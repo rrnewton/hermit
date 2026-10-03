@@ -436,6 +436,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             if self.cfg.recordreplay_modes {
                 Ok(self.record_or_replay(guest, call).await?)
             } else {
+                if let Some(result) = self.try_local_pair_poll(guest, call).await? {
+                    return Ok(result);
+                }
                 Ok(guest.inject(call).await?)
             }
         } else if !self.cfg.sequentialize_threads || self.cfg.recordreplay_modes {

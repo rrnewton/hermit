@@ -27,6 +27,30 @@ static int bootstrap_remaining(u64 deadline) {
      * 50ms budget. A sub-millisecond tail uses a nonblocking poll. */
     return remaining>=50000000ULL?50:(int)(remaining/1000000ULL);
 }
+/* Commands carry no new rights. Only the already authenticated controller
+ * lane can act on its retained INITIAL owner; unused wire words are zero. */
+static int probe_request(struct ug_session *session,int lane,
+                         const struct ug_packet *request,struct ug_packet *response) {
+    if(!lane || request->count)return (errno=EPROTO),-1;
+    u32 op=request->frame.operation;
+    u32 used=(op==UG_PROBE_ARM || op==UG_PROBE_SUBMIT)?2:3;
+    for(u32 i=used;i<8;i++)if(request->frame.values[i])return (errno=EPROTO),-1;
+    const u64 *v=request->frame.values;struct ug_probe_receipt receipt;int result;
+    switch(op) {
+    case UG_PROBE_ARM:
+        result=ug_session_probe_arm(session,v[0],request->frame.sequence,v[1],&receipt);break;
+    case UG_PROBE_SUBMIT:
+        result=ug_session_probe_submit(session,v[0],v[1],&receipt);break;
+    case UG_PROBE_COMPLETE:
+        result=ug_session_probe_complete(session,v[0],v[1],v[2],&receipt);break;
+    case UG_PROBE_RETIRE:
+        result=ug_session_probe_retire(session,v[0],v[1],v[2],&receipt);break;
+    default:return (errno=EPROTO),-1;
+    }
+    _Static_assert(sizeof(receipt)==sizeof(response->frame.values),"probe wire receipt");
+    if(!result)memcpy(response->frame.values,&receipt,sizeof(receipt));
+    return result;
+}
 int ug_keeper_main(u64 bootstrap_deadline_ns) {
     if(bootstrap_remaining(bootstrap_deadline_ns)<0)return 125;
     int parent=fcntl(STDIN_FILENO,F_DUPFD_CLOEXEC,3);if(parent<0)return 125;
@@ -145,6 +169,12 @@ int ug_keeper_main(u64 bootstrap_deadline_ns) {
             case UG_INITIAL:
                 if(lane && request.count==1)
                     result=ug_session_register_initial(session,request.fds[0],request.frame.sequence);
+                break;
+            case UG_PROBE_ARM:
+            case UG_PROBE_SUBMIT:
+            case UG_PROBE_COMPLETE:
+            case UG_PROBE_RETIRE:
+                result=probe_request(session,lane,&request,&response);
                 break;
             case UG_TERMINAL: {
                 if(!lane && !request.count && request.frame.values[0]) {

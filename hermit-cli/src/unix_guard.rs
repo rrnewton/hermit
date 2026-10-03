@@ -35,6 +35,13 @@ const TERMINAL: u32 = 9;
 const TERMINAL_RELEASE: u32 = 10;
 const READBACK_INIT: u32 = 11;
 const READBACK_CHECK: u32 = 12;
+const PROBE_ARM: u32 = 13;
+const PROBE_SUBMIT: u32 = 14;
+const PROBE_COMPLETE: u32 = 15;
+const PROBE_RETIRE: u32 = 16;
+use detcore::network_runtime::guard::NetworkGuardProbeCompletion;
+use detcore::network_runtime::guard::NetworkGuardProbeId;
+use detcore::network_runtime::guard::NetworkGuardProbeKind;
 // Linux UAPI pidfd.h: PIDFD_THREAD = O_EXCL, distinct from signal flag 1.
 const PIDFD_THREAD: libc::c_uint = libc::O_EXCL as libc::c_uint;
 #[repr(C)]
@@ -1116,8 +1123,8 @@ impl ParentGuard {
         if let Some(controller) = &self.controller
             && !pidfd_terminal(controller)?
         {
-                return Err(io::Error::other("controller still live"));
-            }
+            return Err(io::Error::other("controller still live"));
+        }
         self.readers.clear();
         drop(self.creator_map.take());
         drop(self.controller_channel.take());
@@ -1176,9 +1183,19 @@ pub struct ControllerGuard {
     incarnation: u64,
     next_sequence: u64,
     armed_sequence: u64,
+    initial_sequence: Option<u64>,
+    probe: Option<ControllerProbe>,
     birth: Option<GuardBirth>,
     unresolved_rights: Vec<OwnedFd>,
     monitor: GuardEvidence,
+}
+
+#[derive(Clone, Copy)]
+struct ControllerProbe {
+    id: NetworkGuardProbeId,
+    phase: u64,
+    raw: i64,
+    failed: bool,
 }
 impl ControllerGuard {
     /// # Safety
@@ -1210,7 +1227,10 @@ impl ControllerGuard {
             &[pidfd],
             deadline,
         ) {
-            Ok(reply) if reply.rights.is_empty() => Ok(()),
+            Ok(reply) if reply.rights.is_empty() => {
+                self.initial_sequence = Some(sequence);
+                Ok(())
+            }
             Ok(reply) => {
                 self.unresolved_rights.extend(reply.rights);
                 Err(io::Error::other("unexpected initial-registration rights"))
@@ -1220,6 +1240,205 @@ impl ControllerGuard {
                 Err(failure.error)
             }
         }
+    }
+    fn probe_exchange(
+        &mut self,
+        id: NetworkGuardProbeId,
+        operation: u32,
+        raw: i64,
+        disposition: u64,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        use std::os::fd::AsFd;
+        let sequence = if operation == PROBE_ARM {
+            id.sequence
+        } else {
+            let sequence = self
+                .next_sequence
+                .checked_add(1)
+                .ok_or_else(|| io::Error::other("guard probe command sequence exhausted"))?;
+            self.next_sequence = sequence;
+            sequence
+        };
+        let mut values = [0; 8];
+        values[0] = id.initial_sequence;
+        if operation == PROBE_ARM {
+            values[1] = id.kind as u64;
+        } else {
+            values[1] = id.sequence;
+        }
+        if operation == PROBE_COMPLETE {
+            values[2] = raw as u64;
+        }
+        if operation == PROBE_RETIRE {
+            values[2] = disposition;
+        }
+        let result = match raw_request_values(
+            self.channel.as_fd(),
+            self.incarnation,
+            sequence,
+            operation,
+            values,
+            &[],
+            deadline,
+        ) {
+            Ok(reply) => {
+                if !reply.rights.is_empty() {
+                    self.unresolved_rights.extend(reply.rights);
+                    Err(io::Error::other("unexpected Unix probe response rights"))
+                } else {
+                    let (phase, observations) = match operation {
+                        PROBE_ARM => (1, 0),
+                        PROBE_SUBMIT => (2, 0),
+                        PROBE_COMPLETE => (3, 1),
+                        PROBE_RETIRE if disposition == 1 => (3, 1),
+                        PROBE_RETIRE if disposition == 2 => (1, 0),
+                        _ => return Err(io::Error::other("invalid Unix probe command")),
+                    };
+                    let expected = [
+                        id.incarnation,
+                        id.sequence,
+                        phase,
+                        observations,
+                        0,
+                        id.initial_sequence,
+                        raw as u64,
+                        id.kind as u64,
+                    ];
+                    if reply.frame.values != expected {
+                        Err(io::Error::other(
+                            "Unix probe response changed exact native attempt",
+                        ))
+                    } else {
+                        Ok(())
+                    }
+                }
+            }
+            Err(failure) => {
+                self.unresolved_rights.extend(failure.rights);
+                Err(failure.error)
+            }
+        };
+        if result.is_err()
+            && let Some(probe) = &mut self.probe
+        {
+            probe.failed = true;
+        }
+        result
+    }
+    fn require_probe(&mut self, id: NetworkGuardProbeId, phase: u64) -> io::Result<()> {
+        if self
+            .probe
+            .is_none_or(|probe| probe.failed || probe.id != id || probe.phase != phase)
+        {
+            if let Some(probe) = &mut self.probe {
+                probe.failed = true;
+            }
+            return Err(io::Error::other(
+                "Unix probe stale, repeated or unresolved transition",
+            ));
+        }
+        Ok(())
+    }
+    /// # Safety
+    /// The caller retains the registered initial task at its exact stopped
+    /// one-local-row, zero-timeout probe under unchanged MM/FD/grant authority.
+    pub unsafe fn arm_stopped_probe(
+        &mut self,
+        kind: NetworkGuardProbeKind,
+        deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeId> {
+        if self.probe.is_some() {
+            return Err(io::Error::other("Unix probe remains owned"));
+        }
+        let initial_sequence = self
+            .initial_sequence
+            .ok_or_else(|| io::Error::other("Unix probe lacks initial registration"))?;
+        let sequence = self
+            .next_sequence
+            .checked_add(1)
+            .ok_or_else(|| io::Error::other("Unix probe sequence exhausted"))?;
+        self.next_sequence = sequence;
+        let id = NetworkGuardProbeId {
+            incarnation: self.incarnation,
+            initial_sequence,
+            sequence,
+            kind,
+        };
+        self.probe = Some(ControllerProbe {
+            id,
+            phase: 0,
+            raw: 0,
+            failed: false,
+        });
+        self.probe_exchange(id, PROBE_ARM, 0, 0, deadline)?;
+        self.probe.as_mut().unwrap().phase = 1;
+        Ok(id)
+    }
+    /// # Safety
+    /// Only the authenticated actual same-attempt kernel ENTRY may call this.
+    pub unsafe fn submit_entered_probe(
+        &mut self,
+        id: NetworkGuardProbeId,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.require_probe(id, 1)?;
+        self.probe_exchange(id, PROBE_SUBMIT, 0, 0, deadline)?;
+        self.probe.as_mut().unwrap().phase = 2;
+        Ok(())
+    }
+    /// # Safety
+    /// `raw` is the matching actual native Returned callback, not an injected
+    /// helper's synthetic interruption result. The task is still stopped.
+    pub unsafe fn complete_returned_probe(
+        &mut self,
+        id: NetworkGuardProbeId,
+        raw: i64,
+        deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeCompletion> {
+        self.require_probe(id, 2)?;
+        if !id.kind.supports_return(raw) {
+            self.probe.as_mut().unwrap().failed = true;
+            return Err(io::Error::other(
+                "unsupported actual Unix poll result; custody retained",
+            ));
+        }
+        self.probe.as_mut().unwrap().raw = raw;
+        self.probe_exchange(id, PROBE_COMPLETE, raw, 0, deadline)?;
+        self.probe.as_mut().unwrap().phase = 3;
+        Ok(NetworkGuardProbeCompletion {
+            probe: id,
+            raw,
+            observations: 1,
+        })
+    }
+    /// Retire exactly the completed receipt after the caller checked scratch.
+    pub fn retire_completed_probe(
+        &mut self,
+        completion: NetworkGuardProbeCompletion,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.require_probe(completion.probe, 3)?;
+        if completion.observations != 1 || self.probe.unwrap().raw != completion.raw {
+            self.probe.as_mut().unwrap().failed = true;
+            return Err(io::Error::other("Unix probe retirement changed completion"));
+        }
+        self.probe_exchange(completion.probe, PROBE_RETIRE, completion.raw, 1, deadline)?;
+        self.probe = None;
+        Ok(())
+    }
+    /// # Safety
+    /// Actual InterruptedBeforeEntry proved this exact ARMED attempt never
+    /// entered Linux. Missing callbacks and task death cannot supply this proof.
+    pub unsafe fn disarm_unentered_probe(
+        &mut self,
+        id: NetworkGuardProbeId,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.require_probe(id, 1)?;
+        self.probe_exchange(id, PROBE_RETIRE, 0, 2, deadline)?;
+        self.probe = None;
+        Ok(())
     }
     pub fn birth(&self) -> Option<GuardBirth> {
         self.birth
@@ -1759,6 +1978,8 @@ impl ArmedGuard {
             parent_pidfd: copied.parent_pidfd,
             incarnation: copied.incarnation,
             next_sequence: 0, // independent authenticated controller lane
+            initial_sequence: None,
+            probe: None,
             armed_sequence: copied.armed_sequence.ok_or(StartupError::Protocol)?,
             birth: None,
             unresolved_rights: copied.unresolved_rights,
@@ -1922,5 +2143,177 @@ mod pidfd_abi_tests {
     fn pidfd_thread_uses_linux_open_flag_not_signal_flag() {
         assert_eq!(super::PIDFD_THREAD, 0x80);
         assert_ne!(super::PIDFD_THREAD, 1);
+    }
+}
+
+#[cfg(test)]
+mod probe_wire_tests {
+    use std::thread::JoinHandle;
+
+    use super::*;
+
+    fn fixture(
+        mutation: Option<usize>,
+        commands: usize,
+    ) -> (ControllerGuard, JoinHandle<Vec<Frame>>) {
+        // Actual maintained channel encoder/decoder and owned Unix transport;
+        // keeper replies are controlled protocol premises, not native BPF facts.
+        let mut pair = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let channel = unsafe { OwnedFd::from_raw_fd(pair[0]) };
+        let peer = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            let mut id = 0;
+            let mut kind = 0;
+            let mut last_raw = 0;
+            for index in 0..commands {
+                let mut request = Frame::default();
+                let count = unsafe {
+                    libc::recv(
+                        peer.as_raw_fd(),
+                        (&mut request as *mut Frame).cast(),
+                        std::mem::size_of::<Frame>(),
+                        0,
+                    )
+                };
+                assert_eq!(count as usize, std::mem::size_of::<Frame>());
+                assert_eq!(request.magic, MAGIC);
+                assert_eq!(request.incarnation, 11);
+                assert_eq!(request.sequence, 4 + index as u64);
+                assert_eq!(request.rights, 0);
+                assert_eq!(request.values[0], 3);
+                let (phase, observations) = match request.operation {
+                    PROBE_ARM => {
+                        id = request.sequence;
+                        kind = request.values[1];
+                        (1, 0)
+                    }
+                    PROBE_SUBMIT => {
+                        assert_eq!(request.values[1], id);
+                        (2, 0)
+                    }
+                    PROBE_COMPLETE => {
+                        assert_eq!(request.values[1], id);
+                        last_raw = request.values[2];
+                        (3, 1)
+                    }
+                    PROBE_RETIRE => {
+                        assert_eq!(request.values[1], id);
+                        if request.values[2] == 1 {
+                            (3, 1)
+                        } else {
+                            assert_eq!(request.values[2], 2);
+                            (1, 0)
+                        }
+                    }
+                    _ => panic!("unexpected probe operation"),
+                };
+                let mut reply = request;
+                reply.operation |= 0x100;
+                reply.values = [11, id, phase, observations, 0, 3, last_raw, kind];
+                if let Some(at) = mutation {
+                    reply.values[at] ^= 1;
+                }
+                assert_eq!(
+                    unsafe {
+                        libc::send(
+                            peer.as_raw_fd(),
+                            (&reply as *const Frame).cast(),
+                            std::mem::size_of::<Frame>(),
+                            libc::MSG_NOSIGNAL,
+                        )
+                    } as usize,
+                    std::mem::size_of::<Frame>()
+                );
+                seen.push(request);
+            }
+            seen
+        });
+        let placeholder = std::fs::File::open("/dev/null").unwrap();
+        let fd = || placeholder.try_clone().unwrap().into();
+        (
+            ControllerGuard {
+                channel,
+                config: fd(),
+                status: fd(),
+                ring: fd(),
+                keeper_pidfd: fd(),
+                parent_pidfd: fd(),
+                incarnation: 11,
+                next_sequence: 3,
+                armed_sequence: 1,
+                initial_sequence: Some(3),
+                probe: None,
+                birth: None,
+                unresolved_rights: Vec::new(),
+                monitor: GuardEvidence::default(),
+            },
+            server,
+        )
+    }
+    #[test]
+    fn local_guard_probe_wire_roundtrips_exact_kind_raw_and_distinct_sequences() {
+        for (kind, raw) in [
+            (NetworkGuardProbeKind::Poll, 0),
+            (NetworkGuardProbeKind::Poll, 1),
+            (NetworkGuardProbeKind::Poll, -516),
+            (NetworkGuardProbeKind::Ppoll, -514),
+            (NetworkGuardProbeKind::Ppoll, -4),
+        ] {
+            let (mut guard, server) = fixture(None, 4);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            let id = unsafe { guard.arm_stopped_probe(kind, deadline) }.unwrap();
+            assert_eq!(id.initial_sequence, 3);
+            assert_eq!(id.sequence, 4);
+            unsafe { guard.submit_entered_probe(id, deadline) }.unwrap();
+            let completion = unsafe { guard.complete_returned_probe(id, raw, deadline) }.unwrap();
+            assert_eq!(completion.raw, raw);
+            assert_eq!(completion.observations, 1);
+            assert!(guard.probe.is_some());
+            guard.retire_completed_probe(completion, deadline).unwrap();
+            assert!(guard.probe.is_none());
+            let seen = server.join().unwrap();
+            assert_eq!(
+                seen.iter().map(|frame| frame.operation).collect::<Vec<_>>(),
+                [PROBE_ARM, PROBE_SUBMIT, PROBE_COMPLETE, PROBE_RETIRE]
+            );
+        }
+    }
+    #[test]
+    fn local_guard_probe_wire_rejects_each_changed_receipt_field_without_rearm() {
+        for mutation in 0..8 {
+            let (mut guard, server) = fixture(Some(mutation), 1);
+            let deadline = Instant::now() + Duration::from_secs(1);
+            assert!(
+                unsafe { guard.arm_stopped_probe(NetworkGuardProbeKind::Poll, deadline) }.is_err()
+            );
+            assert!(guard.probe.unwrap().failed);
+            assert!(
+                unsafe { guard.arm_stopped_probe(NetworkGuardProbeKind::Poll, deadline) }.is_err()
+            );
+            assert_eq!(server.join().unwrap().len(), 1);
+        }
+    }
+    #[test]
+    fn local_guard_probe_wire_disarm_requires_exact_unsubmitted_owner() {
+        let (mut guard, server) = fixture(None, 2);
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let id =
+            unsafe { guard.arm_stopped_probe(NetworkGuardProbeKind::Ppoll, deadline) }.unwrap();
+        unsafe { guard.disarm_unentered_probe(id, deadline) }.unwrap();
+        assert!(guard.probe.is_none());
+        assert!(unsafe { guard.disarm_unentered_probe(id, deadline) }.is_err());
+        assert_eq!(server.join().unwrap().len(), 2);
     }
 }

@@ -3798,6 +3798,10 @@ pub struct ThreadState<T> {
     /// Original Connect invocation custody; never inherited into a new child.
     #[serde(default)]
     pub(crate) original_connect: Option<crate::network_replay::original_connect::Local>,
+    /// Actual local Unix probe custody; the runtime also retains it across
+    /// cancellation. Neither serialization nor child construction transfers it.
+    #[serde(skip)]
+    pub(crate) local_guard_probe: Option<Arc<crate::network_runtime::guard_probe::Local>>,
     /// Exact metadata consumed by the actual Prepared hook while the original
     /// Call still owns its table permit. Never recovered by a later numeric FD.
     #[serde(default)]
@@ -4253,6 +4257,7 @@ impl<T> ThreadState<T> {
             uninvoked_wait_call: None,
             uninvoked_fd_clone: None,
             original_connect: None,
+            local_guard_probe: None,
             original_file_metadata: None,
             pending_fd_clone: None,
             // For the root thread, we initialize from the seed in the config:

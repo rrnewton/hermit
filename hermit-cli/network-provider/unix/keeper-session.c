@@ -45,7 +45,11 @@ struct recovery_record {
     s32 error; u32 reserved;
     char pin_name[32];
 };
-struct initial_owner { int pidfd; u64 sequence; bool live; };
+struct initial_owner {
+    int pidfd; u64 sequence; bool live;
+    /* Last identity is retained after retirement; no sequence can be reused. */
+    u64 probe_sequence, probe_phase, probe_kind, probe_raw;
+};
 struct ug_session {
     struct bpf_object *object;
     struct bpf_link *links[UG_LINKS];
@@ -283,6 +287,124 @@ int ug_session_register_initial(struct ug_session *s,int pidfd,u64 sequence) {
      * The caller must separately keep its authentic ptrace stop until ACK. */
     if(append(s,RECORD_INITIAL_LIVE,sequence,0,0,NULL,0))return -1;
     owner->live=true;return 0;
+}
+/* Every failed transition is sticky even before the channel appends its
+ * failure row. A partially applied BPF operation must never be retried as a
+ * fresh arm. Only actual terminal recovery can settle unknown custody. */
+static int probe_failure(struct ug_session *s,int error) {
+    if(s)s->failed=true;
+    return fail(error?error:EPROTO);
+}
+static struct initial_owner *probe_owner(struct ug_session *s,u64 sequence) {
+    if(!s || !s->prepared || s->failed || s->admissions_closed ||
+       s->journal_error || !sequence) {probe_failure(s,EINVAL);return NULL;}
+    struct initial_owner *owner=NULL;
+    for(u32 i=0;i<s->initial_count;i++)if(s->initial[i].sequence==sequence) {
+        if(owner) {probe_failure(s,EPROTO);return NULL;}
+        owner=&s->initial[i];
+    }
+    if(!owner || !owner->live || owner->pidfd<0) {probe_failure(s,EPROTO);return NULL;}
+    struct pollfd p={.fd=owner->pidfd,.events=POLLIN};
+    int n=poll(&p,1,0);
+    if(n!=0 || p.revents) {probe_failure(s,n<0?errno:ESRCH);return NULL;}
+    struct ug_task task;struct ug_initial_task initial;
+    if(lookup_value(s->maps[4],&owner->pidfd,&task,0) ||
+       lookup_value(s->maps[8],&sequence,&initial,0) || check_clean(s)) {
+        probe_failure(s,errno);return NULL;
+    }
+    if(task.incarnation!=s->incarnation || task.initial_registration!=sequence ||
+       task.reserved || !ug_initial_membership_matches(&task,&initial)) {
+        probe_failure(s,EPROTO);return NULL;
+    }
+    return owner;
+}
+static int probe_read(struct ug_session *s,struct initial_owner *owner,
+                      u64 sequence,u64 phase,struct ug_probe *out) {
+    if(!sequence || owner->probe_sequence!=sequence || owner->probe_phase!=phase)
+        return probe_failure(s,EPROTO);
+    if(lookup_value(s->maps[9],&owner->pidfd,out,0))return probe_failure(s,errno);
+    if(out->incarnation!=s->incarnation || out->sequence!=sequence || out->phase!=phase ||
+       out->denied || (phase==UG_PROBE_ARMED?out->observations!=0:out->observations!=1))
+        return probe_failure(s,EPROTO);
+    return 0;
+}
+static void probe_receipt(struct initial_owner *owner,const struct ug_probe *probe,
+                           struct ug_probe_receipt *out) {
+    *out=(struct ug_probe_receipt){*probe,owner->sequence,owner->probe_raw,owner->probe_kind};
+}
+int ug_session_probe_arm(struct ug_session *s,u64 initial,u64 sequence,u64 kind,
+                         struct ug_probe_receipt *out) {
+    struct initial_owner *owner=probe_owner(s,initial);if(!owner)return -1;
+    if(!out || !sequence || sequence<=initial || sequence<=owner->probe_sequence ||
+       owner->probe_phase || (kind!=UG_PROBE_POLL && kind!=UG_PROBE_PPOLL))
+        return probe_failure(s,EINVAL);
+    /* Custody precedes the mutating call, including its uncertain failures. */
+    owner->probe_sequence=sequence;owner->probe_phase=UG_PROBE_ARMED;
+    owner->probe_kind=kind;owner->probe_raw=0;
+    struct ug_probe command={s->incarnation,sequence,UG_PROBE_ARMED,0,0},observed;
+    if(update_value(s->maps[9],&owner->pidfd,&command,BPF_NOEXIST))return probe_failure(s,errno);
+    if(probe_read(s,owner,sequence,UG_PROBE_ARMED,&observed) || check_clean(s))
+        return probe_failure(s,errno);
+    probe_receipt(owner,&observed,out);return 0;
+}
+int ug_session_probe_submit(struct ug_session *s,u64 initial,u64 sequence,
+                            struct ug_probe_receipt *out) {
+    struct initial_owner *owner=probe_owner(s,initial);if(!owner)return -1;
+    struct ug_probe command,observed;
+    if(!out)return probe_failure(s,EINVAL);
+    if(probe_read(s,owner,sequence,UG_PROBE_ARMED,&command))return -1;
+    command.phase=UG_PROBE_SUBMITTED;owner->probe_phase=UG_PROBE_SUBMITTED;
+    if(update_value(s->maps[9],&owner->pidfd,&command,BPF_EXIST) ||
+       lookup_value(s->maps[9],&owner->pidfd,&observed,0) || check_clean(s))
+        return probe_failure(s,errno);
+    /* The guest is still at authenticated ENTRY: a callback here is too early. */
+    if(memcmp(&command,&observed,sizeof(command)))return probe_failure(s,EPROTO);
+    probe_receipt(owner,&observed,out);return 0;
+}
+static bool probe_result_supported(u64 kind,u64 raw) {
+    /* Pinned Linux fs/select.c: one scan, including signal_pending, followed by
+     * revents copyout. poll converts ERESTARTNOHAND to ERESTART_RESTARTBLOCK;
+     * ppoll retains ERESTARTNOHAND, or EINTR with STICKY_TIMEOUTS. No other
+     * negative result proves this complete scan/copyout; never infer no-write. */
+    if(raw<=1)return true;
+    if(kind==UG_PROBE_POLL)return raw==(u64)(int64_t)-516;
+    return kind==UG_PROBE_PPOLL &&
+           (raw==(u64)(int64_t)-514 || raw==(u64)(int64_t)-EINTR);
+}
+int ug_session_probe_complete(struct ug_session *s,u64 initial,u64 sequence,u64 raw,
+                              struct ug_probe_receipt *out) {
+    struct initial_owner *owner=probe_owner(s,initial);if(!owner)return -1;
+    struct ug_probe command,observed;
+    if(!out)return probe_failure(s,EINVAL);
+    if(!sequence || owner->probe_sequence!=sequence || owner->probe_phase!=UG_PROBE_SUBMITTED)
+        return probe_failure(s,EPROTO);
+    /* Retain this attempt's genuine raw RETURN even when its map/output
+     * evidence refuses completion; a stale command cannot replace that value. */
+    owner->probe_raw=raw;
+    if(probe_read(s,owner,sequence,UG_PROBE_SUBMITTED,&command))return -1;
+    if(!probe_result_supported(owner->probe_kind,raw))return probe_failure(s,EPROTO);
+    command.phase=UG_PROBE_COMPLETED;owner->probe_phase=UG_PROBE_COMPLETED;
+    if(update_value(s->maps[9],&owner->pidfd,&command,BPF_EXIST) ||
+       lookup_value(s->maps[9],&owner->pidfd,&observed,0) || check_clean(s))
+        return probe_failure(s,errno);
+    if(memcmp(&command,&observed,sizeof(command)))return probe_failure(s,EPROTO);
+    probe_receipt(owner,&observed,out);return 0;
+}
+int ug_session_probe_retire(struct ug_session *s,u64 initial,u64 sequence,u64 disposition,
+                            struct ug_probe_receipt *out) {
+    struct initial_owner *owner=probe_owner(s,initial);if(!owner)return -1;
+    struct ug_probe observed,after;
+    u64 phase=disposition==UG_PROBE_RETIRE_COMPLETED?UG_PROBE_COMPLETED:
+              disposition==UG_PROBE_RETIRE_UNENTERED?UG_PROBE_ARMED:0;
+    if(!out || !phase)return probe_failure(s,EINVAL);
+    if(probe_read(s,owner,sequence,phase,&observed))return -1;
+    union bpf_attr a={0};a.map_fd=s->maps[9];a.key=(u64)(uintptr_t)&owner->pidfd;
+    if(bpf_call(BPF_MAP_DELETE_ELEM,&a))return probe_failure(s,errno);
+    if(!lookup_value(s->maps[9],&owner->pidfd,&after,0) || errno!=ENOENT)
+        return probe_failure(s,EPROTO);
+    if(check_clean(s))return probe_failure(s,errno);
+    /* Only deletion AND positive absence settle this attempt; retain identity. */
+    owner->probe_phase=0;probe_receipt(owner,&observed,out);return 0;
 }
 int ug_session_note_failure(struct ug_session *s,u64 seq,int error) {
     if(!s)return fail(EINVAL);s->failed=true;

@@ -85,6 +85,56 @@ int ug_session_register_initial(struct ug_session *s,int fd,u64 seq) {(void)s;(v
 int ug_session_terminal(struct ug_session *s,u64 seq,struct ug_terminal_receipt *out) {(void)s;(void)seq;(void)out;assert(0);return -1;}
 int ug_session_prepare_terminal(struct ug_session *s,u64 seq,struct ug_terminal_receipt *out,int *fd) {(void)s;(void)seq;(void)out;(void)fd;assert(0);return -1;}
 int ug_session_close_terminal(struct ug_session *s,u64 seq,u64 proof,u64 ordinal,u64 deadline_ns,struct ug_object_close *out) {(void)s;(void)seq;(void)proof;(void)ordinal;(void)deadline_ns;(void)out;assert(0);return -1;}
+static unsigned probe_calls;
+static u64 probe_operation;
+static int probe_stub(struct ug_session *s,u64 initial,u64 sequence,u64 argument,
+                       struct ug_probe_receipt *out,u64 operation) {
+    assert(s==(void *)123 && initial==2 && sequence==3);probe_calls++;
+    probe_operation=operation;
+    *out=(struct ug_probe_receipt){{7,sequence,operation,1,0},initial,argument,UG_PROBE_POLL};
+    return 0;
+}
+int ug_session_probe_arm(struct ug_session *s,u64 initial,u64 seq,u64 kind,struct ug_probe_receipt *out) {
+    return probe_stub(s,initial,seq,kind,out,UG_PROBE_ARM);
+}
+int ug_session_probe_submit(struct ug_session *s,u64 initial,u64 seq,struct ug_probe_receipt *out) {
+    return probe_stub(s,initial,seq,0,out,UG_PROBE_SUBMIT);
+}
+int ug_session_probe_complete(struct ug_session *s,u64 initial,u64 seq,u64 raw,struct ug_probe_receipt *out) {
+    return probe_stub(s,initial,seq,raw,out,UG_PROBE_COMPLETE);
+}
+int ug_session_probe_retire(struct ug_session *s,u64 initial,u64 seq,u64 disposition,struct ug_probe_receipt *out) {
+    return probe_stub(s,initial,seq,disposition,out,UG_PROBE_RETIRE);
+}
+static void probe_dispatch_controls(void) {
+    unsigned passed=0;
+    for(u32 op=UG_PROBE_ARM;op<=UG_PROBE_RETIRE;op++) {
+        struct ug_packet request={0},response={0};
+        request.frame.operation=op;request.frame.sequence=3;
+        request.frame.values[0]=2;request.frame.values[1]=op==UG_PROBE_ARM?UG_PROBE_POLL:3;
+        if(op==UG_PROBE_COMPLETE)request.frame.values[2]=(u64)(int64_t)-516;
+        if(op==UG_PROBE_RETIRE)request.frame.values[2]=UG_PROBE_RETIRE_COMPLETED;
+        probe_calls=0;assert(probe_request((void *)123,1,&request,&response)==0);
+        assert(probe_calls==1 && probe_operation==op && response.frame.values[0]==7 &&
+               response.frame.values[1]==3 && response.frame.values[5]==2 &&
+               response.frame.values[7]==UG_PROBE_POLL);passed++;
+        probe_calls=0;assert(probe_request((void *)123,0,&request,&response)==-1 && errno==EPROTO);
+        assert(!probe_calls);passed++;
+        request.count=1;assert(probe_request((void *)123,1,&request,&response)==-1 && errno==EPROTO);
+        assert(!probe_calls);request.count=0;passed++;
+        unsigned used=op==UG_PROBE_ARM || op==UG_PROBE_SUBMIT?2:3;
+        for(unsigned i=used;i<8;i++) {
+            request.frame.values[i]=1;
+            assert(probe_request((void *)123,1,&request,&response)==-1 && errno==EPROTO && !probe_calls);
+            request.frame.values[i]=0;passed++;
+        }
+    }
+    struct ug_packet request={0},response={0};probe_calls=0;
+    request.frame.operation=UG_INITIAL;
+    assert(probe_request((void *)123,1,&request,&response)==-1 && errno==EPROTO && !probe_calls);passed++;
+    printf("guard_probe_dispatch_controls=%u passed; session substituted\n",passed);
+    assert(passed==35);
+}
 static void fresh(int which) {
     scenario=which;now_ns=1000000000ULL;deadline=now_ns+50000000;
     polls=receives=opens=sends=failures=closes=0;memset(&last_response,0,sizeof(last_response));
@@ -105,5 +155,6 @@ int main(void) {
      * keeps calling it after an observed failure instead of disabling it. */
     fresh(7);assert(ug_keeper_main(deadline)==125);
     assert(monitors==2 && polls==3 && opens==1 && sends==1 && failures==1);
-    printf("guard_keeper_continued_pump_controls=1 passed; session substituted\n");return 0;
+    printf("guard_keeper_continued_pump_controls=1 passed; session substituted\n");
+    probe_dispatch_controls();return 0;
 }

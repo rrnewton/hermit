@@ -35,6 +35,7 @@ pub mod capability_unit;
 mod fd_journal;
 mod grouped_broker;
 pub mod guard;
+pub(crate) mod guard_probe;
 mod helper_receive;
 pub(crate) mod native_peer;
 pub(crate) use helper_receive::Binding as HelperCopyBinding;
@@ -783,6 +784,7 @@ struct GuardRuntime {
     deadline: std::time::Instant,
     observer: Option<(guard::NetworkGuardPublication, Result<(), String>)>,
     initial: Option<GuardInitial>,
+    probe: Option<std::sync::Arc<guard_probe::Local>>,
 }
 
 #[derive(Debug)]
@@ -1209,6 +1211,7 @@ impl NetworkRuntimeResources {
     ) -> (NetworkRuntimeOwner, Self) {
         let shared = std::sync::Arc::new(RuntimeShared {
             guard: Mutex::new(Some(GuardRuntime {
+                probe: None,
                 control,
                 deadline,
                 observer: None,
@@ -1258,6 +1261,7 @@ impl NetworkRuntimeResources {
             return Err(std::io::Error::other("guard already attached"));
         }
         *guard = Some(GuardRuntime {
+            probe: None,
             control,
             deadline,
             observer: None,

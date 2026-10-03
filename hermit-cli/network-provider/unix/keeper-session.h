@@ -33,6 +33,35 @@ int ug_session_observe_birth(struct ug_session *, u64 sequence, struct ug_birth 
 /* An externally authenticated stopped initial guest, not the tracer. Partial
  * insertion retains its held pidfd + STAGED/LIVE row and cannot authorize run. */
 int ug_session_register_initial(struct ug_session *, int held_pidfd, u64 sequence);
+/* Narrow zero-time, one-local-row readiness protocol. This private controller
+ * lane is trusted to hold the actual stopped initial task, exact MM/FD read and
+ * Normal grant continuously, and to submit only from authenticated native ENTRY
+ * and complete only from its matching native RETURN before exposing scratch.
+ * No arbitrary pidfd or user-supplied socket identity enters this interface.
+ * Initial registration and probe sequences are distinct; command sequencing is
+ * additionally enforced by the keeper channel. Unknown completion stays owned.
+ * The existing ABI3 BPF probe map is unchanged. */
+enum ug_probe_kind { UG_PROBE_POLL=1, UG_PROBE_PPOLL=2 };
+enum ug_probe_retirement { UG_PROBE_RETIRE_COMPLETED=1, UG_PROBE_RETIRE_UNENTERED=2 };
+struct ug_probe_receipt {
+    struct ug_probe probe;
+    u64 initial_sequence, raw_result, kind;
+};
+int ug_session_probe_arm(struct ug_session *, u64 initial_sequence,
+                         u64 probe_sequence, u64 kind, struct ug_probe_receipt *);
+int ug_session_probe_submit(struct ug_session *, u64 initial_sequence,
+                            u64 probe_sequence, struct ug_probe_receipt *);
+/* raw_result is the bit pattern of the actual signed native return. Supported
+ * interrupts still require the sole real Unix callback and preserve copyout;
+ * they are not readiness success or proof that no memory was written. */
+int ug_session_probe_complete(struct ug_session *, u64 initial_sequence,
+                              u64 probe_sequence, u64 raw_result,
+                              struct ug_probe_receipt *);
+/* UNENTERED requires actual never-entered backend disposition, not a timeout,
+ * cancellation after submission, absent reply, or a guessed syscall outcome. */
+int ug_session_probe_retire(struct ug_session *, u64 initial_sequence,
+                            u64 probe_sequence, u64 disposition,
+                            struct ug_probe_receipt *);
 /* Session-owned observation history also serves TERMINAL. Keep pumping after
  * policy: a later independent failure must remain in the original journal. */
 int ug_session_monitor(struct ug_session *, int other_actor_pidfd, u64 sequence);

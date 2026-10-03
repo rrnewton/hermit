@@ -6778,29 +6778,215 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The short reader and original sole-root grant protect numeric selection;
     /// neither a copied local marker nor a native readiness bit grants a turn.
     async fn probe_shadow_local_pair<G: Guest<Self>>(
-        &self, guest: &mut G, row: libc::pollfd,
+        &self,
+        guest: &mut G,
+        row: libc::pollfd,
     ) -> Result<libc::pollfd, Error> {
-        let read = self.begin_network_fd_read(guest, row.fd).await?;
-        let operation = async {
-            guest.local_global_state().ok_or_else(|| engine_error("local pair poll lacks local global state"))?
-                .validate_local_pair_poll(guest.thread_state(), &read)?;
-            let mut stack = guest.stack().await;
-            let address = stack.reserve::<libc::pollfd>();
-            let timeout = stack.reserve::<syscalls::Timespec>();
-            let _guard = stack.commit()?;
-            guest.memory().write_value(address, &libc::pollfd { revents: 0, ..row })?;
-            guest.memory().write_value(timeout, &syscalls::Timespec { tv_sec: 0, tv_nsec: 0 })?;
-            let count = guest.inject(syscalls::Ppoll::new().with_fds(Some(address.cast()))
-                .with_nfds(1).with_timeout(Some(timeout)).with_sigmask(None).with_sigsetsize(0)).await?;
-            let observed = guest.memory().read_value(address)?;
-            guest.local_global_state().ok_or_else(|| engine_error("local pair poll lost local global state"))?
-                .validate_local_pair_poll(guest.thread_state(), &read)?;
-            checked_local_poll_result(row, observed, count)
-        }.await;
-        let cleanup = self.shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read }).await;
-        finish_shadow_operation(operation, cleanup)
+        let (observed, result) = self
+            .probe_local_pair(
+                guest,
+                row,
+                crate::network_runtime::guard::NetworkGuardProbeKind::Ppoll,
+                None,
+            )
+            .await?;
+        result?;
+        Ok(observed)
     }
 
+    #[cfg(test)]
+    pub(crate) async fn controlled_shadow_local_pair_probe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        row: libc::pollfd,
+    ) -> Result<libc::pollfd, Error> {
+        self.probe_shadow_local_pair(guest, row).await
+    }
+
+    /// The ordinary local-only Poll bypasses the TCP dispatcher. Preserve its
+    /// existing selected turn, and use the same reader/probe in both modes.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3464): https://github.com/rrnewton/hermit/pull/3464
+    pub(crate) async fn try_local_pair_poll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Poll,
+    ) -> Result<Option<i64>, Error> {
+        if !self.network_fd_tracking_active(guest) || call.nfds() != 1 || call.timeout() != 0 {
+            return Ok(None);
+        }
+        let Some(address) = call.fds() else {
+            return Ok(None);
+        };
+        let mut bytes = [0u8; 8];
+        if guest
+            .memory()
+            .read_exact_with_user_access(address.cast(), &mut bytes)
+            .is_err()
+        {
+            // Linux must retain its original copy-from-user fault ordering.
+            return Ok(None);
+        }
+        let row = libc::pollfd {
+            fd: i32::from_ne_bytes(bytes[..4].try_into().unwrap()),
+            events: i16::from_ne_bytes(bytes[4..6].try_into().unwrap()),
+            revents: i16::from_ne_bytes(bytes[6..].try_into().unwrap()),
+        };
+        if !guest
+            .thread_state()
+            .with_detfd(row.fd, |fd| fd.is_local_socket_pair())
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        let (_, result) = self
+            .probe_local_pair(
+                guest,
+                row,
+                crate::network_runtime::guard::NetworkGuardProbeKind::Poll,
+                Some(call),
+            )
+            .await?;
+        Ok(Some(result?))
+    }
+
+    async fn probe_local_pair<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        row: libc::pollfd,
+        kind: crate::network_runtime::guard::NetworkGuardProbeKind,
+        original: Option<syscalls::Poll>,
+    ) -> Result<(libc::pollfd, Result<i64, Errno>), Error> {
+        use crate::network_runtime::guard::NetworkGuardProbeKind;
+        let read = self.begin_network_fd_read(guest, row.fd).await?;
+        let operation = async {
+            guest
+                .local_global_state()
+                .ok_or_else(|| engine_error("local pair poll lacks local global state"))?
+                .validate_local_pair_poll(guest.thread_state(), &read)?;
+            // Ordinary Poll keeps its exact original pointer and kernel
+            // copyout, including PKRU, cross-page faults and restart_block.
+            // process_vm_writev does not enforce guest PKRU and cannot replace
+            // put_user(short). Only the existing shadow Ppoll uses scratch.
+            // https://github.com/rrnewton/hermit/issues/3619
+            let (address, timeout, _guard) = if let Some(call) = original.as_ref() {
+                (
+                    call.fds().ok_or(Errno::EFAULT)?.cast::<libc::pollfd>(),
+                    None,
+                    None,
+                )
+            } else {
+                let mut stack = guest.stack().await;
+                let address = stack.reserve::<libc::pollfd>();
+                let timeout = stack.reserve::<syscalls::Timespec>();
+                let guard = stack.commit()?;
+                guest
+                    .memory()
+                    .write_value(address, &libc::pollfd { revents: 0, ..row })?;
+                guest.memory().write_value(
+                    timeout,
+                    &syscalls::Timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    },
+                )?;
+                (address, Some(timeout), Some(guard))
+            };
+            let probe: Syscall = match (kind, original) {
+                (NetworkGuardProbeKind::Poll, Some(call)) => call.into(),
+                (NetworkGuardProbeKind::Ppoll, None) => syscalls::Ppoll::new()
+                    .with_fds(Some(address.cast()))
+                    .with_nfds(1)
+                    .with_timeout(timeout)
+                    .with_sigmask(None)
+                    .with_sigsetsize(0)
+                    .into(),
+                _ => {
+                    return Err(engine_error(
+                        "local Unix probe changed original/scratch shape",
+                    ));
+                }
+            };
+            let local = guest
+                .local_global_state()
+                .ok_or_else(|| engine_error("local pair poll lost global state"))?
+                .retain_local_pair_probe(
+                    guest.thread_state(),
+                    &read,
+                    probe.number(),
+                    probe.into_parts().1,
+                    kind,
+                )?;
+            guest.thread_state_mut().local_guard_probe = local.clone();
+            if let Some(local) = &local {
+                local.arm()?;
+            }
+            let result = guest.inject(probe).await;
+            let raw = match result {
+                Ok(raw) => raw,
+                Err(errno) => -i64::from(errno.into_raw()),
+            };
+            if let Some(local) = &local {
+                guest
+                    .local_global_state()
+                    .ok_or_else(|| engine_error("local pair poll lost global state"))?
+                    .validate_retained_local_probe(guest.thread_state(), local)?;
+                match local.returned()? {
+                    Some(actual) if actual == raw => {}
+                    None if result.is_err() => {
+                        guest.thread_state_mut().local_guard_probe = None;
+                        return Err(result.unwrap_err().into());
+                    }
+                    _ => {
+                        return Err(engine_error(
+                            "local Unix probe helper differs from actual native return",
+                        ));
+                    }
+                }
+            }
+            if !matches!(raw, 0 | 1) {
+                if original.is_some() && local.is_none() {
+                    // Record without a guard preserves the genuine original
+                    // Linux errno, with no substituted buffer or manual write.
+                    return Err(result.expect_err("negative native Poll result").into());
+                }
+                return Err(engine_error("unsupported local Unix poll continuation"));
+            }
+            // Guard completion precedes reading/using readiness or resuming
+            // guest execution. Original Poll has already performed its native
+            // copyout; only shadow Ppoll writes a private scratch buffer.
+            let observed = guest.memory().read_value(address)?;
+            guest
+                .local_global_state()
+                .ok_or_else(|| engine_error("local pair poll lost local global state"))?
+                .validate_local_pair_poll(guest.thread_state(), &read)?;
+            let observed = checked_local_poll_result(row, observed, raw)?;
+            if let Some(local) = &local {
+                local.retire()?;
+            }
+            guest
+                .local_global_state()
+                .ok_or_else(|| engine_error("local pair poll lost copyout authority"))?
+                .validate_local_pair_poll(guest.thread_state(), &read)?;
+            guest.thread_state_mut().local_guard_probe = None;
+            Ok((observed, result))
+        }
+        .await;
+        // Ambiguous/submitted native custody retains its original FD reader.
+        // Actual consuming teardown, not dropping this future, owns recovery.
+        if guest
+            .thread_state()
+            .local_guard_probe
+            .as_ref()
+            .is_some_and(|probe| !probe.is_retired())
+        {
+            return operation;
+        }
+        let cleanup = self
+            .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
+            .await;
+        finish_shadow_operation(operation, cleanup)
+    }
     /// One scan lookup. Copying the poll/select input happens before entry;
     /// neither this short admission nor capture spans guest-memory access.
     async fn admit_shadow_poll_fd<G: Guest<Self>>(

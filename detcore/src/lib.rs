@@ -1152,6 +1152,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Memory authority consumes only these real synchronous observations,
         // including Prepared before the existing early return below.
         global.observe_original_memory(tid, self.detpid, state, nr, args, event);
+        global.observe_local_guard_probe(tid, self.detpid, state, nr, args, event);
         // Preparation only binds already admitted custody. It is not an
         // original result, child identity, or no-effect observation.
         if matches!(
@@ -1188,6 +1189,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         _status: ExitStatus,
     ) {
         global.invalidate_terminal_foreground_memory(state);
+        global.observe_local_guard_probe_terminal(tid, self.detpid, state);
         #[cfg(test)]
         let before =
             tool_global::native_prestart_tests::before_terminal(tid, global, state, _status);
@@ -1796,6 +1798,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     uninvoked_wait_call: None,
                     uninvoked_fd_clone: None,
                     original_connect: None,
+                    local_guard_probe: None,
                     original_file_metadata: None,
                     pending_fd_clone: pts.1.pending_fd_clone,
 

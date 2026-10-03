@@ -60,6 +60,50 @@ pub enum NetworkGuardTerminal {
     Internal(NetworkGuardEvidence),
 }
 
+/// The finite, single local-row, zero-timeout native probe shape.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
+pub enum NetworkGuardProbeKind {
+    /// Linux poll, with its original millisecond timeout equal to zero.
+    Poll = 1,
+    /// Linux ppoll, with a zero timespec and no temporary signal mask.
+    Ppoll = 2,
+}
+impl NetworkGuardProbeKind {
+    /// Native exit registers supported by the pinned Linux probe contract.
+    pub fn supports_return(self, raw: i64) -> bool {
+        matches!(raw, 0 | 1)
+            || match self {
+                Self::Poll => raw == -516,               // ERESTART_RESTARTBLOCK
+                Self::Ppoll => matches!(raw, -514 | -4), // ERESTARTNOHAND / EINTR
+            }
+    }
+}
+
+/// Exact keeper-owned attempt, separate from the initial registration command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkGuardProbeId {
+    /// Authenticated native session incarnation.
+    pub incarnation: u64,
+    /// The original INITIAL registration sequence.
+    pub initial_sequence: u64,
+    /// Fresh ARM command sequence, never reused.
+    pub sequence: u64,
+    /// Retained native syscall shape.
+    pub kind: NetworkGuardProbeKind,
+}
+
+/// Actual completed probe snapshot, not permission to expose guest memory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct NetworkGuardProbeCompletion {
+    /// Original keeper attempt.
+    pub probe: NetworkGuardProbeId,
+    /// Unchanged native exit register supplied by the authenticated callback.
+    pub raw: i64,
+    /// Native Unix hook observations for this exact attempt.
+    pub observations: u64,
+}
+
 #[derive(Debug, Default)]
 struct PublicationState {
     backend_failure_retained: bool,
@@ -201,6 +245,63 @@ pub trait NetworkGuardControl: Debug + Send + Sync {
         pidfd: BorrowedFd<'_>,
         deadline: Instant,
     ) -> io::Result<()>;
+
+    /// # Safety
+    /// The authenticated initial task is stopped under its unchanged current
+    /// MM, sole-root Normal grant and exact local FD reader. Its next admitted
+    /// injection is the specified one-row, zero-timeout probe. Ownership must
+    /// survive failed submission and cancellation; this is not native entry.
+    unsafe fn arm_stopped_probe(
+        &self,
+        _kind: NetworkGuardProbeKind,
+        _deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeId> {
+        Err(io::Error::other("native Unix probe control unavailable"))
+    }
+
+    /// # Safety
+    /// Called only at the same retained attempt's actual authenticated kernel
+    /// ENTRY/SECCOMP, with exact syscall number and all six arguments matched.
+    unsafe fn submit_entered_probe(
+        &self,
+        _probe: NetworkGuardProbeId,
+        _deadline: Instant,
+    ) -> io::Result<()> {
+        Err(io::Error::other("native Unix probe control unavailable"))
+    }
+
+    /// # Safety
+    /// `raw` is the actual matching native Returned observation, retained while
+    /// the same task is stopped. Neither helper return nor cancellation suffices.
+    unsafe fn complete_returned_probe(
+        &self,
+        _probe: NetworkGuardProbeId,
+        _raw: i64,
+        _deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeCompletion> {
+        Err(io::Error::other("native Unix probe control unavailable"))
+    }
+
+    /// Remove only the exact completed, verified keeper row; failed retirement
+    /// remains owned and forbids another attempt or result exposure.
+    fn retire_completed_probe(
+        &self,
+        _completion: NetworkGuardProbeCompletion,
+        _deadline: Instant,
+    ) -> io::Result<()> {
+        Err(io::Error::other("native Unix probe control unavailable"))
+    }
+
+    /// # Safety
+    /// Actual InterruptedBeforeEntry proved this same ARMED attempt never
+    /// reached ENTRY. Missing callback, cancellation or death is not this proof.
+    unsafe fn disarm_unentered_probe(
+        &self,
+        _probe: NetworkGuardProbeId,
+        _deadline: Instant,
+    ) -> io::Result<()> {
+        Err(io::Error::other("native Unix probe control unavailable"))
+    }
 
     /// Short-lock cached result only: never invoke the native 50ms poll here.
     fn observation(&self) -> NetworkGuardOutcome;

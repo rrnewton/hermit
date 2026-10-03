@@ -17,6 +17,9 @@ use detcore::network_runtime::guard::NetworkGuardControllerAbort;
 use detcore::network_runtime::guard::NetworkGuardDenial;
 use detcore::network_runtime::guard::NetworkGuardEvidence;
 use detcore::network_runtime::guard::NetworkGuardOutcome;
+use detcore::network_runtime::guard::NetworkGuardProbeCompletion;
+use detcore::network_runtime::guard::NetworkGuardProbeId;
+use detcore::network_runtime::guard::NetworkGuardProbeKind;
 use detcore::network_runtime::guard::NetworkGuardPublication;
 use detcore::network_runtime::guard::NetworkGuardTerminal;
 use detcore::network_runtime::guard::NetworkGuardTerminalDisposition;
@@ -116,8 +119,80 @@ trait GuardMonitor: Send {
     unsafe fn register(&mut self, pidfd: BorrowedFd<'_>, deadline: Instant) -> io::Result<()>;
     fn observe(&mut self) -> GuardOutcome;
     fn snapshot(&mut self) -> GuardOutcome;
+    unsafe fn arm_probe(
+        &mut self,
+        _kind: NetworkGuardProbeKind,
+        _deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeId> {
+        Err(io::Error::other("native Unix probe unavailable"))
+    }
+    unsafe fn submit_probe(
+        &mut self,
+        _probe: NetworkGuardProbeId,
+        _deadline: Instant,
+    ) -> io::Result<()> {
+        Err(io::Error::other("native Unix probe unavailable"))
+    }
+    unsafe fn complete_probe(
+        &mut self,
+        _probe: NetworkGuardProbeId,
+        _raw: i64,
+        _deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeCompletion> {
+        Err(io::Error::other("native Unix probe unavailable"))
+    }
+    fn retire_probe(
+        &mut self,
+        _completion: NetworkGuardProbeCompletion,
+        _deadline: Instant,
+    ) -> io::Result<()> {
+        Err(io::Error::other("native Unix probe unavailable"))
+    }
+    unsafe fn disarm_probe(
+        &mut self,
+        _probe: NetworkGuardProbeId,
+        _deadline: Instant,
+    ) -> io::Result<()> {
+        Err(io::Error::other("native Unix probe unavailable"))
+    }
 }
 impl GuardMonitor for ControllerGuard {
+    unsafe fn arm_probe(
+        &mut self,
+        kind: NetworkGuardProbeKind,
+        deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeId> {
+        unsafe { self.arm_stopped_probe(kind, deadline) }
+    }
+    unsafe fn submit_probe(
+        &mut self,
+        probe: NetworkGuardProbeId,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        unsafe { self.submit_entered_probe(probe, deadline) }
+    }
+    unsafe fn complete_probe(
+        &mut self,
+        probe: NetworkGuardProbeId,
+        raw: i64,
+        deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeCompletion> {
+        unsafe { self.complete_returned_probe(probe, raw, deadline) }
+    }
+    fn retire_probe(
+        &mut self,
+        completion: NetworkGuardProbeCompletion,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.retire_completed_probe(completion, deadline)
+    }
+    unsafe fn disarm_probe(
+        &mut self,
+        probe: NetworkGuardProbeId,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        unsafe { self.disarm_unentered_probe(probe, deadline) }
+    }
     unsafe fn register(&mut self, pidfd: BorrowedFd<'_>, deadline: Instant) -> io::Result<()> {
         unsafe { self.register_stopped_initial(pidfd, deadline) }
     }
@@ -155,6 +230,40 @@ struct Shared {
     stop: AtomicBool,
 }
 impl Shared {
+    fn probe_command<T>(
+        &self,
+        operation: &'static str,
+        call: impl FnOnce(&mut dyn GuardMonitor) -> io::Result<T>,
+    ) -> io::Result<T> {
+        {
+            let state = self
+                .lifecycle
+                .lock()
+                .map_err(|_| io::Error::other("Unix probe lifecycle poisoned"))?;
+            if self.stop.load(Ordering::Acquire)
+                || state.backend_completed
+                || state.initial != InitialState::Registered
+                || !state.observer_started
+            {
+                return Err(io::Error::other(
+                    "Unix probe requires live initial guard and observer",
+                ));
+            }
+        }
+        // The existing observer shares this lock, but no guest/scheduler/table
+        // lock crosses it. Its native wait is already bounded to 50ms.
+        let result = self
+            .guard
+            .lock()
+            .map_err(|_| io::Error::other("Unix probe owner poisoned"))
+            .and_then(|mut guard| call(guard.as_mut()));
+        self.publish(self.read_guard(false));
+        if let Err(error) = &result {
+            self.record(operation, error);
+            self.publish(internal_failure());
+        }
+        result
+    }
     fn cached(&self) -> NetworkGuardOutcome {
         match self.cached.lock() {
             Ok(cached) => *cached,
@@ -241,6 +350,57 @@ impl fmt::Debug for Control {
     }
 }
 impl NetworkGuardControl for Control {
+    unsafe fn arm_stopped_probe(
+        &self,
+        kind: NetworkGuardProbeKind,
+        deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeId> {
+        self.shared
+            .probe_command("arm_stopped_probe", |guard| unsafe {
+                guard.arm_probe(kind, deadline)
+            })
+    }
+    unsafe fn submit_entered_probe(
+        &self,
+        probe: NetworkGuardProbeId,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.shared
+            .probe_command("submit_entered_probe", |guard| unsafe {
+                guard.submit_probe(probe, deadline)
+            })
+    }
+    unsafe fn complete_returned_probe(
+        &self,
+        probe: NetworkGuardProbeId,
+        raw: i64,
+        deadline: Instant,
+    ) -> io::Result<NetworkGuardProbeCompletion> {
+        self.shared
+            .probe_command("complete_returned_probe", |guard| unsafe {
+                guard.complete_probe(probe, raw, deadline)
+            })
+    }
+    fn retire_completed_probe(
+        &self,
+        completion: NetworkGuardProbeCompletion,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.shared
+            .probe_command("retire_completed_probe", |guard| {
+                guard.retire_probe(completion, deadline)
+            })
+    }
+    unsafe fn disarm_unentered_probe(
+        &self,
+        probe: NetworkGuardProbeId,
+        deadline: Instant,
+    ) -> io::Result<()> {
+        self.shared
+            .probe_command("disarm_unentered_probe", |guard| unsafe {
+                guard.disarm_probe(probe, deadline)
+            })
+    }
     unsafe fn register_stopped_initial(
         &self,
         pidfd: BorrowedFd<'_>,
@@ -523,11 +683,11 @@ impl GuardControllerOwner {
         if let Some(observer) = observer
             && observer.join().is_err()
         {
-                let error = io::Error::other("guard observer terminated with panic");
-                self.shared.record("observer_join", &error);
-                self.shared.publish(internal_failure());
-                return Err(error);
-            }
+            let error = io::Error::other("guard observer terminated with panic");
+            self.shared.record("observer_join", &error);
+            self.shared.publish(internal_failure());
+            return Err(error);
+        }
         // Registration and observer are settled; do not turn an unexpected
         // monitor lock holder into an unbounded wait after the deadline.
         let next = match self.shared.guard.try_lock() {

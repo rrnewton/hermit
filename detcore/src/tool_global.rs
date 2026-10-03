@@ -11,6 +11,7 @@
 
 mod foreground_epoll;
 mod foreground_poll;
+mod guard_probe;
 mod foreground_store;
 mod native_source_read;
 mod original_connect;

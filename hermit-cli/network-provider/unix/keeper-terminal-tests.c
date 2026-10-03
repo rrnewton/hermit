@@ -101,7 +101,7 @@ static void fresh(void) {
     subject.directory_dev=17;subject.directory_ino=19;
     subject.incarnation=7;subject.creator=30;subject.creator_sequence=9;subject.controller=31;
     subject.prepared=true;subject.object=(void *)123;subject.links_count=UG_LINKS;
-    subject.initial_count=1;subject.initial[0]=(struct initial_owner){32,2,true};
+    subject.initial_count=1;subject.initial[0]=(struct initial_owner){.pidfd=32,.sequence=2,.live=true};
     for(u32 i=0;i<UG_MAPS;i++)subject.maps[i]=100+(int)i;
     for(u32 i=0;i<UG_MAPS+UG_LINKS;i++) {subject.pin_ids[i]=1000+i;pins[i]=true;}
     for(u32 i=0;i<UG_LINKS;i++) {subject.links[i]=(void *)(uintptr_t)(i+1);links[i]=true;}
