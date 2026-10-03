@@ -74,6 +74,14 @@ fn parse_maps(text: &str) -> Vec<Mapping> {
         .collect()
 }
 
+/// Reads the guest's mappings. Recording cannot continue without them: an
+/// error returned to the guest would leave no event for replay to consume.
+fn read_mappings(path: &str) -> Vec<Mapping> {
+    let maps = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("Cannot record madvise: {path}: {error}"));
+    parse_maps(&String::from_utf8_lossy(&maps))
+}
+
 /// The parts of `[start, end)` covered by file-backed mappings, each with
 /// the protection of its mapping.
 fn file_backed_ranges(mappings: &[Mapping], start: usize, end: usize) -> Vec<(usize, usize, i32)> {
@@ -213,8 +221,7 @@ impl Recorder {
         let maps_path = format!("/proc/{}/maps", guest.pid().as_raw());
 
         let wipeonfork_prefix = if advice == libc::MADV_WIPEONFORK {
-            let maps = std::fs::read(&maps_path).map_err(|_| Errno::EIO)?;
-            let mappings = parse_maps(&String::from_utf8_lossy(&maps));
+            let mappings = read_mappings(&maps_path);
             wipeonfork_live_len(&mappings, start, end)
         } else {
             None
@@ -234,12 +241,14 @@ impl Recorder {
 
         let mut refills = Vec::new();
         if drops_pages {
-            let maps = std::fs::read(&maps_path).map_err(|_| Errno::EIO)?;
-            let mappings = parse_maps(&String::from_utf8_lossy(&maps));
+            let mappings = read_mappings(&maps_path);
             let ranges = file_backed_ranges(&mappings, start, end);
             if !ranges.is_empty() {
-                let mem = std::fs::File::open(format!("/proc/{}/mem", guest.tid().as_raw()))
-                    .map_err(|_| Errno::EIO)?;
+                let mem_path = format!("/proc/{}/mem", guest.tid().as_raw());
+                // The advice has already taken effect, so failing the guest
+                // call now would leave the recording without its event.
+                let mem = std::fs::File::open(&mem_path)
+                    .unwrap_or_else(|error| panic!("Cannot record madvise: {mem_path}: {error}"));
                 for (lo, hi, prot) in ranges {
                     for (addr, bytes) in read_readable_runs(&mem, lo, hi) {
                         refills.push(MadviseRefill { addr, bytes, prot });
