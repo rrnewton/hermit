@@ -3649,9 +3649,19 @@ impl GlobalState {
                 thread: state.dettid,
                 mm: state.mm_id,
             };
-            if tid.as_raw() != owner.thread.as_raw()
-                || runtime.native_birth_creator_terminal(owner).is_err()
-            {
+            let closed = (|| {
+                if tid.as_raw() != owner.thread.as_raw() {
+                    return Err(std::io::Error::other("final wait changed callback TID"));
+                }
+                if self.uses_shared_network_attempts() {
+                    let sched = self.sched.lock().unwrap();
+                    if let Some(projection) = sched.shared_terminal_projection(owner, process)? {
+                        return runtime.native_shared_child_terminal(owner, projection);
+                    }
+                }
+                runtime.native_birth_creator_terminal(owner)
+            })();
+            if closed.is_err() {
                 // A mismatched final observation cannot preserve the root's
                 // historical policy. Keep the former blanket revocation on
                 // this failure path; successful exact retirement only closes
@@ -6142,6 +6152,39 @@ impl GlobalState {
             });
             self.network_stream_changed.notify_waiters();
         }
+        // This method is the last existing observer in the synchronous actual
+        // terminal hook. Even a child with no Local stream/Connect slot must
+        // release its retained physical owner after both observers have run.
+        if self.uses_shared_network_attempts()
+            && let Some(runtime) = &self.network_runtime
+        {
+            let result: std::io::Result<()> = (|| {
+                if tid.as_raw() != owner.thread.as_raw() {
+                    return Err(std::io::Error::other(
+                        "final observers changed callback TID",
+                    ));
+                }
+                let sched = self.sched.lock().unwrap();
+                if let Some(projection) = sched.shared_terminal_projection(owner, process)? {
+                    runtime.finish_shared_terminal_observations(owner, &projection)?;
+                }
+                Ok(())
+            })();
+            if result.is_err() {
+                runtime.revoke_foreground_lineage();
+                self.report_backend_failure(reverie::BackendFailure {
+                    pid: Tid::from_raw(process.as_raw()),
+                    tid,
+                    phase: "actual terminal observers lost retained child custody",
+                });
+            }
+        }
+    }
+
+    fn uses_shared_network_attempts(&self) -> bool {
+        self.network_engine
+            .as_ref()
+            .is_some_and(|engine| engine.lock().unwrap().uses_shared_mm_attempts())
     }
 
     fn native_capture_recovery(&self) -> Option<crate::network_runtime::NativeCaptureRecovery> {
@@ -6255,7 +6298,18 @@ impl GlobalState {
     /// prepared caller, never every task sharing the old address space.
     fn recv_network_owner_gone(&self, owner: NetworkStreamOwner) {
         if let Some(runtime) = &self.network_runtime {
-            runtime.forget_task(owner);
+            if self.uses_shared_network_attempts() {
+                if runtime.forget_shared_task(owner).is_err() {
+                    runtime.revoke_foreground_lineage();
+                    self.report_backend_failure(reverie::BackendFailure {
+                        pid: Tid::from_raw(owner.thread.as_raw()),
+                        tid: Tid::from_raw(owner.thread.as_raw()),
+                        phase: "shared consuming cleanup changed original physical owner",
+                    });
+                }
+            } else {
+                runtime.forget_task(owner);
+            }
         }
         let previous = self
             .pending_exec_states
@@ -9421,6 +9475,7 @@ mod tests {
     mod foreground_store;
     mod native_connected;
     mod replay_connect;
+    mod shared_terminal;
     use std::collections::BTreeSet;
     use std::os::fd::AsRawFd;
     use std::os::fd::FromRawFd;

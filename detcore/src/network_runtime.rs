@@ -1986,6 +1986,31 @@ impl NetworkRuntimeResources {
         self.shared.accepted.lock().unwrap().abandon(owner);
         self.shared.physical.lock().unwrap().forget(owner);
     }
+    pub(crate) fn forget_shared_task(
+        &self,
+        owner: crate::network_replay::NetworkStreamOwner,
+    ) -> std::io::Result<()> {
+        self.shared.accepted.lock().unwrap().abandon(owner);
+        self.shared
+            .physical
+            .lock()
+            .unwrap()
+            .forget_shared_child(owner)
+    }
+
+    /// Called only after both original-connect and stream final observations.
+    /// The scheduler lock retains the exact historical projection throughout.
+    pub(crate) fn finish_shared_terminal_observations(
+        &self,
+        owner: crate::network_replay::NetworkStreamOwner,
+        projection: &std::sync::Arc<native_birth_outcome::NativeTaskProjection>,
+    ) -> std::io::Result<()> {
+        self.shared
+            .physical
+            .lock()
+            .unwrap()
+            .finish_shared_final_observations(owner, projection)
+    }
 
     pub(crate) fn submit_accept(
         &self,

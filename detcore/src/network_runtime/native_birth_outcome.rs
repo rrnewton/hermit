@@ -4,6 +4,9 @@
 use std::io;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use reverie::syscalls::CloneFlags;
 
@@ -36,7 +39,7 @@ pub(crate) struct NativeProcessLifetime {
 
 /// Historical mapping issued by an actual held-generation admission. Retaining
 /// this Arc does not retain a live task descriptor or a current parent claim.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug)]
 pub(crate) struct NativeTaskProjection {
     provider: u64,
     task: u64,
@@ -44,6 +47,28 @@ pub(crate) struct NativeTaskProjection {
     thread: DetTid,
     process: Arc<NativeProcessLifetime>,
     initial: Option<super::physical::InitialProjectionIdentity>,
+    final_wait: OnceLock<NativeTaskFinalWait>,
+}
+
+// Completion is attached to the original immutable identity. It must never
+// change historical identity comparisons used by birth/initial admission.
+impl PartialEq for NativeTaskProjection {
+    fn eq(&self, other: &Self) -> bool {
+        self.provider == other.provider
+            && self.task == other.task
+            && self.start == other.start
+            && self.thread == other.thread
+            && self.process == other.process
+            && self.initial == other.initial
+    }
+}
+impl Eq for NativeTaskProjection {}
+
+#[derive(Debug)]
+struct NativeTaskFinalWait {
+    owner: NetworkStreamOwner,
+    root: Arc<super::ForegroundRoot>,
+    observations_complete: AtomicBool,
 }
 impl NativeTaskProjection {
     /// Only the scheduler's initial-census transaction calls this constructor;
@@ -68,6 +93,7 @@ impl NativeTaskProjection {
                 leader_start: start,
             }),
             initial: Some(initial),
+            final_wait: OnceLock::new(),
         }))
     }
     pub(crate) fn thread(&self) -> DetTid {
@@ -81,6 +107,88 @@ impl NativeTaskProjection {
     }
     pub(crate) fn same_process(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.process, &other.process)
+    }
+    pub(crate) fn is_initial(&self) -> bool {
+        self.initial.is_some()
+    }
+    /// Only the physical owner joined to the actual final-wait callback issues
+    /// this fact. The root contains no PIDFD and does not reference this row.
+    pub(in crate::network_runtime) fn retain_final_wait(
+        &self,
+        owner: NetworkStreamOwner,
+        root: Arc<super::ForegroundRoot>,
+    ) -> io::Result<()> {
+        if self.initial.is_some()
+            || root.owner() != owner
+            || root.logical_process() != self.process()
+            || !self.matches_foreground_identity(owner, root.native_identity())
+            || root.is_current(owner)
+            || !root.has_shared_mm_history()
+        {
+            return Err(io::Error::other(
+                "final wait changed original child projection",
+            ));
+        }
+        let fact = self.final_wait.get_or_init(|| NativeTaskFinalWait {
+            owner,
+            root: root.clone(),
+            observations_complete: AtomicBool::new(false),
+        });
+        if fact.owner != owner || !Arc::ptr_eq(&fact.root, &root) {
+            return Err(io::Error::other("contradictory child final-wait identity"));
+        }
+        Ok(())
+    }
+    pub(in crate::network_runtime) fn final_wait_root(
+        &self,
+        owner: NetworkStreamOwner,
+    ) -> io::Result<&Arc<super::ForegroundRoot>> {
+        self.final_wait
+            .get()
+            .filter(|fact| fact.owner == owner)
+            .map(|fact| &fact.root)
+            .ok_or_else(|| io::Error::other("missing exact child final wait"))
+    }
+    pub(in crate::network_runtime) fn finish_final_observations(
+        &self,
+        owner: NetworkStreamOwner,
+        root: &Arc<super::ForegroundRoot>,
+    ) -> io::Result<()> {
+        if !Arc::ptr_eq(self.final_wait_root(owner)?, root) {
+            return Err(io::Error::other(
+                "final observers changed retained child root",
+            ));
+        }
+        self.final_wait
+            .get()
+            .unwrap()
+            .observations_complete
+            .store(true, Ordering::Release);
+        Ok(())
+    }
+    pub(crate) fn completed_final_wait(
+        &self,
+        initial: &super::ForegroundRoot,
+    ) -> Option<&Arc<super::ForegroundRoot>> {
+        let fact = self.final_wait.get()?;
+        (fact.observations_complete.load(Ordering::Acquire)
+            && fact.root.has_shared_mm_history()
+            && !fact.root.is_current(fact.owner)
+            && std::ptr::eq(fact.root.initial_ancestor(), initial)
+            && fact.root.same_shared_lineage(initial)
+            && initial.is_current(initial.owner()))
+        .then_some(&fact.root)
+    }
+    pub(in crate::network_runtime) fn final_observations_complete(
+        &self,
+        owner: NetworkStreamOwner,
+        root: &Arc<super::ForegroundRoot>,
+    ) -> bool {
+        self.final_wait.get().is_some_and(|fact| {
+            fact.owner == owner
+                && Arc::ptr_eq(&fact.root, root)
+                && fact.observations_complete.load(Ordering::Acquire)
+        })
     }
     pub(crate) fn matches_foreground_identity(
         &self,
@@ -285,6 +393,7 @@ impl NativeBirthOwner {
             thread: admission.child_owner().thread,
             process,
             initial: None,
+            final_wait: OnceLock::new(),
         });
         let outcome = Arc::new(NativeChildOutcome {
             request: self.request.clone(),
@@ -346,6 +455,7 @@ pub(crate) fn synthetic_creator_projection() -> Arc<NativeTaskProjection> {
         start: 29,
         thread: DetTid::from_raw(41),
         initial: None,
+        final_wait: OnceLock::new(),
         process: Arc::new(NativeProcessLifetime {
             local: DetPid::from_raw(41),
             provider: 3,
@@ -484,7 +594,78 @@ mod tests {
                 thread: self.thread,
                 process: self.process.clone(),
                 initial: self.initial.clone(),
+                final_wait: OnceLock::new(),
             }
         }
+    }
+
+    #[tokio::test]
+    async fn shared_terminal_fact_preserves_all_immutable_projection_equalities() {
+        let f =
+            super::super::ForegroundRoot::controlled_shared_birth_after_close_setup(61, |_, _| {})
+                .await;
+        let root = &f.child;
+        let (provider, task, start, _) = root.native_identity();
+        // Identity-only component premise. Actual Tool/physical issuance is
+        // exercised separately; this test checks the unchanged Eq contract.
+        let p = NativeTaskProjection {
+            provider,
+            task,
+            start,
+            thread: root.owner().thread,
+            initial: None,
+            final_wait: OnceLock::new(),
+            process: Arc::new(NativeProcessLifetime {
+                local: root.logical_process(),
+                provider,
+                leader_task: f.parent.native_identity().1,
+                leader_start: f.parent.native_identity().2,
+            }),
+        };
+        let before = p.clone_for_test();
+        assert_eq!(p, before);
+        assert!(
+            p.retain_final_wait(root.owner(), root.clone()).is_err(),
+            "live authority cannot be a terminal fact"
+        );
+        root.revoke();
+        p.retain_final_wait(root.owner(), root.clone()).unwrap();
+        assert_eq!(p, before, "completion must not mutate historical identity");
+        p.finish_final_observations(root.owner(), root).unwrap();
+        assert_eq!(p, before);
+        for field in 0..9 {
+            let mut changed = p.clone_for_test();
+            match field {
+                0 => changed.provider += 1,
+                1 => changed.task += 1,
+                2 => changed.start += 1,
+                3 => changed.thread = DetTid::from_raw(changed.thread.as_raw() + 1),
+                4..=7 => {
+                    changed.process = Arc::new(NativeProcessLifetime {
+                        local: if field == 4 {
+                            DetPid::from_raw(changed.process.local.as_raw() + 1)
+                        } else {
+                            changed.process.local
+                        },
+                        provider: changed.process.provider + u64::from(field == 5),
+                        leader_task: changed.process.leader_task + u64::from(field == 6),
+                        leader_start: changed.process.leader_start + u64::from(field == 7),
+                    })
+                }
+                8 => {
+                    changed.initial =
+                        Some(f.parent.association().root_projection_identity().unwrap())
+                }
+                _ => unreachable!(),
+            }
+            assert_ne!(p, changed, "old identity field {field} was omitted from Eq");
+        }
+        let wrong = NetworkStreamOwner {
+            mm: root.owner().mm.for_exec(root.owner().thread),
+            ..root.owner()
+        };
+        assert!(p.retain_final_wait(wrong, root.clone()).is_err());
+        assert!(p.final_wait_root(wrong).is_err());
+        assert!(p.completed_final_wait(&f.parent).is_some());
     }
 }

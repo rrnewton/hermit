@@ -10,7 +10,7 @@ use crate::memory::MemoryMetadata;
 use crate::tool_local::FileMetadata;
 
 #[cfg(test)]
-mod policy_tests;
+pub(super) mod policy_tests;
 #[cfg(test)]
 mod source_ioctl_fixture;
 
@@ -151,13 +151,21 @@ impl ForegroundRoot {
             None => self.initial_exec.is_some() && self.owner == self.association.owner,
         }
     }
-    fn same_shared_lineage(&self, other: &Self) -> bool {
+    pub(crate) fn same_shared_lineage(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.shared_mm_lineage_lost, &other.shared_mm_lineage_lost)
             && self.association == other.association
             && self.owner.mm == other.owner.mm
             && self.process == other.process
             && self.metadata.ptr_eq(&other.metadata)
             && self.memory.ptr_eq(&other.memory)
+    }
+    pub(crate) fn initial_ancestor(&self) -> &Self {
+        self.parent
+            .as_ref()
+            .map_or(self, |parent| parent.initial_ancestor())
+    }
+    pub(in crate::network_runtime) fn is_shared_child(&self) -> bool {
+        self.parent.is_some()
     }
     pub(crate) fn metadata(&self) -> std::io::Result<Arc<Mutex<FileMetadata>>> {
         if !self.is_current(self.owner()) {
@@ -386,10 +394,14 @@ impl<T> CustodyTasks<T> {
 pub(crate) struct SharedForegroundLineage<'a> {
     root: &'a Arc<ForegroundRoot>,
     members: Vec<&'a Arc<ForegroundRoot>>,
+    retired: Vec<&'a Arc<ForegroundRoot>>,
 }
 impl SharedForegroundLineage<'_> {
     pub(crate) fn root(&self) -> &Arc<ForegroundRoot> { self.root }
     pub(crate) fn members(&self) -> impl Iterator<Item = &Arc<ForegroundRoot>> { self.members.iter().copied() }
+    pub(crate) fn retired(&self) -> impl Iterator<Item = &Arc<ForegroundRoot>> {
+        self.retired.iter().copied()
+    }
 }
 impl<T> CustodyTasks<T> {
     pub(in crate::network_runtime) fn shared_foreground_lineage(
@@ -403,19 +415,24 @@ impl<T> CustodyTasks<T> {
             return Err(bad());
         }
         let mut members = Vec::new();
+        let mut retired = Vec::new();
         for task in self.tasks.values() {
             let member = task.foreground_root.as_ref().ok_or_else(bad)?;
             if !member.has_shared_mm_history() || !root.same_shared_lineage(member)
                 || task.enrollment.as_ref().is_some_and(Enrollment::unresolved)
             { return Err(bad()); }
-            if task.retired { continue; }
+            if task.retired { retired.push(member); continue; }
             if !member.is_current(member.owner()) || task.mm != member.owner().mm
                 || task.process != member.process() || task.thread != member.thread()
             { return Err(bad()); }
             members.push(member);
         }
         if members.is_empty() { return Err(bad()); }
-        Ok(SharedForegroundLineage { root, members })
+        Ok(SharedForegroundLineage {
+            root,
+            members,
+            retired,
+        })
     }
 }
 
@@ -548,6 +565,8 @@ fn runtime_from_controlled_tasks(
             enrollment: task.enrollment,
             native_birth: task.native_birth,
             foreground_metadata: task.foreground_metadata,
+            shared_cleanup_requested: task.shared_cleanup_requested,
+            shared_terminal: task.shared_terminal,
         },
     );
     drop(actual);

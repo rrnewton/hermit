@@ -2,6 +2,7 @@
 //! Possession never selects scheduler signal behavior.
 mod foreground;
 mod source_ioctl;
+mod terminal;
 use std::collections::BTreeMap;
 
 pub(crate) use foreground::ForegroundRoot;
@@ -533,6 +534,8 @@ struct Task<T> {
     native_birth: Option<super::native_birth::NativeBirthAdmission>,
     foreground_metadata: Option<ForegroundMetadata>,
     foreground_root: Option<std::sync::Arc<ForegroundRoot>>,
+    shared_cleanup_requested: bool,
+    shared_terminal: Option<std::sync::Arc<super::native_birth_outcome::NativeTaskProjection>>,
 }
 #[derive(Debug)]
 pub(super) struct CustodyTasks<T> {
@@ -625,6 +628,8 @@ impl<T> CustodyTasks<T> {
                 native_birth: None,
                 foreground_metadata: None,
                 foreground_root: None,
+                shared_cleanup_requested: false,
+                shared_terminal: None,
             },
         );
         Ok(())

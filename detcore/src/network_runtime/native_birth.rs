@@ -361,6 +361,25 @@ impl NetworkRuntimeResources {
             None => Ok(()), // physical admission is closed before a future prepare
         }
     }
+    /// Actual final-wait issuer for the separately selected shared policy.
+    /// Caller retains the scheduler lock through this physical transaction.
+    pub(crate) fn native_shared_child_terminal(
+        &self,
+        owner: NetworkStreamOwner,
+        projection: std::sync::Arc<super::native_birth_outcome::NativeTaskProjection>,
+    ) -> io::Result<()> {
+        if self.shared.endpoint.is_none() {
+            return Err(invalid("shared final wait has no accepted endpoint"));
+        }
+        let mut tasks = self.shared.physical.lock().unwrap();
+        let root = tasks.prepare_shared_final_wait(owner, &projection)?;
+        match self.shared.controller.lock().unwrap().as_ref() {
+            Some(Ok(controller)) => controller.native_birth_creator_terminal(owner)?,
+            Some(Err(error)) => return Err(invalid(error)),
+            None => {}
+        }
+        tasks.retain_shared_final_wait(owner, projection, root)
+    }
     pub(crate) async fn prepare_native_birth(
         &self,
         permit: NetworkFdPublicationPermit,

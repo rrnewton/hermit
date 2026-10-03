@@ -163,6 +163,8 @@ impl SharedBirthFixture {
                     native_birth: task.native_birth,
                     foreground_metadata: task.foreground_metadata,
                     foreground_root: task.foreground_root,
+                    shared_cleanup_requested: task.shared_cleanup_requested,
+                    shared_terminal: task.shared_terminal,
                 },
             );
         }

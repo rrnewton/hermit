@@ -352,6 +352,39 @@ impl SharedMmForegroundObservation<'_> {
     pub(crate) fn root(&self) -> &std::sync::Arc<crate::network_runtime::ForegroundRoot> { self.lineage.root() }
 }
 impl Scheduler {
+    /// Retained historical identity, not a final-wait issuer. Cleanup may have
+    /// removed the live registration; the physical callback joins its owner.
+    pub(crate) fn shared_terminal_projection(
+        &self,
+        owner: NetworkStreamOwner,
+        process: crate::types::DetPid,
+    ) -> std::io::Result<
+        Option<std::sync::Arc<crate::network_runtime::native_birth_outcome::NativeTaskProjection>>,
+    > {
+        let bad = || std::io::Error::other("shared final wait changed historical process/task");
+        let entry = self
+            .thread_tree
+            .process_wait
+            .get(&process)
+            .ok_or_else(bad)?;
+        let mut matches = entry
+            .native_projections
+            .iter()
+            .filter(|p| p.thread() == owner.thread);
+        let projection = matches.next().ok_or_else(bad)?;
+        if entry.reaped
+            || matches.next().is_some()
+            || projection.process() != process
+            || entry
+                .native_projections
+                .iter()
+                .any(|p| !p.same_process(projection))
+        {
+            return Err(bad());
+        }
+        Ok((!projection.is_initial()).then(|| projection.clone()))
+    }
+
     pub(crate) fn shared_mm_foreground_observation<'a>(
         &'a self,
         owner: NetworkStreamOwner,
@@ -370,17 +403,64 @@ impl Scheduler {
             }
         }
         let registered: std::collections::BTreeSet<_> = self.physical_thread_pidfds.keys().copied().collect();
-        let live: std::collections::BTreeSet<_> = self.thread_tree.tree.keys().copied().collect();
-        if members != registered || members != live || self.thread_tree.process_wait.len() != 1
+        if members != registered || self.thread_tree.process_wait.len() != 1
             || !self.pending_physical_process_exits.is_empty()
         { return Err(bad()); }
         let process = self.registered_process(owner.thread).ok_or_else(bad)?;
         let entry = self.thread_tree.process_wait.get(&process).ok_or_else(bad)?;
+        let initial = lineage.root().initial_ancestor();
+        if !members.contains(&initial.owner().thread)
+            || !initial.is_current(initial.owner())
+            || !lineage
+                .members()
+                .any(|root| std::ptr::eq(root.as_ref(), initial))
+        {
+            return Err(bad());
+        }
+        let mut history = std::collections::BTreeSet::new();
         if entry.reaped || !entry.births.is_empty()
             || entry.historical_births.iter().any(|birth| !birth.complete())
-            || entry.native_projections.iter().any(|p| !members.contains(&p.thread()))
-            || entry.native_projections.len() != members.len()
         { return Err(bad()); }
+        for projection in &entry.native_projections {
+            let tid = projection.thread();
+            if !history.insert(tid) {
+                return Err(bad());
+            }
+            if members.contains(&tid) {
+                continue;
+            }
+            if projection.completed_final_wait(initial).is_none()
+                || self.next_turns.contains_key(&tid)
+                || !matches!(self.thread_status(tid), super::ThreadStatus::Gone)
+                || self.pending_run_queue_removals.contains_key(&tid)
+                || self.pending_cross_task_signals.contains_key(&tid)
+                || self.network_capture_blockers.contains_key(&tid)
+                || self.replay_connect.contains_key(&tid)
+                || self.blocked.timed_out_futex_waiters.contains(&tid)
+                || self.blocked.physical_child_ready.contains(&tid)
+                || self.blocked.sigchld_deferred.contains(&tid)
+                || self.blocked.sigchld_ready.contains(&tid)
+                || self.blocked.zero_stream_waiters.contains_key(&tid)
+            {
+                return Err(bad());
+            }
+        }
+        // ThreadTree and the native rows are history, not just live members.
+        // Missing rows are not silently reclassified by this partition.
+        if history != self.thread_tree.tree.keys().copied().collect()
+            || !members.is_subset(&history)
+        {
+            return Err(bad());
+        }
+        for retired in lineage.retired() {
+            if !entry.native_projections.iter().any(|p| {
+                p.thread() == retired.owner().thread
+                    && p.completed_final_wait(initial)
+                        .is_some_and(|root| std::sync::Arc::ptr_eq(root, retired))
+            }) {
+                return Err(bad());
+            }
+        }
         Ok(SharedMmForegroundObservation { grant, lineage })
     }
 }
@@ -519,6 +599,10 @@ impl Scheduler {
 
 #[cfg(test)]
 impl Scheduler {
+    pub(crate) fn controlled_drain_shared_terminal_removals(&mut self) {
+        self.drain_pending_run_queue_removals();
+    }
+
     /// Actual retained birth/projection consumer with a controlled physical
     /// descriptor stand-in. This proves the H join, not a kernel child stop.
     pub(crate) fn controlled_shared_birth_census(
