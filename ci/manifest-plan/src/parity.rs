@@ -2787,7 +2787,10 @@ mod tests {
         // strict compatibility programs into the manifest: each declares its
         // verify cell disabled on the four non-ptrace backends, so the census
         // gains 756 cells and no applicable, selectable or selected one.
-        assert_eq!(row(&counts.all), (2252, 628, 527, 194, 177));
+        // The six KVM verify enables add applicable, selectable and selected cells;
+        // the full matrix still has the same 2252 candidate identities.
+        // https://github.com/rrnewton/reverie/issues/891
+        assert_eq!(row(&counts.all), (2252, 628 + 6, 527 + 6, 194 + 6, 177 + 6));
         let by_backend: Vec<_> = counts
             .by_backend
             .iter()
@@ -2797,7 +2800,7 @@ mod tests {
             by_backend,
             [
                 ("dbt", (563, 85, 26, 16, 2)),
-                ("kvm", (563, 250, 243, 77, 76)),
+                ("kvm", (563, 250 + 6, 243 + 6, 77 + 6, 76 + 6)),
                 ("liteinst", (563, 149, 146, 99, 98)),
                 ("sabre", (563, 144, 112, 2, 1)),
             ]
