@@ -300,7 +300,9 @@ Commands:
       repetition an infrastructure error. Rows only: the verify logs, runner
       evidence, and plan that summarize also checks are not read, so a
       rows-only CLEAN is weaker evidence than a summarized one. Needs no Hermit
-      checkout. Writes DIR/verdicts.json.
+      checkout. Writes DIR/verdicts.json, which records the commit the rows
+      name; check it is the commit you meant to test. Exits nonzero, after
+      writing, unless every cell is CLEAN: flaky is red, as in summarize.
   self-test
       Test pressure-runner selection, timeout, execution-plan, and retained-
       evidence checks without running a guest.
@@ -2707,6 +2709,19 @@ fn verdicts(dir: &Path, repetitions: usize) -> Result<(), String> {
     for (summary, cell) in repeated_cells.iter_mut().zip(&cells) {
         summary["evidence_errors"] = json!(errors.get(cell).cloned().unwrap_or_default());
     }
+    // Flaky is red: as in summarize, any cell short of CLEAN fails the command.
+    let red = repeated_cells
+        .iter()
+        .zip(&cells)
+        .filter(|(summary, _)| summary["verdict"] != json!("CLEAN"))
+        .map(|(summary, cell)| {
+            format!(
+                "{} is {}",
+                display_id(cell),
+                summary["verdict"].as_str().unwrap_or("unjudged")
+            )
+        })
+        .collect::<Vec<_>>();
     let output = dir.join("verdicts.json");
     let document = json!({
         "schema": 1,
@@ -2724,13 +2739,25 @@ fn verdicts(dir: &Path, repetitions: usize) -> Result<(), String> {
     )
     .map_err(|error| format!("cannot write {}: {error}", output.display()))?;
     println!("Wrote {}", output.display());
-    if unidentified.is_empty() {
-        Ok(())
-    } else {
-        Err(format!(
+    let mut problems = Vec::new();
+    if !unidentified.is_empty() {
+        problems.push(format!(
             "no repetition of {} retained a row or host-inapplicable summary naming its cell; it has no verdict",
             unidentified.join(", ")
-        ))
+        ));
+    }
+    if !red.is_empty() {
+        problems.push(format!(
+            "{} of {} cell(s) are not CLEAN: {}",
+            red.len(),
+            cells.len(),
+            red.join(", ")
+        ));
+    }
+    if problems.is_empty() {
+        Ok(())
+    } else {
+        Err(problems.join("; "))
     }
 }
 
@@ -14373,12 +14400,24 @@ fn self_test(root: &Path) -> Result<(), String> {
                 &[observation(&error, &sample_c, &format!("c{number}"))],
             )?;
         }
-        verdicts(&rows_root, 3)?;
-        let written: JsonValue = serde_json::from_str(
-            &fs::read_to_string(rows_root.join("verdicts.json"))
-                .map_err(|e| format!("cannot read verdicts.json: {e}"))?,
-        )
-        .map_err(|e| format!("invalid verdicts.json: {e}"))?;
+        // Flaky is red: the command fails, after writing, unless every cell is
+        // CLEAN.
+        let judge =
+            |root: &Path, repetitions: usize| -> Result<(Result<(), String>, JsonValue), String> {
+                let outcome = verdicts(root, repetitions);
+                let written = serde_json::from_str(
+                    &fs::read_to_string(root.join("verdicts.json"))
+                        .map_err(|e| format!("cannot read verdicts.json: {e}"))?,
+                )
+                .map_err(|e| format!("invalid verdicts.json: {e}"))?;
+                Ok((outcome, written))
+            };
+        let (outcome, written) = judge(&rows_root, 3)?;
+        if !outcome.as_ref().is_err_and(|error| {
+            error.contains("2 of 3 cell(s) are not CLEAN") && error.contains("FLAKY")
+        }) {
+            return Err(format!("verdicts passed a FLAKY collection: {outcome:?}"));
+        }
         let cell = |test: &str| {
             written["cells"]
                 .as_array()
@@ -14418,18 +14457,88 @@ fn self_test(root: &Path) -> Result<(), String> {
         let copied = observation(&pass, &sample_b, "same");
         write(&copies, &sample_b, 1, std::slice::from_ref(&copied))?;
         write(&copies, &sample_b, 2, std::slice::from_ref(&copied))?;
-        verdicts(&copies, 2)?;
-        let written: JsonValue = serde_json::from_str(
-            &fs::read_to_string(copies.join("verdicts.json"))
-                .map_err(|e| format!("cannot read verdicts.json: {e}"))?,
-        )
-        .map_err(|e| format!("invalid verdicts.json: {e}"))?;
-        if written["cells"][0]["verdict"] == json!("CLEAN")
+        let (outcome, written) = judge(&copies, 2)?;
+        if outcome.is_ok()
+            || written["cells"][0]["verdict"] == json!("CLEAN")
             || !written["cells"][0]["evidence_errors"]
                 .to_string()
                 .contains("already retained")
         {
             return Err(format!("verdicts counted a copied row twice: {written}"));
+        }
+        // Only an all-CLEAN collection succeeds; each refusal below turns the
+        // same three clean repetitions red through one altered repetition.
+        let clean_b = |root: &Path| {
+            (1..=3).try_for_each(|number| {
+                write(
+                    root,
+                    &sample_b,
+                    number,
+                    &[observation(&pass, &sample_b, &format!("b{number}"))],
+                )
+            })
+        };
+        let all_clean = scratch.join("verdicts-clean");
+        clean_b(&all_clean)?;
+        let (outcome, written) = judge(&all_clean, 3)?;
+        if outcome.is_err() || written["cells"][0]["verdict"] != json!("CLEAN") {
+            return Err(format!(
+                "verdicts refused an all-CLEAN collection: {outcome:?} {written}"
+            ));
+        }
+        let mut other_commit = observation(&pass, &sample_b, "b3");
+        other_commit.hermit_sha = "0123456789abcdef0123456789abcdef01234567".into();
+        let mut dirty = observation(&pass, &sample_b, "b3");
+        dirty.source_tree_dirty = !dirty.source_tree_dirty;
+        let altered: [(&str, Box<dyn Fn(&Path) -> Result<(), String>>, &str); 4] = [
+            (
+                "verdicts-other-commit",
+                Box::new(|root: &Path| {
+                    write(root, &sample_b, 3, std::slice::from_ref(&other_commit))
+                }),
+                "but the collection is",
+            ),
+            (
+                "verdicts-dirty",
+                Box::new(|root: &Path| write(root, &sample_b, 3, std::slice::from_ref(&dirty))),
+                "but the collection is",
+            ),
+            (
+                "verdicts-misplaced",
+                Box::new(|root: &Path| {
+                    write(root, &sample_b, 3, &[observation(&pass, &sample_c, "b3")])
+                }),
+                "not for its directory's cell",
+            ),
+            (
+                "verdicts-empty-history",
+                Box::new(|root: &Path| {
+                    let dir = root
+                        .join("cells")
+                        .join(format!("{}-repetition-0003", base_cell_slug(&sample_b)));
+                    fs::write(dir.join("results.jsonl"), "")
+                        .map_err(|e| format!("cannot empty {}: {e}", dir.display()))
+                }),
+                "no host-inapplicable harness summary",
+            ),
+        ];
+        for (name, alter, refusal) in &altered {
+            let root = scratch.join(name);
+            clean_b(&root)?;
+            alter(&root)?;
+            let (outcome, written) = judge(&root, 3)?;
+            if outcome.is_ok()
+                || written["cells"].as_array().map(Vec::len) != Some(1)
+                || written["cells"][0]["verdict"] == json!("CLEAN")
+                || written["cells"][0]["clean_passes"] != json!(2)
+                || !written["cells"][0]["evidence_errors"]
+                    .to_string()
+                    .contains(refusal)
+            {
+                return Err(format!(
+                    "{name}: verdicts did not refuse the altered repetition ({refusal}): {outcome:?} {written}"
+                ));
+            }
         }
         // Nothing to judge, or a directory that names no repetition, refuses.
         let empty = scratch.join("verdicts-empty");
