@@ -80,13 +80,20 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// One ptrace verify cell re-selected after the guest mount model excluded
 /// ephemeral per-process host FUSE seed mounts (`fuse.squashfuse_ll` under
 /// `/mnt/xarfuse/`): `system-utils/procfs-sanitized-paths` passed twenty
-/// consecutive strict canonical repetitions at the evidence head under its
-/// manifest comparison profile (`compare_io_buffers: false, rcb_time: false`).
-/// Evidence SHA is the first commit of this change (the tree the
-/// qualification binary was built from).
+/// consecutive strict canonical verify repetitions on the ptrace backend, one
+/// `test-harness run --no-retry` attempt each, under its manifest comparison
+/// profile (`compare_io_buffers: true, rcb_time: false`). Every repetition
+/// compared 1350 INFO messages on each side with `bitwise_parity: true`. The
+/// slowest took 2.3 s of wall time and 1.5 s of CPU time, far inside the
+/// default 22 s CPU and 57 s wall bounds the cell keeps.
+///
+/// The repetitions were re-taken after the change was rebased onto a newer
+/// main. The evidence SHA is the rebased commit the qualification binary was
+/// built from; its tree contains the whole fix (mountinfo, the fdinfo mount-ID
+/// snapshot, `/proc/*/mounts` and the CLI provenance record).
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
-    "9721082f52fec889af9100c39a7d581d2eb1e044";
-pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T09:23:58Z";
+    "4880bcaf75f7fc362862abf1b05bfaeeb47878ee";
+pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-03T19:48:33Z";
 pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
@@ -1951,11 +1958,11 @@ mod tests {
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
         assert_eq!(
             PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA,
-            "9721082f52fec889af9100c39a7d581d2eb1e044"
+            "4880bcaf75f7fc362862abf1b05bfaeeb47878ee"
         );
         assert_eq!(
             PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T09:23:58Z"
+            "2026-10-03T19:48:33Z"
         );
         assert_eq!(PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
