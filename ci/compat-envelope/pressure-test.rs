@@ -820,6 +820,25 @@ fn validate_selection_shape(selection: &CellSelection) -> Result<(), String> {
     Ok(())
 }
 
+/// Prefix of the named resource that [`dbt_host_tmp_resource`] gives each
+/// DBT test.
+const DBT_HOST_TMP_RESOURCE_PREFIX: &str = "dbt_host_tmp:";
+
+/// The named resource that keeps two DBT cells of one test from running at
+/// the same time, or `None` for any other backend.
+///
+/// Hermit's other backends give the guest a private `/tmp`; a DBT guest
+/// reads and writes the host's (https://github.com/rrnewton/hermit/issues/3637).
+/// Hermit gives the guest the same pid in every run, so a test names its
+/// temporary files the same way each time, and two DBT runs of one test that
+/// overlap remove or rewrite each other's files. The name belongs to the
+/// test, not the cell, because every mode of a test writes the same files.
+/// The plan grants each name one unit. This decides only when a cell may
+/// start; its command and environment do not change.
+fn dbt_host_tmp_resource(cell: &CellId) -> Option<String> {
+    (cell.backend == "dbt").then(|| format!("{DBT_HOST_TMP_RESOURCE_PREFIX}{}", cell.test))
+}
+
 /// The prefix a cell's harness command starts with: [`DBT_NAMESPACE_WRAPPER`]
 /// for a DBT cell, nothing for any other backend.
 fn dbt_namespace_prefix(backend: &str) -> String {
@@ -5176,6 +5195,9 @@ fn write_plan_after_scorecard_check(
             if cell.backend == "kvm" {
                 resources.insert("kvm_guest".into(), 1);
             }
+            if let Some(resource) = dbt_host_tmp_resource(cell) {
+                resources.insert(resource, 1);
+            }
             let deps = selected_cell_dependencies(
                 selection.is_exact(),
                 selection.uses_shared_preparation(),
@@ -5301,6 +5323,12 @@ fn write_plan_after_scorecard_check(
         ("manifest_guest".into(), selection.manifest_guest_cap()),
         ("kvm_guest".into(), selection.kvm_guest_cap()),
     ]);
+    dag.resource_caps.extend(
+        cells
+            .iter()
+            .filter_map(|tracked| dbt_host_tmp_resource(&tracked.id))
+            .map(|resource| (resource, 1)),
+    );
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
@@ -5430,6 +5458,12 @@ fn audit_dag(
             if *demand <= 0 || capacity < *demand {
                 return Err(format!(
                     "{tag} requests {demand} unit(s) of {resource}, but the DAG grants {capacity}"
+                ));
+            }
+            if resource.starts_with(DBT_HOST_TMP_RESOURCE_PREFIX) && (*demand != 1 || capacity != 1)
+            {
+                return Err(format!(
+                    "{tag} requests {demand} of {capacity} unit(s) of {resource}; one DBT test's host /tmp admits exactly one cell"
                 ));
             }
         }
@@ -10595,6 +10629,196 @@ fn pressure_sample_classification_self_test() -> Result<(), String> {
     Ok(())
 }
 
+/// A DBT cell, and no other, holds the one unit of its test's
+/// [`dbt_host_tmp_resource`] in every plan form: an exact cell, two
+/// repetitions of one exact cell, a cells-file batch, and the green batch.
+/// So the runner never starts a DBT cell while another DBT cell of the same
+/// test is running.
+fn dbt_host_tmp_self_test(
+    root: &Path,
+    checked_scorecard: &CheckedScorecard<'_>,
+    scratch: &Path,
+    green_batch_dag: &DagConfig,
+) -> Result<(), String> {
+    let host_tmp_check = |step: &Step, dag: &DagConfig, dbt: bool| -> Result<(), String> {
+        let held: Vec<_> = step
+            .hint
+            .resources
+            .iter()
+            .filter(|(name, _)| name.starts_with(DBT_HOST_TMP_RESOURCE_PREFIX))
+            .collect();
+        let exclusive = match held.as_slice() {
+            [] => !dbt,
+            [(name, demand)] => {
+                let test = name
+                    .strip_prefix(DBT_HOST_TMP_RESOURCE_PREFIX)
+                    .unwrap_or_default();
+                dbt && **demand == 1
+                    && dag.resource_caps.get(name.as_str()) == Some(&1)
+                    && step
+                        .cmd
+                        .contains(&format!(" --test {} ", shell_quote(test)))
+            }
+            _ => false,
+        };
+        if exclusive {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} {} the one unit of its own test's host /tmp: {:?}",
+                step.tag(),
+                if dbt { "does not hold" } else { "holds" },
+                step.hint.resources
+            ))
+        }
+    };
+    let one_cell_step = |name: &str, dag: &DagConfig| -> Result<Step, String> {
+        let cells: Vec<_> = dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .collect();
+        match cells.as_slice() {
+            [step] => Ok((*step).clone()),
+            _ => Err(format!("{name} has {} cell steps, not one", cells.len())),
+        }
+    };
+    let batch_is_dbt = |step: &Step| step.cmd.contains("--backend 'dbt'");
+    // One verify cell of each kind, red when the red population has one and
+    // green otherwise, so the check does not depend on how many DBT cells are
+    // green today.
+    let red = pressure_cells(root, &CellSelection::default())?;
+    let green = pressure_cells(
+        root,
+        &CellSelection {
+            green: true,
+            repetitions: Some(1),
+            ..CellSelection::default()
+        },
+    )?;
+    for dbt in [true, false] {
+        let (cell, green_population) = red
+            .selected
+            .iter()
+            .map(|cell| (cell, false))
+            .chain(green.selected.iter().map(|cell| (cell, true)))
+            .find(|(cell, _)| cell.id.mode == "verify" && (cell.id.backend == "dbt") == dbt)
+            .ok_or_else(|| {
+                format!(
+                    "self-test needs one executable {} verify cell, red or green",
+                    if dbt { "DBT" } else { "non-DBT" }
+                )
+            })?;
+        let plan = |form: &str, selection: &CellSelection| {
+            let results = scratch.join(format!("host-tmp-{form}-{}", cell.id.backend));
+            write_plan_after_scorecard_check(
+                checked_scorecard,
+                &results,
+                &results.join("dag.json"),
+                selection,
+            )
+            .map(|(_, dag)| dag)
+        };
+        let exact = plan(
+            "exact",
+            &CellSelection {
+                green: green_population,
+                test: Some(cell.id.test.clone()),
+                mode: Some(cell.id.mode.clone()),
+                backend: Some(cell.id.backend.clone()),
+                repetitions: Some(1),
+                run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                ..CellSelection::default()
+            },
+        )?;
+        let label = display_id(&cell.id);
+        let exact_step = one_cell_step(&format!("exact plan for {label}"), &exact)?;
+        host_tmp_check(&exact_step, &exact, dbt)?;
+        if dbt {
+            // Two repetitions of one DBT test share its one unit, so the
+            // runner cannot start the second until the first has ended.
+            let repeated = plan(
+                "repeated",
+                &CellSelection {
+                    green: green_population,
+                    test: Some(cell.id.test.clone()),
+                    mode: Some(cell.id.mode.clone()),
+                    backend: Some(cell.id.backend.clone()),
+                    repetitions: Some(2),
+                    run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                    ..CellSelection::default()
+                },
+            )?;
+            let host_tmp = dbt_host_tmp_resource(&cell.id);
+            let repetitions: Vec<_> = repeated
+                .steps
+                .iter()
+                .filter(|step| step.group == "cell")
+                .collect();
+            if repetitions.len() != 2
+                || repetitions.iter().any(|step| {
+                    host_tmp
+                        .as_ref()
+                        .and_then(|name| step.hint.resources.get(name))
+                        != Some(&1)
+                })
+            {
+                return Err(format!(
+                    "the two repetitions of {label} do not both hold its host /tmp resource"
+                ));
+            }
+            for step in repetitions {
+                host_tmp_check(step, &repeated, true)?;
+            }
+        }
+        if green_population {
+            // Every green cell is in the green batch, which is checked below.
+            if !green_batch_dag
+                .steps
+                .iter()
+                .any(|step| step.group == "cell" && batch_is_dbt(step) == dbt)
+            {
+                return Err(format!(
+                    "green batch has no {} cell step, although {label} is green",
+                    if dbt { "DBT" } else { "non-DBT" }
+                ));
+            }
+        } else {
+            let cells_file = scratch.join(format!("host-tmp-{}.jsonl", cell.id.backend));
+            fs::write(
+                &cells_file,
+                canonical_cells_jsonl(std::slice::from_ref(&cell.id))?,
+            )
+            .map_err(|error| error.to_string())?;
+            let batch = plan(
+                "batch",
+                &CellSelection {
+                    cells_file: Some(cells_file),
+                    repetitions: Some(1),
+                    run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                    ..CellSelection::default()
+                },
+            )?;
+            let step = one_cell_step(&format!("cells-file plan for {label}"), &batch)?;
+            if batch_is_dbt(&step) != dbt {
+                return Err(format!(
+                    "cells-file plan for {label} selected another backend"
+                ));
+            }
+            host_tmp_check(&step, &batch, dbt)?;
+        }
+    }
+    // The complete green batch: every backend and mode.
+    for step in green_batch_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+    {
+        host_tmp_check(step, green_batch_dag, batch_is_dbt(step))?;
+    }
+    Ok(())
+}
+
 /// A DBT cell's harness, and no other cell's, starts under
 /// [`DBT_NAMESPACE_WRAPPER`], in both harness forms: an exact cell launches
 /// `target/debug/test-harness` directly, and a batch launches it through
@@ -12192,6 +12416,41 @@ fn self_test(root: &Path) -> Result<(), String> {
         .insert("manifest_guest".into(), 0);
     if audit_dag(&ungrantable_resource, 1, 100, &fixture_timeouts).is_ok() {
         return Err("step whose named resource demand exceeds capacity was accepted".into());
+    }
+    // A DBT test's host /tmp is one unit that one cell holds alone.
+    let host_tmp = dbt_host_tmp_resource(&CellId {
+        lane: "portable".into(),
+        category: "fixture".into(),
+        test: "fixture".into(),
+        mode: "verify".into(),
+        backend: "dbt".into(),
+    })
+    .ok_or("a DBT cell has no host /tmp resource")?;
+    let mut exclusive_host_tmp = fixture.clone();
+    exclusive_host_tmp.steps[0]
+        .hint
+        .resources
+        .insert(host_tmp.clone(), 1);
+    exclusive_host_tmp.resource_caps.insert(host_tmp.clone(), 1);
+    audit_dag(&exclusive_host_tmp, 1, 100, &fixture_timeouts)
+        .map_err(|e| format!("positive DBT host /tmp bracket failed: {e}"))?;
+    let exclusive_host_tmp_round_trip = dag_from_json(&dag_to_json(&exclusive_host_tmp))
+        .map_err(|e| format!("cannot reparse DBT host /tmp fixture: {e}"))?;
+    assert_plan_round_trip(&exclusive_host_tmp, &exclusive_host_tmp_round_trip)
+        .map_err(|e| format!("DBT host /tmp round-trip bracket failed: {e}"))?;
+    let mut shared_host_tmp = exclusive_host_tmp.clone();
+    shared_host_tmp.resource_caps.insert(host_tmp.clone(), 2);
+    let mut doubled_host_tmp = shared_host_tmp.clone();
+    doubled_host_tmp.steps[0].hint.resources.insert(host_tmp, 2);
+    for (label, dag) in [
+        ("capacity", &shared_host_tmp),
+        ("demand", &doubled_host_tmp),
+    ] {
+        if audit_dag(dag, 1, 100, &fixture_timeouts).is_ok() {
+            return Err(format!(
+                "a DBT test's host /tmp with a {label} of two units was accepted"
+            ));
+        }
     }
     let mut widened_cell_timeout = fixture.clone();
     widened_cell_timeout.steps[0].timeout = 21;
@@ -14231,6 +14490,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
+    dbt_host_tmp_self_test(root, &checked_scorecard, &scratch, &green_batch_dag)?;
     dbt_namespace_wrapper_self_test(root, &checked_scorecard, &scratch, &green_batch_dag)?;
     let mut missing_green_artifact = green_batch_dag.clone();
     missing_green_artifact
@@ -21218,6 +21478,57 @@ mod pressure_planning_tests {
             declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1)
                 .unwrap_err()
                 .contains("dependency cycle")
+        );
+    }
+
+    #[test]
+    fn dbt_cells_of_one_test_share_one_host_tmp_resource() {
+        let cell = |test: &str, mode: &str, backend: &str| CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: test.into(),
+            mode: mode.into(),
+            backend: backend.into(),
+        };
+        let verify = dbt_host_tmp_resource(&cell("c-programs/syscall-file-io", "verify", "dbt"));
+        assert_eq!(
+            verify.as_deref(),
+            Some("dbt_host_tmp:c-programs/syscall-file-io")
+        );
+        assert_eq!(
+            dbt_host_tmp_resource(&cell("c-programs/syscall-file-io", "replay", "dbt")),
+            verify
+        );
+        assert_ne!(
+            dbt_host_tmp_resource(&cell("c-programs/syscall-file-metadata", "verify", "dbt")),
+            verify
+        );
+        for backend in ["ptrace", "kvm", "liteinst", "sabre", "native"] {
+            assert_eq!(
+                dbt_host_tmp_resource(&cell("c-programs/syscall-file-io", "verify", backend)),
+                None,
+                "{backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_tmp_resource_leaves_the_memory_bound_unchanged() {
+        // One more exclusive resource can only lower how many cells run at
+        // once, so the bound computed without it still holds.
+        let mut dag = memory_fixture();
+        let bound = declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap();
+        dag.steps
+            .iter_mut()
+            .find(|step| step.job == "already-prepared-native")
+            .unwrap()
+            .hint
+            .resources
+            .insert("dbt_host_tmp:fixture".into(), 1);
+        dag.resource_caps.insert("dbt_host_tmp:fixture".into(), 1);
+        assert_eq!(
+            declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap(),
+            bound
         );
     }
 
