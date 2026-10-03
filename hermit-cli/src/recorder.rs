@@ -456,6 +456,8 @@ impl Tool for Recorder {
             Sysno::socketpair,
             Sysno::poll,
             Sysno::ppoll,
+            Sysno::select,
+            Sysno::pselect6,
             Sysno::epoll_wait,
             Sysno::getsockopt,
             Sysno::getpeername,
@@ -604,6 +606,8 @@ impl Tool for Recorder {
             Syscall::Sendmmsg(call) => self.handle_sendmmsg(guest, call).await,
             Syscall::Poll(syscall) => self.handle_poll(guest, syscall).await,
             Syscall::Ppoll(syscall) => self.handle_ppoll(guest, syscall).await,
+            Syscall::Select(syscall) => self.handle_select(guest, syscall).await,
+            Syscall::Pselect6(syscall) => self.handle_pselect6(guest, syscall).await,
             Syscall::EpollWait(syscall) => self.handle_epoll_wait(guest, syscall).await,
             Syscall::Getsockopt(syscall) => self.handle_sockopt_family(guest, syscall.into()).await,
             Syscall::Getpeername(syscall) => {

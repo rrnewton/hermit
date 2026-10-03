@@ -18,11 +18,12 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 1089 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1091 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
-//!    added (895 portable and 5 privileged) and the 189 portable cells of the
-//!    compatibility-corpus fold, after applying the later lane moves listed in
-//!    `LATER_LANE_MOVES` (now 1082 portable and 7 privileged).
+//!    added (895 portable and 5 privileged), the 189 portable cells of the
+//!    compatibility-corpus fold and the 2 portable select replay cells, after
+//!    applying the later lane moves listed in `LATER_LANE_MOVES` (now 1084
+//!    portable and 7 privileged).
 //! 3. The committed compatibility cell table has 9008 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
 //!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
@@ -131,6 +132,24 @@ fn compat_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, i
     }
     deltas
 }
+
+/// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
+/// replayer `select` and `pselect6` and selected the portable ptrace replay cell
+/// of `c-programs/poll-readiness` and `c-programs/pselect6-simulation`. Both
+/// tests already existed, so the cell table keeps its row count: each test's
+/// ptrace replay row moves from not applicable to selected (green).
+const SELECT_REPLAY_TESTS: usize = 2;
+const SELECT_REPLAY_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "ptrace", "replay", SELECT_REPLAY_TESTS)];
+const SELECT_REPLAY_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("ptrace", "replay", "green", SELECT_REPLAY_TESTS as isize),
+    (
+        "ptrace",
+        "replay",
+        "not-applicable",
+        -(SELECT_REPLAY_TESTS as isize),
+    ),
+];
 
 /// Cells that later changes moved between lanes after the fold, as
 /// (test, backend, mode, from lane, to lane). Each move keeps the cell and only
@@ -459,14 +478,15 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
         (
-            900 + COMPAT_FOLD_TESTS,
-            895 + COMPAT_FOLD_TESTS - moved_out("portable") + moved_in("portable"),
+            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS,
+            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS - moved_out("portable")
+                + moved_in("portable"),
             5 - moved_out("privileged") + moved_in("privileged"),
         )
     );
     assert_eq!(
         (lane("portable"), lane("privileged")),
-        (893 + COMPAT_FOLD_TESTS, 7),
+        (893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS, 7),
         "the lane moves above are the only ones since the fold"
     );
     // Every documented move is present in the committed plan exactly once, in
@@ -502,7 +522,11 @@ fn the_committed_plan_keeps_its_cell_counts() {
         .iter()
         .map(|&(lane, backend, mode, n)| ((lane.into(), backend.into(), mode.into()), n))
         .collect::<BTreeMap<(String, String, String), usize>>();
-    for &(lane, backend, mode, n) in S13_PLAN_ADDITIONS.iter().chain(COMPAT_FOLD_PLAN_ADDITIONS) {
+    for &(lane, backend, mode, n) in S13_PLAN_ADDITIONS
+        .iter()
+        .chain(COMPAT_FOLD_PLAN_ADDITIONS)
+        .chain(SELECT_REPLAY_PLAN_ADDITIONS)
+    {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
             .or_default() += n;
@@ -520,7 +544,8 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(counts, expected);
     // The folded cells now belong to c-programs: 437 portable c-programs cells
     // and 276 portable plus 3 privileged backend-parity-c cells before the fold,
-    // plus the 29 portable and 1 privileged c-programs cells S13 added.
+    // plus the 29 portable and 1 privileged c-programs cells S13 added and the
+    // two portable ptrace replay cells of `SELECT_REPLAY_PLAN_ADDITIONS`.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -539,7 +564,10 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(
         by_bucket,
         BTreeMap::from([
-            (("portable".into(), "c-programs".into()), 437 + 276 + 29),
+            (
+                ("portable".into(), "c-programs".into()),
+                437 + 276 + 29 + SELECT_REPLAY_TESTS
+            ),
             (("privileged".into(), "c-programs".into()), 3 + 1),
         ])
     );
@@ -572,6 +600,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .iter()
         .copied()
         .chain(compat_fold_cell_deltas())
+        .chain(SELECT_REPLAY_CELL_DELTAS.iter().copied())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))

@@ -463,12 +463,21 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // replay::tests::only_an_autopilot_replay_of_a_local_recording_is_local and
     // metadata::tests::metadata_without_a_network_choice_loads_as_unknown, which
     // retain all 766 prior identities.
-    // https://github.com/rrnewton/hermit/issues/3550 adds
+    // https://github.com/rrnewton/hermit/pull/3580 adds
+    // event::tests::fd_set_bytes_rounds_up_to_whole_longs,
+    // recorder::network::tests::{capture_select_keeps_sets_and_timeout_on_success,
+    // select_capture_is_clamped_to_the_descriptor_table,
+    // capture_select_keeps_the_readable_prefix_and_drops_an_unreadable_timeout,
+    // capture_select_omits_sets_the_kernel_did_not_copy_out} and
+    // replayer::network::tests::{replay_select_restores_sets_and_exact_timeout,
+    // replay_select_restores_only_the_recorded_prefix_before_efault}, which
+    // retain all 770 prior identities.
+    // https://github.com/rrnewton/hermit/pull/3579 adds
     // recorder::network::tests::capture_recvmsg_keeps_received_prefix_and_truncated_name,
     // replayer::network::tests::restore_recvmsg_writes_payload_name_and_header and
     // replayer::network::tests::write_mmsg_len_targets_each_entry, which retain
-    // all 770 prior identities.
-    ("test.hermit_unit", 773),
+    // all 777 prior identities.
+    ("test.hermit_unit", 780),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -625,8 +634,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511).
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3544 tests.
-    // The host twin selects the same https://github.com/rrnewton/hermit/issues/3550 tests.
-    ("test.hermit_unit_on_host", 773),
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3580 tests.
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3579 tests.
+    ("test.hermit_unit_on_host", 780),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
