@@ -3628,9 +3628,10 @@ impl RunOpts {
                     );
                 }
                 // The probe above asserts the hybrid's trap/hook split, which
-                // does not describe an in-guest Tool.
+                // does not describe an in-guest Tool. Nothing has started the
+                // guest yet, so this names the configuration, not an outcome.
                 LiteinstRuntime::InGuest => eprintln!(
-                    "hermit: [liteinst in-guest] Detcore Tool hosted by the guest preload; the host-hybrid activation probe does not apply"
+                    "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool; the host-hybrid activation probe does not apply"
                 ),
             }
         }
