@@ -115,6 +115,17 @@ pub const DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS: [&str; 1] =
 pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
     "76980bac89901c3ecefbefc816ed47bcf099eda6";
 pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 189;
+/// Ptrace replay cells selected when
+/// <https://github.com/rrnewton/hermit/pull/3580> taught the recorder and
+/// replayer `select` and `pselect6`. Before it, replay of both programs
+/// diverged; each passed five consecutive replay runs on the ptrace backend at
+/// Hermit 1dd202e847ccf0fa149a442701f23b2ae1c3ede6. They keep the ordinary
+/// 22/57 bounds.
+pub const SELECT_REPLAY_2026_10_03_TESTS: [&str; 2] = [
+    "c-programs/poll-readiness",
+    "c-programs/pselect6-simulation",
+];
+pub const SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT: usize = 2;
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
@@ -1921,6 +1932,10 @@ mod tests {
             "2026-09-25T03:15:24Z"
         );
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
+        assert_eq!(
+            SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT,
+            SELECT_REPLAY_2026_10_03_TESTS.len()
+        );
         assert_eq!(
             DBT_MATRIX_2026_09_29_EVIDENCE_SHA,
             "12371d6cbf8a56c69175baea5baeb7507ca7e9cf"

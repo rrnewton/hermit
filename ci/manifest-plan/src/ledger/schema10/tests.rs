@@ -777,8 +777,10 @@ fn pre_fold_expected_json(expected_json: &str) -> String {
     }
     // 276 portable and 3 privileged folded cells, plus the DBT verify cells slice
     // S13 (https://github.com/rrnewton/hermit/issues/3301) selected for the folded
-    // tests c-programs/pid-probe (portable) and c-programs/cpuid-probe (privileged).
-    assert_eq!(restored, 281, "277 portable and 4 privileged folded cells");
+    // tests c-programs/pid-probe (portable) and c-programs/cpuid-probe (privileged),
+    // plus the ptrace replay cell https://github.com/rrnewton/hermit/pull/3580
+    // selected for the folded test c-programs/poll-readiness (portable).
+    assert_eq!(restored, 282, "278 portable and 4 privileged folded cells");
     serde_json::to_string(&expected).unwrap()
 }
 
@@ -942,9 +944,11 @@ fn generated_plan_populations_preserve_command_policy() {
     // https://github.com/rrnewton/hermit/issues/3448 adds the 189 portable
     // ptrace verify cells of the strict compatibility corpus, which ran as
     // generated compat.<label> nodes before; every plan below carries them on
-    // both sides, so only its count moves.
+    // both sides, so only its count moves. The same holds for the two ptrace
+    // replay cells https://github.com/rrnewton/hermit/pull/3580 selects.
     let compat = crate::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT;
-    let total = 900 + compat;
+    let select = crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
+    let total = 900 + compat + select;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -983,7 +987,7 @@ fn generated_plan_populations_preserve_command_policy() {
         .filter(|cell| cell.lane == "portable" && cell.backend != "kvm")
         .cloned()
         .collect::<Vec<_>>();
-    assert_eq!(hosted_cells.len(), 893 + compat - 241);
+    assert_eq!(hosted_cells.len(), 893 + compat + select - 241);
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
         current_hosted.planned_backend_parity_relations().unwrap(),
@@ -1030,7 +1034,7 @@ fn generated_plan_populations_preserve_command_policy() {
             "hosted-portable",
             "e2e.manifest_backend_parity_c_on_host",
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
-            893 + compat,
+            893 + compat + select,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
