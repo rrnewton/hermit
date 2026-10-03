@@ -7,6 +7,7 @@ mod scalar_recvfrom;
 mod raw_poll;
 mod sendto_entry;
 mod native_source_read;
+mod shared_source;
 mod socket_error;
 
 use std::cell::Cell;
@@ -4538,7 +4539,7 @@ fn producer_blocked_replay_trace() -> detcore_model::network_trace::NetworkTrace
             bytes: b"x".to_vec(),
         },
     });
-    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model;
+    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
     for node in &mut nodes[2..] {
         node.id.0 += 1;
     }
@@ -4565,7 +4566,7 @@ fn producer_blocked_replay_trace() -> detcore_model::network_trace::NetworkTrace
         trace.inputs[n].release.receive_entry_cut = cut;
         trace.inputs[n].release.prerequisites = frontier.clone();
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut trace.release_model;
+            &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes
             .iter_mut()
             .find(|node| {
@@ -5736,7 +5737,7 @@ fn shutdown_replay_trace(
             direction,
         },
     });
-    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model;
+    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
     assert_eq!(nodes.len(), 4);
     nodes.push(NetworkReleaseNodeV4 {
         id: NetworkReleaseNodeIdV4(4),
@@ -7123,7 +7124,7 @@ fn scalar_eof_trace(
         trace.inputs.truncate(1);
         trace.native_receive_observations.clear();
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut trace.release_model;
+            &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes.truncate(if blocked { 3 } else { 2 });
     }
     let now = trace.epoch_global_time().unwrap();
@@ -7145,7 +7146,7 @@ fn scalar_eof_trace(
             direction: detcore_model::network_trace::NetworkShutdownV2::Write,
         },
     });
-    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model;
+    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
     nodes.push(NetworkReleaseNodeV4 {
         id: NetworkReleaseNodeIdV4(id),
         kind: NetworkReleaseNodeKindV4::Input {

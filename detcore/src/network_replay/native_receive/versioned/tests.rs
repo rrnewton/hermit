@@ -48,6 +48,7 @@ fn empty() -> NetworkTraceV4 {
 fn nodes(t: &mut NetworkTraceV4) -> &mut Vec<NetworkReleaseNodeV4> {
     match &mut t.release_model {
         NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } => nodes,
+        NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { .. } => panic!("legacy fixture changed its release policy"),
     }
 }
 fn add_channel(t: &mut NetworkTraceV4, id: u64, datagram: bool) {

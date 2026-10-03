@@ -106,11 +106,16 @@ pub struct NetworkReleaseNodeV4 {
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum NetworkReleaseModelV4 {
     SoleInitialRootProgramOrderV1 { nodes: Vec<NetworkReleaseNodeV4> },
+    /// Each effectful attempt freezes the complete frontier under one current
+    /// Normal grant and authenticated shared-MM/files lineage. Logical Calls
+    /// may outlive attempts; the tag alone proves neither custody nor timing.
+    SerializedSharedMmAttemptsV1 { nodes: Vec<NetworkReleaseNodeV4> },
 }
 impl NetworkReleaseModelV4 {
     pub fn nodes(&self) -> &[NetworkReleaseNodeV4] {
         match self {
             Self::SoleInitialRootProgramOrderV1 { nodes } => nodes,
+            Self::SerializedSharedMmAttemptsV1 { nodes } => nodes,
         }
     }
 }

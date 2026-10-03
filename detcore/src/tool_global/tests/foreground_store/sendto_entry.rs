@@ -34,7 +34,7 @@ fn output_trace(errno: Option<i32>) -> NetworkTraceV4 {
             },
         },
     });
-    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model;
+    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
     nodes.push(NetworkReleaseNodeV4 {
         id: NetworkReleaseNodeIdV4(nodes.len() as u64),
         kind: NetworkReleaseNodeKindV4::Progress {

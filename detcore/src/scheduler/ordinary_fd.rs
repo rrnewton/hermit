@@ -19,6 +19,10 @@ use crate::network_replay::NetworkStreamOwner;
 use crate::types::DetTid;
 use crate::types::MmId;
 
+#[cfg(test)]
+#[path = "ordinary_fd/shared_attempt_tests.rs"]
+mod shared_attempt_tests;
+
 /// Why the existing foreground execution gate is open. None of these outcomes
 /// is a result or selection receipt for a native syscall.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -335,6 +339,52 @@ impl Scheduler {
     }
 }
 
+/// Current Normal grant joined to a complete physical shared-MM/files census.
+/// Neither this borrow nor a root proves that backend peers are stopped.
+#[derive(Debug)]
+pub(crate) struct SharedMmForegroundObservation<'a> {
+    grant: OrdinaryFdObservation<'a>,
+    lineage: &'a crate::network_runtime::SharedForegroundLineage<'a>,
+}
+impl SharedMmForegroundObservation<'_> {
+    pub(crate) fn owner(&self) -> NetworkStreamOwner { self.grant.owner() }
+    pub(crate) fn epoch(&self) -> u64 { self.grant.epoch() }
+    pub(crate) fn root(&self) -> &std::sync::Arc<crate::network_runtime::ForegroundRoot> { self.lineage.root() }
+}
+impl Scheduler {
+    pub(crate) fn shared_mm_foreground_observation<'a>(
+        &'a self,
+        owner: NetworkStreamOwner,
+        lineage: &'a crate::network_runtime::SharedForegroundLineage<'a>,
+    ) -> std::io::Result<SharedMmForegroundObservation<'a>> {
+        let bad = || std::io::Error::other("shared attempt lacks current Normal grant and complete native census");
+        let grant = self.ordinary_fd_observation(owner).map_err(|_| bad())?;
+        if grant.resume() != OrdinaryFdResume::Normal || lineage.root().owner() != owner {
+            return Err(bad());
+        }
+        let mut members = std::collections::BTreeSet::new();
+        for root in lineage.members() {
+            self.validate_native_foreground_task(root.owner(), root)?;
+            if !root.has_shared_mm_history() || !members.insert(root.owner().thread) {
+                return Err(bad());
+            }
+        }
+        let registered: std::collections::BTreeSet<_> = self.physical_thread_pidfds.keys().copied().collect();
+        let live: std::collections::BTreeSet<_> = self.thread_tree.tree.keys().copied().collect();
+        if members != registered || members != live || self.thread_tree.process_wait.len() != 1
+            || !self.pending_physical_process_exits.is_empty()
+        { return Err(bad()); }
+        let process = self.registered_process(owner.thread).ok_or_else(bad)?;
+        let entry = self.thread_tree.process_wait.get(&process).ok_or_else(bad)?;
+        if entry.reaped || !entry.births.is_empty()
+            || entry.historical_births.iter().any(|birth| !birth.complete())
+            || entry.native_projections.iter().any(|p| !members.contains(&p.thread()))
+            || entry.native_projections.len() != members.len()
+        { return Err(bad()); }
+        Ok(SharedMmForegroundObservation { grant, lineage })
+    }
+}
+
 impl Scheduler {
     pub(crate) fn foreground_epoll_observation(
         &self,
@@ -464,5 +514,62 @@ impl Scheduler {
         self.step5_guest_unblock(tid, &request, &response).unwrap();
         self.step6_reenquue(tid, false);
         assert!(self.foreground_native_observation(owner, root).is_ok());
+    }
+}
+
+#[cfg(test)]
+impl Scheduler {
+    /// Actual retained birth/projection consumer with a controlled physical
+    /// descriptor stand-in. This proves the H join, not a kernel child stop.
+    pub(crate) fn controlled_shared_birth_census(
+        &mut self,
+        parent_root: &crate::network_runtime::ForegroundRoot,
+        child_root: &crate::network_runtime::ForegroundRoot,
+        admission: &crate::network_runtime::native_birth::NativeBirthAdmission,
+    ) {
+        let admission = admission.clone();
+        let parent = parent_root.owner();
+        let child = child_root.owner();
+        let prepared = self.thread_tree.prepare_no_seq_birth(
+            parent, parent_root.logical_process(),
+            crate::resources::ExternalOpId::new(parent.thread, 900),
+            (admission.flags(), 0, 0), None, Some(admission.permit()),
+        ).unwrap();
+        let submitted = self.thread_tree.submit_no_seq_birth(&prepared).unwrap();
+        let mut inherited = submitted.clone();
+        self.thread_tree.rebind_native_birth(&mut inherited).unwrap();
+        let outcome = inherited.native_owner.as_ref().unwrap().attach(admission).unwrap();
+        assert_eq!(outcome.child(), child);
+        inherited.child = Some(child.thread);
+        assert!(self.thread_tree.consume_no_seq_birth(&inherited, child.thread));
+        assert_eq!(self.thread_tree.join_no_seq_birth(&submitted, child.thread), Some(true));
+        self.install_test_exec_incarnation(child.thread, child.mm);
+        // The fixture's provider uses controlled task identities. Retain an
+        // owned descriptor, rather than claiming that child.thread is an OS TID.
+        let pin = self.physical_thread_pidfds[&parent.thread].3.try_clone().unwrap();
+        assert!(self.physical_thread_pidfds.insert(child.thread,
+            (child.mm, child_root.process(), child_root.thread(), pin, true)).is_none());
+    }
+
+    /// Issue the next real Normal foreground request for an already registered
+    /// shared parent. The peer remains in the retained task census.
+    pub(crate) fn controlled_shared_foreground_grant(
+        &mut self, root: &crate::network_runtime::ForegroundRoot,
+    ) {
+        use super::parked::{ControlCapability, ResourceOrigin, RpcOrigin};
+        let owner = root.owner();
+        self.install_resource_origin(owner.thread, ResourceOrigin {
+            rpc: RpcOrigin::DirectRequestResources, mm: owner.mm, control: ControlCapability::None,
+        }).unwrap();
+        let req = self.next_turns[&owner.thread].req.clone();
+        self.request_put(&req, crate::resources::Resources::new(owner.thread),
+            &std::sync::Arc::new(std::sync::Mutex::new(crate::types::GlobalTime::new(&crate::config::Config::default()))));
+        let (tid, request, response) = self.step3_peek().unwrap();
+        assert_eq!(tid, owner.thread);
+        let request = request.try_read().unwrap().unwrap();
+        self.step4_resource_block(tid, &request, &response).unwrap();
+        self.step5_guest_unblock(tid, &request, &response).unwrap();
+        self.step6_reenquue(tid, false);
+        assert_eq!(self.ordinary_fd_observation(owner).unwrap().resume(), OrdinaryFdResume::Normal);
     }
 }

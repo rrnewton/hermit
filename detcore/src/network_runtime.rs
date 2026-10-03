@@ -91,6 +91,7 @@ pub(crate) use native_copy_exclusion::ReceiveRetryAdmission;
 pub(crate) use native_copy_exclusion::ReceiveRetryOrigin;
 pub(crate) use native_source_interval::NativeSourceInterval;
 pub(crate) use physical::ForegroundRoot;
+pub(crate) use physical::SharedForegroundLineage;
 #[cfg(test)]
 pub(crate) use physical::InitialDescriptor;
 pub(crate) use physical::InitialFileStat;

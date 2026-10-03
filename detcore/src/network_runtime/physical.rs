@@ -5,6 +5,7 @@ mod source_ioctl;
 use std::collections::BTreeMap;
 
 pub(crate) use foreground::ForegroundRoot;
+pub(crate) use foreground::SharedForegroundLineage;
 #[cfg(test)]
 pub(crate) use foreground::controlled_foreground_root;
 #[cfg(test)]
@@ -540,6 +541,7 @@ pub(super) struct CustodyTasks<T> {
     foreground_lineage_lost: bool,
     // Loss of the narrow V4 premise does not revoke live shared-task roots.
     sole_initial_root_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    shared_mm_lineage_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     first_task: Option<DetTid>,
 }
 impl<T> Default for CustodyTasks<T> {
@@ -549,6 +551,7 @@ impl<T> Default for CustodyTasks<T> {
             next_registration: 0,
             foreground_lineage_lost: false,
             sole_initial_root_lost: Default::default(),
+            shared_mm_lineage_lost: Default::default(),
             first_task: None,
         }
     }
@@ -588,6 +591,11 @@ impl<T> CustodyTasks<T> {
             }
         }
         let handle = open()?;
+        if self.tasks.get(&owner.thread).is_some_and(|old| {
+            old.initial_exec.is_some() || old.foreground_root.is_some() || old.native_birth.is_some()
+        }) {
+            self.shared_mm_lineage_lost.store(true, std::sync::atomic::Ordering::Release);
+        }
         if self.first_task.is_some_and(|first| first != owner.thread)
             || (self.first_task.is_some()
                 && self
@@ -707,6 +715,10 @@ impl<T> CustodyTasks<T> {
         &mut self,
         birth: &super::native_birth::NativeBirthAdmission,
     ) -> std::io::Result<()> {
+        let raw = birth.raw();
+        if raw.shared_mm != 1 || raw.shared_files != 1 || raw.same_thread_group != 1 {
+            self.shared_mm_lineage_lost.store(true, std::sync::atomic::Ordering::Release);
+        }
         if birth.terminal() {
             return Err(std::io::Error::other(
                 "terminal child cannot gain live custody",
@@ -1203,7 +1215,11 @@ impl<T> CustodyTasks<T> {
     ) -> std::io::Result<()> {
         if let Some(task) = self.tasks.get_mut(&owner.thread) {
             if task.mm != owner.mm {
+                self.shared_mm_lineage_lost.store(true, std::sync::atomic::Ordering::Release);
                 return Err(std::io::Error::other("terminal task changed custody MM"));
+            }
+            if task.foreground_root.is_none() {
+                self.shared_mm_lineage_lost.store(true, std::sync::atomic::Ordering::Release);
             }
             if let Some(root) = &task.foreground_root {
                 root.revoke();
@@ -1218,6 +1234,9 @@ impl<T> CustodyTasks<T> {
             .get(&owner.thread)
             .is_some_and(|task| task.mm == owner.mm)
         {
+            if self.tasks[&owner.thread].foreground_root.is_none() {
+                self.shared_mm_lineage_lost.store(true, std::sync::atomic::Ordering::Release);
+            }
             if let Some(root) = &self.tasks[&owner.thread].foreground_root {
                 root.revoke();
             }

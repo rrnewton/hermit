@@ -515,6 +515,7 @@ struct StreamCallState {
     native_entry: Option<native_receive::NativeEntry>,
     receive_policy: Option<std::sync::Arc<crate::tool_global::SavedReceivePolicy>>,
     replay_connect: Option<replay_connect::Claim>,
+    shared_attempt: Option<native_receive::SharedAttempt>,
 }
 
 /// Short reader admission from the existing table and OFD authorities. This is
@@ -803,7 +804,7 @@ impl NetworkReplayEngine {
         if state.owner != owner {
             return Err(NetworkReplayError::StreamCallOwnerMismatch(call));
         }
-        if state.original.is_some() || state.open_file.is_none() || state.replay_connect.is_some() {
+        if state.original.is_some() || state.open_file.is_none() || state.replay_connect.is_some() || state.shared_attempt.is_some() {
             return Err(NetworkReplayError::StreamCallPhaseMismatch(call));
         }
         if state.abandoned {
@@ -941,6 +942,7 @@ impl NetworkReplayEngine {
                 native_entry: None,
                 receive_policy: None,
                 replay_connect: None,
+                shared_attempt: None,
                 capture_publication,
                 capture_control: capture_publication
                     .filter(|_| physical_pin_required)
@@ -5264,6 +5266,15 @@ impl NetworkReplayEngine {
         open_file: OpenFileId,
         bytes: &[u8],
     ) -> Result<StreamTransmitOutcome, NetworkReplayError> {
+        self.check_shared_attempt_unclaimed(open_file)?;
+        self.transmit_stream_inner(open_file, bytes)
+    }
+
+    fn transmit_stream_inner(
+        &mut self,
+        open_file: OpenFileId,
+        bytes: &[u8],
+    ) -> Result<StreamTransmitOutcome, NetworkReplayError> {
         let channel = self.bound_channel(open_file)?;
         let state = self.replay_channel_mut(channel)?;
         if state.transport.is_datagram() || state.local_write_closed {
@@ -5362,6 +5373,7 @@ impl NetworkReplayEngine {
         ancillary: &NetworkAncillaryDataV2,
         message_flags: i32,
     ) -> Result<StreamTransmitOutcome, NetworkReplayError> {
+        self.check_shared_attempt_unclaimed(open_file)?;
         let channel = self.bound_channel(open_file)?;
         let state = self.replay_channel_mut(channel)?;
         if state.transport.is_datagram() || state.local_write_closed {
@@ -6558,6 +6570,7 @@ impl NetworkReplayEngine {
         &self,
         open_file: OpenFileId,
     ) -> Result<(), NetworkReplayError> {
+        self.check_shared_attempt_unclaimed(open_file)?;
         self.check_replay_connect_unclaimed(open_file)?;
         if let Some(lease) = self.stream_delivery.get(&open_file) {
             return Err(

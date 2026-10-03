@@ -77,6 +77,11 @@ fn status(operation: &str) -> CallStatus {
     }
 }
 impl SharedBirthFixture {
+    /// Move the unique runtime into GlobalState while keeping the same issued
+    /// birth and responder alive. No runtime or semantic authority is cloned.
+    pub(crate) fn into_runtime_and_retention(self) -> (NetworkRuntimeResources, Box<dyn std::any::Any>) {
+        (self.runtime, Box::new((self._birth, self._peer)))
+    }
     pub(crate) async fn new(thread: i32) -> Self {
         Self::new_after_entry(thread, |_, _, _| {}).await
     }
@@ -90,10 +95,6 @@ impl SharedBirthFixture {
     ) -> Self {
         Self::new_with_setup(thread, |_, _| {}, before).await
     }
-    #[expect(
-        dead_code,
-        reason = "retained pre-close shared-birth guard fixture; no active caller or qualification claim"
-    )]
     pub(crate) async fn new_after_setup(
         thread: i32,
         setup: impl FnOnce(&Arc<ForegroundRoot>, &InitialTableClaim),
@@ -148,6 +149,7 @@ impl SharedBirthFixture {
             actual.first_task = tasks.first_task;
             actual.next_registration = tasks.next_registration;
             actual.sole_initial_root_lost = tasks.sole_initial_root_lost.clone();
+            actual.shared_mm_lineage_lost = tasks.shared_mm_lineage_lost.clone();
             actual.tasks.insert(
                 parent_owner.thread,
                 Task {
@@ -497,4 +499,63 @@ fn initial_root_failed_opener_preserves_sole_policy() {
     );
     assert!(root.is_sole_initial_root(owner));
     assert!(Arc::ptr_eq(&root, &tasks.foreground_root(owner).unwrap()));
+}
+
+#[tokio::test]
+async fn shared_attempt_census_accepts_real_retained_birth_without_restoring_sole_history() {
+    let f = SharedBirthFixture::new(61).await;
+    for root in [&f.parent, &f.child] {
+        assert!(root.has_shared_mm_history());
+        assert!(!root.has_sole_initial_root_history());
+        f.runtime.with_shared_foreground_lineage(root.owner(), |lineage| {
+            assert!(Arc::ptr_eq(lineage.root(), root));
+            assert_eq!(lineage.members().count(), 2);
+            Ok(())
+        }).unwrap();
+    }
+    {
+        let mut tasks = f.runtime.shared.physical.lock().unwrap();
+        tasks.close_native_preparations(f.parent.owner()).unwrap();
+        tasks.forget(f.parent.owner());
+    }
+    assert!(!f.parent.is_current(f.parent.owner()));
+    assert!(f.child.has_shared_mm_history());
+    f.runtime.with_shared_foreground_lineage(f.child.owner(), |lineage| {
+        assert_eq!(lineage.members().count(), 1);
+        Ok(())
+    }).unwrap();
+    assert!(!f.child.has_sole_initial_root_history());
+}
+
+#[tokio::test]
+async fn shared_attempt_census_unknown_registration_cannot_be_erased() {
+    let f = SharedBirthFixture::new(61).await;
+    let unknown = NetworkStreamOwner { thread: DetTid::from_raw(63), mm: f.parent.owner().mm };
+    {
+        let mut tasks = f.runtime.shared.physical.lock().unwrap();
+        tasks.register(unknown, 61, 63, || Ok(std::fs::File::open("/dev/null")?.into())).unwrap();
+    }
+    assert!(f.runtime.with_shared_foreground_lineage(f.parent.owner(), |_| Ok(())).is_err());
+    f.runtime.shared.physical.lock().unwrap().forget(unknown);
+    assert!(!f.parent.has_shared_mm_history());
+    assert!(!f.child.has_shared_mm_history());
+    assert!(f.runtime.with_shared_foreground_lineage(f.parent.owner(), |_| Ok(())).is_err());
+}
+
+#[tokio::test]
+async fn shared_attempt_history_replacement_and_generic_revoke_are_sticky() {
+    for replacement in [false, true] {
+        let f = SharedBirthFixture::new(61).await;
+        let mut tasks = f.runtime.shared.physical.lock().unwrap();
+        if replacement {
+            let owner = f.child.owner();
+            tasks.register(NetworkStreamOwner { mm: owner.mm.for_exec(owner.thread), ..owner }, 61, 62,
+                || Ok(std::fs::File::open("/dev/null")?.into())).unwrap();
+        } else {
+            tasks.revoke_foreground_lineage();
+        }
+        assert!(!f.parent.has_shared_mm_history());
+        assert!(!f.child.has_shared_mm_history());
+        assert!(tasks.shared_foreground_lineage(f.parent.owner()).is_err());
+    }
 }

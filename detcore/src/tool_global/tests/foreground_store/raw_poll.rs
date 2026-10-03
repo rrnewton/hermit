@@ -453,7 +453,7 @@ fn finite_replay_trace(final_mask: i16, release_ms: u64) -> NetworkTraceV4 {
     // but do not preload payload that would contradict the initial empty poll.
     trace.inputs.truncate(1);
     trace.native_receive_observations.clear();
-    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model;
+    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
     nodes.truncate(2);
     let cut = NetworkReceiveEntryCutV4(2);
     let prerequisites = trace.entry_frontier(cut).unwrap();
@@ -480,7 +480,7 @@ fn finite_replay_trace(final_mask: i16, release_ms: u64) -> NetworkTraceV4 {
             },
         });
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut trace.release_model;
+            &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes.push(NetworkReleaseNodeV4 {
             id: NetworkReleaseNodeIdV4(nodes.len() as u64),
             kind: NetworkReleaseNodeKindV4::Input {
@@ -804,7 +804,7 @@ async fn raw_poll_guest_dispatch_preserves_duplicate_alias_masks_and_closes_call
                 | libc::POLLRDHUP,
         },
     });
-    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model;
+    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
     nodes.push(NetworkReleaseNodeV4 {
         id: NetworkReleaseNodeIdV4(cut.0),
         kind: NetworkReleaseNodeKindV4::Input {
@@ -966,7 +966,7 @@ async fn raw_poll_replay_issuer_uses_actual_reader_without_physical_capture() {
             revents: libc::POLLPRI | libc::POLLRDHUP,
         },
     });
-    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model;
+    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
     nodes.push(NetworkReleaseNodeV4 {
         id: NetworkReleaseNodeIdV4(cut.0),
         kind: NetworkReleaseNodeKindV4::Input {

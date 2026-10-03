@@ -14,6 +14,9 @@ impl GlobalState {
         &self, tid: Tid, state: &crate::tool_local::ThreadState<T>,
         read: &crate::network_replay::NetworkFdReadAdmission, requested: usize,
     ) -> Result<usize, NetworkRpcError> {
+        if self.shared_mm_attempts_active() {
+            return self.shared_replay_sendto_read_limit(tid, state, read, requested);
+        }
         let fail = |e: &dyn std::fmt::Display| NetworkRpcError::internal(e.to_string());
         let owner = NetworkStreamOwner { thread: state.dettid, mm: state.mm_id };
         let runtime = self.network_runtime.as_ref().ok_or_else(|| NetworkRpcError::internal("Sendto Replay runtime absent"))?;

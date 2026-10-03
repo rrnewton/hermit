@@ -32,6 +32,7 @@ pub(crate) struct ForegroundRoot {
     memory: Weak<Mutex<MemoryMetadata>>,
     revoked: AtomicBool,
     sole_initial_root_lost: Arc<AtomicBool>,
+    shared_mm_lineage_lost: Arc<AtomicBool>,
 }
 impl ForegroundRoot {
     #[cfg(test)]
@@ -45,10 +46,6 @@ impl ForegroundRoot {
         policy_tests::SharedBirthFixture::new(thread).await
     }
     #[cfg(test)]
-    #[expect(
-        dead_code,
-        reason = "retained pre-close shared-birth guard fixture; no active caller or qualification claim"
-    )]
     pub(crate) async fn controlled_shared_birth_after_close_setup(
         thread: i32,
         before: impl FnOnce(&Arc<Self>, &InitialTableClaim),
@@ -143,6 +140,25 @@ impl ForegroundRoot {
     pub(crate) fn is_sole_initial_root(&self, owner: NetworkStreamOwner) -> bool {
         self.is_current(owner) && self.has_sole_initial_root_history()
     }
+    /// Historical provenance only. A live operation additionally requires the
+    /// complete borrowed physical census and the current scheduler grant.
+    pub(crate) fn has_shared_mm_history(&self) -> bool {
+        if self.shared_mm_lineage_lost.load(Ordering::Acquire) {
+            return false;
+        }
+        match &self.parent {
+            Some(parent) => self.same_shared_lineage(parent) && parent.has_shared_mm_history(),
+            None => self.initial_exec.is_some() && self.owner == self.association.owner,
+        }
+    }
+    fn same_shared_lineage(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.shared_mm_lineage_lost, &other.shared_mm_lineage_lost)
+            && self.association == other.association
+            && self.owner.mm == other.owner.mm
+            && self.process == other.process
+            && self.metadata.ptr_eq(&other.metadata)
+            && self.memory.ptr_eq(&other.memory)
+    }
     pub(crate) fn metadata(&self) -> std::io::Result<Arc<Mutex<FileMetadata>>> {
         if !self.is_current(self.owner()) {
             return Err(std::io::Error::other("foreground root revoked"));
@@ -184,6 +200,7 @@ impl<T> CustodyTasks<T> {
     pub(in crate::network_runtime) fn revoke_foreground_lineage(&mut self) {
         self.foreground_lineage_lost = true;
         self.sole_initial_root_lost.store(true, Ordering::Release);
+        self.shared_mm_lineage_lost.store(true, Ordering::Release);
         for task in self.tasks.values() {
             if let Some(root) = &task.foreground_root {
                 root.revoke();
@@ -202,6 +219,7 @@ impl<T> CustodyTasks<T> {
             return Ok(());
         }
         let sole_initial_root_lost = self.sole_initial_root_lost.clone();
+        let shared_mm_lineage_lost = self.shared_mm_lineage_lost.clone();
         self.task_mut(owner)?.foreground_metadata =
             Some((Arc::downgrade(metadata), Arc::downgrade(memory)));
         let (retired, birth, process, thread, old_root) = {
@@ -273,6 +291,7 @@ impl<T> CustodyTasks<T> {
                     memory: Arc::downgrade(memory),
                     revoked: AtomicBool::new(false),
                     sole_initial_root_lost,
+                    shared_mm_lineage_lost,
                 }));
             return Ok(());
         }
@@ -335,6 +354,7 @@ impl<T> CustodyTasks<T> {
             memory: Arc::downgrade(memory),
             revoked: AtomicBool::new(false),
             sole_initial_root_lost,
+            shared_mm_lineage_lost,
         }));
         Ok(())
     }
@@ -357,6 +377,45 @@ impl<T> CustodyTasks<T> {
                 std::io::Error::other("foreground ctl lacks positive initial-root authority")
             })?;
         Ok(root.clone())
+    }
+}
+
+/// Borrowed from the existing physical task owner. The vector contains only
+/// references held under its mutex; it is not a replacement membership ledger.
+#[derive(Debug)]
+pub(crate) struct SharedForegroundLineage<'a> {
+    root: &'a Arc<ForegroundRoot>,
+    members: Vec<&'a Arc<ForegroundRoot>>,
+}
+impl SharedForegroundLineage<'_> {
+    pub(crate) fn root(&self) -> &Arc<ForegroundRoot> { self.root }
+    pub(crate) fn members(&self) -> impl Iterator<Item = &Arc<ForegroundRoot>> { self.members.iter().copied() }
+}
+impl<T> CustodyTasks<T> {
+    pub(in crate::network_runtime) fn shared_foreground_lineage(
+        &self,
+        owner: NetworkStreamOwner,
+    ) -> std::io::Result<SharedForegroundLineage<'_>> {
+        self.get(owner)?;
+        let bad = || std::io::Error::other("shared attempt lacks complete current physical lineage");
+        let root = self.tasks[&owner.thread].foreground_root.as_ref().ok_or_else(bad)?;
+        if self.foreground_lineage_lost || !root.is_current(owner) || !root.has_shared_mm_history() {
+            return Err(bad());
+        }
+        let mut members = Vec::new();
+        for task in self.tasks.values() {
+            let member = task.foreground_root.as_ref().ok_or_else(bad)?;
+            if !member.has_shared_mm_history() || !root.same_shared_lineage(member)
+                || task.enrollment.as_ref().is_some_and(Enrollment::unresolved)
+            { return Err(bad()); }
+            if task.retired { continue; }
+            if !member.is_current(member.owner()) || task.mm != member.owner().mm
+                || task.process != member.process() || task.thread != member.thread()
+            { return Err(bad()); }
+            members.push(member);
+        }
+        if members.is_empty() { return Err(bad()); }
+        Ok(SharedForegroundLineage { root, members })
     }
 }
 
@@ -475,6 +534,7 @@ fn runtime_from_controlled_tasks(
     actual.first_task = tasks.first_task;
     actual.next_registration = tasks.next_registration;
     actual.sole_initial_root_lost = tasks.sole_initial_root_lost.clone();
+            actual.shared_mm_lineage_lost = tasks.shared_mm_lineage_lost.clone();
     actual.tasks.insert(
         owner.thread,
         Task {

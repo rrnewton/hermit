@@ -9,6 +9,9 @@ mod raw_poll;
 #[path = "versioned/socket_error.rs"]
 mod socket_error;
 
+#[path = "versioned/shared_attempt.rs"]
+pub(in crate::network_replay) mod shared_attempt;
+
 use detcore_model::network_trace::FreshSendTimeoutV1;
 use detcore_model::network_trace::NetworkCreationModelV4;
 use detcore_model::network_trace::NetworkEstablishmentV4;
@@ -483,6 +486,13 @@ impl NetworkReplayEngine {
     }
 
     pub(crate) fn replay_native_receive(trace: NetworkTraceV4) -> Result<Self, NetworkReplayError> {
+        if !matches!(trace.release_model, NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { .. }) {
+            return Err(invalid("legacy V4 replay requires sole-initial-root policy"));
+        }
+        Self::replay_native_receive_inner(trace)
+    }
+
+    fn replay_native_receive_inner(trace: NetworkTraceV4) -> Result<Self, NetworkReplayError> {
         trace.validate().map_err(|e| invalid(&e.to_string()))?;
         // These are the current positive input producers. Other V4 model rows
         // need their actual consume/error/control issuer before this adapter
@@ -956,7 +966,7 @@ impl NetworkReplayEngine {
             ));
         }
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
         nodes.push(node);
         Ok(())
     }
@@ -968,6 +978,7 @@ impl NetworkReplayEngine {
         owner: NetworkStreamOwner,
         call: NetworkStreamCallId,
     ) -> Result<NativeEntryAttempt, NetworkReplayError> {
+        self.require_sole_initial_release_policy()?;
         self.check_native_retirement()?;
         if !self.native_receive_version() || self.mode() != NetworkEngineMode::Record {
             return Err(NetworkReplayError::WrongMode);
@@ -1204,6 +1215,7 @@ impl NetworkReplayEngine {
         kind: EntryKind,
         now: LogicalTime,
     ) -> Result<(), NetworkReplayError> {
+        self.require_sole_initial_release_policy()?;
         let call = attempt.call;
         self.check_native_retirement()?;
         let EngineState::Native(native) = &self.mode else {
@@ -1756,6 +1768,7 @@ impl NetworkReplayEngine {
         pending: NativeTransmitPending,
         observed: &crate::network_runtime::native_peer::Observation,
     ) -> Result<(), NetworkReplayError> {
+        self.require_sole_initial_release_policy()?;
         // Scheduler timing is not original-task return provenance, and an
         // output-only V4 row cannot carry entry/completion/handback authority.
         // Never silently fall back to the old writer after enrollment.
@@ -1841,7 +1854,7 @@ impl NetworkReplayEngine {
         let mut candidate = native.trace.clone();
         candidate.outputs.push(output.clone());
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut candidate.release_model;
+            &mut candidate.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
         nodes.push(node.clone());
         let shadow = self.shadow.as_ref().ok_or(NetworkReplayError::WrongMode)?;
         candidate.fresh_stream_profiles = shadow.profiles.values().cloned().collect();
@@ -1871,7 +1884,7 @@ impl NetworkReplayEngine {
         };
         native.trace.outputs.push(output);
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
         nodes.push(node);
         self.socket_controls
             .get_mut(&open_file)
@@ -1962,6 +1975,7 @@ impl NetworkReplayEngine {
         completed: &crate::network_runtime::native_peer::CompletedNativeSend<'_>,
         now: LogicalTime,
     ) -> Result<(), NetworkReplayError> {
+        self.require_sole_initial_release_policy()?;
         let owner = grant.owner();
         let channel = self.validate_native_sendto(&admission.arguments)?;
         self.validate_native_foreground_call(admission.call, grant, now)?;
@@ -1982,7 +1996,7 @@ impl NetworkReplayEngine {
         };
         let mut candidate = native.trace.clone();
         candidate.outputs.push(output.clone());
-        let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut candidate.release_model;
+        let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut candidate.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
         nodes.push(node.clone());
         let shadow = self.shadow.as_ref().ok_or(NetworkReplayError::WrongMode)?;
         candidate.fresh_stream_profiles = shadow.profiles.values().cloned().collect();
@@ -1992,7 +2006,7 @@ impl NetworkReplayEngine {
         candidate.validate().map_err(|e| invalid(&e.to_string()))?;
         let EngineState::Native(native) = &mut self.mode else { unreachable!() };
         native.trace.outputs.push(output);
-        let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut native.trace.release_model;
+        let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut native.trace.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
         nodes.push(node);
         self.consume_native_entry(admission.call);
         Ok(())
@@ -2060,6 +2074,7 @@ impl NetworkReplayEngine {
         completed: &crate::network_runtime::native_peer::CompletedNativeConnect<'_>,
         now: LogicalTime,
     ) -> Result<(), NetworkReplayError> {
+        self.require_sole_initial_release_policy()?;
         let (open_file, returned) = self.original_native_connected(owner, admission)?;
         let (peer, local) = completed
             .endpoints(owner, admission, returned)
@@ -2159,7 +2174,7 @@ impl NetworkReplayEngine {
             });
         }
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
         nodes.push(input_node);
         if asynchronous {
             nodes.push(NetworkReleaseNodeV4 {
@@ -2242,7 +2257,7 @@ impl NetworkReplayEngine {
             event: NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected),
         });
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes.extend([
             NetworkReleaseNodeV4 {
                 id: NetworkReleaseNodeIdV4(0),
@@ -2413,7 +2428,7 @@ impl NetworkReplayEngine {
         };
         assert!(native.replay.is_none());
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { panic!("legacy fixture changed its release policy"); };
         assert!(!nodes.is_empty());
         nodes[0].id = NetworkReleaseNodeIdV4(99);
     }

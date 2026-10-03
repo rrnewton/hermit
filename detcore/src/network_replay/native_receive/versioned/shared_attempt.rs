@@ -1,0 +1,271 @@
+//! Closed shared-MM policy and one actual selected Replay source attempt.
+//! The Call owns the claim; the runtime owns worker/physical exclusion. Neither
+//! this policy tag nor a logical phase certifies a native syscall completion.
+use super::*;
+use crate::scheduler::ordinary_fd::SharedMmForegroundObservation;
+
+#[cfg(test)]
+#[path = "shared_attempt/tests.rs"]
+mod tests;
+
+#[derive(Debug, Clone)]
+pub(in crate::network_replay) struct SharedAttempt {
+    root: Arc<crate::network_runtime::ForegroundRoot>,
+    epoch: u64,
+    prefix: crate::network_runtime::JoinedNativePrefix,
+    binding: crate::types::FdSlotBinding,
+    transmitted: u64,
+    length: usize,
+}
+
+impl NetworkReplayEngine {
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "unactivated M2 policy: separately named constructor remains opt-in until paired native qualification"
+        )
+    )]
+    pub(crate) fn record_shared_mm_attempts(epoch: DateTime<Utc>) -> Self {
+        let mut engine = Self::record_native_receive(epoch);
+        let EngineState::Native(native) = &mut engine.mode else {
+            unreachable!()
+        };
+        assert!(native.untouched_record());
+        native.trace.release_model =
+            NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { nodes: Vec::new() };
+        engine
+    }
+
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "unactivated M2 policy: separately named constructor remains opt-in until paired native qualification"
+        )
+    )]
+    pub(crate) fn replay_shared_mm_attempts(
+        trace: NetworkTraceV4,
+    ) -> Result<Self, NetworkReplayError> {
+        if !matches!(
+            trace.release_model,
+            NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { .. }
+        ) {
+            return Err(invalid(
+                "shared V4 replay requires serialized shared-MM attempt policy",
+            ));
+        }
+        Self::replay_native_receive_inner(trace)
+    }
+
+    pub(crate) fn uses_shared_mm_attempts(&self) -> bool {
+        matches!(&self.mode, EngineState::Native(native)
+            if matches!(native.trace.release_model, NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { .. }))
+    }
+
+    pub(super) fn require_sole_initial_release_policy(&self) -> Result<(), NetworkReplayError> {
+        match &self.mode {
+            EngineState::Native(native)
+                if matches!(
+                    native.trace.release_model,
+                    NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { .. }
+                ) =>
+            {
+                Ok(())
+            }
+            EngineState::Native(_) => Err(invalid(
+                "legacy V4 issuer requires sole-initial-root policy",
+            )),
+            _ => Err(NetworkReplayError::WrongMode),
+        }
+    }
+
+    pub(in crate::network_replay) fn check_shared_attempt_unclaimed(
+        &self,
+        file: OpenFileId,
+    ) -> Result<(), NetworkReplayError> {
+        if let Some((call, _)) = self
+            .stream_calls
+            .iter()
+            .find(|(_, state)| state.open_file == Some(file) && state.shared_attempt.is_some())
+        {
+            return Err(NetworkReplayError::UnresolvedStreamCall(*call));
+        }
+        Ok(())
+    }
+
+    /// All refusal paths precede the reader transfer. The caller's runtime
+    /// transaction has already reserved an interval and holds the exact complete
+    /// physical lineage plus worker/Calls admission through this mutation.
+    pub(crate) fn begin_shared_replay_transmit(
+        &mut self,
+        read: NetworkFdReadAdmission,
+        grant: &SharedMmForegroundObservation<'_>,
+        prefix: &crate::network_runtime::JoinedNativePrefix,
+        admission: &crate::network_runtime::ForegroundEntryAdmission<'_>,
+        length: usize,
+    ) -> Result<NetworkStreamCall, NetworkReplayError> {
+        let owner = grant.owner();
+        self.check_native_retirement()?;
+        if !self.uses_shared_mm_attempts() || self.mode() != NetworkEngineMode::Replay {
+            return Err(NetworkReplayError::WrongMode);
+        }
+        self.validate_fd_read(owner, &read)?;
+        let binding = read
+            .binding
+            .ok_or_else(|| invalid("shared source lacks selected descriptor"))?;
+        if !(1..=512).contains(&length)
+            || read.external_grant.is_some()
+            || !self.stream_calls.is_empty()
+            || !self.stream_operations.is_empty()
+            || !self.shadow_probes.is_empty()
+            || !Arc::ptr_eq(grant.root(), prefix.root())
+            || !Arc::ptr_eq(grant.root(), admission.root())
+            || !admission.is_original_prefix(prefix)
+            || binding.slot.files != grant.root().files()
+            || !grant.root().has_shared_mm_history()
+            || self.transmit_stream_read_limit(binding.open_file, length)? != length
+        {
+            return Err(invalid(
+                "shared source changed selected prefix/lineage or owns another active attempt",
+            ));
+        }
+        let channel = self.bound_channel(binding.open_file)?;
+        let EngineState::Native(native) = &self.mode else {
+            unreachable!()
+        };
+        let completed = self.native_completed()?;
+        if !native.trace.channels.iter().any(|definition| {
+            definition.id == channel
+                && definition.transport == NetworkTransportV2::Tcp
+                && definition.role == NetworkEndpointRoleV2::OutboundClient
+        }) || !native.trace.release_model.nodes().iter().any(|node| {
+            matches!(node.kind, NetworkReleaseNodeKindV4::Progress {
+                    channel: established, milestone: NetworkProgressV4::Established { .. },
+                } if established == channel)
+                && completed.contains(&node.id)
+        }) {
+            return Err(invalid(
+                "shared source lacks completed outbound TCP establishment",
+            ));
+        }
+        let transmitted = self.replay_transmit_offset(binding.open_file)?;
+        let control = read
+            .control
+            .ok_or_else(|| invalid("shared source lost selected control"))?;
+        let attempt = SharedAttempt {
+            root: grant.root().clone(),
+            epoch: grant.epoch(),
+            prefix: prefix.clone(),
+            binding,
+            transmitted,
+            length,
+        };
+        let call = self.begin_native_stream_call_from_read(owner, read)?;
+        assert!(!call.physical_pin_required);
+        self.finish_socket_control(owner, control, NetworkSocketControlFinish::Unchanged)
+            .expect("prevalidated logical reader cannot acquire an effect during transfer");
+        self.stream_calls
+            .get_mut(&call.id)
+            .expect("transferred Call")
+            .shared_attempt = Some(attempt);
+        Ok(call)
+    }
+
+    pub(crate) fn validate_shared_replay_transmit(
+        &self,
+        call: NetworkStreamCallId,
+        grant: &SharedMmForegroundObservation<'_>,
+        prefix: &crate::network_runtime::JoinedNativePrefix,
+    ) -> Result<OpenFileId, NetworkReplayError> {
+        let owner = grant.owner();
+        self.check_stream_owner(owner)?;
+        self.check_native_retirement()?;
+        if !self.uses_shared_mm_attempts()
+            || self.mode() != NetworkEngineMode::Replay
+            || !self.fd_table_capability()
+        {
+            return Err(invalid("shared source lost replay/table policy"));
+        }
+        let state = self
+            .stream_calls
+            .get(&call)
+            .ok_or(NetworkReplayError::UnknownStreamCall(call))?;
+        let attempt = state
+            .shared_attempt
+            .as_ref()
+            .ok_or(NetworkReplayError::StreamCallPhaseMismatch(call))?;
+        if state.owner != owner
+            || state.abandoned
+            || state.final_wait
+            || state.phase != StreamCallPhase::Active
+            || state.physical_pin_required
+            || state.terminal_evidence.is_some()
+            || state.capture_publication.is_some()
+            || state.capture_control.is_some()
+            || state.original.is_some()
+            || state.helper_copy.is_some()
+            || !state.native_receive.is_empty()
+            || state.private_receive.is_some()
+            || state.record_no_store.is_some()
+            || state.replay_receive.is_some()
+            || state.foreground_store.is_some()
+            || state.private_drain.is_some()
+            || state.native_entry.is_some()
+            || state.native_entry_attempted.is_some()
+            || state.receive_policy.is_some()
+            || state.replay_connect.is_some()
+            || state.open_file != Some(attempt.binding.open_file)
+            || attempt.epoch != grant.epoch()
+            || !Arc::ptr_eq(&attempt.root, grant.root())
+            || !attempt.prefix.same_prefix(prefix)
+            || !attempt.root.is_current(owner)
+            || !attempt.root.has_shared_mm_history()
+            || self.stream_calls.len() != 1
+            || !self.stream_operations.is_empty()
+            || !self.socket_controls.is_empty()
+            || !self.shadow_probes.is_empty()
+            || self
+                .zero_stream_waits
+                .values()
+                .any(|wait| wait.call == call)
+            || self.replay_transmit_offset(attempt.binding.open_file)? != attempt.transmitted
+            || self.transmit_stream_read_limit(attempt.binding.open_file, attempt.length)?
+                != attempt.length
+        {
+            return Err(invalid(
+                "shared source changed original Call/grant/prefix or retains other custody",
+            ));
+        }
+        Ok(attempt.binding.open_file)
+    }
+
+    /// Only the actual Global source consumer calls this inside the original
+    /// with_source_interval transaction after the backend's true worker join.
+    /// On mismatch/error the claim stays retained; no generic cancellation may
+    /// erase it. Global drains lifetime-retired ports before replying.
+    pub(crate) fn complete_shared_replay_transmit(
+        &mut self,
+        call: NetworkStreamCallId,
+        grant: &SharedMmForegroundObservation<'_>,
+        prefix: &crate::network_runtime::JoinedNativePrefix,
+        bytes: &[u8],
+    ) -> Result<StreamTransmitOutcome, NetworkReplayError> {
+        let file = self.validate_shared_replay_transmit(call, grant, prefix)?;
+        if bytes.len()
+            != self.stream_calls[&call]
+                .shared_attempt
+                .as_ref()
+                .unwrap()
+                .length
+        {
+            return Err(invalid("shared source changed exact selected length"));
+        }
+        let result = self.transmit_stream_inner(file, bytes)?;
+        self.release_stream_call_lifetime(grant.owner(), call, file)?;
+        self.stream_calls.remove(&call);
+        self.complete_deferred_retirement(file);
+        self.check_native_retirement()?;
+        Ok(result)
+    }
+}

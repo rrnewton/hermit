@@ -40,7 +40,7 @@ impl NetworkReplayEngine {
             event: NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected),
         });
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes.extend([
             NetworkReleaseNodeV4 {
                 id: NetworkReleaseNodeIdV4(0),
@@ -220,6 +220,7 @@ impl NetworkReplayEngine {
         grant: &crate::scheduler::ordinary_fd::OrdinaryFdObservation<'_>,
         now: LogicalTime,
     ) -> Result<i16, NetworkReplayError> {
+        self.require_sole_initial_release_policy()?;
         let probe = self.owned_shadow_probe(owner, lease)?.clone();
         self.validate_native_foreground_call(probe.call, grant, now)?;
         if probe.call != call
@@ -311,7 +312,7 @@ impl NetworkReplayEngine {
                 prerequisites: release.prerequisites,
             };
             let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-                &mut candidate.release_model;
+                &mut candidate.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
             nodes.push(node.clone());
             additions.push((input, node));
         }
@@ -340,7 +341,7 @@ impl NetworkReplayEngine {
             unreachable!()
         };
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
         for (input, node) in additions {
             native.trace.inputs.push(input);
             nodes.push(node);
@@ -450,7 +451,7 @@ mod tests {
             event: NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected),
         });
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes.extend([
             NetworkReleaseNodeV4 {
                 id: NetworkReleaseNodeIdV4(0),
@@ -1280,7 +1281,7 @@ mod tests {
             },
         });
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut trace.release_model;
+            &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes.push(NetworkReleaseNodeV4 {
             id: NetworkReleaseNodeIdV4(index),
             kind: NetworkReleaseNodeKindV4::Input {

@@ -96,6 +96,7 @@ impl NetworkReplayEngine {
         now: LogicalTime,
         errno: i32,
     ) -> Result<(), NetworkReplayError> {
+        self.require_sole_initial_release_policy()?;
         let control = self.owned_socket_control(owner, lease)?;
         let file = control.open_file;
         let read = control
@@ -175,7 +176,7 @@ impl NetworkReplayEngine {
         };
         candidate.inputs.push(input.clone());
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut candidate.release_model;
+            &mut candidate.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
         nodes.push(node.clone());
         nodes.push(progress.clone());
         let shadow = self.shadow.as_ref().ok_or(NetworkReplayError::WrongMode)?;
@@ -204,7 +205,7 @@ impl NetworkReplayEngine {
         };
         native.trace.inputs.push(input);
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { return Err(invalid("legacy V4 publisher requires sole-initial-root policy")); };
         nodes.push(node);
         nodes.push(progress);
         self.socket_controls
@@ -227,6 +228,7 @@ impl NetworkReplayEngine {
         let control = self.owned_socket_control(owner, lease)?;
         let file = control.open_file;
         self.check_replay_connect_unclaimed(file)?;
+        self.check_shared_attempt_unclaimed(file)?;
         if !control.physical.can_release_unchanged() || self.shadow_probes.contains_key(&lease) {
             return Err(NetworkReplayError::UnresolvedStreamOperation(lease));
         }

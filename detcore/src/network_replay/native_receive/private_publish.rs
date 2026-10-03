@@ -532,7 +532,7 @@ impl NetworkReplayEngine {
         let trace = native.record().expect("validated recorder");
         trace.inputs.push(input);
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut trace.release_model;
+            &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes.push(producer);
         trace.native_receive_observations.push(observation);
         let channel = self.channels.get_mut(&plan.channel).unwrap();

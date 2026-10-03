@@ -5,6 +5,46 @@ use super::*;
 use crate::network_replay::NetworkStreamOwner;
 
 impl NetworkRuntimeResources {
+    /// The caller already holds the scheduler. Keep the physical census fixed
+    /// through the synchronous grant/engine transaction; never await or submit
+    /// native work from this callback. No borrowed value can escape the lock.
+    pub(crate) fn with_shared_foreground_lineage<T>(
+        &self,
+        owner: NetworkStreamOwner,
+        use_lineage: impl FnOnce(&SharedForegroundLineage<'_>) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let physical = self.shared.physical.lock().unwrap();
+        let lineage = physical.shared_foreground_lineage(owner)?;
+        use_lineage(&lineage)
+    }
+
+    /// Atomically reserve the original source interval before consuming a
+    /// selected reader. The callback must fail before its custody transfer;
+    /// success returns both the transferred Call and its interval. On refusal
+    /// no worker/keepalive exists and dropping the interval ends the reservation.
+    pub(crate) fn prepare_shared_replay_source<T>(
+        &self,
+        prefix: &JoinedNativePrefix,
+        lineage: &SharedForegroundLineage<'_>,
+        transfer: impl FnOnce(&ForegroundEntryAdmission<'_>) -> std::io::Result<T>,
+    ) -> std::io::Result<(T, NativeSourceInterval)> {
+        if !Arc::ptr_eq(lineage.root(), &prefix.root)
+            || !prefix.shared.ptr_eq(&Arc::downgrade(&self.shared))
+        {
+            return Err(std::io::Error::other("shared source changed its original runtime/root"));
+        }
+        let mut owned = self.shared.native_workers.lock().unwrap();
+        let interval = self.shared.reserve_source_interval(&mut owned, prefix.root.clone(), prefix.generation)?;
+        let calls = self.shared.native_streams.lock().unwrap();
+        calls.settled()?;
+        let value = transfer(&ForegroundEntryAdmission {
+            prefix,
+            _admission: &owned,
+            _calls: &calls,
+        })?;
+        Ok((value, interval))
+    }
+
     pub(crate) fn reserve_replay_source_interval(
         &self,
         prefix: &JoinedNativePrefix,
@@ -57,6 +97,11 @@ pub(crate) struct JoinedNativePrefix {
 impl JoinedNativePrefix {
     pub(crate) fn root(&self) -> &Arc<ForegroundRoot> {
         &self.root
+    }
+    pub(crate) fn same_prefix(&self, other: &Self) -> bool {
+        self.shared.ptr_eq(&other.shared)
+            && Arc::ptr_eq(&self.root, &other.root)
+            && self.generation == other.generation
     }
 }
 impl NetworkRuntimeResources {

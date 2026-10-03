@@ -367,7 +367,7 @@ async fn socket_error_replay_refuses_a_future_consumed_byte_cut() {
             errno: 0,
         },
     });
-    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model;
+    let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } = &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
     nodes.push(NetworkReleaseNodeV4 {
         id: NetworkReleaseNodeIdV4(cut.0),
         kind: NetworkReleaseNodeKindV4::Input {

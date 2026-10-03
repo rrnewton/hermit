@@ -770,7 +770,7 @@ mod tests {
             },
         });
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut trace.release_model;
+            &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
         let NetworkReleaseNodeKindV4::Progress { channel, .. } = &mut nodes[1].kind else {
             unreachable!()
         };
@@ -1010,7 +1010,7 @@ mod tests {
         let mut missing = fixture_trace(now, false);
         missing.inputs.clear();
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut missing.release_model;
+            &mut missing.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes.clear();
         missing.validate().unwrap();
         let mut f = fixture_with_trace(missing);

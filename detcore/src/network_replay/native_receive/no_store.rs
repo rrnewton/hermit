@@ -486,7 +486,7 @@ impl NetworkReplayEngine {
         if append {
             candidate.inputs.push(input.clone());
             let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-                &mut candidate.release_model;
+                &mut candidate.release_model else { panic!("legacy fixture changed its release policy"); };
             nodes.push(producer.clone());
         }
         candidate.validate().map_err(|e| invalid(&e.to_string()))?;
@@ -502,7 +502,7 @@ impl NetworkReplayEngine {
                 .expect("validated native recorder and first-error fence");
             trace.inputs.push(input);
             let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-                &mut trace.release_model;
+                &mut trace.release_model else { panic!("legacy fixture changed its release policy"); };
             nodes.push(producer);
             let channel = self.channels.get_mut(&channel_id).unwrap();
             channel.published_ingress = Some(PublishedIngress {

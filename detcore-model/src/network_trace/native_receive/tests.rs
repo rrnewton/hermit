@@ -111,6 +111,7 @@ fn empty() -> NetworkTraceV4 {
 fn nodes(t: &mut NetworkTraceV4) -> &mut Vec<NetworkReleaseNodeV4> {
     match &mut t.release_model {
         NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } => nodes,
+        NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { .. } => panic!("legacy fixture changed its release policy"),
     }
 }
 fn add_channel(t: &mut NetworkTraceV4, id: u64, datagram: bool) {
@@ -1579,4 +1580,37 @@ fn finite_channel_creation_rejects_valid_accepted_child_independently_of_listene
         Err(Invalid::UnsupportedCreation)
     );
     assert_eq!(validate_channel_creation(&outbound), Ok(()));
+}
+
+#[test]
+fn shared_attempt_policy_preserves_graph_checks_and_distinct_framing() {
+    let mut legacy = empty();
+    add_channel(&mut legacy, 1, false);
+    input(&mut legacy, 1, NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected), &[]);
+    progress(&mut legacy, 1, NetworkProgressV4::Established {
+        source: NetworkEstablishmentV4::ConnectedInput { input_ordinal: 0 },
+    }, &[0]);
+    legacy.validate().unwrap();
+    let mut shared = legacy.clone();
+    shared.release_model = NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 {
+        nodes: legacy.release_model.nodes().to_vec(),
+    };
+    let mut legacy_bytes = Vec::new();
+    let mut shared_bytes = Vec::new();
+    legacy.write_framed(&mut legacy_bytes).unwrap();
+    shared.write_framed(&mut shared_bytes).unwrap();
+    assert_ne!(legacy_bytes, shared_bytes);
+    assert_eq!(NetworkTraceV4::read_framed(Cursor::new(shared_bytes)).unwrap(), shared);
+    for policy in [false, true] {
+        let mut invalid = if policy { shared.clone() } else { legacy.clone() };
+        let entries = match &mut invalid.release_model {
+            NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes }
+            | NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { nodes } => nodes,
+        };
+        entries[0].id = NetworkReleaseNodeIdV4(7);
+        assert_eq!(invalid.validate(), Err(Invalid::NonCanonicalNode));
+        let mut invalid = if policy { shared.clone() } else { legacy.clone() };
+        invalid.inputs[0].release.receive_entry_cut = NetworkReceiveEntryCutV4(3);
+        assert_eq!(invalid.validate(), Err(Invalid::InvalidEntryCut));
+    }
 }

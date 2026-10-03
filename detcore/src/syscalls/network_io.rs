@@ -3231,16 +3231,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .and_then(|global| global.native_receive_mode())
                 == Some(crate::network_replay::NetworkEngineMode::Replay)
         {
+            let shared_attempt = guest.local_global_state().unwrap().shared_mm_attempts_active();
             if !original_sendto_shape(call)
-                || !guest
+                || (!shared_attempt && !guest
                     .thread_state()
-                    .with_detfd(call.fd(), |fd| fd.is_nonblocking())?
+                    .with_detfd(call.fd(), |fd| fd.is_nonblocking())?)
             {
                 return Err(engine_error(
                     "V4 Sendto Replay requires nonblocking scalar MSG_NOSIGNAL",
                 ));
             }
             let read = self.begin_network_fd_read(guest, call.fd()).await?;
+            let mut read_transferred = false;
             let result = async {
                 let maximum = guest.local_global_state().unwrap().replay_sendto_read_limit(
                     guest.tid(), guest.thread_state(), &read, call.size(),
@@ -3254,9 +3256,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                             guest.tid(), guest.thread_state(), &read,
                             (call.buf().ok_or(Errno::EFAULT)?.as_raw(), maximum, call.flags()),
                         ).await.map_err(engine_rpc_error)?;
-                    let bytes = guest.read_native_source(
-                        prepared.address(), prepared.length(), prepared.retention(),
-                    ).await.map_err(|error| {
+                    read_transferred = prepared.transferred_read();
+                    let source = if read_transferred {
+                        guest.stage_followed_source(
+                            prepared.address(), prepared.length(), prepared.retention(),
+                        ).await
+                    } else {
+                        guest.read_native_source(
+                            prepared.address(), prepared.length(), prepared.retention(),
+                        ).await
+                    };
+                    let bytes = source.map_err(|error| {
                         // Preserve the existing explicit unsupported-backend
                         // refusal; no unsafe memory() fallback or guest errno.
                         tracing::error!(%error, "Replay source worker refused");
@@ -3276,6 +3286,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // without touching even an inaccessible original payload.
                 self.stream_transmit(guest, call.into(), open_file, Vec::new(), policy).await
             }.await;
+            if read_transferred {
+                // The shared Call consumed the read and either retired after
+                // a true source join or retains custody on failure. A second
+                // reader release cannot stand in for either outcome.
+                return result;
+            }
             let released = self
                 .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
                 .await;

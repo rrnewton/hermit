@@ -4,6 +4,9 @@ use super::*;
 use crate::network_runtime::ForegroundRoot;
 use crate::network_runtime::NativeSourceInterval;
 
+mod shared_source;
+use shared_source::SharedNativeSource;
+
 struct Context {
     root: Arc<ForegroundRoot>,
     epoch: u64,
@@ -15,20 +18,39 @@ struct Context {
 
 /// Local and consuming: neither a copied byte vector nor a fresh Normal grant
 /// can replace the original read admission and actually joined prefix.
-pub(crate) struct PreparedNativeSource {
+pub(crate) struct LegacyNativeSource {
     context: Context,
     interval: NativeSourceInterval,
 }
 
+pub(crate) enum PreparedNativeSource {
+    Legacy(Box<LegacyNativeSource>),
+    Shared(SharedNativeSource),
+}
+
 impl PreparedNativeSource {
     pub(crate) fn address(&self) -> usize {
-        self.context.address
+        match self {
+            Self::Legacy(source) => source.context.address,
+            Self::Shared(source) => source.address,
+        }
     }
     pub(crate) fn length(&self) -> usize {
-        self.context.length
+        match self {
+            Self::Legacy(source) => source.context.length,
+            Self::Shared(source) => source.length,
+        }
     }
     pub(crate) fn retention(&self) -> Box<dyn Send + Sync> {
-        self.interval.keepalive()
+        match self {
+            Self::Legacy(source) => source.interval.keepalive(),
+            Self::Shared(source) => source.interval.keepalive(),
+        }
+    }
+    /// A successful shared preparation transferred the selected reader into
+    /// its Call. The old FinishFdRead path must never release it afterward.
+    pub(crate) fn transferred_read(&self) -> bool {
+        matches!(self, Self::Shared(_))
     }
 }
 
@@ -65,6 +87,9 @@ impl GlobalState {
             ));
         }
         check_range(address, length)?;
+        if self.shared_mm_attempts_active() {
+            return self.prepare_shared_replay_transmit_source(tid, state, read, address, length).await;
+        }
         let owner = NetworkStreamOwner {
             thread: state.dettid,
             mm: state.mm_id,
@@ -125,7 +150,10 @@ impl GlobalState {
                 .reserve_replay_source_interval(&prefix)
                 .map_err(internal)
         })?;
-        Ok(PreparedNativeSource { context, interval })
+        Ok(PreparedNativeSource::Legacy(Box::new(LegacyNativeSource {
+            context,
+            interval,
+        })))
     }
 
     fn check_native_source_task<T>(
@@ -209,6 +237,12 @@ impl GlobalState {
         if bytes.len() != prepared.length() {
             return Err(internal("Replay source changed exact length"));
         }
+        let prepared = match prepared {
+            PreparedNativeSource::Legacy(prepared) => prepared,
+            PreparedNativeSource::Shared(prepared) => {
+                return self.finish_shared_replay_transmit_source(tid, state, prepared, bytes);
+            }
+        };
         self.with_native_source_authority(tid, state, &prepared.context, |engine, open_file| {
             self.network_runtime
                 .as_ref()

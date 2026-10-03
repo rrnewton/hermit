@@ -80,7 +80,7 @@ impl Fixture {
             event: NetworkInputKindV2::Connect(NetworkConnectionResultV2::Connected),
         });
         let NetworkReleaseModelV4::SoleInitialRootProgramOrderV1 { nodes } =
-            &mut native.trace.release_model;
+            &mut native.trace.release_model else { panic!("legacy fixture changed its release policy"); };
         nodes.extend([
             NetworkReleaseNodeV4 {
                 id: NetworkReleaseNodeIdV4(0),

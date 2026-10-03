@@ -376,6 +376,7 @@ mod versioned;
 pub(super) use versioned::NativeEntry;
 pub(super) use versioned::NativeEntryMarker;
 pub(super) use versioned::NativeState;
+pub(super) use versioned::shared_attempt::SharedAttempt;
 
 #[path = "native_receive/private_peek.rs"]
 mod private_peek;
