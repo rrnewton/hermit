@@ -2,6 +2,7 @@
 //! mmap observation and the access-check backend below are controlled premises.
 //! The writer performs real process_vm_writev; safeptrace separately tests its
 //! production Stopped implementation and target-PKRU check. No BPF/E2E claim.
+mod fd_identity;
 mod scalar_recvfrom;
 mod raw_poll;
 mod sendto_entry;
@@ -1093,6 +1094,7 @@ async fn private_drain_actual_terminal_close_preserves_source_store_and_unknown_
         let source = Arc::downgrade(full.store().completion().binding());
         let store = Arc::downgrade(full.store());
         let fd = runtime.private_receive_original_fixture_fd(owner, f.call);
+        let audit = no_store_duplicate_actual_original(&f);
         engine.lock().unwrap().begin_private_drain(&full).unwrap();
         let observed = if known_result {
             Some(
@@ -1112,11 +1114,8 @@ async fn private_drain_actual_terminal_close_preserves_source_store_and_unknown_
         // Explicit controlled final-wait premise; this executes the actual
         // bounded physical cleanup, not a guest/kernel final-wait event.
         assert!(unsafe { outside.finish_native_controller_tasks().await }.is_err());
-        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
-        assert_eq!(
-            std::io::Error::last_os_error().raw_os_error(),
-            Some(libc::EBADF)
-        );
+        fd_identity::check_original_socket_released(fd, &audit).unwrap();
+        drop(audit);
         assert!(format!("{:?}", engine.lock().unwrap()).contains("TerminalPinReleased"));
         assert!(matches!(engine.lock().unwrap().finish(),
             Err(crate::network_replay::NetworkReplayError::UnresolvedStreamCall(call)) if call == f.call));
@@ -8418,11 +8417,7 @@ fn assert_record_guest_pin_released(
         runtime.finish_native_stream_release(owner, q.call).is_err(),
         "actual physical completion was already consumed once"
     );
-    assert_eq!(unsafe { libc::fcntl(original, libc::F_GETFD) }, -1);
-    assert_eq!(
-        std::io::Error::last_os_error().raw_os_error(),
-        Some(libc::EBADF)
-    );
+    fd_identity::check_original_socket_released(original, audit).unwrap();
     let mut actual = 0i32;
     let mut length = std::mem::size_of::<i32>() as libc::socklen_t;
     assert_eq!(
@@ -9595,31 +9590,26 @@ async fn private_record_retry_same_ofd_survives_numeric_fd_replacement() {
     use std::io::Read;
     use std::io::Write;
     use std::os::fd::AsRawFd;
-    use std::os::fd::FromRawFd;
-    use std::os::fd::IntoRawFd;
     let mut f = NativeNoStoreFixture::new(false, 5, true).await;
     f.confirm(false);
     let duplicate = no_store_duplicate_actual_original(&f.fixture);
-    let slot = duplicate.into_raw_fd();
+    let slot = duplicate.as_raw_fd();
     // The controlled callback receipt binds the real original-OFD alias BEFORE
     // completion and close. This is exactly the numeric operand replaced below.
     let (read, mut invocation) = retry_invocation_at_fd(&f, false, slot);
     assert_eq!(read.fd(), slot);
     let completed = retry_complete(&f).await;
-    assert_eq!(unsafe { libc::close(slot) }, 0);
+    // Keep the target slot owned while allocating the replacement. Closing it
+    // first lets another parallel test allocate it, and dup3 would then close
+    // that test's descriptor instead of our original alias.
     let (replacement, mut replacement_peer) = std::os::unix::net::UnixStream::pair().unwrap();
-    if replacement.as_raw_fd() != slot {
-        assert_eq!(
-            unsafe { libc::dup3(replacement.as_raw_fd(), slot, libc::O_CLOEXEC) },
-            slot
-        );
-    }
-    let replacement = if replacement.as_raw_fd() == slot {
-        replacement
-    } else {
-        drop(replacement);
-        unsafe { std::os::unix::net::UnixStream::from_raw_fd(slot) }
-    };
+    assert_ne!(replacement.as_raw_fd(), slot);
+    assert_eq!(
+        unsafe { libc::dup3(replacement.as_raw_fd(), slot, libc::O_CLOEXEC) },
+        slot
+    );
+    drop(replacement);
+    let replacement = std::os::unix::net::UnixStream::from(duplicate);
     replacement_peer.write_all(b"separate").unwrap();
     f.fixture
         ._peer
