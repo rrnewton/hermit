@@ -2854,9 +2854,11 @@ fn backend_stats_are_debug_gated_and_absent_from_the_info_envelope() {
 ///
 /// Hermit reports from two call sites, one per way of running the guest: a
 /// plain `run` waits for the exit status, while `--verify` (and `analyze`)
-/// capture the output. Both are checked. Under `--verify` each of the two
-/// compared runs writes its DEBUG log to its own retained file, so each file
-/// must hold exactly one record from its own run.
+/// capture the output. Both are checked. Under `--verify --keep-logs` each of
+/// the two compared runs writes its DEBUG log to its own file, and after a
+/// match Hermit keeps only run 1's as the golden log and deletes run 2's
+/// (https://github.com/rrnewton/hermit/issues/3301). So the golden log must
+/// hold exactly one record from its own run, and run 2's log must be gone.
 ///
 /// `process_reports=0` is today's architecture, not a gap: the ptrace host
 /// counts every hook entry itself, so no guest process submits a report.
@@ -2948,23 +2950,18 @@ fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
         verify_stderr.contains("Success: deterministic. Determinism verified."),
         "{verify_stderr}"
     );
-    for prefix in ["run1_log_", "run2_log_"] {
-        let captures: Vec<PathBuf> = fs::read_dir(logs.path())
-            .expect("failed to read the retained verify-log directory")
-            .map(|entry| entry.expect("failed to read a verify-log entry").path())
-            .filter(|path| {
-                path.file_name()
-                    .and_then(OsStr::to_str)
-                    .is_some_and(|name| name.starts_with(prefix))
-            })
-            .collect();
-        let [capture] = &captures[..] else {
-            panic!("expected exactly one {prefix} capture, found {captures:?}");
-        };
-        let text = fs::read_to_string(capture)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", capture.display()));
-        check_record(&capture.display().to_string(), &text);
-    }
+    let golden = retained_captures(logs.path(), "run1_log_");
+    let [capture] = &golden[..] else {
+        panic!("expected exactly one run1_log_ capture, found {golden:?}");
+    };
+    let text = fs::read_to_string(capture)
+        .unwrap_or_else(|error| panic!("failed to read {}: {error}", capture.display()));
+    check_record(&capture.display().to_string(), &text);
+    let duplicates = retained_captures(logs.path(), "run2_log_");
+    assert!(
+        duplicates.is_empty(),
+        "a matched verification must delete run 2's log: {duplicates:?}"
+    );
 }
 
 #[test]
