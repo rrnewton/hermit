@@ -102,9 +102,10 @@ fn explicit_mtimes_are_reported_by_stat_and_verify_strictly() {
 /// file over the name a utimensat call targets, between the kernel's update and
 /// Hermit's lookup of the updated inode. The guest reports, for each file that
 /// ever held the name, whether it sees the explicit mtime; that file's real
-/// mtime must then be the explicit one too. Before the lookup was bound to the
-/// inode resolved before the call, the file that took over the name could get
-/// the virtual mtime of a call that never touched it.
+/// mtime must then be the explicit one too. Before the update was bound to the
+/// inode resolved before and after the call, and to the mtime the kernel stored
+/// on it, the file that took over the name could get the virtual mtime of a
+/// call that never touched it.
 #[test]
 fn a_renamed_over_target_does_not_get_the_explicit_mtime() {
     const EXPLICIT: Duration = Duration::from_secs(1_000_000_000);
