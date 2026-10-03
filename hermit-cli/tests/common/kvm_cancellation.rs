@@ -158,7 +158,7 @@ fn check_outputs(directory: &Path) {
 
 /// Hard-links the run 2 log listed in `logs`, if there is one, to `capture`.
 /// Returns whether the link exists.
-fn link_run2_log(logs: &Path, capture: &Path) -> bool {
+pub(super) fn link_run2_log(logs: &Path, capture: &Path) -> bool {
     for entry in fs::read_dir(logs).expect("verify log directory") {
         let entry = entry.expect("verify log entry");
         if !entry.file_name().to_string_lossy().starts_with("run2_log_") {
