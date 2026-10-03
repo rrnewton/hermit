@@ -78,8 +78,8 @@ demo7: $(BOOT_SNAPSHOT) | drgn-prereqs
 
 # Demo 8 needs assets built by 08-btrfs-convert-uaf/prepare-assets.sh. Without
 # them it prints SKIPPED and exits 0, which run-all.sh reports as a skip. A sweep
-# with a skip exits 3 unless run-all.sh is given --allow-skips, so `make all`
-# and `make group2` fail (make exits 2) until those assets exist.
+# with a skip exits 3, so `make all` and `make group2` fail (make exits 2) until
+# those assets exist.
 demo8: | hermit-prereqs
 	@"$(DEMO_DIR)08-btrfs-convert-uaf/run.sh"
 

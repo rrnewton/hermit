@@ -47,8 +47,7 @@ instead of the expected crash. The story of the bug is in
 
 Without the prepared assets, `run.sh` prints `SKIPPED` and exits 0, so
 `demos/run-all.sh` counts it as skipped rather than failed. A skipped demo
-produced no result, so the sweep then exits 3 instead of 0, unless it was given
-`--allow-skips`.
+produced no result, so the sweep then exits 3 instead of 0.
 
 ## Run it
 
