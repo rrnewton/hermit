@@ -4,6 +4,8 @@ bucket: compat
 # validation host, each run under Hermit's verify. The rows labelled
 # sabre-compat-only, and every row's SaBRe cell (`focused`), belong to the SaBRe
 # run type alone; the full validation runs the ptrace cells of the other rows.
+# The `variants` entry repeats the strict corpus's rows as strict-<row> tests
+# for the strict run type alone, on ptrace with none of the relaxations below.
 # The scheduled super suite still runs its four heavy rows (rustc, javac, java,
 # node) on ptrace from ci/compat/corpus-strict.json. Lane settings are stated
 # once below and every row is expanded into an ordinary test recipe
@@ -185,6 +187,58 @@ corpus:
         [
           java, javac
         ]
+  # The strict run type (scripts/validate.rs --strict-compat-only): every row
+  # of ci/compat/corpus-strict.json once more on ptrace, under --strict and
+  # Hermit's stripped --verify with none of the corpus's relaxations, so
+  # CPUID virtualization and the preemption timeslice stay on. Until
+  # 2026-10-02 these were 193 separate strictcompat.<program> validation
+  # nodes running the same argv.
+  variants:
+    - label: strict-compat-only
+      id_prefix: strict-
+      description: Real program under strict Hermit with no relaxations
+      timeout_seconds: 60
+      cpu_timeout_seconds: 59
+      slow_reason: >-
+        The strict lane gives every program 60 wall seconds
+        (STRICT_COMPAT_TIMEOUT in validate.sh), heavy rows included: the
+        wall bound its generated strictcompat.<program> validation nodes
+        carried. Their 120 CPU seconds cannot be stated: a cell's CPU
+        budget must stay below its wall bound, so it is 59. Measured on
+        2026-10-02 with the release Hermit built at 03bbb8358: the slowest
+        passing program (rustc) used 4.0 s wall and 3.5 s CPU, and the two
+        red JVM rows at most 19.6 s wall and 19.2 s CPU
+      no_retry_reason: >-
+        Each program ran once per strict validation as its own
+        strictcompat.<program> node, and a failure of that one run failed
+        the validation; a second attempt would let a nondeterministic
+        program pass
+      except:
+        - reason: >-
+            Not in the strict corpus (ci/compat/corpus-strict.json): the
+            SaBRe corpus had these programs and the strict corpus did not
+          rows:
+            [
+              timeout, truncate, fallocate, setfattr, setfacl, mountpoint,
+              diff3, basenc, dos2unix, envsubst, col, colrm, crc32, uuidgen,
+              shred, sync, pathchk, namei, getconf, cscope, flex, msgfmt,
+              msgunfmt
+            ]
+        - reason: >-
+            The SaBRe corpus's single-image argv; the strict corpus runs
+            these programs through the rows of the same name without the
+            suffix
+          rows: [lua-direct, perl-direct, df-direct]
+      # Measured red on 2026-10-02 with the release Hermit built at
+      # 03bbb8358: through this bucket, and 2 of 2 runs each of the retired
+      # strictcompat.<program> command.
+      unselected:
+        - result: determinism-failure
+          evidence: https://github.com/rrnewton/hermit/issues/3495
+          reason: >-
+            Diverges at a read whose content differs between runs (syscall
+            134, after the JVM's .hotspotrc lookup)
+          rows: [java, javac]
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}

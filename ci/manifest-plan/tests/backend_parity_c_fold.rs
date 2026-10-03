@@ -204,6 +204,30 @@ fn sabre_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, is
     deltas
 }
 
+/// Fold 4 of the same issue moved the strict compatibility run type from 193
+/// generated validation nodes into the manifest as variant tests
+/// compat/strict-<row>, one per program of ci/compat/corpus-strict.json. Each
+/// adds the 16 rows every test has: its ptrace verify row is red (enabled, and
+/// only the strict-compat-only run type selects it), and its other 15 rows are
+/// not applicable. The plan of the full validation is unchanged.
+const STRICT_FOLD_TESTS: usize = 193;
+
+fn strict_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, isize)> {
+    let tests = STRICT_FOLD_TESTS as isize;
+    let mut deltas = vec![
+        ("ptrace", "verify", "red", tests),
+        ("native", "naked", "not-applicable", tests),
+    ];
+    for backend in ["dbt", "kvm", "liteinst", "sabre"] {
+        deltas.push((backend, "verify", "not-applicable", tests));
+    }
+    for backend in ["dbt", "kvm", "liteinst", "ptrace", "sabre"] {
+        deltas.push((backend, "chaos", "not-applicable", tests));
+        deltas.push((backend, "replay", "not-applicable", tests));
+    }
+    deltas
+}
+
 /// Cells that later changes moved between lanes after the fold, as
 /// (test, backend, mode, from lane, to lane). Each move keeps the cell and only
 /// changes which lane runs it, so the total and the per-(backend, mode) counts
@@ -636,7 +660,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
     let rows = table["cells"].as_array().unwrap();
     assert_eq!(
         rows.len(),
-        5776 + 208 + 16 * COMPAT_FOLD_TESTS + 16 * SABRE_FOLD_NEW_ROWS
+        5776 + 208 + 16 * COMPAT_FOLD_TESTS + 16 * SABRE_FOLD_NEW_ROWS + 16 * STRICT_FOLD_TESTS
     );
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for row in rows {
@@ -664,6 +688,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .chain(KVM_2026_10_03_CELL_DELTAS.iter().copied())
         .chain(KVM_SOCKET_CELL_DELTAS.iter().copied())
         .chain(sabre_fold_cell_deltas())
+        .chain(strict_fold_cell_deltas())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))

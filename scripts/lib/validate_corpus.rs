@@ -123,6 +123,10 @@ pub fn load(root: &Path, mode: &str, paths: &CorpusPaths) -> Result<Vec<CorpusRo
 /// rows were added: the corpus reached netlink only incidentally through `ip`,
 /// `ss`, and every `python3` row, none of which asserted anything about a reply,
 /// so no cell would have failed if detcore stopped normalizing netlink at all.
+///
+/// The strict-compat-only run type no longer reads this file: since
+/// 2026-10-02 its rows are the compat.yaml `variants` cells compat/strict-<row>.
+/// The super suite's portable strict rows still do.
 pub const STRICT_COMPAT_TOTAL: usize = 193;
 
 /// `RR_COMPAT_EXPECTED` (validate.sh:1117). The exact set measured to pass

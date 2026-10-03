@@ -46,7 +46,60 @@ struct Corpus {
     /// structured `ci_disabled_reason`, so its run type does not require it.
     #[serde(default)]
     unselected: Vec<CorpusUnselected>,
+    /// Second tests on the corpus backend that a focused run type adds to the
+    /// rows under its own Hermit flags and budget; the default (full)
+    /// validation does not select them.
+    #[serde(default)]
+    variants: Vec<CorpusVariant>,
     rows: Vec<CorpusRow>,
+}
+
+/// One focused run type's own test of each row except the named ones:
+/// `<bucket>/<id_prefix><id>`, whose one verify cell runs on the corpus
+/// backend. It shares the corpus's environment and comparator; its Hermit
+/// flags, budget and single-attempt reason are its own, and none of its cells
+/// is a diagnostic.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusVariant {
+    /// The run type, written as each variant test's label.
+    label: String,
+    /// Prepended to the row's test id suffix.
+    id_prefix: String,
+    /// Prefix of every variant test's description.
+    description: String,
+    #[serde(default)]
+    hermit_args: Vec<String>,
+    hermit_args_reason: Option<String>,
+    timeout_seconds: u64,
+    cpu_timeout_seconds: u64,
+    slow_reason: String,
+    no_retry_reason: String,
+    /// Rows without a variant test, grouped by the reason.
+    #[serde(default)]
+    except: Vec<CorpusRowGroup>,
+    /// Variant cells measured red, as in the corpus's own `unselected`.
+    #[serde(default)]
+    unselected: Vec<CorpusVariantUnselected>,
+}
+
+/// Rows sharing one reason.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusRowGroup {
+    reason: String,
+    rows: Vec<String>,
+}
+
+/// One failure class of a variant's cells, which all run on the corpus
+/// backend.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusVariantUnselected {
+    result: crate::ci_selection::CiDisabledResult,
+    evidence: String,
+    reason: String,
+    rows: Vec<String>,
 }
 
 /// One failure class: the cells on `backend` of the named rows, with the
@@ -291,6 +344,86 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             }
         }
     }
+    let mut variant_labels = BTreeSet::new();
+    let mut variant_ids = BTreeSet::<String>::new();
+    for variant in &corpus.variants {
+        nonempty(bucket, "variant label", &variant.label)?;
+        if !variant_labels.insert(variant.label.as_str()) {
+            return Err(format!(
+                "{bucket}: corpus variant `{}` is repeated",
+                variant.label
+            ));
+        }
+        let what = |field: &str| format!("variant {} {field}", variant.label);
+        nonempty(bucket, &what("id_prefix"), &variant.id_prefix)?;
+        nonempty(bucket, &what("description"), &variant.description)?;
+        nonempty(bucket, &what("slow_reason"), &variant.slow_reason)?;
+        nonempty(bucket, &what("no_retry_reason"), &variant.no_retry_reason)?;
+        let mut excepted = BTreeSet::new();
+        for group in &variant.except {
+            nonempty(bucket, &what("except reason"), &group.reason)?;
+            if group.rows.is_empty() {
+                return Err(format!(
+                    "{bucket}: corpus {} names no rows",
+                    what("except group")
+                ));
+            }
+            for label in &group.rows {
+                if !labels.contains(label.as_str()) {
+                    return Err(format!(
+                        "{bucket}: corpus {} names `{label}`, which is no row",
+                        what("except")
+                    ));
+                }
+                if !excepted.insert(label.as_str()) {
+                    return Err(format!(
+                        "{bucket}: corpus {} names `{label}` twice",
+                        what("except")
+                    ));
+                }
+            }
+        }
+        let mut red = BTreeSet::new();
+        for class in &variant.unselected {
+            nonempty(bucket, &what("unselected evidence"), &class.evidence)?;
+            nonempty(bucket, &what("unselected reason"), &class.reason)?;
+            if class.rows.is_empty() {
+                return Err(format!(
+                    "{bucket}: corpus {} names no rows",
+                    what("unselected class")
+                ));
+            }
+            for label in &class.rows {
+                if !labels.contains(label.as_str()) || excepted.contains(label.as_str()) {
+                    return Err(format!(
+                        "{bucket}: corpus {} names `{label}`, which has no variant test",
+                        what("unselected")
+                    ));
+                }
+                if !red.insert(label.as_str()) {
+                    return Err(format!(
+                        "{bucket}: corpus {} names `{label}` twice",
+                        what("unselected")
+                    ));
+                }
+            }
+        }
+        for row in corpus
+            .rows
+            .iter()
+            .filter(|row| !excepted.contains(row.label.as_str()))
+        {
+            let id = format!("{}{}", variant.id_prefix, row_id(row));
+            if ids.contains(id.as_str()) || variant_ids.contains(&id) {
+                return Err(format!(
+                    "{bucket}: corpus {} gives row `{}` the test id `{id}`, which another test has",
+                    what("id_prefix"),
+                    row.label
+                ));
+            }
+            variant_ids.insert(id);
+        }
+    }
     let off_reason = format!(
         "A {bucket} corpus row runs only its lane's verify cell on {}",
         corpus.backend
@@ -414,19 +547,12 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             ("slow_reason", per_cell(&|_, _, slow| string(slow))),
         ];
         if !unselected.is_empty() {
-            let result = |class: &CorpusUnselected| {
-                serde_yaml::to_value(class.result).expect("a result class serializes")
-            };
             verify.push((
                 "ci_disabled_reason",
                 mapping(unselected.iter().map(|(backend, class)| {
                     (
                         *backend,
-                        mapping([
-                            ("result", result(class)),
-                            ("evidence", string(&class.evidence)),
-                            ("reason", string(&class.reason)),
-                        ]),
+                        ci_disabled_reason(class.result, &class.evidence, &class.reason),
                     )
                 })),
             ));
@@ -449,24 +575,7 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
         if let Some(reason) = &corpus.verify.hermit_args_reason {
             verify.push(("hermit_args_reason", string(reason)));
         }
-        if !corpus.verify.env.is_empty() {
-            verify.push((
-                "env",
-                mapping(
-                    corpus
-                        .verify
-                        .env
-                        .iter()
-                        .map(|(k, v)| (k.as_str(), string(v))),
-                ),
-            ));
-        }
-        if let Some(comparator) = &corpus.verify.comparator {
-            verify.push(("comparator", string(comparator)));
-        }
-        if let Some(reason) = &corpus.verify.comparator_reason {
-            verify.push(("comparator_reason", string(reason)));
-        }
+        push_shared_verify_settings(&mut verify, &corpus.verify);
         if let Some(reason) = &corpus.verify.no_retry_reason {
             verify.push(("no_retry_reason", string(reason)));
         }
@@ -476,59 +585,189 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                 mapping([(corpus.backend.as_str(), string(reason))]),
             ));
         }
-        let mut modes = vec![("verify", mapping(verify))];
-        for mode in NON_VERIFY_MODES {
-            let backends_disabled = if mode == "naked" {
-                mapping([("native", string(&off_reason))])
-            } else {
-                mapping(
-                    BACKENDS
-                        .iter()
-                        .map(|backend| (*backend, string(&off_reason))),
-                )
-            };
-            modes.push((
-                mode,
-                mapping([
-                    ("ci", Value::Bool(false)),
-                    ("ci_disabled_reason", string(&off_reason)),
-                    ("backends_enabled", Value::Sequence(Vec::new())),
-                    ("backends_disabled", backends_disabled),
-                ]),
+        tests.push(test_recipe(
+            corpus,
+            &format!("{bucket}/{}", row_id(row)),
+            &format!("{} `{}`", corpus.description, row.label),
+            row,
+            verify,
+            &off_reason,
+            &row.labels,
+        ));
+    }
+    for variant in &corpus.variants {
+        let backend = corpus.backend.as_str();
+        let excepted = variant
+            .except
+            .iter()
+            .flat_map(|group| &group.rows)
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let unselected = variant
+            .unselected
+            .iter()
+            .flat_map(|class| class.rows.iter().map(move |label| (label.as_str(), class)))
+            .collect::<BTreeMap<_, _>>();
+        let off_reason = format!(
+            "A {bucket} corpus row's {} test runs only its verify cell on {backend}",
+            variant.label
+        );
+        let per_cell = |value: Value| mapping([(backend, value)]);
+        for row in corpus
+            .rows
+            .iter()
+            .filter(|row| !excepted.contains(row.label.as_str()))
+        {
+            let class = unselected.get(row.label.as_str());
+            let mut verify = vec![
+                (
+                    "ci",
+                    class.map_or(Value::Bool(true), |_| per_cell(Value::Bool(false))),
+                ),
+                ("backends_enabled", strings(&[backend.to_string()])),
+                (
+                    "backends_disabled",
+                    mapping(
+                        BACKENDS
+                            .iter()
+                            .filter(|other| **other != backend)
+                            .map(|other| (*other, string(&off_reason))),
+                    ),
+                ),
+                (
+                    "timeout_seconds",
+                    per_cell(Value::from(variant.timeout_seconds)),
+                ),
+                (
+                    "cpu_timeout_seconds",
+                    per_cell(Value::from(variant.cpu_timeout_seconds)),
+                ),
+                ("slow_reason", per_cell(string(&variant.slow_reason))),
+            ];
+            if let Some(class) = class {
+                verify.push((
+                    "ci_disabled_reason",
+                    per_cell(ci_disabled_reason(
+                        class.result,
+                        &class.evidence,
+                        &class.reason,
+                    )),
+                ));
+            }
+            if !variant.hermit_args.is_empty() {
+                verify.push(("hermit_args", per_cell(strings(&variant.hermit_args))));
+            }
+            if let Some(reason) = &variant.hermit_args_reason {
+                verify.push(("hermit_args_reason", string(reason)));
+            }
+            push_shared_verify_settings(&mut verify, &corpus.verify);
+            verify.push(("no_retry_reason", string(&variant.no_retry_reason)));
+            tests.push(test_recipe(
+                corpus,
+                &format!("{bucket}/{}{}", variant.id_prefix, row_id(row)),
+                &format!("{} `{}`", variant.description, row.label),
+                row,
+                verify,
+                &off_reason,
+                std::slice::from_ref(&variant.label),
             ));
         }
-        let description = format!("{} `{}`", corpus.description, row.label);
-        let test = vec![
-            (
-                "id",
-                string(&format!(
-                    "{bucket}/{}",
-                    row.id.as_deref().unwrap_or(&row.label)
-                )),
-            ),
-            ("description", string(&description)),
-            ("lane", string(&corpus.lane)),
-            ("requires", strings(&corpus.requires)),
-            ("occasional", Value::Bool(false)),
-            ("direct", strings(&row.argv)),
-            (
-                "observation",
-                mapping([
-                    ("status", Value::Bool(true)),
-                    ("stdout", Value::Bool(true)),
-                    ("stderr", Value::Bool(true)),
-                    ("artifacts", Value::Sequence(Vec::new())),
-                ]),
-            ),
-            ("modes", mapping(modes)),
-        ];
-        let mut test = test;
-        if !row.labels.is_empty() {
-            test.push(("labels", strings(&row.labels)));
-        }
-        tests.push(mapping(test));
     }
     Ok(tests)
+}
+
+/// The test id's suffix after `<bucket>/`.
+fn row_id(row: &CorpusRow) -> &str {
+    row.id.as_deref().unwrap_or(&row.label)
+}
+
+/// One structured `ci_disabled_reason` entry.
+fn ci_disabled_reason(
+    result: crate::ci_selection::CiDisabledResult,
+    evidence: &str,
+    reason: &str,
+) -> Value {
+    mapping([
+        (
+            "result",
+            serde_yaml::to_value(result).expect("a result class serializes"),
+        ),
+        ("evidence", string(evidence)),
+        ("reason", string(reason)),
+    ])
+}
+
+/// The verify settings every cell of the corpus shares: environment and
+/// comparator.
+fn push_shared_verify_settings(verify: &mut Vec<(&str, Value)>, settings: &CorpusVerify) {
+    if !settings.env.is_empty() {
+        verify.push((
+            "env",
+            mapping(settings.env.iter().map(|(k, v)| (k.as_str(), string(v)))),
+        ));
+    }
+    if let Some(comparator) = &settings.comparator {
+        verify.push(("comparator", string(comparator)));
+    }
+    if let Some(reason) = &settings.comparator_reason {
+        verify.push(("comparator_reason", string(reason)));
+    }
+}
+
+/// One expanded test: the row's argv under `verify`, with every other mode off
+/// for `off_reason`.
+fn test_recipe(
+    corpus: &Corpus,
+    id: &str,
+    description: &str,
+    row: &CorpusRow,
+    verify: Vec<(&str, Value)>,
+    off_reason: &str,
+    labels: &[String],
+) -> Value {
+    let mut modes = vec![("verify", mapping(verify))];
+    for mode in NON_VERIFY_MODES {
+        let backends_disabled = if mode == "naked" {
+            mapping([("native", string(off_reason))])
+        } else {
+            mapping(
+                BACKENDS
+                    .iter()
+                    .map(|backend| (*backend, string(off_reason))),
+            )
+        };
+        modes.push((
+            mode,
+            mapping([
+                ("ci", Value::Bool(false)),
+                ("ci_disabled_reason", string(off_reason)),
+                ("backends_enabled", Value::Sequence(Vec::new())),
+                ("backends_disabled", backends_disabled),
+            ]),
+        ));
+    }
+    let mut test = vec![
+        ("id", string(id)),
+        ("description", string(description)),
+        ("lane", string(&corpus.lane)),
+        ("requires", strings(&corpus.requires)),
+        ("occasional", Value::Bool(false)),
+        ("direct", strings(&row.argv)),
+        (
+            "observation",
+            mapping([
+                ("status", Value::Bool(true)),
+                ("stdout", Value::Bool(true)),
+                ("stderr", Value::Bool(true)),
+                ("artifacts", Value::Sequence(Vec::new())),
+            ]),
+        ),
+        ("modes", mapping(modes)),
+    ];
+    if !labels.is_empty() {
+        test.push(("labels", strings(labels)));
+    }
+    mapping(test)
 }
 
 /// The repository root, in a `direct` argv element.
@@ -660,6 +899,62 @@ mod tests {
 
     fn tests_of(document: &Value) -> &Vec<Value> {
         document["test"].as_sequence().unwrap()
+    }
+
+    /// The shipped compat manifest, read at compile time relative to this
+    /// file, because scripts/manifest-to-commands.rs compiles this module
+    /// under rust-script, where CARGO_MANIFEST_DIR is not ci/manifest-plan.
+    const COMPAT_YAML: &str = include_str!("../../../tests/e2e/manifests/compat.yaml");
+
+    /// compat.yaml's strict variant runs exactly the programs of
+    /// ci/compat/corpus-strict.json, the corpus STRICT_COMPAT_TOTAL counts and
+    /// the super suite still reads: a row added to either file without the
+    /// other fails here instead of silently changing the strict run type.
+    #[test]
+    fn the_strict_variant_runs_exactly_the_strict_corpus_programs() {
+        let document: Value = serde_yaml::from_str(COMPAT_YAML).unwrap();
+        let label_of = document["corpus"]["rows"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                let label = row["label"].as_str().unwrap();
+                (
+                    row["id"].as_str().unwrap_or(label).to_owned(),
+                    label.to_owned(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let expanded = expand_corpus(document).unwrap();
+        let strict_label = Value::from("strict-compat-only");
+        let variant = tests_of(&expanded)
+            .iter()
+            .filter(|test| {
+                test["labels"]
+                    .as_sequence()
+                    .is_some_and(|labels| labels.contains(&strict_label))
+            })
+            .map(|test| {
+                let id = test["id"].as_str().unwrap();
+                let row = id.strip_prefix("compat/strict-").unwrap_or_else(|| {
+                    panic!("{id}: a strict-compat-only test outside the strict variant")
+                });
+                label_of[row].clone()
+            })
+            .collect::<BTreeSet<_>>();
+        let corpus: serde_json::Value =
+            serde_json::from_str(include_str!("../../compat/corpus-strict.json")).unwrap();
+        let strict = corpus["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["label"].as_str().unwrap().to_owned())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(strict.len(), 193);
+        assert_eq!(
+            variant.symmetric_difference(&strict).collect::<Vec<_>>(),
+            Vec::<&String>::new()
+        );
     }
 
     #[test]
@@ -817,6 +1112,143 @@ mod tests {
             "heavy fixture budget: a compile workload"
         );
         assert_eq!(verify["ci"], seq("{ptrace: false, sabre: true}"));
+    }
+
+    /// The corpus with a strict variant: one row excepted, one red.
+    fn variant_corpus() -> String {
+        CORPUS.replace(
+            "  rows:\n    - {label: \"echo\"",
+            r#"  variants:
+    - label: strict-compat-only
+      id_prefix: strict-
+      description: Fixture program without relaxations
+      timeout_seconds: 30
+      cpu_timeout_seconds: 29
+      slow_reason: strict fixture budget
+      no_retry_reason: strict fixture single run
+      except:
+        - reason: not in the fixture strict corpus
+          rows: [echo]
+      unselected:
+        - result: determinism-failure
+          evidence: https://github.com/rrnewton/hermit/issues/3
+          reason: fixture strict divergence
+          rows: [slow]
+  rows:
+    - {label: "echo""#,
+        )
+    }
+
+    #[test]
+    fn a_variant_adds_one_labelled_test_per_row_on_the_corpus_backend() {
+        let expanded = expand_corpus(document(&variant_corpus())).unwrap();
+        let tests = tests_of(&expanded);
+        let ids = tests
+            .iter()
+            .map(|test| test["id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        // The rows' own tests are unchanged and come first; echo is excepted.
+        assert_eq!(
+            ids,
+            [
+                "fixture/echo",
+                "fixture/gxx",
+                "fixture/slow",
+                "fixture/strict-gxx",
+                "fixture/strict-slow"
+            ]
+        );
+        assert_eq!(
+            tests[..3],
+            tests_of(&expand_corpus(document(CORPUS)).unwrap())[..]
+        );
+        let seq = |text: &str| serde_yaml::from_str::<Value>(text).unwrap();
+        let gxx = &tests[3];
+        assert_eq!(
+            gxx["description"],
+            "Fixture program without relaxations `g++`"
+        );
+        assert_eq!(gxx["labels"], seq("[strict-compat-only]"));
+        assert_eq!(gxx["direct"], seq("[/usr/bin/g++, --version]"));
+        let verify = &gxx["modes"]["verify"];
+        assert_eq!(verify["ci"], true);
+        assert_eq!(verify["backends_enabled"], seq("[ptrace]"));
+        assert!(verify["backends_disabled"].get("ptrace").is_none());
+        assert!(verify["backends_disabled"]["sabre"].as_str().is_some());
+        // No corpus hermit_args, its own budget and single-attempt reason, the
+        // corpus's environment and comparator, and no cell labels.
+        assert!(verify.get("hermit_args").is_none());
+        assert!(verify.get("hermit_args_reason").is_none());
+        assert_eq!(verify["timeout_seconds"], seq("{ptrace: 30}"));
+        assert_eq!(verify["cpu_timeout_seconds"], seq("{ptrace: 29}"));
+        assert_eq!(
+            verify["slow_reason"],
+            seq("{ptrace: strict fixture budget}")
+        );
+        assert_eq!(verify["no_retry_reason"], "strict fixture single run");
+        assert_eq!(verify["env"]["TMPDIR"], "/tmp");
+        assert_eq!(verify["comparator"], "stripped");
+        assert!(verify.get("labels").is_none());
+        // slow: a diagnostic row in the corpus, but no variant cell is one;
+        // its variant cell is red.
+        let slow = &tests[4]["modes"]["verify"];
+        assert!(slow.get("diagnostic").is_none());
+        assert_eq!(slow["timeout_seconds"], seq("{ptrace: 30}"));
+        assert_eq!(slow["ci"], seq("{ptrace: false}"));
+        assert_eq!(
+            slow["ci_disabled_reason"],
+            seq(
+                "{ptrace: {result: determinism-failure, evidence: 'https://github.com/rrnewton/hermit/issues/3', reason: fixture strict divergence}}"
+            )
+        );
+        // Variant Hermit flags replace the corpus's.
+        let flagged = expand_corpus(document(&variant_corpus().replace(
+            "      timeout_seconds: 30",
+            "      hermit_args: [--fixture-flag]\n      hermit_args_reason: fixture reason\n      timeout_seconds: 30",
+        )))
+        .unwrap();
+        let verify = &tests_of(&flagged)[3]["modes"]["verify"];
+        assert_eq!(verify["hermit_args"], seq("{ptrace: [--fixture-flag]}"));
+        assert_eq!(verify["hermit_args_reason"], "fixture reason");
+    }
+
+    #[test]
+    fn a_malformed_variant_is_refused() {
+        let variant = variant_corpus();
+        let refused = |from: &str, to: &str| {
+            assert!(variant.contains(from), "{from}");
+            expand_corpus(document(&variant.replace(from, to))).unwrap_err()
+        };
+        assert!(refused("rows: [echo]", "rows: [absent]").contains("which is no row"));
+        assert!(refused("rows: [echo]", "rows: [echo, echo]").contains("twice"));
+        assert!(refused("rows: [echo]", "rows: []").contains("names no rows"));
+        assert!(refused("rows: [slow]", "rows: [echo]").contains("which has no variant test"));
+        assert!(refused("rows: [slow]", "rows: [slow, slow]").contains("twice"));
+        assert!(refused("rows: [slow]", "rows: []").contains("names no rows"));
+        assert!(refused("id_prefix: strict-", "id_prefix: \"\"").contains("nonempty"));
+        // strict-gxx would collide with a row's own test id.
+        assert!(
+            refused(
+                "{label: \"slow\", argv",
+                "{label: \"slow\", id: strict-gxx, argv"
+            )
+            .contains("which another test has")
+        );
+        assert!(
+            refused(
+                "  rows:\n    - {label: \"echo\"",
+                &format!(
+                    "{}  rows:\n    - {{label: \"echo\"",
+                    &variant[variant.find("    - label: strict").unwrap()
+                        ..variant.find("  rows:\n").unwrap()]
+                )
+            )
+            .contains("is repeated")
+        );
+        assert!(
+            refused("      id_prefix", "      surprise: 1\n      id_prefix")
+                .contains("invalid corpus section")
+        );
     }
 
     #[test]

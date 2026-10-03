@@ -86,7 +86,6 @@ const COMPAT_MEM_BYTES: i64 = 4 * 1024 * 1024 * 1024;
 /// Which compatibility corpus a focused mode runs, and how it is labelled.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CompatMode {
-    Strict,
     PortableStrict,
     E9patch,
     Rr,
@@ -94,11 +93,12 @@ pub enum CompatMode {
 
 impl CompatMode {
     /// The `ci/compat/corpus-<mode>.json` file this mode reads. `PortableStrict`
-    /// shares `strict`'s corpus: `PORTABLE_STRICT_PROBE_ARGS` changes the Hermit
-    /// FLAGS, never corpus membership (validate.sh:2965).
+    /// reads the strict lane's corpus: `PORTABLE_STRICT_PROBE_ARGS` changes the
+    /// Hermit FLAGS, never corpus membership (validate.sh:2965). The strict lane
+    /// itself runs those rows as compat.yaml cells since 2026-10-02.
     pub fn corpus_name(self) -> &'static str {
         match self {
-            CompatMode::Strict | CompatMode::PortableStrict => "strict",
+            CompatMode::PortableStrict => "strict",
             CompatMode::E9patch => "e9patch",
             CompatMode::Rr => "rr",
         }
@@ -107,7 +107,7 @@ impl CompatMode {
     /// Plain-language name printed per row and in the summary.
     pub fn display_name(self) -> &'static str {
         match self {
-            CompatMode::Strict | CompatMode::PortableStrict => "legacy below-L2 stripped verify",
+            CompatMode::PortableStrict => "legacy below-L2 stripped verify",
             CompatMode::E9patch => "e9patch legacy below-L2 stripped verify",
             CompatMode::Rr => "rr",
         }
@@ -118,14 +118,6 @@ impl CompatMode {
     pub fn run_args(self, label: &str, nsswitch: &str) -> Vec<String> {
         let s = |v: &str| v.to_string();
         match self {
-            CompatMode::Strict => vec![
-                s("run"),
-                s("--strict"),
-                s("--verify"),
-                s("--env"),
-                s("TMPDIR=/tmp"),
-                s("--"),
-            ],
             CompatMode::PortableStrict => vec![
                 s("run"),
                 s("--strict"),
@@ -197,9 +189,6 @@ pub enum CompatDisposition {
     Passed,
     /// Passed while listed as known fail-closed. The EXPECTATION is stale, not the run.
     PassedButListedFailClosed,
-    /// Failed, listed, and exempted. This is `Strict`'s historical behaviour and is deliberately
-    /// confined to it.
-    KnownFailClosedExempt,
     /// Failed while listed as known fail-closed, and STILL BLOCKING. Reporting the row's reason
     /// is not the same as excusing it; this variant exists so the reason can be printed without
     /// the failure being downgraded.
@@ -230,7 +219,7 @@ impl CompatDisposition {
 /// exercise every combination without constructing or planting a corpus, and so production
 /// keeps reading the real tables.
 ///
-/// `Strict` keeps its exemption. `PortableStrict` gains REPORTING ONLY. Every other mode --
+/// `PortableStrict` gains REPORTING ONLY. Every other mode --
 /// `E9patch`, `Rr` -- consults neither table and gains nothing: a failure there is
 /// blocking exactly as before.
 pub fn classify_compat_outcome(
@@ -239,10 +228,9 @@ pub fn classify_compat_outcome(
     listed_failclosed: bool,
     listed_diagnostic: bool,
 ) -> CompatDisposition {
-    // Only the two strict modes consult the fail-closed table at all; it describes what
+    // Only the strict mode consults the fail-closed table at all; it describes what
     // `--strict` refuses, which says nothing about the other backends.
-    let consults_failclosed =
-        matches!(mode, CompatMode::Strict | CompatMode::PortableStrict) && listed_failclosed;
+    let consults_failclosed = mode == CompatMode::PortableStrict && listed_failclosed;
     if ok {
         if consults_failclosed {
             return CompatDisposition::PassedButListedFailClosed;
@@ -250,10 +238,7 @@ pub fn classify_compat_outcome(
         return CompatDisposition::Passed;
     }
     if consults_failclosed {
-        return match mode {
-            CompatMode::Strict => CompatDisposition::KnownFailClosedExempt,
-            _ => CompatDisposition::KnownFailClosedBlocking,
-        };
+        return CompatDisposition::KnownFailClosedBlocking;
     }
     if mode == CompatMode::PortableStrict && listed_diagnostic {
         return CompatDisposition::PortableDiagnostic;

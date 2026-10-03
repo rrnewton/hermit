@@ -5103,7 +5103,7 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 2372);
+        assert_eq!(parsed.cells.len(), 3144);
         assert_eq!(
             parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
             [&ParityBackend::Dbt]
@@ -5141,12 +5141,16 @@ mod tests {
         // 2372 (593 per backend) and 3 more applicable SaBRe cells since the
         // rows lua-direct, perl-direct and df-direct kept the SaBRe corpus's
         // single-image argv.
+        // 3144 (786 per backend) since fold 4 added the strict-compat-only
+        // run type's 193 variant tests, each declaring its verify cell
+        // disabled on the four non-ptrace backends like the rows it repeats:
+        // 772 more cells and no applicable, selectable or selected one.
         // Six earlier and three socket KVM verify enables add applicable,
         // selectable and selected cells without adding candidate identities.
         // https://github.com/rrnewton/reverie/issues/891
         assert_eq!(
             row(&counts.all),
-            (2372, 843 + 6 + 3, 527 + 6 + 3, 194 + 6 + 3, 177 + 6 + 3)
+            (3144, 843 + 6 + 3, 527 + 6 + 3, 194 + 6 + 3, 177 + 6 + 3)
         );
         let by_backend: Vec<_> = counts
             .by_backend
@@ -5156,13 +5160,13 @@ mod tests {
         assert_eq!(
             by_backend,
             [
-                ("dbt", (593, 85, 26, 16, 2)),
+                ("dbt", (786, 85, 26, 16, 2)),
                 (
                     "kvm",
-                    (593, 250 + 6 + 3, 243 + 6 + 3, 77 + 6 + 3, 76 + 6 + 3)
+                    (786, 250 + 6 + 3, 243 + 6 + 3, 77 + 6 + 3, 76 + 6 + 3)
                 ),
-                ("liteinst", (593, 149, 146, 99, 98)),
-                ("sabre", (593, 359, 112, 2, 1)),
+                ("liteinst", (786, 149, 146, 99, 98)),
+                ("sabre", (786, 359, 112, 2, 1)),
             ]
         );
     }

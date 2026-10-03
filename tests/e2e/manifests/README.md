@@ -31,7 +31,8 @@ Seven buckets currently contain calibrated blocking workloads:
 - `c-programs.yaml` (eight calibrated Buck-derived C probes)
 - `compat.yaml` (the 189-program strict compatibility corpus, written as a
   `corpus` section; five of its rows are diagnostics; it also holds the
-  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows)
+  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, and the
+  `strict-compat-only` run type's 193 strict variant tests)
 
 Eight additional `*-c.yaml`/`c-programs.yaml` buckets make 180 more C guests
 centrally discoverable. Eight `c-programs.yaml` entries have calibrated
@@ -400,7 +401,14 @@ why that row's cell is a diagnostic, with its own shortened budget, and
 on one more backend to every row except those its `except` names (each with
 the reason that backend is disabled there), labelled with a run type (below),
 so the default run type does not run it; it shares the section's verify
-settings except `hermit_args`, which stay on the section's backend. A row's own
+settings except `hermit_args`, which stay on the section's backend. Each
+`variants` entry adds one more test per row except those its `except` groups
+name (each group with its reason): id `<bucket>/<id_prefix><id or label>`,
+labelled with the entry's run type, with one verify cell on the section's
+backend that keeps the section's environment and comparator but takes its
+`hermit_args` (none unless stated), budget, `slow_reason` and
+`no_retry_reason` from the entry and is never a diagnostic; the entry's own
+`unselected` lists its cells measured red. A row's own
 `labels` put all of its cells in those run types. `unselected` lists cells
 measured red: each stays enabled with `ci: false` and a `ci_disabled_reason`
 carrying the class's `result`, `evidence` (an issue) and `reason`. A row's

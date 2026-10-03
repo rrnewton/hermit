@@ -1165,7 +1165,7 @@ fn usage() -> &'static str {
      \x20 --portable       Alias for the portable-only level.\n\
      \n\
      Focused gates (run one matrix/lane and exit):\n\
-     \x20 --strict-compat-only          Run the blocking legacy stripped app matrix.\n\
+     \x20 --strict-compat-only          Only the compat bucket's strict cells (label strict-compat-only).\n\
      \x20 --portable-strict-compat-only Only the strict compatibility bucket (compat.yaml), release Hermit.\n\
      \x20 --rr-compat-only              Gate the known-passing record/replay matrix.\n\
      \x20 --sabre-compat-only           Only the compat bucket's SaBRe cells (label sabre-compat-only).\n\
@@ -2099,11 +2099,8 @@ const STRICT_EXECUTION_FLAG: &str = "--strict";
 /// `record start --verify --verify-strict`, a different path with a different
 /// evidence policy and no `--strict` marker, so folding it into this list would
 /// assert something untrue about it.
-const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 3] = [
-    CompatMode::Strict,
-    CompatMode::PortableStrict,
-    CompatMode::E9patch,
-];
+const LEGACY_BELOW_L2_STRICT_MODES: [CompatMode; 2] =
+    [CompatMode::PortableStrict, CompatMode::E9patch];
 
 /// Whether a rendered plan is missing the literal strict flag from Hermit's
 /// option prefix.
@@ -3011,24 +3008,6 @@ fn self_test() -> Result<(), String> {
                 D::PortableDiagnostic,
                 false,
             ),
-            // Strict keeps its historical exemption, and only Strict has it.
-            (
-                CompatMode::Strict,
-                false,
-                true,
-                false,
-                D::KnownFailClosedExempt,
-                false,
-            ),
-            (
-                CompatMode::Strict,
-                true,
-                true,
-                false,
-                D::PassedButListedFailClosed,
-                false,
-            ),
-            (CompatMode::Strict, false, false, false, D::Blocking, true),
             // No other mode consults either table: a failure blocks whatever the tables say.
             (CompatMode::E9patch, false, true, false, D::Blocking, true),
             (CompatMode::E9patch, false, false, true, D::Blocking, true),
@@ -3217,25 +3196,6 @@ fn self_test() -> Result<(), String> {
                  measured population: base={passed}/{measured} {blocking:?}, with unknown={unknown_passed}/{unknown_measured} {unknown_blocking:?}"
             ));
         }
-        // And the same planted table under Strict must exempt the listed failure, so the
-        // bracket also pins that the two modes still differ.
-        let (_, _, strict_blocking, strict_nonblocking) = compat_summary_with_tables(
-            CompatMode::Strict,
-            "compat.",
-            &outcomes,
-            &planted_known,
-            &planted_diag,
-        );
-        if strict_blocking.iter().any(|l| l == "listed_fails") {
-            return Err(format!(
-                "Strict lost its historical exemption for a listed row: {strict_blocking:?}"
-            ));
-        }
-        if strict_nonblocking != BTreeSet::from(["compat.listed_fails".to_string()]) {
-            return Err(format!(
-                "Strict nonblocking failures did not retain exactly its listed exemption: {strict_nonblocking:?}"
-            ));
-        }
     }
 
     // Strict-execution bracket for the legacy below-L2 compatibility modes.
@@ -3256,7 +3216,7 @@ fn self_test() -> Result<(), String> {
                  legacy below-L2 run would not use strict execution: {rendered:?}"
             ));
         }
-        if matches!(mode, CompatMode::Strict | CompatMode::PortableStrict)
+        if mode == CompatMode::PortableStrict
             && !rendered[..guest_separator]
                 .windows(2)
                 .any(|pair| pair == ["--env", "TMPDIR=/tmp"])
@@ -11607,7 +11567,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
             selection_mode = "selected";
         }
         let (compat, compat_prefix) = match label {
-            "strict-compat-only" => (Some(CompatMode::Strict), Some("strictcompat.")),
             "rr-compat-only" => (Some(CompatMode::Rr), Some("rrcompat.")),
             "e9patch-compat-only" => (Some(CompatMode::E9patch), Some("e9patchcompat.")),
             _ => (None, None),
@@ -11864,13 +11823,28 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     sabre_prep.labels = vec!["sabre-compat-only".into()];
     steps.push(sabre_prep);
 
+    // The strict run type's rows are the compat.yaml cells labelled
+    // strict-compat-only, run the same way by strictcompat.manifest_compat.
+    let mut strict_prep = prepare_fixtures_node_dep(
+        "strictcompatprep.fixtures",
+        &portable_fixtures,
+        "build.host_hermit_link",
+    );
+    strict_prep.group = "strictcompatprep".into();
+    strict_prep.desc = "Prepare the fixture files the strict run type's compat cells read".into();
+    strict_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of strictcompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
+        portable_fixtures.display()
+    );
+    strict_prep.labels = vec!["strict-compat-only".into()];
+    steps.push(strict_prep);
+
     for (mode, namespace, label) in [
         (
             CompatMode::PortableStrict,
             "portablecompat",
             "portable-strict-compat-only",
         ),
-        (CompatMode::Strict, "strictcompat", "strict-compat-only"),
         (CompatMode::E9patch, "e9patchcompat", "e9patch-compat-only"),
         (CompatMode::Rr, "rrcompat", "rr-compat-only"),
     ] {
@@ -13687,7 +13661,7 @@ fn summary_listing_bracket() -> Result<String, String> {
     }
     // Compatibility is deliberately different: its policy owns the matrix
     // rows, while only failures outside that matrix are added.
-    if effective_failure_count(Some(CompatMode::Strict), 99, 2, 1) != 3 {
+    if effective_failure_count(Some(CompatMode::PortableStrict), 99, 2, 1) != 3 {
         return Err(
             "failure count: compatibility matrix and structural failure populations were not kept separate"
                 .into(),
@@ -14121,11 +14095,7 @@ fn compat_summary_with_attempts(
         // ONE decision, read twice: once for what to print and once for whether the row
         // blocks. Before this the two were separate arms of the same `if`, which is how a
         // reporting change can silently become an exemption.
-        // `display_name()` deliberately renders Strict and PortableStrict identically, but these
-        // two modes treat a listed row in OPPOSITE ways, so the message must distinguish them or
-        // the reader cannot tell an exemption from a blocking report.
         let mode_label = match mode {
-            CompatMode::Strict => "--strict",
             CompatMode::PortableStrict => "--portable-strict",
             other => other.display_name(),
         };
@@ -14142,12 +14112,6 @@ fn compat_summary_with_attempts(
                     "  WARN {label} passed but is listed as known fail-closed under {} \
                      ({}); the EXPECTATION is STALE -- drop it from the known-failure table",
                     mode_label, known[label]
-                );
-            }
-            CompatDisposition::KnownFailClosedExempt => {
-                println!(
-                    "  WARN {label} known fail-closed under --strict ({}; nonblocking)",
-                    known[label]
                 );
             }
             CompatDisposition::KnownFailClosedBlocking => {
@@ -14178,7 +14142,7 @@ fn compat_summary_with_attempts(
     // forever -- it can neither fail (nothing ran it) nor be reported stale (it never passed),
     // so the table grows entries no run can retire. Naming them is reporting only; it changes
     // no verdict.
-    if matches!(mode, CompatMode::Strict | CompatMode::PortableStrict) {
+    if mode == CompatMode::PortableStrict {
         let unmeasured: Vec<&str> = known
             .keys()
             .copied()
@@ -17269,8 +17233,10 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // portablecompat.<program> probes of the portable-strict-compat-only
         // run type (fold 2 of the same issue). 38 since
         // sabrecompat.manifest_compat replaced the 212 sabrecompat.<program>
-        // probes of the sabre-compat-only run type (fold 3).
-        assert_eq!(steps.len(), 38);
+        // probes of the sabre-compat-only run type (fold 3). 39 since
+        // strictcompat.manifest_compat replaced the 193 strictcompat.<program>
+        // probes of the strict-compat-only run type (fold 4).
+        assert_eq!(steps.len(), 39);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -20883,15 +20849,17 @@ fn compat_test_results(
     TestResults::current(executed, 0, results)
 }
 
-/// Add a focused compatibility lane's direct rows (`strictcompat.*`,
-/// `sabrecompat.*`, ...) to the exact test denominator.
+/// Add a focused compatibility lane's direct rows (`rrcompat.*`,
+/// `e9patchcompat.*`) to the exact test denominator.
 ///
 /// Before those lanes were flattened, a nested validate published a single
 /// structured-count file to one outer step. The direct steps already carry
 /// stronger typed terminal outcomes and attempts, so the outer producer now
 /// consumes those facts itself. (The portable strict corpus reports through
 /// its manifest bucket instead: e2e.manifest_compat, and
-/// portablecompat.manifest_compat in the corpus-only lane.) A failed
+/// portablecompat.manifest_compat in the corpus-only lane; so do the SaBRe
+/// and strict run types, through sabrecompat.manifest_compat and
+/// strictcompat.manifest_compat.) A failed
 /// count-bearing non-compatibility node still leaves the passed count unknown;
 /// flattening must not turn an inexact base count into an exact-looking total.
 fn run_test_counts(
@@ -26705,7 +26673,7 @@ fn run(
         compat_measured = Some(measured);
         let floor = match mode {
             CompatMode::Rr => Some(validate_corpus::RR_COMPAT_EXPECTED),
-            CompatMode::Strict | CompatMode::PortableStrict | CompatMode::E9patch => None,
+            CompatMode::PortableStrict | CompatMode::E9patch => None,
         };
         if let Some(f) = floor {
             if passed < f {
@@ -31340,8 +31308,10 @@ mod raw_census_publication_tests {
         // portablecompat.<program> probes of the portable-strict-compat-only
         // run type (fold 2 of the same issue). 38 since
         // sabrecompat.manifest_compat replaced the 212 sabrecompat.<program>
-        // probes of the sabre-compat-only run type (fold 3).
-        assert_eq!(publishers.len(), 38);
+        // probes of the sabre-compat-only run type (fold 3). 39 since
+        // strictcompat.manifest_compat replaced the 193 strictcompat.<program>
+        // probes of the strict-compat-only run type (fold 4).
+        assert_eq!(publishers.len(), 39);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             let expects_proc_locks_runtime = matches!(
