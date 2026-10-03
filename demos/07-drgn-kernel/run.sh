@@ -33,6 +33,7 @@ Useful overrides:
   DEMO07_SNAPSHOT_NAME=name  internal snapshot name (default: hermit-boot)
   DEMO07_VMLINUX=/path       matching ELF debug/BTF image (extracted from bzImage by default)
   DEMO07_TIMEOUT=240         restore/advance timeout in seconds
+  DEMO07_ARTIFACTS=/path     per-pass run directories (default: target/demos/07-drgn-kernel)
   DEMO07_QEMU_BIOS=/path     QEMU firmware directory, for a QEMU in a non-standard prefix
   DEMO07_QEMU_LIBRARY_PATH=/path  extra LD_LIBRARY_PATH for that QEMU
 EOF
