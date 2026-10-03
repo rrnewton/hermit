@@ -1750,12 +1750,14 @@ impl Replayer {
     // TODO-HUMAN-REVIEW(PR-3601)
     /// Replays an xattr change from its recorded result. Every xattr query
     /// also replays from the recording, so the guest never reads the replay
-    /// root's attributes directly. The kernel does, for a few names: an access
-    /// ACL rewrites the mode bits, a default ACL shapes later creations, and a
-    /// file capability sets what a later exec grants. Those govern calls
-    /// replay runs live, so a change to one of them that the recording saw
-    /// succeed on a file in the replay root must establish its end state
-    /// there, or replay refuses to continue. A change to any other name is
+    /// root's attributes directly. The kernel does, for some names: an access
+    /// ACL rewrites the mode bits, a default ACL shapes later creations, a file
+    /// capability sets what a later exec grants, and the other `security.`
+    /// names are labels that security modules (SELinux, Smack, IMA, EVM)
+    /// consult on access and exec. Those govern calls replay runs live, so a
+    /// change to one of them that the recording saw succeed on a file in the
+    /// replay root must establish its end state there, even a read-only one
+    /// (EROFS), or replay refuses to continue. A change to any other name is
     /// carried over where the replay root can take it and otherwise kept
     /// virtual: nothing that replay runs live can observe it.
     ///
@@ -1766,8 +1768,8 @@ impl Replayer {
     /// ends in the recorded state too.
     ///
     /// A file the replay root lacks (a placeholder descriptor, ENOENT or
-    /// ENOTDIR) or cannot write (EROFS) keeps the change virtual, whatever the
-    /// name, as other path mutations do. No live call can reach such a file:
+    /// ENOTDIR) keeps the change virtual, whatever the name, as other path
+    /// mutations do. No live call can reach such a file:
     /// tools that copy a file's ACL to their output, such as strip, and
     /// installs that set a capability on a staged binary both change files
     /// outside the recorded tree.
@@ -1821,8 +1823,8 @@ impl Replayer {
         });
         let governs_live_calls = matches!(
             name.to_bytes(),
-            b"system.posix_acl_access" | b"system.posix_acl_default" | b"security.capability"
-        );
+            b"system.posix_acl_access" | b"system.posix_acl_default"
+        ) || name.to_bytes().starts_with(b"security.");
         // A placeholder descriptor names a file the replay root lacks.
         let outcome = if in_replay_root {
             guest.inject_with_retry(live_call).await.map(drop)
@@ -1832,7 +1834,7 @@ impl Replayer {
         match outcome {
             Ok(()) => {}
             Err(Errno::ENODATA) if is_removal => {}
-            Err(error @ (Errno::ENOENT | Errno::ENOTDIR | Errno::EROFS)) => {
+            Err(error @ (Errno::ENOENT | Errno::ENOTDIR)) => {
                 tracing::debug!(?syscall, %error, "replay xattr change kept virtual");
             }
             Err(error) if !governs_live_calls => {
