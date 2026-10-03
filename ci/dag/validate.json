@@ -262,7 +262,7 @@
       "group": "check",
       "job": "dbt_runtime_abi",
       "desc": "Hermit supplies every reverie_dbt_runtime_* callback the DBT client declares",
-      "description": "The DBT client declares and calls every reverie_dbt_runtime_* callback unconditionally, but their upstream definitions sit behind reverie-dbt's prototype-runtime feature, which detcore-dbt disables by design so Hermit can supply Detcore's runtime instead. The two lists are joined by hand and nothing compared them: cargo cannot, because the client is C and the link happens when DynamoRIO loads it. MEASURED 2026-08-20: test.dbt_parity had been red nine days on one missing symbol, and advancing the Reverie pin took the gap from one to five while every build stayed green. This node compares the two dynamic symbol tables and names the missing callbacks, which DynamoRIO's own '<ERROR: using undefined symbol!>' never does. test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301 and its 28 cases became DBT verify cells of the c-programs and system-utils manifests, so e2e.manifest_c_programs, e2e.manifest_system_utils and privileged-e2e.manifest_c_programs depend on this node. THOSE DEPENDENCIES ARE AN ORDERING FIX, NOT A DATA DEPENDENCY: nothing this node produces is consumed; the check runs first so a missing callback is named before eager-exit can cancel it. The cost is that a failure here skips those nodes' cells on every backend for that run, which is already red with the cause named. The e2e _on_host twins do not depend on it: the hosted-portable workflow runs each of them as its own job through ci/run-node.sh, which omits dependencies outside the job's selection, while this node runs in the separate dbt-parity release-shard job, which an E2E failure cannot cancel; ci/check-shard-coverage.sh therefore refuses an E2E edge to a node that no earlier hosted job supplies. The privileged-only-e2e nodes do not depend on it because this node is not in the privileged or hosted-privileged profiles.",
+      "description": "The DBT client declares and calls every reverie_dbt_runtime_* callback unconditionally, but their upstream definitions sit behind reverie-dbt's prototype-runtime feature, which detcore-dbt disables by design so Hermit can supply Detcore's runtime instead. The two lists are joined by hand and nothing compared them: cargo cannot, because the client is C and the link happens when DynamoRIO loads it. MEASURED 2026-08-20: test.dbt_parity had been red nine days on one missing symbol, and advancing the Reverie pin took the gap from one to five while every build stayed green. This node compares the two dynamic symbol tables and names the missing callbacks, which DynamoRIO's own '<ERROR: using undefined symbol!>' never does. test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301 and its 28 cases became DBT verify cells of the c-programs and system-utils manifests, so e2e.manifest_c_programs, e2e.manifest_system_utils and privileged-e2e.manifest_c_programs depend on this node. THOSE DEPENDENCIES ARE AN ORDERING FIX, NOT A DATA DEPENDENCY: nothing this node produces is consumed; the check runs first so a missing callback is named before eager-exit can cancel it. The cost is that a failure here skips those nodes' cells on every backend for that run, which is already red with the cause named. The e2e _on_host twins do not depend on it: the hosted-portable workflow runs each of them as its own job through ci/run-node.sh, which omits dependencies outside the job's selection, while this node runs in the separate dbt-runtime-abi release-shard job, which an E2E failure cannot cancel; ci/check-shard-coverage.sh therefore refuses an E2E edge to a node that no earlier hosted job supplies. The privileged-only-e2e nodes do not depend on it because this node is not in the privileged or hosted-privileged profiles.",
       "labels": [
         "full",
         "portable"
@@ -371,25 +371,22 @@
     },
     {
       "group": "check",
-      "job": "backend_parity_suites",
-      "desc": "Backend-parity driver contracts, including the L2 evidence-tier gate",
-      "description": "EXECUTION GAP CLOSED 2026-08-25 (task three_backend_parity_suites). These three self-contained Python suites were inventoried as driver-owned but had no DAG node: inventory established ownership, not execution, and neither the backend-parity mutation node nor running run_matrix.py as the DBT parity program imports them. Before wiring, all three were run directly at bc9d1782acf0 and passed: verify-tier evidence (50 runtime checks), scorecard-header compatibility (73), and atomic run-matrix output (19). The suite guards typed-verdict-only L2 claims, non-vacuous compared-log counts, operand-derived parity and schema compatibility, and whole-or-nothing result artifacts. It consumes the verification-report binary produced by build.workspace, but has no guest or backend prerequisite.",
+      "job": "e9patch_corpus",
+      "desc": "e9patch corpus driver contracts (typed build-info and engagement readers)",
+      "description": "tests/e9patch/e9patch_corpus.py ratchets e9patch preprocessing parity against golden ptrace, but it needs e9tool and a Hermit built with the e9patch cargo feature, and CI has neither, so no validation lane runs its guests. This node runs tests/e9patch/test_e9patch_corpus.py, which checks the driver without running Hermit or compiling a guest: the build-info reader follows the boolean features.e9patch of a schema-1 `hermit version --json` record and refuses a record without it by field name; the engagement reader follows the producer's candidate, mapped and B0 site counts and refuses a record that lacks one; corpus commands use the caller's private host --tmp root rather than host /tmp; and `e9patch_corpus.py --check` finds exactly the corpus guest sources. The six reader checks ran in check.backend_parity_suites, inside tests/backend-parity/test_verify_tier_evidence.py, until the corpus moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. The --tmp check came from tests/backend-parity/test_parallel_validate_paths.py, which no node ran.",
       "labels": [
         "full",
+        "hosted-portable",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; VERIFICATION_REPORT_BIN=$PWD/target/validate/verification-report python3 tests/backend-parity/test_verify_tier_evidence.py && python3 tests/backend-parity/test_scorecard_header_compat.py && python3 tests/backend-parity/test_run_matrix_output_skew.py'",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 tests/e9patch/test_e9patch_corpus.py",
       "result_manifests": [],
       "deps": [
-        "build.rust_scripts_in_pinned_root",
-        "build.workspace_in_pinned_root",
+        "build.rust_scripts",
         "gate.manifest",
-        "pre.reverie_pin",
-        "setup.pinned_root_fetch"
+        "pre.reverie_pin"
       ],
-      "env": {
-        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
-      },
+      "env": {},
       "networkonly": false,
       "engine_only": false,
       "timeout": 60,
@@ -398,7 +395,7 @@
       "jobs_env": null,
       "hint": {
         "resources": {},
-        "est_duration_s": 8.0,
+        "est_duration_s": 2.0,
         "rss_baseline_bytes": 134217728,
         "hard_mem_max_bytes": 536870912,
         "classification": "light",
@@ -406,7 +403,7 @@
         "measured_effective_cores": null,
         "measured_cpu_utilization": null
       },
-      "fail_fast_family": "check.backend_parity_suites"
+      "fail_fast_family": "check.e9patch_corpus"
     },
     {
       "group": "check",
@@ -10853,7 +10850,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "784",
+        "NEXTEST_EXPECTED_EXECUTED": "813",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -10902,7 +10899,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "791",
+        "NEXTEST_EXPECTED_EXECUTED": "796",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -11257,7 +11254,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
         "HERMIT_REQUIRE_DAP_GDB": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "118",
+        "NEXTEST_EXPECTED_EXECUTED": "119",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -11309,7 +11306,7 @@
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "118",
+        "NEXTEST_EXPECTED_EXECUTED": "119",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -52004,7 +52001,7 @@
       "group": "check",
       "job": "dbt_runtime_abi_on_host",
       "desc": "Hermit supplies every reverie_dbt_runtime_* callback the DBT client declares",
-      "description": "The DBT client declares and calls every reverie_dbt_runtime_* callback unconditionally, but their upstream definitions sit behind reverie-dbt's prototype-runtime feature, which detcore-dbt disables by design so Hermit can supply Detcore's runtime instead. The two lists are joined by hand and nothing compared them: cargo cannot, because the client is C and the link happens when DynamoRIO loads it. MEASURED 2026-08-20: test.dbt_parity had been red nine days on one missing symbol, and advancing the Reverie pin took the gap from one to five while every build stayed green. This node compares the two dynamic symbol tables and names the missing callbacks, which DynamoRIO's own '<ERROR: using undefined symbol!>' never does. test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301 and its 28 cases became DBT verify cells of the c-programs and system-utils manifests, so e2e.manifest_c_programs, e2e.manifest_system_utils and privileged-e2e.manifest_c_programs depend on this node. THOSE DEPENDENCIES ARE AN ORDERING FIX, NOT A DATA DEPENDENCY: nothing this node produces is consumed; the check runs first so a missing callback is named before eager-exit can cancel it. The cost is that a failure here skips those nodes' cells on every backend for that run, which is already red with the cause named. The e2e _on_host twins do not depend on it: the hosted-portable workflow runs each of them as its own job through ci/run-node.sh, which omits dependencies outside the job's selection, while this node runs in the separate dbt-parity release-shard job, which an E2E failure cannot cancel; ci/check-shard-coverage.sh therefore refuses an E2E edge to a node that no earlier hosted job supplies. The privileged-only-e2e nodes do not depend on it because this node is not in the privileged or hosted-privileged profiles.",
+      "description": "The DBT client declares and calls every reverie_dbt_runtime_* callback unconditionally, but their upstream definitions sit behind reverie-dbt's prototype-runtime feature, which detcore-dbt disables by design so Hermit can supply Detcore's runtime instead. The two lists are joined by hand and nothing compared them: cargo cannot, because the client is C and the link happens when DynamoRIO loads it. MEASURED 2026-08-20: test.dbt_parity had been red nine days on one missing symbol, and advancing the Reverie pin took the gap from one to five while every build stayed green. This node compares the two dynamic symbol tables and names the missing callbacks, which DynamoRIO's own '<ERROR: using undefined symbol!>' never does. test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301 and its 28 cases became DBT verify cells of the c-programs and system-utils manifests, so e2e.manifest_c_programs, e2e.manifest_system_utils and privileged-e2e.manifest_c_programs depend on this node. THOSE DEPENDENCIES ARE AN ORDERING FIX, NOT A DATA DEPENDENCY: nothing this node produces is consumed; the check runs first so a missing callback is named before eager-exit can cancel it. The cost is that a failure here skips those nodes' cells on every backend for that run, which is already red with the cause named. The e2e _on_host twins do not depend on it: the hosted-portable workflow runs each of them as its own job through ci/run-node.sh, which omits dependencies outside the job's selection, while this node runs in the separate dbt-runtime-abi release-shard job, which an E2E failure cannot cancel; ci/check-shard-coverage.sh therefore refuses an E2E edge to a node that no earlier hosted job supplies. The privileged-only-e2e nodes do not depend on it because this node is not in the privileged or hosted-privileged profiles.",
       "labels": [
         "hosted-portable"
       ],
@@ -52033,40 +52030,6 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "check.dbt_runtime_abi_on_host"
-    },
-    {
-      "group": "check",
-      "job": "backend_parity_suites_on_host",
-      "desc": "Backend-parity driver contracts, including the L2 evidence-tier gate",
-      "description": "EXECUTION GAP CLOSED 2026-08-25 (task three_backend_parity_suites). These three self-contained Python suites were inventoried as driver-owned but had no DAG node: inventory established ownership, not execution, and neither the backend-parity mutation node nor running run_matrix.py as the DBT parity program imports them. Before wiring, all three were run directly at bc9d1782acf0 and passed: verify-tier evidence (50 runtime checks), scorecard-header compatibility (73), and atomic run-matrix output (19). The suite guards typed-verdict-only L2 claims, non-vacuous compared-log counts, operand-derived parity and schema compatibility, and whole-or-nothing result artifacts. It consumes the verification-report binary produced by build.workspace, but has no guest or backend prerequisite.",
-      "labels": [
-        "hosted-portable"
-      ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; VERIFICATION_REPORT_BIN=$PWD/target/validate/verification-report python3 tests/backend-parity/test_verify_tier_evidence.py && python3 tests/backend-parity/test_scorecard_header_compat.py && python3 tests/backend-parity/test_run_matrix_output_skew.py",
-      "result_manifests": [],
-      "deps": [
-        "build.workspace_on_host",
-        "gate.manifest",
-        "pre.reverie_pin"
-      ],
-      "env": {},
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 60,
-      "cpu_timeout": 7200,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 8.0,
-        "rss_baseline_bytes": 134217728,
-        "hard_mem_max_bytes": 536870912,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "check.backend_parity_suites_on_host"
     },
     {
       "group": "build",
@@ -52305,7 +52268,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "784",
+        "NEXTEST_EXPECTED_EXECUTED": "813",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -52351,7 +52314,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "791",
+        "NEXTEST_EXPECTED_EXECUTED": "796",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,

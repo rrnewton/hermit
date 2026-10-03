@@ -523,12 +523,12 @@
       ]
     },
     {
-      "_why": "Backend-parity driver contract suites are outside Cargo targets. No validation DAG node runs run_matrix.py since test.dbt_parity was retired in slice S13 of https://github.com/rrnewton/hermit/issues/3301, so only the suites node is selected.",
+      "_why": "The e9patch preprocessing corpus and its manual driver moved out of tests/backend-parity in slice S13 of https://github.com/rrnewton/hermit/issues/3301. No validation lane has e9tool, so only the driver's contract test is selected.",
       "nodes": [
-        "check.backend_parity_suites"
+        "check.e9patch_corpus"
       ],
       "paths": [
-        "tests/backend-parity/**"
+        "tests/e9patch/**"
       ]
     },
     {
