@@ -333,7 +333,7 @@ def _append_line(pc, file, line, thread_id):
         {
             "pc": pc,
             "frame": _frame_identity(),
-            "file": os.path.realpath(file),
+            "file": file,
             "line": line,
             "thread_id": thread_id,
             "breakpoint": False,
@@ -426,6 +426,22 @@ class _StopAddressBreakpoint(gdb.Breakpoint):
         return False
 
 
+def _line_spec_file(name):
+    # The file part of a line breakpoint's location, from a file name in
+    # readelf's decoded line table. readelf prints the line table's file entry,
+    # which is often only the name relative to its directory entry: GCC 15
+    # stores an absolute source path as directory plus base name, and binutils
+    # 2.46 prints just "deep.c" for it, as does any binutils for a file
+    # compiled by a relative path. Resolving such a name against GDB's working
+    # directory names a file the program was not built from, every line
+    # breakpoint stays pending, and the history records no line arrivals.
+    # GDB matches a relative name against the trailing components of each
+    # source file's name, so it is passed through unchanged.
+    if os.path.isabs(name):
+        return os.path.realpath(name)
+    return name
+
+
 def _install_line_breakpoints(event=None):
     global _line_program
     global _suppress_events
@@ -451,7 +467,7 @@ def _install_line_breakpoints(event=None):
     for row in decoded.splitlines():
         match = re.match(r"^\s*(.*?)\s+(\d+)\s+0x[0-9a-fA-F]+(?:\s|$)", row)
         if match is not None:
-            source_lines.add((os.path.realpath(match.group(1)), int(match.group(2))))
+            source_lines.add((_line_spec_file(match.group(1)), int(match.group(2))))
 
     previous_suppression = _suppress_events
     _suppress_events = True
