@@ -206,9 +206,22 @@ INIT
   printf 'root:x:0:0:root:/:/bin/sh\n' >"$root/etc/passwd"
   printf 'root:x:0:\n' >"$root/etc/group"
 
-  # Build the archive reproducibly: fixed timestamps and ownership, sorted
-  # entries, no inode numbers, and no gzip header timestamp. The same BusyBox
-  # binary then always yields a byte-identical initramfs.
+  # Set every mode explicitly, because cpio stores modes as it finds them: the
+  # directories, /init, /etc/passwd, and /etc/group were created under the
+  # caller's umask, and /bin/busybox was copied with the installed BusyBox's
+  # mode. Symbolic links are left alone: their mode is always 0777, and chmod
+  # would follow them to /bin/busybox.
+  find "$root" -type d -exec chmod 0755 {} +
+  find "$root" -type f -exec chmod 0644 {} +
+  chmod 0755 "$root/bin/busybox" "$root/init"
+
+  # Build the archive reproducibly: fixed modes, timestamps, and ownership,
+  # sorted entries, no inode numbers, and no gzip header timestamp. The same
+  # BusyBox binary, cpio, and gzip then yield a byte-identical initramfs
+  # whatever the caller's umask, when the build directory is on the same kind
+  # of filesystem: cpio also stores each directory's link count as the
+  # filesystem reports it (btrfs reports 1, ext4 2 plus the number of
+  # subdirectories), and GNU cpio 2.13 has no option to omit it.
   find "$root" -exec touch -h -d @0 {} +
   initrd_tmp="$ARTIFACT_DIR/.initramfs.cpio.gz.$$"
   (
