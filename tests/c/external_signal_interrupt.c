@@ -11,8 +11,8 @@
  * usage: external_signal_interrupt <futex|sem|select|rawselect|poll|epoll|wait4|waitid>
  *            <external|process|thread|timer|exit> [restart] [timed] [warm]
  *            [ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign|
- *             chldkill|chldthrexit|stealgrp|stealkill|stealthrexit|
- *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit]
+ *             chldkill|chldthrexit|chldpend|stealgrp|stealkill|stealthrexit|
+ *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2]
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
  * select system call itself. `sem` is glibc's sem_timedwait, a FUTEX_WAIT_BITSET
@@ -24,7 +24,12 @@
  * signal arrives:
  *   external: from outside Hermit; the harness signals this process.
  *   process:  from a forked guest process that stays alive after kill().
- *             For wait4/waitid it is the waited child, blocked on a pipe.
+ *             For wait4/waitid it is the waited child, blocked on a pipe;
+ *             with `restart` it instead exits 100 ms after its kill(), so a
+ *             wait that Linux restarts under SA_RESTART returns the child
+ *             (printed as ret=child for wait4) near 200 ms, and a HANDLED_AT
+ *             line after ELAPSED reports when the handler first ran (-1 if
+ *             it never did): near 100 ms when the signal interrupted the wait.
  *   thread:   from a sibling thread with pthread_kill(). The thread waits,
  *             boundedly, for the handler to run (exiting 93 with
  *             WAKER_TIMEOUT if it never does), then sets the futex word and
@@ -43,8 +48,8 @@
  * timeout, the sender does not wake the futex, and an ELAPSED line reports the
  * CLOCK_MONOTONIC time the call took, so the wait must run to its deadline.
  *
- * The next six options change a disposition while the waiter is already
- * parked; they need the `thread` sender. The sibling thread blocks SIGUSR1 and
+ * The next seven options change a disposition, or queue a signal, while the
+ * waiter is already parked; they need the `thread` sender. The sibling thread blocks SIGUSR1 and
  * SIGCHLD, so only the waiter can take the signal, and after 100 ms it:
  *   ign2caught: installs the SIGUSR1 handler over SIG_IGN, then pthread_kill.
  *   caught2ign: sets SIGUSR1 to SIG_IGN over the handler, then pthread_kill.
@@ -55,17 +60,23 @@
  *   chldkill:   as chldlate, but the child dies by sending itself SIGKILL.
  *   chldthrexit: as chldlate, but the child's only thread calls the exit
  *               system call rather than exit_group.
+ *   chldpend:   leaves SIGCHLD at its default disposition, forks a child that
+ *               exits at once and reaps it, so that child's SIGCHLD is pending
+ *               on the process's shared queue (a traced process queues even a
+ *               signal it ignores), where only the waiter can take it; then
+ *               pthread_kill(SIGUSR1). The waiter has a caught signal and a
+ *               default-ignored SIGCHLD pending together.
  * chldkill and chldthrexit end the child without exit_group, so Hermit's
  * scheduler sends no child-exit SIGCHLD of its own: the only SIGCHLD is the
  * kernel's, which the scheduler makes eligible at the child's logical death.
- * ign2caught, chldlate, chldkill and chldthrexit must end the wait with EINTR
- * near 100 ms; the sibling wakes the futex (and writes the pipe) only after
- * the handler ran.
+ * ign2caught, chldlate, chldkill, chldthrexit and chldpend must end the wait
+ * with EINTR near 100 ms; the sibling wakes the futex (and writes the pipe)
+ * only after the handler ran.
  * caught2ign and chldign must not end it: a `timed` wait then returns at its
  * original 300 ms deadline, and an untimed one is ended by the sibling's
  * FUTEX_WAKE (or pipe write) 200 ms after the signal.
  *
- * `exit` and these six options also print the ELAPSED line.
+ * `exit` and these seven options also print the ELAPSED line.
  *
  * The remaining options add a sibling thread that does NOT block SIGCHLD, so
  * the kernel may deliver a child's SIGCHLD to it instead of to the waiter.
@@ -99,9 +110,16 @@
  *
  * `warm` issues the waiting call's own system-call instruction once before the
  * wait, so a backend that patches a call site on its first execution (LiteInst)
- * runs the wait through the patched site: syscall(SYS_gettid) for `futex` and
- * `rawselect`, which share glibc's syscall() instruction, and a 10 ms
- * sem_timedwait that must time out for `sem`.
+ * runs the wait through the patched site: syscall(SYS_gettid) for `futex`,
+ * `rawselect`, `wait4` and `waitid`, which then share glibc's syscall()
+ * instruction (with `warm`, wait4 and waitid are issued through syscall()
+ * rather than their glibc wrappers), and a 10 ms sem_timedwait that must time
+ * out for `sem`.
+ *
+ * `usr2` needs the `external` sender, which then sends SIGUSR1 and SIGUSR2
+ * back to back: SIGUSR2 is caught too, and after the RESULT line the guest
+ * waits, boundedly, for both handlers and prints how often each ran on a
+ * HANDLED line (`HANDLED usr1=1 usr2=1` when neither signal was lost).
  *
  * Output is one deterministic RESULT line after the call returns, followed
  * by DONE once every helper has been reaped. A kernel-internal errno, which has
@@ -131,12 +149,19 @@ static volatile sig_atomic_t handled = 0;
 /* Handler runs on the main thread and on any other thread. */
 static volatile sig_atomic_t handled_main = 0;
 static volatile sig_atomic_t handled_sibling = 0;
+/* The `usr2` option's second caught signal. */
+static volatile sig_atomic_t handled_usr2 = 0;
+/* With `restart`, wait4 and waitid stamp the handler's first run, so a wait
+ * that Linux restarts (handler near 100 ms, wait ending near 200 ms) can be
+ * told apart from one the signal never interrupted (handler after the wait). */
+static volatile sig_atomic_t stamp_handler = 0;
+static struct timespec handled_at;
 static uint32_t futex_word = 0;
 static pthread_t main_thread;
 static int sent_signal = SIGUSR1;
 static int quiet = 0;
 /* A disposition change while the waiter is parked (see the usage comment). */
-enum flip { FLIP_NONE, IGN2CAUGHT, CAUGHT2IGN, CHLDLATE, CHLDIGN, CHLDKILL, CHLDTHREXIT };
+enum flip { FLIP_NONE, IGN2CAUGHT, CAUGHT2IGN, CHLDLATE, CHLDIGN, CHLDKILL, CHLDTHREXIT, CHLDPEND };
 static enum flip flip = FLIP_NONE;
 static int flip_timed = 0;
 /* A sibling that does not block SIGCHLD (see the usage comment). */
@@ -164,9 +189,16 @@ static int ready_write_fd = -1;
 static void on_usr1(int sig) {
   (void)sig;
   handled += 1;
+  /* clock_gettime is async-signal-safe. */
+  if (stamp_handler && handled == 1) clock_gettime(CLOCK_MONOTONIC, &handled_at);
   /* pthread_self() reads the thread pointer; it makes no system call. */
   if (pthread_equal(pthread_self(), main_thread)) handled_main += 1;
   else handled_sibling += 1;
+}
+
+static void on_usr2(int sig) {
+  (void)sig;
+  handled_usr2 += 1;
 }
 
 static void say(const char *s) {
@@ -215,7 +247,8 @@ static void wait_for_handler(void) {
 
 /* Whether the flip makes the signal caught, so it must end the wait. */
 static int flip_catches(void) {
-  return flip == IGN2CAUGHT || flip == CHLDLATE || flip == CHLDKILL || flip == CHLDTHREXIT;
+  return flip == IGN2CAUGHT || flip == CHLDLATE || flip == CHLDKILL || flip == CHLDTHREXIT ||
+         flip == CHLDPEND;
 }
 
 /* The child of the SIGCHLD options, which never returns. */
@@ -246,6 +279,19 @@ static void flip_sender(void) {
       if (child < 0) _exit(96);
       if (child == 0) flip_child();
       break;
+    case CHLDPEND: {
+      /* Reaping the child orders its SIGCHLD before the pthread_kill: the
+       * kernel queues the parent's SIGCHLD for a traced child before the
+       * tracer can report the exit that lets waitpid() return. */
+      pid_t pending_child = fork();
+      if (pending_child < 0) _exit(96);
+      if (pending_child == 0) _exit(0);
+      int st;
+      while (waitpid(pending_child, &st, 0) < 0 && errno == EINTR) {
+      }
+      if (pthread_kill(main_thread, SIGUSR1) != 0) _exit(91);
+      break;
+    }
     case FLIP_NONE:
       _exit(97);
   }
@@ -410,15 +456,15 @@ int main(int argc, char **argv) {
     say("usage: external_signal_interrupt <futex|sem|select|rawselect|poll|epoll|wait4|waitid> "
         "<external|process|thread|timer|exit> [restart] [timed] [warm] "
         "[ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit|"
-        "stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
-        "spinthrexit]\n");
+        "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
+        "spinthrexit|usr2]\n");
     return 2;
   }
   /* Before any handler is installed: the handler compares against it. */
   main_thread = pthread_self();
   const char *call = argv[1];
   const char *sender = argv[2];
-  int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, options = 0;
+  int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, options = 0;
   static const struct {
     const char *name;
     enum role role;
@@ -455,13 +501,17 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "chldign")) flip = CHLDIGN;
     else if (!strcmp(argv[i], "chldkill")) flip = CHLDKILL;
     else if (!strcmp(argv[i], "chldthrexit")) flip = CHLDTHREXIT;
+    else if (!strcmp(argv[i], "chldpend")) flip = CHLDPEND;
+    else if (!strcmp(argv[i], "usr2")) usr2 = 1;
     else return 2;
   }
-  if (ignored + blocked + (sent_signal == SIGWINCH) + (flip != FLIP_NONE) + options > 1) return 2;
+  if (ignored + blocked + (sent_signal == SIGWINCH) + (flip != FLIP_NONE) + options + usr2 > 1)
+    return 2;
   flip_timed = timed;
   int is_futex = !strcmp(call, "futex");
   int is_sem = !strcmp(call, "sem");
-  int is_wait = !strcmp(call, "wait4") || !strcmp(call, "waitid");
+  int is_wait4 = !strcmp(call, "wait4");
+  int is_wait = is_wait4 || !strcmp(call, "waitid");
   int from_process = !strcmp(sender, "process");
   int from_thread = !strcmp(sender, "thread");
   int from_timer = !strcmp(sender, "timer");
@@ -482,9 +532,12 @@ int main(int argc, char **argv) {
   if ((role == ROLE_STEAL || role == ROLE_FORK) && !from_thread) return 2;
   if (role == ROLE_FORK && !timed) return 2;
   if (role == ROLE_SPIN && !from_exit) return 2;
-  if (warm && !is_futex && !is_rawselect && !is_sem) return 2;
+  if (warm && !is_futex && !is_rawselect && !is_sem && !is_wait) return 2;
   if (is_sem && timed) return 2;
-  int report_elapsed = quiet || flip != FLIP_NONE || from_exit || role != ROLE_NONE || warm;
+  if (usr2 && strcmp(sender, "external")) return 2;
+  int report_elapsed =
+      quiet || flip != FLIP_NONE || from_exit || role != ROLE_NONE || warm || (is_wait && restart);
+  stamp_handler = is_wait && restart;
 
   struct sigaction sa;
   memset(&sa, 0, sizeof sa);
@@ -498,6 +551,11 @@ int main(int argc, char **argv) {
   if (flip == IGN2CAUGHT) usr1.sa_handler = SIG_IGN;
   if (sigaction(SIGUSR1, &usr1, NULL) != 0) return 3;
   if (sigaction(SIGALRM, &sa, NULL) != 0) return 3;
+  if (usr2) {
+    struct sigaction second = sa;
+    second.sa_handler = on_usr2;
+    if (sigaction(SIGUSR2, &second, NULL) != 0) return 3;
+  }
   if (blocked) {
     sigset_t mask;
     sigemptyset(&mask);
@@ -542,6 +600,12 @@ int main(int argc, char **argv) {
       close(pfd[1]);
       sleep_ms(100);
       kill(parent, sent_signal);
+      /* A wait that Linux restarts under SA_RESTART ends when this child
+       * exits, 100 ms after its signal. */
+      if (restart && is_wait) {
+        sleep_ms(100);
+        _exit(7);
+      }
       /* Stay alive: the waiter must not depend on this process exiting. */
       char c;
       ssize_t r = read(pfd[0], &c, 1);
@@ -599,25 +663,40 @@ int main(int argc, char **argv) {
   } else if (is_epoll) {
     struct epoll_event ev;
     ret = epoll_wait(epfd, &ev, 1, bounded ? QUIET_TIMEOUT_MS : -1);
-  } else if (!strcmp(call, "wait4")) {
+  } else if (is_wait4) {
     int st = 0;
     struct rusage ru;
-    ret = wait4(child, &st, 0, &ru);
+    /* `warm` runs the wait through glibc's syscall() instruction, the site
+     * syscall(SYS_gettid) warmed. */
+    ret = warm ? syscall(SYS_wait4, child, &st, 0, &ru) : wait4(child, &st, 0, &ru);
   } else {
     siginfo_t si;
     memset(&si, 0, sizeof si);
-    ret = waitid(P_PID, child, &si, WEXITED);
+    ret = warm ? syscall(SYS_waitid, P_PID, child, &si, WEXITED, NULL)
+               : waitid(P_PID, child, &si, WEXITED);
   }
   err = errno;
   struct timespec end;
   clock_gettime(CLOCK_MONOTONIC, &end);
 
   char buf[160];
-  snprintf(buf, sizeof buf, "RESULT call=%s ret=%ld errno=%s handler=%d\n", call,
-           ret < 0 ? -1L : ret, ret < 0 ? errno_name(err) : "none", (int)handled);
+  /* A wait4 that reaps the child prints `child` rather than its pid. */
+  char ret_text[32];
+  if (is_wait4 && child > 0 && ret == child)
+    snprintf(ret_text, sizeof ret_text, "child");
+  else
+    snprintf(ret_text, sizeof ret_text, "%ld", ret < 0 ? -1L : ret);
+  snprintf(buf, sizeof buf, "RESULT call=%s ret=%s errno=%s handler=%d\n", call, ret_text,
+           ret < 0 ? errno_name(err) : "none", (int)handled);
   say(buf);
   if (report_elapsed) {
     snprintf(buf, sizeof buf, "ELAPSED ms=%ld\n", ms_between(&start, &end));
+    say(buf);
+  }
+  if (stamp_handler) {
+    /* The handler ran before the call returned or restarted, if at all. */
+    snprintf(buf, sizeof buf, "HANDLED_AT ms=%ld\n",
+             handled > 0 ? ms_between(&start, &handled_at) : -1L);
     say(buf);
   }
   if (from_thread || role == ROLE_SPIN) pthread_join(thread, NULL);
@@ -629,6 +708,13 @@ int main(int argc, char **argv) {
   if (role != ROLE_NONE) {
     snprintf(buf, sizeof buf, "HANDLER main=%d sibling=%d\n", (int)handled_main,
              (int)handled_sibling);
+    say(buf);
+  }
+  if (usr2) {
+    /* Both signals were sent before the wait could return; give a handler
+     * that has not run yet a bounded time before counting. */
+    for (int i = 0; i < 200 && !(handled && handled_usr2); i++) sleep_ms(10);
+    snprintf(buf, sizeof buf, "HANDLED usr1=%d usr2=%d\n", (int)handled, (int)handled_usr2);
     say(buf);
   }
   if (child > 0) {
