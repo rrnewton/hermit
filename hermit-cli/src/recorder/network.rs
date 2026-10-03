@@ -208,20 +208,19 @@ fn fd_table_size(tid: reverie::Pid) -> Result<usize, Errno> {
 /// a userspace `nfds` such as `FD_SETSIZE`. Reading the table size after the
 /// call gives an upper bound when another thread grew the table concurrently;
 /// any extra bytes are then the unchanged guest bytes, so replay restoring them
-/// is a no-op. A negative `nfds` fails with EINVAL before any copy-out.
-fn select_copyout_len(
-    nfds: i32,
-    fd_table_size: impl FnOnce() -> Result<usize, Errno>,
-) -> Result<usize, Errno> {
+/// is a no-op. If the table size cannot be read, the unclamped length is the
+/// same kind of upper bound; the capture stops at the first unreadable byte.
+/// A negative `nfds` fails with EINVAL before any copy-out.
+fn select_copyout_len(nfds: i32, fd_table_size: impl FnOnce() -> Result<usize, Errno>) -> usize {
     let Ok(nfds) = usize::try_from(nfds) else {
-        return Ok(0);
+        return 0;
     };
     let nfds = if nfds <= MIN_FD_TABLE_SIZE {
         nfds
     } else {
-        nfds.min(fd_table_size()?)
+        nfds.min(fd_table_size().unwrap_or(nfds))
     };
-    Ok(select_fd_set_bytes(nfds))
+    select_fd_set_bytes(nfds)
 }
 
 /// Read the readable prefix of `length` bytes in bounded chunks, so an
@@ -484,16 +483,15 @@ impl Recorder {
         syscall: Select,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
-        let event = select_copyout_len(syscall.nfds(), || fd_table_size(guest.tid())).map(|len| {
-            SyscallEvent::Select(capture_select_event(
-                &guest.memory(),
-                [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
-                syscall.timeout().map(|address| address.cast::<Timeval>()),
-                len,
-                result,
-            ))
-        });
-        self.record_event(guest, event);
+        let len = select_copyout_len(syscall.nfds(), || fd_table_size(guest.tid()));
+        let event = SyscallEvent::Select(capture_select_event(
+            &guest.memory(),
+            [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+            syscall.timeout().map(|address| address.cast::<Timeval>()),
+            len,
+            result,
+        ));
+        self.record_event(guest, Ok(event));
         result
     }
 
@@ -503,16 +501,15 @@ impl Recorder {
         syscall: Pselect6,
     ) -> Result<i64, Errno> {
         let result = guest.inject(syscall).await;
-        let event = select_copyout_len(syscall.nfds(), || fd_table_size(guest.tid())).map(|len| {
-            SyscallEvent::Pselect6(capture_select_event(
-                &guest.memory(),
-                [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
-                syscall.timeout(),
-                len,
-                result,
-            ))
-        });
-        self.record_event(guest, event);
+        let len = select_copyout_len(syscall.nfds(), || fd_table_size(guest.tid()));
+        let event = SyscallEvent::Pselect6(capture_select_event(
+            &guest.memory(),
+            [syscall.readfds(), syscall.writefds(), syscall.exceptfds()],
+            syscall.timeout(),
+            len,
+            result,
+        ));
+        self.record_event(guest, Ok(event));
         result
     }
 }
@@ -542,17 +539,16 @@ mod tests {
 
     #[test]
     fn select_copyout_len_clamps_to_the_fd_table() {
-        assert_eq!(select_copyout_len(-1, || panic!("no copy-out")), Ok(0));
-        assert_eq!(select_copyout_len(0, || panic!("no table read")), Ok(0));
-        assert_eq!(select_copyout_len(3, || panic!("no table read")), Ok(8));
-        assert_eq!(select_copyout_len(64, || panic!("no table read")), Ok(8));
-        assert_eq!(select_copyout_len(1024, || Ok(64)), Ok(8));
-        assert_eq!(select_copyout_len(1024, || Ok(256)), Ok(32));
-        assert_eq!(select_copyout_len(100, || Ok(4096)), Ok(16));
-        assert_eq!(
-            select_copyout_len(1024, || Err(Errno::ENOENT)),
-            Err(Errno::ENOENT)
-        );
+        assert_eq!(select_copyout_len(-1, || panic!("no copy-out")), 0);
+        assert_eq!(select_copyout_len(0, || panic!("no table read")), 0);
+        assert_eq!(select_copyout_len(3, || panic!("no table read")), 8);
+        assert_eq!(select_copyout_len(64, || panic!("no table read")), 8);
+        assert_eq!(select_copyout_len(1024, || Ok(64)), 8);
+        assert_eq!(select_copyout_len(1024, || Ok(256)), 32);
+        assert_eq!(select_copyout_len(100, || Ok(4096)), 16);
+        // An unreadable table size must not become a recorded errno: replay
+        // would return it in place of the real result.
+        assert_eq!(select_copyout_len(1024, || Err(Errno::ENOENT)), 128);
     }
 
     #[test]
