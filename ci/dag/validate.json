@@ -35047,7 +35047,7 @@
       "group": "e2e",
       "job": "manifest_applications_buck",
       "desc": "Portable manifest bucket: applications (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_applications from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_applications's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_applications.",
+      "description": "Runs the applications bucket's CI cells: workloads that exec chains of real tools (a cc and ar build-and-link, a git commit-and-archive script with pinned identities) and one that polls the wall clock (examples/timed-progress-bar.py, also on KVM). They show that a process tree of stock tools, and a clock-polling loop, give the same canonical log and stdout in both strict runs. Expect it to go red on a divergence anywhere in the cc or git process tree, or when the progress bar overruns its budget on either backend. Buck import twin: publishes the cells of e2e.manifest_applications from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_applications's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_applications.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -35102,7 +35102,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -35122,7 +35122,7 @@
       "group": "e2e",
       "job": "manifest_bin_c_buck",
       "desc": "Portable manifest bucket: bin-c (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_bin_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_bin_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_bin_c.",
+      "description": "Verifies tests/bin/posix_timer_test.c on ptrace, SaBRe and LiteInst: a CLOCK_MONOTONIC POSIX timer must deliver SIGALRM inside a bounded window while the program sleeps toward an absolute deadline, so a missed timer signal fails promptly instead of hanging. This carries the timer-delivery check to the two binary-rewriting backends. A guest exit of 1 (signal missing or outside the window) or a canonical divergence is a failure, and the SaBRe cell also requires eligible execution-path evidence. Buck import twin: publishes the cells of e2e.manifest_bin_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_bin_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_bin_c.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -35170,7 +35170,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -35190,7 +35190,7 @@
       "group": "e2e",
       "job": "manifest_c_programs_buck",
       "desc": "Portable manifest bucket: c-programs (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_c_programs from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_c_programs's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_c_programs.",
+      "description": "FOLD 2026-09-28 (https://github.com/rrnewton/hermit/issues/3301): the backend-parity-c bucket was folded into c-programs, so this node now also runs the 276 portable cells that e2e.manifest_backend_parity_c ran (713 portable cells in all), and that node is gone. Validation run validate-coord-s15-fdd8f55a8e7c (Hermit fdd8f55a8e7c, 2026-09-28) measured the two nodes at 128.62 s and 75.76 s of wall time (about 204 s together), 844 s and 510 s of CPU time (1354 s together, under the unchanged 7200 s CPU bound), and peaks of 3862880256 and 3859349504 bytes at width 8. The wall bound rises from 600 s to 900 s and the estimate from 300 s to 480 s, the sum of the two former estimates; memory bounds are unchanged because peak memory follows the worker width, which stays 8, not the number of cells. The selector no longer passes --allow-empty: a c-programs node that selects no cells now fails instead of passing having run nothing. WORKER WIDTH measured 2026-08-23: recent 20-way validation runs rotated an identical empty early-Run1 no_result across unrelated ptrace cells, while each affected cell passed in another run. A focused run at eight workers completed all 127 selected strict rows in 264.3s with 127 canonical matches and no no_result, leaving a measured 335.7s margin to the unchanged 600s hang bound. This node reserves all 8 manifest_guest slots and passes the same width to the harness; ordinary Hermit gates may overlap now that their unsupported exclusive resource is removed. Tradeoff: blocking validation still does not exercise the former 20-way manifest pressure; every cell and the strict comparator remain enabled and unchanged. MEMORY measured 2026-08-25 at Hermit 16f70d9994 with the complete current-main artifact and width 8 under ambient load 40-107: five uncapped cgroup peaks were 2855145472-2894295040 bytes; three stricter 4-GiB-cap repetitions completed all 128 cells with peaks up to 3025047552 bytes and no cgroup kill. The 4-GiB baseline rounds above the observed high-water mark; the 6-GiB hard cap preserves nearly 3 GiB of runaway headroom without reserving the former unmeasured 32 GiB. Buck import twin: publishes the cells of e2e.manifest_c_programs from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_c_programs's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_c_programs.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -40495,7 +40495,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": "--jobs",
       "jobs_env": null,
@@ -40515,7 +40515,7 @@
       "group": "e2e",
       "job": "manifest_chaos_c_buck",
       "desc": "Portable manifest bucket: chaos-c (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_chaos_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_chaos_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_chaos_c.",
+      "description": "Runs tests/chaos/lock_granularity.c, whose second thread computes from a value it read under the lock and that the first thread may overwrite before the result is stored, printing Fail: the ptrace chaos cell sweeps seeds, each reproduced under its own --verify, and requires both a passing and a failing seed, while the verify cell requires the default schedule to pass identically in both runs. As a race demonstrator it fails when chaos stops exposing the race, when a seed does not reproduce itself, or when the default schedule diverges or fails. Buck import twin: publishes the cells of e2e.manifest_chaos_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_chaos_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_chaos_c.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -40556,7 +40556,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -40576,7 +40576,7 @@
       "group": "e2e",
       "job": "manifest_compat_buck",
       "desc": "Portable manifest bucket: compat, the strict compatibility corpus on the host (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_compat from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_compat's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_compat.",
+      "description": "The portable strict compatibility corpus (tests/e2e/manifests/compat.yaml): 189 programs installed on the validation host, each one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's stripped --verify comparison, which is below L2 and never counted as bitwise parity. It runs on the host, not in the pinned root, because 31 of the programs are not in the pinned image; the Hermit is the pinned root's validate-profile binary, verified through the host artifact pointer build.host_hermit_link publishes. compatprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/strict-compat. Five rows (df, ranlib, top, zstd, zstd-roundtrip) are diagnostics with a 20-second budget: a measured failure of one is reported and counted but does not fail the node. Until 2026-10-01 these programs were 189 separate compat.<program> nodes; in the validation of Hermit 76980bac they took 92.8 s of wall and 60.3 CPU seconds in total, the slowest 3.0 s. Buck import twin: publishes the cells of e2e.manifest_compat from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_compat's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_compat.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -41926,7 +41926,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": "--jobs",
       "jobs_env": null,
@@ -41946,7 +41946,7 @@
       "group": "e2e",
       "job": "manifest_data_handling_buck",
       "desc": "Portable manifest bucket: data-handling (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_data_handling from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_data_handling's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_data_handling.",
+      "description": "Runs data-processing shell workloads under verify on ptrace, and jq also on KVM: a tar round trip, a sort, uniq and awk pipeline, jq transforming JSON that calls now(), sqlite3 printing random(), randomblob and the current time, a multithreaded zstd compression, and dd moving data in partial blocks through a pipe. They require clock and PRNG reads inside stock tools to repeat, a multithreaded compressor to emit identical frames, and partial pipe reads and writes to give the same results. Divergence, a wrong dd byte count, a zstd round-trip digest mismatch, or a budget overrun counts as failure. Buck import twin: publishes the cells of e2e.manifest_data_handling from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_data_handling's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_data_handling.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -42022,7 +42022,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -42042,7 +42042,7 @@
       "group": "e2e",
       "job": "manifest_debugger_c_buck",
       "desc": "Portable manifest bucket: debugger-c (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_debugger_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_debugger_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_debugger_c.",
+      "description": "Verifies tests/debugger/guests/debuggee.c, which prints its virtualized pid and a computed result, on ptrace, KVM, SaBRe and LiteInst. The debugger integration tests set breakpoints in this guest and rely on that pid being stable across runs, so this checks that the guest itself is deterministic on every backend that runs it; two runs that disagree on the pid or the canonical log, or a nonzero exit, are failures on any of the four. Buck import twin: publishes the cells of e2e.manifest_debugger_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_debugger_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_debugger_c.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -42097,7 +42097,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -42117,7 +42117,7 @@
       "group": "e2e",
       "job": "manifest_determinism_stress_c_buck",
       "desc": "Portable manifest bucket: determinism-stress-c (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_determinism_stress_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_determinism_stress_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_determinism_stress_c.",
+      "description": "Runs the C concurrency guests one program per test, so a divergence names one program rather than a shell chain: a fork tree, a pipe chain and pipe prefill (both also on KVM), thread stress, shared mmap across fork, a lock-free compare-and-swap counter, pid and tid identity across threads, procfs, wait and exec, a condition-variable producer-consumer queue, cross-thread signal order, and thread_contention in contention mode. thread_contention also runs, in epoll mode, as a ptrace chaos cell with distinct-outcome and entropy floors. Any verify mismatch, or the chaos cell missing a floor or failing to reproduce a seed, fails the bucket. Buck import twin: publishes the cells of e2e.manifest_determinism_stress_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_determinism_stress_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_determinism_stress_c.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -42242,7 +42242,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -42262,7 +42262,7 @@
       "group": "e2e",
       "job": "manifest_determinism_stress_buck",
       "desc": "Portable manifest bucket: determinism-stress (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_determinism_stress from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_determinism_stress's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_determinism_stress.",
+      "description": "Runs concurrency workloads: two bash writers interleaving output (examples/race.sh, on ptrace and KVM), thread contention, epoll and shared-mmap stress inside one guest, a fork tree followed by a pipe chain, and the tests/chaos order-violation race under the default schedule. A ptrace chaos cell runs tests/chaos/thread_interleaving.c, sweeping seeds over four workers whose append order can permute, and requires every seed to pass while meeting distinct-order and normalized-entropy floors, so a partial loss of schedule diversity is caught, not only a total collapse. A verify divergence in any of these programs, or the chaos cell missing a floor or not reproducing a seed, makes it red. Buck import twin: publishes the cells of e2e.manifest_determinism_stress from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_determinism_stress's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_determinism_stress.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -42345,7 +42345,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -42365,7 +42365,7 @@
       "group": "e2e",
       "job": "manifest_language_runtimes_buck",
       "desc": "Portable manifest bucket: language-runtimes (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_language_runtimes from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_language_runtimes's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_language_runtimes.",
+      "description": "Verifies programs that read entropy, hash seeds or clocks through language runtimes: Bash $RANDOM and a loop, pipe and time script, Python random numbers, hash seeds, dict order and subprocess timing, Perl rand, hash order and subprocess timing, awk, Lua, Ruby and Tcl random numbers, m4 temporary names, a C++ program reading std::random_device and std::chrono, Rust HashMap iteration, and Node.js JIT output with Math.random, on ptrace and most also on KVM (examples/rand.py also on LiteInst). It checks that Hermit's virtualization of those sources holds across independent runtime implementations, not one library path; the native-variance controls are not CI-selected, so it does not itself show the output would differ without Hermit. A runtime reaching a source Hermit does not virtualize shows as a stdout or canonical-log divergence. Buck import twin: publishes the cells of e2e.manifest_language_runtimes from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_language_runtimes's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_language_runtimes.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -42623,7 +42623,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -42643,7 +42643,7 @@
       "group": "e2e",
       "job": "manifest_shared_futex_c_buck",
       "desc": "Portable manifest bucket: shared-futex-c (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_shared_futex_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_shared_futex_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_shared_futex_c.",
+      "description": "Verifies tests/shared-futex-verify/qemu_hello.c on ptrace, a guest that prints a marker with its virtualized pid and exits 7; the manifest declares that exit, so the cell passes only on a matched comparison whose guest status and Hermit exit status are both exactly 7. It pins exact propagation of a nonzero guest exit; the same program is the userspace payload tests/qemu-boot/strict_l2_userspace_test.sh expects to return 7. A divergence, a zero exit, or any other status is refused. Buck import twin: publishes the cells of e2e.manifest_shared_futex_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_shared_futex_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_shared_futex_c.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -42677,7 +42677,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -42697,7 +42697,7 @@
       "group": "e2e",
       "job": "manifest_system_utils_buck",
       "desc": "Portable manifest bucket: system-utils (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_system_utils from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_system_utils's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_system_utils.",
+      "description": "WORKER-WIDTH DERIVATION 2026-08-24: a current-main sweep of the 28 ptrace cells found 0 failures at --jobs 1 and 2, then rotating failures at every wider sampled setting: 2 at 8, 2 at 16, 6 at 28, and 3 at 64; system-utils/mktemp-name failed in the 28- and 64-wide buckets and passed alone at width 1. The counts are intentionally not treated as monotonic or stable; the durable fact is that widening manufactures contention-sensitive reds while the production width of 1 is clean. Keep --jobs 1 explicit until the cells are made concurrency-safe; system-utils/harness-width-contract reads the exact parsed worker capacity and fails if this control changes without a new measurement. Buck import twin: publishes the cells of e2e.manifest_system_utils from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_system_utils's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_system_utils.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -43242,7 +43242,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": "",
       "jobs_env": null,
@@ -43262,7 +43262,7 @@
       "group": "e2e",
       "job": "manifest_util_c_buck",
       "desc": "Portable manifest bucket: util-c (Buck rows)",
-      "description": "Publishes the cells of e2e.manifest_util_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_util_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_util_c.",
+      "description": "Verifies tests/util/pmu_skid.c on ptrace as a guest: its child calls PTRACE_TRACEME, which Detcore refuses with a deterministic EPERM, so the program exits with its dedicated refused status 3, which the manifest declares. It guards Hermit's refusal of guest ptrace: guest ptrace succeeding (the program goes on to open perf counters), the refusal arriving with a different errno (a different exit status), or the two runs diverging all fail it. Buck import twin: publishes the cells of e2e.manifest_util_c from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with e2e.manifest_util_c's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops e2e.manifest_util_c.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -43296,7 +43296,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -43316,7 +43316,7 @@
       "group": "privileged-e2e",
       "job": "manifest_applications_buck",
       "desc": "Privileged manifest bucket: applications (Buck rows)",
-      "description": "Publishes the cells of privileged-e2e.manifest_applications from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with privileged-e2e.manifest_applications's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops privileged-e2e.manifest_applications.",
+      "description": "The selected KVM cell has a measured 74 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop. Buck import twin: publishes the cells of privileged-e2e.manifest_applications from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with privileged-e2e.manifest_applications's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops privileged-e2e.manifest_applications.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -43350,7 +43350,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -43370,7 +43370,7 @@
       "group": "privileged-e2e",
       "job": "manifest_c_programs_buck",
       "desc": "Privileged manifest bucket: c-programs (Buck rows)",
-      "description": "Publishes the cells of privileged-e2e.manifest_c_programs from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with privileged-e2e.manifest_c_programs's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops privileged-e2e.manifest_c_programs.",
+      "description": "The selected cells are the four cpuid-probe verify cells (dbt, kvm, liteinst, ptrace): the kvm, liteinst and ptrace cells that the privileged backend-parity-c node ran before that bucket was folded into c-programs (https://github.com/rrnewton/hermit/issues/3301), and the dbt cell that slice S13 of the same issue carried over from the retired DBT parity matrix; the selector no longer passes --allow-empty, so selecting no cells fails. They use the 57 s wall backstop and may retry once. The shared 600 s E2E-class node bound remains a generous backup after per-machine scaling, while the typed inner CPU/wall policy identifies the actual stop. Buck import twin: publishes the cells of privileged-e2e.manifest_c_programs from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with privileged-e2e.manifest_c_programs's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops privileged-e2e.manifest_c_programs.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -43425,7 +43425,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": null,
       "jobs_env": null,
@@ -43445,7 +43445,7 @@
       "group": "privileged-e2e",
       "job": "manifest_system_utils_buck",
       "desc": "Privileged manifest bucket: system-utils (Buck rows)",
-      "description": "Publishes the cells of privileged-e2e.manifest_system_utils from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with privileged-e2e.manifest_system_utils's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops privileged-e2e.manifest_system_utils.",
+      "description": "HOST-REQUIREMENT ROUTING 2026-09-28: system-utils/sysfs-sanitized-prefixes is the only cell in this privileged bucket. Its guest reads one live leaf under each of eight host sysfs prefixes (block, hwmon, rtc, node, btrfs, irq, uevent, module) and refuses when a prefix has no readable leaf, so it needs a host that has that hardware and a mounted btrfs. GitHub-hosted run https://github.com/rrnewton/hermit/actions/runs/36485831200 failed it with \"hwmon has no readable sanitized leaf\". The manifest entry is therefore lane: privileged, which keeps it out of the hosted-portable selection while the full profile still runs it. Wall evidence from the ledger series of the development host recorded in docs/TESTING_ENVIRONMENTS.md, \"Named measurement hosts\" (2026-08..09): verify/ptrace 148 samples, per-run median 2096 ms, max 15438 ms; verify/kvm 29 samples, median 2316 ms, max 3467 ms. Memory hints match the portable system-utils bucket, whose 3 GiB hard cap already contained both cells at --jobs 1. The shared 600 s E2E-class node bound is the backstop. Buck import twin: publishes the cells of privileged-e2e.manifest_system_utils from the rows e2e.buck_cells wrote: test-harness in import mode (E2E_IMPORT_RESULTS) with privileged-e2e.manifest_system_utils's arguments, so it owns the same cells and writes the same result files. It executes no cell. A cell with no row, a row from another commit or an unclean tree, or a PASS without complete evidence is an ERROR, so executed equals plan. Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which drops privileged-e2e.manifest_system_utils.",
       "labels": [
         "full-buck-e2e"
       ],
@@ -43486,7 +43486,7 @@
       "env": {},
       "networkonly": false,
       "engine_only": false,
-      "timeout": 300,
+      "timeout": 600,
       "cpu_timeout": 600,
       "jobs_flag": "",
       "jobs_env": null,

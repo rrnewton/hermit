@@ -1454,7 +1454,7 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         twin.env.clear();
         // The import's parity post-pass counts its bound from the step start,
         // so dagrun must not kill the step first.
-        twin.timeout = crate::parity::PARITY_STEP_WALL_FLOOR.as_secs();
+        twin.timeout = crate::parity::PARITY_STEP_WALL_FLOOR.as_secs() as i64;
         twin.cpu_timeout = 600;
         twin.hint.resources.clear();
         twin.hint.est_duration_s = 1.0;
@@ -4229,7 +4229,8 @@ sys.exit(37)
     fn steps_sharing_a_result_file_never_run_in_one_run_type() {
         // e2e.manifest_compat, portablecompat.manifest_compat,
         // sabrecompat.manifest_compat, strictcompat.manifest_compat,
-        // rrcompat.manifest_compat and e2e.manifest_compat_on_host all write
+        // rrcompat.manifest_compat, e2e.manifest_compat_on_host and the
+        // full-buck-e2e import twin e2e.manifest_compat_buck all write
         // $E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl. That is safe
         // only while no run type selects two of them: a run selects one label,
         // so their label sets must be non-empty and pairwise disjoint.
@@ -4248,8 +4249,8 @@ sys.exit(37)
             .get("$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl")
             .map_or(0, Vec::len);
         assert_eq!(
-            shared, 6,
-            "the six manifest_compat buckets share one result file"
+            shared, 7,
+            "the six manifest_compat buckets and the Buck import twin share one result file"
         );
         for (path, steps) in &writers {
             for (index, first) in steps.iter().enumerate() {
