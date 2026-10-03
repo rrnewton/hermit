@@ -199,7 +199,8 @@ evidence_complete=true
 missing=()
 [[ -s $out/tpx.jsonl ]] || { evidence_complete=false; missing+=(tpx.jsonl); }
 if [[ $outcome == PASS && $MODE == verify ]]; then
-    [[ -s $A/cell__verify-1.json ]] || { evidence_complete=false; missing+=(verify-1.json); }
+    # hermit always writes a verdict; a file without one is not a verify report.
+    [[ -s $A/cell__verify-1.json && -n $verdict ]] || { evidence_complete=false; missing+=(verify-1.json); }
     if [[ $verdict == matched ]]; then
         ((n_run1 == 1 && n_run2 == 0)) || { evidence_complete=false; missing+=(detlogs); }
     else
