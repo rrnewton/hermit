@@ -75,7 +75,7 @@ fn zero_copy_pipe_syscalls_fail_closed_by_default_and_allow_compatibility_opt_ou
         let stderr = String::from_utf8_lossy(&default_output.stderr);
         assert!(
             stdout.contains(&format!("{syscall} deterministically unavailable")),
-            "{syscall} default run did not expose deterministic ENOSYS\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            "{syscall} default run did not expose its deterministic refusal (EINVAL for splice/tee, ENOSYS for vmsplice)\nstdout:\n{stdout}\nstderr:\n{stderr}"
         );
         assert!(
             stdout.contains("Determinism verified") || stderr.contains("Determinism verified"),

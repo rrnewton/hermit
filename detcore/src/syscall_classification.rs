@@ -1218,9 +1218,11 @@ pub(crate) const fn is_host_security_identity_probe_syscall(sysno: Sysno) -> boo
 // TODO-HUMAN-REVIEW(PR-855): Fail-closed zero-copy pipe fallback set.
 /// Linux zero-copy pipe transfers. Their observable blocking and buffer
 /// ownership depend on kernel pipe state, while `vmsplice` can additionally
-/// pin guest pages beyond the syscall boundary. Fail-closed runs return
-/// `ENOSYS`, the documented signal for callers to use read/write fallbacks.
-/// The explicit compatibility opt-out retains host forwarding.
+/// pin guest pages beyond the syscall boundary. Fail-closed runs refuse
+/// `splice` and `tee` with `EINVAL` (the descriptor pair cannot be spliced),
+/// which is what callers such as GNU grep fall back to read/write on, and
+/// `vmsplice` with `ENOSYS`. The explicit compatibility opt-out retains host
+/// forwarding.
 pub(crate) const fn is_zero_copy_pipe_syscall(sysno: Sysno) -> bool {
     matches!(
         sysno,
