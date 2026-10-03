@@ -14,7 +14,9 @@ second. Run directly (``python3 demos/tests/test_concurrent_anchor.py``) or via
 ``make -C demos test``.
 """
 
+import dataclasses
 import multiprocessing
+import re
 import sys
 import tempfile
 import unittest
@@ -28,7 +30,22 @@ sys.path.insert(0, str(LIB_DIR))
 import demo_common as dc  # noqa: E402
 
 
-BASE_LOG = "line-a\nline-b\nline-c\n"
+# Three Hermit INFO records in the form Hermit writes them to standard error.
+# A repeat check counts a match only when both logs hold an INFO record.
+BASE_LOG = (
+    "2026-08-17T04:27:14.000001Z  INFO detcore: line-a\n"
+    "2026-08-17T04:27:14.000002Z  INFO detcore: line-b\n"
+    "2026-08-17T04:27:14.000003Z  INFO detcore: line-c\n"
+)
+
+# The line Hermit's bounded log writer ends a log with once the log reaches
+# HERMIT_LOG_MAX_BYTES (TRUNCATION_MARKER in detcore/src/logdiff.rs); a test
+# below checks this copy against that source.
+TRUNCATION_MARKER = (
+    "=== HERMIT LOG TRUNCATED: reached the configured size bound "
+    "(HERMIT_LOG_MAX_BYTES). Output beyond this point was DISCARDED. The run "
+    "itself continued and was NOT affected. ==="
+)
 
 
 def _boot_record(work, idx=0, qcow2_sha="d" * 64, info_log=None):
@@ -74,6 +91,14 @@ def _resume_record(schema_version=dc.RUN_METADATA_SCHEMA_VERSION, info_log=None)
     if schema_version >= 3:
         record["guest_exit_status"] = 0
     return record
+
+
+def _stamped(text, second):
+    """Give every line of ``text`` a wall-clock prefix in Hermit's format."""
+    return "".join(
+        "{}.{:06d}Z  {}".format(second, number, line)
+        for number, line in enumerate(text.splitlines(keepends=True), start=1)
+    )
 
 
 def _build_and_publish(assets_str, lib_str, barrier, queue, idx, divergent):
@@ -232,6 +257,7 @@ class InfoLogAdmissionTest(unittest.TestCase):
                 tmp,
                 "2026-08-17T04:27:14.000000Z " + body,
                 "2026-08-17T04:29:10.000000Z " + body,
+                stamp=False,
             )
 
             self.assertTrue(passed, report)
@@ -303,12 +329,33 @@ class InfoLogAdmissionTest(unittest.TestCase):
             self.assertEqual(first_record["qemu_argv"], ["-qmp=unix:<qmp-socket>"])
             self.assertEqual(first_record["qemu_argv"], second_record["qemu_argv"])
 
-    def _compare_logs(self, tmp, anchor_text, current_text):
+    def _compare_logs(self, tmp, anchor_text, current_text, stamp=True):
+        """Compare two logs given as text, one line per log line.
+
+        With ``stamp`` (the default), each line is given a wall-clock prefix in
+        Hermit's format, a different one in each log, so every line is a Hermit
+        record and the fixtures exercise the comparison of record bodies. Such
+        fixtures always hold INFO records, so no verdict here comes from an
+        empty log.
+        """
+        if stamp:
+            anchor_text = _stamped(anchor_text, "2026-08-17T04:27:14")
+            current_text = _stamped(current_text, "2026-08-17T04:29:10")
+        passed, report = self._compare_log_bytes(
+            tmp, anchor_text.encode(), current_text.encode()
+        )
+        if stamp:
+            self.assertFalse(
+                any("holds no Hermit INFO record" in entry for entry in report), report
+            )
+        return passed, report
+
+    def _compare_log_bytes(self, tmp, anchor_bytes, current_bytes):
         root = Path(tmp)
         anchor_log = root / "anchor.log"
         current_log = root / "current.log"
-        anchor_log.write_text(anchor_text)
-        current_log.write_text(current_text)
+        anchor_log.write_bytes(anchor_bytes)
+        current_log.write_bytes(current_bytes)
         return dc.compare_runs(self._metadata(anchor_log), self._metadata(current_log))
 
     # Guest addresses are compared byte for byte. Both logs come from separate
@@ -485,12 +532,12 @@ class InfoLogAdmissionTest(unittest.TestCase):
             anchor_log = root / "anchor.log"
             current_log = root / "current.log"
             anchor_log.write_text(
-                "INFO detcore::scheduler: COMMIT turn 48 on previously committed "
-                "1_767_225_600.042_170_525s\n"
+                "2026-08-17T04:27:14.000001Z  INFO detcore::scheduler: COMMIT turn "
+                "48 on previously committed 1_767_225_600.042_170_525s\n"
             )
             current_log.write_text(
-                "INFO detcore::scheduler: COMMIT turn 48 on previously committed "
-                "1_767_225_600.042_170_465s\n"
+                "2026-08-17T04:29:10.000001Z  INFO detcore::scheduler: COMMIT turn "
+                "48 on previously committed 1_767_225_600.042_170_465s\n"
             )
 
             passed, report = dc.compare_runs(
@@ -543,6 +590,240 @@ class InfoLogAdmissionTest(unittest.TestCase):
                     for line in report
                 )
             )
+
+    # A match is evidence that the run repeated only when both logs hold a
+    # Hermit INFO record: a line that starts with a wall-clock timestamp
+    # followed by INFO. A run whose tracing went to a file (HERMIT_LOG_FILE), or
+    # whose QEMU_LOG_FILTER kept only warnings, leaves a log with none, and two
+    # such logs used to match.
+
+    def test_two_empty_logs_are_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_log_bytes(tmp, b"", b"")
+
+            self.assertFalse(passed, "two empty logs are no evidence of a repeat")
+            self.assertIn(
+                "WARN: the first-run Hermit INFO log holds no Hermit INFO record, so "
+                "it is no evidence that the run repeated; QEMU_LOG_FILTER must keep "
+                "Hermit's INFO records (the default does); remove the saved first "
+                "run with demos/clean.sh and run again",
+                report,
+            )
+            self.assertIn(
+                "WARN: the current Hermit INFO log holds no Hermit INFO record, so it "
+                "is no evidence that the run repeated; QEMU_LOG_FILTER must keep "
+                "Hermit's INFO records (the default does)",
+                report,
+            )
+            self.assertFalse(
+                any(entry.startswith("PASS: Hermit INFO log") for entry in report), report
+            )
+
+    def test_identical_logs_without_an_info_record_are_refused(self):
+        # A warning, a run report, and a line that says INFO without the
+        # timestamp that starts a Hermit record, as a guest could print.
+        log = (
+            b"2026-08-17T04:27:14.000001Z  WARN reverie_ptrace::task: a warning\n"
+            b"hermit run report:\n"
+            b"  exit status: 0\n"
+            b"INFO detcore: printed by the guest\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_log_bytes(tmp, log, log)
+
+            self.assertFalse(passed, "logs without an INFO record are no evidence")
+            for name in ("first-run", "current"):
+                self.assertTrue(
+                    any(
+                        entry.startswith(
+                            "WARN: the {} Hermit INFO log holds no Hermit INFO "
+                            "record".format(name)
+                        )
+                        for entry in report
+                    ),
+                    report,
+                )
+            self.assertFalse(
+                any(entry.startswith("PASS: Hermit INFO log") for entry in report), report
+            )
+
+    def test_an_empty_current_log_is_refused_beside_a_full_first_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_log_bytes(tmp, BASE_LOG.encode(), b"")
+
+            self.assertFalse(passed)
+            self.assertTrue(
+                any("canonical repeat verification failed" in entry for entry in report),
+                report,
+            )
+            self.assertTrue(
+                any(
+                    entry.startswith(
+                        "WARN: the current Hermit INFO log holds no Hermit INFO record"
+                    )
+                    for entry in report
+                ),
+                report,
+            )
+            self.assertFalse(
+                any("the first-run Hermit INFO log holds no" in entry for entry in report),
+                report,
+            )
+
+    def test_a_match_reports_how_much_was_compared(self):
+        log = (
+            "2026-08-17T04:27:14.000001Z  INFO detcore: a\n"
+            "2026-08-17T04:27:14.000002Z  WARN reverie: b\n"
+            "    continuation of b\n"
+            "2026-08-17T04:27:14.000003Z  INFO detcore: c\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_log_bytes(
+                tmp, log.encode(), log.replace("04:27:14", "04:29:10").encode()
+            )
+
+            self.assertTrue(passed, report)
+            self.assertIn(
+                "PASS: Hermit INFO log matches first run exactly apart from the "
+                "wall-clock prefix (Hermit-marked host addresses compared by first "
+                "appearance); compared 4 lines, 2 of which start a Hermit INFO record",
+                report,
+            )
+
+    # Hermit's bounded log writer ends a log that reached HERMIT_LOG_MAX_BYTES
+    # with a marker line and discards the rest. Two logs cut at the same size
+    # can match while what was discarded differed, so neither may count.
+
+    def test_the_marker_is_the_one_hermit_writes(self):
+        source = (DEMO_DIR.parent / "detcore" / "src" / "logdiff.rs").read_text()
+        match = re.search(
+            r'pub const TRUNCATION_MARKER: &str = "((?:[^"\\]|\\.)*)";', source, re.S
+        )
+        self.assertIsNotNone(match, "TRUNCATION_MARKER not found in logdiff.rs")
+        # A backslash at the end of a line continues a Rust string literal and
+        # drops the next line's leading whitespace.
+        self.assertEqual(TRUNCATION_MARKER, re.sub(r"\\\n\s*", "", match.group(1)))
+        self.assertEqual(TRUNCATION_MARKER, dc.HERMIT_LOG_TRUNCATION_MARKER)
+
+    def test_logs_that_end_with_the_truncation_marker_are_refused(self):
+        for ending in ("\n", "", "\r\n\n"):
+            with self.subTest(ending=ending), tempfile.TemporaryDirectory() as tmp:
+                log = (BASE_LOG + TRUNCATION_MARKER + ending).encode()
+                passed, report = self._compare_log_bytes(tmp, log, log)
+
+                self.assertFalse(passed, "a truncated log is incomplete evidence")
+                for name in ("first-run", "current"):
+                    self.assertIn(
+                        "WARN: Hermit INFO logs not compared because the {} log ends "
+                        "with Hermit's truncation marker (HERMIT_LOG_MAX_BYTES), so "
+                        "part of it was discarded; canonical repeat verification "
+                        "requires complete logs".format(name),
+                        report,
+                    )
+
+    def test_a_truncated_current_log_is_refused_by_name(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_log_bytes(
+                tmp,
+                BASE_LOG.encode(),
+                (BASE_LOG + TRUNCATION_MARKER + "\n").encode(),
+            )
+
+            self.assertFalse(passed)
+            self.assertTrue(
+                any(
+                    "the current log ends with Hermit's truncation marker" in entry
+                    for entry in report
+                ),
+                report,
+            )
+            self.assertFalse(
+                any("the first-run log ends with" in entry for entry in report), report
+            )
+
+    def test_a_marker_followed_by_more_records_is_compared(self):
+        # Positive control: the log was not cut where the marker text appears.
+        log = (TRUNCATION_MARKER + "\n" + BASE_LOG).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_log_bytes(tmp, log, log)
+
+            self.assertTrue(passed, report)
+
+    def test_a_marker_inside_a_longer_last_line_is_compared(self):
+        # Positive control: a record that ends with the marker text, such as a
+        # guest path, is not the marker line (Hermit's own test of
+        # log_was_truncated uses the same shape).
+        log = (
+            BASE_LOG
+            + "2026-08-17T04:27:14.000004Z  INFO detcore: statx path="
+            + TRUNCATION_MARKER
+            + "\n"
+        ).encode()
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_log_bytes(tmp, log, log)
+
+            self.assertTrue(passed, report)
+
+    # The logs are compared as bytes, a line ending only at a newline byte.
+
+    def test_bytes_that_are_not_utf8_are_compared(self):
+        anchor = BASE_LOG.encode() + b"2026-08-17T04:27:14.000004Z  INFO detcore: read \xff\n"
+        current = BASE_LOG.encode() + b"2026-08-17T04:29:10.000004Z  INFO detcore: read \xfe\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_log_bytes(tmp, anchor, current)
+
+            self.assertFalse(passed, "\\xff and \\xfe are different bytes")
+            self.assertTrue(
+                any("canonical repeat verification failed" in entry for entry in report),
+                report,
+            )
+
+    def test_line_endings_are_compared(self):
+        cases = {
+            "CRLF against LF": (
+                b"2026-08-17T04:27:14.000001Z  INFO detcore: a\r\n",
+                b"2026-08-17T04:29:10.000001Z  INFO detcore: a\n",
+            ),
+            "lone CR against LF": (
+                b"2026-08-17T04:27:14.000001Z  INFO detcore: a\r"
+                b"2026-08-17T04:27:14.000002Z  INFO detcore: b\n",
+                b"2026-08-17T04:29:10.000001Z  INFO detcore: a\n"
+                b"2026-08-17T04:29:10.000002Z  INFO detcore: b\n",
+            ),
+        }
+        for name, (anchor, current) in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                passed, report = self._compare_log_bytes(tmp, anchor, current)
+
+                self.assertFalse(passed, report)
+                self.assertTrue(
+                    any(
+                        "canonical repeat verification failed" in entry
+                        for entry in report
+                    ),
+                    report,
+                )
+
+    def test_a_timestamp_on_one_side_only_is_refused(self):
+        # Whether a line starts with a wall-clock timestamp is compared; only
+        # the timestamp's value is not.
+        anchor = (
+            b"2026-08-17T04:27:14.000001Z  INFO detcore: x\n"
+            b"2026-08-17T04:27:14.000002Z  WARN reverie: y\n"
+        )
+        current = b"2026-08-17T04:29:10.000001Z  INFO detcore: x\nWARN reverie: y\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            passed, report = self._compare_log_bytes(tmp, anchor, current)
+
+            self.assertFalse(passed, report)
+            divergence = next(
+                entry
+                for entry in report
+                if "canonical repeat verification failed" in entry
+            )
+            self.assertIn("first divergence at line 2", divergence)
+            self.assertIn("- '<wall-clock> WARN reverie: y\\n'", divergence)
+            self.assertIn("+ 'WARN reverie: y\\n'", divergence)
 
 
 class RunMetadataContractTest(unittest.TestCase):
@@ -767,6 +1048,188 @@ class RunMetadataContractTest(unittest.TestCase):
         record["future_field"] = True
         with self.assertRaisesRegex(ValueError, "qemu-run-metadata-field"):
             dc.parse_run_metadata(record)
+
+    # A compared field that neither run recorded is never passed over in
+    # silence: the report says why it was not compared, or the repeat fails
+    # when a row of that shape must record it.
+
+    def _info_log(self, tmp):
+        info_log = Path(tmp) / "hermit-info.log"
+        info_log.write_text(BASE_LOG)
+        return info_log
+
+    def test_boot_rows_report_the_guest_command_fields_as_not_compared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            info_log = self._info_log(tmp)
+            anchor = dc.parse_run_metadata(_boot_record(Path(tmp), 0, info_log=info_log))
+            current = dc.parse_run_metadata(_boot_record(Path(tmp), 1, info_log=info_log))
+            passed, report = dc.compare_runs(anchor, current)
+
+            self.assertTrue(passed, report)
+            self.assertIn(
+                "NOT COMPARED: guest output SHA-256: qemu-boot runs start no guest "
+                "command",
+                report,
+            )
+            self.assertIn(
+                "NOT COMPARED: guest command exit status: qemu-boot runs start no "
+                "guest command",
+                report,
+            )
+
+    def test_resume_rows_without_a_snapshot_report_the_snapshot_fields_as_not_compared(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            row = dc.parse_run_metadata(_resume_record(3, self._info_log(tmp)))
+            passed, report = dc.compare_runs(row, row)
+
+            self.assertTrue(passed, report)
+            self.assertIn(
+                "NOT COMPARED: qcow2 SHA-256: neither run saved a snapshot", report
+            )
+            self.assertIn(
+                "NOT COMPARED: serial output SHA-256: qemu-resume rows do not record "
+                "it; the guest command's output, taken from the serial log, is "
+                "compared instead",
+                report,
+            )
+
+    def test_a_required_field_that_neither_run_recorded_fails(self):
+        # The parser refuses a row without these fields, so only a row built
+        # some other way can lack them; compare_runs does not rely on that.
+        boot = "qemu-boot rows of schema 3"
+        resume = "qemu-resume rows of schema 3 with snapshot_saved false"
+        cases = (
+            (boot, "qemu_version", "QEMU version"),
+            (boot, "qemu_binary_sha256", "QEMU binary SHA-256"),
+            (boot, "qcow2_sha256", "qcow2 SHA-256"),
+            (boot, "serial_sha256", "serial output SHA-256"),
+            (resume, "qemu_version", "QEMU version"),
+            (resume, "qemu_binary_sha256", "QEMU binary SHA-256"),
+            (resume, "guest_output_sha256", "guest output SHA-256"),
+            (resume, "guest_exit_status", "guest command exit status"),
+        )
+        for description, field, label in cases:
+            with self.subTest(row=description, field=field), tempfile.TemporaryDirectory() as tmp:
+                info_log = self._info_log(tmp)
+                record = (
+                    _boot_record(Path(tmp), info_log=info_log)
+                    if description == boot
+                    else _resume_record(3, info_log)
+                )
+                row = dataclasses.replace(dc.parse_run_metadata(record), **{field: None})
+                passed, report = dc.compare_runs(row, row)
+
+                self.assertFalse(passed, report)
+                self.assertIn(
+                    "WARN: {} was not compared: neither run recorded it, although {} "
+                    "must record it".format(label, description),
+                    report,
+                )
+
+    def test_a_field_older_rows_lack_fails_where_current_rows_record_it(self):
+        # Two schema-2 rows: neither recorded the guest command's exit status,
+        # which the current code records, so the repeat cannot vouch for it.
+        with tempfile.TemporaryDirectory() as tmp:
+            older = dc.parse_run_metadata(_resume_record(2, self._info_log(tmp)))
+            passed, report = dc.compare_runs(older, older)
+
+            self.assertFalse(passed, report)
+            self.assertIn(
+                "WARN: guest command exit status was not compared: neither run "
+                "recorded it (first run schema 2, current run schema 2; qemu-resume "
+                "rows of schema 3 with snapshot_saved false record it), so this "
+                "repeat cannot vouch for it",
+                report,
+            )
+
+    def test_schema_one_rows_without_a_qemu_binary_digest_fail(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            record = _resume_record(1, self._info_log(tmp))
+            del record["qemu_binary_sha256"]
+            row = dc.parse_run_metadata(record)
+            passed, report = dc.compare_runs(row, row)
+
+            self.assertFalse(passed, report)
+            self.assertIn(
+                "WARN: QEMU binary SHA-256 was not compared: neither run recorded it "
+                "(first run schema 1, current run schema 1; qemu-resume rows of "
+                "schema 3 with snapshot_saved false record it), so this repeat "
+                "cannot vouch for it",
+                report,
+            )
+
+    def test_the_required_fields_match_the_parser(self):
+        # metadata_field_required restates the parser's rules for the compared
+        # fields; a field is required exactly when the parser refuses a row
+        # without it.
+        for kind in dc.QemuRunKind:
+            for schema_version in dc.SUPPORTED_RUN_METADATA_SCHEMA_VERSIONS:
+                for snapshot_saved in (
+                    (False, True) if kind is dc.QemuRunKind.RESUME else (None,)
+                ):
+                    for field, _ in dc.COMPARED_METADATA_FIELDS:
+                        with self.subTest(
+                            kind=kind.value,
+                            schema=schema_version,
+                            snapshot_saved=snapshot_saved,
+                            field=field,
+                        ):
+                            if kind is dc.QemuRunKind.BOOT:
+                                record = _boot_record(Path("/tmp"))
+                                record["schema_version"] = schema_version
+                            else:
+                                record = _resume_record(schema_version)
+                                if snapshot_saved:
+                                    record.update(
+                                        snapshot_saved=True,
+                                        qcow2_path="/tmp/resume.qcow2",
+                                        qcow2_sha256="e" * 64,
+                                        qcow2_size=1,
+                                        snapshot_date_nsec_canonicalized=True,
+                                    )
+                            # The complete row parses.
+                            dc.parse_run_metadata(record)
+                            record.pop(field, None)
+                            if dc.metadata_field_required(
+                                kind, schema_version, snapshot_saved, field
+                            ):
+                                with self.assertRaisesRegex(
+                                    ValueError, "qemu-run-metadata-{}:".format(field)
+                                ):
+                                    dc.parse_run_metadata(record)
+                            else:
+                                self.assertIsNone(
+                                    getattr(dc.parse_run_metadata(record), field)
+                                )
+
+
+class RuntimePathRewriteTest(unittest.TestCase):
+    """Demo 5 replaces its run directory in the saved log as bytes."""
+
+    def test_the_file_rewrite_matches_the_text_rewrite_and_keeps_other_bytes(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "boot-run"
+            run_dir.mkdir()
+            for qmp_socket in (
+                run_dir / "qmp.sock",
+                Path("/var/tmp/hermit-qmp-test/boot.sock"),
+            ):
+                with self.subTest(qmp_socket=str(qmp_socket)):
+                    text = (
+                        "-drive file={run}/disk.qcow2 -qmp unix:{socket}\r\n"
+                        "progress\rnext {run}\n"
+                    ).format(run=run_dir, socket=qmp_socket)
+                    log = run_dir / "hermit-info.log"
+                    log.write_bytes(text.encode() + b"\xff\n")
+
+                    dc.canonicalize_qemu_runtime_paths_in_file(log, run_dir, qmp_socket)
+
+                    self.assertEqual(
+                        dc.canonicalize_qemu_runtime_path(text, run_dir, qmp_socket).encode()
+                        + b"\xff\n",
+                        log.read_bytes(),
+                    )
+                    self.assertEqual(["hermit-info.log"], sorted(p.name for p in run_dir.iterdir()))
 
 
 if __name__ == "__main__":

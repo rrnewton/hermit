@@ -101,8 +101,9 @@ PASS: QEMU argv matches first run
 PASS: QEMU version matches (QEMU emulator version 10.1.2 (...))
 PASS: QEMU binary SHA-256 matches (...)
 PASS: qcow2 SHA-256 matches (9f2cc4675b3e641386c358d8ef8234e100ec829ad4de63577fb3e98cf8a79c66)
+NOT COMPARED: serial output SHA-256: qemu-resume rows do not record it; the guest command's output, taken from the serial log, is compared instead
 PASS: guest output SHA-256 matches (42a2dfb7b01dab06b2fc0b36483d3f75aaa7d33d239a636b3ae2daf9b0f81f06)
-PASS: Hermit INFO log matches first run exactly apart from the wall-clock prefix (Hermit-marked host addresses compared by first appearance)
+PASS: Hermit INFO log matches first run exactly apart from the wall-clock prefix (Hermit-marked host addresses compared by first appearance); compared ... lines, ... of which start a Hermit INFO record
 PASS: all repeat checks match the first run
 
 DETERMINISTIC: snapshot SHA-256 matches the previous run:
@@ -119,10 +120,13 @@ Elided (`...`): your Hermit version and path, the tail of Hermit's log, the
 QEMU package name and binary hash, and the per-run directory names (a
 timestamp and a process ID). The wall-clock times (`16.3s`) depend on host
 load; in a terminal the `Hermit/QEMU resume` counter updates in place until it
-reads `done`. The `PASS: Hermit INFO log` line is shown in the current
-comparator's wording; the capture printed an earlier comparator's wording. Its
-logs pass the current comparison too: they differed in no line once the
-wall-clock prefix was removed (see below). The directory named `28ba533b...`
+reads `done`. The `NOT COMPARED:` line and the `PASS: Hermit INFO log` line
+are shown in the current wording, with the two counts elided; the capture
+printed an earlier comparator's wording, which had neither. That comparator
+read the logs as text, and by it the capture's logs differed in no line once
+the wall-clock prefix was removed (see below). The current comparison reads
+them as bytes; its counts for a pair of resumes on 2026-10-03 follow. The
+directory named `28ba533b...`
 is the SHA-256 of the command string `uname -a`. Your hashes and virtual times
 will match these only with the same QEMU build, kernel and demo 5 snapshot. As
 in demo 5, a saved reference run no longer applies after you rebuild Hermit,
@@ -144,6 +148,14 @@ removed. The other two commands behaved the same way: `ls /` (three resumes)
 gave post-command snapshot `146f380f...` and guest output `81acdc95...`, and
 `cat /proc/meminfo | head -n 3` (two resumes) gave `642d32db...` and
 `a78a631c...`.
+
+On 2026-10-03 the two `uname -a` resumes of a first invocation of the current
+demo (Hermit 0.4.0 gb82e83b510a6) each ran 287703 scheduler turns and saved,
+exactly as captured, a log of 258,316,724 bytes holding no carriage return and
+no line that is not UTF-8. The repeat check compared 1,602,765 lines, 1,027,339
+of which start a Hermit INFO record, and found no difference. Comparing that
+pair again outside the demo took 6.4 seconds, against 3.9 seconds for the
+earlier comparator, with the host's load average near 200.
 
 The first resume of a new command ends instead with:
 
@@ -177,6 +189,13 @@ Run metadata: ignored/qemu-linux/resume-metadata/28ba533b0f3c4df63d6b4a5ead73860
   command's result; a status that differs from the reference run does.
 - The reference run is stored per command (under a directory named after the
   command's SHA-256), so `uname -a` and `ls /` are checked independently.
+- The Hermit log is compared as in demo 5 (see its "What to notice"): every
+  captured line, as bytes, with only the wall-clock prefix removed and the
+  host addresses Hermit marks numbered by first appearance. A log that ends
+  with Hermit's truncation marker, or that holds no Hermit INFO record, fails
+  the check, so `QEMU_LOG_FILTER` must keep Hermit's INFO records; the demo
+  starts Hermit without `HERMIT_LOG` and `HERMIT_LOG_FILE`. A `NOT COMPARED:`
+  line names a check that does not apply to these runs and says why.
 - As in demo 5, one value in the Hermit log still depends on how `hermit` was
   started. QEMU reads `/proc/self/status`, and Hermit passes that file's
   `SigIgn` line, the set of signals the process ignores, through from the host
@@ -202,7 +221,8 @@ Run metadata: ignored/qemu-linux/resume-metadata/28ba533b0f3c4df63d6b4a5ead73860
   `WARN:` is the Hermit log, check whether the differing lines are QEMU's reads
   of `/proc/self/status`.
 - `--no-save-snapshot` skips saving the post-command snapshot; the guest output
-  and the Hermit log are still compared, and the `qcow2 SHA-256` and
+  and the Hermit log are still compared, the repeat check prints
+  `NOT COMPARED: qcow2 SHA-256: neither run saved a snapshot`, and the
   `DETERMINISTIC:` lines do not appear. Such a run keeps its own reference, in
   the command's directory name with `-no-save-snapshot` appended, because it
   executes differently (194491 scheduler turns for `uname -a` instead of
@@ -366,4 +386,5 @@ Controls (environment variables):
 | `QEMU_ASSETS` | `ignored/qemu-linux` | Where demo 5's snapshot and this demo's results are kept. |
 | `QEMU_BOOT_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The boot snapshot to restore. |
 | `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. It must be the one demo 5 used. |
+| `QEMU_LOG_FILTER` | `warn,detcore=info,reverie_ptrace::task=info` | Hermit's log filter, passed to Hermit as `RUST_LOG`; the demo removes `HERMIT_LOG` and `HERMIT_LOG_FILE` from Hermit's environment. The repeat check needs Hermit's INFO records, so a filter that keeps none fails it. A different filter also changes the log, its size and so how soon `QEMU_MAX_LOG_BYTES` is reached, and a saved reference run no longer applies; run `demos/clean.sh`. |
 | `QEMU_MAX_LOG_BYTES` | 512 MiB | Stop the run if Hermit's event log grows past this size. Healthy resumes on 2026-09-30 wrote 169,751,813 bytes (`uname -a` with `--no-save-snapshot`, 10.0 to 11.4 seconds) and 258,227,125 to 259,021,561 bytes (the three commands above, saving a snapshot, 15.7 to 16.5 seconds) (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote 80 to 153 MB. A resume that keeps running reaches this cap after about 29 seconds (18.5 to 19.2 MB per second on 2026-10-03), so with the defaults it, not `QEMU_TIMEOUT`, is what stops a command that does not finish. The cap also holds while the demo waits, for up to 60 seconds after Hermit exits, for the rest of Hermit's output. |

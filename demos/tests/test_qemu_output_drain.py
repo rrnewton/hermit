@@ -20,8 +20,17 @@ These tests run each demo's own launch, copy and wait code with Hermit replaced
 by a script that starts one process and then exits, leaving that process to
 keep writing to the output it inherited, to hold the output open silently, or
 to write a little and exit; or that never exits itself. The demo stops at its
-first step after the wait, so no Hermit, QEMU or kernel is needed. Run
-directly (``python3 demos/tests/test_qemu_output_drain.py``) or via
+first step after the wait, so no Hermit, QEMU or kernel is needed.
+
+Two more checks use the same stand-in. The repeat check compares the log these
+demos capture, so they start Hermit without HERMIT_LOG and HERMIT_LOG_FILE,
+which would change which records the log holds or send them to a file instead;
+the stand-in records the environment it was given. And demo 5 replaces its
+private run directory in the saved log with a fixed token, which must leave
+every other byte of the log as Hermit wrote it, a carriage return or a byte
+that is not UTF-8 included; the stand-in writes such bytes.
+
+Run directly (``python3 demos/tests/test_qemu_output_drain.py``) or via
 ``make -C demos test``.
 """
 
@@ -53,6 +62,12 @@ import demo_common as dc  # noqa: E402
 # process's in FAKE_HERMIT_PIDS. Then it exits 0, except in mode "hung", where
 # it writes 1 KiB to its output about every 10 milliseconds and never exits.
 #
+# Two modes do one more thing first. "record-environment" writes the values of
+# HERMIT_LOG, HERMIT_LOG_FILE and RUST_LOG it was started with, as JSON, to
+# FAKE_HERMIT_ENVIRONMENT. "write-output" writes the bytes of
+# FAKE_HERMIT_OUTPUT to its output, with each @RUN_DIR@ replaced by the host
+# directory that the demo binds at FAKE_HERMIT_BIND_TARGET in the guest.
+#
 # The two processes that write start only once the fake Hermit has exited (their
 # parent PID changes when it does), so everything they write arrives after the
 # demo's wait for Hermit has ended, however slowly a busy machine runs the
@@ -68,10 +83,23 @@ DESCENDANTS = {
     # Writes 1,500 bytes, then exits.
     "late-output": [sys.executable, "-c", AFTER_EXIT + "os.write(1, b'late output\\n' * 125)\n", str(os.getpid())],
     "hung": ["sleep", "1000"],
+    # Exits at once.
+    "record-environment": ["true"],
+    "write-output": ["true"],
 }
 mode = os.environ["FAKE_HERMIT_MODE"]
 if os.environ.get("FAKE_HERMIT_TRANSCRIPT"):
     shutil.copyfile(os.environ["FAKE_HERMIT_TRANSCRIPT"], os.environ["FAKE_HERMIT_SERIAL_LOG"])
+if mode == "record-environment":
+    with open(os.environ["FAKE_HERMIT_ENVIRONMENT"], "w") as handle:
+        json.dump({name: os.environ.get(name) for name in ("HERMIT_LOG", "HERMIT_LOG_FILE", "RUST_LOG")}, handle)
+if mode == "write-output":
+    target = ":" + os.environ["FAKE_HERMIT_BIND_TARGET"]
+    run_dir = next(argument[: -len(target)] for argument in sys.argv if argument.endswith(target))
+    with open(os.environ["FAKE_HERMIT_OUTPUT"], "rb") as handle:
+        output = handle.read()
+    sys.stdout.buffer.write(output.replace(b"@RUN_DIR@", os.fsencode(run_dir)))
+    sys.stdout.buffer.flush()
 descendant = subprocess.Popen(DESCENDANTS[mode])
 pids = os.environ["FAKE_HERMIT_PIDS"]
 with open(pids + ".tmp", "w") as handle:
@@ -166,9 +194,13 @@ class _OutputDrainScenarios:
         timeout: int = 30,
         max_log_bytes: int = LARGE_CAP,
         drain_timeout: int = 30,
+        extra_environment: Optional[dict] = None,
+        extra_replacements: Optional[dict] = None,
     ) -> Tuple[object, float]:
         """Run the demo once with the fake Hermit in ``mode``.
 
+        ``extra_environment`` is added to the environment the demo runs in, and
+        ``extra_replacements`` to the names this test replaces in the demo.
         Returns what the demo returned or raised, and the seconds from when the
         fake Hermit had started (it had recorded its PIDs) until then.
         """
@@ -200,8 +232,10 @@ class _OutputDrainScenarios:
                 "wait_for_process": wait_when_ready,
             }
         )
+        replacements.update(extra_replacements or {})
         environment = {"FAKE_HERMIT_MODE": mode, "FAKE_HERMIT_PIDS": str(self.pids_file)}
         environment.update(self.fake_environment(mode))
+        environment.update(extra_environment or {})
         function = self.namespace[self.function_name]
         printed = io.TextIOWrapper(io.BytesIO(), encoding="utf-8", write_through=True)
         with mock.patch.dict(function.__globals__, replacements), mock.patch.dict(
@@ -284,6 +318,29 @@ class _OutputDrainScenarios:
         self.assertEqual(self.log_path.read_bytes(), LATE_OUTPUT)
         self._assert_stopped("descendant")
 
+    def test_hermit_starts_without_the_variables_that_move_or_change_its_log(self):
+        # HERMIT_LOG_FILE would send Hermit's tracing records to that file, so
+        # the log the demo compares would hold none, and HERMIT_LOG would change
+        # which records it holds. The demo clears both and sets RUST_LOG itself.
+        recorded = self.directory / "environment.json"
+        outcome, _ = self._run(
+            "record-environment",
+            extra_environment={
+                "HERMIT_LOG": "trace",
+                "HERMIT_LOG_FILE": str(self.directory / "hermit.log"),
+                "FAKE_HERMIT_ENVIRONMENT": str(recorded),
+            },
+        )
+        self.assertIsInstance(outcome, ReachedTheNextStep)
+        self.assertEqual(
+            json.loads(recorded.read_text()),
+            {
+                "HERMIT_LOG": None,
+                "HERMIT_LOG_FILE": None,
+                "RUST_LOG": self.namespace["LOG_FILTER"],
+            },
+        )
+
 
 class Demo5OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
     """Demo 5's boot."""
@@ -324,6 +381,45 @@ class Demo5OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
     def assert_timeout_reported(self, outcome) -> None:
         self.assertIsInstance(outcome, TimeoutError)
         self.assertEqual(str(outcome), "process exceeded timeout of 1s")
+
+    def test_the_saved_log_keeps_every_byte_but_the_run_directory(self):
+        # Demo 5 replaces its private run directory in the saved log with a
+        # fixed token. It used to do that on the log decoded as text, which
+        # turned each carriage return into a newline and each byte that is not
+        # UTF-8 into U+FFFD, so the repeat check could not see them.
+        output = (
+            b"2026-08-17T04:27:14.000001Z  INFO detcore: opened @RUN_DIR@/qmp.sock\r\n"
+            b"2026-08-17T04:27:14.000002Z  INFO detcore: read \xff\n"
+            b"progress\rdone\n"
+        )
+        source = self.directory / "output"
+        source.write_bytes(output)
+        saved = {}
+
+        def snapshot_exists(path, name):
+            # The snapshot and the serial log that QEMU would have written.
+            path.write_bytes(b"stand-in for the snapshot")
+            (path.parent / "serial.log").write_text("2022-01-01T00:00:00\n")
+            return True
+
+        def save_metadata(run_dir, disk, info_log, fields):
+            saved["log"] = Path(info_log).read_bytes()
+            raise ReachedTheNextStep()
+
+        outcome, _ = self._run(
+            "write-output",
+            extra_environment={
+                "FAKE_HERMIT_OUTPUT": str(source),
+                "FAKE_HERMIT_BIND_TARGET": str(self.namespace["GUEST_RUN_DIR"]),
+            },
+            extra_replacements={
+                "snapshot_exists": snapshot_exists,
+                "canonicalize_qcow2_snapshot_timestamp": lambda path, name: None,
+                "save_metadata": save_metadata,
+            },
+        )
+        self.assertIsInstance(outcome, ReachedTheNextStep)
+        self.assertEqual(saved["log"], output.replace(b"@RUN_DIR@", b"<run-dir>"))
 
 
 # The frame /init writes around a command that printed "done" and exited 0.

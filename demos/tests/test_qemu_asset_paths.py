@@ -161,7 +161,9 @@ class DefaultQemuAssetsTest(unittest.TestCase):
         for relative in ("05-qemu-boot/run.py", "06-qemu-resume/run.py"):
             with self.subTest(relative=relative):
                 text = (DEMO_DIR / relative).read_text()
-                environment_start = text.index("environment = os.environ.copy()")
+                environment_start = text.index(
+                    "environment = hermit_log_environment(LOG_FILTER)"
+                )
                 launch = text.index("process = subprocess.Popen(", environment_start)
                 self.assertIn(setting, text[environment_start:launch])
                 self.assertIn("env=environment", text[launch:])
