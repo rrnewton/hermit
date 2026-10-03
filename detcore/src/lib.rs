@@ -1041,13 +1041,19 @@ impl<T: RecordOrReplay> Detcore<T> {
 ///
 /// Output pointers are dereferenced only when the kernel can have written
 /// them. Linux leaves the output buffer of the syscalls listed in
-/// [`failure_leaves_outputs_unwritten`] untouched when they fail, so rendering
-/// it would publish whatever the guest happened to have there -- typically
-/// uninitialized stack -- as if it were a result, and two otherwise identical
-/// runs would diverge on it
-/// (<https://github.com/rrnewton/hermit/issues/3153>). For those syscalls a
-/// failure renders the pointer arguments without their pointees; the errno is
-/// printed next to this rendering from the result itself.
+/// [`failure_leaves_outputs_unwritten`] untouched when they fail with any errno
+/// other than EFAULT, so rendering it would publish whatever the guest
+/// happened to have there -- typically uninitialized stack -- as if it were a
+/// result, and two otherwise identical runs would diverge on it
+/// (<https://github.com/rrnewton/hermit/issues/3153>). For those syscalls such
+/// a failure renders the pointer arguments without their pointees; the errno
+/// is printed next to this rendering from the result itself.
+///
+/// EFAULT keeps the outputs rendered, because it is also the error of a copy
+/// that faulted part way: `copy_to_user()` may already have stored a prefix of
+/// the struct, which the guest can read and DETLOG must show. A tool error is
+/// not a guest errno and proves nothing about the buffer, so it keeps them
+/// rendered too.
 ///
 /// Every other syscall keeps rendering its outputs on failure, because some
 /// Linux syscalls do write an output on an error return (for example
@@ -1060,15 +1066,17 @@ fn display_syscall_finished<'a, M: MemoryAccess>(
 ) -> reverie::syscalls::Display<'a, M, Syscall> {
     match syscall {
         Syscall::Fstat(_) => syscall.display(memory), //FIXME: T136880615 - fstat structure isn't fully deterministic yet
-        _ if result.is_err() && failure_leaves_outputs_unwritten(syscall) => {
+        _ if failure_proves_outputs_unwritten(result)
+            && failure_leaves_outputs_unwritten(syscall) =>
+        {
             syscall.display(memory)
         }
         _ => syscall.display_with_outputs(memory),
     }
 }
 
-/// Syscalls whose output buffer Linux does not write when the syscall fails,
-/// restricted to those whose output the pinned Reverie formatter dereferences.
+/// Syscalls whose output buffer Linux does not write when the syscall fails
+/// with an errno other than EFAULT, restricted to those whose output the pinned Reverie formatter dereferences.
 ///
 /// This is deliberately a list of syscalls PROVEN not to write on failure,
 /// rather than a list of exceptions that do: a syscall missing from it keeps
@@ -1092,7 +1100,8 @@ fn display_syscall_finished<'a, M: MemoryAccess>(
 ///
 /// In every case the one failure that follows a copy attempt is the `-EFAULT`
 /// from the copy itself, where `copy_to_user()` may have stored a prefix of
-/// the struct before faulting. That partial prefix is not rendered.
+/// the struct before faulting. [`failure_proves_outputs_unwritten`] therefore
+/// keeps rendering EFAULT failures, so that partial prefix stays visible.
 ///
 /// `gettimeofday` is intentionally absent: `SYSCALL_DEFINE2(gettimeofday)` in
 /// `kernel/time/time.c` stores `tv` and then returns `-EFAULT` if copying
@@ -1107,6 +1116,14 @@ fn failure_leaves_outputs_unwritten(syscall: &Syscall) -> bool {
             | Syscall::Statx(_)
             | Syscall::ClockGettime(_)
     )
+}
+
+/// Whether `result` is a failure that, for a syscall listed in
+/// [`failure_leaves_outputs_unwritten`], proves Linux stored no output: a
+/// guest errno other than EFAULT. EFAULT can follow a partial copy, and a
+/// tool error is not the syscall's result.
+fn failure_proves_outputs_unwritten(result: &Result<i64, Error>) -> bool {
+    matches!(result, Err(Error::Errno(errno)) if *errno != Errno::EFAULT)
 }
 
 #[reverie::tool]
@@ -3984,6 +4001,78 @@ mod finished_syscall_display_tests {
         assert!(
             succeeded.contains(&format!("tv_sec: {SENTINEL}")),
             "timespec missing on success: {succeeded}"
+        );
+    }
+
+    /// EFAULT is also the error of a copy-out that faulted part way, after
+    /// `copy_to_user()` stored a prefix the guest can read, so it must keep
+    /// the buffer rendered for every allowlisted syscall.
+    #[test]
+    fn efault_failures_still_render_a_possible_partial_copy() {
+        let path = CString::new("/dev/null").unwrap();
+        let stat = sentinel_stat();
+        let line = finish_line(&newfstatat(&path, &stat), Err(Errno::EFAULT.into()));
+        assert!(
+            line.contains(&format!(
+                "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
+                &stat as *const libc::stat, SENTINEL
+            )),
+            "partial stat copy hidden on EFAULT: {line}"
+        );
+        assert!(line.contains("EFAULT"), "errno missing: {line}");
+
+        let buf = sentinel_statx();
+        let line = finish_line(&statx(&path, &buf), Err(Errno::EFAULT.into()));
+        assert!(
+            line.contains(&format!(
+                "{:p} -> {{st_mode=SFlag(S_IFREG) | 0644, st_size={}, ...}}",
+                &buf as *const libc::statx, SENTINEL
+            )),
+            "partial statx copy hidden on EFAULT: {line}"
+        );
+
+        let tp = Timespec {
+            tv_sec: SENTINEL,
+            tv_nsec: 0,
+        };
+        let call = Syscall::ClockGettime(
+            ClockGettime::new()
+                .with_clockid(ClockId::CLOCK_MONOTONIC)
+                .with_tp(Some(TimespecMutPtr(
+                    AddrMut::from_ptr(&tp as *const Timespec).unwrap(),
+                ))),
+        );
+        let line = finish_line(&call, Err(Errno::EFAULT.into()));
+        assert!(
+            line.contains(&format!("tv_sec: {SENTINEL}")),
+            "partial timespec copy hidden on EFAULT: {line}"
+        );
+    }
+
+    /// A tool error is not the syscall's result and proves nothing about the
+    /// buffer, so only a guest errno other than EFAULT hides it.
+    #[test]
+    fn only_non_efault_guest_errnos_prove_the_buffer_unwritten() {
+        for errno in [Errno::ENOENT, Errno::EINVAL, Errno::EBADF, Errno::ENOMEM] {
+            assert!(failure_proves_outputs_unwritten(&Err(errno.into())));
+        }
+        assert!(!failure_proves_outputs_unwritten(
+            &Err(Errno::EFAULT.into())
+        ));
+        assert!(!failure_proves_outputs_unwritten(&Ok(0)));
+        assert!(!failure_proves_outputs_unwritten(&Err(Error::Tool(
+            anyhow::anyhow!("tool failure")
+        ))));
+
+        let path = CString::new("/dev/null").unwrap();
+        let stat = sentinel_stat();
+        let line = finish_line(
+            &newfstatat(&path, &stat),
+            Err(Error::Tool(anyhow::anyhow!("tool failure"))),
+        );
+        assert!(
+            line.contains(&format!("st_size={SENTINEL}")),
+            "buffer hidden on a tool error: {line}"
         );
     }
 

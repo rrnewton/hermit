@@ -24,6 +24,7 @@ use detcore::types::NANOS_PER_SYSCALL;
 use reverie::Rdtsc;
 use reverie::RdtscResult;
 use reverie_ptrace::testing::check_fn_with_config;
+use reverie_ptrace::testing::test_fn_with_config;
 
 // Keep this synchronized with the clock-query category in `syscall_time`.
 const NANOS_PER_CLOCK_GETTIME: f64 = 10_000.0;
@@ -821,6 +822,136 @@ fn tod_gettimeofday_null_tv_faulting_tz_fails() {
         config,
         true,
     );
+}
+
+/// Installs a seccomp filter in the calling process that makes `time(2)` fail
+/// with EFAULT without running it: every call, or with `only_tloc`, only a
+/// call whose `tloc` is that address.
+fn install_time_efault_filter(only_tloc: Option<usize>) {
+    const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
+    // Offsets of `nr`, `arch` and the two halves of `args[0]` in
+    // `struct seccomp_data`.
+    const NR: u32 = 0;
+    const ARCH: u32 = 4;
+    const ARG0_LO: u32 = 16;
+    const ARG0_HI: u32 = 20;
+    let stmt = |code: u32, k: u32| libc::sock_filter {
+        code: code as u16,
+        jt: 0,
+        jf: 0,
+        k,
+    };
+    let jeq = |k: u32, jt: u8, jf: u8| libc::sock_filter {
+        code: (libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K) as u16,
+        jt,
+        jf,
+        k,
+    };
+    let load = |offset| stmt(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, offset);
+    let allow = stmt(libc::BPF_RET | libc::BPF_K, libc::SECCOMP_RET_ALLOW);
+    let efault = stmt(
+        libc::BPF_RET | libc::BPF_K,
+        libc::SECCOMP_RET_ERRNO | libc::EFAULT as u32,
+    );
+    let mut filter = vec![load(ARCH), jeq(AUDIT_ARCH_X86_64, 1, 0), allow, load(NR)];
+    match only_tloc {
+        None => filter.extend([jeq(libc::SYS_time as u32, 0, 1), efault, allow]),
+        Some(tloc) => filter.extend([
+            jeq(libc::SYS_time as u32, 0, 5),
+            load(ARG0_LO),
+            jeq(tloc as u32, 0, 3),
+            load(ARG0_HI),
+            jeq((tloc >> 32) as u32, 0, 1),
+            efault,
+            allow,
+        ]),
+    }
+    let prog = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    assert_eq!(
+        unsafe { libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) },
+        0
+    );
+    assert_eq!(
+        unsafe {
+            libc::prctl(
+                libc::PR_SET_SECCOMP,
+                libc::SECCOMP_MODE_FILTER,
+                &prog as *const libc::sock_fprog,
+            )
+        },
+        0
+    );
+}
+
+const RESUMED_AFTER_FAULT: &str = "resumed-after-faulting-gettimeofday";
+
+/// A seccomp filter inherited from Hermit's parent that returns EFAULT for
+/// `time(2)` makes Detcore's `time(2)` store probe report EFAULT although
+/// nothing faulted, while the host has already stored its wall clock in a
+/// writable `tv`. The run must stop before the guest resumes and can read that
+/// host time. Detcore emulates the guest's own `seccomp(2)` and refuses
+/// `PR_SET_NO_NEW_PRIVS`, so the filter is installed on this test thread, which
+/// forks the guest and so passes the filter on to it.
+fn seccomp_efault_time_probe_stops_the_run(only_probe_address: bool, expected: &str) {
+    let config = detcore::Config {
+        virtualize_time: true,
+        ..Default::default()
+    };
+    // Mapped before the fork, so the guest has it at the same address.
+    let (page, _) = map_pages(1);
+    let tv_raw = page.expose_provenance();
+    install_time_efault_filter(only_probe_address.then_some(tv_raw));
+    let outcome = test_fn_with_config::<Detcore, _>(
+        move || {
+            let tv_addr = ptr::with_exposed_provenance_mut::<libc::timeval>(tv_raw);
+            let unmapped = ptr::without_provenance_mut::<libc::c_void>(1);
+            unsafe { tv_addr.write(SENTINEL_TV) };
+            // The filter is in force in the guest: its own call fails without
+            // storing anything.
+            let probe = if only_probe_address {
+                tv_addr.cast::<libc::time_t>()
+            } else {
+                ptr::null_mut()
+            };
+            let ret = unsafe { libc::syscall(libc::SYS_time, probe) };
+            assert_eq!(
+                (ret, unsafe { *libc::__errno_location() }),
+                (-1, libc::EFAULT)
+            );
+            assert_eq!(unsafe { (*tv_addr).tv_sec }, SENTINEL_TV.tv_sec);
+
+            let result = raw_gettimeofday(tv_addr, unmapped);
+            println!("{RESUMED_AFTER_FAULT} {result:?} tv_sec={}", unsafe {
+                (*tv_addr).tv_sec
+            });
+        },
+        config,
+        true,
+    );
+    let error = match outcome {
+        Err(error) => error,
+        Ok((output, _)) => panic!(
+            "the run finished with {:?}; stdout: {}; stderr: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        ),
+    };
+    let message = format!("{error:#}");
+    assert!(message.contains(expected), "unexpected failure: {message}");
+}
+
+#[test]
+fn tod_gettimeofday_faulting_tz_seccomp_efault_for_every_time_call_stops_the_run() {
+    seccomp_efault_time_probe_stops_the_run(false, "time(NULL) control probe failed");
+}
+
+#[test]
+fn tod_gettimeofday_faulting_tz_seccomp_efault_for_the_probe_address_stops_the_run() {
+    seccomp_efault_time_probe_stops_the_run(true, "the word changed during the call");
 }
 
 fn raw_getimeofday_delta() {

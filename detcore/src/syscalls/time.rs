@@ -117,6 +117,14 @@ enum TvRepairFailureKind {
     /// The backend could not execute the `time(2)` probe. EFAULT is not a
     /// failure: it means Linux stopped before storing this word.
     ProbeFailed(Errno),
+    /// After a store probe returned EFAULT, `time(NULL)`, which Linux cannot
+    /// fail, failed too. Something other than the store, such as a seccomp
+    /// filter, produced the EFAULT, so it says nothing about `tv`.
+    ControlProbeFailed(Errno),
+    /// A word at or after the one whose store probe returned EFAULT no longer
+    /// matches what the guest could read before the call, so the original call
+    /// stored it and the EFAULT did not come from the store.
+    StoppedWordChanged,
     /// The exact overwrite after a successful probe failed. The probe just
     /// stored host seconds, so the run cannot safely continue.
     OverwriteFailed(Errno),
@@ -140,6 +148,13 @@ impl std::fmt::Display for TvRepairFailure {
             TvRepairFailureKind::ProbeFailed(errno) => {
                 write!(f, "time(2) store probe failed: {errno}")
             }
+            TvRepairFailureKind::ControlProbeFailed(errno) => write!(
+                f,
+                "time(NULL) control probe failed: {errno}, so the store probe's EFAULT was not a store fault"
+            ),
+            TvRepairFailureKind::StoppedWordChanged => f.write_str(
+                "the word changed during the call although its store probe returned EFAULT",
+            ),
             TvRepairFailureKind::OverwriteFailed(errno) => {
                 write!(f, "virtual-time overwrite failed: {errno}")
             }
@@ -179,6 +194,60 @@ fn classify_time_store_probe(
             TvRepairFailureKind::ProbeFailed(errno),
         )),
     }
+}
+
+/// `time(NULL)` stores nothing and cannot fail on Linux, so any error means
+/// the injected `time(2)` never reached the native call.
+fn require_native_time_control_probe(
+    field: &'static str,
+    result: Result<i64, Errno>,
+) -> Result<(), Error> {
+    match result {
+        Ok(_) => Ok(()),
+        Err(errno) => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::ControlProbeFailed(errno),
+        )),
+    }
+}
+
+/// A word Linux did not store keeps both its contents and its readability.
+fn require_unchanged_stopped_word(
+    field: &'static str,
+    before: Option<libc::time_t>,
+    after: Result<libc::time_t, Errno>,
+) -> Result<(), Error> {
+    match (before, after) {
+        (Some(before), Ok(after)) if before == after => Ok(()),
+        (None, Err(_)) => Ok(()),
+        _ => Err(tv_repair_error(
+            field,
+            TvRepairFailureKind::StoppedWordChanged,
+        )),
+    }
+}
+
+/// The guest-readable contents of `tv_sec` and `tv_usec` before a
+/// `gettimeofday`, `None` where the word cannot be read.
+type TimevalWordSnapshot = [Option<libc::time_t>; 2];
+
+const TIMEVAL_WORDS: [(&str, usize); 2] = [
+    ("tv_sec", std::mem::offset_of!(Timeval, tv_sec)),
+    ("tv_usec", std::mem::offset_of!(Timeval, tv_usec)),
+];
+
+fn snapshot_timeval_words<'a, G, T>(
+    guest: &mut G,
+    tv_addr: AddrMut<'a, Timeval>,
+) -> TimevalWordSnapshot
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    TIMEVAL_WORDS.map(|(field, offset)| {
+        let addr = timeval_word_addr(field, tv_addr, offset).ok()?;
+        guest.memory().read_value(addr).ok()
+    })
 }
 
 fn timeval_word_addr<'a>(
@@ -238,8 +307,24 @@ fn should_repair_failed_gettimeofday_tv(backend_is_kvm: bool) -> bool {
 /// the word with its virtual value. Other probe errors and overwrite failures
 /// fail closed because host time may remain.
 ///
-/// This deliberately performs no read or rewrite probe, and never writes a
-/// word the kernel could not store. The host seconds written by a successful
+/// An EFAULT from the probe is only evidence about `tv` if it came from the
+/// store. A seccomp filter can return EFAULT for `time(2)` without running it,
+/// and would otherwise end the repair while host time remains in a writable
+/// `tv`. Two checks therefore confirm every EFAULT before it is trusted.
+/// First, `time(NULL)` is injected: it stores nothing and cannot fail on
+/// Linux, so any error means the probes are not reaching the native call.
+/// Second, every word from the stopped one onward must still read exactly as
+/// it did before the original call, readable with the same value or
+/// unreadable both times; a changed word was stored by that call. Both
+/// failures end the run. A filter that returns EFAULT only for this probe's
+/// exact address, on a word the guest can write but not read, passes both
+/// checks; no observation that leaves the guest's memory untouched can tell
+/// that case apart.
+///
+/// The repair never writes a word the kernel could not store, and it does not
+/// test writability by rewriting a word, because a remote write ignores
+/// protection keys that deny the guest's own stores. The pre-call snapshot is
+/// a read only. The host seconds written by a successful
 /// probe exist transiently until the overwrite. Default thread
 /// sequentialization prevents another guest thread from observing that
 /// interval, but another process sharing the page can observe it; such
@@ -256,36 +341,35 @@ async fn overwrite_failed_gettimeofday_tv<'a, G, T>(
     guest: &mut G,
     tv_addr: AddrMut<'a, Timeval>,
     tv: &Timeval,
+    before: &TimevalWordSnapshot,
 ) -> Result<(), Error>
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let words = [
-        (
-            "tv_sec",
-            std::mem::offset_of!(Timeval, tv_sec),
-            tv.tv_sec as libc::time_t,
-        ),
-        (
-            "tv_usec",
-            std::mem::offset_of!(Timeval, tv_usec),
-            tv.tv_usec as libc::time_t,
-        ),
-    ];
-    for (field, offset, value) in words {
+    let values = [tv.tv_sec as libc::time_t, tv.tv_usec as libc::time_t];
+    for (index, (field, offset)) in TIMEVAL_WORDS.into_iter().enumerate() {
         let addr = timeval_word_addr(field, tv_addr, offset)?;
         let probe = syscalls::Time::new().with_tloc(Some(addr));
-        match classify_time_store_probe(field, guest.inject(probe).await) {
-            Ok(TimeStoreProbe::Stored) => {
-                let bytes = value.to_ne_bytes();
+        match classify_time_store_probe(field, guest.inject(probe).await)? {
+            TimeStoreProbe::Stored => {
+                let bytes = values[index].to_ne_bytes();
                 let overwrite = guest
                     .memory()
                     .write_with_user_access(addr.cast::<u8>(), &bytes);
                 require_complete_time_word_overwrite(field, bytes.len(), overwrite)?;
             }
-            Ok(TimeStoreProbe::Stopped) => break,
-            Err(error) => return Err(error),
+            TimeStoreProbe::Stopped => {
+                let control = syscalls::Time::new().with_tloc(None);
+                require_native_time_control_probe(field, guest.inject(control).await)?;
+                for (stopped, (field, offset)) in TIMEVAL_WORDS.into_iter().enumerate().skip(index)
+                {
+                    let addr = timeval_word_addr(field, tv_addr, offset)?;
+                    let after = guest.memory().read_value(addr);
+                    require_unchanged_stopped_word(field, before[stopped], after)?;
+                }
+                break;
+            }
         }
     }
     Ok(())
@@ -361,6 +445,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let time_ns = guest_clock_time(guest).await;
 
+        let repair_on_efault = should_repair_failed_gettimeofday_tv(guest.config().backend_is_kvm);
+        // What the guest could read in `tv` before the call; the repair uses it
+        // to confirm which words a failing call left alone.
+        let before = match call.tv() {
+            Some(tp) if repair_on_efault => Some(snapshot_timeval_words(guest, tp.into())),
+            _ => None,
+        };
+
         // A call failing with EFAULT may still have stored host wall-clock time
         // in `tv`, so keep its result until `tv` holds virtual time.
         let result = self
@@ -370,20 +462,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         let tv: Timeval = time_ns.into();
 
         if let Some(tp) = call.tv() {
-            match &result {
-                Ok(_) => guest.memory().write_value(tp, &tv)?,
+            match (&result, &before) {
+                (Ok(_), _) => guest.memory().write_value(tp, &tv)?,
                 // Linux's gettimeofday fails only with EFAULT, which is taken
                 // to be its own even when a seccomp filter returned it without
                 // running the call. Any other error came from the backend, the
                 // tool, a seccomp filter or a replayed log, and says nothing
                 // about what reached `tv`, so memory is left alone.
-                Err(Error::Errno(Errno::EFAULT))
-                    if should_repair_failed_gettimeofday_tv(guest.config().backend_is_kvm) =>
-                {
+                (Err(Error::Errno(Errno::EFAULT)), Some(before)) => {
                     require_live_time_store_probe(self.cfg.replay_data.is_some())?;
-                    overwrite_failed_gettimeofday_tv(guest, tp.into(), &tv).await?
+                    overwrite_failed_gettimeofday_tv(guest, tp.into(), &tv, before).await?
                 }
-                Err(_) => {}
+                (Err(_), _) => {}
             }
         }
 
@@ -917,6 +1007,43 @@ mod tests {
         }
 
         #[test]
+        fn any_control_probe_error_means_the_efault_was_not_a_store_fault() {
+            require_native_time_control_probe("tv_sec", Ok(1_767_225_600)).unwrap();
+            for errno in [Errno::EFAULT, Errno::EPERM, Errno::ENOSYS] {
+                let error = require_native_time_control_probe("tv_usec", Err(errno))
+                    .expect_err("time(NULL) cannot fail natively");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_usec",
+                        kind: TvRepairFailureKind::ControlProbeFailed(errno),
+                    }
+                );
+            }
+        }
+
+        #[test]
+        fn a_stopped_word_must_keep_its_contents_and_readability() {
+            require_unchanged_stopped_word("tv_sec", Some(7), Ok(7)).unwrap();
+            require_unchanged_stopped_word("tv_sec", None, Err(Errno::EFAULT)).unwrap();
+            for (before, after) in [
+                (Some(7), Ok(1_791_041_091)),
+                (Some(7), Err(Errno::EFAULT)),
+                (None, Ok(7)),
+            ] {
+                let error = require_unchanged_stopped_word("tv_usec", before, after)
+                    .expect_err("a changed stopped word means the call stored it");
+                assert_eq!(
+                    failure(error),
+                    TvRepairFailure {
+                        field: "tv_usec",
+                        kind: TvRepairFailureKind::StoppedWordChanged,
+                    }
+                );
+            }
+        }
+
+        #[test]
         fn failed_gettimeofday_repair_is_skipped_only_for_kvm() {
             assert!(should_repair_failed_gettimeofday_tv(false));
             assert!(!should_repair_failed_gettimeofday_tv(true));
@@ -978,6 +1105,7 @@ mod tests {
 
         #[test]
         fn timeval_word_addresses_follow_kernel_order_and_overflow_fails_closed() {
+            assert_eq!(TIMEVAL_WORDS, [("tv_sec", 0), ("tv_usec", 8)]);
             let tv_addr = AddrMut::<Timeval>::from_raw(0x10_0000).unwrap();
             assert_eq!(
                 timeval_word_addr("tv_sec", tv_addr, std::mem::offset_of!(Timeval, tv_sec))
