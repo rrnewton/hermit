@@ -350,7 +350,8 @@ fn help_does_not_turn_missing_or_unknown_arguments_into_success() {
 }
 
 /// The source-snapshot flags redirect a caller who uses them where they do not
-/// apply, and --repo-root reaches expected-plan too, from a Git-less snapshot.
+/// apply, including a --source-sha for files Git tracks, and --repo-root
+/// reaches expected-plan too, from a Git-less snapshot.
 #[test]
 fn test_harness_source_snapshot_flags_redirect_misuse() {
     let harness = env!("CARGO_BIN_EXE_test-harness");
@@ -379,6 +380,34 @@ fn test_harness_source_snapshot_flags_redirect_misuse() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         assert!(stderr.contains(expected), "{arguments:?}: {stderr}");
     }
+    // Git knows the commit of files it tracks and whether they are dirty, so a
+    // --source-sha may not override it.
+    let checkout = std::env::temp_dir().join(format!(
+        "hermit-manifest-cli-tracked-checkout-{}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&checkout).expect("create checkout");
+    std::fs::write(checkout.join("tracked"), "").expect("write tracked file");
+    let git = |arguments: &[&str]| {
+        located_by_directory("git")
+            .arg("-C")
+            .arg(&checkout)
+            .args(arguments)
+            .status()
+            .expect("run git")
+            .success()
+    };
+    let tracking = git(&["init", "-q"]) && git(&["add", "tracked"]);
+    let checkout_root = checkout.to_str().unwrap();
+    let tracked = run(
+        harness,
+        &["run", "--repo-root", checkout_root, "--source-sha", sha],
+    );
+    std::fs::remove_dir_all(&checkout).expect("remove checkout");
+    assert!(tracking);
+    assert_eq!(tracked.status.code(), Some(2), "{tracked:?}");
+    let stderr = String::from_utf8_lossy(&tracked.stderr);
+    assert!(stderr.contains("Git tracks files under"), "{stderr}");
     let root = env!("CARGO_MANIFEST_DIR").to_string() + "/../..";
     let default = run(harness, &["expected-plan"]);
     let rooted = run(harness, &["expected-plan", "--repo-root", &root]);

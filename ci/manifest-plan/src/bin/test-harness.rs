@@ -43,7 +43,7 @@ use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::retries_product_failures;
 use hermit_manifest_plan::runner::run_cell;
-use hermit_manifest_plan::runner::validate_source_sha;
+use hermit_manifest_plan::runner::validate_source_snapshot;
 use hermit_manifest_plan::runner::write_junit;
 use hermit_manifest_plan::self_test_selection;
 use hermit_manifest_plan::stress_series::HostCapabilities;
@@ -101,9 +101,9 @@ Selection options:
 Source options:
   --repo-root <DIR>                Read manifests and programs from DIR and run hermit
                                    there (default: the checkout this binary was built in)
-  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA with no Git
-                                   metadata: take the test inventory from its files and
-                                   record SHA as hermit_sha instead of asking git
+  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA whose files
+                                   Git does not track: take the test inventory from its
+                                   files and record SHA as hermit_sha instead of asking git
 
 Execution and output options:
   --prebuilt                       Reuse prepared test programs (run only)
@@ -187,9 +187,9 @@ const REPO_ROOT_OPTION: &str =
                                    checkout this binary was built in)";
 
 const SOURCE_SHA_OPTION: &str =
-    "  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA with no Git
-                                   metadata: take the test inventory from its files and
-                                   record SHA as hermit_sha instead of asking git";
+    "  --source-sha <SHA>               DIR is a clean `git archive` of commit SHA whose files
+                                   Git does not track: take the test inventory from its
+                                   files and record SHA as hermit_sha instead of asking git";
 
 const AMBIENT_PREPARATION_ENVIRONMENT: &str =
     "  HOME=<PATH>                            Base for default Rust toolchain homes
@@ -809,13 +809,13 @@ fn validate_args(command: &str, args: &Args) {
         fail("--tpx-json is accepted by run only");
     }
     if let Some(sha) = args.source_sha.as_deref() {
-        if args.repo_root.is_none() {
+        let Some(repo_root) = args.repo_root.as_deref() else {
             fail(
                 "--source-sha describes a --repo-root source snapshot; pass --repo-root DIR \
                  naming the `git archive` of that commit",
             );
-        }
-        validate_source_sha(sha).unwrap_or_else(|error| fail(error));
+        };
+        validate_source_snapshot(repo_root, sha).unwrap_or_else(|error| fail(error));
     }
     if !matches!(command, "build" | "run") && args.jobs.is_some() {
         fail("--jobs is accepted by build and run only");
@@ -3706,11 +3706,9 @@ report.write_bytes((root/'verification.json').read_bytes())
         const TEST: &str = "tests::import_mode_republishes_rows_and_a_missing_cell_is_an_error";
         const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
         const STALE: &str = "fedcba9876543210fedcba9876543210fedcba98";
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
         if let Some(fixture) = std::env::var_os(CHILD) {
+            // The fixture is the `git archive` --source-sha names: Git tracks
+            // none of its files.
             let fixture = PathBuf::from(fixture);
             let mut values = vec![
                 "--category".into(),
@@ -3718,7 +3716,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 "--ci-only".into(),
                 "--prebuilt".into(),
                 "--repo-root".into(),
-                root.display().to_string(),
+                fixture.display().to_string(),
                 "--source-sha".into(),
                 SHA.into(),
                 "--results".into(),
@@ -3732,7 +3730,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             let args = parse(values.into_iter());
             validate_args("run", &args);
             let manifests = ManifestSet::load(&fixture).unwrap();
-            let code = super::run(&root, &manifests, &args);
+            let code = super::run(&fixture, &manifests, &args);
             std::process::exit(if code == ExitCode::SUCCESS { 0 } else { 1 });
         }
 
@@ -3745,6 +3743,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             "test-source",
             "timeouts",
             "binding",
+            "stale-first-row",
             "untrusted-retry",
             "no-retry",
             "pass-then-fail",
@@ -3752,6 +3751,8 @@ report.write_bytes((root/'verification.json').read_bytes())
             "pass-then-pass",
             "duplicate-attempt",
             "file-order",
+            "file-order-pass-first",
+            "rowless-first-execution",
             "host-inapplicable-then-fail",
             "host-inapplicable-row",
             "unconfirmed",
@@ -3780,7 +3781,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             );
             let cells = run_cells(&manifests, &selection).unwrap();
             assert_eq!(cells.len(), 3, "verify@ptrace, verify@kvm, custom@kvm");
-            let producer = RunContext::for_import(root.clone(), Some(SHA)).unwrap();
+            let producer = RunContext::for_import(path.to_path_buf(), Some(SHA)).unwrap();
             let mut rows = Vec::new();
             let mut evidence = Vec::new();
             for (index, cell) in cells.iter().enumerate() {
@@ -3797,6 +3798,11 @@ report.write_bytes((root/'verification.json').read_bytes())
                     ("custom", "pass-then-pass") => &[(1, "PASS"), (2, "PASS")],
                     ("custom", "duplicate-attempt") => &[(1, "PASS"), (1, "FAIL")],
                     ("custom", "file-order") => &[(2, "FAIL"), (1, "PASS")],
+                    // Sorted by attempt, this history would end in a PASS.
+                    ("custom", "file-order-pass-first") => &[(2, "PASS"), (1, "FAIL")],
+                    // The first execution died before writing a row, and the
+                    // ingest still numbered it attempt 1.
+                    ("custom", "rowless-first-execution") => &[(2, "PASS")],
                     ("custom", "host-inapplicable-then-fail") => {
                         &[(1, "HOST-INAPPLICABLE"), (2, "FAIL")]
                     }
@@ -3806,7 +3812,14 @@ report.write_bytes((root/'verification.json').read_bytes())
                 };
                 for (number, &(attempt, outcome)) in attempts.iter().enumerate() {
                     let mut producer = producer.clone();
-                    if ptrace && scenario == "stale" {
+                    let stale = match scenario {
+                        "stale" => ptrace,
+                        // Only custom@kvm's failed first execution: its
+                        // passing retry is current.
+                        "stale-first-row" => cell.id.mode == "custom" && number == 0,
+                        _ => false,
+                    };
+                    if stale {
                         producer.source_sha = STALE.into();
                     }
                     let mut row = import_producer_row(
@@ -3937,6 +3950,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 "stale" | "dirty" | "stamped" | "test-source" | "timeouts" | "binding" => {
                     Some(("verify", Some("ptrace"), Some("import-stale")))
                 }
+                "stale-first-row" => Some(("custom", Some("kvm"), Some("import-stale"))),
                 "untrusted-retry" => Some(("custom", Some("kvm"), Some("infrastructure"))),
                 // Its FAIL is the verdict, and a FAIL is not an ERROR.
                 "no-retry" => None,
@@ -3945,6 +3959,8 @@ report.write_bytes((root/'verification.json').read_bytes())
                 | "pass-then-pass"
                 | "duplicate-attempt"
                 | "file-order"
+                | "file-order-pass-first"
+                | "rowless-first-execution"
                 | "host-inapplicable-then-fail" => {
                     Some(("custom", Some("kvm"), Some("import-history")))
                 }
@@ -3975,7 +3991,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 "duplicate-attempt" => {
                     Some("attempt 1 does not follow the preceding attempts; expected 2")
                 }
-                "file-order" => {
+                "file-order" | "file-order-pass-first" | "rowless-first-execution" => {
                     Some("attempt 2 does not follow the preceding attempts; expected 1")
                 }
                 "host-inapplicable-then-fail" | "host-inapplicable-row" => {
@@ -3990,6 +4006,16 @@ report.write_bytes((root/'verification.json').read_bytes())
                     .and_then(|row| row.reason.as_deref())
                     .unwrap_or_default();
                 assert!(reason.contains(expected), "{reason}\n{context}");
+            }
+            // Every row is checked, not only the one that decides the cell.
+            if scenario == "stale-first-row" {
+                let reason = published
+                    .iter()
+                    .find(|row| row.error_kind.as_deref() == Some("import-stale"))
+                    .and_then(|row| row.reason.as_deref())
+                    .unwrap_or_default();
+                let expected = format!("imported row was built from {STALE}, this run is {SHA}");
+                assert!(reason.contains(&expected), "{reason}\n{context}");
             }
             assert_eq!(
                 summary["imported"]["missing_cells"],
@@ -4016,14 +4042,68 @@ report.write_bytes((root/'verification.json').read_bytes())
                 | "pass-then-pass"
                 | "duplicate-attempt"
                 | "file-order"
+                | "file-order-pass-first"
+                | "rowless-first-execution"
                 | "host-inapplicable-then-fail"
+                | "stale-first-row"
                 | "evidence-elsewhere" => assert_eq!(custom, vec![(1, "ERROR")], "{context}"),
                 // Both custom@kvm attempts are published, in order.
                 _ => assert_eq!(custom, vec![(1, "FAIL"), (2, "PASS")], "{context}"),
             }
+            // JUnit and the dagrun counts report the same final outcomes, and
+            // the counts each cell's published attempts.
+            let failed = u64::from(scenario == "no-retry");
+            assert_eq!(summary["failed"], failed, "{context}");
+            let junit = fs::read_to_string(path.join("out/junit.xml")).unwrap();
+            let header = format!(
+                "tests=\"3\" failures=\"{failed}\" errors=\"{}\" skipped=\"0\"",
+                u64::from(expected_error.is_some())
+            );
+            assert!(junit.contains(&header), "{junit}\n{context}");
+            let counts: serde_json::Value =
+                serde_json::from_slice(&fs::read(path.join("counts.json")).unwrap()).unwrap();
+            let by_id = |results: &serde_json::Value| {
+                let mut results = results.as_array().unwrap().clone();
+                results.sort_by_key(|result| result["id"].as_str().unwrap().to_string());
+                results
+            };
+            let expected_counts = cells
+                .iter()
+                .map(|cell| {
+                    let history = published
+                        .iter()
+                        .filter(|row| row.mode == cell.id.mode && row.backend == cell.id.backend)
+                        .collect::<Vec<_>>();
+                    json!({
+                        "id": format!(
+                            "imported/control [{}/{}]",
+                            cell.id.backend.as_deref().unwrap_or("native"),
+                            cell.id.mode
+                        ),
+                        "result": if history.last().unwrap().outcome == "PASS" { "pass" } else { "fail" },
+                        "attempts": history.len(),
+                    })
+                })
+                .collect::<serde_json::Value>();
+            assert_eq!(counts["schema"], 2, "{context}");
+            assert_eq!(counts["executed_tests"], 3, "{context}");
+            assert_eq!(
+                by_id(&counts["results"]),
+                by_id(&expected_counts),
+                "{context}"
+            );
             if scenario == "complete" {
                 assert_eq!(published.len(), 4, "{context}");
                 assert_eq!(summary["passed"], 3, "{context}");
+                assert_eq!(
+                    by_id(&counts["results"]),
+                    by_id(&json!([
+                        {"id": "imported/control [kvm/custom]", "result": "pass", "attempts": 2},
+                        {"id": "imported/control [kvm/verify]", "result": "pass", "attempts": 1},
+                        {"id": "imported/control [ptrace/verify]", "result": "pass", "attempts": 1}
+                    ])),
+                    "{context}"
+                );
                 assert_eq!(
                     summary["imported"]["source_run_ids"]
                         .as_array()
@@ -4044,18 +4124,12 @@ report.write_bytes((root/'verification.json').read_bytes())
     /// policy the harness would build on such a machine.
     #[test]
     fn import_mode_host_inapplicable_claim_needs_this_machines_confirmation() {
-        use std::path::PathBuf;
-
         use hermit_manifest_plan::imported_results;
         use hermit_manifest_plan::imported_results::bucket_dir;
         use hermit_manifest_plan::runner::RunContext;
         use serde_json::json;
 
         const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
         let fixture = std::env::temp_dir().join(format!(
             "hermit-harness-import-claim-{}-{:?}",
             std::process::id(),
@@ -4070,7 +4144,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .map(String::from),
         );
         let cells = run_cells(&manifests, &selection).unwrap();
-        let context = RunContext::for_import(root, Some(SHA)).unwrap();
+        let context = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
         let import = fixture.join("import");
         let bucket = bucket_dir(&import, "portable", "imported");
         fs::create_dir_all(&bucket).unwrap();
@@ -4169,22 +4243,17 @@ report.write_bytes((root/'verification.json').read_bytes())
 
     /// An imported row records whether this checkout is dirty, as an executed
     /// row does: clean producer rows do not make a dirty checkout's run look
-    /// clean. (`run` takes `--source-sha` in the fixture above, which counts as
-    /// clean, so this drives `imported_results::load` directly.)
+    /// clean. (`run` in the fixture above names a `--source-sha` snapshot,
+    /// which is clean by construction and is refused where Git tracks the
+    /// files, so this drives `imported_results::load` directly.)
     #[test]
     fn import_mode_marks_the_rows_of_a_dirty_checkout_dirty() {
-        use std::path::PathBuf;
-
         use hermit_manifest_plan::imported_results;
         use hermit_manifest_plan::imported_results::bucket_dir;
         use hermit_manifest_plan::runner::RunContext;
         use serde_json::json;
 
         const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../..")
-            .canonicalize()
-            .unwrap();
         let fixture = std::env::temp_dir().join(format!(
             "hermit-harness-import-dirty-{}-{:?}",
             std::process::id(),
@@ -4199,7 +4268,7 @@ report.write_bytes((root/'verification.json').read_bytes())
                 .map(String::from),
         );
         let cells = run_cells(&manifests, &selection).unwrap();
-        let clean = RunContext::for_import(root, Some(SHA)).unwrap();
+        let clean = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
         let import = fixture.join("import");
         let bucket = bucket_dir(&import, "portable", "imported");
         fs::create_dir_all(&bucket).unwrap();

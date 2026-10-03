@@ -29,6 +29,10 @@ mkdir -p "$TEST_RESULT_ARTIFACTS_DIR" "$TEST_RESULT_ARTIFACT_ANNOTATIONS_DIR"
 # On RE these are relative to /re_cwd; absolutize before anything changes directory.
 A=$(realpath "$TEST_RESULT_ARTIFACTS_DIR")
 N=$(realpath "$TEST_RESULT_ARTIFACT_ANNOTATIONS_DIR")
+run_id="buck-$(hostname -s)-$$-$(date +%s%N)"
+# Named by the run id, so the testx listing shows which run an execution was
+# without fetching anything (ingest.py ties local artifact copies to it).
+printf '%s\n' "$run_id" >"$A/run_id.$run_id"
 B=$(realpath "${HERMIT_E2E_BUNDLE:?}")
 bundle_sha=$(cat "$B/BUNDLE.sha256" 2>/dev/null || true)
 if [[ -n ${HERMIT_E2E_BUNDLE_SHA256:-} && $bundle_sha != "$HERMIT_E2E_BUNDLE_SHA256" ]]; then
@@ -47,7 +51,6 @@ W=$(mktemp -d "$(dirname "$A")/hermit-cell.XXXXXX") || emit_fatal "cannot create
 mkdir -p "$W/run-state"
 cp -a "$B/run-state/." "$W/run-state/" || emit_fatal "cannot copy the compat run state"
 slug=$(printf '%s' "$TEST" | tr / -)-$MODE-$BACKEND
-run_id="buck-$(hostname -s)-$$-$(date +%s%N)"
 tpx_timeout=${TPX_TIMEOUT_SEC:-600}
 deadline=${CELL_DEADLINE_S:-$((tpx_timeout - 30))}
 ((deadline > 10)) || deadline=10

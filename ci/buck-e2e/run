@@ -1,9 +1,12 @@
 #!/bin/bash
-# Run every e2e manifest cell as a Tpx test under Buck and write the e2e result files
-# (one results.jsonl + summary.json per bucket) that the cargo flow's e2e nodes write.
+# Run every e2e manifest cell as a Tpx test under Buck and write, into --out, the rows
+# (one results.jsonl + summary.json per bucket) that `test-harness run` imports
+# (E2E_IMPORT_RESULTS=IMPORT_DIR) to publish the result files the cargo flow's e2e nodes
+# write. Only import mode may read IMPORT_DIR; see ci/buck-e2e/ingest.py.
 #
-# usage: ci/buck-e2e/run --mode hybrid|local --out E2E_RESULT_ROOT --work DIR
+# usage: ci/buck-e2e/run --mode hybrid|local --out IMPORT_DIR --work DIR
 #            [--buck2 PATH] [-- EXTRA_BUCK2_TEST_ARGS...]
+#        ci/buck-e2e/run -h|--help
 #
 #   hybrid  RE-routed cells run on Meta RE and the rest locally (see defs.bzl). The two
 #           groups run as two concurrent `buck2 test` invocations: Buck stores RE test
@@ -11,8 +14,11 @@
 #           all remote, so an unchanged cell is answered from the cache next time.
 #   local   every cell runs locally (-c hermit_e2e.routing=local), one invocation.
 #
-# The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage). Tpx
-# retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
+# The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage), and
+# HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files, before
+# and after the run: Buck builds the release hermit from the working tree, and every row
+# records SOURCE_SHA as a clean source tree.
+# Tpx retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
 # ingest.py turns a retried cell's executions into attempts 1 and 2. EXTRA args go to
 # every `buck2 test` before the `--` (e.g. @shim/modes/hybrid).
 # The release hermit is built unstamped (-c hermit_release.unstamped=true: no commit
@@ -29,16 +35,32 @@ while [[ $# -gt 0 ]]; do
         --out) out=$2; shift 2 ;;
         --work) work=$2; shift 2 ;;
         --buck2) buck2=$2; shift 2 ;;
+        -h | --help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "${BASH_SOURCE[0]}"; exit 0 ;;
         --) shift; break ;;
         *) echo "ci/buck-e2e/run: unknown argument $1" >&2; exit 2 ;;
     esac
 done
 [[ $mode == hybrid || $mode == local ]] || { echo "ci/buck-e2e/run: --mode hybrid|local is required" >&2; exit 2; }
 [[ -n $out && -n $work ]] || { echo "ci/buck-e2e/run: --out and --work are required" >&2; exit 2; }
-[[ -d $here/staged ]] || { echo "ci/buck-e2e/run: stage the inputs first (ci/buck-e2e/stage)" >&2; exit 2; }
+[[ -s $here/staged/SOURCE_SHA ]] || { echo "ci/buck-e2e/run: stage the inputs first (ci/buck-e2e/stage)" >&2; exit 2; }
+staged_sha=$(cat "$here/staged/SOURCE_SHA")
+require_staged_source() { # require_staged_source WHEN EXIT_STATUS
+    local head
+    head=$(git -C "$root" rev-parse HEAD)
+    if [[ $head != "$staged_sha" ]]; then
+        echo "ci/buck-e2e/run: HEAD is $head $1, but the staged inputs are for $staged_sha;" \
+            "check out $staged_sha, or re-stage at HEAD (ci/buck-e2e/stage)" >&2
+        exit "$2"
+    fi
+    if [[ -n $(git -C "$root" status --porcelain --untracked-files=no) ]]; then
+        echo "ci/buck-e2e/run: the checkout has uncommitted changes $1, but every row records" \
+            "$staged_sha as a clean source tree; commit them and re-stage, or revert them" >&2
+        exit "$2"
+    fi
+}
+require_staged_source "before the run" 2
 mkdir -p "$out" "$work"
 extra=("$@")
-started=$(date +%s)
 tpx=(-- --retry 1 --no-retry-on-skip)
 
 invoke() { # invoke NAME TARGET [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
@@ -73,5 +95,6 @@ for r in "${runs[@]}"; do
     fi
     ids+=("$(cat "$work/$r.test_id")")
 done
+require_staged_source "after the run" 1
 python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
-    --local-artifacts "$root/buck-out/v2/test/execution" --since "$started" "${ids[@]}"
+    --local-artifacts "$root/buck-out/v2/test/execution" "${ids[@]}"
