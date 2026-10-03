@@ -507,6 +507,7 @@ impl NetworkReplayEngine {
                     | NetworkInputKindV2::Connect(NetworkConnectionResultV2::Error(libc::EINPROGRESS))
                     | NetworkInputKindV2::ConnectEstablished
                     | NetworkInputKindV2::RawTcpPollState { .. }
+                    | NetworkInputKindV2::SharedRawTcpPollState { .. }
                     | NetworkInputKindV2::SocketErrorRead { .. }
                     | NetworkInputKindV2::StreamBytes { .. }
                     | NetworkInputKindV2::PeerShutdown {
@@ -1452,7 +1453,8 @@ impl NetworkReplayEngine {
                                 replay.connect_in_progress_delivered.contains(&input.channel),
                             NetworkInputKindV2::ConnectEstablished => replay.connected.contains(&input.channel)
                                 && replay.connect_in_progress_delivered.contains(&input.channel),
-                            NetworkInputKindV2::RawTcpPollState { .. } => replay.poll.completed(input.ordinal),
+                            NetworkInputKindV2::RawTcpPollState { .. }
+                                | NetworkInputKindV2::SharedRawTcpPollState { .. } => replay.poll.completed(input.ordinal),
                             NetworkInputKindV2::SocketErrorRead { .. } => replay.consumed_socket_errors.contains(&input.ordinal),
                             NetworkInputKindV2::StreamBytes { stream_offset, bytes } =>
                                 self.channels[&input.channel].inbound_consumed >= *stream_offset + bytes.len() as u64,
@@ -1506,6 +1508,7 @@ impl NetworkReplayEngine {
                 continue;
             }
             if let NetworkInputKindV2::RawTcpPollState { consumed_prefix, .. }
+                | NetworkInputKindV2::SharedRawTcpPollState { consumed_prefix, .. }
                 | NetworkInputKindV2::SocketErrorRead { consumed_prefix, .. } = input.event {
                 let consumed = self.channels[&input.channel].inbound_consumed;
                 if consumed_prefix > consumed {
@@ -1531,6 +1534,17 @@ impl NetworkReplayEngine {
                     input.release.not_before_global_time,
                     revents,
                 );
+            } else if let NetworkInputKindV2::SharedRawTcpPollState {
+                consumed_prefix, revents, control_generation, receive_low_water,
+            } = input.event {
+                replay.poll.apply_shared(input.ordinal, input.channel, raw_poll::SharedPollSnapshot {
+                    ordinal: input.ordinal,
+                    consumed_prefix,
+                    observed_at: input.release.not_before_global_time,
+                    revents,
+                    control_generation,
+                    receive_low_water,
+                });
             } else if matches!(input.event, NetworkInputKindV2::SocketErrorRead { .. }) {
                 // Availability is separate from the actual consuming getter.
             } else if input.event == NetworkInputKindV2::ConnectEstablished {
@@ -1567,6 +1581,7 @@ impl NetworkReplayEngine {
             .filter(|(n, input)| !replay.released[*n] && seen.insert(input.channel))
             .filter(|(_, input)| {
                 !matches!(input.event, NetworkInputKindV2::RawTcpPollState { consumed_prefix, .. }
+                    | NetworkInputKindV2::SharedRawTcpPollState { consumed_prefix, .. }
                     | NetworkInputKindV2::SocketErrorRead { consumed_prefix, .. }
                     if consumed_prefix > self.channels[&input.channel].inbound_consumed)
                     && input

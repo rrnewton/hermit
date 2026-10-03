@@ -97,9 +97,11 @@ async fn fixture_engine_kind(
                 receive_entry_cut: cut,
                 prerequisites: prerequisites.clone(),
             },
-            event: NetworkInputKindV2::RawTcpPollState {
+            event: NetworkInputKindV2::SharedRawTcpPollState {
                 consumed_prefix: 0,
                 revents: libc::POLLIN,
+                control_generation: 0,
+                receive_low_water: 1,
             },
         });
         let NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { nodes } =
@@ -644,7 +646,7 @@ async fn shared_poll_wait_requires_all_original_interests_and_never_invents_zero
             .native_trace_fixture()
             .inputs
             .iter()
-            .all(|i| !matches!(i.event, NetworkInputKindV2::RawTcpPollState { .. }))
+            .all(|i| !matches!(i.event, NetworkInputKindV2::RawTcpPollState { .. } | NetworkInputKindV2::SharedRawTcpPollState { .. }))
     );
 }
 

@@ -270,6 +270,9 @@ impl From<NetworkTraceValidationErrorV4> for NetworkTraceCodecErrorV4 {
     }
 }
 
+#[path = "native_receive/shared_poll.rs"]
+mod shared_poll;
+
 type Validation = Result<(), NetworkTraceValidationErrorV4>;
 use NetworkTraceValidationErrorV4 as Invalid;
 
@@ -354,6 +357,7 @@ impl NetworkTraceV4 {
     /// kernel-committed bytes, a stopped task or the actual receive-entry permit.
     pub fn validate(&self) -> Validation {
         let epoch = self.epoch_global_time()?;
+        shared_poll::validate_policy(self)?;
         // Private payload-only projection. Placeholder V2 gates are never
         // returned, encoded or given to an engine. V4 releases are checked below.
         let payload = NetworkTraceV2 {
@@ -365,7 +369,7 @@ impl NetworkTraceV4 {
                 .map(|i| NetworkInputEventV2 {
                     ordinal: i.ordinal,
                     channel: i.channel,
-                    event: i.event.clone(),
+                    event: shared_poll::payload(&i.event),
                     release: NetworkReleaseV2 {
                         not_before_global_time: epoch,
                         after_transmitted_offset: 0,
@@ -565,7 +569,8 @@ impl NetworkTraceV4 {
                     NetworkTraceValidationError::ReleaseBeforeEpoch,
                 ));
             }
-            if let NetworkInputKindV2::RawTcpPollState { consumed_prefix, .. } = input.event {
+            if let NetworkInputKindV2::RawTcpPollState { consumed_prefix, .. }
+                | NetworkInputKindV2::SharedRawTcpPollState { consumed_prefix, .. } = input.event {
                 let observation = (consumed_prefix, input.release.not_before_global_time);
                 // Applying eligible state to closure must not erase an
                 // observable zero/ready boundary. Ledger order alone does not

@@ -5843,6 +5843,7 @@ impl ChannelState {
             // Connect result. Legacy validators reject it before reaching here.
             NetworkInputKindV2::ConnectEstablished
             | NetworkInputKindV2::RawTcpPollState { .. }
+            | NetworkInputKindV2::SharedRawTcpPollState { .. }
             | NetworkInputKindV2::SocketErrorRead { .. } => unreachable!("V4-only state input"),
         }
         self.refresh_readiness();

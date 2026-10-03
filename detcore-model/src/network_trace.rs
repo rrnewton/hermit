@@ -4,7 +4,7 @@
  *
  * This source code is licensed under the BSD-style license found in the
  * LICENSE file in the root directory of this source tree.
- */
+*/
 
 //! Versioned data model for schedule-independent external network input.
 //!
@@ -772,6 +772,14 @@ pub enum NetworkInputKindV2 {
     /// V4-only consuming SO_ERROR read, including the meaningful zero result.
     /// This is control input, not a failed receive or a terminal stream event.
     SocketErrorRead { consumed_prefix: u64, errno: i32 },
+    /// Shared-policy V4 full poll state with immutable pre-observation controls.
+    /// Appended to preserve every earlier serialized input discriminant.
+    SharedRawTcpPollState {
+        consumed_prefix: u64,
+        revents: i16,
+        control_generation: u64,
+        receive_low_water: u32,
+    },
 }
 
 /// One globally ordered observation with schedule-independent release gates.
@@ -1568,6 +1576,11 @@ impl NetworkTraceV2 {
                 return Err(NetworkTraceValidationError::EventAfterTerminal);
             }
             match &input.event {
+                NetworkInputKindV2::SharedRawTcpPollState { .. } => {
+                    // Only the V4 shared validator may project this payload.
+                    // Neither V2 nor V3 may invent missing control provenance.
+                    return Err(NetworkTraceValidationError::InvalidChannelRelationship);
+                }
                 NetworkInputKindV2::Connect(result) => {
                     if channel.role != NetworkEndpointRoleV2::OutboundClient {
                         return Err(NetworkTraceValidationError::InvalidChannelRelationship);

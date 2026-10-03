@@ -1614,3 +1614,6 @@ fn shared_attempt_policy_preserves_graph_checks_and_distinct_framing() {
         assert_eq!(invalid.validate(), Err(Invalid::InvalidEntryCut));
     }
 }
+
+#[path = "tests/shared_poll.rs"]
+mod shared_poll_provenance;

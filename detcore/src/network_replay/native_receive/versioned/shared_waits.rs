@@ -961,7 +961,7 @@ impl NetworkReplayEngine {
         })
     }
 
-    fn shared_poll_sample(
+    pub(super) fn shared_poll_sample(
         &self,
         file: OpenFileId,
     ) -> Result<Option<(LogicalTime, i16)>, NetworkReplayError> {
@@ -973,9 +973,23 @@ impl NetworkReplayEngine {
             .replay
             .as_ref()
             .ok_or(NetworkReplayError::WrongMode)?;
-        Ok(replay
+        let queue = &self.channels[&channel];
+        let low_water = self
+            .shadow
+            .as_ref()
+            .and_then(|shadow| shadow.sockets.get(&file))
+            .ok_or(NetworkReplayError::UnregisteredStreamSocket(file))?
+            .options
+            .receive_low_water;
+        replay
             .poll
-            .shared_observation_at(channel, self.channels[&channel].inbound_consumed))
+            .shared_observation_at(
+                channel,
+                queue.inbound_consumed,
+                queue.local_control_generation,
+                low_water,
+            )
+            .map(|sample| sample.map(|s| (s.observed_at, s.revents)))
     }
 }
 

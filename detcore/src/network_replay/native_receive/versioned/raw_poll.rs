@@ -62,9 +62,21 @@ impl NetworkReplayEngine {
     }
 }
 
+/// A released immutable shared trace input, never application-time controls.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SharedPollSnapshot {
+    pub(super) ordinal: u64,
+    pub(super) consumed_prefix: u64,
+    pub(super) observed_at: LogicalTime,
+    pub(super) revents: i16,
+    pub(super) control_generation: u64,
+    pub(super) receive_low_water: u32,
+}
+
 #[derive(Debug, Default)]
 pub(super) struct PollSnapshots {
     latest: BTreeMap<NetworkChannelId, (u64, LogicalTime, i16)>,
+    shared_latest: BTreeMap<NetworkChannelId, SharedPollSnapshot>,
     applied: BTreeSet<u64>,
 }
 
@@ -99,14 +111,37 @@ impl PollSnapshots {
         }
     }
 
+    pub(super) fn apply_shared(
+        &mut self,
+        ordinal: u64,
+        channel: NetworkChannelId,
+        snapshot: SharedPollSnapshot,
+    ) {
+        self.shared_latest.insert(channel, snapshot);
+        self.applied.insert(ordinal);
+    }
+
     pub(super) fn shared_observation_at(
         &self,
         channel: NetworkChannelId,
         consumed: u64,
-    ) -> Option<(LogicalTime, i16)> {
-        self.latest
-            .get(&channel)
-            .and_then(|&(cut, at, mask)| (cut == consumed).then_some((at, mask)))
+        control_generation: u64,
+        receive_low_water: u32,
+    ) -> Result<Option<SharedPollSnapshot>, NetworkReplayError> {
+        let Some(sample) = self.shared_latest.get(&channel) else {
+            return Ok(None);
+        };
+        if sample.consumed_prefix != consumed {
+            return Ok(None);
+        }
+        if sample.control_generation != control_generation
+            || sample.receive_low_water != receive_low_water
+        {
+            return Err(invalid(
+                "shared Poll observation has stale recorded controls",
+            ));
+        }
+        Ok(Some(*sample))
     }
 
     #[cfg(test)]
@@ -1601,3 +1636,7 @@ mod tests {
         assert!(state.at(NetworkChannelId(2), 1).is_err());
     }
 }
+
+#[cfg(test)]
+#[path = "raw_poll/shared_provenance_tests.rs"]
+mod shared_provenance_tests;
