@@ -37979,6 +37979,13 @@
           "category": "c-programs",
           "test": "c-programs/fsync-durability",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fsync-durability",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {
