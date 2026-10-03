@@ -184,17 +184,27 @@ if [[ -d $celldir ]]; then
     done < <(find "$celldir" -type f -print0)
 fi
 
-# Evidence policy: a passing verify cell must return its verdict JSON and both DETLOGs.
+# Evidence policy: a passing verify cell must return its verdict JSON and the DETLOGs
+# hermit keeps: after a matched verify only run 1's log (the golden copy; hermit deletes
+# run 2's), otherwise both.
 outcome=$(python3 -c 'import json,sys
 rows=[json.loads(l) for l in open(sys.argv[1]) if l.strip()]
 print(rows[-1]["outcome"] if rows else "")' "$out/results.jsonl" 2>/dev/null)
-n_detlogs=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run[12]_log_*' | wc -l)
+n_run1=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run1_log_*' | wc -l)
+n_run2=$(find "$A" -maxdepth 1 -name 'cell__verify-logs__*run2_log_*' | wc -l)
+n_detlogs=$((n_run1 + n_run2))
+verdict=$(python3 -c 'import json,sys
+print(json.load(open(sys.argv[1])).get("verdict") or "")' "$A/cell__verify-1.json" 2>/dev/null) || verdict=
 evidence_complete=true
 missing=()
 [[ -s $out/tpx.jsonl ]] || { evidence_complete=false; missing+=(tpx.jsonl); }
 if [[ $outcome == PASS && $MODE == verify ]]; then
     [[ -s $A/cell__verify-1.json ]] || { evidence_complete=false; missing+=(verify-1.json); }
-    ((n_detlogs >= 2)) || { evidence_complete=false; missing+=(detlogs); }
+    if [[ $verdict == matched ]]; then
+        ((n_run1 == 1 && n_run2 == 0)) || { evidence_complete=false; missing+=(detlogs); }
+    else
+        ((n_run1 >= 1 && n_run2 >= 1)) || { evidence_complete=false; missing+=(detlogs); }
+    fi
 fi
 ((copy_errors == 0)) || { evidence_complete=false; missing+=("copy_errors=$copy_errors"); }
 
