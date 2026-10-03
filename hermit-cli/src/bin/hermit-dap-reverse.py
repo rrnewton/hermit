@@ -41,6 +41,10 @@ _line_breakpoints = []
 _arrival_leaders = {}
 _stop_address_breakpoints = {}
 _line_program = None
+# Why the hidden line breakpoints cannot record the program's source-line
+# path, or None. stepBack and reverseContinue refuse while it is set: without
+# that record they would rewind to the wrong point in time without saying so.
+_line_breakpoint_problem = None
 _suppress_events = False
 _advancing = False
 _last_stopped = None
@@ -369,7 +373,9 @@ def _arrival_leader(pc):
 
 class _LineBreakpoint(gdb.Breakpoint):
     def __init__(self, file, line):
-        super().__init__("{}:{}".format(file, line), internal=True)
+        # An explicit location: a linespec string would misparse a file name
+        # that contains a space or a colon.
+        super().__init__(source=file, line=line, internal=True)
         self.silent = True
         self.file = file
         self.line = line
@@ -426,45 +432,163 @@ class _StopAddressBreakpoint(gdb.Breakpoint):
         return False
 
 
+def _line_table_addresses(program):
+    # The address of every row in PROGRAM's DWARF line tables. Only the
+    # address is taken from readelf. The file name it prints is a line-table
+    # file entry's name without the entry's directory, and which entry
+    # differs between releases: for GCC 11's DWARF 5 output, binutils 2.35
+    # printed file entry 0, where GCC stores the full path, while 2.46 prints
+    # the bare name of entry 1; for GCC 15's output both print a bare name.
+    # A bare name resolved against GDB's working directory named no source
+    # file, so every line breakpoint stayed pending and nothing recorded the
+    # source-line path.
+    decoded = subprocess.run(
+        # --wide keeps each row on one line, however long its file name.
+        ["readelf", "--wide", "--debug-dump=decodedline", program],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    ).stdout
+    addresses = set()
+    for row in decoded.splitlines():
+        # A row is a file name, a line number, an address and optional view
+        # and statement columns. An end-of-sequence row prints "-" for its
+        # line number (binutils 2.46) or repeats the last one (2.35). Its
+        # address can resolve to the table of the code that follows, which
+        # that code's own rows reach anyway.
+        match = re.search(r"(?:^|\s)\d+\s+0x([0-9a-fA-F]+)(?:\s|$)", row)
+        if match is not None:
+            addresses.add(int(match.group(1), 16))
+    return addresses
+
+
+def _source_lines(addresses):
+    # Every (file, line) pair in the GDB symbol tables that hold ADDRESSES,
+    # with file and line as GDB itself names them, so that a breakpoint on
+    # the pair resolves however readelf printed the row. A table's lines
+    # include those whose rows are all non-statement rows, as readelf's do.
+    #
+    # The addresses are link-time addresses. new_objfile reports the program
+    # when the DAP attach request loads it, before GDB connects to the replay
+    # and relocates a position-independent program, so link-time addresses
+    # are still the addresses GDB knows them by here.
+    progspace = gdb.current_progspace()
+    symtabs = {}
+    for address in addresses:
+        symtab = progspace.find_pc_line(address).symtab
+        if symtab is not None:
+            # A header has one symbol table in every compilation unit that
+            # uses it; the unit's static block tells those tables apart.
+            block = symtab.static_block()
+            key = (symtab.fullname(), block.start, block.end)
+            symtabs.setdefault(key, symtab)
+    source_lines = set()
+    for (file, _, _), symtab in symtabs.items():
+        source_lines.update((file, line) for line in symtab.linetable().source_lines())
+    return source_lines
+
+
+def _unknown_source_file(file, line):
+    # GDB's own explanation when it does not recognise FILE as a source file
+    # name, or None when it does.
+    try:
+        gdb.decode_line('"{}":{}'.format(file, line))
+    except gdb.error as error:
+        if str(error).startswith("No source file named"):
+            return str(error)
+    return None
+
+
 def _install_line_breakpoints(event=None):
+    global _line_breakpoint_problem
     global _line_program
     global _suppress_events
 
     program = gdb.current_progspace().filename
     if program is None or program == _line_program or not os.path.isfile(program):
         return
+    _line_program = program
+    _line_breakpoint_problem = None
 
+    problem = None
     try:
-        decoded = subprocess.run(
-            # Without --wide, readelf truncates long file names to a fixed
-            # column, and no line breakpoint can be set from a truncated name.
-            ["readelf", "--wide", "--debug-dump=decodedline", program],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        ).stdout
+        addresses = _line_table_addresses(program)
     except (OSError, subprocess.CalledProcessError) as error:
-        raise gdb.error("failed to read source-line information: {}".format(error))
-
-    source_lines = set()
-    for row in decoded.splitlines():
-        match = re.match(r"^\s*(.*?)\s+(\d+)\s+0x[0-9a-fA-F]+(?:\s|$)", row)
-        if match is not None:
-            source_lines.add((os.path.realpath(match.group(1)), int(match.group(2))))
+        addresses = set()
+        problem = "failed to read the line tables of {}: {}".format(program, error)
+    source_lines = _source_lines(addresses)
+    if problem is None and not addresses:
+        problem = "readelf lists no line-table rows in {}; build it with -g".format(
+            program
+        )
+    elif problem is None and not source_lines:
+        problem = "GDB has no source line at any of the {} addresses in {}".format(
+            len(addresses), program
+        )
 
     previous_suppression = _suppress_events
     _suppress_events = True
     _arrival_leaders.clear()
+    placed = set()
+    unplaced = {}
     try:
         for file, line in sorted(source_lines):
             try:
-                _line_breakpoints.append(_LineBreakpoint(file, line))
+                breakpoint = _LineBreakpoint(file, line)
             except gdb.error:
-                pass
+                unplaced.setdefault(file, line)
+                continue
+            if breakpoint.pending:
+                # GDB places a line with no statement row at the next line
+                # that has one, and leaves it pending when no later line
+                # does. Such a line can never be a stop, so its breakpoint
+                # records nothing; GDB would retry it at every library load.
+                breakpoint.delete()
+                unplaced.setdefault(file, line)
+            else:
+                placed.add(file)
+                _line_breakpoints.append(breakpoint)
     finally:
         _suppress_events = previous_suppression
-    _line_program = program
+
+    if problem is None and not placed:
+        problem = "GDB placed none of the {} source-line breakpoints in {}".format(
+            len(source_lines), program
+        )
+    if problem is None:
+        # A file none of whose lines got a breakpoint is benign when all its
+        # rows are non-statement rows, and a defect when GDB does not
+        # recognise the name it gave the file.
+        for file in sorted(set(unplaced) - placed):
+            unknown = _unknown_source_file(file, unplaced[file])
+            if unknown is not None:
+                problem = "no source-line breakpoint could be set in {}: {}".format(
+                    file, unknown
+                )
+                break
+    if problem is not None:
+        _line_breakpoint_problem = problem
+        # An output event, not gdb.write: the attach request loads the
+        # program with gdb.execute(..., to_string=True), so whatever is
+        # written meanwhile reaches only GDB's own DAP log, never the client.
+        server.send_event(
+            "output",
+            {
+                "category": "stderr",
+                "output": "hermit-dap: stepBack and reverseContinue are "
+                "unavailable: {}\n".format(problem),
+            },
+        )
+
+
+def _require_line_breakpoints():
+    # Refuse a reverse request, before it touches the replay, when the
+    # source-line path it rewinds along was never recorded.
+    if _line_breakpoint_problem is not None:
+        raise DAPException(
+            "Hermit reverse execution is unavailable: " + _line_breakpoint_problem
+        )
 
 
 def _source_position(event):
@@ -933,6 +1057,7 @@ def _reverse_request(operation, run):
 def _step_back(thread_id, granularity):
     if granularity != "statement":
         raise DAPException("Hermit stepBack currently supports statement granularity")
+    _require_line_breakpoints()
     set_thread(thread_id)
     matching = [
         index
@@ -969,6 +1094,7 @@ def _visible_breakpoints_by_pc():
 
 
 def _reverse_continue(thread_id):
+    _require_line_breakpoints()
     set_thread(thread_id)
     breakpoints = _visible_breakpoints_by_pc()
     target_index = next(
