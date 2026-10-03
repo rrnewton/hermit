@@ -54,6 +54,15 @@ keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDA
         "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS")
 with open(os.environ["FAKE_CALLS"], "a") as calls:
     calls.write(json.dumps({"who": "harness", "argv": args, "env": {k: os.environ.get(k) for k in keys}}) + "\n")
+# Like hermit, which writes its private verify summary into its working directory (the
+# repository root when no enclosing checkout ignores `ignored/`), and a write through an
+# existing bundle file, which a hard-linked copy would carry back into the bundle.
+repo = host(flag("--repo-root"))
+with open(os.path.join(repo, ".hermit-verify-summary-fake"), "w") as f:
+    f.write("summary\n")
+if os.environ.get("HERMIT_BIN", "").startswith("/src/"):
+    with open(host(os.environ["HERMIT_BIN"]), "a") as f:
+        f.write("written by the cell\n")
 outcome = os.environ.get("FAKE_OUTCOME", "PASS")
 results, tpx = host(flag("--results")), host(flag("--tpx-json"))
 os.makedirs(os.path.dirname(results), exist_ok=True)
@@ -178,7 +187,7 @@ class CellTest(unittest.TestCase):
         self.assertEqual(len(self.calls_by("check-image")), 1)
         [wrapper] = self.calls_by("wrapper")
         opts, command = wrapper["opts"], wrapper["command"]
-        self.assertNotIn("--src-rw", opts, "the bundle must be mounted read-only")
+        self.assertIn("--src-rw", opts, "hermit writes its verify summary into /src/bundle/src")
         self.assertEqual(wrapper["mountpoints"], ["agent-utils/rs/.agent-utils-locks",
                                                   "agent-utils/rs/.agent-utils-snapshots",
                                                   "agent-utils/rs/target", "target"])
@@ -212,6 +221,8 @@ class CellTest(unittest.TestCase):
         self.assertEqual(result["outcome"], "PASS")
         after = sorted(str(p.relative_to(self.bundle)) for p in self.bundle.rglob("*"))
         self.assertEqual(after, self.before, "cell.sh must not write into the bundle")
+        self.assertEqual((self.bundle / "hermit" / "hermit").read_text(), "hermit\n",
+                         "a write in the container reached the bundle: the copy shares its inodes")
         self.assertEqual(list(self.tmp.joinpath("tpx").glob("hermit-cell.*")), [], "scratch left behind")
 
     def test_pinned_root_failure_is_reported(self) -> None:
