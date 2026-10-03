@@ -20,6 +20,7 @@ use std::path::PathBuf;
 
 use serde_json::Value;
 
+mod accepted_abi11;
 mod accepted_failed;
 mod accepted_only;
 mod original;
@@ -278,6 +279,7 @@ impl ResourceRecoveryContext {
         self.resolve(0, root, label).is_ok()
             || accepted_only::resolve(self, root, label).is_ok()
             || accepted_failed::resolve(self, root, label).is_ok()
+            || accepted_abi11::resolve(self, root, label).is_ok()
     }
     pub(crate) fn unix_resolved(
         &self,
