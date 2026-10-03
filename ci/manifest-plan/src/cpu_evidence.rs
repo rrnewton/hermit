@@ -1403,8 +1403,125 @@ pub(crate) mod tests {
         assert!(!valid(&row));
     }
 
+    /// A bound reader's live summary, built by the production summarizer from
+    /// successive samples taken 100 ms apart.
+    fn recorded_live(source: LiveCpuSource, samples: &[u64]) -> Value {
+        let mut live = LiveCpuEnabled::new();
+        live.source = source;
+        live.registration = RegistrationObservation::BoundOnce;
+        for (index, &cpu_usec) in samples.iter().enumerate() {
+            live.record_poll(
+                Duration::from_millis(100 * (index as u64 + 1)),
+                true,
+                &Ok(cpu_usec),
+                false,
+            );
+        }
+        serde_json::to_value(LiveCpuObservation::Enabled(Box::new(live))).unwrap()
+    }
+
+    fn row_with_cgroup_samples(samples: &[u64]) -> Value {
+        let mut row = executed_row();
+        row["cpu_observations"]["invocations"][0]["live"] =
+            recorded_live(LiveCpuSource::CgroupV2InvocationCpuStatV1, samples);
+        row
+    }
+
+    fn fixture_identity() -> CellIdentity {
+        CellIdentity {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: "fixture/test".into(),
+            mode: "verify".into(),
+            backend: "ptrace".into(),
+        }
+    }
+
     #[test]
-    fn each_live_source_is_named_and_the_cgroup_counter_cannot_fall() {
+    fn a_falling_cgroup_history_is_refused_by_every_reader() {
+        let decreased = "cgroup CPU counter decreased";
+        let sha = "a".repeat(40);
+        // The same readers accept a rising counter under the same source name,
+        // so each refusal below is the decrease and not a decoding error.
+        let rising = row_with_cgroup_samples(&[7, 9]);
+        let observations: CellCpuObservationsV1 =
+            serde_json::from_value(rising["cpu_observations"].clone()).unwrap();
+        observations.validate().unwrap();
+        assert!(valid(&rising));
+        crate::ledger::read_schema10_source_result(&serde_json::to_vec(&rising).unwrap()).unwrap();
+        CellCpuHistoryV1::from_source_rows(&[(1, rising)])
+            .unwrap()
+            .unwrap()
+            .validate_for_artifact("run", &sha, &fixture_identity(), 1)
+            .unwrap();
+
+        let falling = row_with_cgroup_samples(&[9, 7]);
+        let observations: CellCpuObservationsV1 =
+            serde_json::from_value(falling["cpu_observations"].clone()).unwrap();
+        assert!(observations.validate().unwrap_err().contains(decreased));
+        assert!(!valid(&falling));
+        assert!(
+            validate_cpu_observations_in_source_row(&falling)
+                .unwrap_err()
+                .contains(decreased)
+        );
+        assert!(
+            crate::ledger::read_schema10_source_result(&serde_json::to_vec(&falling).unwrap())
+                .unwrap_err()
+                .contains(decreased)
+        );
+        assert!(
+            CellCpuHistoryV1::from_source_rows(&[(1, falling)])
+                .unwrap_err()
+                .contains(decreased)
+        );
+        // A history assembled without the source-row reader is still refused
+        // when it is validated for an artifact.
+        let history = CellCpuHistoryV1 {
+            version: 1,
+            attempts: vec![CpuAttemptHistory::Recorded {
+                outer_attempt: 1,
+                observations: Box::new(observations),
+            }],
+        };
+        assert!(
+            history
+                .validate_for_artifact("run", &sha, &fixture_identity(), 1)
+                .unwrap_err()
+                .contains(decreased)
+        );
+    }
+
+    #[test]
+    fn a_flat_cgroup_history_keeps_distinct_high_water_and_last_points() {
+        for samples in [&[7, 7, 7][..], &[1, 6, 6][..], &[0, 0, 0][..]] {
+            let row = row_with_cgroup_samples(samples);
+            let live = &row["cpu_observations"]["invocations"][0]["live"];
+            assert_eq!(
+                live["last"]["cpu_usec"], live["high_water"]["cpu_usec"],
+                "{samples:?}"
+            );
+            assert_ne!(
+                live["last"]["poll"], live["high_water"]["poll"],
+                "{samples:?}"
+            );
+            assert_ne!(live["last"]["at"], live["high_water"]["at"], "{samples:?}");
+            assert!(valid(&row), "{samples:?}");
+            assert!(
+                crate::ledger::read_schema10_source_result(&serde_json::to_vec(&row).unwrap())
+                    .is_ok(),
+                "{samples:?}"
+            );
+        }
+    }
+
+    // The summary keeps only the first, last and high-water samples, so a dip
+    // that recovers (1, 5, 3, 6) cannot be seen in the recorded evidence: it is
+    // recorded exactly as 1, 3, 5, 6 would be. This rule proves only that the
+    // last sample did not fall below the recorded high-water sample. Detecting
+    // every decrease between successive samples is the writer's job.
+    #[test]
+    fn each_live_source_is_named_and_a_cgroup_last_sample_cannot_fall_below_its_high_water() {
         for (source, name) in [
             (
                 LiveCpuSource::AgentUtilsPairedPidfdStatV1,
