@@ -13,6 +13,8 @@
 #           results for test-execution caching only from invocations whose tests are
 #           all remote, so an unchanged cell is answered from the cache next time.
 #   local   every cell runs locally (-c hermit_e2e.routing=local), one invocation.
+#   --buck2 PATH  the buck2 to run (default: $BUCK2, else buck2 on PATH). ingest.py
+#           fetches the results with testx ($TESTX, else testx on PATH).
 #
 # The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage), and
 # HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files, before
@@ -25,6 +27,14 @@
 # hash or build date in the binary), so a commit that changes no compiled source
 # rebuilds nothing and its cells stay cached. Only scripts/build-buck-release.rs stamps.
 # Each invocation's event log and test-run id are kept in --work.
+#
+# ci/buck-e2e/verdict.py then judges the rows as the cargo flow's e2e nodes judge theirs:
+# the staged test-harness, in import mode, once per (lane, category) bucket of the plan.
+# Its result files go to --work/verdict, which each run replaces.
+# Exit status: 0 when every plan cell passes (an excused diagnostic failure is printed and,
+# as in the cargo flow, does not fail the run); 1 when any cell is FAIL or ERROR or has no
+# result, or the run could not be ingested or judged; 2 for a usage error or a
+# precondition that fails before the run.
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
@@ -43,6 +53,10 @@ done
 [[ $mode == hybrid || $mode == local ]] || { echo "ci/buck-e2e/run: --mode hybrid|local is required" >&2; exit 2; }
 [[ -n $out && -n $work ]] || { echo "ci/buck-e2e/run: --out and --work are required" >&2; exit 2; }
 [[ -s $here/staged/SOURCE_SHA ]] || { echo "ci/buck-e2e/run: stage the inputs first (ci/buck-e2e/stage)" >&2; exit 2; }
+[[ -x $here/staged/bin/test-harness ]] || {
+    echo "ci/buck-e2e/run: $here/staged/bin/test-harness is missing; stage the inputs again (ci/buck-e2e/stage)" >&2
+    exit 2
+}
 staged_sha=$(cat "$here/staged/SOURCE_SHA")
 require_staged_source() { # require_staged_source WHEN EXIT_STATUS
     local head
@@ -97,4 +111,18 @@ for r in "${runs[@]}"; do
 done
 require_staged_source "after the run" 1
 python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
-    --local-artifacts "$root/buck-out/v2/test/execution" "${ids[@]}"
+    --local-artifacts "$root/buck-out/v2/test/execution" "${ids[@]}" || {
+    echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
+    exit 1
+}
+rm -rf -- "${work:?}/verdict"
+status=0
+python3 "$here/verdict.py" --plan "$root/ci/expected-e2e-plan.json" --import-dir "$out" \
+    --out "$work/verdict" --harness "$here/staged/bin/test-harness" --repo-root "$root" || status=$?
+case $status in
+    0) ;;
+    1) echo "ci/buck-e2e/run: the run did not pass (above); each bucket's result files are in $work/verdict" >&2
+       exit 1 ;;
+    *) echo "ci/buck-e2e/run: verdict.py could not judge the run (exit $status, above); the run has no verdict" >&2
+       exit 1 ;;
+esac
