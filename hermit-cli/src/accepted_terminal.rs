@@ -1766,11 +1766,19 @@ fn actor_receipt(actor: &ActorReceipt, expected_prefix: &str) -> io::Result<()> 
 }
 fn validate_startup(started: &StartupReceipt, artifact: &ProviderArtifact) -> io::Result<()> {
     artifact.topology.validate()?;
-    let expected_counts = match artifact.topology {
+    let mut expected_counts = match artifact.topology {
         detcore::network_runtime::ProviderTopology::ClassicV40 => [23, 46, 58],
         detcore::network_runtime::ProviderTopology::GroupedV1 { .. } => [23, 44, 44],
         detcore::network_runtime::ProviderTopology::FtraceV1 { .. } => [24, 49, 49],
     };
+    if matches!(
+        artifact.wire_format,
+        detcore::network_runtime::ProviderWireFormat::Abi11Copy4
+            | detcore::network_runtime::ProviderWireFormat::Abi11Copy5
+    ) {
+        // ABI11 adds one executable-source sidecar map, with no new attachments.
+        expected_counts[0] += 1;
+    }
     if [artifact.maps, artifact.programs, artifact.links] != expected_counts
         || artifact.object_sha256 == [0; 32]
         || artifact.library_sha256 == [0; 32]
@@ -3356,6 +3364,7 @@ pub fn validate_accepted_recovery_directory(
 
 #[cfg(test)]
 mod recovery_receipt_tests {
+    mod abi11_counts;
     use std::os::unix::fs::PermissionsExt;
 
     use super::*;
