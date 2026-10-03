@@ -103,7 +103,7 @@ pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_SHA: &str =
 pub const SIGSUSPEND_ALARM_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T17:03:24Z";
 pub const SIGSUSPEND_ALARM_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// `c-programs/external-io-signal-interrupt` verify on ptrace, a new guest for
-/// https://github.com/rrnewton/hermit/issues/3222: an alarm must interrupt a
+/// <https://github.com/rrnewton/hermit/issues/3222>: an alarm must interrupt a
 /// thread blocked in `select` over more than 64 descriptors, which Hermit runs
 /// as blocking external IO outside the run queue, with EINTR even under
 /// SA_RESTART, and the interruption must be committed at a deterministic turn
