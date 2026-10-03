@@ -104,6 +104,9 @@ pub enum SyscallEvent {
     Exec(ExecEvent),
     /// The result and mutable output fields of a raw `ppoll` call.
     Ppoll(PpollEvent),
+    /// The result and mutable output fields of a raw `select` or `pselect6`
+    /// call.
+    Select(SelectEvent),
 }
 
 /// Recorded output and signal side effects of a read syscall.
@@ -371,6 +374,36 @@ pub struct PpollEvent {
     /// this continuously; replay must restore the captured value without
     /// rounding, freezing, or synthesizing it.
     pub timeout: Option<Timespec>,
+}
+
+/// Records every guest-visible output of a raw `select` or `pselect6` call.
+///
+/// Linux copies the three descriptor sets out only when the call succeeds, or
+/// partially before an EFAULT. It then writes the remaining time into a
+/// non-null timeout (a `struct timeval` for `select`, a `struct timespec` for
+/// `pselect6`) whatever the result. Replay restores the writes in that order
+/// before returning the recorded result.
+#[derive(Serialize, Deserialize, Debug)]
+pub struct SelectEvent {
+    /// The exact return value or errno observed while recording.
+    pub result: Result<i64, Errno>,
+
+    /// Post-kernel bytes of the read, write and exception sets, in argument
+    /// order. Each holds the readable prefix of the set's `FDS_BYTES(nfds)`
+    /// range, or `None` when the pointer was null or the kernel did not copy
+    /// the sets out.
+    pub fd_sets: [Option<Vec<u8>>; 3],
+
+    /// Post-kernel bytes of the timeout, when its pointer was non-null and
+    /// readable. Replay restores them exactly, without rounding or freezing.
+    pub timeout: Option<Vec<u8>>,
+}
+
+/// Bytes Linux copies in and out for each descriptor set of `nfds` bits:
+/// whole `long`s, as `FDS_BYTES` in fs/select.c.
+pub fn fd_set_bytes(nfds: i32) -> usize {
+    const LONG_BYTES: usize = std::mem::size_of::<libc::c_long>();
+    usize::try_from(nfds).map_or(0, |nfds| nfds.div_ceil(8 * LONG_BYTES) * LONG_BYTES)
 }
 
 #[derive(Serialize, Deserialize, Debug)]
