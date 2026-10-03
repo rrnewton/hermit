@@ -138,10 +138,17 @@ jobs:
         swapfile=/mnt/compatibility-rebuild.swap
         free -g
         df -h /mnt "$RUNNER_TEMP"
-        # The swapfile is never removed, so it must not take space from the
-        # rebuild's scratch and target directories under $RUNNER_TEMP.
+        # The swapfile is never removed. On the current hosted image /mnt and
+        # $RUNNER_TEMP share /dev/root (145 GB, 82 GB free on 2026-10-03), so
+        # require room for the swapfile plus 40 GiB left for the rebuild's
+        # scratch and target directories under $RUNNER_TEMP.
+        required_kib=$(( 16 * 1024 * 1024 ))
         if [[ $(stat -c %d /mnt) == $(stat -c %d "$RUNNER_TEMP") ]]; then
-          echo "::error::/mnt and \$RUNNER_TEMP are on the same filesystem; refusing to put a 16 GiB swapfile there"
+          required_kib=$(( required_kib + 40 * 1024 * 1024 ))
+        fi
+        available_kib=$(df --output=avail -k /mnt | tail -n 1 | tr -d ' ')
+        if [[ ! "$available_kib" =~ ^[0-9]+$ ]] || (( available_kib < required_kib )); then
+          echo "::error::/mnt has ${available_kib} KiB available; the swapfile needs ${required_kib} KiB there"
           exit 1
         fi
         sudo fallocate -l 16G "$swapfile"
