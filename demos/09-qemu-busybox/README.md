@@ -2,11 +2,12 @@
 
 This is the smallest whole-machine demo: one shell script that boots a pinned
 Linux kernel with a BusyBox userland inside QEMU, with QEMU running under
-`hermit run --strict`. The guest runs a short fixed workload (a kernel name
-query, a directory listing, a shell pipeline, an arbitrary-precision
-calculation of pi, and a SHA-256 of its own BusyBox binary) and powers off.
-Unlike demos 5 to 7 it needs no Python and saves no snapshot, which makes it a
-good first check that QEMU works under Hermit on your machine.
+`hermit run --strict`. The guest runs a short fixed workload in five stages (a
+kernel name query, a directory listing, a shell pipeline, an
+arbitrary-precision calculation of pi, and a SHA-256 of its own BusyBox
+binary), checks that each stage succeeded, and powers off. Unlike demos 5 to 7
+it needs no Python and saves no snapshot, which makes it a good first check
+that QEMU works under Hermit on your machine.
 
 ## Prerequisites
 
@@ -17,6 +18,11 @@ good first check that QEMU works under Hermit on your machine.
   `KERNEL_IMAGE=`), and the usual command-line tools the scripts check for:
   `cpio`, `file`, `find`, `gzip`, `install`, `sha256sum`, `sort`, `stat`,
   `tee`, `timeout`, `touch`, `wc`.
+- The BusyBox must have an applet for every command the guest's [`init`](init)
+  runs (`bc`, `head`, `ls`, `mknod`, `mount`, `poweroff`, `printf`, `sh`,
+  `sha256sum`, `sort`, `uname`), and its shell must support
+  `set -o pipefail`. `build-initramfs.sh` checks both and stops, naming what
+  is missing, before it builds anything.
 - User-space access to the CPU's hardware performance counters. `--strict`
   uses them to switch between QEMU's threads at repeatable points.
 - `ptrace` must be allowed (it is blocked by some container runtimes and by
@@ -24,7 +30,8 @@ good first check that QEMU works under Hermit on your machine.
 - For the two-run check (`VERIFY=1`), also `jq`.
 - Time: one boot took about 160 seconds on 2026-09-30 on the host used for
   this README, and the `VERIFY=1` run shown under
-  [What you will see](#what-you-will-see) took 335 seconds. A raised
+  [What you will see](#what-you-will-see) took 385 seconds (335 seconds in a
+  run on 2026-10-01, when the host was less busy). A raised
   `SKID_MARGIN` makes the boot too slow to finish (see
   [Known limitation](#known-limitation-a-late-performance-counter-interrupt-has-no-tested-remedy)).
 
@@ -38,7 +45,8 @@ demos/09-qemu-busybox/run.sh
 
 The same demo runs with `make -C demos demo9`. The first run downloads the
 pinned kernel from the Hermit GitHub releases into `target/qemu-busybox/`,
-checks its SHA-256, and builds the initramfs; later runs reuse the kernel.
+checks its SHA-256, and builds the initramfs; later runs reuse the kernel and
+build the initramfs again, so a change to `init` takes effect on the next run.
 
 To have Hermit boot the machine twice and compare the two runs:
 
@@ -51,10 +59,13 @@ The script then reads Hermit's JSON verdict and requires that the runs matched,
 that the comparison covered the full event logs without filtering, and that
 both logs contain the same, nonzero number of messages. Two empty logs would
 also compare equal, which is why the count is checked. This mode runs the boot
-twice and then compares the two event logs, 714,635 INFO messages each in the
-run shown below. That run took 335 seconds, against about 160 seconds for a
-single boot on 2026-09-30. Nothing from the guest appears until both boots and
-the comparison have finished. Hermit then prints the first run's console.
+twice and then compares the two event logs, 713,587 INFO messages each in the
+run shown below. That run took 385 seconds on 2026-10-03; the host, which has
+316 hardware threads, had a 1-minute load average of 228.57 when it started
+and 233.80 when it ended. On 2026-10-01, at a load average near 40, the same
+command took 335 seconds, against about 160 seconds for a single boot on
+2026-09-30. Nothing from the guest appears until both boots and the comparison
+have finished. Hermit then prints the first run's console.
 
 To run the launcher by hand once the kernel and initramfs exist:
 
@@ -99,11 +110,11 @@ same binds.
 
 ## What you will see
 
-Observed on 2026-10-01 in one run of the `VERIFY=1` command above, with the
+Observed on 2026-10-03 in one run of the `VERIFY=1` command above, with the
 cached kernel, QEMU 10.1.2, `/usr/sbin/busybox` from the `busybox-1.35.0-2.el9`
-package, and Hermit built from hermit main `1139c661ede3` plus commits that
-change no Hermit source, on a 316-thread AMD EPYC 9D85 host. That run took
-335 seconds. Every number and hash in the two example blocks below, in the
+package, and Hermit 0.4.0 built from hermit main `0f028322361f` plus commits
+that change no Hermit source, on a 316-thread AMD EPYC 9D85 host. That run took
+385 seconds. Every number and hash in the two example blocks below, in the
 note on what the first one leaves out, and in the paragraph on its
 `verify.json` comes from it. The paragraph on the by-hand launcher at the end
 of this section describes a different run, made on 2026-09-30. The run printed
@@ -115,12 +126,12 @@ kernel ready: .../target/qemu-busybox/bzImage (cached)
 busybox=.../busybox
 busybox_sha256=e35db14651077c08598fbc3259609b2db398e5b7dcf07b28f1f3156118bcc081
 initramfs=.../target/qemu-busybox/initramfs-busybox.cpio.gz
-initramfs_sha256=5515b4bced678c4d22ff54dafd1676f06b8e254f1656d2994018df24aa1e9698
+initramfs_sha256=96e97c4aeb0ecfa52d81313c83f73d00c62bd174882c75337e33bd34ad63d355
 entries=417
-bytes=765044
+bytes=766247
 backend=ptrace verify=strict log=info relaxations=none
 pmu_skid_margin=auto
-hermit=.../hermit (hermit 0.2.0 (...))
+hermit=.../hermit (hermit 0.4.0 (...))
 qemu=/usr/bin/qemu-system-x86_64
 kernel=.../target/qemu-busybox/bzImage
 initramfs=.../target/qemu-busybox/initramfs-busybox.cpio.gz
@@ -129,11 +140,11 @@ info=.../target/qemu-busybox/hermit-info.log
 stderr=.../target/qemu-busybox/hermit-stderr.log
 verify_json=.../target/qemu-busybox/verify.json
 kernel_sha256=e4b1c0248a31c7e1f7cb31d82a1a03d4e7cab408ee1b8e622dd897c17eae46a2
-initramfs_sha256=5515b4bced678c4d22ff54dafd1676f06b8e254f1656d2994018df24aa1e9698
+initramfs_sha256=96e97c4aeb0ecfa52d81313c83f73d00c62bd174882c75337e33bd34ad63d355
 [    0.000000] Linux version 6.17.13-0_fbk0_crackerjackhost_0_g2b4321c50d79 (...) #1 SMP Thu Dec 18 12:27:13 PST 2025
 [    0.000000] Command line: console=ttyS0 panic=-1 rdinit=/init
 ...
-[    1.803909] Run /init as init process
+[    1.804137] Run /init as init process
 HERMIT-QEMU-BUSYBOX-START
 Linux (none) 6.17.13-0_fbk0_crackerjackhost_0_g2b4321c50d79 #1 SMP Thu Dec 18 12:27:13 PST 2025 x86_64 x86_64 x86_64 GNU/Linux
 --- root filesystem ---
@@ -155,11 +166,11 @@ usr
 3.1415926532
 --- busybox sha256 ---
 e35db14651077c08598fbc3259609b2db398e5b7dcf07b28f1f3156118bcc081  /bin/busybox
-HERMIT-QEMU-BUSYBOX-PASS
-[    1.905816] ACPI: PM: Preparing to enter system sleep state S5
-[    1.905838] reboot: Power down
-console_sha256=324712862e60da9b4fb27b977f550e824a3679ec240a927a752eb02721adb0e5
-compared_info_messages=714635
+HERMIT-QEMU-BUSYBOX-PASS stages=5
+[    1.906529] ACPI: PM: Preparing to enter system sleep state S5
+[    1.906551] reboot: Power down
+console_sha256=ca262b5199302d72876fa29181e76cc5978e60d4598aa15f4723271bb006c876
+compared_info_messages=713587
 PASS: two runs of the BusyBox boot produced identical output and event logs (ptrace backend)
 
 === Demo 9: QEMU BusyBox Boot: SUCCESS ===
@@ -171,7 +182,8 @@ boot messages between `Command line:` and `Run /init`. BusyBox `ls` colors the
 directory listing on the serial console; the color escape codes are left out
 above. The first run prints the kernel download instead of the `(cached)` line.
 
-The BusyBox and initramfs hashes depend on your BusyBox binary. The kernel
+The BusyBox and initramfs hashes depend on your BusyBox binary, and the
+initramfs hash also on this directory's `init`. The kernel
 hash, the pipeline hash, and pi come from pinned inputs and should match
 exactly. The other run-specific values in this section are an example from one
 run, not values to expect: the console hash, `compared_info_messages`, the
@@ -194,31 +206,34 @@ in `hermit-stderr.log`, before the console. In the same run it was:
 :: Run1...
 :: Run2...
 :: Comparing captured verification logs...
-Logs contain 714636 | 714636 messages total
-Logs contain 714635 | 714635 detcore-specific messages
-Logs contain 714635 | 714635 INFO messages
-Logs contain 711277 | 711277 DETLOG & scheduler COMMIT messages
+Logs contain 713588 | 713588 messages total
+Logs contain 713587 | 713587 detcore-specific messages
+Logs contain 713587 | 713587 INFO messages
+Logs contain 710246 | 710246 DETLOG & scheduler COMMIT messages
 Canonicalizing host addresses (ordinal by first appearance); comparing everything else exactly...
   Comparing INFO messages...
 
-Done processing logs, no substantive differences found (714635 | 714635 INFO messages compared).
+Done processing logs, no substantive differences found (713587 | 713587 INFO messages compared).
 Logs contain 1 | 1 scheduler empty-run-queue kick messages
 Logs contain 0 | 0 scheduler COMMIT records reading /proc/self/maps
 :: comparison=BitwiseInfoV1 relaxations=none
 :: Success: deterministic. Determinism verified.
+:: Compared: stdout and stderr byte for byte, and the INFO records of the guest's log (713587 vs 713587) exactly apart from the wall-clock prefix and canonicalized addresses, under BitwiseInfoV1: bitwise parity established.
 ```
 
 Standard error and standard output reach the terminal separately, so Hermit's
-last two summary lines can land inside the console output. In one earlier run
-`:: comparison=BitwiseInfoV1 relaxations=none` came out in the middle of the
-kernel's `Calibrating delay loop` message; where the lines land varies from run
-to run.
+last summary lines can land inside the console output. In the run shown, the
+`:: ` of `:: Success: deterministic. Determinism verified.` came out before the
+first kernel message, and the rest of that line, followed by the `:: Compared:`
+line, in the middle of the kernel's `Calibrating delay loop` message. In an
+earlier run `:: comparison=BitwiseInfoV1 relaxations=none` landed there; where
+the lines land varies from run to run.
 
 The same run's `verify.json` reported `"verdict": "matched"` and
-`"bitwise_parity": true`, `compared_log_messages` of 714,635 on both sides, and
+`"bitwise_parity": true`, `compared_log_messages` of 713,587 on both sides, and
 identical values for its two boots, `runtime.run1` and `runtime.run2`:
-`scheduler_turns` 40,383, `syscalls` 257,606, and `virtual_nanoseconds`
-194,572,515,695, that is, 194.572515695 seconds of virtual time. This is an L2
+`scheduler_turns` 40,151, `syscalls` 257,203, and `virtual_nanoseconds`
+193,654,733,365, that is, 193.654733365 seconds of virtual time. This is an L2
 result for the ptrace backend at log level `info` with no relaxations.
 
 The by-hand launcher command above prints the same kernel messages and workload
@@ -237,7 +252,8 @@ their last digit, as did the order of the six `SATA link down` lines. That
 command runs QEMU without `run.sh`'s explicit QEMU path argument, without
 `--log info`, without `--base-env=minimal`, and with whatever standard input
 your shell gives it, so do not compare its hash with `run.sh`'s. Observed on
-2026-09-30 with the current scripts; it took 154 seconds.
+2026-09-30 with the scripts of that date, whose `init` did not yet check its
+stages and printed its PASS line without `stages=5`; it took 154 seconds.
 
 ## What to notice
 
@@ -245,8 +261,17 @@ your shell gives it, so do not compare its hash with `run.sh`'s. Observed on
   kernel reports a skewed or unusable clock source (for example
   `Marking TSC unstable`). The guest's time comes from QEMU's instruction count,
   and QEMU's time comes from Hermit.
-- The workload marker `HERMIT-QEMU-BUSYBOX-PASS` must appear. Determinism alone
-  is not enough, since two identical failed boots would also match.
+- The workload line `HERMIT-QEMU-BUSYBOX-PASS stages=5` must appear.
+  Determinism alone is not enough, since two identical failed boots would also
+  match. The guest's `init` prints that line only after each of its five stages
+  has exited with status 0. It runs the pipeline under `set -o pipefail`, so a
+  failure of `printf`, `sort`, or `head` counts, not only one of the final
+  `sha256sum`; without that option the pipeline would report success, because
+  `sha256sum` succeeds on empty input. A failed stage prints
+  `HERMIT-QEMU-BUSYBOX-FAIL stage=<stage> status=<status>` instead and powers
+  off, and `run.sh` fails, quoting that line. An initramfs whose `init` prints
+  the PASS line without `stages=5`, such as one built before `init` checked its
+  stages, is refused too: it does not show that the stages succeeded.
 - The console transcript is saved as `target/qemu-busybox/console.log` and its
   SHA-256 is printed. With the same kernel, BusyBox, QEMU, Hermit, and checkout
   path, another run prints the same hash. That holds because `run.sh` fixes
@@ -292,11 +317,13 @@ your shell gives it, so do not compare its hash with `run.sh`'s. Observed on
 
 ## How it works
 
-`build-initramfs.sh` puts the BusyBox binary, its applet links, and the
-[`init`](init) script into a compressed cpio archive, fixing everything that
-normally varies between hosts: file order, owners, timestamps, archive inode
-numbers, and the gzip header. The same BusyBox therefore always gives the same
-initramfs.
+`build-initramfs.sh` first checks that the BusyBox has an applet for every
+command `init` runs and that its shell honors `set -o pipefail`; either gap
+would otherwise show only inside the guest, after the boot. It then puts the
+BusyBox binary, its applet links, and the [`init`](init) script into a
+compressed cpio archive, fixing everything that normally varies between hosts:
+file order, owners, timestamps, archive inode numbers, and the gzip header. The
+same BusyBox therefore always gives the same initramfs.
 
 [`boot_qemu.sh`](boot_qemu.sh) checks its inputs and then replaces itself with
 QEMU, configured to leave nothing to chance: the `q35` machine with the `max`
@@ -341,22 +368,25 @@ README, on 2026-09-30:
 - With `SKID_MARGIN=17288` and a longer timeout, the run had completed 552
   scheduler turns after 15 minutes (with a second Hermit run active on the same
   host) and was stopped. The full boot shown under
-  [What you will see](#what-you-will-see) took 40,383 turns; that count
+  [What you will see](#what-you-will-see) took 40,151 turns; that count
   depends on the checkout's path and the Hermit build.
 
 On 2026-10-01 the default margin did produce a late interrupt on the same host.
-In a `VERIFY=1` run started six and a half minutes before the one shown under
-[What you will see](#what-you-will-see), one interrupt in the second boot
-arrived 864 branches past its target. Hermit reported that one interrupt twice:
-once on standard error, as a line starting `HERMIT_SKID_OVERSHOOT`, and once in
-the second boot's event log. Both reports give the same branch count,
+In a `VERIFY=1` run started six and a half minutes before another `VERIFY=1`
+run that passed (the run this README showed until 2026-10-03), one interrupt
+in the second boot arrived 864 branches past its target. Hermit reported that
+one interrupt twice: once on standard error, as a line starting
+`HERMIT_SKID_OVERSHOOT`, and once in the second boot's event log. Both reports
+give the same branch count,
 12,163,249,089, and the first boot's event log has no such report. Hermit
 counted 2 reports (`HERMIT_POLICY_REFUSAL class=policy-refusal
 cause=skid-overshoot count=2`), the two boots' event logs differed, and Hermit
-refused the result with exit status 122, so `run.sh` failed. The next run, the
-one shown, passed. The host's 1-minute load average, read from `/proc/loadavg`,
-was 49.06 when the refused run started and 41.02 when it ended, and 40.16 and
-26.86 for the run that passed.
+refused the result with exit status 122, so `run.sh` failed. The next run
+passed. The host's 1-minute load average, read from `/proc/loadavg`, was 49.06
+when the refused run started and 41.02 when it ended, and 40.16 and 26.86 for
+the run that passed. The run shown under
+[What you will see](#what-you-will-see), on 2026-10-03 at a load average near
+230, reported no late interrupt.
 
 So a run in which the default margin produces `HERMIT_SKID_OVERSHOOT` fails,
 and on a host where that happens often this demo is not known to work. Demo 9
@@ -374,7 +404,7 @@ Controls (environment variables):
 | --- | --- | --- |
 | `KERNEL_IMAGE` | (download) | Use a local `bzImage` instead of the pinned download. For a path under `/tmp`, see [Run it](#run-it). |
 | `QEMU_KERNEL_URL`, `QEMU_KERNEL_SHA256` | the pinned release | Pin a different kernel; set both together. |
-| `INITRAMFS_IMAGE` | (built) | Use an existing initramfs instead of building one. For a path under `/tmp`, see [Run it](#run-it). |
+| `INITRAMFS_IMAGE` | (built) | Use an existing initramfs instead of building one. Its `/init` must print `HERMIT-QEMU-BUSYBOX-PASS stages=5`; an image built before `init` checked its stages is refused once its boot ends, so rebuild it with `build-initramfs.sh`. For a path under `/tmp`, see [Run it](#run-it). |
 | `BUSYBOX` | `busybox` on `PATH` | A statically linked BusyBox for the initramfs. |
 | `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. A QEMU under `/tmp` is refused; see [Run it](#run-it). |
 | `DEMO_TIMEOUT_SECONDS` | `300` | Seconds before the run is stopped. |

@@ -25,7 +25,8 @@ DEMO_DIR = Path(__file__).resolve().parent.parent
 HELPER = DEMO_DIR / "lib" / "hermit-tmp-binds.sh"
 DEMO9 = DEMO_DIR / "09-qemu-busybox"
 
-MARKER = "HERMIT-QEMU-BUSYBOX-PASS"
+# The line the guest's /init prints once every stage of its workload succeeded.
+MARKER = "HERMIT-QEMU-BUSYBOX-PASS stages=5"
 
 # Stands in for `hermit ... run ... -- boot_qemu.sh KERNEL INITRAMFS QEMU`.
 # run.sh copies the run's standard output to console.log through a `tee` that
@@ -37,9 +38,9 @@ if [ "${1:-}" = --version ]; then
   exit 0
 fi
 printf '%s\n' "$*" >>"$DEMO09_TEST_ARGS_FILE"
-echo HERMIT-QEMU-BUSYBOX-PASS
+echo 'HERMIT-QEMU-BUSYBOX-PASS stages=5'
 for _ in $(seq 1 200); do
-  if grep -Fq HERMIT-QEMU-BUSYBOX-PASS "$DEMO09_TEST_CONSOLE" 2>/dev/null; then
+  if grep -Fq 'HERMIT-QEMU-BUSYBOX-PASS stages=5' "$DEMO09_TEST_CONSOLE" 2>/dev/null; then
     exit 0
   fi
   sleep 0.05

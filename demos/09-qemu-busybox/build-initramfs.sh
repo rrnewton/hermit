@@ -25,10 +25,27 @@ file "$busybox" | grep -q 'statically linked' || fail \
 for command in cpio file find gzip install sha256sum sort stat touch wc; do
   command -v "$command" >/dev/null || fail "$command is required"
 done
-for applet in bc ls mknod mount poweroff sha256sum sh uname; do
-  "$busybox" --list | grep -Fxq "$applet" || fail \
-    "BusyBox does not provide required applet: $applet"
+
+# Every command /init runs, other than the shell's builtins, must be a BusyBox
+# applet, and its shell must support pipefail, which /init needs to see a
+# failure in any stage of its pipeline. Either gap would otherwise show only
+# inside the guest, after the boot.
+applet_names=$("$busybox" --list) || fail \
+  "BusyBox could not list its applets: $busybox"
+missing_applets=()
+for applet in bc head ls mknod mount poweroff printf sh sha256sum sort uname; do
+  case $'\n'"$applet_names"$'\n' in
+    *$'\n'"$applet"$'\n'*) ;;
+    *) missing_applets+=("$applet") ;;
+  esac
 done
+[[ ${#missing_applets[@]} -eq 0 ]] || fail \
+  "BusyBox lacks applets the guest's /init runs (${missing_applets[*]}): $busybox"
+"$busybox" sh -c 'set -o pipefail' 2>/dev/null || fail \
+  "BusyBox's sh does not support 'set -o pipefail', which the guest's /init needs: $busybox"
+if "$busybox" sh -c 'set -o pipefail; false | true' 2>/dev/null; then
+  fail "BusyBox's sh accepts 'set -o pipefail' but ignores it: $busybox"
+fi
 
 mkdir -p "$repo_root/target/qemu-busybox" "$(dirname -- "$output")"
 root=$(mktemp -d "$repo_root/target/qemu-busybox/root.XXXXXX")
