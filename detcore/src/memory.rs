@@ -91,6 +91,7 @@ impl MemoryMetadata {
     /// belongs to the loader, the kernel tags nothing, and the guest's heap is
     /// an ordinary anonymous mapping. Binding to the observed break keeps the
     /// heap identifiable on every backend.
+    #[cfg(not(target_os = "none"))]
     pub(crate) fn brk_heap_range(&self) -> Option<(u64, u64)> {
         let (start, current) = (self.brk_start?, self.brk_current?);
         (current > start).then_some((start, current))

@@ -277,6 +277,7 @@ impl DetFd {
     }
 
     /// Update the scheduler resource shared by aliases of this open file.
+    #[cfg(not(target_os = "none"))]
     pub(crate) fn set_resource<S: Into<Option<ResourceID>>>(&self, resource: S) {
         self.description().resource = resource.into();
     }
