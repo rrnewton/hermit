@@ -143,8 +143,12 @@ struct DetInodeInfo {
 /// epoch (https://github.com/rrnewton/hermit/issues/3639).
 ///
 /// These values are canonical and content-independent: they are written
-/// deliberately by tools that erase timestamps, so they carry no host- or
-/// run-specific information and revealing them cannot weaken determinism.
+/// deliberately by tools that erase timestamps, so they carry no host clock
+/// or run-specific information. Revealing them makes whether a file's host
+/// mtime is canonical part of Hermit's input, like the file's contents: a
+/// guest that rewrites the host mtime of an input file (`touch f` after
+/// `stat f` on a canonical file) changes the input of the next run, exactly
+/// as rewriting its contents would.
 /// - `1` (1970-01-01T00:00:01Z) is the mtime of every file and directory in
 ///   the Nix store (seconds 1, nanoseconds 0). nixpkgs' stdenv derives
 ///   `SOURCE_DATE_EPOCH` from the newest source mtime, so reporting the epoch
