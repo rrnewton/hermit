@@ -6668,9 +6668,10 @@ impl Scheduler {
 
     /// Capture is an external input boundary: only its genuinely idle elapsed
     /// intervals enter virtual time. Replay uses recorded release times instead
-    /// of host elapsed time, including when it must perform a local original
-    /// effect such as close. Keep its idle marker until that effect completes:
-    /// it also prevents empty-queue maintenance from fast-forwarding timers.
+    /// of host elapsed time. A capture grant also keeps its idle marker until
+    /// completion, preventing empty-queue timer fast-forward past that input.
+    /// Local original Close uses ordinary external IO: it has no captured
+    /// release time, and a pending timer may interrupt its physical wait.
     /// An explicit sample permits exact tests without sleeps or tolerances.
     fn sample_network_capture_clock(&mut self, time: &mut GlobalTime, now: Instant) {
         for (tid, operation) in &self.network_capture_blockers {
@@ -7804,6 +7805,10 @@ impl Scheduler {
             .unwrap_or(LogicalTime::ZERO)
     }
 }
+
+#[cfg(test)]
+#[path = "scheduler/original_close_clock_tests.rs"]
+mod original_close_clock_tests;
 
 #[cfg(test)]
 mod test {

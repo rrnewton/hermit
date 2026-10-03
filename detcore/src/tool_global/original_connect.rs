@@ -333,7 +333,11 @@ impl GlobalState {
                     {
                         let granted = if self.cfg.sequentialize_threads {
                             read.external_grant == Some(arguments.operation)
-                                && sched.original_external_grant_matches(owner, arguments.operation)
+                                && sched.original_transfer_grant_matches(
+                                    owner,
+                                    arguments.operation,
+                                    arguments.kind,
+                                )
                         } else {
                             read.external_grant.is_none()
                         };

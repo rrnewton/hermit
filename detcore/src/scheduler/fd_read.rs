@@ -161,6 +161,22 @@ impl Scheduler {
             && !self.network_capture_blockers.contains_key(&owner.thread)
     }
 
+    /// Match the original operation's exact time-source classification too.
+    /// Close cannot borrow a capture grant, nor Connect an ordinary IO grant.
+    pub(crate) fn original_transfer_grant_matches(
+        &self,
+        owner: NetworkStreamOwner,
+        operation: ExternalOpId,
+        kind: crate::network_replay::original_connect::Kind,
+    ) -> bool {
+        use crate::network_replay::original_connect::Kind;
+        match kind {
+            Kind::Close => self.original_external_io_grant_matches(owner, operation),
+            Kind::Connect => self.original_external_grant_matches(owner, operation),
+            _ => false,
+        }
+    }
+
     /// Actual selected external resource, including scalar Read's existing
     /// BlockingExternalIO path. The token itself was issued before step4.
     pub(crate) fn original_fd_grant_matches(

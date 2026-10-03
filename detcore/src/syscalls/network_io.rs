@@ -83,6 +83,22 @@ use crate::tool_global::thread_observe_time;
 use crate::types::LogicalTime;
 use crate::types::OpenFileId;
 
+/// Close is a physical descriptor effect, including a potentially blocking
+/// socket close. It has no external input record from which Replay could
+/// reproduce host elapsed time. Keep its existing blocking grant/continuation,
+/// but reserve the capture clock for Connect's recorded external input.
+pub(crate) fn original_external_resource(
+    kind: crate::network_replay::original_connect::Kind,
+    operation: ExternalOpId,
+) -> Result<ResourceID, Error> {
+    use crate::network_replay::original_connect::Kind;
+    match kind {
+        Kind::Close => Ok(ResourceID::BlockingExternalIO(operation)),
+        Kind::Connect => Ok(ResourceID::BlockingNetworkCapture(operation)),
+        _ => Err(engine_error("unsupported original external resource kind")),
+    }
+}
+
 fn engine_error(error: impl std::fmt::Display) -> Error {
     Error::Tool(anyhow::anyhow!(
         "shared network engine refused operation: {error}"
@@ -1313,7 +1329,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             let state = guest.thread_state();
             let mut resources = Resources::new(state.dettid);
             resources.insert(
-                ResourceID::BlockingNetworkCapture(arguments.operation),
+                original_external_resource(kind, arguments.operation)?,
                 Permission::RW,
             );
             resources.fyi(call.name());
