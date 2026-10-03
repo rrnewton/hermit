@@ -108,3 +108,71 @@ multiple result sets. For example:
 ./benchmarks/targeted.py --skip-build --iterations 1 --warmups 0 \
   --backends native,ptrace --benchmarks cpu_bound
 ```
+
+## Per-call system call cost
+
+`getpid_cost.rs` measures what one raw `getpid` call costs natively and under
+the `ptrace` and `liteinst` backends. It answers a narrower question than
+`targeted.py`'s `syscall_heavy` row: how many microseconds each backend adds
+to a single intercepted call once process start-up is taken out.
+
+The guest is `fixtures/getpid_loop.c`, which makes exactly N raw `getpid`
+calls and prints `calls=N`. Hermit virtualizes the guest's clocks, so the
+harness times each whole run from outside. For each variant it takes the
+median wall time at several N (default 0, 25,000, 50,000 and 100,000) and fits
+a least-squares line through those medians. The slope is the cost of one call;
+the intercept is the fixed cost of a run, including Hermit start-up and any
+wrapper. The `extra us/call` column is a backend's slope minus the native
+slope.
+
+Build Hermit and stage the LiteInst runtime beside it first (the top-level
+`README.md` describes the staging script), then run from the repository root:
+
+```sh
+./scripts/stage-liteinst-runtime.sh release \
+  "$PWD/target/release/libreverie_liteinst.so" \
+  "$PWD/target/liteinst-runtime-build"
+cargo build --locked --release -p hermit --bin hermit
+./benchmarks/getpid_cost.rs
+./benchmarks/getpid_cost.rs --backends ptrace --counts 0,100000 --iterations 3
+./benchmarks/getpid_cost.rs --hermit "/path/to/wrapper target/release/hermit"
+```
+
+Hermit runs use the same hardware-independent configuration as `run.py`
+(see Methodology above), so no PMU timer is armed. The slope is interception
+plus Detcore's handling of `getpid`, not interception alone. In the current
+LiteInst backend Detcore runs in the ptrace host, so even a call through a
+patched site ends in a `SIGTRAP` that the host must service. Each round runs
+every count, and the variant order rotates from round to round so no variant
+always runs first. A sample counts only if it exits 0 and prints exactly
+`calls=N`; failed and timed-out samples are kept in the output, the variant
+gets no fit, and the harness exits 1.
+
+Every run starts with `RUST_LOG`, `HERMIT_LOG` and `HERMIT_LOG_FILE` removed
+from its environment, so an inherited logging setting can neither slow the
+timed runs nor move the statistics record off stderr. After timing, one more
+run per backend at the largest N sets `RUST_LOG=hermit::backend_stats=debug`
+and keeps the backend's own `backend run complete` record. That run must pass
+the same `calls=N` check and print exactly one record naming its backend, or
+the harness exits 1. For LiteInst the record counts each dispatch path:
+`direct_hook` for calls through a patched site, the trap paths for calls that
+were not. Two limits apply to those counts:
+
+- A call that never reaches a patch attempt is in no path counter. That covers
+  task-creating calls (`clone`, `fork`, `vfork`, `execve`), which LiteInst
+  never patches, and every call once the guest has a second task. The fixture
+  makes neither, so its counts are complete.
+- Hermit prints the record only when the backend returns normally, including
+  after a forced shutdown. A backend error or a timeout loses it, exactly as it
+  does for `ptrace`.
+
+Each wall time comes from polling the run every 500 microseconds, so a sample
+can read up to one poll interval, plus the host's timer slack, longer than the
+run. The JSON records the interval as `poll_interval_ns`.
+
+Raw samples, per-count medians with median absolute deviation, the fits, the
+statistics records, the commands, the full repository SHA, the script's
+SHA-256, the host's kernel, CPU model and load average are written to the
+ignored `benchmarks/results/getpid-cost.json`. The harness does not create a
+cgroup or pin CPUs; run it on a quiet host and compare the recorded load
+averages before trusting a small difference.

@@ -649,7 +649,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_dap_replay_step_back_refuses_an_activation_that_differs_only_at_frame_7
     // (https://github.com/rrnewton/hermit/pull/3545) retains all 117 prior
     // selected CLI identities.
-    ("test.cli", 118),
+    // liteinst_backend_stats_report_the_guests_own_dispatch_paths
+    // (https://github.com/rrnewton/hermit/pull/3564) retains all 118 prior
+    // selected CLI identities.
+    ("test.cli", 119),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
