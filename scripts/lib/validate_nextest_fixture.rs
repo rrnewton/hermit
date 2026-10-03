@@ -1,5 +1,7 @@
-//! Authentic producer/runner/ledger coverage. All generated sources and results
-//! remain in the script harness's retained directory, outside product inventory.
+//! Authentic producer/runner/ledger coverage. The fixture's evidence (bounds,
+//! per-case logs, results and ledger rows) remains in the script harness's
+//! retained directory, outside product inventory. Its Cargo build does not:
+//! see [`FixtureTree`].
 
 use std::fs;
 use std::path::Path;
@@ -45,6 +47,127 @@ fn quoted(path: &Path) -> String {
 }
 
 const FIXTURE_WALL_SECONDS: u64 = 1200;
+
+/// Stable name of every fixture tree inside the harness log directory.
+const FIXTURE_ROOT_PREFIX: &str = "real-nextest-results-";
+
+/// One run's fixture tree, `<DAGRUN_LOG_DIR>/real-nextest-results-XXXXXX`.
+///
+/// The harness retains its log directory on purpose, so the small evidence
+/// files stay. The generated crate and its Cargo target directory are only
+/// inputs to the five cases, and the target directory is a complete Cargo
+/// build: until 2026-10-03 the tree was kept whole, and one host held 70 of
+/// them using 43.5e9 bytes (https://github.com/rrnewton/hermit/issues/3622).
+///
+/// [`FixtureTree::finish`] removes both when every case has passed. A failing
+/// case unwinds past `finish`; the whole tree is then kept for diagnosis and
+/// its path printed. A killed test runs neither, and no validation cleanup
+/// sweeps the harness log directory, so the leftover is found by this name:
+/// `<DAGRUN_LOG_DIR>/real-nextest-results-*/target`.
+struct FixtureTree {
+    root: PathBuf,
+    finished: bool,
+}
+
+impl FixtureTree {
+    fn create(parent: &Path) -> Self {
+        let root = tempfile::Builder::new()
+            .prefix(FIXTURE_ROOT_PREFIX)
+            .tempdir_in(parent)
+            .unwrap()
+            .keep();
+        Self {
+            root,
+            finished: false,
+        }
+    }
+
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn crate_dir(&self) -> PathBuf {
+        self.root.join("crate")
+    }
+
+    fn target_dir(&self) -> PathBuf {
+        self.root.join("target")
+    }
+
+    /// Called after the last assertion. A removal failure fails the test: a
+    /// silent one is exactly the leak this type exists to prevent.
+    fn finish(mut self) {
+        self.finished = true;
+        for directory in [self.target_dir(), self.crate_dir()] {
+            match fs::remove_dir_all(&directory) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot remove fixture {}: {error}", directory.display()),
+            }
+            assert!(
+                !directory.exists(),
+                "{} survived removal",
+                directory.display()
+            );
+        }
+    }
+}
+
+impl Drop for FixtureTree {
+    fn drop(&mut self) {
+        if !self.finished {
+            eprintln!(
+                "authentic Nextest fixture failed; its whole tree is kept for diagnosis: {}. \
+                 Delete its target/ (a full Cargo build) when done.",
+                self.root.display()
+            );
+        }
+    }
+}
+
+#[test]
+fn fixture_tree_drops_its_build_on_success_and_keeps_it_on_failure() {
+    fn populate(tree: &FixtureTree) -> PathBuf {
+        let root = tree.root().to_path_buf();
+        fs::create_dir_all(tree.target_dir().join("debug/deps")).unwrap();
+        fs::write(tree.target_dir().join("debug/deps/fixture-binary"), b"x").unwrap();
+        fs::create_dir_all(tree.crate_dir().join("src")).unwrap();
+        fs::write(tree.crate_dir().join("Cargo.toml"), b"[package]\n").unwrap();
+        fs::write(root.join("bounds.json"), b"{}").unwrap();
+        fs::create_dir_all(root.join("writable-pass")).unwrap();
+        fs::write(root.join("writable-pass/producer.stderr"), b"log").unwrap();
+        root
+    }
+    let parent = tempfile::tempdir().unwrap();
+
+    let passed = FixtureTree::create(parent.path());
+    let root = populate(&passed);
+    assert_eq!(root.parent(), Some(parent.path()));
+    let name = root.file_name().unwrap().to_str().unwrap();
+    assert!(name.starts_with(FIXTURE_ROOT_PREFIX), "{name}");
+    passed.finish();
+    assert!(
+        !root.join("target").exists(),
+        "a passing run must not keep its Cargo build"
+    );
+    assert!(!root.join("crate").exists());
+    assert!(root.join("bounds.json").is_file(), "evidence is retained");
+    assert!(root.join("writable-pass/producer.stderr").is_file());
+
+    let failed = FixtureTree::create(parent.path());
+    let root = populate(&failed);
+    let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        let _failed = failed;
+        panic!("simulated fixture assertion failure");
+    }));
+    assert!(unwound.is_err());
+    assert!(
+        root.join("target/debug/deps/fixture-binary").is_file(),
+        "a failing run keeps its whole tree for diagnosis"
+    );
+    assert!(root.join("crate/Cargo.toml").is_file());
+    assert!(root.join("bounds.json").is_file());
+}
 
 /// This fixture owns a local clock, not a replacement scheduler epoch. A real
 /// enclosing absolute deadline can only shorten it. An epoch alone does not
@@ -246,11 +369,8 @@ fn actual_nextest_results_and_publication_failures() {
         std::env::var_os("DAGRUN_LOG_DIR")
             .expect("run this test through ci/rust-script-bin/run-test-harness"),
     );
-    let root = tempfile::Builder::new()
-        .prefix("real-nextest-results-")
-        .tempdir_in(parent)
-        .unwrap()
-        .keep();
+    let tree = FixtureTree::create(&parent);
+    let root = tree.root().to_path_buf();
     eprintln!("authentic Nextest fixture evidence: {}", root.display());
     assert!(
         git_text(
@@ -261,7 +381,7 @@ fn actual_nextest_results_and_publication_failures() {
         "commit the candidate before running the exact-source fixture"
     );
     let original_head = git_text(&source, &["rev-parse", "HEAD"]);
-    let fixture = root.join("crate");
+    let fixture = tree.crate_dir();
     fs::create_dir_all(fixture.join("src")).unwrap();
     fs::write(fixture.join("Cargo.toml"), concat!(
         "[package]\nname = \"hermit\"\nversion = \"0.0.0\"\nedition = \"2024\"\npublish = false\n",
@@ -271,7 +391,7 @@ fn actual_nextest_results_and_publication_failures() {
         "#[test]\nfn passes() { assert_eq!(2 + 2, 4); }\n",
         "#[test]\nfn fails() { assert_eq!(2 + 2, 5, \"intentional structured-result fixture assertion\"); }\n",
     )).unwrap();
-    let target = root.join("target");
+    let target = tree.target_dir();
     // Cargo's standard explicit/default home remains in force. Only the target
     // and temp directories below are fixture-owned; a test must not silently
     // copy or claim private ownership of the developer's registry/configuration.
@@ -648,4 +768,5 @@ fn actual_nextest_results_and_publication_failures() {
         )
         .is_empty()
     );
+    tree.finish();
 }
