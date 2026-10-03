@@ -22,9 +22,19 @@
 # (ENOTDIR), so Hermit reports that the program does not exist
 # (https://github.com/rrnewton/hermit/issues/3626). Binding the directory also
 # shows the program the directory's other entries, which in the
-# demos are the program alone or files tracked in the repository. A symbolic
-# link inside a bound directory is resolved in the program's view, where the
-# rest of the host's /tmp is hidden.
+# demos are the program alone or files tracked in the repository, so a FILE
+# inside that directory is not bound again.
+#
+# The program resolves a symbolic link inside the bound directory in its own
+# view, where the rest of the host's /tmp is hidden, so a link to another place
+# under /tmp leads nowhere there. The program, and each FILE inside its
+# directory, is therefore refused when the program itself or a component of the
+# FILE's path below that directory is a symbolic link. This also refuses links
+# that would work, such as one to a path outside /tmp or to another file in the
+# same directory; pass the path the link resolves to instead. A FILE outside
+# the program's directory is bound by itself, and a symbolic link in its path
+# is no obstacle: Hermit mounts it before it hides the host's /tmp, and the
+# mount follows the link, so the program sees the file the link points to.
 #
 # hermit_tmp_check_paths HINT PROGRAM [FILE...]
 #   Return 0 if PROGRAM and every FILE are outside /tmp or can be shown to the
@@ -36,16 +46,24 @@
 #   the bound path at the same relative path inside the private /tmp, and `..`
 #   would leave it), or it names /tmp itself. For PROGRAM, its directory is
 #   bound, so PROGRAM must not be directly in /tmp (binding /tmp would show the
-#   program all of it), and its directory must not be a symbolic link (Hermit
-#   would mount it as a file).
+#   program all of it), its directory must not be a symbolic link (Hermit
+#   would mount it as a file), and PROGRAM must not be a symbolic link itself.
+#   A FILE inside PROGRAM's directory must have no symbolic link among the
+#   components of its path below that directory (see above).
 #
 #   A path that reaches /tmp without beginning with /tmp/ is refused when it is
-#   absolute (through a symbolic link), when it is PROGRAM (Hermit starts a
+#   absolute (through a symbolic link), or when it is PROGRAM (Hermit starts a
 #   program by the absolute path it resolves on the host, which then begins
-#   with /tmp/ and is hidden), or when it is a relative FILE that reaches /tmp
-#   through a `..` component or a symbolic link. Any other relative FILE is
-#   reached through the working directory, which the program inherits as it
-#   is, so it is left unchanged.
+#   with /tmp/ and is hidden). A relative FILE is looked up by the program from
+#   its working directory, which it inherits as the directory itself, not its
+#   name. That lookup sees the host's files, one component at a time, until it
+#   steps onto /tmp itself, by a `..` from below /tmp or by `tmp` from /, where
+#   the program sees its private /tmp, or until it meets a symbolic link, which
+#   the program resolves in its own view. A relative FILE that reaches /tmp is
+#   therefore refused when one of its components is a symbolic link or its
+#   lookup passes through /tmp itself, and is otherwise left unchanged,
+#   including a `..` that stays below /tmp, as in `sub/../a.img` or
+#   `../dir/a.img`.
 #
 # hermit_tmp_bind_args ARRAY PROGRAM [FILE...]
 #   Set the caller's array named ARRAY to `--bind DIR` for PROGRAM's directory
@@ -63,7 +81,7 @@
 # _HERMIT_TMP_NORMAL to that path without `.` components or repeated or
 # trailing slashes; for "refuse", _HERMIT_TMP_PROBLEM to the reason.
 _hermit_tmp_classify() {
-  local kind="$1" path="$2" resolved logical
+  local kind="$1" path="$2" resolved prefix rest component
   _HERMIT_TMP_CLASS=unchanged
   _HERMIT_TMP_BIND=
   _HERMIT_TMP_NORMAL=
@@ -106,6 +124,10 @@ _hermit_tmp_classify() {
         _HERMIT_TMP_PROBLEM="its directory, $_HERMIT_TMP_BIND, is a symbolic link, which Hermit would mount as a file"
         return
       fi
+      if [ "$kind" = program ] && [ -L "$_HERMIT_TMP_NORMAL/$(basename -- "$path")" ]; then
+        _HERMIT_TMP_PROBLEM="it is a symbolic link, which Hermit would follow in the program's view, where the rest of the host's /tmp is hidden; $(_hermit_tmp_resolves_to "$path")"
+        return
+      fi
       _HERMIT_TMP_CLASS=bind
       ;;
     *)
@@ -129,31 +151,120 @@ _hermit_tmp_classify() {
         _HERMIT_TMP_PROBLEM="Hermit starts a program by the absolute path it resolves on the host, $resolved, which is under /tmp"
         return
       fi
-      case "/$path/" in
-        */../*)
-          _HERMIT_TMP_PROBLEM="it resolves to $resolved, under /tmp, through a '..' component"
-          return
-          ;;
-      esac
-      # The same path with the working directory's symbolic links resolved
-      # and none of its own: it differs from $resolved only when one of the
-      # path's own components is a symbolic link.
-      logical=$(realpath -m -s -- "$(pwd -P)/$path" 2>/dev/null) || logical=
-      if [ "$logical" != "$resolved" ]; then
-        _HERMIT_TMP_PROBLEM="it resolves to $resolved, under /tmp, through a symbolic link"
+      # Follow the program's lookup of the relative path, one component at a
+      # time from the physical path of the working directory, which the
+      # program inherits as the directory itself. A `..` moves to the parent
+      # directory, as it does for the program; stepping onto /tmp itself, by a
+      # `..` from below it or by `tmp` from /, moves the program into its
+      # private /tmp, and a symbolic link is resolved in the program's view.
+      if ! prefix=$(pwd -P 2>/dev/null); then
+        _HERMIT_TMP_PROBLEM="the working directory could not be resolved"
         return
       fi
+      rest=$path
+      while [ -n "$rest" ]; do
+        component=${rest%%/*}
+        if [ "$component" = "$rest" ]; then
+          rest=
+        else
+          rest=${rest#*/}
+        fi
+        case "$component" in
+          '' | .)
+            continue
+            ;;
+          ..)
+            prefix=${prefix%/*}
+            if [ -z "$prefix" ]; then
+              prefix=/
+            fi
+            ;;
+          *)
+            prefix=${prefix%/}/$component
+            if [ -L "$prefix" ]; then
+              _HERMIT_TMP_PROBLEM="it resolves to $resolved, under /tmp, through a symbolic link"
+              return
+            fi
+            ;;
+        esac
+        if [ "$prefix" = /tmp ]; then
+          _HERMIT_TMP_PROBLEM="it resolves to $resolved, under /tmp, through /tmp itself, where the program sees its private /tmp"
+          return
+        fi
+      done
       _HERMIT_TMP_CLASS=unchanged
       ;;
   esac
 }
 
+# Print the end of a refusal of the symbolic link $1: the instruction to give
+# the path it resolves to, naming that path when realpath can resolve it.
+_hermit_tmp_resolves_to() {
+  local resolved
+  if resolved=$(realpath -m -- "$1" 2>/dev/null); then
+    printf 'give the path it resolves to, %s, instead' "$resolved"
+  else
+    printf 'give the path it resolves to instead'
+  fi
+}
+
+# Set _HERMIT_TMP_LINK to the first symbolic link among the paths that lead
+# from the directory $1 down to $2, a path inside it without `.` or `..`
+# components or repeated or trailing slashes, or to nothing if there is none.
+_hermit_tmp_link_below() {
+  local prefix="$1" rest="${2#"$1"}" component
+  _HERMIT_TMP_LINK=
+  while [ -n "$rest" ]; do
+    rest=${rest#/}
+    component=${rest%%/*}
+    rest=${rest#"$component"}
+    prefix=$prefix/$component
+    if [ -L "$prefix" ]; then
+      _HERMIT_TMP_LINK=$prefix
+      return 0
+    fi
+  done
+  return 0
+}
+
+# Classify the file $2 as _hermit_tmp_classify does, when $1 is the program's
+# directory, bound as a whole, or empty when that directory is not bound. A
+# file that the directory already shows gets the class "inside" and is not
+# bound again, unless the program would meet a symbolic link below the
+# directory on the way to it, which refuses it.
+_hermit_tmp_classify_file() {
+  local program_dir="$1"
+  _hermit_tmp_classify file "$2"
+  if [ "$_HERMIT_TMP_CLASS" != bind ] || [ -z "$program_dir" ]; then
+    return 0
+  fi
+  case "$_HERMIT_TMP_NORMAL/" in
+    "$program_dir"/*) ;;
+    *) return 0 ;;
+  esac
+  _hermit_tmp_link_below "$program_dir" "$_HERMIT_TMP_NORMAL"
+  if [ -z "$_HERMIT_TMP_LINK" ]; then
+    _HERMIT_TMP_CLASS=inside
+    return 0
+  fi
+  _HERMIT_TMP_CLASS=refuse
+  _HERMIT_TMP_PROBLEM="it is inside the program's directory, $program_dir, which is bound as a whole, and $_HERMIT_TMP_LINK is a symbolic link, which the program would follow in its own view, where the rest of the host's /tmp is hidden; $(_hermit_tmp_resolves_to "$2")"
+  return 0
+}
+
 hermit_tmp_check_paths() {
-  local hint="$1" kind=program path
+  local hint="$1" kind=program path program_dir=
   shift
   for path in "$@"; do
-    _hermit_tmp_classify "$kind" "$path"
-    kind="file"
+    if [ "$kind" = program ]; then
+      _hermit_tmp_classify program "$path"
+      if [ "$_HERMIT_TMP_CLASS" = bind ]; then
+        program_dir=$_HERMIT_TMP_NORMAL
+      fi
+      kind="file"
+    else
+      _hermit_tmp_classify_file "$program_dir" "$path"
+    fi
     if [ "$_HERMIT_TMP_CLASS" = refuse ]; then
       printf 'error: %s is under /tmp. Hermit gives the program it runs a private /tmp, and the demo cannot make this path visible there: %s. %s\n' \
         "$path" "$_HERMIT_TMP_PROBLEM" "$hint" >&2
@@ -176,14 +287,9 @@ hermit_tmp_bind_args() {
     program_dir=$_HERMIT_TMP_NORMAL
   fi
   for path in "$@"; do
-    _hermit_tmp_classify file "$path"
+    # The program's directory already shows a file "inside" it.
+    _hermit_tmp_classify_file "$program_dir" "$path"
     [ "$_HERMIT_TMP_CLASS" = bind ] || continue
-    # The program's directory already shows a file inside it.
-    if [ -n "$program_dir" ]; then
-      case "$_HERMIT_TMP_NORMAL/" in
-        "$program_dir"/*) continue ;;
-      esac
-    fi
     _hermit_tmp_binds+=(--bind "$_HERMIT_TMP_BIND")
   done
   return 0

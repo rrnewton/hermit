@@ -99,9 +99,14 @@ hermit run --strict --epoch=2026-01-01T00:00:00Z \
 
 `run.sh` stops, naming the path and the reason, when a path under `/tmp`
 cannot be shown this way: for example a path that reaches `/tmp` through a
-symbolic link, or one that contains `:` or a `..` component. It checks this
-before it creates the output directory, downloads the kernel, or builds the
-initramfs. It also refuses a QEMU binary under `/tmp`, because QEMU reads its
+symbolic link; a kernel or initramfs reached through a symbolic link inside
+`demos/09-qemu-busybox`, which is bound as a whole, so the guest would follow
+the link with the rest of the host's `/tmp` hidden; or a path that begins
+with `/tmp/` and contains `:` or a `..` component. A relative `KERNEL_IMAGE`
+or `INITRAMFS_IMAGE` is used in place, through the working directory,
+including one whose `..` stays below `/tmp`, such as
+`target/qemu-busybox/sub/../bzImage`. It checks this before it creates the
+output directory, downloads the kernel, or builds the initramfs. It also refuses a QEMU binary under `/tmp`, because QEMU reads its
 firmware from the directories it was built or installed for, which a bind of
 the binary would not show. The binds add entries to the guest's mount table. Like the
 checkout's path, they are an input to the run, so a checkout under `/tmp`

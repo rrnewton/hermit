@@ -140,8 +140,9 @@ its step 2, and it must stay that way for the recorded seed to apply:
   running it again, as any change of path does. The scripts stop before they
   create a directory, build, or run anything, naming the path and the reason,
   when a path under `/tmp` cannot be shown this way: for example a path that
-  reaches `/tmp` through a symbolic link, a converter given as a relative
-  path, or a path that contains `:` or a `..` component.
+  reaches `/tmp` through a symbolic link, a converter that is itself a
+  symbolic link or is given as a relative path, or a path that begins with
+  `/tmp/` and contains `:` or a `..` component.
 - Keep the same absolute paths. The paths are the program's arguments, and a
   different argument length shifts the program's memory layout. With seed 7 on
   the reference build, image paths of 75, 85 (the path above), and 104
