@@ -36,7 +36,7 @@ pub(crate) fn deterministic_ioctl_error(request: &ioctl::Request<'_>) -> Option<
     }
 }
 
-// TODO-HUMAN-REVIEW(#3591)
+// TODO-HUMAN-REVIEW(PR-3601)
 /// Returns the output buffer and its size for an xattr query (`getxattr`,
 /// `lgetxattr`, `fgetxattr` and the `listxattr` family), or `None` for any
 /// other syscall. A zero size only asks for the length the value needs: the

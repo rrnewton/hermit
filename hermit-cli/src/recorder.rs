@@ -610,7 +610,7 @@ impl Tool for Recorder {
             Syscall::Getcwd(syscall) => self.handle_getcwd(guest, syscall).await,
             Syscall::Fadvise64(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#3591): descriptor syncs and metadata changes
+            // TODO-HUMAN-REVIEW(PR-3601): descriptor syncs and metadata changes
             // record only their result. Replay's descriptor may be a
             // placeholder, and no later replayed call reads the metadata back
             // from the replay root: stat, open and exec results are recorded.
@@ -622,7 +622,7 @@ impl Tool for Recorder {
             | Syscall::Fsetxattr(_)
             | Syscall::Fremovexattr(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#3591)
+            // TODO-HUMAN-REVIEW(PR-3601)
             Syscall::Getxattr(_)
             | Syscall::Lgetxattr(_)
             | Syscall::Fgetxattr(_)
