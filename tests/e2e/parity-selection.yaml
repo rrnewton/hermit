@@ -55,8 +55,9 @@ cells:
     backends: [kvm, liteinst]
   - test: c-programs/dup-shared-offset
     backends: [dbt, kvm, liteinst]
+  # One qualified KVM candidate: https://github.com/rrnewton/reverie/issues/905
   - test: c-programs/epoll-pwait2
-    backends: [liteinst]
+    backends: [kvm, liteinst]
   - test: c-programs/epoll-readiness
     backends: [kvm, liteinst]
   - test: c-programs/event-delivery-ordering

@@ -18,19 +18,20 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 1101 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1102 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
 //!    added (895 portable and 5 privileged), the 189 portable cells of the
 //!    compatibility-corpus fold, the 2 portable select replay cells and the 6
 //!    portable KVM verify selections, the three socket selections, and one
-//!    poll-readiness selection, after applying the later lane moves listed
-//!    in `LATER_LANE_MOVES` (now 1094 portable and 7 privileged).
-//! 3. The committed compatibility cell table has 9008 rows, with
+//!    poll-readiness and one epoll-pwait2 selection, after applying the later lane moves listed
+//!    in `LATER_LANE_MOVES` (now 1095 portable and 7 privileged).
+//! 3. The committed compatibility cell table has 14800 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
 //!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
 //!    compatibility-corpus fold, plus the 2 select replay and 6 KVM verify
-//!    selection changes, plus three socket and one poll-readiness selection,
-//!    that keep the row total unchanged.
+//!    selection changes, plus three socket, one poll-readiness and one epoll-pwait2 selection,
+//!    that keep the row total unchanged, plus the later SaBRe, strict and rr
+//!    compatibility folds described below.
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
 //!    so folding more tests into that node cannot turn it into a vacuous pass.
 //!
@@ -264,6 +265,16 @@ fn rr_fold_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, isize
     }
     deltas
 }
+
+/// <https://github.com/rrnewton/reverie/issues/905> qualifies the unchanged
+/// epoll-pwait2 KVM verify fixture: one additional required cell with all seven
+/// checks and the original bounds intact. Replay stays disabled.
+const KVM_EPOLL_PWAIT2_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "kvm", "verify", 1)];
+const KVM_EPOLL_PWAIT2_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("kvm", "verify", "green", 1),
+    ("kvm", "verify", "not-applicable", -1),
+];
 
 /// Cells that later changes moved between lanes after the fold, as
 /// (test, backend, mode, from lane, to lane). Each move keeps the cell and only
@@ -590,18 +601,22 @@ fn the_committed_plan_keeps_its_cell_counts() {
             .count()
     };
     // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+    // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
         (
-            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1,
-            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 - moved_out("portable")
+            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1,
+            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 - moved_out("portable")
                 + moved_in("portable"),
             5 - moved_out("privileged") + moved_in("privileged"),
         )
     );
     assert_eq!(
         (lane("portable"), lane("privileged")),
-        (893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1, 7),
+        (
+            893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1,
+            7
+        ),
         "the lane moves above are the only ones since the fold"
     );
     // Every documented move is present in the committed plan exactly once, in
@@ -644,6 +659,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         .chain(KVM_2026_10_03_PLAN_ADDITIONS)
         .chain(KVM_SOCKET_PLAN_ADDITIONS)
         .chain(KVM_PSELECT_PLAN_ADDITIONS)
+        .chain(KVM_EPOLL_PWAIT2_PLAN_ADDITIONS)
     {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
@@ -666,7 +682,8 @@ fn the_committed_plan_keeps_its_cell_counts() {
     // two portable ptrace replay cells of `SELECT_REPLAY_PLAN_ADDITIONS` and
     // six portable KVM verify cells of `KVM_2026_10_03_PLAN_ADDITIONS` and
     // three socket KVM verify cells of `KVM_SOCKET_PLAN_ADDITIONS`, plus the one
-    // poll-readiness cell of `KVM_PSELECT_PLAN_ADDITIONS` above.
+    // poll-readiness cell of `KVM_PSELECT_PLAN_ADDITIONS` and one epoll-pwait2
+    // cell of `KVM_EPOLL_PWAIT2_PLAN_ADDITIONS` above.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -687,7 +704,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         BTreeMap::from([
             (
                 ("portable".into(), "c-programs".into()),
-                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3 + 1
+                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1
             ),
             (("privileged".into(), "c-programs".into()), 3 + 1),
         ])
@@ -735,6 +752,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .chain(sabre_fold_cell_deltas())
         .chain(strict_fold_cell_deltas())
         .chain(rr_fold_cell_deltas())
+        .chain(KVM_EPOLL_PWAIT2_CELL_DELTAS.iter().copied())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))
