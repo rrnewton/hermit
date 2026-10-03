@@ -519,12 +519,21 @@ impl Tool for Replayer {
             Syscall::Sendmsg(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550):
-            // these must not run live in replay. bind/listen would contend for
-            // host addresses and accept would wait for a peer that, in replay,
-            // never connects.
-            Syscall::Bind(_) | Syscall::Listen(_) | Syscall::Shutdown(_) => {
-                self.handle_simple(guest, syscall).await
+            // bind and listen still run live in replay because setsockopt does:
+            // options such as AF_ALG's ALG_SET_KEY or IPV6_V6ONLY depend on the
+            // bound state, and must succeed or fail as they did when recorded.
+            // accept is replayed, since it would wait for a peer that never
+            // connects in replay, and so is shutdown, whose live result depends
+            // on a connection that replay does not make.
+            Syscall::Bind(_) => {
+                self.handle_replayed_side_effect(guest, syscall, "bind")
+                    .await
             }
+            Syscall::Listen(_) => {
+                self.handle_replayed_side_effect(guest, syscall, "listen")
+                    .await
+            }
+            Syscall::Shutdown(_) => self.handle_simple(guest, syscall).await,
             Syscall::Accept(call) => self.handle_accept(guest, syscall, call.into()).await,
             Syscall::Accept4(call) => self.handle_accept(guest, syscall, call).await,
             Syscall::Socketpair(call) => self.handle_socketpair(guest, call).await,

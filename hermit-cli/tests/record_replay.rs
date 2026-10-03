@@ -308,11 +308,13 @@ fn section_contents<'a>(output: &'a str, name: &str) -> &'a str {
         .unwrap_or_else(|| panic!("missing {name} section in public recording output"))
 }
 
-const BASELINE_RECORD_WORKLOADS: [&str; 10] = [
+const BASELINE_RECORD_WORKLOADS: [&str; 11] = [
     "c_getpid",
     "c_ioctl_fioclex",
     "c_ioctl_siocethtool",
     "c_recvmsg_scm_rights_mmap",
+    // https://github.com/rrnewton/hermit/issues/3550
+    "c_record_replay_socket_calls",
     "c_ppoll_readv",
     "c_uname",
     "c_sysinfo",

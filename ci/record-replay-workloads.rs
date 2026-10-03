@@ -25,10 +25,14 @@ pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
 pub const PACKAGE: &str = "hermetic_infra_hermit_tests";
 pub const C_FLAGS: [&str; 3] = ["-O0", "-g", "-pthread"];
 
-pub const C_SOURCES: [(&str, &str); 26] = [
+pub const C_SOURCES: [(&str, &str); 27] = [
     ("c_getpid", "tests/c/getpid.c"),
     ("c_getsockopt_null", "tests/c/getsockopt_null.c"),
     ("c_setsockopt_replay", "tests/c/record_replay_setsockopt.c"),
+    (
+        "c_record_replay_socket_calls",
+        "tests/c/record_replay_socket_calls.c",
+    ),
     ("c_ioctl_fioclex", "tests/c/ioctl_fioclex.c"),
     ("c_ioctl_siocethtool", "tests/c/ioctl_siocethtool.c"),
     (
