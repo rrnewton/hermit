@@ -153,6 +153,21 @@ static int fd_require_dead_thread(int);
 static int unavailable(void) { errno=ENODATA; return -1; }
 static int invalid(void) { errno=EINVAL; return -1; }
 #ifdef AP_FTRACE_PROVIDER
+/* Refusal diagnostics use only the query which failed the existing predicate.
+ * They do not requery, retry, repair or authorize a missing observation. */
+static int observer_metadata_unavailable(const char *stage,unsigned at,
+        const struct bpf_prog_info *program,unsigned ps,
+        const struct bpf_link_info *link,unsigned ls) {
+    fprintf(stderr,"accepted observer refusal stage=%s index=%u program_size=%u "
+        "program_type=%u program_id=%u recursion_misses=%llu link_size=%u "
+        "link_type=%u link_id=%u link_program_id=%u multi_count=%u multi_flags=%u "
+        "multi_missed=%llu\n",stage,at,ps,program->type,program->id,
+        (unsigned long long)program->recursion_misses,ls,link->type,link->id,
+        link->prog_id,link->type==BPF_LINK_TYPE_KPROBE_MULTI?link->kprobe_multi.count:0,
+        link->type==BPF_LINK_TYPE_KPROBE_MULTI?link->kprobe_multi.flags:0,
+        link->type==BPF_LINK_TYPE_KPROBE_MULTI?(unsigned long long)link->kprobe_multi.missed:0);
+    return unavailable();
+}
 /* ap_require_grouped_target has already authenticated the exact GNU build ID,
  * kallsyms coordinates and retained image bytes. Independently read the live
  * page size and vmlinux BTF struct-page size before accepting the direct-map
@@ -248,7 +263,8 @@ static int fd_accept_observer_ready_mode(struct ap_session *s,bool task_scoped_r
             expected_addresses[n]=grouped_session_address(expected_cookies[group][n],s->group_anchor);
         if(!ap_ftrace_kprobe_multi_link_matches(&program,program_size,&link,link_size,
               addresses,cookies,expected_addresses,expected_cookies[group],count,0))
-            return unavailable();
+            return observer_metadata_unavailable("selection",group,
+                &program,program_size,&link,link_size);
     }
     for(unsigned which=0;which<2;which++) {
         struct bpf_prog_info program={0};struct bpf_link_info link={0};
@@ -271,7 +287,8 @@ static int fd_accept_observer_ready_mode(struct ap_session *s,bool task_scoped_r
             ap_ftrace_kprobe_multi_link_matches(&program,ps,&link,ls,
                 addresses,cookies,expected_addresses,expected_cookies,4,
                 which?BPF_F_KPROBE_MULTI_RETURN:0);
-        if(!matches)return unavailable();
+        if(!matches)return observer_metadata_unavailable("shared-selection",which,
+            &program,ps,&link,ls);
     }
 #else
     (void)task_scoped_receipt;

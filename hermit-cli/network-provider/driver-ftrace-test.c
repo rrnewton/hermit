@@ -29,7 +29,7 @@ enum df_fault {
     DF_ATTACH_FAIL, DF_LOAD_FAIL, DF_CONFIG_FAIL, DF_RING_FAIL, DF_READ_LINK,
     DF_ANCHOR_FAIL, DF_WRONG_PROGRAM_KIND, DF_LEGACY_PROGRAM,
     DF_FAULT_TARGET, DF_FAULT_MISS, DF_FAULT_SHORT, DF_FAULT_MAP, DF_FAULT_MAP_MISSING,
-    DF_OPEN_FAIL
+    DF_OPEN_FAIL, DF_PROGRAM_MISS, DF_LINK_MISS
 };
 static enum df_fault df_fault;
 static unsigned df_bad_at;
@@ -431,6 +431,7 @@ int bpf_obj_get_info_by_fd(int fd,void *out,unsigned int *size) {
     if(fd>=2000 && fd<2000+(int)df_object.programs) {
         unsigned at=(unsigned)(fd-2000);assert(df_programs[at].fd==fd && *size==sizeof(struct bpf_prog_info));
         struct bpf_prog_info *p=out;p->id=df_programs[at].id;p->type=df_programs[at].type;
+        if(at==df_bad_at && df_fault==DF_PROGRAM_MISS)p->recursion_misses=7;
         if(!strcmp(df_programs[at].name,"fd_original_read_entered")) {p->attach_btf_obj_id=11;p->attach_btf_id=19;}
         if(!strcmp(df_programs[at].name,"fd_stream_fault_enter") || !strcmp(df_programs[at].name,"fd_stream_fault_exit")) {
             p->attach_btf_obj_id=11;p->attach_btf_id=108812;
@@ -464,6 +465,7 @@ int bpf_obj_get_info_by_fd(int fd,void *out,unsigned int *size) {
                 }
             }
             v->kprobe_multi.count=l->count;v->kprobe_multi.flags=l->flags;
+            if(l->at==df_bad_at && df_fault==DF_LINK_MISS)v->kprobe_multi.missed=11;
             if(capacity && l->at==df_bad_at && df_fault==DF_COUNT_BAD)v->kprobe_multi.count--;
             if(capacity && l->at==df_bad_at && df_fault==DF_FLAGS)v->kprobe_multi.flags^=BPF_F_KPROBE_MULTI_RETURN;
         }
@@ -681,6 +683,59 @@ static void df_export_inventory(void) {
     printf("]}\n");
 }
 
+/* Exercise actual Sendto preparation before submit, using the existing full
+ * driver/load model. Each fresh-query refusal retains the original errno and
+ * leaves every pending slot, command counter and kernel-shaped map untouched.
+ * These host premises identify the reachable native diagnostic branches; they
+ * do not identify which one failed in a particular kernel run. */
+static void df_sendto_readiness(void) {
+    static const struct {const char *program;enum df_fault fault;} cases[]={
+        {"fd_original_read_entered",DF_PROGRAM_MISS},
+        {"fd_stream_fault_enter",DF_PROGRAM_MISS},
+        {"fd_stream_fault_exit",DF_PROGRAM_MISS},
+        {"fd_stream_copy_protocol_enter",DF_PROGRAM_MISS},
+        {"fd_stream_copy_protocol_exit",DF_LINK_MISS},
+        {"fd_so",DF_PROGRAM_MISS},
+        {"fd_si",DF_LINK_MISS},
+        {"fd_s20e",DF_PROGRAM_MISS},
+        {"fd_s20x",DF_LINK_MISS},
+        {"fd_s20e",DF_ADDRESS},
+        {"fd_s20x",DF_SHORT_INFO}
+    };
+    const struct ap_pending_command empty={0};
+    for(unsigned i=0;i<DF_COUNT(cases);i++) {
+        df_reset(DF_OK,0);struct ap_session *s=NULL;
+        assert(!ap_open("fixture-object-only",DF_PROVIDER,&s) && s->ready);
+        assert(!stream_copy_observer_ready(s) && !fd_accept_observer_ready(s));
+        const u64 next=s->next_command;const unsigned updates=df_updates;
+        df_bad_at=df_index(cases[i].program);df_fault=cases[i].fault;
+        u64 command=UINT64_C(0xfeedface);errno=0;
+        assert(ap_prepare_original_sendto(s,DF_PIDFD,395,1,5,0x5555555b1ca0,79,0x4000,&command)==-1);
+        assert(errno==ENODATA && command==UINT64_C(0xfeedface));
+        assert(s->next_command==next && df_updates==updates);
+        for(unsigned slot=0;slot<AP_COMMANDS;slot++)
+            assert(!memcmp(&s->pending[slot],&empty,sizeof(empty)));
+        /* Distinguish the preexisting policies without changing either one.
+         * Shared global counters are not task-scoped completion evidence. */
+        if(i==7 || i==8) {
+            assert(fd_accept_observer_ready(s)==-1 && errno==ENODATA);
+            assert(!fd_accept_observer_ready_runtime(s));
+        }
+        if(i>=9)assert(fd_accept_observer_ready_runtime(s)==-1 && errno==ENODATA);
+        df_fault=DF_OK;
+        assert(!stream_copy_observer_ready(s) && !fd_accept_observer_ready(s));
+        /* Preparation released its serialization flag even on refusal. */
+        assert(!enter_commands(s));leave_commands(s);
+        df_closed(s,0);
+    }
+    df_reset(DF_OK,0);struct ap_session *s=NULL;
+    assert(!ap_open("fixture-object-only",DF_PROVIDER,&s) && s->ready);
+    dm_info_error=true;u64 command=UINT64_C(0xfeedface);errno=0;
+    assert(ap_prepare_original_sendto(s,DF_PIDFD,395,1,5,0x5555555b1ca0,79,0x4000,&command)==-1);
+    assert(errno==EIO && command==UINT64_C(0xfeedface));
+    dm_info_error=false;assert(!enter_commands(s));leave_commands(s);df_closed(s,0);
+}
+
 static const char *const df_selectors[]={
     "positive","page-size","page-struct","build-id","image","group-image",
     "missing-program","extra-program","duplicate-program","duplicate-link","perf-link",
@@ -691,7 +746,7 @@ static const char *const df_selectors[]={
     "load-failure","config-failure","ring-failure","program-reuse","link-census",
     "fault-entry-target","fault-exit-target","fault-entry-miss","fault-exit-miss",
     "fault-entry-short","fault-exit-short","fault-map-shape","fault-map-missing",
-    "fault-runtime-miss"
+    "fault-runtime-miss","sendto-readiness"
 };
 static void df_case(unsigned n) {
     switch(n) {
@@ -748,6 +803,7 @@ static void df_case(unsigned n) {
             df_closed(s,0);
         }
         break;
+    case 44:df_sendto_readiness();break;
     default:df_unexpected("selector index");
     }
     df_cases++;printf("driver-ftrace fixture case passed: %s\n",df_selectors[n]);
@@ -760,7 +816,7 @@ static int inherited_main(int argc,char **argv) {
     }
     if(argc==1 || !strcmp(argv[1],"all")) {
         for(unsigned i=0;i<DF_COUNT(df_selectors);i++)df_case(i);
-        assert(df_cases==44 && df_partial_prefixes==49);
+        assert(df_cases==45 && df_partial_prefixes==49); /* original 44 plus Sendto readiness */
     } else {
         bool found=false;
         for(unsigned i=0;i<DF_COUNT(df_selectors);i++)if(!strcmp(argv[1],df_selectors[i])) {df_case(i);found=true;break;}

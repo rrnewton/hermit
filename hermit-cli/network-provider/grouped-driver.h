@@ -89,7 +89,8 @@ static int grouped_observer_ready(struct ap_session *s) {
     u32 ps=sizeof(program),ls=sizeof(link);
     if(bpf_obj_get_info_by_fd(s->read_entry_program,&program,&ps) ||
        bpf_obj_get_info_by_fd(s->read_entry_link,&link,&ls))return -1;
-    if(!ap_ftrace_read_link_matches(&program,ps,&link,ls))return unavailable();
+    if(!ap_ftrace_read_link_matches(&program,ps,&link,ls))
+        return observer_metadata_unavailable("read-entry",0,&program,ps,&link,ls);
     unsigned matches=0;
     for(u32 i=0;i<s->links_count;i++) {
         struct bpf_link_info owned={0};u32 size=sizeof(owned);
@@ -178,7 +179,8 @@ static int grouped_stream_ready(struct ap_session *s) {
            link.type!=BPF_LINK_TYPE_TRACING || link.prog_id!=program.id ||
            link.tracing.target_obj_id!=program.attach_btf_obj_id ||
            link.tracing.target_btf_id!=AP_STREAM_FAULT_BTF_ID || link.tracing.cookie ||
-           link.tracing.attach_type!=(which?BPF_TRACE_FEXIT:BPF_TRACE_FENTRY))return unavailable();
+           link.tracing.attach_type!=(which?BPF_TRACE_FEXIT:BPF_TRACE_FENTRY))
+            return observer_metadata_unavailable("stream-fault",which,&program,ps,&link,ls);
     }
 #endif
     for(unsigned which=0;which<2;which++) {
@@ -201,7 +203,8 @@ static int grouped_stream_ready(struct ap_session *s) {
         if(program.id!=bound->program_id || link.id!=bound->id || link.type!=bound->type ||
            !ap_ftrace_kprobe_multi_link_matches(&program,ps,&link,ls,addresses,cookies,
                expected_addresses,expected_cookies,count,
-               which?BPF_F_KPROBE_MULTI_RETURN:0))return unavailable();
+               which?BPF_F_KPROBE_MULTI_RETURN:0))
+            return observer_metadata_unavailable("stream-membership",which,&program,ps,&link,ls);
 #else
         if(ps<offsetof(struct bpf_prog_info,recursion_misses)+sizeof(program.recursion_misses) ||
            ls<offsetof(struct bpf_link_info,kprobe_multi.cookies)+sizeof(link.kprobe_multi.cookies) ||

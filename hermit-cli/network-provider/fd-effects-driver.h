@@ -109,8 +109,14 @@ int ap_prepare_original_sendto(struct ap_session *s,int pidfd,u64 call,u64 mm,
         .generation_before=buffer,.generation_after=mm,.expected_level=fd,
         .expected_option=flags,.original_count=count};
     int rc=stream_copy_observer_ready(s);
-    if(!rc)rc=fd_accept_observer_ready(s);
-    if(!rc)rc=submit(s,pidfd,&c);
+    const char *stage="stream-copy";
+    if(!rc) {stage="selected-file";rc=fd_accept_observer_ready(s);}
+    if(!rc) {stage="submit";rc=submit(s,pidfd,&c);}
+    if(rc) {
+        int saved=errno;
+        fprintf(stderr,"accepted sendto preparation refused stage=%s errno=%d\n",stage,saved);
+        errno=saved;
+    }
     if(!rc)*command=c.command;
     leave_commands(s);return rc;
 #endif
