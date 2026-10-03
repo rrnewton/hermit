@@ -1372,6 +1372,12 @@ impl Replayer {
     /// the guest's root and base directory, so it sees the guest's mounts and
     /// symlinks rather than the replayer's. An `O_CREAT` open first creates the
     /// missing parent directories inside the replay root.
+    ///
+    /// A path that crosses a procfs symlink (`/proc/<pid>/root`,
+    /// `/proc/self/fd/<n>`, or `/dev/fd/<n>` through `/proc/self/fd`) is
+    /// refused before any directory is created. Its text names a path inside
+    /// the replay root, but the guest's kernel follows the link to the linked
+    /// object, which may be a host file outside it.
     fn open_materializes_in_replay_root<G: Guest<Self>>(
         &self,
         guest: &G,
@@ -1401,14 +1407,19 @@ impl Replayer {
             .filter(|parent| !parent.as_os_str().is_empty());
         if flags.contains(OFlag::O_CREAT)
             && let Some(parent) = parent
+            && let Err(error) =
+                crate::record_replay_path::ensure_directory_path_follow_final_without_procfs_symlinks(
+                    &root, &start, parent,
+                )
+            && error.raw_os_error() == Some(libc::ELOOP)
         {
-            let _ = crate::record_replay_path::ensure_directory_path_follow_final(
-                &root, &start, parent,
-            );
+            return false;
         }
         let metadata =
             |object: &OwnedFd| std::fs::metadata(format!("/proc/self/fd/{}", object.as_raw_fd()));
-        match crate::record_replay_path::resolve_existing_path(&root, &start, path, false) {
+        match crate::record_replay_path::resolve_existing_path_without_procfs_symlinks(
+            &root, &start, path,
+        ) {
             Ok(resolved) => match metadata(&resolved.object) {
                 Ok(found) if flags.contains(OFlag::O_TMPFILE) => found.is_dir(),
                 Ok(found) if found.file_type().is_file() => {
@@ -1424,9 +1435,11 @@ impl Replayer {
                 // Only the final component may be missing.
                 match parent {
                     None => true,
-                    Some(parent) => crate::record_replay_path::resolve_existing_path(
-                        &root, &start, parent, false,
-                    )
+                    Some(parent) => {
+                        crate::record_replay_path::resolve_existing_path_without_procfs_symlinks(
+                            &root, &start, parent,
+                        )
+                    }
                     .and_then(|resolved| metadata(&resolved.object))
                     .is_ok_and(|found| found.is_dir()),
                 }
