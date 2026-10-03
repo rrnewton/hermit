@@ -19,6 +19,12 @@ seed's first crash and prints the same output again on the seed's replay, as
 two Hermit runs of one seed do; run natively, the program prints a different
 PID and different addresses every time. CalibrationReportComparisonTest needs
 no compiler: its planted program prints a saved report.
+
+Hermit gives the program it runs a private /tmp. TmpBindTest and
+CalibrationTmpBindTest check that both scripts bind the converter's directory
+and its image into it when their paths begin with /tmp/, refuse a path under
+/tmp that they cannot bind, and add nothing for paths outside /tmp. The stubs
+record each run's arguments, and the tests compare them exactly.
 """
 
 import hashlib
@@ -258,6 +264,7 @@ if [ "${1:-}" = --version ]; then
   echo 'hermit 0.2.0 (2026-09-30, g0123456789ab)'
   exit 0
 fi
+[ -z "${DEMO08_TEST_ARGS_FILE:-}" ] || printf '%s\n' "$*" >>"$DEMO08_TEST_ARGS_FILE"
 seed=""
 conv=""
 previous=""
@@ -432,6 +439,68 @@ def _make_assets(assets):
     (assets / "pop-tiny.img").write_bytes(b"")
 
 
+# The flags of every chaos run in run.sh and prepare-assets.sh. A checkout
+# outside /tmp must keep getting exactly this command line, which is what its
+# recorded seed was found with.
+CHAOS_FLAGS = (
+    "--log=error run --chaos --sched-seed {seed} --no-virtualize-cpuid "
+    "--base-env=minimal --epoch=2026-01-01T00:00:00Z"
+)
+
+
+def _chaos_args(assets, artifacts, variant, seed, binds=()):
+    """The recorded argv of one chaos run: the flags, `binds`, then the command."""
+    return " ".join(
+        [CHAOS_FLAGS.format(seed=seed), *binds, "--"]
+        + [
+            "{}/{}/btrfs-convert".format(assets, variant),
+            "{}/chaos-{}.img".format(artifacts, variant),
+        ]
+    )
+
+
+def _tmp_binds(assets, artifacts, variant):
+    """The --bind options a chaos run gets for its converter and image.
+
+    Each is bound only when its path begins with /tmp/, where Hermit would hide
+    it from the converter: the converter through its directory, the image by
+    itself.
+    """
+    binds = []
+    if str(assets).startswith("/tmp/"):
+        binds += ["--bind", "{}/{}".format(assets, variant)]
+    if str(artifacts).startswith("/tmp/"):
+        binds += ["--bind", "{}/chaos-{}.img".format(artifacts, variant)]
+    return binds
+
+
+def _is_under_tmp(path):
+    return path == "/tmp" or path.startswith("/tmp/")
+
+
+def _temporary_root(test, under_tmp):
+    """A new directory under /tmp, or outside it, removed after `test`.
+
+    The parent is the system temporary directory when it is on the requested
+    side of /tmp, so a run with TMPDIR set stays inside it; otherwise /tmp, or
+    /var/tmp for a directory outside /tmp. Parents are resolved first, so a
+    symbolic link in TMPDIR cannot put the directory on the wrong side. The
+    test is skipped if neither parent is usable.
+    """
+    for parent in (tempfile.gettempdir(), "/tmp" if under_tmp else "/var/tmp"):
+        resolved = os.path.realpath(parent)
+        if _is_under_tmp(resolved) != under_tmp:
+            continue
+        if not os.access(resolved, os.W_OK | os.X_OK):
+            continue
+        holder = tempfile.TemporaryDirectory(dir=resolved, prefix="demo08-test-")
+        test.addCleanup(holder.cleanup)
+        return Path(holder.name)
+    test.skipTest(
+        "no writable directory {} /tmp".format("under" if under_tmp else "outside")
+    )
+
+
 def _sha256_hex(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -536,16 +605,23 @@ class DemoRunControlsTest(unittest.TestCase):
         # program's output before it, and not Hermit's exit events after it.
         for name in ("asan-report.txt", "asan-report-replay.txt"):
             self.assertEqual((self.artifacts / name).read_text(), FULL_REPORT, name)
-        # Every chaos run uses the documented command line and the same seed.
-        invocations = (self.tmp / "hermit-args").read_text().splitlines()
-        self.assertEqual(len(invocations), 3)
-        for line in invocations:
-            self.assertRegex(
-                line,
-                r"^--log=error run --chaos --sched-seed 7 --no-virtualize-cpuid "
-                r"--base-env=minimal --epoch=2026-01-01T00:00:00Z -- "
-                r"\S+/(buggy|fixed)/btrfs-convert \S+\.img$",
-            )
+        # Every chaos run uses the documented command line and the same seed,
+        # plus a --bind for each path under /tmp, which is where the system
+        # temporary directory usually puts this test's files. The tests in
+        # TmpBindTest pin both cases.
+        self.assertEqual(
+            (self.tmp / "hermit-args").read_text().splitlines(),
+            [
+                _chaos_args(
+                    self.assets,
+                    self.artifacts,
+                    variant,
+                    7,
+                    _tmp_binds(self.assets, self.artifacts, variant),
+                )
+                for variant in ("buggy", "fixed", "buggy")
+            ],
+        )
 
     def _native_buggy_prints(self, report_name, status):
         """Make the native buggy binary print one of the reports and exit."""
@@ -1312,6 +1388,357 @@ class CalibrationReportComparisonTest(unittest.TestCase):
         self.assertFalse(
             (self.artifacts / "calibration-confirm-replay-seed-0.out").exists()
         )
+
+
+# The start of the refusal both scripts print for a path under /tmp that they
+# cannot show the converter, and the advice that ends it.
+TMP_REFUSAL = (
+    "error: {} is under /tmp. Hermit gives the program it runs a private /tmp, "
+    "and the demo cannot make this path visible there: {}. "
+)
+TMP_HINT = (
+    "Run demo 8 from a checkout outside /tmp or through a path that begins with "
+    "/tmp/, or set DEMO08_DIR and DEMO08_ARTIFACTS to directories outside /tmp "
+    "or to absolute paths that begin with /tmp/."
+)
+
+
+class TmpBindTest(unittest.TestCase):
+    """run.sh shows the converter its program and image when they are in /tmp.
+
+    Hermit hides the host's /tmp from the program it runs and refuses to start
+    a program there, so run.sh adds `--bind DIR` for the converter's directory
+    and `--bind IMAGE` for the image when their paths begin with /tmp/. A
+    checkout outside /tmp must keep exactly the command line it had before, the
+    one its recorded crash seed was found with.
+    """
+
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        # The stub and its records. Their location is not on the command line.
+        self.state = Path(holder.name)
+        (self.state / "bin").mkdir()
+        _write_executable(self.state / "bin" / "hermit", RUN_STUB)
+        (self.state / "uaf.txt").write_text(UAF_REPORT)
+        self.inside = _temporary_root(self, under_tmp=True)
+        self.outside = _temporary_root(self, under_tmp=False)
+
+    def _run(self, assets, artifacts, cwd=None):
+        """run.sh on the full result: a crash, a clean fix, the same crash."""
+        for name in ("hermit-args", "buggy-count"):
+            (self.state / name).unlink(missing_ok=True)
+        environment = _base_environment(self.state / "bin")
+        environment.update(
+            {
+                "DEMO08_DIR": str(assets),
+                "DEMO08_ARTIFACTS": str(artifacts),
+                "DEMO08_CRASH_SEED": "7",
+                "DEMO08_TIMEOUT": "30",
+                "DEMO08_REQUIRE_ASSETS": "1",
+                "DEMO08_TEST_FIXED_MODE": "clean",
+                "DEMO08_TEST_BUGGY_MODE": "complete-abort",
+                "DEMO08_TEST_COUNT_FILE": str(self.state / "buggy-count"),
+                "DEMO08_TEST_ARGS_FILE": str(self.state / "hermit-args"),
+                "DEMO08_TEST_UAF_FILE": str(self.state / "uaf.txt"),
+            }
+        )
+        return subprocess.run(
+            [str(RUN)],
+            cwd=cwd,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=120,
+        )
+
+    def _assert_passed_with(self, result, expected):
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn(
+            "=== Demo 8: btrfs-convert Use-After-Free: SUCCESS ===", result.stdout
+        )
+        self.assertEqual(
+            (self.state / "hermit-args").read_text().splitlines(), expected
+        )
+
+    def _assert_tmp_refusal(self, result, path, problem):
+        """run.sh stopped before any Hermit run, naming the path and the fix."""
+        self.assertEqual(result.returncode, 2, result.stdout)
+        self.assertIn(TMP_REFUSAL.format(path, problem) + TMP_HINT, result.stdout)
+        self.assertNotIn("SUCCESS ===", result.stdout)
+        self.assertFalse((self.state / "hermit-args").exists(), result.stdout)
+
+    def test_a_checkout_under_tmp_binds_the_converter_directory_and_the_image(self):
+        assets, artifacts = self.inside / "assets", self.inside / "artifacts"
+        _make_assets(assets)
+        result = self._run(assets, artifacts)
+        self._assert_passed_with(
+            result,
+            [
+                "--log=error run --chaos --sched-seed 7 --no-virtualize-cpuid "
+                "--base-env=minimal --epoch=2026-01-01T00:00:00Z "
+                "--bind {a}/{v} --bind {o}/chaos-{v}.img "
+                "-- {a}/{v}/btrfs-convert {o}/chaos-{v}.img".format(
+                    a=assets, o=artifacts, v=variant
+                )
+                for variant in ("buggy", "fixed", "buggy")
+            ],
+        )
+
+    def test_a_checkout_outside_tmp_keeps_its_command_line(self):
+        """Positive control: no --bind at all, as before the binds existed."""
+        assets, artifacts = self.outside / "assets", self.outside / "artifacts"
+        _make_assets(assets)
+        result = self._run(assets, artifacts)
+        self._assert_passed_with(
+            result,
+            [
+                "--log=error run --chaos --sched-seed 7 --no-virtualize-cpuid "
+                "--base-env=minimal --epoch=2026-01-01T00:00:00Z "
+                "-- {a}/{v}/btrfs-convert {o}/chaos-{v}.img".format(
+                    a=assets, o=artifacts, v=variant
+                )
+                for variant in ("buggy", "fixed", "buggy")
+            ],
+        )
+
+    def test_only_the_paths_under_tmp_are_bound(self):
+        for name, assets, artifacts, binds in (
+            (
+                "image under /tmp",
+                self.outside / "assets",
+                self.inside / "artifacts",
+                "--bind {o}/chaos-{v}.img ",
+            ),
+            (
+                "converter under /tmp",
+                self.inside / "assets",
+                self.outside / "artifacts",
+                "--bind {a}/{v} ",
+            ),
+        ):
+            with self.subTest(name):
+                _make_assets(assets)
+                result = self._run(assets, artifacts)
+                self._assert_passed_with(
+                    result,
+                    [
+                        (
+                            "--log=error run --chaos --sched-seed 7 "
+                            "--no-virtualize-cpuid --base-env=minimal "
+                            "--epoch=2026-01-01T00:00:00Z "
+                            + binds
+                            + "-- {a}/{v}/btrfs-convert {o}/chaos-{v}.img"
+                        ).format(a=assets, o=artifacts, v=variant)
+                        for variant in ("buggy", "fixed", "buggy")
+                    ],
+                )
+
+    def test_a_relative_image_in_a_working_directory_under_tmp_is_left_as_is(self):
+        """The converter inherits the working directory, which reaches the image."""
+        assets = self.inside / "assets"
+        _make_assets(assets)
+        result = self._run(assets, "artifacts", cwd=self.inside)
+        self._assert_passed_with(
+            result,
+            [
+                "--log=error run --chaos --sched-seed 7 --no-virtualize-cpuid "
+                "--base-env=minimal --epoch=2026-01-01T00:00:00Z "
+                "--bind {a}/{v} "
+                "-- {a}/{v}/btrfs-convert artifacts/chaos-{v}.img".format(
+                    a=assets, v=variant
+                )
+                for variant in ("buggy", "fixed", "buggy")
+            ],
+        )
+
+    def test_a_path_into_tmp_through_a_symbolic_link_is_refused(self):
+        _make_assets(self.inside / "assets")
+        (self.outside / "link").symlink_to(self.inside)
+        assets = self.outside / "link" / "assets"
+        result = self._run(assets, self.outside / "artifacts")
+        self._assert_tmp_refusal(
+            result,
+            "{}/buggy/btrfs-convert".format(assets),
+            "it resolves to {}, under /tmp, but it does not begin with /tmp/".format(
+                os.path.realpath(self.inside / "assets" / "buggy" / "btrfs-convert")
+            ),
+        )
+
+    def test_a_path_with_a_colon_is_refused(self):
+        assets = self.inside / "as:sets"
+        _make_assets(assets)
+        result = self._run(assets, self.inside / "artifacts")
+        self._assert_tmp_refusal(
+            result,
+            "{}/buggy/btrfs-convert".format(assets),
+            "it contains ':', which --bind reads as SOURCE:TARGET",
+        )
+
+    def test_an_image_path_with_a_colon_is_refused(self):
+        assets, artifacts = self.inside / "assets", self.inside / "arti:facts"
+        _make_assets(assets)
+        result = self._run(assets, artifacts)
+        self._assert_tmp_refusal(
+            result,
+            "{}/chaos-buggy.img".format(artifacts),
+            "it contains ':', which --bind reads as SOURCE:TARGET",
+        )
+        # Nor is the artifact directory created.
+        self.assertFalse(artifacts.exists())
+
+    def test_a_path_with_a_dot_dot_component_is_refused(self):
+        _make_assets(self.inside / "assets")
+        (self.inside / "x").mkdir()
+        assets = "{}/x/../assets".format(self.inside)
+        result = self._run(assets, self.inside / "artifacts")
+        self._assert_tmp_refusal(
+            result,
+            "{}/buggy/btrfs-convert".format(assets),
+            "it contains a '..' component",
+        )
+
+    def test_a_converter_directory_that_is_a_symbolic_link_is_refused(self):
+        assets = self.inside / "assets"
+        _make_assets(assets)
+        (assets / "buggy").rename(self.inside / "real-buggy")
+        (assets / "buggy").symlink_to(self.inside / "real-buggy")
+        result = self._run(assets, self.inside / "artifacts")
+        self._assert_tmp_refusal(
+            result,
+            "{}/buggy/btrfs-convert".format(assets),
+            "its directory, {}/buggy, is a symbolic link, which Hermit would "
+            "mount as a file".format(assets),
+        )
+
+    def test_a_relative_converter_in_a_working_directory_under_tmp_is_refused(self):
+        """Hermit starts the converter by its absolute path, which it hides."""
+        _make_assets(self.inside / "assets")
+        result = self._run("assets", self.inside / "artifacts", cwd=self.inside)
+        self._assert_tmp_refusal(
+            result,
+            "assets/buggy/btrfs-convert",
+            "Hermit starts a program by the absolute path it resolves on the host, "
+            "{}/assets/buggy/btrfs-convert, which is under /tmp".format(self.inside),
+        )
+
+
+class CalibrationTmpBindTest(unittest.TestCase):
+    """prepare-assets.sh calibrates with the binds that run.sh replays.
+
+    A seed found without the binds would be replayed with them, so calibration
+    must run each converter with exactly run.sh's command line, and refuse the
+    paths run.sh refuses before it builds or runs anything.
+    """
+
+    def setUp(self):
+        holder = tempfile.TemporaryDirectory()
+        self.addCleanup(holder.cleanup)
+        self.state = Path(holder.name)
+        (self.state / "bin").mkdir()
+        _write_executable(self.state / "bin" / "hermit", CALIBRATION_STUB)
+        first = self.state / "first-run.txt"
+        first.write_text(UAF_REPORT)
+        self.guest = self.state / "planted-uaf"
+        _write_executable(
+            self.guest, "#!/usr/bin/env bash\ncat '{}'\nexit 134\n".format(first)
+        )
+        self.inside = _temporary_root(self, under_tmp=True)
+        self.outside = _temporary_root(self, under_tmp=False)
+
+    def _prepare(self, assets, artifacts):
+        """Calibrate one seed, 0, which crashes on its first run and replay."""
+        _make_assets(assets)
+        # The cache stamp prepare-assets.sh expects, so it skips the build.
+        (assets / ".nightly-prep-version").write_text(
+            "prep={} btrfs={} fixture-src={}\n".format(
+                PREP_VERSION, BTRFS_COMMIT, fixture_source_digest()
+            )
+        )
+        environment = _base_environment(self.state / "bin")
+        environment.update(
+            {
+                "DEMO08_DIR": str(assets),
+                "DEMO08_BUILD_ROOT": str(self.state / "build-unused"),
+                "DEMO08_BTRFS_REPO": str(self.state / "no-such-repository"),
+                "DEMO08_ARTIFACTS": str(artifacts),
+                "DEMO08_CALIBRATION_SEEDS": "1",
+                "DEMO08_CALIBRATION_TIMEOUT": "5",
+                "DEMO08_TEST_COUNT_DIR": str(self.state / "counts"),
+                "DEMO08_TEST_MODE": "planted-uaf",
+                "DEMO08_TEST_UAF_BIN": str(self.guest),
+                "DEMO08_TEST_UAF_SEED": "0",
+                "DEMO08_TEST_ARGS_FILE": str(self.state / "hermit-args"),
+            }
+        )
+        return subprocess.run(
+            [str(PREPARE)],
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=300,
+        )
+
+    def _assert_calibrated_with(self, result, assets, expected):
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn("Demo 8 crash seed calibrated: 0", result.stdout)
+        self.assertTrue((assets / ".crash-seed").exists(), result.stdout)
+        self.assertEqual(
+            (self.state / "hermit-args").read_text().splitlines(), expected
+        )
+
+    def test_a_checkout_under_tmp_calibrates_with_the_binds(self):
+        assets, artifacts = self.inside / "assets", self.inside / "artifacts"
+        result = self._prepare(assets, artifacts)
+        # The seed's first run, its replay, and the fixed control.
+        self._assert_calibrated_with(
+            result,
+            assets,
+            [
+                "--log=error run --chaos --sched-seed 0 --no-virtualize-cpuid "
+                "--base-env=minimal --epoch=2026-01-01T00:00:00Z "
+                "--bind {a}/{v} --bind {o}/chaos-{v}.img "
+                "-- {a}/{v}/btrfs-convert {o}/chaos-{v}.img".format(
+                    a=assets, o=artifacts, v=variant
+                )
+                for variant in ("buggy", "buggy", "fixed")
+            ],
+        )
+
+    def test_a_checkout_outside_tmp_calibrates_with_its_command_line(self):
+        """Positive control: no --bind at all, as before the binds existed."""
+        assets, artifacts = self.outside / "assets", self.outside / "artifacts"
+        result = self._prepare(assets, artifacts)
+        self._assert_calibrated_with(
+            result,
+            assets,
+            [
+                "--log=error run --chaos --sched-seed 0 --no-virtualize-cpuid "
+                "--base-env=minimal --epoch=2026-01-01T00:00:00Z "
+                "-- {a}/{v}/btrfs-convert {o}/chaos-{v}.img".format(
+                    a=assets, o=artifacts, v=variant
+                )
+                for variant in ("buggy", "buggy", "fixed")
+            ],
+        )
+
+    def test_a_path_it_cannot_bind_stops_it_before_any_run(self):
+        assets = self.inside / "as:sets"
+        result = self._prepare(assets, self.inside / "artifacts")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn(
+            TMP_REFUSAL.format(
+                "{}/buggy/btrfs-convert".format(assets),
+                "it contains ':', which --bind reads as SOURCE:TARGET",
+            )
+            + TMP_HINT,
+            result.stdout,
+        )
+        self.assertNotIn("Searching for a crashing seed", result.stdout)
+        self.assertFalse((self.state / "hermit-args").exists(), result.stdout)
+        self.assertFalse((assets / ".crash-seed").exists())
 
 
 if __name__ == "__main__":

@@ -62,6 +62,40 @@ To run the launcher by hand once the kernel and initramfs exist:
 hermit run --strict --epoch=2026-01-01T00:00:00Z -- demos/09-qemu-busybox/boot_qemu.sh target/qemu-busybox/bzImage target/qemu-busybox/initramfs-busybox.cpio.gz
 ```
 
+Hermit gives the program it runs a private, empty `/tmp`. It refuses to start
+a launcher under the host's `/tmp`, and QEMU could not open a kernel or
+initramfs there. From a checkout under `/tmp`, `run.sh` therefore adds three
+`--bind` options, which mount exactly these host paths at the same paths
+inside the private `/tmp`: the directory that holds `boot_qemu.sh`, the
+kernel, and the initramfs. For a checkout outside `/tmp` it adds nothing, so
+its command line is unchanged. The launcher is bound through its directory
+because Hermit cannot start a program whose path is itself a `--bind` target:
+it reports that the program does not exist. `--tmp=/tmp` would also work, but
+it would show QEMU everything in the host's `/tmp` and make all of it an input
+to the run. By hand, from a checkout under `/tmp`, give absolute paths and the
+same three options:
+
+```bash
+hermit run --strict --epoch=2026-01-01T00:00:00Z \
+  --bind "$PWD/demos/09-qemu-busybox" \
+  --bind "$PWD/target/qemu-busybox/bzImage" \
+  --bind "$PWD/target/qemu-busybox/initramfs-busybox.cpio.gz" \
+  -- "$PWD/demos/09-qemu-busybox/boot_qemu.sh" \
+  "$PWD/target/qemu-busybox/bzImage" \
+  "$PWD/target/qemu-busybox/initramfs-busybox.cpio.gz"
+```
+
+`run.sh` stops, naming the path and the reason, when a path under `/tmp`
+cannot be shown this way: for example a path that reaches `/tmp` through a
+symbolic link, or one that contains `:` or a `..` component. It checks this
+before it creates the output directory, downloads the kernel, or builds the
+initramfs. It also refuses a QEMU binary under `/tmp`, because QEMU reads its
+firmware from the directories it was built or installed for, which a bind of
+the binary would not show. The binds add entries to the guest's mount table. Like the
+checkout's path, they are an input to the run, so a checkout under `/tmp`
+prints its own console hash; within one `VERIFY=1` run both boots have the
+same binds.
+
 ## What you will see
 
 Observed on 2026-10-01 in one run of the `VERIFY=1` command above, with the
@@ -270,8 +304,9 @@ guest's clocks follow the instruction count, a real-time clock driven by that
 virtual clock, no default devices, no network, and the serial console on
 standard output. [`run.sh`](run.sh) runs that launcher under
 `hermit --log info run --strict --epoch=2026-01-01T00:00:00Z --base-env=minimal`
-with standard input from `/dev/null`, with no settings that relax determinism,
-tees the console to `console.log`, and checks the result. It passes the
+with standard input from `/dev/null`, with no settings that relax determinism
+(from a checkout under `/tmp`, with the `--bind` options described under
+[Run it](#run-it)), tees the console to `console.log`, and checks the result. It passes the
 launcher the kernel, initramfs, and QEMU paths as arguments. Given the
 initramfs path, `boot_qemu.sh` does not look up its own directory, because
 bash's `cd` examines every directory on the way there and Hermit reports those
@@ -336,12 +371,12 @@ Controls (environment variables):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `KERNEL_IMAGE` | (download) | Use a local `bzImage` instead of the pinned download. |
+| `KERNEL_IMAGE` | (download) | Use a local `bzImage` instead of the pinned download. For a path under `/tmp`, see [Run it](#run-it). |
 | `QEMU_KERNEL_URL`, `QEMU_KERNEL_SHA256` | the pinned release | Pin a different kernel; set both together. |
-| `INITRAMFS_IMAGE` | (built) | Use an existing initramfs instead of building one. |
+| `INITRAMFS_IMAGE` | (built) | Use an existing initramfs instead of building one. For a path under `/tmp`, see [Run it](#run-it). |
 | `BUSYBOX` | `busybox` on `PATH` | A statically linked BusyBox for the initramfs. |
-| `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. |
+| `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. A QEMU under `/tmp` is refused; see [Run it](#run-it). |
 | `DEMO_TIMEOUT_SECONDS` | `300` | Seconds before the run is stopped. |
 | `VERIFY` | `0` | Set to `1` to run twice and compare. |
 | `SKID_MARGIN` | (Hermit's default) | Passed to `hermit run --skid-margin`. No raised value has completed a boot; see the known limitation above. |
-| `OUTPUT_DIR` | `target/qemu-busybox` | Where the kernel, initramfs, console, and logs are kept. |
+| `OUTPUT_DIR` | `target/qemu-busybox` | Where the kernel, initramfs, console, and logs are kept. For a path under `/tmp`, see [Run it](#run-it). |
