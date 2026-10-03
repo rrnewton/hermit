@@ -240,27 +240,80 @@ def _recording():
     return not _suppress_events or _advancing
 
 
-def _stack_pointer():
-    # The stopped thread's stack pointer: the frame identity of a history
-    # entry. A deterministic replay reaches the same execution point with the
-    # same stack pointer every time, and two activations of one function at
-    # different call depths (recursion) never share it. Two passes of a loop
-    # in one activation do share it, so it catches a rewind that lands in the
-    # wrong frame, not one that lands in the wrong pass of the same frame.
+def _frame_identity():
+    # The frame identity of a history entry: a (pc, stack pointer) pair for
+    # every frame of the stopped thread, newest first. An older frame's pc is
+    # its return address and its stack pointer is the canonical frame address
+    # of the frame it called. A deterministic replay reaches the same
+    # execution point with the same chain every time.
+    #
+    # The chain tells apart two activations of one function at different call
+    # depths (recursion: the stack pointers differ) and two calls from
+    # different call sites at the same depth (sibling calls: a caller's
+    # return address differs). It cannot tell apart two passes of a loop in
+    # one activation, or two calls from the same call site at the same depth
+    # (a call inside a loop): their chains are equal. GDB stops unwinding at
+    # main by default, so frames that called main are not part of the chain.
+    identity = []
     try:
-        return int(gdb.newest_frame().read_register("sp"))
+        frame = gdb.newest_frame()
+        while frame is not None:
+            identity.append((int(frame.pc()), int(frame.read_register("sp"))))
+            frame = frame.older()
     except (gdb.error, AttributeError, ValueError):
+        # The unwinder gave up at this frame. That happens at the same frame
+        # on every pass through the same execution point, so the partial
+        # chain is still an identity.
+        pass
+    return tuple(identity) or None
+
+
+def _describe_frames(identity):
+    if identity is None:
+        return "unknown"
+    return " <- ".join("{:#x}/sp {:#x}".format(pc, sp) for pc, sp in identity)
+
+
+# TEST-ONLY fault injection, read by nothing but this extension:
+# HERMIT_DAP_TEST_ONLY_DROP_LINE_ARRIVAL=LINE:K makes the line breakpoints
+# leave the K-th arrival they record at source line LINE out of the history,
+# as a debugger stub that loses a breakpoint would. The history then holds
+# one arrival too few, which is how hermit's tests drive the frame check and
+# its recovery paths. A stop the client sees is still recorded, by
+# _remember_stop. Never set it outside a test.
+_TEST_ONLY_DROP_VARIABLE = "HERMIT_DAP_TEST_ONLY_DROP_LINE_ARRIVAL"
+_test_only_drop = None
+_test_only_drop_seen = 0
+
+
+def _parse_test_only_drop():
+    value = os.environ.get(_TEST_ONLY_DROP_VARIABLE)
+    if value is None:
         return None
+    match = re.fullmatch(r"([1-9][0-9]*):([1-9][0-9]*)", value)
+    if match is None:
+        return value
+    return (int(match.group(1)), int(match.group(2)))
+
+
+def _test_only_dropped(line):
+    global _test_only_drop_seen
+    if _test_only_drop is None or _test_only_drop[0] != line:
+        return False
+    _test_only_drop_seen += 1
+    return _test_only_drop_seen == _test_only_drop[1]
 
 
 def _append_line(pc, file, line, thread_id):
     # One entry per arrival at a line address. Reverse requests count earlier
     # entries with the same pc to choose which hit of a temporary breakpoint
     # to stop at, so an extra or a missing entry moves the target in time.
+    if _test_only_dropped(line):
+        return
     _history.append(
         {
             "pc": pc,
-            "sp": _stack_pointer(),
+            "frame": _frame_identity(),
             "file": os.path.realpath(file),
             "line": line,
             "thread_id": thread_id,
@@ -338,7 +391,7 @@ class _StopAddressBreakpoint(gdb.Breakpoint):
             if int(gdb.newest_frame().pc()) == self.pc:
                 position = _source_position(None) or {
                     "pc": self.pc,
-                    "sp": _stack_pointer(),
+                    "frame": _frame_identity(),
                     "file": None,
                     "line": 0,
                     "thread_id": gdb.selected_thread().global_num,
@@ -410,7 +463,7 @@ def _source_position(event):
             ]
         return {
             "pc": int(frame.pc()),
-            "sp": _stack_pointer(),
+            "frame": _frame_identity(),
             "file": os.path.realpath(sal.symtab.fullname()),
             "line": sal.line,
             "thread_id": gdb.selected_thread().global_num,
@@ -545,10 +598,10 @@ class _WrongFrame(Exception):
     pass
 
 
-def _run_to(pc, occurrence, sp=None):
+def _run_to(pc, occurrence, frame=None):
     # Continue the replay to the OCCURRENCE-th arrival at PC since it started,
-    # and check that it stopped in the frame whose stack pointer is SP (when
-    # SP is known).
+    # and check that it stopped with the frame identity FRAME (when FRAME is
+    # known; see _frame_identity).
     target = gdb.Breakpoint(
         "*{:#x}".format(pc),
         type=gdb.BP_BREAKPOINT,
@@ -560,15 +613,15 @@ def _run_to(pc, occurrence, sp=None):
         gdb.execute("continue", from_tty=False, to_string=True)
         if int(gdb.newest_frame().pc()) != pc:
             raise gdb.error("replay did not stop at the requested source position")
-        landed = _stack_pointer()
-        if sp is not None and landed != sp:
+        landed = _frame_identity()
+        if frame is not None and landed != frame:
             raise _WrongFrame(
-                "arrival {} at {:#x} has stack pointer {}, but the history entry "
-                "was recorded with {:#x}".format(
+                "arrival {} at {:#x} has the frames {}, but the history entry "
+                "was recorded with {}".format(
                     occurrence,
                     pc,
-                    "unknown" if landed is None else "{:#x}".format(landed),
-                    sp,
+                    _describe_frames(landed),
+                    _describe_frames(frame),
                 )
             )
     finally:
@@ -594,7 +647,7 @@ class _ArrivalCounter(gdb.Breakpoint):
 
 def _count_arrivals(pc, marker):
     # Restart the replay and count its arrivals at PC before it reaches
-    # MARKER, a (pc, occurrence, sp) triple, or before it exits when MARKER is
+    # MARKER, a (pc, occurrence, frame) triple, or before it exits when MARKER is
     # None.
     global _suppress_events
 
@@ -660,6 +713,22 @@ def _line_entry_after(index):
     )
 
 
+def _line_entry_reached_after(index):
+    # The index of a line entry after INDEX, running the live replay forward,
+    # recording as usual, until the history holds one. None when the replay
+    # exits first; the history then holds every arrival after INDEX.
+    marker_index = _line_entry_after(index)
+    for _ in range(_ADVANCE_LIMIT):
+        if marker_index is not None:
+            return marker_index
+        if gdb.selected_inferior().pid == 0 or not _advance_to_a_line():
+            return None
+        marker_index = _line_entry_after(index)
+    if marker_index is None:
+        raise gdb.error("replay did not reach a source line")
+    return marker_index
+
+
 def _occurrence(index, advance=True):
     # Which arrival at its pc, counted from the start of the replay, the
     # history entry at INDEX is. ADVANCE=False refuses to run the live replay
@@ -668,15 +737,14 @@ def _occurrence(index, advance=True):
     entry = _history[index]
     pc = entry["pc"]
     if _arrival_leader(pc) is not None:
-        # A line breakpoint is meant to record every arrival at a line
-        # address, but it can miss one. Reverie's gdbstub (pinned d8c16b6)
-        # saves and restores a whole 8-byte word for each software
-        # breakpoint, so removing one breakpoint, as GDB does to step over it,
-        # can erase the int3 of a line breakpoint up to 7 bytes after it for
-        # the rest of that resume. Measured: a stepOut from a recursive call's
-        # return address skips the caller's closing line. The count is then
-        # short, and _run_to's stack pointer check turns the wrong landing it
-        # causes into an error.
+        # A line breakpoint records every arrival at a line address, as long
+        # as the debugger stub keeps its int3 in place. Reverie's gdbstub
+        # did not always: it restored a whole 8-byte word when it removed a
+        # software breakpoint, which could erase the int3 of a line
+        # breakpoint up to 7 bytes after it, and the count came out short
+        # (fixed in https://github.com/rrnewton/reverie/pull/890). A short or
+        # long count makes _run_to land at another arrival, and its frame
+        # check refuses that landing whenever the frame identity differs.
         return sum(1 for earlier in _history[: index + 1] if earlier["pc"] == pc)
 
     # No line breakpoint covers PC: the history holds the arrival the client
@@ -688,25 +756,19 @@ def _occurrence(index, advance=True):
     # the next line arrival first: counting to the replay's exit instead
     # would also count the arrivals after the current position, which the
     # history does not hold.
-    marker_index = _line_entry_after(index)
-    if marker_index is None and not advance:
-        raise gdb.error("no later source line to count arrivals against")
-    alive = True
-    for _ in range(_ADVANCE_LIMIT):
-        if marker_index is not None or not alive:
-            break
-        alive = _advance_to_a_line()
-        marker_index = _line_entry_after(index)
+    if advance:
+        marker_index = _line_entry_reached_after(index)
     else:
-        if marker_index is None and alive:
-            raise gdb.error("replay did not reach a source line")
+        marker_index = _line_entry_after(index)
+        if marker_index is None:
+            raise gdb.error("no later source line to count arrivals against")
     if marker_index is None:
         arrivals = _count_arrivals(pc, None)
         later = _history[index + 1 :]
     else:
         marker = _history[marker_index]
         arrivals = _count_arrivals(
-            pc, (marker["pc"], _occurrence(marker_index), marker.get("sp"))
+            pc, (marker["pc"], _occurrence(marker_index), marker["frame"])
         )
         later = _history[index + 1 : marker_index]
     occurrence = arrivals - sum(1 for entry_after in later if entry_after["pc"] == pc)
@@ -738,7 +800,7 @@ def _rewind(target_index, reason, breakpoint_ids=None, occurrence=None):
             breakpoint.enabled = False
         _restart_replay()
         if position is not None:
-            _run_to(position["pc"], occurrence, position.get("sp"))
+            _run_to(position["pc"], occurrence, position["frame"])
 
         body = dict(_last_stopped or {})
         body["reason"] = reason
@@ -775,6 +837,21 @@ def _rewind_or_stay(target_index, reason, breakpoint_ids=None):
     # request fails with _StayedAtCurrentStop instead of reporting a stop at
     # the wrong time.
     current_index = len(_history) - 1
+    current_occurrence = None
+    if (
+        target_index >= 0
+        and current_index >= 0
+        and _arrival_leader(_history[current_index]["pc"]) is None
+    ):
+        # The current stop is not a line start (a stepOut's return address,
+        # say), so counting its arrival needs a line entry after it (see
+        # _occurrence). Once the rewind below has restarted the replay,
+        # nothing can record one, so record it now, while the live replay is
+        # still at the current stop. If the replay exits first, the history
+        # holds every arrival after the current stop, and the count is taken
+        # now, against the exit.
+        if _line_entry_reached_after(current_index) is None:
+            current_occurrence = _occurrence(current_index)
     try:
         return _rewind(target_index, reason, breakpoint_ids)
     except _WrongFrame as wrong:
@@ -782,17 +859,15 @@ def _rewind_or_stay(target_index, reason, breakpoint_ids=None):
     if current_index < 0:
         raise gdb.error("the rewind landed in the wrong frame: " + problem)
     # The live replay is now somewhere else, so counting the current stop's
-    # arrival must not run it forward. Entries after CURRENT_INDEX that the
-    # count above recorded came from the real path and may be used.
-    occurrence = _occurrence(current_index, advance=False)
-    body = _rewind(current_index, "step", None, occurrence)
+    # arrival must not run it forward. Entries after CURRENT_INDEX came from
+    # the real path and may be used.
+    if current_occurrence is None:
+        current_occurrence = _occurrence(current_index, advance=False)
+    body = _rewind(current_index, "step", None, current_occurrence)
     body["description"] = "Returned to the current stop"
     raise _StayedAtCurrentStop(
         "Hermit could not reach the earlier stop exactly, so the replay stays "
-        "at the current stop ({}). See "
-        "https://github.com/rrnewton/hermit/pull/3545 for the known cause.".format(
-            problem
-        ),
+        "at the current stop ({}).".format(problem),
         body,
     )
 
@@ -957,6 +1032,13 @@ if _missing_tools:
     _refuse(
         "managed replay requires readelf and setpriv on PATH (missing: {})".format(
             ", ".join(_missing_tools)
+        )
+    )
+_test_only_drop = _parse_test_only_drop()
+if isinstance(_test_only_drop, str):
+    _refuse(
+        "{} must be LINE:K with positive integers, not {!r}".format(
+            _TEST_ONLY_DROP_VARIABLE, _test_only_drop
         )
     )
 

@@ -271,12 +271,10 @@ The DAP adapter is experimental. It is tested end to end with GDB 17.2 on a
 single-threaded C program: attaching to `run --gdbserver`, hitting a source
 breakpoint, continuing, reading the stack and evaluating variables, and, for a
 recording, `stepBack` and `reverseContinue`, including `stepBack` after a
-`stepOut` or `next` and a `reverseContinue` back to the replay's entry (the
-`hermit_dap_*` tests in `hermit-cli/tests/cli.rs`). One known case fails:
-after a `stepOut` that starts at a recursive call's return address, a later
-`stepBack` to the caller's closing line cannot land exactly (see the
-limitation below), so it fails with an error instead. Other GDB versions are
-not tested. Reverse replay patches GDB's DAP server internals, so under a GDB whose
+`stepOut` or `next`, in recursion and between two calls from the same caller,
+and a `reverseContinue` back to the replay's entry (the `hermit_dap_*` tests in
+`hermit-cli/tests/cli.rs`). Other GDB versions are not tested. Reverse replay
+patches GDB's DAP server internals, so under a GDB whose
 DAP server lacks them it refuses to start: the client's first request gets a
 failed response naming the missing hook, and the adapter writes the same
 message to its stderr and exits. It refuses the same way when `readelf` or
@@ -379,17 +377,33 @@ passes through the loop's line, which the client never stopped at and which
 start no new source line. A `stepOut` from a function without debug
 information reports the stop with reason `stopped` rather than `step`.
 
-Known limitation: the adapter finds line arrivals with breakpoints on every
-source line, and Reverie's gdbstub can lose one of them. It saves and restores
-a whole 8-byte word for each software breakpoint, so when GDB removes a
-breakpoint to step over it, a breakpoint up to 7 bytes after it is erased for
-the rest of that resume. The adapter records each stop's stack pointer and
-checks it when it replays to that stop. If the replay lands in another frame,
-the adapter puts it back at the client's current stop, sends a `stopped`
-event for it, and fails the `stepBack` or `reverseContinue` with an error that
-says it could not reach the earlier stop exactly. It never reports a stop at
-the wrong time in another frame. The check cannot tell two passes through the
-same frame apart, such as two iterations of a loop.
+The adapter finds line arrivals with an internal breakpoint on every source
+line, and chooses which arrival at an address to restart to by counting the
+earlier ones. If the debugger stub loses one of those breakpoints, the count
+is wrong and the replay runs to another arrival at the same address. Reverie's
+gdbstub did lose them: it restored a whole 8-byte word when it removed a
+software breakpoint, so when GDB removed a breakpoint to step over it, a
+breakpoint up to 7 bytes after it was erased for the rest of that resume. That
+was fixed in https://github.com/rrnewton/reverie/pull/890.
+
+As a check on the count, the adapter records a frame identity with every stop
+and line arrival: the program counter and stack pointer of each frame GDB
+unwinds, from the innermost frame out to `main` (GDB does not unwind past
+`main` by default). When it replays to a stop, it compares the identity where
+the replay landed. If they differ, it puts the replay back at the client's
+current stop, sends a `stopped` event for it, and fails the `stepBack` or
+`reverseContinue` with an error saying it could not reach the earlier stop
+exactly. If it cannot put the replay back either, the request fails and the
+adapter ends the session: it sends an `output` event saying why, then
+`terminated`.
+
+The frame identity tells apart two activations of a function at different
+call depths, such as recursive calls, and two calls at the same depth from
+different call sites, such as `g(1)` and `g(2)` on consecutive lines. It
+cannot tell apart two passes through the same activation, such as two
+iterations of a loop, or two calls from the same call site at the same depth,
+such as a call inside a loop. Their identities are equal, so a wrong count
+there would land at the wrong pass without an error.
 
 ```bash
 dapper proxy --control-port 4711 from-config hermit-dap-replay.json

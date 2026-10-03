@@ -631,11 +631,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // hermit_dap_replay_steps_back_through_repeated_and_shared_addresses
     // (https://github.com/rrnewton/hermit/pull/3545) retain all 105 prior
     // selected CLI identities.
-    // hermit_dap_replay_step_back_in_recursion_lands_exactly_or_refuses and
+    // hermit_dap_replay_step_back_in_recursion_lands_exactly and
     // hermit_dap_replay_step_back_skips_later_passes_of_a_one_line_loop
     // (https://github.com/rrnewton/hermit/pull/3545) retain all 108 prior
     // selected CLI identities.
-    ("test.cli", 110),
+    // hermit_dap_replay_step_back_between_sibling_calls_lands_exactly,
+    // hermit_dap_replay_step_back_refuses_a_sibling_call_with_the_same_stack_pointer,
+    // hermit_dap_replay_refused_step_back_stays_at_a_mid_line_stop and
+    // hermit_dap_replay_reverse_continue_ends_the_session_when_it_cannot_return
+    // (https://github.com/rrnewton/hermit/pull/3545) retain all 110 prior
+    // selected CLI identities.
+    ("test.cli", 114),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -678,7 +684,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities retained. The same two further hermit-dap replay tests from
     // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 108 prior
     // identities retained.
-    ("test.cli_on_host", 110),
+    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 107 prior
+    // identities retained. The same four further hermit-dap replay tests from
+    // https://github.com/rrnewton/hermit/pull/3545 as test.cli; all 110 prior
+    // identities retained.
+    ("test.cli_on_host", 114),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 36),

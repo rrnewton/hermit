@@ -7458,86 +7458,100 @@ int main(void) {
 // ⚠️ THE LINE NUMBERS IN THE TEST BELOW ARE THIS LAYOUT: 4 is the base case,
 // 5 the recursive call, 6 `return r + 1;`, 7 the closing brace, 10 main's call.
 
-/// stepBack in recursion must land in the right activation or fail the
-/// request; it must never report a stop in another activation as the previous
-/// step.
+/// stepBack in recursion must land exactly, in the right activation.
 ///
 /// Stopped in `depth(0)`, two stepOuts reach `depth(2)` at the recursive
 /// call's return address, and three nexts walk lines 6 and 7 of `depth(2)` to
-/// line 6 of `depth(3)`. The previous stop is line 7 of `depth(2)`.
+/// line 6 of `depth(3)`. The previous stop is line 7 of `depth(2)`. A
+/// stepOut from there reaches `depth(3)`'s return address, in the middle of
+/// line 5, and the stop before that is again line 7 of `depth(2)`.
 ///
 /// The second stepOut starts at the return address it also targets, and GDB
-/// steps over a line breakpoint on the way. Reverie's gdbstub (pinned
-/// d8c16b6) restores a whole 8-byte word when it removes a software
-/// breakpoint, which erases the line-7 breakpoint 6 bytes further on for the
-/// rest of that stepOut, so the history misses `depth(1)`'s line 7. Counting
-/// arrivals at line 7 then picks `depth(1)`'s: measured before the frame
-/// check, stepBack reported a `step` stop at line 7 with n = 1 and four
-/// frames. With the frame check the request fails, the replay is put back at
-/// the current stop, and a `next` from there still works. With the Reverie
-/// fix (restore one byte), the history is complete and stepBack lands
-/// exactly; measured with a locally patched Reverie, the first branch below
-/// passes. Either branch proves the property; a stop in the wrong
-/// activation fails both.
+/// steps over a breakpoint there. Reverie's gdbstub used to restore a whole
+/// 8-byte word when it removed a software breakpoint, which erased the line-7
+/// breakpoint 6 bytes further on for the rest of that stepOut, so the history
+/// missed `depth(1)`'s line 7. Counting arrivals at line 7 then picked
+/// `depth(1)`'s: measured before the frame check, stepBack reported a `step`
+/// stop at line 7 with n = 1 and four frames, and with the frame check it
+/// refused the landing. The gdbstub now restores only the breakpoint's own
+/// byte (<https://github.com/rrnewton/reverie/pull/890>), and stepBack must
+/// land exactly. Against a Reverie without that fix this test fails.
 #[test]
-fn hermit_dap_replay_step_back_in_recursion_lands_exactly_or_refuses() {
-    const TEST: &str = "hermit_dap_replay_step_back_in_recursion_lands_exactly_or_refuses";
-    let Some(hermit_dap) = hermit_dap_binary(TEST) else {
+fn hermit_dap_replay_step_back_in_recursion_lands_exactly() {
+    const TEST: &str = "hermit_dap_replay_step_back_in_recursion_lands_exactly";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "recursion", DAP_RECURSION_SOURCE, "d=3", None)
+    else {
         return;
     };
-    let Some(gdb) = dap_capable_gdb(TEST) else {
-        return;
-    };
-    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("failed to create the hermit-dap work dir");
-    let (source, program) = dap_compile(work.path(), "recursion", DAP_RECURSION_SOURCE);
-    let data_dir = work.path().join("recordings");
-    let recording = dap_record(&program, &data_dir, "d=3");
-
-    let port = unused_local_port();
-    let adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
-    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
-    if let Err(refusal) = dap.initialize() {
-        dap_gdb_skip(TEST, &refusal);
-        return;
-    }
     let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_recursion_walk_to_depth_3_line_6(&mut dap, &thread);
 
-    for n in ["3", "2", "1", "0"] {
-        let what = format!("the base-case check with n = {n}");
-        let stop = dap.resume("continue", &thread, &what, DAP_TIMEOUT);
-        dap.assert_stop(
-            &what,
-            &stop,
-            &thread,
-            "breakpoint",
-            &[("depth", 4)],
-            ("n", n),
-        );
-    }
-    let what = "stepOut into depth(1)";
-    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    let at_line_7_of_depth_2 = [("depth", 7), ("depth", 5), ("main", 10)];
+    let what = "stepBack to line 7 of depth(2)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
     dap.assert_stop(
         what,
         &stop,
         &thread,
         "step",
-        &[("depth", 5), ("depth", 5), ("depth", 5), ("main", 10)],
-        ("n", "1"),
-    );
-    let what = "stepOut into depth(2)";
-    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
-    dap.assert_stop(
-        what,
-        &stop,
-        &thread,
-        "step",
-        &[("depth", 5), ("depth", 5), ("main", 10)],
+        &at_line_7_of_depth_2,
         ("n", "2"),
     );
+
+    let what = "stepOut to depth(3)'s return address";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 5), ("main", 10)],
+        ("n", "3"),
+    );
+    let what = "stepBack from the return address to line 7 of depth(2)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &at_line_7_of_depth_2,
+        ("n", "2"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// Drives the recursion guest from its attach stop, with a breakpoint on
+/// line 4, to line 6 of `depth(3)`, checking every stop on the way: the four
+/// base-case checks, two stepOuts to `depth(2)`'s return address, and nexts
+/// to lines 6 and 7 of `depth(2)` and line 6 of `depth(3)`.
+fn dap_recursion_walk_to_depth_3_line_6(dap: &mut DapClient, thread: &serde_json::Value) {
+    dap_recursion_walk_to_depth_2_line_7(dap, thread);
+    let what = "next to line 6 of depth(3)";
+    let stop = dap.resume("next", thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        thread,
+        "step",
+        &[("depth", 6), ("main", 10)],
+        ("n", "3"),
+    );
+}
+
+/// The first part of [`dap_recursion_walk_to_depth_3_line_6`]: from the
+/// attach stop to line 7 of `depth(2)`.
+fn dap_recursion_walk_to_depth_2_line_7(dap: &mut DapClient, thread: &serde_json::Value) {
+    dap_recursion_walk_to_depth_2_return(dap, thread);
     // (what, expected frames, expected n) for each `next`.
     type Frames<'a> = &'a [(&'a str, u64)];
-    let walk: [(&str, Frames<'_>, &str); 3] = [
+    let walk: [(&str, Frames<'_>, &str); 2] = [
         (
             "next to line 6 of depth(2)",
             &[("depth", 6), ("depth", 5), ("main", 10)],
@@ -7548,61 +7562,472 @@ fn hermit_dap_replay_step_back_in_recursion_lands_exactly_or_refuses() {
             &[("depth", 7), ("depth", 5), ("main", 10)],
             "2",
         ),
-        (
-            "next to line 6 of depth(3)",
-            &[("depth", 6), ("main", 10)],
-            "3",
-        ),
     ];
     for (what, frames, n) in walk {
-        let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
-        dap.assert_stop(what, &stop, &thread, "step", frames, ("n", n));
+        let stop = dap.resume("next", thread, what, DAP_TIMEOUT);
+        dap.assert_stop(what, &stop, thread, "step", frames, ("n", n));
     }
+}
 
-    let what = "stepBack to line 7 of depth(2)";
-    let seq = dap.request("stepBack", serde_json::json!({"threadId": thread}));
-    let response = dap.wait_for("the stepBack response", DAP_REVERSE_TIMEOUT, |message| {
-        message["type"] == "response" && message["request_seq"] == seq
-    });
-    let stop = dap.stopped(what, DAP_REVERSE_TIMEOUT);
-    if response["success"] == true {
+/// The first part of [`dap_recursion_walk_to_depth_2_line_7`]: from the
+/// attach stop, through the four base-case checks, and two stepOuts to
+/// `depth(2)` at the recursive call's return address.
+fn dap_recursion_walk_to_depth_2_return(dap: &mut DapClient, thread: &serde_json::Value) {
+    for n in ["3", "2", "1", "0"] {
+        let what = format!("the base-case check with n = {n}");
+        let stop = dap.resume("continue", thread, &what, DAP_TIMEOUT);
         dap.assert_stop(
-            what,
+            &what,
             &stop,
-            &thread,
-            "step",
-            &[("depth", 7), ("depth", 5), ("main", 10)],
-            ("n", "2"),
-        );
-    } else {
-        if !response["message"]
-            .as_str()
-            .is_some_and(|text| text.contains("could not reach the earlier stop exactly"))
-        {
-            dap.fail(&format!(
-                "a failed stepBack must say it could not land exactly: {response}"
-            ));
-        }
-        let at_current = [("depth", 6), ("main", 10)];
-        let what = "the current stop after the refused stepBack";
-        dap.assert_stop(what, &stop, &thread, "step", &at_current, ("n", "3"));
-        let what = "next to line 7 of depth(3) after the refused stepBack";
-        let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
-        dap.assert_stop(
-            what,
-            &stop,
-            &thread,
-            "step",
-            &[("depth", 7), ("main", 10)],
-            ("n", "3"),
+            thread,
+            "breakpoint",
+            &[("depth", 4)],
+            ("n", n),
         );
     }
+    let what = "stepOut into depth(1)";
+    let stop = dap.resume("stepOut", thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        thread,
+        "step",
+        &[("depth", 5), ("depth", 5), ("depth", 5), ("main", 10)],
+        ("n", "1"),
+    );
+    let what = "stepOut into depth(2)";
+    let stop = dap.resume("stepOut", thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        thread,
+        "step",
+        &[("depth", 5), ("depth", 5), ("main", 10)],
+        ("n", "2"),
+    );
+}
+
+/// hermit-dap serving a fresh recording of `text` (compiled as `name`, whose
+/// output must contain `expected`) to a client that has initialized it, with
+/// the extension's test-only fault injection set to `drop_line_arrival`
+/// when it is given (see [`DAP_TEST_ONLY_DROP_LINE_ARRIVAL`]). Returns
+/// `None` after reporting a skip, as the other hermit-dap tests do.
+fn dap_replay_session(
+    test: &str,
+    name: &str,
+    text: &str,
+    expected: &str,
+    drop_line_arrival: Option<&str>,
+) -> Option<(DapClient, tempfile::TempDir, PathBuf, PathBuf, u16)> {
+    let hermit_dap = hermit_dap_binary(test)?;
+    let gdb = dap_capable_gdb(test)?;
+    let work = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the hermit-dap work dir");
+    let (source, program) = dap_compile(work.path(), name, text);
+    let data_dir = work.path().join("recordings");
+    let recording = dap_record(&program, &data_dir, expected);
+    let port = unused_local_port();
+    let mut adapter = dap_replay_adapter(hermit_dap, &gdb, &recording, &data_dir, port);
+    adapter.env_remove(DAP_TEST_ONLY_DROP_LINE_ARRIVAL);
+    if let Some(drop) = drop_line_arrival {
+        adapter.env(DAP_TEST_ONLY_DROP_LINE_ARRIVAL, drop);
+    }
+    let mut dap = DapClient::spawn(adapter, work.path().join("hermit-dap.stderr"));
+    if let Err(refusal) = dap.initialize() {
+        dap_gdb_skip(test, &refusal);
+        return None;
+    }
+    Some((dap, work, source, program, port))
+}
+
+/// The replay extension's test-only fault injection. `LINE:K` makes its line
+/// breakpoints leave the K-th arrival they record at source line LINE out of
+/// the history, as a debugger stub that loses a breakpoint would, so a test
+/// can drive the frame check and its recovery paths without depending on
+/// such a stub bug. A stop the client sees is still recorded.
+const DAP_TEST_ONLY_DROP_LINE_ARRIVAL: &str = "HERMIT_DAP_TEST_ONLY_DROP_LINE_ARRIVAL";
+
+/// The guest of the sibling-call stepBack tests below: `main` calls `g`
+/// twice from the same depth, so both activations of `g` have the same stack
+/// pointer. In `g`, line 9 (`return r + 1;`) and line 10 (the closing brace)
+/// start 6 bytes apart at -O0.
+const DAP_SIBLING_SOURCE: &str = r#"#include <stdio.h>
+
+static int k(int x) {
+  return x;
+}
+
+static int g(int x) {
+  int r = k(x);
+  return r + 1;
+}
+
+int main(void) {
+  int a = g(1);
+  int b = g(2);
+  printf("s=%d\n", a + b);
+  return 0;
+}
+"#;
+// ⚠️ THE LINE NUMBERS IN THE TESTS BELOW ARE THIS LAYOUT: 4 is k's body, 8
+// g's call of k, 9 `return r + 1;`, 10 g's closing brace, 13 and 14 the two
+// calls of g, 15 the printf, 16 `return 0;`.
+
+/// Drives the sibling-call guest from its attach stop, with a breakpoint on
+/// line 4, to the printf after both calls of `g`, checking every stop: into
+/// `k` from `g(1)`, out to `g` and to `main`, next to the second call, into
+/// `k` from `g(2)`, out to `g`, and nexts over lines 9 and 10 of `g(2)` and
+/// back into `main`.
+fn dap_sibling_walk_to_the_printf(dap: &mut DapClient, thread: &serde_json::Value) {
+    // (request, what, reason, expected frames, (watched expression, value)).
+    type Step<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a [(&'a str, u64)],
+        (&'a str, &'a str),
+    );
+    let walk: [Step<'_>; 9] = [
+        (
+            "continue",
+            "the stop in k called from g(1)",
+            "breakpoint",
+            &[("k", 4), ("g", 8), ("main", 13)],
+            ("x", "1"),
+        ),
+        (
+            "stepOut",
+            "stepOut to g(1)",
+            "step",
+            &[("g", 8), ("main", 13)],
+            ("x", "1"),
+        ),
+        (
+            "stepOut",
+            "stepOut to main from g(1)",
+            "step",
+            &[("main", 13)],
+            ("sizeof a", "4"),
+        ),
+        (
+            "next",
+            "next to the second call",
+            "step",
+            &[("main", 14)],
+            ("a", "2"),
+        ),
+        (
+            "continue",
+            "the stop in k called from g(2)",
+            "breakpoint",
+            &[("k", 4), ("g", 8), ("main", 14)],
+            ("x", "2"),
+        ),
+        (
+            "stepOut",
+            "stepOut to g(2)",
+            "step",
+            &[("g", 8), ("main", 14)],
+            ("x", "2"),
+        ),
+        (
+            "next",
+            "next to line 9 of g(2)",
+            "step",
+            &[("g", 9), ("main", 14)],
+            ("x", "2"),
+        ),
+        (
+            "next",
+            "next to line 10 of g(2)",
+            "step",
+            &[("g", 10), ("main", 14)],
+            ("x", "2"),
+        ),
+        (
+            "next",
+            "next to the printf",
+            "step",
+            &[("main", 15)],
+            ("b", "3"),
+        ),
+    ];
+    for (request, what, reason, frames, watch) in walk {
+        let stop = dap.resume(request, thread, what, DAP_TIMEOUT);
+        dap.assert_stop(what, &stop, thread, reason, frames, watch);
+    }
+}
+
+/// stepBack between two calls from the same caller at the same depth must
+/// land in the right one.
+///
+/// Stopped at the printf after `g(1)` and `g(2)`, the previous stop is line
+/// 10 of `g(2)`. Both activations of `g` have the same stack pointer. Before
+/// the Reverie fix (<https://github.com/rrnewton/reverie/pull/890>), GDB
+/// stepping over line 9's breakpoint in `g(1)` erased line 10's 6 bytes
+/// further on, the history missed `g(1)`'s line 10, and the arrival count
+/// picked `g(1)`'s. Measured with a stack-pointer-only frame check: stepBack
+/// reported a `step` stop at line 10 called from line 13, x = 1. With the
+/// fix, it must land exactly: line 10 called from line 14, x = 2. Against a
+/// Reverie without the fix this test fails.
+#[test]
+fn hermit_dap_replay_step_back_between_sibling_calls_lands_exactly() {
+    const TEST: &str = "hermit_dap_replay_step_back_between_sibling_calls_lands_exactly";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "sibling", DAP_SIBLING_SOURCE, "s=5", None)
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_sibling_walk_to_the_printf(&mut dap, &thread);
+
+    let what = "stepBack to line 10 of g(2)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("g", 10), ("main", 14)],
+        ("x", "2"),
+    );
+    let what = "stepBack to line 9 of g(2)";
+    let stop = dap.resume("stepBack", &thread, what, DAP_REVERSE_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("g", 9), ("main", 14)],
+        ("x", "2"),
+    );
 
     dap.call(
         "disconnect",
         serde_json::json!({"terminateDebuggee": true}),
         DAP_TIMEOUT,
     );
+}
+
+/// Sends a reverse request that must fail because Hermit could not land
+/// exactly, and returns the `stopped` event that puts the client back at its
+/// current stop.
+fn dap_refused_reverse_request(
+    dap: &mut DapClient,
+    command: &str,
+    thread: &serde_json::Value,
+    what: &str,
+) -> serde_json::Value {
+    let seq = dap.request(command, serde_json::json!({"threadId": thread}));
+    let response = dap.wait_for(
+        &format!("the {command} response"),
+        DAP_REVERSE_TIMEOUT,
+        |message| message["type"] == "response" && message["request_seq"] == seq,
+    );
+    if response["success"] != false
+        || !response["message"]
+            .as_str()
+            .is_some_and(|text| text.contains("could not reach the earlier stop exactly"))
+    {
+        dap.fail(&format!(
+            "{what}: the {command} must fail and say it could not land exactly: {response}"
+        ));
+    }
+    dap.stopped(what, DAP_REVERSE_TIMEOUT)
+}
+
+/// A stepBack whose arrival count is short must refuse to land in a sibling
+/// call that has the same stack pointer, and stay at the current stop.
+///
+/// The test-only fault injection drops the first arrival the line
+/// breakpoints record at line 10, `g(1)`'s, which is the history the Reverie
+/// bug of [`hermit_dap_replay_step_back_between_sibling_calls_lands_exactly`]
+/// produced. Counting arrivals at line 10 then picks `g(1)`'s, whose stack
+/// pointer equals `g(2)`'s; only the caller's return address (line 13
+/// against line 14) tells them apart. stepBack must fail, put the replay back
+/// at the printf with a `stopped` event, and leave a working session.
+#[test]
+fn hermit_dap_replay_step_back_refuses_a_sibling_call_with_the_same_stack_pointer() {
+    const TEST: &str =
+        "hermit_dap_replay_step_back_refuses_a_sibling_call_with_the_same_stack_pointer";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "sibling", DAP_SIBLING_SOURCE, "s=5", Some("10:1"))
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_sibling_walk_to_the_printf(&mut dap, &thread);
+
+    let what = "the printf after the refused stepBack";
+    let stop = dap_refused_reverse_request(&mut dap, "stepBack", &thread, what);
+    dap.assert_stop(what, &stop, &thread, "step", &[("main", 15)], ("b", "3"));
+    let what = "next to `return 0` after the refused stepBack";
+    let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("main", 16)],
+        ("a + b", "5"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// A refused stepBack from a stop in the middle of a source line must put the
+/// replay back at that stop, not end the session.
+///
+/// The client stops at `depth(3)`'s return address, in the middle of line 5,
+/// after the walk of [`hermit_dap_replay_step_back_in_recursion_lands_exactly`].
+/// The test-only fault injection drops the first arrival the line breakpoints
+/// record at line 7, `depth(0)`'s, so the count for line 7 of `depth(2)`
+/// picks another activation and the frame check refuses the landing. Going
+/// back to the current stop means counting arrivals at an address no line
+/// breakpoint covers, which needs a line arrival after it in the history.
+/// Before the fix none was recorded, and the request failed with "no later
+/// source line to count arrivals against" and ended the session.
+#[test]
+fn hermit_dap_replay_refused_step_back_stays_at_a_mid_line_stop() {
+    const TEST: &str = "hermit_dap_replay_refused_step_back_stays_at_a_mid_line_stop";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "recursion", DAP_RECURSION_SOURCE, "d=3", Some("7:1"))
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_recursion_walk_to_depth_2_line_7(&mut dap, &thread);
+    let at_return = [("depth", 5), ("main", 10)];
+    let what = "stepOut to depth(3)'s return address";
+    let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(what, &stop, &thread, "step", &at_return, ("n", "3"));
+
+    let what = "the return address after the refused stepBack";
+    let stop = dap_refused_reverse_request(&mut dap, "stepBack", &thread, what);
+    dap.assert_stop(what, &stop, &thread, "step", &at_return, ("n", "3"));
+    let what = "next to line 6 of depth(3) after the refused stepBack";
+    let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 6), ("main", 10)],
+        ("r", "2"),
+    );
+
+    dap.call(
+        "disconnect",
+        serde_json::json!({"terminateDebuggee": true}),
+        DAP_TIMEOUT,
+    );
+}
+
+/// A reverse request that can neither land exactly nor go back to the current
+/// stop must fail and end the session, saying why, rather than leave the
+/// client at an unknown position.
+///
+/// With a breakpoint on line 6, the client stops there in `depth(2)` and then
+/// in `depth(3)`. The test-only fault injection drops the first arrival the
+/// line breakpoints record at line 6, `depth(1)`'s, so every count for line 6
+/// is one short: reverseContinue lands in `depth(1)` instead of `depth(2)`,
+/// and going back to the current stop lands in `depth(2)` instead of
+/// `depth(3)`. Both landings fail the frame check. The client must get a
+/// failed response, an `output` event naming the request and the frames, and
+/// a `terminated` event.
+#[test]
+fn hermit_dap_replay_reverse_continue_ends_the_session_when_it_cannot_return() {
+    const TEST: &str = "hermit_dap_replay_reverse_continue_ends_the_session_when_it_cannot_return";
+    let Some((mut dap, _work, source, program, port)) =
+        dap_replay_session(TEST, "recursion", DAP_RECURSION_SOURCE, "d=3", Some("6:1"))
+    else {
+        return;
+    };
+    let thread = dap.attach_and_break(&program, &format!("127.0.0.1:{port}"), &source, 4);
+    dap_recursion_walk_to_depth_2_return(&mut dap, &thread);
+    let what = "next to line 6 of depth(2)";
+    let stop = dap.resume("next", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "step",
+        &[("depth", 6), ("depth", 5), ("main", 10)],
+        ("n", "2"),
+    );
+    let breakpoints = dap.call(
+        "setBreakpoints",
+        serde_json::json!({"source": {"path": source}, "breakpoints": [{"line": 6}]}),
+        DAP_TIMEOUT,
+    );
+    if breakpoints["body"]["breakpoints"][0]["verified"] != true {
+        dap.fail(&format!(
+            "the breakpoint at line 6 must resolve: {breakpoints}"
+        ));
+    }
+    let what = "the breakpoint at line 6 of depth(3)";
+    let stop = dap.resume("continue", &thread, what, DAP_TIMEOUT);
+    dap.assert_stop(
+        what,
+        &stop,
+        &thread,
+        "breakpoint",
+        &[("depth", 6), ("main", 10)],
+        ("n", "3"),
+    );
+
+    let seq = dap.request("reverseContinue", serde_json::json!({"threadId": thread}));
+    let response = dap.wait_for(
+        "the reverseContinue response",
+        DAP_REVERSE_TIMEOUT,
+        |message| message["type"] == "response" && message["request_seq"] == seq,
+    );
+    if response["success"] != false {
+        dap.fail(&format!("the reverseContinue must fail: {response}"));
+    }
+    let output = dap.wait_for(
+        "the output event of the failed reverseContinue",
+        DAP_REVERSE_TIMEOUT,
+        |message| {
+            message["type"] == "event"
+                && (message["event"] == "output"
+                    || matches!(
+                        message["event"].as_str(),
+                        Some("stopped" | "terminated" | "exited")
+                    ))
+        },
+    );
+    let text = output["body"]["output"].as_str().unwrap_or_default();
+    if output["event"] != "output"
+        || !text.starts_with("hermit-dap: reverseContinue failed: ")
+        || !text.contains("has the frames")
+    {
+        dap.fail(&format!(
+            "the failed reverseContinue must first report why, naming the frames: {output}"
+        ));
+    }
+    let ended = dap.wait_for(
+        "the terminated event of the failed reverseContinue",
+        DAP_REVERSE_TIMEOUT,
+        |message| {
+            message["type"] == "event"
+                && matches!(
+                    message["event"].as_str(),
+                    Some("stopped" | "terminated" | "exited")
+                )
+        },
+    );
+    if ended["event"] != "terminated" {
+        dap.fail(&format!(
+            "the failed reverseContinue must end the session with terminated: {ended}"
+        ));
+    }
+
+    let _ = dap.request("disconnect", serde_json::json!({"terminateDebuggee": true}));
 }
 
 /// The guest of the one-line-loop stepBack test below: a loop on one source
@@ -7712,9 +8137,8 @@ fn hermit_dap_replay_step_back_skips_later_passes_of_a_one_line_loop() {
     let what = "stepOut of sq to the loop's first pass";
     let stop = dap.resume("stepOut", &thread, what, DAP_TIMEOUT);
     // GDB reports a stepOut of a function without debug information with
-    // reason "stopped", not "step"; the position is what matters here.
-    let reason = stop["reason"].as_str().unwrap_or_default().to_owned();
-    dap.assert_stop(what, &stop, &thread, &reason, &in_loop, ("i", "0"));
+    // reason "stopped", not "step".
+    dap.assert_stop(what, &stop, &thread, "stopped", &in_loop, ("i", "0"));
     let what = "the breakpoint after the loop";
     let stop = dap.resume("continue", &thread, what, DAP_TIMEOUT);
     dap.assert_stop(
