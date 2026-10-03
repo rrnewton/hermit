@@ -89,7 +89,7 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
     let source = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../hermit-cli/network-provider").canonicalize().unwrap();
     check_compiled_sources(&source);
-    assert_eq!(driver_ftrace_inputs::C_INPUTS.len(), 27);
+    assert_eq!(driver_ftrace_inputs::C_INPUTS.len(), 29);
     let scratch = tempfile::Builder::new().prefix("hermit-driver-ftrace-").tempdir().unwrap();
     let inputs = scratch.path().join("sources");
     fs::create_dir(&inputs).unwrap();
@@ -136,7 +136,8 @@ fn actual_ftrace_driver_inventory_uses_original_ready_validator() {
         .contains("'stream-copy-fault.h' file not found"));
     // Each new production include must belong to this closed source set. Keep
     // the older missing-fault-header negative above and the same original clock.
-    for header in ["owned-metadata.h", "owned-metadata-driver.h"] {
+    for header in ["owned-metadata.h", "owned-metadata-driver.h",
+        "stream-tx.h", "stream-tx-driver.h"] {
         let incomplete = scratch.path().join(format!("missing-{header}"));
         fs::create_dir(&incomplete).unwrap();
         for (name, bytes) in driver_ftrace_inputs::C_INPUTS {

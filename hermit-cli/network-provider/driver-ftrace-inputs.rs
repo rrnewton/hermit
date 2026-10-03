@@ -29,6 +29,8 @@ pub(super) const C_INPUTS: &[(&str, &[u8])] = &[
     ("stream-copy-driver.h", include_bytes!("stream-copy-driver.h")),
     ("stream-copy.h", include_bytes!("stream-copy.h")),
     ("stream-copy-fault.h", include_bytes!("stream-copy-fault.h")),
+    ("stream-tx.h", include_bytes!("stream-tx.h")),
+    ("stream-tx-driver.h", include_bytes!("stream-tx-driver.h")),
     ("task-disarm.h", include_bytes!("task-disarm.h")),
 ];
 pub(super) const INPUTS: &[(&str, &[u8])] = &[
