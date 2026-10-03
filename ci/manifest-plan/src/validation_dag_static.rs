@@ -613,7 +613,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // record_replay_path::tests::procfs_symlinks_are_refused_only_when_requested
     // (replay-root containment refuses procfs symlinks) and retains all 796
     // prior identities.
-    ("test.hermit_unit", 797),
+    // backend_blocked_wait_signal_contract_is_explicit and
+    // backend_skipped_syscall_restart_contract_is_explicit
+    // (https://github.com/rrnewton/hermit/issues/3146) retain all 797 prior
+    // identities (`cargo nextest list --profile ci` measured 799 at the rebased
+    // head of https://github.com/rrnewton/hermit/pull/3361).
+    ("test.hermit_unit", 799),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -656,7 +661,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The wait4 argument-validation precedence test
     // (wait4_argument_validation_follows_linux_precedence) retains all 852
     // prior identities.
-    ("test.detcore_unit", 853),
+    // Twenty-five blocked-wait signal tests (twenty in scheduler.rs, one in
+    // syscalls/helpers.rs, four in syscalls/threads.rs;
+    // https://github.com/rrnewton/hermit/issues/3146) retain all 853 prior
+    // identities (`cargo nextest list --profile ci` measured 878 at the rebased
+    // head of https://github.com/rrnewton/hermit/pull/3361).
+    ("test.detcore_unit", 878),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -777,7 +787,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities.
     // liteinst_dispatch_record_reports_patched_sites retains all 27 prior
     // identities.
-    ("test.liteinst_strict", 28),
+    // external_signal_interrupt adds its 48 tests plus its copy of the shared
+    // liteinst_runtime::tests::staged_ci_artifact_never_becomes_a_cargo_profile
+    // unit test; all 28 liteinst_advanced identities are retained
+    // (`cargo nextest list --profile ci` measured 28 + 49 = 77 at the rebased
+    // head of https://github.com/rrnewton/hermit/pull/3361;
+    // https://github.com/rrnewton/hermit/issues/3146). Its tests are split per
+    // backend so each stays inside the per-test wall and CPU bounds.
+    ("test.liteinst_strict", 77),
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops retains all 6
     // prior identities.
     ("test.sabre_examples", 7),
@@ -833,7 +850,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 850 prior
     // identities.
     // The host node carries the identical library/binary selection.
-    ("test.detcore_unit_on_host", 853),
+    // The host twin selects the same twenty-five blocked-wait signal tests
+    // (https://github.com/rrnewton/hermit/issues/3146).
+    ("test.detcore_unit_on_host", 878),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -858,14 +877,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3522).
     // The host node carries the identical selection.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3603 test.
-    ("test.hermit_unit_on_host", 797),
+    // The host twin selects the same two backend signal-contract tests
+    // (https://github.com/rrnewton/hermit/issues/3146).
+    ("test.hermit_unit_on_host", 799),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
     // identities. The host twin also selects
     // liteinst_dispatch_record_reports_patched_sites.
-    ("test.liteinst_strict_on_host", 28),
+    // The host twin selects the same external_signal_interrupt binary
+    // (https://github.com/rrnewton/hermit/issues/3146).
+    ("test.liteinst_strict_on_host", 77),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // The fold-2 resolver test retains all 764 prior identities.
@@ -3519,16 +3542,19 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"liteinst_strict"########,
         desc: r########"Portable LiteInst strict compatibility"########,
-        description: r########"Exercises the LiteInst backend on real programs: the liteinst_advanced integration tests run one at a time against target/ci/hermit with --backend liteinst --strict, their number pinned by NEXTEST_EXPECTED_EXECUTED. Coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert; the node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, or a test added or removed without updating the count, makes it red."########,
+        description: r########"Exercises the LiteInst backend on real programs: the liteinst_advanced and external_signal_interrupt integration tests run one at a time against target/ci/hermit, their number pinned by NEXTEST_EXPECTED_EXECUTED. In liteinst_advanced, which runs with --backend liteinst --strict, coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert. In external_signal_interrupt, the tests/c/external_signal_interrupt.c guest runs under both --backend ptrace and --backend liteinst: a signal that Linux would deliver must end a blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. The node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, a blocked wait that a deliverable signal no longer ends or that an undeliverable signal ends, or a test added or removed without updating the count, makes it red. REGISTRATION 2026-09-29 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt joins liteinst_advanced here because it needs exactly this node's setup: every cell runs both the ptrace and LiteInst backends through HERMIT_LITEINST_TEST_BINARY, so it needs the staged release runtime that liteinst-strict-node.sh pre-checks. MEMORY SAMPLED 2026-09-29 on hermit@7752765b8e (branch claude/external-signal-interrupt-3146-20260928, devbig014, release target/ci/hermit-strict, warm test binaries, outside the pinned root): the exact two-binary nextest command in a systemd-run --user scope peaked at 224415744 bytes (cgroup memory.peak, 38 tests, 38 passed, nextest 100.2 s; the busiest test used 14.7 s of the 22 s per-test CPU bound). The existing 1-GiB baseline and 3-GiB hard cap stay above that sample and are unchanged. A cold run that also compiled the test binaries peaked at 3009363968 bytes; that build work belongs to the prepared-build producer, not to this node. CPU RESAMPLED 2026-09-29 after the second review of https://github.com/rrnewton/hermit/pull/3361 added sixteen tests (devbig014, release target/ci/hermit-strict, warm test binaries, the node command run alone): 74 tests, 74 passed, nextest 237.0 s, 213.2 s of test CPU in total. The busiest test, the older liteinst_readiness_waits_are_interrupted_by_internal_signals, used 13.4 s of the 22 s per-test CPU bound, and none of the sixteen new tests used more than 5.4 s. Memory was not resampled for the added tests."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
             r########"portable"########,
         ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit HERMIT_LITEINST_STAGE_DIR=$PWD/target/validate ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit HERMIT_LITEINST_STAGE_DIR=$PWD/target/validate ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced --test external_signal_interrupt -j 1"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
-        integration_test_binaries: Some(&[r########"liteinst_advanced"########]),
+        integration_test_binaries: Some(&[
+            r########"liteinst_advanced"########,
+            r########"external_signal_interrupt"########,
+        ]),
         deps: &[
             r########"build.e2e_artifact"########,
             r########"setup.nextest"########,

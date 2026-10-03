@@ -180,6 +180,28 @@ pub struct Config {
     #[clap(skip = true)]
     pub backend_supports_parked_write_signal_interruption: bool,
 
+    /// The backend runs the guest as real host threads whose signal state the kernel
+    /// owns and reports in `/proc`, and resumes a Tool's restart errno through the
+    /// kernel's own signal-delivery and syscall-restart path. Blocking waits then
+    /// decide signal interruption from the guest's real mask and dispositions
+    /// (https://github.com/rrnewton/hermit/issues/3146). Off by default: only the
+    /// backends measured to honor that contract opt in.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_supports_blocked_wait_signal_interruption: bool,
+
+    /// The backend can complete an intercepted syscall without the kernel's
+    /// syscall-return path, so a restart errno (`ERESTARTSYS`, `ERESTARTNOINTR`,
+    /// `ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`) that a Tool returns can reach the
+    /// guest unconverted. LiteInst does this at a call site it has already patched:
+    /// reverie's `handle_injected_syscall` writes the Tool's result straight into
+    /// the guest's register frame. Detcore then applies Linux's restart rules
+    /// itself for a call that arrived that way
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_may_skip_kernel_syscall_restart: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1125): Review backend-owned capability-control prctls.
     /// The execution backend virtualizes capability bounding-set and ambient-capability state.
@@ -1478,6 +1500,8 @@ mod tests {
         assert!(config.backend_runs_exit_robust_list);
         assert!(!config.backend_requires_thread_directed_process_signals);
         assert!(config.backend_supports_parked_write_signal_interruption);
+        assert!(!config.backend_supports_blocked_wait_signal_interruption);
+        assert!(!config.backend_may_skip_kernel_syscall_restart);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
     }

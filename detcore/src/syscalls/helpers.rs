@@ -16,6 +16,7 @@ use reverie::Guest;
 use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
+use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
@@ -32,11 +33,14 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
 use crate::syscalls::threads::WaitSignalDisposition;
 use crate::syscalls::threads::block_signals_for_disposition;
 use crate::syscalls::threads::blocked_signal_mask;
+use crate::syscalls::threads::eligible_pending_signals;
+use crate::syscalls::threads::read_kernel_signal_state;
 use crate::syscalls::threads::restore_signals_after_disposition;
 use crate::syscalls::threads::wait_signal_disposition;
 use crate::tool_global::ResumeStatus;
@@ -954,6 +958,22 @@ pub trait NonblockableSyscall: SyscallInfo {
         Errno::ERESTARTSYS
     }
 
+    /// Return the errno for an interrupting signal that ends this wait after it began,
+    /// on a backend that decides interruption from the kernel's signal state
+    /// (`backend_supports_blocked_wait_signal_interruption`). The kernel applies the
+    /// guest's disposition to it on resume, so it must be the restart code Linux uses
+    /// for this call: a handler then turns it into `EINTR` or a restart, and a signal
+    /// with no handler restarts the call.
+    fn kernel_restart_errno(&self) -> Errno {
+        self.signal_interrupt_errno()
+    }
+
+    /// Signals the wait itself accepts rather than being interrupted by, read from
+    /// guest memory. Only `rt_sigtimedwait` has any.
+    fn signals_consumed_by_wait<M: MemoryAccess>(&self, _memory: &M) -> KernelSigset {
+        0
+    }
+
     /// Convert a physical nonblocking completion into the result expected by the guest.
     /// `retried` is true after a prior result was classified as blocked.
     fn normalize_nonblocking_result(
@@ -1004,6 +1024,12 @@ impl NonblockableSyscall for reverie::syscalls::Poll {
     fn signal_interrupt_errno(&self) -> Errno {
         Errno::EINTR
     }
+
+    /// Linux ends an interrupted `poll` with a restart code that a handler turns into
+    /// `EINTR` and that restarts the call when no handler runs.
+    fn kernel_restart_errno(&self) -> Errno {
+        Errno::ERESTARTNOHAND
+    }
 }
 
 impl TimeoutableSyscall for reverie::syscalls::Poll {
@@ -1026,6 +1052,12 @@ impl NonblockableSyscall for reverie::syscalls::Ppoll {
 
     fn signal_interrupt_errno(&self) -> Errno {
         Errno::EINTR
+    }
+
+    /// Linux ends an interrupted `ppoll` with a restart code that a handler turns into
+    /// `EINTR` and that restarts the call when no handler runs.
+    fn kernel_restart_errno(&self) -> Errno {
+        Errno::ERESTARTNOHAND
     }
 }
 
@@ -1135,6 +1167,20 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
         // the guest.  With timeout=0, the timeout is what shows that it would have blocked.
         res == Err(Errno::ETIMEDOUT)
     }
+
+    /// Linux restarts an untimed `FUTEX_WAIT` under `SA_RESTART` (`-ERESTARTSYS`), but a
+    /// timed wait returns `-ERESTART_RESTARTBLOCK`, which a handler always turns into
+    /// `EINTR`. `ERESTARTNOHAND` gives a timed wait that outcome for a caught signal and a
+    /// transparent restart otherwise. A restart after a stop signal starts a relative
+    /// timeout again, where Linux's restart block would resume the original deadline
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    fn kernel_restart_errno(&self) -> Errno {
+        if self.timeout().is_some() {
+            Errno::ERESTARTNOHAND
+        } else {
+            Errno::ERESTARTSYS
+        }
+    }
 }
 
 impl TimeoutableSyscall for reverie::syscalls::Futex {
@@ -1161,6 +1207,13 @@ impl NonblockableSyscall for reverie::syscalls::RtSigtimedwait {
 
     fn signal_interrupt_errno(&self) -> Errno {
         Errno::EINTR
+    }
+
+    /// Signals in the wait's own set are accepted by it, not interrupting.
+    fn signals_consumed_by_wait<M: MemoryAccess>(&self, memory: &M) -> KernelSigset {
+        self.set()
+            .and_then(|set| memory.read_value(set.cast::<KernelSigset>()).ok())
+            .unwrap_or(0)
     }
 }
 
@@ -1442,6 +1495,12 @@ where
     G: Guest<Detcore<T>>,
 {
     let maybe_tup = maybe_timeout.map(|t| (t, call.timeout_return_val()));
+    if guest
+        .config()
+        .backend_supports_blocked_wait_signal_interruption
+    {
+        return retry_blocking_wait_with_kernel_signal_state(guest, call, rsrc, maybe_tup).await;
+    }
     // poll/epoll_wait/futex/rt_sigtimedwait keep their existing execution (raw
     // inject_with_retry): their record/replay handling is out of scope for the internal
     // pipe data-ordering fix, and their fds are not necessarily internal pipes.
@@ -1541,6 +1600,316 @@ where
             return res;
         }
     }
+}
+
+/// Retry a blocking wait on a backend that decides signal interruption from the
+/// kernel's signal state (`backend_supports_blocked_wait_signal_interruption`).
+///
+/// A wait ends early only for a signal that would end it natively: one the guest
+/// does not block and that is caught, or whose default action terminates or stops
+/// the process. Ignored, blocked, and default-ignored signals leave the wait
+/// running to its original deadline
+/// (https://github.com/rrnewton/hermit/issues/3146).
+///
+/// The first probe runs under the guest's own mask. If it would block, every
+/// blockable signal is blocked for the rest of the wait, so later probes cannot be
+/// stopped by one and every signal that arrives stays pending in the kernel, where
+/// `/proc` reports it. Each turn classifies the pending set against the guest's
+/// mask and dispositions, and an interrupting signal ends the wait with the call's
+/// restart errno (see `KernelSignalWait::interrupted`). The guest's mask is
+/// restored before returning, so the signal is delivered as the call returns.
+async fn retry_blocking_wait_with_kernel_signal_state<T, G, C>(
+    guest: &mut G,
+    call0: C,
+    rsrc: Resources,
+    maybe_timeout: Option<(LogicalTime, Result<i64, Errno>)>,
+) -> Result<i64, Error>
+where
+    C: NonblockableSyscall + Into<Syscall>,
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let mut signals = KernelSignalWait::new(guest, call0.signals_consumed_by_wait(&guest.memory()));
+    let mut rsrc = rsrc.clone();
+    let (mut call, mut guard) = call0.into_nonblocking(guest).await;
+
+    let result = loop {
+        // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
+        // state below decides whether it ends the wait.
+        let _ = resource_request(guest, rsrc.clone()).await;
+        match signals.interrupted(guest).await {
+            Ok(false) => {}
+            Ok(true) => {
+                let errno = call0.kernel_restart_errno();
+                tracing::trace!(
+                    "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
+                    call.display(&guest.memory()),
+                    errno
+                );
+                break Err(errno.into());
+            }
+            Err(errno) => break Err(errno.into()),
+        }
+        // A plain `inject`, never `inject_with_retry`: see `KernelSignalWait`.
+        let syscall_result = guest.inject(call).await;
+        if let Err(errno) = syscall_result
+            && probe_was_interrupted_by_signal(errno)
+        {
+            tracing::trace!(
+                "retry_nonblocking_syscall: signal stopped the probe of {}: {:?}",
+                call.display(&guest.memory()),
+                errno
+            );
+            break Err(Errno::ERESTARTNOINTR.into());
+        }
+        if !call.syscall_would_have_blocked(syscall_result) {
+            let res = call
+                .normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0)
+                .map_err(|e| e.into());
+            tracing::trace!(
+                "retry_nonblocking_syscall: syscall completed after {} retries: {} = {:?}",
+                rsrc.poll_attempt,
+                call.display(&guest.memory()),
+                res
+            );
+            break res;
+        }
+        if !signals.is_blocking() {
+            // Only one scratch-stack guard may be live, so release the probe's, block
+            // signals from a fresh one, and rebuild the probe.
+            guard = None;
+            if let Err(error) = signals.block(guest, None).await {
+                break Err(error);
+            }
+            (call, guard) = call0.into_nonblocking(guest).await;
+        }
+        rsrc.poll_attempt += 1;
+        if let Some((timeout, timeout_result)) = maybe_timeout {
+            let new_time = thread_observe_time(guest).await;
+            if new_time >= timeout {
+                tracing::trace!(
+                    "Timing out syscall after #{} retries: {}",
+                    rsrc.poll_attempt - 1,
+                    call.display(&guest.memory())
+                );
+                break timeout_result.map_err(|e| e.into());
+            }
+            tracing::trace!(
+                "Retry #{} for syscall due to result {:?}, {} from timeout: {}",
+                rsrc.poll_attempt,
+                syscall_result,
+                timeout - new_time,
+                call.display(&guest.memory())
+            );
+        } else {
+            tracing::trace!(
+                "Retry #{} for syscall due to result {:?}: {}",
+                rsrc.poll_attempt,
+                syscall_result,
+                call.display(&guest.memory())
+            );
+        }
+        record_retry_event(guest, call).await;
+    };
+
+    drop(guard);
+    signals.restore(guest, None).await?;
+    result
+}
+
+/// Signal handling for one blocking wait whose interruption is decided from the
+/// kernel's signal state (`backend_supports_blocked_wait_signal_interruption`).
+///
+/// A wait ends early only for a signal that would end it natively: one the guest
+/// does not block and that is caught, or whose default action terminates or stops
+/// the process. Ignored, blocked, and default-ignored signals leave the wait
+/// running to its original deadline
+/// (https://github.com/rrnewton/hermit/issues/3146).
+///
+/// The first probe runs under the guest's own mask. If it would block, `block`
+/// blocks every blockable signal for the rest of the wait, so later probes cannot
+/// be stopped by one and every signal that arrives stays pending in the kernel,
+/// where `/proc` reports it. `interrupted` classifies the pending set against the
+/// guest's mask and dispositions each turn, and `restore` puts the guest's mask
+/// back before the call returns, so a pending interrupting signal is delivered as
+/// the call returns its restart errno.
+///
+/// Probes use a plain `inject`, never `inject_with_retry`: a signal that stops the
+/// guest around a probe is dequeued from the kernel and held by the backend, and a
+/// retry that is stopped again would replace it. Before the mask is set only a
+/// signal that arrived after the turn's `/proc` read can do that; afterwards only
+/// an unblockable one can. Either way the caller restarts the call
+/// (`ERESTARTNOINTR`) after the backend delivers it. Injecting the mask change
+/// itself is stopped the same way, which is why a signal found pending before the
+/// mask is set ends the wait without another probe. A stop after the probe ran
+/// replaces its result, so a probe that consumed something (an edge-triggered
+/// event, a dequeued signal) loses it; that remains a known gap.
+pub(crate) struct KernelSignalWait {
+    pid: reverie::Pid,
+    tid: reverie::Pid,
+    /// Signals the wait itself consumes (rt_sigtimedwait's set), which never
+    /// interrupt it.
+    consumed: KernelSigset,
+    /// The guest's own mask while the wait runs with every signal blocked.
+    saved_mask: Option<KernelSigset>,
+}
+
+impl KernelSignalWait {
+    pub(crate) fn new<T, G>(guest: &G, consumed: KernelSigset) -> Self
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        Self {
+            pid: guest.pid(),
+            tid: guest.tid(),
+            consumed,
+            saved_mask: None,
+        }
+    }
+
+    /// Whether every blockable signal is blocked for this wait.
+    pub(crate) fn is_blocking(&self) -> bool {
+        self.saved_mask.is_some()
+    }
+
+    /// Whether a signal that would end the wait natively is pending, in which case
+    /// the caller returns the call's restart errno. The guest thread has been
+    /// stopped inside the call since it was intercepted, so such a signal arrived
+    /// while the call was waiting, and Linux returns the restart errno for that.
+    /// Linux would still report sources that were ready when the call began, which
+    /// this check puts behind the signal, as the scheduler's `Signaled` path did.
+    /// A `SIGCHLD` counts only once the scheduler made it eligible
+    /// (`eligible_pending_signals`).
+    pub(crate) async fn interrupted<T, G>(&self, guest: &mut G) -> Result<bool, Errno>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let state = read_kernel_signal_state(self.pid, self.tid)?;
+        let guest_mask = self.saved_mask.unwrap_or(state.blocked);
+        let could_interrupt = state.interrupting(guest_mask) & !self.consumed;
+        let interrupting =
+            eligible_pending_signals(guest, state.pending & could_interrupt, could_interrupt).await;
+        if interrupting != 0 {
+            tracing::trace!(
+                "[tid {}] pending signals {:#x} interrupt a blocking wait",
+                self.tid,
+                interrupting
+            );
+        }
+        Ok(interrupting != 0)
+    }
+
+    /// Block every blockable signal for the rest of the wait. `scratch` is a guest
+    /// cell for the mask when the caller holds the only scratch-stack guard;
+    /// otherwise a fresh guard is taken. A signal that stops the guest around this
+    /// call arrived before the wait blocked, so the mask is put back if it took
+    /// effect and the call restarts.
+    pub(crate) async fn block<'a, T, G>(
+        &mut self,
+        guest: &mut G,
+        scratch: Option<AddrMut<'a, KernelSigset>>,
+    ) -> Result<(), Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let guest_mask = read_kernel_signal_state(self.pid, self.tid)?.blocked;
+        match inject_signal_mask(guest, blocked_signal_mask(), scratch).await {
+            Ok(()) => {
+                self.saved_mask = Some(guest_mask);
+                Ok(())
+            }
+            Err(errno) if probe_was_interrupted_by_signal(errno) => {
+                self.saved_mask = Some(guest_mask);
+                self.restore(guest, scratch).await?;
+                Err(Errno::ERESTARTNOINTR.into())
+            }
+            Err(errno) => Err(errno.into()),
+        }
+    }
+
+    /// Put back the guest's mask, if `block` replaced it. A signal can stop the guest
+    /// around the call, before or after it takes effect, so success is read back
+    /// from the kernel.
+    pub(crate) async fn restore<'a, T, G>(
+        &mut self,
+        guest: &mut G,
+        scratch: Option<AddrMut<'a, KernelSigset>>,
+    ) -> Result<(), Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        const ATTEMPTS: usize = 3;
+        let Some(guest_mask) = self.saved_mask.take() else {
+            return Ok(());
+        };
+        for _ in 0..ATTEMPTS {
+            if read_kernel_signal_state(self.pid, self.tid)?.blocked == guest_mask {
+                return Ok(());
+            }
+            match inject_signal_mask(guest, guest_mask, scratch).await {
+                Ok(()) => return Ok(()),
+                // Stopped by a signal: the read at the top of the loop decides whether
+                // the mask took effect.
+                Err(errno) if probe_was_interrupted_by_signal(errno) => {}
+                Err(errno) => return Err(errno.into()),
+            }
+        }
+        if read_kernel_signal_state(self.pid, self.tid)?.blocked == guest_mask {
+            Ok(())
+        } else {
+            Err(Errno::EIO.into())
+        }
+    }
+}
+
+/// Replace the guest's signal mask with `mask`, written to `scratch` or, when the
+/// caller holds no scratch-stack guard, to a fresh one.
+async fn inject_signal_mask<'a, T, G>(
+    guest: &mut G,
+    mask: KernelSigset,
+    scratch: Option<AddrMut<'a, KernelSigset>>,
+) -> Result<(), Errno>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    fn setmask(cell: Addr<'_, KernelSigset>) -> syscalls::RtSigprocmask {
+        syscalls::RtSigprocmask::new()
+            .with_how(libc::SIG_SETMASK)
+            .with_set(Some(cell.cast()))
+            .with_oldset(None)
+            .with_sigsetsize(KERNEL_SIGSET_SIZE)
+    }
+    match scratch {
+        Some(cell) => {
+            guest.memory().write_value(cell, &mask)?;
+            guest.inject(setmask(cell.into())).await.map(drop)
+        }
+        None => {
+            let mut stack = guest.stack().await;
+            let cell = stack.push(mask);
+            let _guard = stack.commit().map_err(|_| Errno::EFAULT)?;
+            guest.inject(setmask(cell)).await.map(drop)
+        }
+    }
+}
+
+/// Whether an injected call's error means a signal stopped the guest around it
+/// rather than that the call produced a result: the backend's restart errno, or
+/// `EINTR` where a backend runs the call itself. None of these calls blocks.
+pub(crate) fn probe_was_interrupted_by_signal(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::EINTR
+            | Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK
+    )
 }
 
 pub(crate) async fn record_retry_event<G, C, T>(guest: &mut G, call: C)
@@ -1713,6 +2082,42 @@ mod tests {
         assert_eq!(
             reverie::syscalls::Futex::new().signal_interrupt_errno(),
             Errno::ERESTARTSYS
+        );
+    }
+
+    #[test]
+    fn kernel_restart_errno_matches_linux_restart_policy() {
+        // Signal-state interruption hands the kernel the wait's own restart code, so
+        // the guest's disposition decides between a handler's EINTR and a restart
+        // (https://github.com/rrnewton/hermit/issues/3146).
+        assert_eq!(
+            reverie::syscalls::Poll::new().kernel_restart_errno(),
+            Errno::ERESTARTNOHAND
+        );
+        assert_eq!(
+            reverie::syscalls::Ppoll::new().kernel_restart_errno(),
+            Errno::ERESTARTNOHAND
+        );
+        // epoll_wait and sigtimedwait never restart after a handler.
+        assert_eq!(
+            reverie::syscalls::EpollWait::new().kernel_restart_errno(),
+            Errno::EINTR
+        );
+        assert_eq!(
+            reverie::syscalls::RtSigtimedwait::new().kernel_restart_errno(),
+            Errno::EINTR
+        );
+        assert_eq!(
+            reverie::syscalls::Futex::new().kernel_restart_errno(),
+            Errno::ERESTARTSYS
+        );
+        // A timed wait is never restarted after a handler runs.
+        let timeout = reverie::syscalls::Addr::from_raw(0x1000).unwrap();
+        assert_eq!(
+            reverie::syscalls::Futex::new()
+                .with_timeout(Some(timeout))
+                .kernel_restart_errno(),
+            Errno::ERESTARTNOHAND
         );
     }
 

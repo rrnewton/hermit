@@ -40,13 +40,16 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::SchedValue;
+use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::robust_list;
 use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::SigchldEligibilityRequest;
 use crate::tool_global::await_exact_child_physical_exit;
 use crate::tool_global::cancel_exec;
 use crate::tool_global::child_tid_clear_address;
@@ -58,6 +61,7 @@ use crate::tool_global::process_group;
 use crate::tool_global::ready_child_wait;
 use crate::tool_global::resource_request;
 use crate::tool_global::set_child_tid_address;
+use crate::tool_global::sigchld_eligibility;
 use crate::tool_global::thread_is_live;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::wait_for_child_lifecycle;
@@ -640,6 +644,396 @@ where
         ));
     }
     Ok(None)
+}
+
+/// The one-bit kernel sigset for `raw_signal` (1-based), or 0 when out of range.
+pub(crate) fn kernel_sigset_bit(raw_signal: i32) -> KernelSigset {
+    if (1..=KernelSigset::BITS as i32).contains(&raw_signal) {
+        1_u64 << (raw_signal as u32 - 1)
+    } else {
+        0
+    }
+}
+
+/// One thread's signal state as the kernel reports it in
+/// `/proc/<pid>/task/<tid>/status`.
+///
+/// The kernel is the authority for a guest thread's mask, dispositions, and
+/// pending signals on backends that run the guest as real host threads. Reading
+/// the state has no effect on the guest, unlike a probe syscall around which a
+/// signal can be dequeued and held by the backend
+/// (https://github.com/rrnewton/hermit/issues/3146).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct KernelSignalState {
+    /// Signals pending for the thread or its whole thread group (`SigPnd | ShdPnd`).
+    pub(crate) pending: KernelSigset,
+    /// Signals pending on the thread's private queue (`SigPnd`).
+    pub(crate) thread_pending: KernelSigset,
+    /// Signals pending on the thread group's shared queue (`ShdPnd`).
+    pub(crate) shared_pending: KernelSigset,
+    /// The thread's current signal mask (`SigBlk`).
+    pub(crate) blocked: KernelSigset,
+    /// Signals whose disposition is `SIG_IGN` (`SigIgn`).
+    pub(crate) ignored: KernelSigset,
+    /// Signals with a handler installed (`SigCgt`).
+    pub(crate) caught: KernelSigset,
+}
+
+impl KernelSignalState {
+    /// Parse the five signal lines of a `/proc/<pid>/task/<tid>/status` file.
+    pub(crate) fn parse(status: &str) -> Option<Self> {
+        let mut thread_pending = None;
+        let mut shared_pending = None;
+        let mut state = KernelSignalState::default();
+        let mut blocked = None;
+        let mut ignored = None;
+        let mut caught = None;
+        for line in status.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            let slot = match key {
+                "SigPnd" => &mut thread_pending,
+                "ShdPnd" => &mut shared_pending,
+                "SigBlk" => &mut blocked,
+                "SigIgn" => &mut ignored,
+                "SigCgt" => &mut caught,
+                _ => continue,
+            };
+            *slot = Some(KernelSigset::from_str_radix(value.trim(), 16).ok()?);
+        }
+        state.thread_pending = thread_pending?;
+        state.shared_pending = shared_pending?;
+        state.pending = state.thread_pending | state.shared_pending;
+        state.blocked = blocked?;
+        state.ignored = ignored?;
+        state.caught = caught?;
+        Some(state)
+    }
+
+    /// Signals whose delivery, while unblocked in `mask`, ends a blocking wait: a
+    /// caught signal runs its handler, and a `SIG_DFL` signal terminates, dumps
+    /// core, or stops the process. Ignored signals and the default-ignored
+    /// `SIGCHLD`, `SIGCONT`, `SIGURG`, and `SIGWINCH` do not, and neither does the
+    /// backend's own preemption signal.
+    pub(crate) fn interrupting(&self, mask: KernelSigset) -> KernelSigset {
+        let default_ignored = [libc::SIGCHLD, libc::SIGCONT, libc::SIGURG, libc::SIGWINCH]
+            .into_iter()
+            .fold(0, |set, signal| set | kernel_sigset_bit(signal));
+        let default_action = !(self.ignored | self.caught);
+        (self.caught | (default_action & !default_ignored))
+            & !mask
+            & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32)
+    }
+
+    /// Pending signals that would end a blocking wait under the guest's `mask`.
+    pub(crate) fn pending_interrupting(&self, mask: KernelSigset) -> KernelSigset {
+        self.pending & self.interrupting(mask)
+    }
+}
+
+/// Read `tid`'s signal state from the kernel.
+pub(crate) fn read_kernel_signal_state(pid: Pid, tid: Pid) -> Result<KernelSignalState, Errno> {
+    let path = format!("/proc/{}/task/{}/status", pid.as_raw(), tid.as_raw());
+    let status = std::fs::read_to_string(path).map_err(|_| Errno::ESRCH)?;
+    KernelSignalState::parse(&status).ok_or(Errno::EIO)
+}
+
+/// Whether the scheduler tracks which pending `SIGCHLD`s a gated wait may count.
+/// This must match the scheduler's own condition (`Scheduler::sigchld_eligibility`).
+pub(crate) fn sigchld_eligibility_is_tracked<T, G>(guest: &G) -> bool
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let config = guest.config();
+    config.sequentialize_threads && config.backend_supports_blocked_wait_signal_interruption
+}
+
+/// The part of a gated wait's `pending` set that may interrupt it, given the
+/// signals that could (`interrupting`): `pending` without a `SIGCHLD` that the
+/// scheduler has not made eligible
+/// (https://github.com/rrnewton/hermit/issues/3146).
+///
+/// The kernel posts `SIGCHLD` to a parent when a child exits, at a moment set by
+/// host timing, so `/proc` can report one that the schedule has not reached yet.
+/// The scheduler makes a `SIGCHLD` eligible at its own ordering points: a guest
+/// send in the sender's turn, its own `ChildExit` send at a granted
+/// `exit_group`'s time, and the logical death of a child that had no
+/// `ChildExit` send. Only those count here. The rest stay pending in the kernel
+/// and are delivered when the wait ends.
+///
+/// The scheduler is asked whenever `SIGCHLD` could interrupt the wait, pending or
+/// not, so whether the question is asked depends only on the guest's mask and
+/// dispositions, never on when the host posted the signal. See the `SIGCHLD`
+/// eligibility section of `Scheduler` for why the answer is deterministic.
+pub(crate) async fn eligible_pending_signals<G, T>(
+    guest: &mut G,
+    pending: KernelSigset,
+    interrupting: KernelSigset,
+) -> KernelSigset
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let sigchld = kernel_sigset_bit(libc::SIGCHLD);
+    if interrupting & sigchld == 0 || !sigchld_eligibility_is_tracked(guest) {
+        return pending;
+    }
+    let thread = guest.thread_state().dettid;
+    let request = SigchldEligibilityRequest::Take {
+        thread,
+        pending: pending & sigchld != 0,
+    };
+    if sigchld_eligibility(guest, request).await {
+        pending
+    } else {
+        if pending & sigchld != 0 {
+            trace!(
+                "[detcore, dtid {}] a pending SIGCHLD is not eligible yet; it does not interrupt the wait",
+                thread
+            );
+        }
+        pending & !sigchld
+    }
+}
+
+/// The signal a thread's return to user mode delivers first, as Linux's
+/// `get_signal` picks it: see [`first_delivered_signal`].
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FirstDelivery {
+    /// A caught signal: its handler runs.
+    Handler(i32),
+    /// A `SIG_DFL` signal whose default action terminates the process.
+    Fatal,
+    /// Nothing: every pending, unblocked signal is ignored or stops the thread.
+    Nothing,
+}
+
+/// What Linux does with a syscall that returned a kernel restart errno.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RestartOutcome {
+    /// The call returns `EINTR`.
+    Interrupt,
+    /// The call is executed again.
+    Restart,
+}
+
+/// The kernel's restart errnos (`include/linux/errno.h`), which never reach user
+/// space through the kernel's own syscall-return path.
+pub(crate) fn is_kernel_restart_errno(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK
+    )
+}
+
+/// The signal Linux delivers first to a thread returning to user mode, given
+/// the signals pending and unblocked on its private queue (`thread`) and on its
+/// thread group's shared queue (`shared`), and the dispositions in `state`.
+///
+/// `get_signal` dequeues from the private queue first, then the shared one, and
+/// within a queue takes a synchronous signal (`SIGSEGV`, `SIGBUS`, `SIGILL`,
+/// `SIGTRAP`, `SIGFPE`, `SIGSYS`) first and otherwise the lowest number
+/// (`next_signal`). It discards an ignored or default-ignored signal, stops the
+/// thread for a default-stop one, and goes on to the next. The first caught or
+/// default-fatal signal decides. The backend's own preemption signal is never
+/// the guest's.
+pub(crate) fn first_delivered_signal(
+    thread: KernelSigset,
+    shared: KernelSigset,
+    state: &KernelSignalState,
+) -> FirstDelivery {
+    let bits = |signals: &[i32]| {
+        signals
+            .iter()
+            .fold(0, |set, &signal| set | kernel_sigset_bit(signal))
+    };
+    let synchronous = bits(&[
+        libc::SIGSEGV,
+        libc::SIGBUS,
+        libc::SIGILL,
+        libc::SIGTRAP,
+        libc::SIGFPE,
+        libc::SIGSYS,
+    ]);
+    let default_skipped = bits(&[
+        libc::SIGCHLD,
+        libc::SIGCONT,
+        libc::SIGURG,
+        libc::SIGWINCH,
+        libc::SIGSTOP,
+        libc::SIGTSTP,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+    ]);
+    let preemption = kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32);
+    for queue in [thread & !preemption, shared & !preemption] {
+        let ordered = (1..=KernelSigset::BITS as i32)
+            .filter(|signal| synchronous & kernel_sigset_bit(*signal) != 0)
+            .chain(
+                (1..=KernelSigset::BITS as i32)
+                    .filter(|signal| synchronous & kernel_sigset_bit(*signal) == 0),
+            );
+        for signal in ordered {
+            let bit = kernel_sigset_bit(signal);
+            if queue & bit == 0 {
+                continue;
+            }
+            if state.caught & bit != 0 {
+                return FirstDelivery::Handler(signal);
+            }
+            if state.ignored & bit != 0 || default_skipped & bit != 0 {
+                continue;
+            }
+            return FirstDelivery::Fatal;
+        }
+    }
+    FirstDelivery::Nothing
+}
+
+/// Linux's decision for a syscall that returned `errno`, a kernel restart
+/// errno, when `first` is delivered as it returns (`arch_do_signal_or_restart`
+/// and `handle_signal`): a handler turns `ERESTARTNOHAND` and
+/// `ERESTART_RESTARTBLOCK` into `EINTR`, and `ERESTARTSYS` into `EINTR` unless
+/// the handler has `SA_RESTART` (`handler_restarts`); `ERESTARTNOINTR` always
+/// restarts. With no handler to run, every one of them restarts. A fatal signal
+/// ends the process, so the value is never seen.
+pub(crate) fn restart_outcome(
+    errno: Errno,
+    first: FirstDelivery,
+    handler_restarts: bool,
+) -> RestartOutcome {
+    match (errno, first) {
+        (Errno::ERESTARTNOINTR, _) | (_, FirstDelivery::Nothing) => RestartOutcome::Restart,
+        (Errno::ERESTARTSYS, FirstDelivery::Handler(_)) if handler_restarts => {
+            RestartOutcome::Restart
+        }
+        _ => RestartOutcome::Interrupt,
+    }
+}
+
+/// Complete a syscall whose handler returned a kernel restart errno, on a
+/// backend that finished it without the kernel's syscall-return path
+/// (`backend_may_skip_kernel_syscall_restart`, https://github.com/rrnewton/hermit/issues/3146).
+///
+/// Where the kernel's syscall-return path runs, it turns such an errno into
+/// `EINTR` or a restart as it delivers the pending signal. LiteInst takes that
+/// path only for a site's first execution, a ptrace stop. A site it has
+/// patched traps into the backend, which writes the result into the guest's
+/// frame and resumes after the syscall instruction, so a restart errno would
+/// reach the guest as a return value (errno 512 or 514, which glibc's
+/// `sem_timedwait` aborts on). The injected route is recognised by its
+/// registers: the backend reports the syscall number in both `rax` and
+/// `orig_rax` until the result is set, where a ptrace syscall stop reports
+/// `-ENOSYS` in `rax`.
+///
+/// This decides what the kernel would: it reads the thread's pending signals,
+/// mask and dispositions, in the thread's own turn, and applies Linux's rules
+/// ([`first_delivered_signal`], [`restart_outcome`]). A `SIGCHLD` counts only
+/// if the scheduler made it eligible, as for a gated wait. An interrupt returns
+/// `EINTR`, and the kernel still delivers the signal as the thread resumes. A
+/// restart cannot re-execute the call, because the backend resumes after the
+/// syscall instruction: a futex wait returns 0, a wakeup futex(2) allows and
+/// every caller re-checks, and any other call returns `EINTR`, where Linux
+/// would re-run the call in both cases.
+/// https://github.com/rrnewton/hermit/issues/3403 tracks handing the restart to
+/// a backend that can re-run the call, which also retires the register test
+/// above.
+pub(crate) async fn complete_skipped_syscall_restart<G, T>(
+    guest: &mut G,
+    call: &Syscall,
+    res: Result<i64, Error>,
+) -> Result<i64, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let errno = match res {
+        Err(Error::Errno(errno)) if is_kernel_restart_errno(errno) => errno,
+        other => return other,
+    };
+    let regs = guest.regs().await;
+    if regs.rax != regs.orig_rax {
+        // A ptrace syscall stop: the kernel's return path applies the errno.
+        return Err(Error::Errno(errno));
+    }
+    let dettid = guest.thread_state().dettid;
+    let first = match read_kernel_signal_state(guest.pid(), guest.tid()) {
+        Ok(state) => {
+            let unblocked = !state.blocked;
+            let candidates = state.pending & unblocked;
+            // `eligible_pending_signals` asks the scheduler whenever a caught,
+            // unblocked `SIGCHLD` could be delivered, pending or not, so whether
+            // it asks does not depend on when the host posted one.
+            let counted =
+                eligible_pending_signals(guest, candidates, state.caught & unblocked).await;
+            first_delivered_signal(
+                state.thread_pending & counted,
+                state.shared_pending & counted,
+                &state,
+            )
+        }
+        Err(read_errno) => {
+            debug!(
+                "[detcore, dtid {}] cannot read the signal state to complete {:?} ({}); reporting EINTR",
+                dettid, errno, read_errno
+            );
+            FirstDelivery::Fatal
+        }
+    };
+    let handler_restarts = match (errno, first) {
+        (Errno::ERESTARTSYS, FirstDelivery::Handler(signal)) => {
+            handler_has_sa_restart(guest, signal).await
+        }
+        _ => false,
+    };
+    let outcome = restart_outcome(errno, first, handler_restarts);
+    let futex_wait = matches!(
+        call,
+        Syscall::Futex(futex)
+            if matches!(futex.futex_op() & libc::FUTEX_CMD_MASK, libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET)
+    );
+    let completed = match outcome {
+        RestartOutcome::Interrupt => Err(Error::Errno(Errno::EINTR)),
+        RestartOutcome::Restart if futex_wait => Ok(0),
+        RestartOutcome::Restart => Err(Error::Errno(Errno::EINTR)),
+    };
+    trace!(
+        "[detcore, dtid {}] completed {:?} on the injected route: first delivery {:?}, {:?} -> {:?}",
+        dettid, errno, first, outcome, completed
+    );
+    completed
+}
+
+/// Whether `signal`'s handler has `SA_RESTART`, read through an injected
+/// `rt_sigaction`. A failed read answers no, which reports `EINTR`: what the
+/// kernel returns for a handler without the flag.
+async fn handler_has_sa_restart<G, T>(guest: &mut G, signal: i32) -> bool
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let action_addr = stack.reserve::<KernelSigaction>();
+    let Ok(_guard) = stack.commit() else {
+        return false;
+    };
+    let call = syscalls::RtSigaction::new()
+        .with_signum(signal)
+        .with_action(None)
+        .with_old_action(Some(action_addr.cast()))
+        .with_sigsetsize(std::mem::size_of::<u64>());
+    if guest.inject_with_retry(call).await.is_err() {
+        return false;
+    }
+    guest
+        .memory()
+        .read_value(action_addr)
+        .is_ok_and(|action: KernelSigaction| action.flags & libc::SA_RESTART as u64 != 0)
 }
 
 pub(super) fn blocked_signal_mask() -> KernelSigset {
@@ -1308,6 +1702,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 {
                     SchedValue::Value(num) => num,
                     SchedValue::TimeOut => panic!("impossible, futex wake doesn't have a timeout"),
+                    SchedValue::Signaled => panic!("impossible, futex wake is never signaled"),
                 };
                 // AUTONOMOUS-BOT-IMPLEMENTED
                 // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
@@ -1346,42 +1741,150 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let maybe_timeout_lt = self
                         .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
                         .await?;
-                    let ans = futex_action(
-                        guest,
-                        FutexAction::WaitRequest(maybe_timeout_lt),
-                        &futexid,
-                        init_val,
-                        bitset,
-                    )
-                    .await;
-                    let res = if ans != Some(SchedValue::TimeOut) {
-                        let expected = call.val();
-                        // AUTONOMOUS-BOT-IMPLEMENTED
-                        // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
-                        match guest.memory().read_value(ptr) {
-                            Ok(observed) => {
+                    let signal_interruption = guest
+                        .config()
+                        .backend_supports_blocked_wait_signal_interruption;
+                    // Whether this wait was woken for a signal and is checking again.
+                    let mut rewait = false;
+                    // Whether a wait request reached the scheduler. A wait that
+                    // ends before its first one, on a pending signal or a failed
+                    // read, sends no `WaitFinished`, as before.
+                    let mut requested = false;
+                    let res = loop {
+                        if rewait {
+                            // The scheduler woke this wait for a signal, and the check
+                            // below decides, in this thread's own turn, whether one is
+                            // still pending for it. While the wait was off the waiter
+                            // list a `FUTEX_WAKE` could not reach it, so a changed value
+                            // ends it first as a wakeup, which futex(2) allows; a signal
+                            // still pending is then delivered as the call returns, as
+                            // when a wake and a signal race on Linux. An unreadable word
+                            // goes on to the check: a Linux waiter the signal never
+                            // reached would still be asleep, not rereading the word.
+                            if let Ok(observed) = guest.memory().read_value(ptr)
+                                && observed != call.val()
+                            {
                                 trace!(
-                                    "[detcore, dtid {}] after (emulated) futex wait, memory value is {}, expected {}",
-                                    &dettid, observed, expected,
+                                    "[detcore, dtid {}] futex value changed while its wait was woken for a signal ({} != {}); returning as woken",
+                                    &dettid,
+                                    observed,
+                                    call.val()
                                 );
-                                if expected == observed {
-                                    debug!(
-                                        "WARNING: fishy that the futex value did not change before wakeup. Weird application-level protocol.\n"
-                                    );
-                                }
+                                break Ok(0);
                             }
-                            Err(error) => trace!(
-                                "[detcore, dtid {}] skipped post-wait futex memory diagnostic: {}",
-                                &dettid, error,
-                            ),
                         }
-                        Ok(0)
-                    } else {
-                        trace!("[detcore, dtid {}] futex wait timed out", &dettid);
-                        Err(Error::Errno(Errno::ETIMEDOUT))
-                    };
-                    futex_action(guest, FutexAction::WaitFinished, &futexid, init_val, bitset)
+                        // On a backend whose kernel reports the guest's signal state,
+                        // a blocked, ignored, or default-ignored signal leaves the wait
+                        // parked until its wakeup or its original deadline. As in
+                        // Linux, one already pending when the value matches ends the
+                        // wait at once with the futex's restart errno; a `SIGCHLD`
+                        // counts only once the scheduler made it eligible
+                        // (`eligible_pending_signals`).
+                        //
+                        // The same check decides a wait the scheduler woke for a
+                        // signal. The scheduler commits such a wake without this
+                        // thread running, and queues the thread to run next so that it
+                        // is the thread that dequeues the signal. Checking again here,
+                        // in the thread's own turn, keeps the restart errno for a
+                        // signal the kernel will deliver to this thread as the call
+                        // returns. If another thread took the signal first (a chaos
+                        // schedule can run one ahead) or it became ignored, the wait
+                        // parks again with its original absolute deadline, as a Linux
+                        // waiter the signal never reached is still waiting: an expired
+                        // deadline ends it at the scheduler's next timed pop with
+                        // ETIMEDOUT. Returning the restart errno with nothing to
+                        // deliver would instead have leaked it to the guest, or
+                        // restarted the call with a fresh timeout.
+                        //
+                        // The scheduler is given only the mask, which only this thread
+                        // can change and so cannot change while it is parked. A sibling
+                        // can change the dispositions at any time, so the scheduler
+                        // reads them when it commits a wake, not here
+                        // (https://github.com/rrnewton/hermit/issues/3146).
+                        let signal_watch = if signal_interruption {
+                            let state = match read_kernel_signal_state(guest.pid(), guest.tid()) {
+                                Ok(state) => state,
+                                Err(errno) => break Err(Error::Errno(errno)),
+                            };
+                            let interrupting = state.interrupting(state.blocked);
+                            let pending = eligible_pending_signals(
+                                guest,
+                                state.pending_interrupting(state.blocked),
+                                interrupting,
+                            )
+                            .await;
+                            if pending != 0 {
+                                let errno = call.kernel_restart_errno();
+                                trace!(
+                                    "[detcore, dtid {}] futex wait interrupted by pending signals {:#x}: {:?}",
+                                    &dettid, pending, errno
+                                );
+                                break Err(Error::Errno(errno));
+                            }
+                            Some(FutexSignalWatch {
+                                unblocked: !state.blocked
+                                    & !kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                                pid: guest.pid().as_raw(),
+                                tid: guest.tid().as_raw(),
+                            })
+                        } else {
+                            None
+                        };
+                        if rewait {
+                            debug!(
+                                "[detcore, dtid {}] futex wait woken for a signal that is not pending for it; waiting again until {:?}",
+                                &dettid, maybe_timeout_lt
+                            );
+                        }
+                        requested = true;
+                        let ans = futex_action(
+                            guest,
+                            FutexAction::WaitRequest(maybe_timeout_lt, signal_watch),
+                            &futexid,
+                            init_val,
+                            bitset,
+                        )
                         .await;
+                        if signal_interruption && ans == Some(SchedValue::Signaled) {
+                            // The scheduler ended the wait for a signal that
+                            // interrupted it under the dispositions the kernel held
+                            // when the wake was committed. The check at the top of the
+                            // loop decides, in this thread's turn, whether it is still
+                            // pending here.
+                            rewait = true;
+                            continue;
+                        }
+                        break if ans != Some(SchedValue::TimeOut) {
+                            let expected = call.val();
+                            // AUTONOMOUS-BOT-IMPLEMENTED
+                            // TODO-HUMAN-REVIEW(#845): Review exited-thread futex diagnostics.
+                            match guest.memory().read_value(ptr) {
+                                Ok(observed) => {
+                                    trace!(
+                                        "[detcore, dtid {}] after (emulated) futex wait, memory value is {}, expected {}",
+                                        &dettid, observed, expected,
+                                    );
+                                    if expected == observed {
+                                        debug!(
+                                            "WARNING: fishy that the futex value did not change before wakeup. Weird application-level protocol.\n"
+                                        );
+                                    }
+                                }
+                                Err(error) => trace!(
+                                    "[detcore, dtid {}] skipped post-wait futex memory diagnostic: {}",
+                                    &dettid, error,
+                                ),
+                            }
+                            Ok(0)
+                        } else {
+                            trace!("[detcore, dtid {}] futex wait timed out", &dettid);
+                            Err(Error::Errno(Errno::ETIMEDOUT))
+                        };
+                    };
+                    if requested {
+                        futex_action(guest, FutexAction::WaitFinished, &futexid, init_val, bitset)
+                            .await;
+                    }
                     res
                 }
             }
@@ -2613,7 +3116,7 @@ where
         {
             Some(SchedValue::Value(count)) => count,
             // A wake never carries a timeout, and a cancelled RPC wakes nobody.
-            Some(SchedValue::TimeOut) | None => 0,
+            Some(SchedValue::TimeOut) | Some(SchedValue::Signaled) | None => 0,
         };
         // Guest-level identities only: dettid, the modeled futex key, and a
         // count. No host pointers and no iteration order leak into this line,
@@ -2845,6 +3348,200 @@ mod tests {
             report.read_to_string(&mut aggregate).unwrap();
             assert_eq!(aggregate, if reported { "execveat\n" } else { "" });
         }
+    }
+
+    fn bits(signals: &[i32]) -> KernelSigset {
+        signals
+            .iter()
+            .fold(0, |set, &signal| set | kernel_sigset_bit(signal))
+    }
+
+    #[test]
+    fn kernel_signal_state_parses_proc_status() {
+        let status = "Name:\tguest\nSigQ:\t1/1024\nSigPnd:\t0000000000000200\n\
+                      ShdPnd:\t0000000000000400\nSigBlk:\t0000000000000800\n\
+                      SigIgn:\t0000000000001000\nSigCgt:\t0000000000000400\n";
+        assert_eq!(
+            KernelSignalState::parse(status),
+            Some(KernelSignalState {
+                pending: bits(&[libc::SIGUSR1, libc::SIGSEGV]),
+                thread_pending: bits(&[libc::SIGUSR1]),
+                shared_pending: bits(&[libc::SIGSEGV]),
+                blocked: bits(&[libc::SIGUSR2]),
+                ignored: bits(&[libc::SIGPIPE]),
+                caught: bits(&[libc::SIGSEGV]),
+            })
+        );
+        // Every line is required: a missing one is not an empty set.
+        assert_eq!(
+            KernelSignalState::parse("SigPnd:\t0\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\n"),
+            None
+        );
+        assert_eq!(
+            KernelSignalState::parse(
+                "SigPnd:\tzz\nShdPnd:\t0\nSigBlk:\t0\nSigIgn:\t0\nSigCgt:\t0\n"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn only_unblocked_caught_or_fatal_signals_interrupt_a_wait() {
+        let state = KernelSignalState {
+            pending: bits(&[
+                libc::SIGUSR1,
+                libc::SIGUSR2,
+                libc::SIGPIPE,
+                libc::SIGTERM,
+                libc::SIGCHLD,
+                libc::SIGWINCH,
+                libc::SIGURG,
+                libc::SIGCONT,
+            ]),
+            blocked: bits(&[libc::SIGUSR2]),
+            ignored: bits(&[libc::SIGPIPE]),
+            caught: bits(&[libc::SIGUSR1, libc::SIGUSR2, libc::SIGWINCH]),
+            ..Default::default()
+        };
+        // Caught and unblocked (SIGUSR1, SIGWINCH) and default-fatal (SIGTERM) end the
+        // wait; blocked (SIGUSR2), ignored (SIGPIPE), and default-ignored ones do not.
+        assert_eq!(
+            state.pending_interrupting(state.blocked),
+            bits(&[libc::SIGUSR1, libc::SIGWINCH, libc::SIGTERM])
+        );
+        // The mask the guest had when the wait began decides, not the current one.
+        assert_eq!(
+            state.pending_interrupting(0),
+            bits(&[libc::SIGUSR1, libc::SIGUSR2, libc::SIGWINCH, libc::SIGTERM])
+        );
+        let interrupting = state.interrupting(state.blocked);
+        assert_ne!(interrupting & kernel_sigset_bit(libc::SIGKILL), 0);
+        assert_ne!(interrupting & kernel_sigset_bit(libc::SIGSTOP), 0);
+        assert_eq!(
+            interrupting & kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+            0
+        );
+        assert_eq!(kernel_sigset_bit(0), 0);
+        assert_eq!(kernel_sigset_bit(65), 0);
+    }
+
+    /// The injected-route completion picks the signal Linux's `get_signal`
+    /// delivers first: private queue before shared, a synchronous signal before
+    /// the lowest number, and ignored, default-ignored and default-stop signals
+    /// passed over (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn first_delivered_signal_follows_get_signal_order() {
+        let state = KernelSignalState {
+            caught: bits(&[libc::SIGUSR1, libc::SIGUSR2, libc::SIGSEGV, libc::SIGCHLD]),
+            ignored: bits(&[libc::SIGPIPE]),
+            ..Default::default()
+        };
+        let none = 0;
+        assert_eq!(
+            first_delivered_signal(none, none, &state),
+            FirstDelivery::Nothing
+        );
+        // Private before shared, even when the shared signal is lower.
+        assert_eq!(
+            first_delivered_signal(bits(&[libc::SIGUSR2]), bits(&[libc::SIGUSR1]), &state),
+            FirstDelivery::Handler(libc::SIGUSR2)
+        );
+        // Synchronous before a lower-numbered signal in the same queue.
+        assert_eq!(
+            first_delivered_signal(bits(&[libc::SIGUSR1, libc::SIGSEGV]), none, &state),
+            FirstDelivery::Handler(libc::SIGSEGV)
+        );
+        // Ignored, default-ignored and default-stop signals are passed over.
+        assert_eq!(
+            first_delivered_signal(
+                bits(&[
+                    libc::SIGPIPE,
+                    libc::SIGWINCH,
+                    libc::SIGURG,
+                    libc::SIGCONT,
+                    libc::SIGTSTP,
+                    libc::SIGTTIN,
+                    libc::SIGTTOU,
+                    libc::SIGSTOP,
+                ]),
+                bits(&[libc::SIGCHLD]),
+                &state
+            ),
+            FirstDelivery::Handler(libc::SIGCHLD)
+        );
+        let default_chld = KernelSignalState { caught: 0, ..state };
+        assert_eq!(
+            first_delivered_signal(none, bits(&[libc::SIGCHLD, libc::SIGTSTP]), &default_chld),
+            FirstDelivery::Nothing
+        );
+        // A default-fatal signal decides before a later caught one.
+        assert_eq!(
+            first_delivered_signal(bits(&[libc::SIGINT, libc::SIGUSR1]), none, &state),
+            FirstDelivery::Fatal
+        );
+        // The backend's preemption signal is never the guest's.
+        assert_eq!(
+            first_delivered_signal(
+                kernel_sigset_bit(reverie::PERF_EVENT_SIGNAL as i32),
+                none,
+                &state
+            ),
+            FirstDelivery::Nothing
+        );
+    }
+
+    /// Linux's restart rules: a handler turns `ERESTARTNOHAND` and
+    /// `ERESTART_RESTARTBLOCK` into `EINTR`, and `ERESTARTSYS` into `EINTR`
+    /// unless it has `SA_RESTART`; `ERESTARTNOINTR` always restarts, and every
+    /// one restarts when no handler runs
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn restart_outcome_follows_the_kernel_restart_rules() {
+        use RestartOutcome::Interrupt;
+        use RestartOutcome::Restart;
+        let handler = FirstDelivery::Handler(libc::SIGUSR1);
+        for (errno, with_handler, with_sa_restart, fatal, nothing) in [
+            (
+                Errno::ERESTARTNOHAND,
+                Interrupt,
+                Interrupt,
+                Interrupt,
+                Restart,
+            ),
+            (
+                Errno::ERESTART_RESTARTBLOCK,
+                Interrupt,
+                Interrupt,
+                Interrupt,
+                Restart,
+            ),
+            (Errno::ERESTARTSYS, Interrupt, Restart, Interrupt, Restart),
+            (Errno::ERESTARTNOINTR, Restart, Restart, Restart, Restart),
+        ] {
+            assert_eq!(
+                restart_outcome(errno, handler, false),
+                with_handler,
+                "{errno:?}"
+            );
+            assert_eq!(
+                restart_outcome(errno, handler, true),
+                with_sa_restart,
+                "{errno:?}"
+            );
+            assert_eq!(
+                restart_outcome(errno, FirstDelivery::Fatal, false),
+                fatal,
+                "{errno:?}"
+            );
+            assert_eq!(
+                restart_outcome(errno, FirstDelivery::Nothing, true),
+                nothing,
+                "{errno:?}"
+            );
+            assert!(is_kernel_restart_errno(errno));
+        }
+        assert!(!is_kernel_restart_errno(Errno::EINTR));
+        assert!(!is_kernel_restart_errno(Errno::ETIMEDOUT));
     }
 
     #[test]

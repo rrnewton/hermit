@@ -188,7 +188,17 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "cli",
         ]),
-        "test.liteinst_strict" | "liteinst.strict" => Some(&[
+        "test.liteinst_strict" => Some(&[
+            "-p",
+            "hermit",
+            "--features",
+            "third-party-backends",
+            "--test",
+            "liteinst_advanced",
+            "--test",
+            "external_signal_interrupt",
+        ]),
+        "liteinst.strict" => Some(&[
             "-p",
             "hermit",
             "--features",
