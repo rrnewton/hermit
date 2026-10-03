@@ -84,10 +84,23 @@ def no_verdict(rc, summary, planned):
     if "imported" not in summary:
         return ("test-harness exited 0 but its summary.json is not an import's, so it ignored "
                 "E2E_IMPORT_RESULTS; judge with the harness staged from this checkout (ci/buck-e2e/stage)")
-    if summary.get("cells") != planned:
+    imported = summary["imported"] if isinstance(summary["imported"], dict) else {}
+    counts = {key: summary.get(key) for key in COUNTS}
+    counts["missing_cells"] = imported.get("missing_cells")
+    absent = [key for key, value in counts.items() if type(value) is not int]
+    if absent:
+        return (f"test-harness exited 0 but its summary.json has no integer {', '.join(absent)}; "
+                "judge with the harness staged from this checkout (ci/buck-e2e/stage)")
+    if summary["cells"] != planned:
         return (f"test-harness exited 0 but its summary.json has {summary.get('cells')} cells and the plan "
                 f"{planned}; judge with the harness and plan of one commit (ci/buck-e2e/stage)")
-    if summary.get("errors") != 0 or summary.get("failed") != summary.get("diagnostic_failures"):
+    outcomes = summary["passed"] + summary["failed"] + summary["errors"] + summary["host_inapplicable"]
+    if outcomes != summary["cells"]:
+        return (f"test-harness exited 0 but its summary.json counts {outcomes} PASS, FAIL, ERROR and "
+                f"HOST-INAPPLICABLE outcomes for {summary['cells']} cells")
+    if counts["missing_cells"] != 0:
+        return f"test-harness exited 0 but its summary.json counts {counts['missing_cells']} imported cells missing"
+    if summary["errors"] != 0 or summary["failed"] != summary["diagnostic_failures"]:
         return (f"test-harness exited 0 but its summary.json counts {summary.get('failed')} FAIL "
                 f"({summary.get('diagnostic_failures')} diagnostic) and {summary.get('errors')} ERROR")
     return None
@@ -162,10 +175,11 @@ def main():
             refuse(f"cannot run {harness}: {error}; stage the inputs (ci/buck-e2e/stage) or pass --harness")
         summary = read_summary(os.path.join(d, "summary.json"))
         counted = summary if summary and "unreadable" not in summary else {}
+        imported = counted.get("imported") if isinstance(counted.get("imported"), dict) else {}
         for key in COUNTS:
-            totals[key] += counted.get(key) or 0
+            totals[key] += counted.get(key) if type(counted.get(key)) is int else 0
         for key in IMPORTED:
-            totals[key] += (counted.get("imported") or {}).get(key) or 0
+            totals[key] += imported.get(key) if type(imported.get(key)) is int else 0
         excused = {junit_name(cell): cell for cell in counted.get("diagnostic_failure_cells") or []}
         for name, cell in sorted(excused.items()):
             print(f"verdict: DIAGNOSTIC {lane}/{category} {name}: a diagnostic cell's product failure "
