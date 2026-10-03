@@ -75,7 +75,7 @@ cells:
   - test: c-programs/fchmodat2-flags
     backends: [kvm, liteinst]
   - test: c-programs/fcntl-owner
-    backends: [liteinst]
+    backends: [kvm, liteinst]
   - test: c-programs/fd-duplication
     backends: [dbt, kvm, liteinst]
   - test: c-programs/file-backed-mmap

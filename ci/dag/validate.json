@@ -1959,6 +1959,13 @@
           "category": "c-programs",
           "test": "c-programs/fcntl-owner",
           "mode": "verify",
+          "backend": "kvm"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fcntl-owner",
+          "mode": "verify",
           "backend": "liteinst"
         },
         {

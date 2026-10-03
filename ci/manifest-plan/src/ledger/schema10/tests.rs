@@ -787,10 +787,11 @@ fn pre_fold_expected_json(expected_json: &str) -> String {
     // https://github.com/rrnewton/reverie/issues/905
     // One ordinary syncfs KVM row joins the same live population:
     // https://github.com/rrnewton/reverie/issues/838
+    // The pipe owner/signal row adds one: https://github.com/rrnewton/reverie/pull/910.
     assert_eq!(
         restored,
-        282 + 6 + 3 + 1 + 1 + 1,
-        "290 portable and 4 privileged folded cells"
+        282 + 6 + 3 + 1 + 1 + 1 + 1,
+        "291 portable and 4 privileged folded cells"
     );
     serde_json::to_string(&expected).unwrap()
 }
@@ -965,7 +966,8 @@ fn generated_plan_populations_preserve_command_policy() {
     // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
     // One epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
     // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-    let total = 900 + compat + select + 6 + 3 + 1 + 1 + 1;
+    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+    let total = 900 + compat + select + 6 + 3 + 1 + 1 + 1 + 1;
     assert!(exact_rng_population(&raw_expected, total));
     let expected_cells = raw_expected.iter().cloned().collect::<BTreeSet<_>>();
     assert_eq!(expected_cells.len(), total);
@@ -1010,7 +1012,8 @@ fn generated_plan_populations_preserve_command_policy() {
         hosted_cells.len(),
         // The new KVM row is also excluded from hosted runs: https://github.com/rrnewton/reverie/issues/905.
         // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-        893 + compat + select + 6 + 3 + 1 + 1 + 1 - (241 + 6 + 3 + 1 + 1 + 1)
+        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+        893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1 - (241 + 6 + 3 + 1 + 1 + 1 + 1)
     );
     assert_eq!(current_hosted.planned_cells().unwrap(), hosted_cells);
     assert_eq!(
@@ -1060,7 +1063,8 @@ fn generated_plan_populations_preserve_command_policy() {
             LAST_LIVE_HOSTED_PARITY_SELECTOR,
             // This pre-exclusion shape also owns the new KVM row: https://github.com/rrnewton/reverie/issues/905.
             // The ordinary syncfs KVM row adds one too: https://github.com/rrnewton/reverie/issues/838.
-            893 + compat + select + 6 + 3 + 1 + 1 + 1,
+            // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+            893 + compat + select + 6 + 3 + 1 + 1 + 1 + 1,
         ),
     ] {
         let mut live = dagrun::select_steps_by_labels(&generated, &[label.to_owned()]).unwrap();
@@ -1181,7 +1185,12 @@ fn generated_plan_populations_preserve_command_policy() {
                 expected_relations.len(),
                 // One epoll-pwait2 KVM relation: https://github.com/rrnewton/reverie/issues/905.
                 // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-                if active { 174 + 6 + 3 + 1 + 1 + 1 } else { 0 }
+                // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+                if active {
+                    174 + 6 + 3 + 1 + 1 + 1 + 1
+                } else {
+                    0
+                }
             );
             assert_eq!(
                 plan.planned_backend_parity_relations().unwrap(),
@@ -1191,7 +1200,8 @@ fn generated_plan_populations_preserve_command_policy() {
                 for (backend, count) in [
                     // The same sole added candidate: https://github.com/rrnewton/reverie/issues/905.
                     // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-                    ("kvm", 75 + 6 + 3 + 1 + 1 + 1),
+                    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
+                    ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1),
                     ("liteinst", 97),
                     ("sabre", 1),
                     ("dbt", 1),
