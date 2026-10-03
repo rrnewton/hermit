@@ -13,6 +13,11 @@ script_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repo_root=$(cd -- "$script_dir/../.." && pwd)
 # shellcheck source=demos/lib/fetch-url.sh
 source "$script_dir/../lib/fetch-url.sh"
+# hermit_tmp_check_paths, hermit_tmp_bind_args, hermit_tmp_is_under: show the
+# launcher, kernel, and initramfs to the guest when they are under /tmp, which
+# Hermit hides from it.
+# shellcheck source=demos/lib/hermit-tmp-binds.sh
+source "$script_dir/../lib/hermit-tmp-binds.sh"
 
 kernel_image=${KERNEL_IMAGE:-}
 # When KERNEL_IMAGE is unset, the demo downloads this exact kernel into the
@@ -34,6 +39,12 @@ command -v hermit >/dev/null 2>&1 || fail \
   "hermit is not on PATH -- build it with 'make -C $repo_root release-core' and run: export PATH=\"$repo_root/target/release:\$PATH\""
 [[ -n $qemu_bin && -x $qemu_bin ]] || fail \
   "qemu-system-x86_64 not found; install it or set QEMU_BIN"
+# Hermit gives the guest a private /tmp. A bind could show it the QEMU binary,
+# but QEMU also reads firmware from the directories it was built for, which a
+# bind of the binary would not show.
+if hermit_tmp_is_under "$qemu_bin"; then
+  fail "QEMU $qemu_bin is under /tmp, which Hermit hides from the program it runs, and QEMU also reads firmware from where it was built or installed; set QEMU_BIN to a QEMU installed outside /tmp"
+fi
 [[ $timeout_seconds =~ ^[1-9][0-9]*$ ]] || fail \
   "DEMO_TIMEOUT_SECONDS must be a positive integer"
 [[ $verify == 0 || $verify == 1 ]] || fail "VERIFY must be 0 or 1"
@@ -50,6 +61,18 @@ if [[ $verify == 1 ]]; then
   command -v jq >/dev/null 2>&1 \
     || fail "VERIFY=1 requires 'jq' to read the typed verdict; install jq or run without VERIFY=1"
 fi
+
+initramfs_image=${INITRAMFS_IMAGE:-$output_dir/initramfs-busybox.cpio.gz}
+
+# Hermit gives the guest a private /tmp, so from a checkout under /tmp the
+# launcher's directory, the kernel, and the initramfs are bound into it below.
+# Refuse a path that cannot be shown to the guest now, before anything is
+# created, downloaded, or built, rather than letting the boot fail on it.
+# Without KERNEL_IMAGE, the kernel is downloaded to $output_dir/bzImage.
+hermit_tmp_check_paths \
+  "Run demo 9 from a checkout outside /tmp or through a path that begins with /tmp/, or set OUTPUT_DIR, KERNEL_IMAGE, and INITRAMFS_IMAGE to paths outside /tmp or to absolute paths that begin with /tmp/." \
+  "$script_dir/boot_qemu.sh" "${kernel_image:-$output_dir/bzImage}" \
+  "$initramfs_image" || exit 1
 
 mkdir -p "$output_dir"
 
@@ -85,7 +108,6 @@ if [[ -z $kernel_image ]]; then
 fi
 [[ -r $kernel_image ]] || fail "kernel image is not readable: $kernel_image"
 
-initramfs_image=${INITRAMFS_IMAGE:-$output_dir/initramfs-busybox.cpio.gz}
 console_log=$output_dir/console.log
 info_log=$output_dir/hermit-info.log
 stderr_log=$output_dir/hermit-stderr.log
@@ -128,6 +150,13 @@ if [[ $verify == 1 ]]; then
   # --verify-strict compares the complete event logs.
   hermit_args+=(--verify --verify-strict --verify-json "$verify_json")
 fi
+# --bind for the launcher's directory, the kernel, and the initramfs when they
+# begin with /tmp/, and nothing for paths outside /tmp; see
+# demos/lib/hermit-tmp-binds.sh. Hermit opens --log-file and writes
+# --verify-json itself, outside the guest, so those need no bind.
+tmp_binds=()
+hermit_tmp_bind_args tmp_binds "$script_dir/boot_qemu.sh" "$kernel_image" "$initramfs_image"
+hermit_args+=("${tmp_binds[@]}")
 hermit_args+=(--)
 
 printf 'backend=ptrace verify=%s log=info relaxations=none\n' \

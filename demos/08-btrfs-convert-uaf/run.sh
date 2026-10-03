@@ -34,6 +34,10 @@ ARTIFACTS="${DEMO08_ARTIFACTS:-$ROOT/target/demos/08-btrfs-convert-uaf}"
 # asan_report: the complete AddressSanitizer report in a run's output.
 # shellcheck source=demos/08-btrfs-convert-uaf/asan-report.sh
 source "$DEMO_DIR/asan-report.sh"
+# hermit_tmp_check_paths, hermit_tmp_bind_args: show the converter its program
+# and image when they are under /tmp, which Hermit hides from it.
+# shellcheck source=demos/lib/hermit-tmp-binds.sh
+source "$DEMO_DIR/../lib/hermit-tmp-binds.sh"
 
 usage() {
   cat <<'EOF'
@@ -130,6 +134,16 @@ fi
   exit 2
 }
 TIMEOUT="${DEMO08_TIMEOUT:-90}"
+# The images that the chaos runs of steps 2 to 4 convert. Hermit gives the
+# converter a private /tmp, so from a checkout under /tmp chaos_convert binds
+# the converter's directory and its image into it; refuse a path it cannot
+# show the converter now, before anything is created or run, rather than
+# letting Hermit fail on it.
+CHAOS_IMG="$ARTIFACTS/chaos-buggy.img"
+FIXED_IMG="$ARTIFACTS/chaos-fixed.img"
+TMP_HINT="Run demo 8 from a checkout outside /tmp or through a path that begins with /tmp/, or set DEMO08_DIR and DEMO08_ARTIFACTS to directories outside /tmp or to absolute paths that begin with /tmp/."
+hermit_tmp_check_paths "$TMP_HINT" "$BUGGY" "$CHAOS_IMG" || exit 2
+hermit_tmp_check_paths "$TMP_HINT" "$FIXED" "$FIXED_IMG" || exit 2
 mkdir -p "$ARTIFACTS"
 
 # btrfs-convert rewrites its image in place, so every run gets a fresh copy.
@@ -171,11 +185,23 @@ complete_asan_uaf() {
 #   --epoch=...         Without it the virtual clock starts at the host's
 #       current time (Hermit prints "source=host-now"), so every run starts
 #       from a different clock.
+#
+# --bind is added only for a converter or image path that begins with /tmp/,
+# so the command line for a checkout outside /tmp has no --bind at all. Hermit
+# gives the converter a private /tmp, and each --bind mounts one host path at
+# the same path inside it: the directory that holds the converter (Hermit
+# cannot start a program that is itself a bind target) and the image file (see
+# demos/lib/hermit-tmp-binds.sh). prepare-assets.sh adds the same binds, so a
+# seed it calibrates in a checkout under /tmp was found with the binds this
+# script replays.
 chaos_convert() {
   local conv="$1" seed="$2" img="$3" out="$4"
+  local -a binds=()
+  hermit_tmp_bind_args binds "$conv" "$img"
   timeout "$TIMEOUT" hermit --log=error run \
     --chaos --sched-seed "$seed" --no-virtualize-cpuid \
     --base-env=minimal --epoch=2026-01-01T00:00:00Z \
+    "${binds[@]}" \
     -- "$conv" "$img" >"$out" 2>&1
 }
 
@@ -227,7 +253,6 @@ echo
 
 # --- Step 2: the chaos buggy run crashes on a known seed ----------------------
 echo "--- Step 2: chaos buggy, --sched-seed $CRASH_SEED (expect an ASAN use-after-free) ---"
-CHAOS_IMG="$ARTIFACTS/chaos-buggy.img"
 fresh_image "$CHAOS_IMG"
 buggy_rc=0
 chaos_convert "$BUGGY" "$CRASH_SEED" "$CHAOS_IMG" "$ARTIFACTS/chaos-buggy.out" \
@@ -265,7 +290,6 @@ echo
 
 # --- Step 3: the chaos fixed run on the same seed is clean --------------------
 echo "--- Step 3: chaos fixed, --sched-seed $CRASH_SEED (expect a clean exit) ---"
-FIXED_IMG="$ARTIFACTS/chaos-fixed.img"
 fresh_image "$FIXED_IMG"
 # This control shows the fix closes the window, so it must both finish and stay
 # clean. Read the output first, which catches a use-after-free at any exit

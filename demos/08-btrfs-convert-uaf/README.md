@@ -103,13 +103,44 @@ hermit --log=error run --chaos --sched-seed "$seed" --no-virtualize-cpuid \
 echo "exit status: $?"
 ```
 
-This is exactly the command `run.sh` runs in its step 2, and it must stay
-that way for the recorded seed to apply:
+For a checkout outside `/tmp`, this is exactly the command `run.sh` runs in
+its step 2, and it must stay that way for the recorded seed to apply:
 
-- Keep the image out of `/tmp`. Hermit gives the program a private, empty
-  `/tmp`, so it cannot see an image you copied there; btrfs-convert then prints
-  `ERROR: ext2fs_open: No such file or directory` and
-  `ERROR: no file system found to convert`, and exits with status 1.
+- Keep the image out of `/tmp`, or bind it as below. Hermit gives the program
+  a private, empty `/tmp`, so it cannot see an image you copied there;
+  btrfs-convert then prints `ERROR: ext2fs_open: No such file or directory`
+  and `ERROR: no file system found to convert`, and exits with status 1. For
+  the same reason Hermit refuses to start a converter under `/tmp`. In a
+  checkout under `/tmp`, `run.sh` and `prepare-assets.sh` therefore add one
+  `--bind` for the directory that holds the converter and one for the image,
+  which mount exactly those host paths at the same paths inside the private
+  `/tmp`; the manual equivalent adds these two lines before `--`:
+
+  ```bash
+    --bind "$PWD/ignored/demo08-btrfs/buggy" \
+    --bind "$PWD/target/demos/08-btrfs-convert-uaf/chaos-buggy.img" \
+  ```
+
+  For a checkout outside `/tmp` the scripts add nothing, so their command line
+  and the seeds recorded with it are unchanged. The converter is bound through
+  its directory because Hermit cannot start a program whose path is itself a
+  `--bind` target: it reports that the program does not exist. `--tmp=/tmp`
+  would also work, but it would show the converter everything in the host's
+  `/tmp` and make all of it an input to the run. The binds add entries to the
+  guest's mount table and the directories leading to them inside the private
+  `/tmp`. The patched build reads no mount table (see
+  [How it works](#how-it-works)). The 117-line mount table in the UUID
+  measurement under [What to notice](#what-to-notice) came from eight extra
+  `--bind` options ([WRITEUP.md](WRITEUP.md)), and with the current harness
+  it printed the same UUID as the 101-line table in all six runs. No run has
+  measured whether the binds change which seeds crash. `prepare-assets.sh`
+  calibrates with the same binds that
+  `run.sh` replays, so moving a checkout into or out of `/tmp` calls for
+  running it again, as any change of path does. The scripts stop before they
+  create a directory, build, or run anything, naming the path and the reason,
+  when a path under `/tmp` cannot be shown this way: for example a path that
+  reaches `/tmp` through a symbolic link, a converter given as a relative
+  path, or a path that contains `:` or a `..` component.
 - Keep the same absolute paths. The paths are the program's arguments, and a
   different argument length shifts the program's memory layout. With seed 7 on
   the reference build, image paths of 75, 85 (the path above), and 104
@@ -389,8 +420,8 @@ Controls (environment variables):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DEMO08_DIR` | `ignored/demo08-btrfs` | Directory holding `buggy/`, `fixed/`, `pop-tiny.img`, and `.crash-seed`. |
-| `DEMO08_ARTIFACTS` | `target/demos/08-btrfs-convert-uaf` | Scratch images and saved reports. |
+| `DEMO08_DIR` | `ignored/demo08-btrfs` | Directory holding `buggy/`, `fixed/`, `pop-tiny.img`, and `.crash-seed`. Under `/tmp`, give an absolute path that begins with `/tmp/`; see [Run it](#run-it). |
+| `DEMO08_ARTIFACTS` | `target/demos/08-btrfs-convert-uaf` | Scratch images and saved reports. Under `/tmp`, give an absolute path that begins with `/tmp/`; see [Run it](#run-it). |
 | `DEMO08_CRASH_SEED` | from `.crash-seed`, else `7` | The chaos seed to use. |
 | `DEMO08_TIMEOUT` | `90` | Seconds allowed per run. `prepare-assets.sh` applies the same limit, so it only records a seed that fits. |
 | `DEMO08_REQUIRE_ASSETS` | `0` | Set to `1` to fail instead of skipping when the assets are missing. |

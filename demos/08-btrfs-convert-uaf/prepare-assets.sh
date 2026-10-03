@@ -43,6 +43,10 @@ DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # asan_report: the complete AddressSanitizer report in a run's output.
 # shellcheck source=demos/08-btrfs-convert-uaf/asan-report.sh
 source "$DEMO_DIR/asan-report.sh"
+# hermit_tmp_check_paths, hermit_tmp_bind_args: show the converter its program
+# and image when they are under /tmp, which Hermit hides from it.
+# shellcheck source=demos/lib/hermit-tmp-binds.sh
+source "$DEMO_DIR/../lib/hermit-tmp-binds.sh"
 ROOT="$(cd "$DEMO_DIR/../.." && pwd)"
 ASSETS="${DEMO08_DIR:-$ROOT/ignored/demo08-btrfs}"
 BUILD_ROOT="${DEMO08_BUILD_ROOT:-$ROOT/ignored/demo08-build}"
@@ -99,6 +103,15 @@ command -v timeout >/dev/null 2>&1 || fail "timeout is required to prepare demo 
     "DEMO08_TIMEOUT=$DEMO_TIMEOUT; a seed calibrated above that budget is cut off by the demo"
 [[ $REFUSAL_RETRIES =~ ^[0-9]+$ ]] || \
   fail "DEMO08_REFUSAL_RETRIES must be a non-negative integer"
+# Calibration runs each converter on its image under Hermit, which gives the
+# converter a private /tmp; run_variant binds the converter's directory and the
+# image into it when they are under /tmp. Refuse a path it cannot show the
+# converter now, before the build, rather than after.
+TMP_HINT="Run demo 8 from a checkout outside /tmp or through a path that begins with /tmp/, or set DEMO08_DIR and DEMO08_ARTIFACTS to directories outside /tmp or to absolute paths that begin with /tmp/."
+hermit_tmp_check_paths "$TMP_HINT" \
+  "$ASSETS/buggy/btrfs-convert" "$ARTIFACTS/chaos-buggy.img" || exit 1
+hermit_tmp_check_paths "$TMP_HINT" \
+  "$ASSETS/fixed/btrfs-convert" "$ARTIFACTS/chaos-fixed.img" || exit 1
 
 # A crashing seed belongs to the exact buggy binary it was found with, so it is
 # stored together with that binary's sha256. A recorded seed whose hash does not
@@ -148,6 +161,7 @@ RUN_UAF=
 run_variant() {
   local variant=$1 seed=$2 image=$3 output=$4
   local rc start engagement=did-not-reach uaf=none
+  local -a binds=()
 
   # Checked explicitly because errexit is suspended here: confirm_seed runs as
   # `if confirm_seed ...`. A failed copy would leave the previous run's
@@ -156,14 +170,17 @@ run_variant() {
     fail "demo 8 could not stage a fresh image for the $variant run on seed $seed:" \
       "copying $ASSETS/pop-tiny.img to $image failed. This is an I/O or environment fault," \
       "not a disagreement between two runs of the same seed."
+  hermit_tmp_bind_args binds "$ASSETS/$variant/btrfs-convert" "$image"
   start=$SECONDS
   set +e
   # The same flags as run.sh's chaos_convert, which explains --base-env=minimal
   # and --epoch: without them the seed recorded here depends on this shell's
-  # environment and on the host clock, and run.sh may not reproduce it.
+  # environment and on the host clock, and run.sh may not reproduce it. It also
+  # explains the --bind options, which are present only for paths under /tmp.
   timeout "$CALIBRATION_TIMEOUT" hermit --log=error run \
     --chaos --sched-seed "$seed" --no-virtualize-cpuid \
     --base-env=minimal --epoch=2026-01-01T00:00:00Z \
+    "${binds[@]}" \
     -- "$ASSETS/$variant/btrfs-convert" "$image" >"$output" 2>&1
   rc=$?
   set -e
