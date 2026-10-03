@@ -93,13 +93,14 @@ const MAX_DYNAMIC_SIZE: usize = 1 << 20;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-3635): Review the ELF startup facts that gate in-guest LiteInst.
-/// Reads [`ElfStartup`] from `path`. Returns `Ok(None)` when the file is not
-/// an ELF image, and an error when it is one whose headers cannot be read.
+/// Reads [`ElfStartup`] from `file`, starting at its beginning whatever its
+/// current offset. Returns `Ok(None)` when the file is not an ELF image, and an
+/// error when it is one whose headers cannot be read.
 #[cfg(feature = "liteinst")]
-pub fn elf_startup(path: &Path) -> std::io::Result<Option<ElfStartup>> {
+pub fn elf_startup(file: &mut fs::File) -> std::io::Result<Option<ElfStartup>> {
     let invalid =
         |what: &str| std::io::Error::new(std::io::ErrorKind::InvalidData, what.to_owned());
-    let mut file = fs::File::open(path)?;
+    file.seek(std::io::SeekFrom::Start(0))?;
     let mut header_bytes = [0; ELF_HEADER_SIZE];
     let mut filled = 0;
     while filled < header_bytes.len() {
@@ -394,7 +395,7 @@ mod tests {
     fn startup_of(bytes: &[u8]) -> Option<ElfStartup> {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         file.write_all(bytes).unwrap();
-        elf_startup(file.path()).unwrap()
+        elf_startup(file.as_file_mut()).unwrap()
     }
 
     #[test]
