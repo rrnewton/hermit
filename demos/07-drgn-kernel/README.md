@@ -88,6 +88,11 @@ RESULT: restored demo 5 boot snapshot; requested_sleep_us=1000; task_lists_diffe
 === Demo 7: drgn Kernel Task Evolution: SUCCESS ===
 ```
 
+Edited by hand: the `RESULT` field `requested_sleep_us` was named
+`fixed_virtual_advance_us` when this output was captured and was renamed on
+2026-10-02; its value 1000 and the rest of the block are as printed then, and
+the block is to be refreshed from the next verified run of this demo.
+
 Elided (`...`): your Hermit version and the path of the `hermit` on your
 `PATH`. Everything from `evolution 1` to `RESULT` was byte-identical in ten
 invocations (twenty passes) on 2026-09-30, from both `run.sh` and `make`, with
