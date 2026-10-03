@@ -4,8 +4,9 @@ A data race may fail once in a thousand runs and then refuse to fail while you
 debug it. Hermit's chaos mode makes thread-scheduling decisions from a seeded
 random number generator: different seeds explore different thread orders, and
 the same seed always reproduces the same order. The demo shows one seed that
-passes and one that fails, surveys 16 seeds, then saves the failing schedule to
-a file and replays exactly that schedule.
+passes and one that fails, surveys 16 seeds, then saves the failing seed's
+schedule to a file and replays the file under the passing seed: the replay
+fails the same way, so the file, not the seed, decides the outcome.
 
 ## Prerequisites
 
@@ -22,9 +23,9 @@ From the repository root:
 demos/03-chaos-concurrency/run.sh
 ```
 
-The same demo runs with `make -C demos demo3`. It takes about 18 to 19 seconds
-once `hello_race` is built; most of that is the 20 Hermit runs, under a second
-each.
+The same demo runs with `make -C demos demo3`. Once `hello_race` is built, it
+took 18 and 23 seconds in two runs on 2026-10-03, on a host with a load average
+of about 190 and 260; most of that is the 20 Hermit runs, about a second each.
 
 To try one seed yourself:
 
@@ -41,12 +42,13 @@ either command again and you get the same result.
 
 ## What you will see
 
-Output of `demos/03-chaos-concurrency/run.sh` on 2026-09-30, with Hermit built
-from commit `dc92644f96f4`. Cargo's build lines are left out. Every Hermit run
-also prints a `hermit: virtual-time epoch=... source=host-now` line on standard
-error (see [demo 1](../01-deterministic-run/README.md#how-it-works)); those lines
-are left out of the first two sections. In the last section their host-clock
-instants are shown as `...`.
+Output of `demos/03-chaos-concurrency/run.sh` on 2026-10-03, with Hermit built
+from commit `b82e83b510a6`. Cargo's build lines and the warning that this Hermit
+was not built from the demo's checkout are left out. Every Hermit run also
+prints a `hermit: virtual-time epoch=... source=host-now` line on standard
+error (see [demo 1](../01-deterministic-run/README.md#how-it-works)); those
+lines are left out of the first two sections. In the last section their
+host-clock instants are shown as `...`.
 
 ```text
 ==========================================
@@ -57,11 +59,11 @@ hello_race contains an intentional data race. Chaos mode makes scheduler
 choices with a seeded PRNG, so different seeds explore different interleavings
 and the same seed reproduces the same result. Seed 1 passes; seed 0 reaches the
 antagonistic schedule and returns the guest's expected failure status. The demo
-surveys seeds 0-15, then records a failing schedule to an artifact and replays
-that exact schedule, confirming the outputs match.
+surveys seeds 0-15, then records seed 0's schedule to a file and replays the
+file under seed 1: the replay fails like the recording, with identical output.
 
 ==========================================
-Using hermit 0.2.0 (2026-09-30, gdc92644f96f4-dirty) (...)
+Using hermit 0.4.0 (2026-10-03, gb82e83b510a6) (...)
 
 === Seed 1 passes; seed 0 reproduces the expected failure ===
 Final value: 2
@@ -92,7 +94,9 @@ failing seeds: 0 5 6 12 15; seeds 0 and 1 repeated their first output byte for b
 === Save and replay the failing schedule ===
 hermit: virtual-time epoch=... source=host-now; reproduce with --epoch=...
 hermit: virtual-time epoch=... source=recording; reproduce with --epoch=...
-recorded and replayed runs both failed, with identical output:
+Seed 1 passes without the file. Replayed under seed 1, the file reproduced the
+recording's failure with identical output, starting the virtual clock at the
+recording's instant (...):
 Final value: 1
 Antagonistic schedule reached, failing.
 
@@ -119,14 +123,21 @@ out here).
   `Antagonistic schedule reached, failing.`. Any other exit status, or a run
   that prints nothing, stops the demo, so a Hermit error cannot pass for the
   expected failure.
-- The last step records the failing run's thread switches with
-  `--record-preemptions-to=FILE`, replays them with
-  `--replay-preemptions-from=FILE`, requires both runs to reach the failing
-  outcome, and checks with `cmp` that the two outputs are identical. The schedule file is kept under `target/demos/` (for this run,
+- The last step records seed 0's failing run with
+  `--record-preemptions-to=FILE` and replays FILE with
+  `--replay-preemptions-from=FILE` under seed 1. It requires both runs to reach
+  the failing outcome and checks with `cmp` that the two outputs are identical.
+  Seed 1 passes without the file (first step), so the failing replay shows
+  that the file, not the seed, chose the failing order. The schedule file is
+  kept under `target/demos/` (for this run,
   `target/demos/hermit-demo.<random>/hello-race-schedule.json`, 187 KB listing
   1,839 scheduling events). The file also stores the virtual clock's starting
-  instant, and the replay reuses it: the second `hermit: virtual-time` line says
-  `source=recording` and shows the same instant as the first.
+  instant, and the replay reuses it: the script checks that the second
+  `hermit: virtual-time` line says `source=recording` and shows the same
+  instant as the first, and stops with an error otherwise. For these two runs
+  the script unsets `HERMIT_EPOCH`, which would give both runs that instant, so
+  the replay would not take it from the file, and `HERMIT_LOG_FILE`, which
+  would move that line from standard error into the log file.
 
 ## How it works
 

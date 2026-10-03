@@ -4,8 +4,9 @@
 #
 # hello_race contains an intentional data race. Chaos mode makes scheduler
 # choices with a seeded PRNG, so different seeds explore different interleavings
-# and the same seed reproduces the same result. A recorded schedule artifact
-# reproduces an exact failure without relying only on the seed.
+# and the same seed reproduces the same result. A schedule recorded from a
+# failing seed reproduces that failure when it is replayed under a seed that
+# passes without it.
 
 set -euo pipefail
 
@@ -19,8 +20,8 @@ echo 'hello_race contains an intentional data race. Chaos mode makes scheduler'
 echo 'choices with a seeded PRNG, so different seeds explore different interleavings'
 echo 'and the same seed reproduces the same result. Seed 1 passes; seed 0 reaches the'
 echo "antagonistic schedule and returns the guest's expected failure status. The demo"
-echo 'surveys seeds 0-15, then records a failing schedule to an artifact and replays'
-echo 'that exact schedule, confirming the outputs match.'
+echo "surveys seeds 0-15, then records seed 0's schedule to a file and replays the"
+echo 'file under seed 1: the replay fails like the recording, with identical output.'
 echo ''
 echo '=========================================='
 
@@ -106,9 +107,25 @@ echo "failing seeds: ${failing_seeds[*]}; seeds 0 and 1 repeated their first out
 demo_banner "Save and replay the failing schedule"
 export CHAOS_SCHEDULE="$DEMO_ARTIFACTS/hello-race-schedule.json"
 
-# Both runs must reach the failing order: exit status 1 and FAIL_LINE.
+# virtual_time_fields STDERR_FILE: print "EPOCH SOURCE" from the line
+# "hermit: virtual-time epoch=EPOCH source=SOURCE; reproduce with --epoch=EPOCH"
+# that Hermit writes to stderr when a run starts.
+virtual_time_fields() {
+  sed -n -E 's/^hermit: virtual-time epoch=([^ ;]+) source=([a-z-]+); reproduce with --epoch=\1$/\1 \2/p' "$1"
+}
+
+# Record seed 0's failing run, then replay that file under seed 1. Seed 1
+# passes without the file (first step), so a failing replay shows that the
+# file, not the seed, chose the failing order. Both runs must reach the failing
+# order: exit status 1 and FAIL_LINE.
+#
+# Both runs keep Hermit's stderr in a file, to check that the replay started
+# its virtual clock at the instant stored in the file. HERMIT_EPOCH and
+# HERMIT_LOG_FILE are unset for them: a set HERMIT_EPOCH would give both runs
+# that start, so the replay would not take it from the file, and a set
+# HERMIT_LOG_FILE would move the virtual-time line off stderr.
 status=0
-hermit --log=error run \
+env -u HERMIT_EPOCH -u HERMIT_LOG_FILE hermit --log=error run \
   "${HERMIT_TMP_FLAGS[@]}" \
   --chaos --seed=0 \
   --base-env=minimal \
@@ -116,25 +133,37 @@ hermit --log=error run \
   --max-timeslice=disabled \
   --env=HERMIT_MODE=chaos \
   --record-preemptions-to="$CHAOS_SCHEDULE" \
-  -- "$HELLO_RACE" >"$DEMO_TMP/chaos-recorded.txt" || status=$?
-check_outcome "recording the failing schedule" "$status" \
+  -- "$HELLO_RACE" >"$DEMO_TMP/chaos-recorded.txt" 2>"$DEMO_TMP/chaos-recorded.err" || status=$?
+cat "$DEMO_TMP/chaos-recorded.err" >&2
+check_outcome "recording the failing schedule (seed 0)" "$status" \
   "$DEMO_TMP/chaos-recorded.txt" 1 "$FAIL_LINE"
 test -s "$CHAOS_SCHEDULE"
 
 status=0
-hermit --log=error run \
+env -u HERMIT_EPOCH -u HERMIT_LOG_FILE hermit --log=error run \
   "${HERMIT_TMP_FLAGS[@]}" \
-  --chaos \
+  --chaos --seed=1 \
   --base-env=minimal \
   --no-virtualize-cpuid \
   --max-timeslice=disabled \
   --env=HERMIT_MODE=chaos \
   --replay-preemptions-from="$CHAOS_SCHEDULE" \
-  -- "$HELLO_RACE" >"$DEMO_TMP/chaos-replayed.txt" || status=$?
-check_outcome "replaying the failing schedule" "$status" \
+  -- "$HELLO_RACE" >"$DEMO_TMP/chaos-replayed.txt" 2>"$DEMO_TMP/chaos-replayed.err" || status=$?
+cat "$DEMO_TMP/chaos-replayed.err" >&2
+check_outcome "replaying the failing schedule under seed 1" "$status" \
   "$DEMO_TMP/chaos-replayed.txt" 1 "$FAIL_LINE"
 cmp "$DEMO_TMP/chaos-recorded.txt" "$DEMO_TMP/chaos-replayed.txt"
-echo 'recorded and replayed runs both failed, with identical output:'
+
+recorded_clock="$(virtual_time_fields "$DEMO_TMP/chaos-recorded.err")"
+replayed_clock="$(virtual_time_fields "$DEMO_TMP/chaos-replayed.err")"
+if [ -z "$recorded_clock" ] || [ "$replayed_clock" != "${recorded_clock%% *} recording" ]; then
+  echo "the replay did not start its virtual clock at the instant stored in $CHAOS_SCHEDULE" >&2
+  echo "recording: ${recorded_clock:-no virtual-time line}; replay: ${replayed_clock:-no virtual-time line}" >&2
+  exit 1
+fi
+echo 'Seed 1 passes without the file. Replayed under seed 1, the file reproduced the'
+echo "recording's failure with identical output, starting the virtual clock at the"
+echo "recording's instant (${recorded_clock%% *}):"
 cat "$DEMO_TMP/chaos-replayed.txt"
 
 demo_success
