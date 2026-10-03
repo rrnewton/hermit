@@ -137,19 +137,23 @@ pub struct AcceptEvent {
     pub addr: Vec<u8>,
     /// The peer address length written back, if the guest passed an address.
     pub addr_len: Option<libc::socklen_t>,
-    /// The accepted socket's shape, so replay can reserve the fd with a real,
-    /// unconnected socket on which later live socket calls such as
-    /// `setsockopt` still succeed. `None` if it could not be queried.
+    /// The accepted socket's shape, so replay can reserve the fd with a real
+    /// socket of the same domain, type and protocol. `None` if it could not be
+    /// queried; replay of such a recording refuses rather than guessing.
     pub shape: Option<SocketShape>,
 }
 
-/// Recorded outputs of a successful `recvmmsg`.
+/// Recorded outputs of a successful `recvmmsg`, or of one that received
+/// messages and then failed to write its timeout back.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecvmmsgEvent {
     /// One entry per received message; `RecvmsgEvent::result` is its `msg_len`.
     pub messages: Vec<RecvmsgEvent>,
     /// The remaining timeout written back, if the guest passed one.
     pub timeout: Option<Timespec>,
+    /// Linux received `messages` but could not write the remaining timeout
+    /// back, so the call returned EFAULT after its side effects.
+    pub timeout_fault: bool,
 }
 
 /// Recorded output and signal side effects of a read syscall.

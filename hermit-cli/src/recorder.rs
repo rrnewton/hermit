@@ -592,7 +592,8 @@ impl Tool for Recorder {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3550):
             // record the results replay needs: bind and listen run again live
-            // and must match, while accept and shutdown are replayed from here.
+            // and must match, except on accepted or connected sockets, where
+            // replay returns these results; accept and shutdown always do.
             Syscall::Bind(_) | Syscall::Listen(_) | Syscall::Shutdown(_) => {
                 self.handle_simple(guest, syscall).await
             }

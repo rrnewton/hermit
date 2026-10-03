@@ -375,6 +375,12 @@ impl Replayer {
             write_mmsg_len(&mut guest.memory(), base, index, length)?;
         }
 
+        if event.timeout_fault {
+            // Linux received these messages, then failed to write the
+            // remaining timeout back.
+            assert!(syscall.timeout().is_some());
+            return Err(Errno::EFAULT);
+        }
         assert_eq!(event.timeout.is_some(), syscall.timeout().is_some());
         if let Some(timeout) = event.timeout {
             let address = AddrMut::<Timespec>::from_raw(syscall.timeout().unwrap().as_raw())
@@ -437,7 +443,13 @@ impl Replayer {
             );
         }
 
-        self.reserve_replay_socket(guest, event.fd, event.shape, call.flags())
+        let shape = event.shape.unwrap_or_else(|| {
+            panic!(
+                "recorded accept of fd {} lacks the socket shape replay needs to reserve it",
+                event.fd
+            )
+        });
+        self.reserve_replay_socket(guest, event.fd, shape, call.flags())
             .await;
         Ok(i64::from(event.fd))
     }

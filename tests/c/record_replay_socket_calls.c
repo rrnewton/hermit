@@ -11,7 +11,10 @@
  * (https://github.com/rrnewton/hermit/issues/3550): bind, listen, accept4 with
  * a truncated peer address, shutdown, socketpair, sendmmsg and recvmmsg with
  * SCM_RIGHTS. It also sets options whose result depends on the bound state
- * (IPV6_V6ONLY after bind, AF_ALG's ALG_SET_KEY), which replay runs live.
+ * (IPV6_V6ONLY after bind, AF_ALG's ALG_SET_KEY), which replay runs live, and
+ * IPV6_ADDRFORM, which depends on a connection replay does not make. Two
+ * recvmmsg edge cases return a count or an error after partial side effects:
+ * an unmapped header after the received ones, and a read-only timeout.
  */
 
 #define _GNU_SOURCE
@@ -23,6 +26,7 @@
 #include <netinet/tcp.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -108,6 +112,78 @@ static int batched_messages(void) {
   return 0;
 }
 
+/* Queue `count` datagrams "m0", "m1", ... on a fresh socketpair. */
+static int queued_pair(int sv[2], int count) {
+  CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+  for (int i = 0; i < count; i++) {
+    char payload[3] = {'m', (char)('0' + i), 0};
+    CHECK(send(sv[0], payload, 2, 0) == 2);
+  }
+  return 0;
+}
+
+static void prepare_receive(struct mmsghdr* message, struct iovec* iov,
+                            char* buffer, size_t length) {
+  memset(message, 0, sizeof *message);
+  iov->iov_base = buffer;
+  iov->iov_len = length;
+  message->msg_hdr.msg_iov = iov;
+  message->msg_hdr.msg_iovlen = 1;
+  message->msg_len = 77;
+}
+
+static int partial_side_effects(void) {
+  long page = sysconf(_SC_PAGESIZE);
+  char* pages = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE,
+                     MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  CHECK(pages != MAP_FAILED);
+  CHECK(mprotect(pages + page, page, PROT_NONE) == 0);
+
+  /* Two headers end the readable page; the third is unmapped. */
+  int sv[2];
+  CHECK(queued_pair(sv, 2) == 0);
+  struct mmsghdr* tail = (struct mmsghdr*)(pages + page) - 2;
+  struct iovec iov[2];
+  char buffers[2][8] = {{0}};
+  for (int i = 0; i < 2; i++) {
+    prepare_receive(&tail[i], &iov[i], buffers[i], sizeof buffers[i]);
+  }
+  int received = recvmmsg(sv[1], tail, 4, MSG_DONTWAIT, NULL);
+  printf("recvmmsg unmapped tail %d errno %d lens %u %u data %.2s %.2s\n",
+         received, received < 0 ? errno : 0, tail[0].msg_len, tail[1].msg_len,
+         buffers[0], buffers[1]);
+  /* Linux reports the fault on the next receive. */
+  char next[8];
+  ssize_t result = recv(sv[1], next, sizeof next, MSG_DONTWAIT);
+  printf("next recv %zd errno %d\n", result, result < 0 ? errno : 0);
+  close(sv[0]);
+  close(sv[1]);
+
+  /* Both messages are received before the timeout cannot be written back. */
+  CHECK(queued_pair(sv, 2) == 0);
+  struct timespec* timeout = (struct timespec*)pages;
+  timeout->tv_sec = 5;
+  timeout->tv_nsec = 0;
+  CHECK(mprotect(pages, page, PROT_READ) == 0);
+  struct mmsghdr messages[3];
+  struct iovec message_iov[3];
+  char message_buffers[3][8] = {{0}};
+  for (int i = 0; i < 3; i++) {
+    prepare_receive(&messages[i], &message_iov[i], message_buffers[i],
+                    sizeof message_buffers[i]);
+  }
+  received = recvmmsg(sv[1], messages, 3, MSG_DONTWAIT, timeout);
+  printf(
+      "recvmmsg read-only timeout %d errno %d lens %u %u %u data %.2s %.2s\n",
+      received, received < 0 ? errno : 0, messages[0].msg_len,
+      messages[1].msg_len, messages[2].msg_len, message_buffers[0],
+      message_buffers[1]);
+  close(sv[0]);
+  close(sv[1]);
+  CHECK(munmap(pages, 2 * page) == 0);
+  return 0;
+}
+
 static int tcp_server(void) {
   int listener = socket(AF_INET, SOCK_STREAM, 0);
   CHECK(listener >= 0);
@@ -150,6 +226,53 @@ static int tcp_server(void) {
   printf("read %.4s\n", reply);
   CHECK(shutdown(accepted, SHUT_WR) == 0);
   printf("shutdown accepted ok\n");
+  return 0;
+}
+
+/* IPV6_ADDRFORM converts a connected socket with a v4-mapped peer to AF_INET. */
+static int connected_state_options(void) {
+  int listener = socket(AF_INET6, SOCK_STREAM, 0);
+  if (listener < 0) {
+    printf("ipv6 addrform unavailable errno %d\n", errno);
+    return 0;
+  }
+  struct sockaddr_in6 address = {.sin6_family = AF_INET6};
+  CHECK(inet_pton(AF_INET6, "::ffff:127.0.0.1", &address.sin6_addr) == 1);
+  if (bind(listener, (struct sockaddr*)&address, sizeof address) != 0) {
+    printf("ipv6 addrform bind unavailable errno %d\n", errno);
+    close(listener);
+    return 0;
+  }
+  socklen_t length = sizeof address;
+  CHECK(getsockname(listener, (struct sockaddr*)&address, &length) == 0);
+  CHECK(listen(listener, 1) == 0);
+
+  int client = socket(AF_INET6, SOCK_STREAM, 0);
+  CHECK(client >= 0);
+  CHECK(connect(client, (struct sockaddr*)&address, sizeof address) == 0);
+  int accepted = accept(listener, NULL, NULL);
+  CHECK(accepted >= 0);
+
+  int inet = AF_INET;
+  int on_accepted =
+      setsockopt(accepted, IPPROTO_IPV6, IPV6_ADDRFORM, &inet, sizeof inet);
+  int accepted_errno = on_accepted < 0 ? errno : 0;
+  int on_client =
+      setsockopt(client, IPPROTO_IPV6, IPV6_ADDRFORM, &inet, sizeof inet);
+  int client_errno = on_client < 0 ? errno : 0;
+  int on_listener =
+      setsockopt(listener, IPPROTO_IPV6, IPV6_ADDRFORM, &inet, sizeof inet);
+  printf("ipv6_addrform accepted %d errno %d client %d errno %d listener %d "
+         "errno %d\n",
+         on_accepted, accepted_errno, on_client, client_errno, on_listener,
+         on_listener < 0 ? errno : 0);
+  /* Linux refuses listen on a connected socket. */
+  int relisten = listen(accepted, 1);
+  printf("listen on accepted %d errno %d\n", relisten,
+         relisten < 0 ? errno : 0);
+  close(accepted);
+  close(client);
+  close(listener);
   return 0;
 }
 
@@ -200,7 +323,8 @@ static int bound_state_options(void) {
 }
 
 int main(void) {
-  if (batched_messages() != 0 || tcp_server() != 0 ||
+  if (batched_messages() != 0 || partial_side_effects() != 0 ||
+      tcp_server() != 0 || connected_state_options() != 0 ||
       bound_state_options() != 0) {
     return 1;
   }
