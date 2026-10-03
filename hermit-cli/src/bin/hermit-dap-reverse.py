@@ -250,7 +250,8 @@ def _recording():
 # spends about 60 microseconds unwinding each frame. A full chain therefore
 # makes a forward run cost the square of the stack depth: one continue past a
 # recursion 1000 deep took 121.79 s with the full chain and 4.77 s with the
-# cap (devbig030, GDB 17.2). With the cap the cost per arrival is bounded.
+# cap (GDB 17.2, on the host recorded in docs/TESTING_ENVIRONMENTS.md under
+# "Named measurement hosts"). With the cap the cost per arrival is bounded.
 # hermit_dap_replay_step_back_refuses_an_activation_that_differs_only_at_frame_7
 # in hermit-cli/tests/cli.rs fails with any smaller value, and
 # hermit_dap_replay_continue_through_deep_recursion_is_fast_and_lands_exactly

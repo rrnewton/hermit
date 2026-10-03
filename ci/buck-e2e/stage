@@ -53,8 +53,9 @@ sha=$(git -C "$root" rev-parse HEAD)
 tmp=$(mktemp -d)
 trap 'rm -rf "${tmp:?}"' EXIT
 
-# patchelf sets the staged hermit's runtime search path. Hosts without it (devbig030
-# has no patchelf package) use the static binary from the pinned PyPI wheel, fetched
+# patchelf sets the staged hermit's runtime search path. Hosts without it (the host
+# recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts" has no
+# patchelf package) use the static binary from the pinned PyPI wheel, fetched
 # once into ignored/host-tools/ and checked against its sha256.
 patchelf=${PATCHELF:-$(command -v patchelf || true)}
 if [[ -z $patchelf ]]; then
