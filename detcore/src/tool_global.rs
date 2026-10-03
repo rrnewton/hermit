@@ -33,6 +33,7 @@ use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU16;
 use std::sync::atomic::Ordering::SeqCst;
 use std::task::Poll;
+#[cfg(not(target_os = "none"))]
 use std::time::SystemTime;
 
 use anyhow::bail;
@@ -53,9 +54,6 @@ pub(crate) use parked::signal_dequeued;
 use reverie::GlobalRPC;
 use reverie::GlobalTool;
 use reverie::Guest;
-// Without std, reverie-process's look-alike of nix's type, as in detcore-model.
-#[cfg(target_os = "none")]
-use reverie::Pid;
 use reverie::Signal;
 use reverie::Tid;
 use reverie::syscalls::AddrMut;
@@ -101,6 +99,7 @@ use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::scheduler::runqueue::REPLAY_DEFERRED_PRIORITY;
 use crate::scheduler::runqueue::REPLAY_FOREGROUND_PRIORITY;
 use crate::scheduler::runqueue::is_ordinary_priority;
+#[cfg(not(target_os = "none"))]
 use crate::scheduler::sched_loop;
 use crate::scheduler::sched_loop_external;
 use crate::tool_local::Detcore;
@@ -167,7 +166,12 @@ struct PendingExecState {
 /// Separate terminal cleanup outcomes; neither replaces the backend failure.
 pub struct BackendFailureCleanup {
     /// Natural scheduler completion, retaining a task panic or cancellation.
+    #[cfg(not(target_os = "none"))]
     pub scheduler: Result<(), tokio::task::JoinError>,
+    /// The Narf kernel build of Detcore never spawns a scheduler task, so it
+    /// has no join to fail.
+    #[cfg(target_os = "none")]
+    pub scheduler: Result<(), std::convert::Infallible>,
     /// The requested partial recording's write result; no destination is success.
     pub preemption_recording: Result<(), String>,
 }
@@ -502,6 +506,7 @@ pub struct GlobalState {
     /// Descriptor state retained after the one-shot scheduler transition is consumed.
     post_exec_fd_blocking: Mutex<BTreeMap<DetTid, ExecFdBlockingOverrides>>,
 
+    #[cfg(not(target_os = "none"))]
     sched_handle: Option<tokio::task::JoinHandle<()>>,
 
     /// Global time is a *volatile* vector clock of individual thread progress. Each
@@ -521,6 +526,7 @@ pub struct GlobalState {
     preemptions_to_replay: Option<PreemptionReader>,
 
     /// The start is when we construct the global state.  Close enough.
+    #[cfg(not(target_os = "none"))]
     realtime_start: SystemTime,
 }
 
@@ -577,6 +583,7 @@ impl GlobalState {
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
+        #[cfg(not(target_os = "none"))]
         let handle = if cfg.sequentialize_threads && spawn_scheduler {
             // Announce before spawning, not from inside the spawned task. The
             // task's first poll is unordered with respect to the rest of this
@@ -589,6 +596,15 @@ impl GlobalState {
         } else {
             None
         };
+        // The Narf kernel build of Detcore has no task spawner. Its host starts
+        // the scheduler with `init_for_external_scheduler` and drives it with
+        // `run_external_scheduler`.
+        #[cfg(target_os = "none")]
+        if cfg.sequentialize_threads && spawn_scheduler {
+            panic!(
+                "the Narf kernel build of Detcore has no task spawner; start its scheduler with init_for_external_scheduler and run_external_scheduler"
+            );
+        }
 
         let preemptions_to_replay: Option<PreemptionReader> = cfg
             .replay_preemptions_from
@@ -653,8 +669,10 @@ impl GlobalState {
                 cfg.mountinfo_mount_ids_captured,
                 &cfg.fdinfo_unlisted_mount_ids,
             )),
+            #[cfg(not(target_os = "none"))]
             sched_handle: handle,
             cfg: cfg.clone(),
+            #[cfg(not(target_os = "none"))]
             realtime_start: SystemTime::now(),
             global_time,
             preemptions_to_replay,
@@ -725,8 +743,10 @@ impl GlobalState {
     /// Unrecoverable fatal erorr. Bring things to a close cleanly, but as quickly as
     /// possible.
     pub fn force_shutdown_with_error(&self) {
+        #[cfg(not(target_os = "none"))]
         let start = std::time::Instant::now();
         let sched = loop {
+            #[cfg(not(target_os = "none"))]
             if start.elapsed().as_millis() > 1000 {
                 eprintln!(
                     "Could not acquire scheduler lock during forced shutdown (timeout)... proceeding anyway."
@@ -737,9 +757,20 @@ impl GlobalState {
                 Ok(guard) => {
                     break guard;
                 }
+                #[cfg(not(target_os = "none"))]
                 Err(std::sync::TryLockError::WouldBlock) => {
                     std::thread::yield_now();
                     continue;
+                }
+                // The Narf kernel build of Detcore has no clock to bound the
+                // wait and no thread to yield to, so it gives up at once, as
+                // the host does when the wait times out.
+                #[cfg(target_os = "none")]
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    eprintln!(
+                        "Could not acquire scheduler lock during forced shutdown (held elsewhere)... proceeding anyway."
+                    );
+                    return;
                 }
                 Err(e) => {
                     eprintln!(
@@ -759,6 +790,7 @@ impl GlobalState {
     ///
     /// External-scheduler states do not own a task and are left unchanged.
     pub async fn cancel_internal_scheduler(&mut self) {
+        #[cfg(not(target_os = "none"))]
         if let Some(handle) = self.sched_handle.take() {
             handle.abort();
             match handle.await {
@@ -774,12 +806,18 @@ impl GlobalState {
     /// A failed run has no successful run summary. Preserve the scheduler's
     /// join error and any requested partial preemption recording's write error
     /// for the caller, without allowing either to replace the backend failure.
+    // The Narf kernel build of Detcore has no scheduler task to take out of `self`.
+    #[cfg_attr(target_os = "none", allow(unused_mut))]
     pub async fn clean_up_after_backend_failure(mut self) -> BackendFailureCleanup {
+        #[cfg(not(target_os = "none"))]
         let scheduler = if let Some(handle) = self.sched_handle.take() {
             handle.await
         } else {
             Ok(())
         };
+        // The Narf kernel build of Detcore never spawns a scheduler task.
+        #[cfg(target_os = "none")]
+        let scheduler = Ok(());
         // A scheduler panic can poison this mutex. Its JoinError is returned
         // below; recovering only to finish output must not replace that error.
         let writer = self
@@ -811,7 +849,10 @@ impl GlobalState {
     ///
     /// If the boolean argument is true, print to stderr, otherwise only print the summary
     /// to the log.
+    // The Narf kernel build of Detcore has no scheduler task to take out of `self`.
+    #[cfg_attr(target_os = "none", allow(unused_mut))]
     pub async fn clean_up(mut self, to_stderr: bool, print_summary_to_json_file: &Option<PathBuf>) {
+        #[cfg(not(target_os = "none"))]
         if let Some(handle) = self.sched_handle.take() {
             debug!("Global state cleanup, confirming scheduler has shut down...");
             handle.await.expect("Global scheduler clean shutdown");
@@ -880,7 +921,13 @@ impl GlobalState {
         // Real time report:
         // N.B.: We don't have a job-level exit hook atm (T76248597), so we use the
         // CURRENT time -- that we are calling summarize -- as the end time:
-        summary.realtime_elapsed = Some(self.realtime_start.elapsed()?);
+        //
+        // The Narf kernel build of Detcore has no real-time clock, so it leaves
+        // realtime_elapsed at None, as a partial summary does.
+        #[cfg(not(target_os = "none"))]
+        {
+            summary.realtime_elapsed = Some(self.realtime_start.elapsed()?);
+        }
 
         if self.cfg.virtualize_time {
             let final_time = self.global_time.lock().unwrap();
@@ -2621,7 +2668,7 @@ impl GlobalState {
         } else {
             // In this scenario, virtualize_metadata is set and virtualize_time isn't.
             // We virtualize initial mtimes, but update using realtime.
-            let dt: DateTime<Utc> = Utc::now();
+            let dt: DateTime<Utc> = utc_now();
             let nanos = dt.timestamp_nanos_opt().expect(
                 "current time cannot be represented in a timestamp with nanosecond precision",
             ) as u64;
@@ -2778,6 +2825,7 @@ impl GlobalState {
                 "[dtid {}] signaling thread with {} at the point of stack trace printing.",
                 ev.dettid, sig.0
             );
+            #[cfg(not(target_os = "none"))]
             let tid = Pid::from_raw(ev.dettid.as_raw());
             // TODO(T78538674): virtualize pid/tid:
             // We send a raw signal here and let the guest pick it up WHENEVER it resumes.
@@ -2785,6 +2833,7 @@ impl GlobalState {
             // protocol here.
             // Alarm/timer signals are guest-chosen and may be realtime, which
             // `nix` cannot name; fall through to the raw syscall for those.
+            #[cfg(not(target_os = "none"))]
             match sig.signal() {
                 Some(named) => signal::kill(tid, named).unwrap(),
                 None => {
@@ -2794,6 +2843,14 @@ impl GlobalState {
                     assert_eq!(rc, 0, "raw kill of signal {} failed", sig.raw());
                 }
             }
+            // The host panics when the signal cannot be sent. The Narf kernel
+            // build of Detcore has no host threads to send it to.
+            #[cfg(target_os = "none")]
+            panic!(
+                "Failed to send stack-trace signal {} to dtid {}: the Narf kernel build of Detcore has no host threads to signal",
+                sig.raw(),
+                ev.dettid
+            );
         }
 
         SchedulerRpcResult::Continue(result)
@@ -4310,7 +4367,29 @@ where
     //
     // The RPC above is `cfg!(debug_assertions)`-only, so it cannot be the
     // signal — in a release build the parent would learn nothing.
+    #[cfg(not(target_os = "none"))]
     std::process::exit(status);
+    // The Narf kernel build of Detcore has no process to exit. Until Narf
+    // gives it a way to end the run with this status, it stops the run here.
+    #[cfg(target_os = "none")]
+    panic!(
+        "Unrecoverable shutdown with exit status {status}: the Narf kernel build of Detcore has no process to exit"
+    );
+}
+
+/// The current real time, for a file modification when time is not virtualized.
+#[cfg(not(target_os = "none"))]
+fn utc_now() -> DateTime<Utc> {
+    Utc::now()
+}
+
+/// The Narf kernel build of Detcore has no real-time clock. It needs
+/// `virtualize_time` wherever the host would read the real time.
+#[cfg(target_os = "none")]
+fn utc_now() -> DateTime<Utc> {
+    panic!(
+        "Cannot update a file's modification time: the Narf kernel build of Detcore has no real-time clock, so it needs virtualize_time with virtualize_metadata"
+    )
 }
 
 #[cfg(test)]

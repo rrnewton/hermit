@@ -81,7 +81,6 @@ pub use core::pin;
 pub use core::primitive;
 pub use core::ptr;
 pub use core::result;
-pub use core::task;
 pub use core::u8;
 pub use core::u16;
 pub use core::u32;
@@ -106,6 +105,13 @@ pub mod os;
 pub mod path;
 pub mod sync;
 pub mod time;
+
+/// `core::task` with alloc's `Wake`, as std's `task` has them.
+pub mod task {
+    pub use core::task::*;
+
+    pub use a::task::*;
+}
 
 /// `core::hash` plus std's `DefaultHasher` and `RandomState`.
 pub mod hash {
