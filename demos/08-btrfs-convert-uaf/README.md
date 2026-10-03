@@ -337,8 +337,9 @@ replay: ASAN report byte-identical: all 63 lines from the ERROR line through ABO
   that its target is not mounted reads that whole table. On a host where
   other software mounts and unmounts file systems, that made the schedule, and
   with it the crashing seed and the printed file system UUID, change from one
-  run to the next. The demo's harness skips that check (see
-  [How it works](#how-it-works)).
+  run to the next. The demo's harness skips that check to work around this gap
+  in Hermit's determinism, so the demo does not test btrfs-convert's refusal to
+  convert a mounted file system (see [How it works](#how-it-works)).
 - The target file system UUID that btrfs-convert prints repeats too. libuuid
   builds it from random bytes, which Hermit makes repeatable, and a mask
   seeded from the clock, which is Hermit's virtual clock, so anything that
@@ -387,16 +388,28 @@ The two variants carry a small harness, applied identically to both, in
   and the thread slept through the race. The harness replaces the timer with a
   pipe: the thread blocks reading it, and the shutdown path writes one byte to
   wake it for one last loop iteration, the iteration that races the free.
-- btrfs-convert first checks that its target is not mounted: it reads
+- The harness removes btrfs-convert's check that its target is not mounted.
+  This is a workaround for a gap in Hermit's determinism, not part of the bug:
+  Hermit lets the host's mount table reach the program. The check reads
   `/proc/self/mounts`, calls `stat` on each entry, and reads
-  `/sys/block/loop*/loop/backing_file`. Because that table comes from the
-  host's current mounts, the number of system calls and branch instructions in
-  that check, and so the chaos schedule after it, followed the host's mounts. The
-  harness replaces `ret = check_mounted(file);` with `ret = 0;`. The image is a
-  plain file that is never mounted, so the check had nothing to find. Run
-  natively under `strace`, the patched build opens neither `/proc/self/mounts`
-  nor any `/sys/block` file; the unpatched build opened `/proc/self/mounts`
-  once and `/sys/block/loop*/loop/backing_file` 14 times.
+  `/sys/block/loop*/loop/backing_file`. Under Hermit, `/proc/self/mounts`
+  lists the mounts the host has at the time of the run, passed through
+  unchanged, and the loop devices are the host's. So the number of entries,
+  and with it the number of system calls and branch instructions in the check
+  and the chaos schedule after it, followed whatever the host had mounted. The
+  harness replaces `ret = check_mounted(file);` with `ret = 0;`. As a result,
+  the demo does not exercise btrfs-convert's refusal to convert a mounted file
+  system: the patched builds would go on to convert a mounted target, so use
+  them only on the demo's image. That image is a private copy that is never
+  mounted, so the check had nothing to find. Run natively under `strace`, the
+  patched build opens neither `/proc/self/mounts` nor any `/sys/block` file;
+  the unpatched build opened `/proc/self/mounts` once and
+  `/sys/block/loop*/loop/backing_file` 14 times. Giving the program a mount
+  table that does not depend on the host's mounts is tracked in
+  MOUNT-TABLE-ISSUE-URL.
+  <https://github.com/rrnewton/hermit/issues/1820> is a narrower, related
+  issue: a short-lived host mount changed `findmnt` output between the two
+  runs of a Hermit `--verify`.
 - The demo runs the program with `--base-env=minimal`, so AddressSanitizer
   settings such as `ASAN_OPTIONS` in your environment do not reach it; instead
   `convert/main.c` defines `__asan_default_options()` with
