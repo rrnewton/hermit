@@ -5,7 +5,7 @@
 # write. Only import mode may read IMPORT_DIR; see ci/buck-e2e/ingest.py.
 #
 # usage: ci/buck-e2e/run --mode hybrid|local --out IMPORT_DIR --work DIR
-#            [--buck2 PATH] [-- EXTRA_BUCK2_TEST_ARGS...]
+#            [--buck2 PATH] [--no-verdict] [-- EXTRA_BUCK2_TEST_ARGS...]
 #        ci/buck-e2e/run -h|--help
 #
 #   hybrid  RE-routed cells run on Meta RE and the rest locally (see defs.bzl). The two
@@ -15,11 +15,14 @@
 #   local   every cell runs locally (-c hermit_e2e.routing=local), one invocation.
 #   --buck2 PATH  the buck2 to run (default: $BUCK2, else buck2 on PATH). ingest.py
 #           fetches the results with testx ($TESTX, else testx on PATH).
+#   --no-verdict  stop after ingesting: leave the rows in IMPORT_DIR for the validation
+#           DAG's manifest bucket nodes to judge (ci/buck-e2e/validate-node), and exit 0
+#           whatever the cells' verdicts are.
 #
 # The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage), and
-# HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files, before
-# and after the run: Buck builds the release hermit from the working tree, and every row
-# records SOURCE_SHA as a clean source tree.
+# HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files before
+# the run, after it, and after judging it: Buck builds the release hermit from the working
+# tree, and every row records SOURCE_SHA as a clean source tree.
 # Tpx retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
 # ingest.py turns a retried cell's executions into attempts 1 and 2. EXTRA args go to
 # every `buck2 test` before the `--` (e.g. @shim/modes/hybrid).
@@ -32,19 +35,21 @@
 # the staged test-harness, in import mode, once per (lane, category) bucket of the plan.
 # Its result files go to --work/verdict, which each run replaces.
 # Exit status: 0 when every plan cell passes (an excused diagnostic failure is printed and,
-# as in the cargo flow, does not fail the run); 1 when any cell is FAIL or ERROR or has no
-# result, or the run could not be ingested or judged; 2 for a usage error or a
-# precondition that fails before the run.
+# as in the cargo flow, does not fail the run), or, with --no-verdict, once the rows are
+# in IMPORT_DIR; 1 when any cell is FAIL or ERROR or has no result (without --no-verdict),
+# or the run could not be ingested or judged; 2 for a usage error or a precondition that
+# fails before the run.
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
-mode= out= work= buck2=${BUCK2:-buck2}
+mode= out= work= buck2=${BUCK2:-buck2} verdict=1
 while [[ $# -gt 0 ]]; do
     case $1 in
         --mode) mode=$2; shift 2 ;;
         --out) out=$2; shift 2 ;;
         --work) work=$2; shift 2 ;;
         --buck2) buck2=$2; shift 2 ;;
+        --no-verdict) verdict=0; shift ;;
         -h | --help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "${BASH_SOURCE[0]}"; exit 0 ;;
         --) shift; break ;;
         *) echo "ci/buck-e2e/run: unknown argument $1" >&2; exit 2 ;;
@@ -58,15 +63,23 @@ done
     exit 2
 }
 staged_sha=$(cat "$here/staged/SOURCE_SHA")
+# The checkout is $root: an inherited GIT_DIR or GIT_WORK_TREE would point git elsewhere
+# (the names of ci/manifest-plan/src/git_environment.rs REPOSITORY_LOCATION_VARIABLES).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_OBJECT_DIRECTORY \
+    GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_NAMESPACE GIT_PREFIX
 require_staged_source() { # require_staged_source WHEN EXIT_STATUS
-    local head
-    head=$(git -C "$root" rev-parse HEAD)
+    local head changes
+    head=$(git -C "$root" rev-parse HEAD) && changes=$(git -C "$root" status --porcelain --untracked-files=no) || {
+        echo "ci/buck-e2e/run: git cannot read the checkout $root $1 (above), so its source tree is" \
+            "unknown; repair the checkout and run again" >&2
+        exit "$2"
+    }
     if [[ $head != "$staged_sha" ]]; then
         echo "ci/buck-e2e/run: HEAD is $head $1, but the staged inputs are for $staged_sha;" \
             "check out $staged_sha, or re-stage at HEAD (ci/buck-e2e/stage)" >&2
         exit "$2"
     fi
-    if [[ -n $(git -C "$root" status --porcelain --untracked-files=no) ]]; then
+    if [[ -n $changes ]]; then
         echo "ci/buck-e2e/run: the checkout has uncommitted changes $1, but every row records" \
             "$staged_sha as a clean source tree; commit them and re-stage, or revert them" >&2
         exit "$2"
@@ -115,10 +128,13 @@ python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" 
     echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
     exit 1
 }
+((verdict)) || exit 0
 rm -rf -- "${work:?}/verdict"
 status=0
 python3 "$here/verdict.py" --plan "$root/ci/expected-e2e-plan.json" --import-dir "$out" \
     --out "$work/verdict" --harness "$here/staged/bin/test-harness" --repo-root "$root" || status=$?
+# The harness records whether the source tree was clean when it judged; it must still be.
+require_staged_source "while the run was judged" 1
 case $status in
     0) ;;
     1) echo "ci/buck-e2e/run: the run did not pass (above); each bucket's result files are in $work/verdict" >&2

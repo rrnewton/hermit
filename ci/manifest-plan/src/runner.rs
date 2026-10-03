@@ -163,28 +163,53 @@ pub fn validate_source_sha(sha: &str) -> Result<(), String> {
 /// A `--source-sha` names the commit of a Git-less snapshot at `root`, which
 /// is then recorded as clean. A directory holding files Git tracks is refused:
 /// Git reports their commit and whether they are dirty, and the name would
-/// override both. A snapshot extracted inside a checkout but not tracked by it
-/// (ci/buck-e2e/staged/src) is accepted, and so is any root on a host without
-/// git (an RE worker).
+/// override both. A root with no `.git` at or above it (an RE worker's input
+/// tree, whether or not git is installed there) is accepted, and so is a
+/// snapshot extracted inside a checkout but not tracked by it
+/// (ci/buck-e2e/staged/src). Inside a checkout, a git that cannot answer
+/// (a corrupt index, an unusable `.git`, no git to run) is refused: the files
+/// might be tracked.
 pub fn validate_source_snapshot(root: &Path, sha: &str) -> Result<(), String> {
     validate_source_sha(sha)?;
+    let absolute = std::path::absolute(root)
+        .map_err(|error| format!("cannot resolve --repo-root {}: {error}", root.display()))?;
+    if !absolute
+        .ancestors()
+        .any(|dir| dir.join(".git").symlink_metadata().is_ok())
+    {
+        return Ok(());
+    }
     let tracked = crate::git_environment::git_command()
         .arg("-C")
         .arg(root)
         .args(["ls-files", "--error-unmatch", "--", "."])
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    if tracked {
-        return Err(format!(
+        .stderr(Stdio::piped())
+        .output();
+    match tracked {
+        // `--error-unmatch` exits 1 when Git tracks nothing under the path.
+        Ok(output) if output.status.code() == Some(1) => Ok(()),
+        Ok(output) if output.status.success() => Err(format!(
             "--source-sha names the commit of a Git-less `git archive` snapshot, but Git \
              tracks files under {}, and Git reports their commit and whether they are dirty; \
              drop --source-sha, or pass --repo-root naming the archive",
             root.display()
-        ));
+        )),
+        Ok(output) => Err(format!(
+            "--source-sha names the commit of a Git-less snapshot, but {} is inside a Git \
+             checkout and `git ls-files` there failed ({}: {}), so whether Git tracks its files \
+             is unknown; repair the checkout, or pass --repo-root naming an archive outside it",
+            root.display(),
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
+        Err(error) => Err(format!(
+            "--source-sha names the commit of a Git-less snapshot, but {} is inside a Git \
+             checkout and git cannot run ({error}), so whether Git tracks its files is unknown; \
+             install git, or pass --repo-root naming an archive outside the checkout",
+            root.display()
+        )),
     }
-    Ok(())
 }
 
 fn first_attempt() -> u64 {
@@ -6535,6 +6560,12 @@ mod tests {
             source_identity(&checkout.join("src"), Some(sha)),
         ];
         let nested = source_identity(&snapshot, Some(sha));
+        // A corrupt index leaves Git unable to say whether it tracks the files.
+        fs::write(checkout.join(".git/index"), "junk").unwrap();
+        let unreadable = [
+            source_identity(&checkout.join("src"), Some(sha)),
+            source_identity(&snapshot, Some(sha)),
+        ];
         fs::remove_dir_all(&checkout).unwrap();
         assert!(tracking);
         for identity in refused {
@@ -6542,6 +6573,30 @@ mod tests {
             assert!(error.contains("Git tracks files under"), "{error}");
         }
         assert_eq!(nested, Ok((sha.to_string(), false)));
+        for identity in unreadable {
+            let error = identity.unwrap_err();
+            assert!(
+                error.contains("`git ls-files` there failed")
+                    && error.contains("whether Git tracks its files is unknown"),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_source_sha_is_accepted_outside_any_checkout() {
+        let archive = std::env::temp_dir().join(format!("runner-archive-{}", std::process::id()));
+        fs::create_dir_all(archive.join("src")).unwrap();
+        let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
+        let outside = source_identity(&archive.join("src"), Some(sha));
+        fs::remove_dir_all(&archive).unwrap();
+        assert!(
+            !std::env::temp_dir()
+                .ancestors()
+                .any(|dir| dir.join(".git").exists()),
+            "this test needs a temporary directory outside any checkout"
+        );
+        assert_eq!(outside, Ok((sha.to_string(), false)));
     }
 
     /// The four outcomes of the verification-spelling probe.

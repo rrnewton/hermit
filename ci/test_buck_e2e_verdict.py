@@ -43,7 +43,8 @@ BUCKETS = ["portable/c-programs", "portable/compat", "privileged/system-utils"]
 # --category CATEGORY --results FILE --junit FILE` in import mode. It appends how it
 # was called to FAKE_HARNESS_CALLS and reports each bucket as FAKE_HARNESS_REPORTS says
 # ({"LANE/CATEGORY": {"rc", "signal", "summary", "junit", "log"}}), or, for a bucket that has no
-# report there, as the imported rows say: each cell's last row is its outcome.
+# report there, as the imported rows say: each cell's last row is its outcome. With
+# FAKE_HARNESS_TOUCH, it first appends a line to that file.
 FAKE_HARNESS = r"""#!/usr/bin/env python3
 import json, os, sys
 from xml.sax.saxutils import escape
@@ -53,6 +54,9 @@ lane, category, results, junit = flag("--lane"), flag("--category"), flag("--res
 seen = {k: os.environ.get(k) for k in ("E2E_IMPORT_RESULTS", "E2E_RESULT_ROOT", "DAGRUN_TEST_COUNTS_PATH")}
 with open(os.environ["FAKE_HARNESS_CALLS"], "a") as calls:
     calls.write(json.dumps({"argv": args, "env": seen}) + "\n")
+if os.environ.get("FAKE_HARNESS_TOUCH"):
+    with open(os.environ["FAKE_HARNESS_TOUCH"], "a") as touched:
+        touched.write("changed while judging\n")
 report = json.loads(os.environ.get("FAKE_HARNESS_REPORTS") or "{}").get(lane + "/" + category)
 if report is None:
     bucket = os.path.join(os.environ["E2E_IMPORT_RESULTS"], lane, "manifest_" + category.replace("-", "_"))
@@ -89,12 +93,21 @@ sys.exit(report.get("rc", 0))
 """
 # buck2, for the one thing ci/buck-e2e/run asks of it: `test ... --write-test-id FILE
 # //ci/buck-e2e:NAME -- ...`. It writes NAME as the test run id and exits FAKE_BUCK2_RC.
+# With FAKE_BUCK2_TOUCH it appends a line to that file; with FAKE_BUCK2_COMMIT it commits
+# nothing in its working directory, moving HEAD.
 FAKE_BUCK2 = r"""#!/usr/bin/env python3
-import os, sys
+import os, subprocess, sys
 args = sys.argv[1:]
 target = next(arg for arg in args if arg.startswith("//ci/buck-e2e:"))
 with open(args[args.index("--write-test-id") + 1], "w") as f:
     f.write(target.split(":", 1)[1] + "\n")
+if os.environ.get("FAKE_BUCK2_TOUCH"):
+    with open(os.environ["FAKE_BUCK2_TOUCH"], "a") as touched:
+        touched.write("changed during the run\n")
+if os.environ.get("FAKE_BUCK2_COMMIT"):
+    subprocess.run(["git", "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+                    "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null",
+                    "commit", "-q", "--allow-empty", "-m", "moved"], check=True)
 sys.exit(int(os.environ.get("FAKE_BUCK2_RC", "0")))
 """
 
@@ -275,6 +288,15 @@ class VerdictTest(unittest.TestCase):
             ("too few cells", summary(1), "its summary.json has 1 cells and the plan 2; judge with the "
              "harness and plan of one commit (ci/buck-e2e/stage)"),
             ("an ERROR", summary(2, errors=1), "its summary.json counts 0 FAIL (0 diagnostic) and 1 ERROR"),
+            ("no counts", {k: v for k, v in summary(2).items() if k not in ("passed", "failed", "diagnostic_failures")},
+             "its summary.json has no integer passed, failed, diagnostic_failures; judge with the harness "
+             "staged from this checkout (ci/buck-e2e/stage)"),
+            ("a count that is not an integer", {**summary(2), "errors": "0"}, "its summary.json has no integer errors;"),
+            ("no missing_cells", summary(2, imported={"root": "IMPORT"}), "its summary.json has no integer missing_cells;"),
+            ("outcomes that do not add up to the cells", summary(2, passed=1),
+             "its summary.json counts 1 PASS, FAIL, ERROR and HOST-INAPPLICABLE outcomes for 2 cells"),
+            ("a missing cell", summary(2, imported={"missing_cells": 1, "dropped_retries": 0}),
+             "its summary.json counts 1 imported cells missing"),
         ]
         for name, written, reason in cases:
             with self.subTest(name):
@@ -288,6 +310,16 @@ class VerdictTest(unittest.TestCase):
                     f"{self.out}/portable/manifest_compat/harness.log:\n"
                     "verdict:   | first line\nverdict:   | last line\n",
                 )
+
+    def test_an_error_on_an_excused_diagnostic_cell_is_still_listed(self):
+        erroring = {"rc": 1, "summary": summary(2, errors=1, failed=1, passed=0, diagnostic=[(E, "exit status 3")]),
+                    "junit": [[D, "error", "import-stale: the row's test digest differs"],
+                              [E, "failure", "exit status 3"]]}
+        # The cell E's FAIL is excused; an ERROR on the same name must not be.
+        erroring["junit"].append([E, "error", "import-missing"])
+        process, _ = self.failed({"portable/compat": erroring}, f"verdict:   ERROR {D}: import-stale",
+                                 f"verdict:   ERROR {E}: import-missing\n")
+        self.assertNotIn(f"verdict:   FAIL {E}", process.stderr)
 
     def test_a_harness_that_dies_or_cannot_be_executed_fails_the_run(self):
         for report, died in (({"rc": 126}, "exited 126"), ({"rc": 127}, "exited 127"),
@@ -381,6 +413,8 @@ class RunTest(unittest.TestCase):
         for name in ("run", "ingest.py", "verdict.py"):
             shutil.copy2(BUCK_E2E / name, scripts / name)
         (checkout / "ci" / "expected-e2e-plan.json").write_text(json.dumps(ingest_test.PLAN))
+        self.tracked = checkout / "tracked.txt"
+        self.tracked.write_text("committed\n")
         git = ["git", "-C", str(checkout), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
                "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null"]
         environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
@@ -396,17 +430,23 @@ class RunTest(unittest.TestCase):
         self.buck2 = write_executable(self.root / "bin" / "buck2", FAKE_BUCK2)
         self.testx = write_executable(self.root / "bin" / "testx", ingest_test.FAKE_TESTX)
         self.calls = self.root / "harness-calls.jsonl"
+        self.head = head
 
-    def run_buck_e2e(self, mode, runs, buck2_status=32):
-        """Run ci/buck-e2e/run --mode MODE, with buck2 exiting BUCK2_STATUS and testx
-        listing RUNS ({test run id: [execution, ...]}): the run id is the target name,
-        all for local mode, re and local for hybrid."""
+    def run_buck_e2e(self, mode, runs, *extra, buck2_status=32, **environment):
+        """Run ci/buck-e2e/run --mode MODE [EXTRA...], with buck2 exiting BUCK2_STATUS and
+        testx listing RUNS ({test run id: [execution, ...]}): the run id is the target name,
+        all for local mode, re and local for hybrid. ENVIRONMENT is added to run's."""
+        shutil.rmtree(self.root / "fake", ignore_errors=True)
         ingest_test.write_test_runs(self.root / "fake", runs)
         environment = dict(os.environ, TESTX=str(self.testx), FAKE_TESTX_DIR=str(self.root / "fake"),
-                           FAKE_BUCK2_RC=str(buck2_status), FAKE_HARNESS_CALLS=str(self.calls))
+                           FAKE_BUCK2_RC=str(buck2_status), FAKE_HARNESS_CALLS=str(self.calls), **environment)
         command = [str(self.run_script), "--mode", mode, "--out", str(self.root / "import"),
-                   "--work", str(self.root / "work"), "--buck2", str(self.buck2)]
+                   "--work", str(self.root / "work"), "--buck2", str(self.buck2), *extra]
         return subprocess.run(command, capture_output=True, text=True, env=environment)
+
+    def imported_rows(self):
+        return sorted(str(path.relative_to(self.root / "import"))
+                      for path in (self.root / "import").rglob("results.jsonl"))
 
     def test_a_failing_or_erroring_cell_fails_the_run_and_is_named(self):
         for outcome, tag in (("FAIL", "FAIL"), ("ERROR", "ERROR")):
@@ -454,6 +494,75 @@ class RunTest(unittest.TestCase):
         self.assertIn("staged/bin/test-harness is missing; stage the inputs again (ci/buck-e2e/stage)",
                       process.stderr)
         self.assertFalse((self.root / "work").exists(), "buck2 ran without a harness to judge its results")
+
+    def test_a_checkout_that_is_not_the_staged_source_is_refused_before_the_run(self):
+        passing_runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
+        staged = self.run_script.parent / "staged" / "SOURCE_SHA"
+        cases = [
+            ("HEAD is not SOURCE_SHA", lambda: staged.write_text("0" * 40 + "\n"),
+             f"ci/buck-e2e/run: HEAD is {self.head} before the run, but the staged inputs are for {'0' * 40}; "
+             f"check out {'0' * 40}, or re-stage at HEAD (ci/buck-e2e/stage)"),
+            ("a tracked file is changed", lambda: self.tracked.write_text("edited\n"),
+             f"ci/buck-e2e/run: the checkout has uncommitted changes before the run, but every row records "
+             f"{self.head} as a clean source tree; commit them and re-stage, or revert them"),
+            ("git cannot read the index", lambda: (self.root / "checkout" / ".git" / "index").write_bytes(b"junk"),
+             "ci/buck-e2e/run: git cannot read the checkout "),
+        ]
+        for name, change, message in cases:
+            with self.subTest(name):
+                restore = {path: path.read_bytes()
+                           for path in (staged, self.tracked, self.root / "checkout" / ".git" / "index")}
+                change()
+                process = self.run_buck_e2e("local", passing_runs)
+                for path, data in restore.items():
+                    path.write_bytes(data)
+                self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+                self.assertIn(message, process.stderr)
+                self.assertFalse((self.root / "work").exists(), "buck2 ran on a checkout that is not the staged one")
+                self.assertEqual(calls_in(self.calls), [])
+        # Untracked files are not source: the staged inputs themselves are untracked.
+        (self.root / "checkout" / "untracked.txt").write_text("scratch\n")
+        process = self.run_buck_e2e("local", passing_runs)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+
+    def test_a_checkout_that_changes_during_the_run_has_no_verdict(self):
+        passing_runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
+        cases = [
+            ("a tracked file changes", {"FAKE_BUCK2_TOUCH": str(self.tracked)}, "has uncommitted changes after the run"),
+            ("HEAD moves", {"FAKE_BUCK2_COMMIT": "1"}, " after the run, but the staged inputs are for "),
+        ]
+        for name, environment, message in cases:
+            with self.subTest(name):
+                for directory in ("import", "work", "fake"):
+                    shutil.rmtree(self.root / directory, ignore_errors=True)
+                process = self.run_buck_e2e("local", passing_runs, **environment)
+                self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+                self.assertIn(message, process.stderr)
+                self.assertEqual(self.imported_rows(), [], "ingest.py ran on rows of a changed checkout")
+                self.assertEqual(calls_in(self.calls), [])
+                git = ["git", "-C", str(self.root / "checkout")]
+                subprocess.run(git + ["reset", "-q", "--hard", self.head], check=True)
+
+    def test_a_checkout_that_changes_while_the_run_is_judged_fails(self):
+        runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
+        process = self.run_buck_e2e("local", runs, FAKE_HARNESS_TOUCH=str(self.tracked))
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        self.assertIn("ci/buck-e2e/run: the checkout has uncommitted changes while the run was judged", process.stderr)
+        self.assertEqual(len(calls_in(self.calls)), 1)
+
+    def test_an_inherited_git_location_does_not_redirect_the_source_checks(self):
+        runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
+        process = self.run_buck_e2e("local", runs, GIT_DIR=str(self.root / "nowhere"),
+                                    GIT_WORK_TREE=str(self.root / "nowhere"))
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+
+    def test_no_verdict_stops_after_ingesting_whatever_the_cells_did(self):
+        runs = {"all": [ingest_test.execution(ingest_test.X, 100, "FAIL", "rx1"), ingest_test.Y_PASSES]}
+        process = self.run_buck_e2e("local", runs, "--no-verdict")
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(self.imported_rows(), ["portable/manifest_cat/results.jsonl"])
+        self.assertEqual(calls_in(self.calls), [])
+        self.assertFalse((self.root / "work" / "verdict").exists())
 
     def test_both_help_forms_document_the_exit_status(self):
         for form in ("--help", "-h"):
