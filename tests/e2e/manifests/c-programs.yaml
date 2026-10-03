@@ -14815,9 +14815,11 @@ test:
         backends_enabled:
           - ptrace
           - liteinst
+          # The unchanged eight-check zero-time fixture passes strict KVM verify.
+          # https://github.com/rrnewton/reverie/issues/620
+          - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
-          kvm: KVM ElfExecutor personality implements poll/ppoll readiness but returns deterministic ENOSYS for select(2)/pselect6
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
       naked:
         ci: false
