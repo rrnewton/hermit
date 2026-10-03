@@ -243,6 +243,57 @@ int main(void) {
   }
   munmap(stack, 2 * page);
 
+  // The stat buffer can also share its memory with an argument at another
+  // address, through two shared mappings of one page, which no address
+  // comparison sees. Hermit must give Linux the path it was passed, update the
+  // virtual mtime, and leave the shared page as it found it.
+  int memfd = memfd_create("utimensat-alias", 0);
+  if (memfd < 0 || ftruncate(memfd, page) != 0) {
+    perror("memfd");
+    return 2;
+  }
+  char* stack_view = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+  char* data_view = mmap(NULL, page, PROT_READ | PROT_WRITE, MAP_SHARED, memfd, 0);
+  if (stack_view == MAP_FAILED || data_view == MAP_FAILED) {
+    perror("shared stack");
+    return 2;
+  }
+  memset(data_view, 0x5a, page);
+  strcpy(data_view + page - 256, "a");
+  char* expected = malloc(page);
+  memcpy(expected, data_view, page);
+  struct timespec aliased[2] = {{0, UTIME_OMIT}, {EARLY + 8, 17}};
+  ret = syscall_at(
+      stack_view + page, SYS_utimensat, AT_FDCWD, (long)(data_view + page - 256), (long)aliased, 0);
+  if (ret != 0) {
+    fprintf(stderr, "utimensat with its path in a shared view of the stack returned %ld\n", ret);
+    failures++;
+  }
+  expect_mtime("utimensat with its path in a shared view of the stack", "a", EARLY + 8, 17);
+  if (memcmp(data_view, expected, page) != 0) {
+    fprintf(stderr, "utimensat changed the shared page under the stack\n");
+    failures++;
+  }
+  free(expected);
+  munmap(stack_view, page);
+  munmap(data_view, page);
+  close(memfd);
+
+  // A raw syscall may run with its stack pointer near zero, where Hermit's
+  // scratch addresses would wrap below address zero. The call must still
+  // reach Linux.
+  struct timespec low[2] = {{0, UTIME_OMIT}, {EARLY + 9, 19}};
+  ret = syscall_at((char*)200L, SYS_utimensat, AT_FDCWD, (long)"b", (long)low, 0);
+  if (ret != 0) {
+    fprintf(stderr, "utimensat with the stack pointer at 200 returned %ld\n", ret);
+    failures++;
+  }
+  ret = syscall_at((char*)0L, SYS_utimensat, AT_FDCWD, (long)"b", (long)low, 0);
+  if (ret != 0) {
+    fprintf(stderr, "utimensat with the stack pointer at 0 returned %ld\n", ret);
+    failures++;
+  }
+
   // A later write still moves the mtime off the explicitly set value.
   set_mtime("a", EARLY + 5, 11);
   expect_mtime("utimensat before write", "a", EARLY + 5, 11);
