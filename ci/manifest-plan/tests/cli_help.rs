@@ -436,6 +436,20 @@ fn test_harness_source_snapshot_flags_redirect_misuse() {
     let head = String::from_utf8(head.stdout).unwrap().trim().to_string();
     let snapshot_root = snapshot.to_str().unwrap();
     let refused = run(harness, &["expected-plan", "--repo-root", snapshot_root]);
+    // The boundary `.git` that keeps Git from walking up is not a usable
+    // checkout, so Git cannot say whether it tracks these files.
+    let unusable = run(
+        harness,
+        &[
+            "expected-plan",
+            "--repo-root",
+            snapshot_root,
+            "--source-sha",
+            &head,
+        ],
+    );
+    // A real `git archive` has no `.git` at all.
+    std::fs::remove_file(snapshot.join(".git")).expect("remove the boundary .git");
     let planned = run(
         harness,
         &[
@@ -449,6 +463,12 @@ fn test_harness_source_snapshot_flags_redirect_misuse() {
     std::fs::remove_dir_all(&snapshot).expect("remove snapshot");
     assert_eq!(refused.status.code(), Some(2), "{refused:?}");
     assert!(String::from_utf8_lossy(&refused.stderr).contains("pass --source-snapshot"));
+    assert_eq!(unusable.status.code(), Some(2), "{unusable:?}");
+    assert!(
+        String::from_utf8_lossy(&unusable.stderr)
+            .contains("whether Git tracks its files is unknown"),
+        "{unusable:?}"
+    );
     assert!(planned.status.success(), "{planned:?}");
     assert!(String::from_utf8_lossy(&planned.stdout).contains("\"cells\""));
 }
