@@ -10628,6 +10628,17 @@ fn sigint_instakill_reports_a_signal_death_not_a_policy_refusal() {
         "SIGINT to guest failed"
     );
 
+    // ⚠️ LET THE SIGNAL INTERRUPT THE READ BEFORE CLOSING STDIN. Closed at once,
+    // the pipe's EOF usually won the race: the guest's read returned 0
+    // uninterrupted and SIGINT reached the Tool at an ordinary delivery stop.
+    // The failing order is the one where the read is interrupted: detcore's
+    // retried read then takes SIGINT into reverie's held-signal slot, and before
+    // https://github.com/rrnewton/reverie/pull/831 the resume delivered it
+    // without calling handle_signal_event, so Hermit died of SIGINT instead of
+    // exiting 130 (https://github.com/rrnewton/hermit/issues/3468). The pause
+    // makes that the order this test checks on every run.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
     // ⚠️ CLOSE STDIN AFTER SIGNALLING, BEFORE WAITING. This one line is the
     // difference between measuring the fix and measuring nothing. With it held
     // open through the wait, this reported `code=None signal=Some(2)` -- the
