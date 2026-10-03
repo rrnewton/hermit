@@ -132,7 +132,7 @@ Build Hermit and stage the LiteInst runtime beside it first (the top-level
 ./scripts/stage-liteinst-runtime.sh release \
   "$PWD/target/release/libreverie_liteinst.so" \
   "$PWD/target/liteinst-runtime-build"
-cargo build --locked --release -p hermit --bin hermit
+cargo build --locked --release -p hermit --features liteinst --bin hermit
 ./benchmarks/getpid_cost.rs
 ./benchmarks/getpid_cost.rs --backends ptrace --counts 0,100000 --iterations 3
 ./benchmarks/getpid_cost.rs --hermit "/path/to/wrapper target/release/hermit"
@@ -152,16 +152,22 @@ Every run starts with `RUST_LOG`, `HERMIT_LOG` and `HERMIT_LOG_FILE` removed
 from its environment, so an inherited logging setting can neither slow the
 timed runs nor move the statistics record off stderr. After timing, one more
 run per backend at the largest N sets `RUST_LOG=hermit::backend_stats=debug`
-and keeps the backend's own `backend run complete` record. That run must pass
-the same `calls=N` check and print exactly one record naming its backend, or
-the harness exits 1. For LiteInst the record counts each dispatch path:
-`direct_hook` for calls through a patched site, the trap paths for calls that
-were not. The harness prints the nonzero path counts beside the fits, writes
-them to the JSON as `dispatch_paths`, and refuses the LiteInst result (exit 1)
-unless `direct_hook` is at least N - 1, the one allowance being a first call
-that traps before its site is patched. Below that floor the fixture's `getpid`
-site was not patched, so the LiteInst slope would be the cost of a trap, not of
-a hooked call. Two limits apply to those counts:
+and keeps the backend's own `backend run complete` record. LiteInst also gets
+the same run with N = 0. Each of these runs must pass the same `calls=N` check
+and print exactly one record naming its backend; otherwise that backend gets no
+fit (its row reads `no fit` and its JSON summary has `"stats_accepted": false`
+and `"fit": null`) and the harness exits 1. For LiteInst the record counts each
+dispatch path: `direct_hook` for calls through a patched site, the trap paths
+for calls that were not. `direct_hook` counts every patched site, so the
+harness subtracts the zero-call run's count, which comes only from start-up
+and exit sites. The harness prints the nonzero path counts beside the fits,
+writes them to the JSON as `dispatch_paths`, and refuses the LiteInst result
+the same way unless that difference is at least N - 1, the one allowance being
+a first call that traps before its site is patched. Below that floor the
+fixture's `getpid` site was not patched, so the LiteInst slope would be the
+cost of a trap, not of a hooked call. A largest N below 2 owes the hook no call
+at all, so it cannot show one and is refused the same way. Two limits apply to
+those counts:
 
 - A call at a site that never had a patch attempt is in no path counter.
   LiteInst never attempts the task-creating calls (`clone`, `clone3`, `fork`,

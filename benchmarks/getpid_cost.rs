@@ -16,10 +16,11 @@
 //!
 //! After timing, one extra run per backend sets
 //! `RUST_LOG=hermit::backend_stats=debug` and keeps the backend's own
-//! statistics record, which says which path the calls took. That run must
-//! succeed and print exactly one record for its backend, or the harness
-//! exits 1. Timed runs inherit no logging variables, so they log nothing
-//! beyond `--log=error`.
+//! statistics record, which says which path the calls took. LiteInst gets a
+//! second such run with zero calls, whose hooks are subtracted. Each of
+//! these runs must succeed and print exactly one record for its backend, or
+//! the backend gets no fit and the harness exits 1. Timed runs inherit no
+//! logging variables, so they log nothing beyond `--log=error`.
 //!
 //! Run `./benchmarks/getpid_cost.rs --help` for the flags.
 
@@ -377,17 +378,13 @@ fn dispatch_paths(record: &str) -> Option<Vec<(String, u64)>> {
 /// exactly one record, for this backend. Anything else means the counters
 /// describe another run, or nothing at all.
 ///
-/// For LiteInst the record must also show that the fixture's own `getpid`
-/// site was patched: at least `calls - 1` calls took `direct_hook`, the one
-/// allowance being the first call, which may arrive through a trap before the
-/// site is patched. Otherwise every call trapped or went uncounted, and the
-/// fitted slope is the cost of a trap, not of a hooked call.
+/// For LiteInst the record must also carry a readable `direct_hook` count,
+/// which is returned for [`check_hooked_calls`]; other backends return `None`.
 fn check_stats_run(
     backend: &str,
-    calls: u64,
     outcome: &Outcome,
     records: &[String],
-) -> Result<(), String> {
+) -> Result<Option<u64>, String> {
     match outcome {
         Outcome::Ok => {}
         Outcome::Failed(reason) => return Err(format!("the run failed: {reason}")),
@@ -405,19 +402,36 @@ fn check_stats_run(
         }
     };
     if backend != "liteinst" {
-        return Ok(());
+        return Ok(None);
     }
     let paths = dispatch_paths(record)
         .ok_or_else(|| format!("its record has no readable paths[...] list: {record:?}"))?;
-    let direct = paths
+    paths
         .iter()
         .find(|(name, _)| name == "direct_hook")
-        .map(|(_, count)| *count)
-        .ok_or_else(|| format!("its paths[...] list has no direct_hook counter: {record:?}"))?;
+        .map(|(_, count)| Some(*count))
+        .ok_or_else(|| format!("its paths[...] list has no direct_hook counter: {record:?}"))
+}
+
+/// The fixture's own `getpid` site must have been patched. `direct` counts
+/// hooks at every patched site, so the hooks of a zero-call run (`baseline`,
+/// start-up and exit sites only) are subtracted first. What remains must be at
+/// least `calls - 1`, the one allowance being the first call, which may arrive
+/// through a trap before the site is patched. Otherwise every call trapped or
+/// went uncounted, and the fitted slope is the cost of a trap, not of a hooked
+/// call. A run of fewer than two calls owes nothing to the hook, so it cannot
+/// show a hooked call and is refused too.
+fn check_hooked_calls(calls: u64, direct: u64, baseline: u64) -> Result<(), String> {
     let floor = calls.saturating_sub(1);
-    if direct < floor {
+    if floor == 0 {
         return Err(format!(
-            "direct_hook={direct} is below {floor}: the getpid site was not patched, so the fitted slope is not the cost of a hooked call"
+            "calls={calls} owes no call to direct_hook: a LiteInst statistics run needs at least 2 calls to show one through the patched site"
+        ));
+    }
+    let hooked = direct.saturating_sub(baseline);
+    if hooked < floor {
+        return Err(format!(
+            "direct_hook={direct} less the zero-call run's {baseline} is {hooked}, below {floor}: the getpid site was not patched, so the fitted slope is not the cost of a hooked call"
         ));
     }
     Ok(())
@@ -476,19 +490,28 @@ fn fit_line(points: &[(f64, f64)]) -> Option<(f64, f64)> {
 }
 
 /// One variant's result: medians come from measured runs only, but a failed
-/// warmup refuses the fit exactly as a failed measured run does.
+/// warmup or a rejected statistics run refuses the fit exactly as a failed
+/// measured run does.
 struct Summary {
     variant: String,
     measured: usize,
     failed: usize,
     failed_warmups: usize,
+    /// Whether every statistics run of this backend was accepted; `None` for
+    /// `native`, which has none.
+    stats_accepted: Option<bool>,
     /// `(calls, median ns, MAD ns, runs)` for each count with a successful run.
     points: Vec<(u64, f64, f64, usize)>,
     /// `(ns per call, intercept ns)`, or `None` after any failure.
     fit: Option<(f64, f64)>,
 }
 
-fn summarize(samples: &[Sample], variant: &str, counts: &[u64]) -> Summary {
+fn summarize(
+    samples: &[Sample],
+    variant: &str,
+    counts: &[u64],
+    stats_accepted: Option<bool>,
+) -> Summary {
     let failures = |warmup: bool| {
         samples
             .iter()
@@ -513,7 +536,7 @@ fn summarize(samples: &[Sample], variant: &str, counts: &[u64]) -> Summary {
             points.push((calls, center, mad, walls.len()));
         }
     }
-    let fit = (failed == 0 && failed_warmups == 0)
+    let fit = (failed == 0 && failed_warmups == 0 && stats_accepted != Some(false))
         .then(|| {
             fit_line(
                 &points
@@ -528,6 +551,7 @@ fn summarize(samples: &[Sample], variant: &str, counts: &[u64]) -> Summary {
         measured: measured.len(),
         failed,
         failed_warmups,
+        stats_accepted,
         points,
         fit,
     }
@@ -655,24 +679,43 @@ fn run(options: &Options) -> Result<bool, String> {
     }
 
     // One unmeasured run per backend that asks the backend for its own counters.
+    // LiteInst first runs the fixture with zero calls, so that hooks taken at
+    // start-up and exit sites can be subtracted from the measured run's.
     let stats_calls = *options.counts.iter().max().expect("at least two counts");
     let mut stats_runs = Vec::new();
     for backend in &options.backends {
-        let argv = variant_argv(&hermit, backend, &fixture, stats_calls);
-        let (_, status, stdout, stderr) =
-            run_bounded(&argv, &[("RUST_LOG", STATS_FILTER)], options.timeout, &work)?;
-        let records = stats_records(&stderr);
-        let classified = classify(status, &stdout, &stderr, stats_calls);
-        let verdict = check_stats_run(backend, stats_calls, &classified, &records);
-        if let Err(reason) = &verdict {
-            eprintln!("FAILED stats run {backend} calls={stats_calls}: {reason}");
+        let mut baseline = None;
+        let baseline_run = (backend == "liteinst").then_some(0);
+        for calls in baseline_run.into_iter().chain([stats_calls]) {
+            let argv = variant_argv(&hermit, backend, &fixture, calls);
+            let (_, status, stdout, stderr) =
+                run_bounded(&argv, &[("RUST_LOG", STATS_FILTER)], options.timeout, &work)?;
+            let records = stats_records(&stderr);
+            let classified = classify(status, &stdout, &stderr, calls);
+            let verdict = match check_stats_run(backend, &classified, &records) {
+                Err(reason) => Err(reason),
+                Ok(None) => Ok(()),
+                Ok(Some(direct)) if calls == 0 => {
+                    baseline = Some(direct);
+                    Ok(())
+                }
+                Ok(Some(direct)) => match baseline {
+                    Some(baseline) => check_hooked_calls(calls, direct, baseline),
+                    None => Err(
+                        "the zero-call run was rejected, so the getpid site's hooks cannot be told from start-up and exit hooks".to_string(),
+                    ),
+                },
+            };
+            if let Err(reason) = &verdict {
+                eprintln!("FAILED stats run {backend} calls={calls}: {reason}");
+            }
+            let outcome = match classified {
+                Outcome::Ok => "ok".to_string(),
+                Outcome::Failed(reason) => format!("failed: {reason}"),
+                Outcome::TimedOut => "timed out".to_string(),
+            };
+            stats_runs.push((backend.clone(), calls, outcome, records, verdict));
         }
-        let outcome = match classified {
-            Outcome::Ok => "ok".to_string(),
-            Outcome::Failed(reason) => format!("failed: {reason}"),
-            Outcome::TimedOut => "timed out".to_string(),
-        };
-        stats_runs.push((backend.clone(), outcome, records, verdict));
     }
     let load_after = fs::read_to_string("/proc/loadavg").unwrap_or_default();
 
@@ -680,7 +723,15 @@ fn run(options: &Options) -> Result<bool, String> {
     let mut all_ok = stats_runs.iter().all(|(.., verdict)| verdict.is_ok());
     let summaries: Vec<Summary> = variants
         .iter()
-        .map(|variant| summarize(&samples, variant, &options.counts))
+        .map(|variant| {
+            let stats_accepted = (variant != "native").then(|| {
+                stats_runs
+                    .iter()
+                    .filter(|(backend, ..)| backend == variant)
+                    .all(|(.., verdict)| verdict.is_ok())
+            });
+            summarize(&samples, variant, &options.counts, stats_accepted)
+        })
         .collect();
     all_ok &= summaries.iter().all(|summary| summary.fit.is_some());
     let native_slope = summaries
@@ -700,6 +751,7 @@ fn run(options: &Options) -> Result<bool, String> {
         variant,
         failed,
         failed_warmups,
+        stats_accepted,
         points,
         fit,
         ..
@@ -725,10 +777,19 @@ fn run(options: &Options) -> Result<bool, String> {
                 );
             }
             None => {
-                let reason = if *failed > 0 || *failed_warmups > 0 {
-                    format!("{failed} failed sample(s), {failed_warmups} failed warmup(s)")
-                } else {
+                let mut reasons = Vec::new();
+                if *stats_accepted == Some(false) {
+                    reasons.push("statistics run rejected".to_string());
+                }
+                if *failed > 0 || *failed_warmups > 0 {
+                    reasons.push(format!(
+                        "{failed} failed sample(s), {failed_warmups} failed warmup(s)"
+                    ));
+                }
+                let reason = if reasons.is_empty() {
                     "least-squares line undefined".to_string()
+                } else {
+                    reasons.join(", ")
                 };
                 println!(
                     "{variant:<10} {:>12} {:>16} {:>12}  {reason}; {per_count}",
@@ -737,12 +798,12 @@ fn run(options: &Options) -> Result<bool, String> {
             }
         }
     }
-    for (backend, outcome, records, verdict) in &stats_runs {
+    for (backend, calls, outcome, records, verdict) in &stats_runs {
         let accepted = match verdict {
             Ok(()) => "accepted".to_string(),
             Err(reason) => format!("REJECTED: {reason}"),
         };
-        println!("stats run {backend} calls={stats_calls} ({outcome}; {accepted}):");
+        println!("stats run {backend} calls={calls} ({outcome}; {accepted}):");
         if records.is_empty() {
             println!("  no {STATS_MARKER:?} record on stderr");
         }
@@ -754,7 +815,7 @@ fn run(options: &Options) -> Result<bool, String> {
                     .map(|(name, count)| format!("{name}={count}"))
                     .collect::<Vec<_>>();
                 println!(
-                    "  dispatch paths over {stats_calls} getpid calls: {}",
+                    "  dispatch paths over {calls} getpid calls: {}",
                     if nonzero.is_empty() {
                         "all zero".to_string()
                     } else {
@@ -797,7 +858,7 @@ fn run(options: &Options) -> Result<bool, String> {
             )
         },
     ));
-    let summary_json = json_list(summaries.iter().map(|Summary { variant, measured, failed, failed_warmups, points, fit }| {
+    let summary_json = json_list(summaries.iter().map(|Summary { variant, measured, failed, failed_warmups, stats_accepted, points, fit }| {
         let points_json = json_list(points.iter().map(|(calls, center, mad, n)| {
             format!("{{\"calls\": {calls}, \"median_ns\": {center}, \"mad_ns\": {mad}, \"samples\": {n}}}")
         }));
@@ -805,8 +866,12 @@ fn run(options: &Options) -> Result<bool, String> {
             Some((slope, intercept)) => format!("{{\"ns_per_call\": {slope}, \"intercept_ns\": {intercept}}}"),
             None => "null".to_string(),
         };
+        let stats_accepted_json = match stats_accepted {
+            Some(accepted) => accepted.to_string(),
+            None => "null".to_string(),
+        };
         format!(
-            "{{\"variant\": {}, \"measured_samples\": {measured}, \"failed_samples\": {failed}, \"failed_warmup_samples\": {failed_warmups}, \"points\": {points_json}, \"fit\": {fit_json}}}",
+            "{{\"variant\": {}, \"measured_samples\": {measured}, \"failed_samples\": {failed}, \"failed_warmup_samples\": {failed_warmups}, \"stats_accepted\": {stats_accepted_json}, \"points\": {points_json}, \"fit\": {fit_json}}}",
             json_string(variant)
         )
     }));
@@ -827,9 +892,9 @@ fn run(options: &Options) -> Result<bool, String> {
             json_string(&reason)
         )
     }));
-    let stats_json = json_list(stats_runs.iter().map(|(backend, outcome, records, verdict)| {
+    let stats_json = json_list(stats_runs.iter().map(|(backend, calls, outcome, records, verdict)| {
         format!(
-            "{{\"backend\": {}, \"calls\": {stats_calls}, \"rust_log\": {}, \"outcome\": {}, \"accepted\": {}, \"rejection\": {}, \"records\": {}, \"dispatch_paths\": {}}}",
+            "{{\"backend\": {}, \"calls\": {calls}, \"rust_log\": {}, \"outcome\": {}, \"accepted\": {}, \"rejection\": {}, \"records\": {}, \"dispatch_paths\": {}}}",
             json_string(backend),
             json_string(STATS_FILTER),
             json_string(outcome),
@@ -1039,7 +1104,7 @@ mod tests {
         let mut clean = measured();
         // A slow but successful warmup affects neither the medians nor the fit.
         clean.push(sample(0, true, 900_000, Outcome::Ok));
-        let summary = summarize(&clean, "ptrace", &[0, 10]);
+        let summary = summarize(&clean, "ptrace", &[0, 10], Some(true));
         assert_eq!((summary.measured, summary.failed), (2, 0));
         assert_eq!(summary.failed_warmups, 0);
         assert_eq!(summary.points[0].1, 1_000.0);
@@ -1048,7 +1113,7 @@ mod tests {
         for outcome in [Outcome::TimedOut, Outcome::Failed("calls=9".to_string())] {
             let mut warm_failure = measured();
             warm_failure.push(sample(10, true, 3_000, outcome));
-            let summary = summarize(&warm_failure, "ptrace", &[0, 10]);
+            let summary = summarize(&warm_failure, "ptrace", &[0, 10], Some(true));
             assert_eq!((summary.failed, summary.failed_warmups), (0, 1));
             assert_eq!(summary.points.len(), 2);
             assert_eq!(summary.fit, None);
@@ -1056,7 +1121,7 @@ mod tests {
 
         let mut measured_failure = measured();
         measured_failure.push(sample(10, false, 3_000, Outcome::TimedOut));
-        let summary = summarize(&measured_failure, "ptrace", &[0, 10]);
+        let summary = summarize(&measured_failure, "ptrace", &[0, 10], Some(true));
         assert_eq!((summary.failed, summary.failed_warmups), (1, 0));
         assert_eq!(summary.fit, None);
         // Another variant's failure does not refuse this one.
@@ -1066,9 +1131,33 @@ mod tests {
                 ..sample(calls, false, wall_ns, Outcome::Ok)
             });
         }
-        let native = summarize(&measured_failure, "native", &[0, 10]);
+        let native = summarize(&measured_failure, "native", &[0, 10], None);
         assert_eq!((native.failed, native.failed_warmups), (0, 0));
         assert_eq!(native.fit, Some((10.0, 500.0)));
+    }
+
+    #[test]
+    fn summarize_refuses_a_fit_when_the_statistics_run_was_rejected() {
+        let samples: Vec<Sample> = [(0, 1_000), (10, 3_000)]
+            .into_iter()
+            .map(|(calls, wall_ns)| Sample {
+                variant: "liteinst".to_string(),
+                calls,
+                round: 0,
+                warmup: false,
+                wall_ns,
+                outcome: Outcome::Ok,
+            })
+            .collect();
+        let accepted = summarize(&samples, "liteinst", &[0, 10], Some(true));
+        assert_eq!(accepted.fit, Some((200.0, 1_000.0)));
+        // Clean timed samples, but the statistics run says the calls did not
+        // take the hook: the slope would be a trap's cost, so no fit.
+        let rejected = summarize(&samples, "liteinst", &[0, 10], Some(false));
+        assert_eq!(rejected.stats_accepted, Some(false));
+        assert_eq!((rejected.failed, rejected.failed_warmups), (0, 0));
+        assert_eq!(rejected.points.len(), 2);
+        assert_eq!(rejected.fit, None);
     }
 
     #[test]
@@ -1090,45 +1179,72 @@ mod tests {
     fn check_stats_run_needs_one_record_for_its_own_backend() {
         let own = liteinst_record(100, 1);
         let other = "x INFO backend run complete backend=ptrace stats=metrics=none".to_string();
-        assert!(check_stats_run("liteinst", 100, &Outcome::Ok, &[own.clone()]).is_ok());
-        assert!(check_stats_run("liteinst", 100, &Outcome::Ok, &[]).is_err());
-        assert!(
-            check_stats_run("liteinst", 100, &Outcome::Ok, &[own.clone(), own.clone()]).is_err()
+        assert_eq!(
+            check_stats_run("liteinst", &Outcome::Ok, &[own.clone()]),
+            Ok(Some(100))
         );
-        assert!(check_stats_run("liteinst", 100, &Outcome::Ok, &[other.clone()]).is_err());
+        assert!(check_stats_run("liteinst", &Outcome::Ok, &[]).is_err());
+        assert!(check_stats_run("liteinst", &Outcome::Ok, &[own.clone(), own.clone()]).is_err());
+        assert!(check_stats_run("liteinst", &Outcome::Ok, &[other.clone()]).is_err());
         assert!(
             check_stats_run(
                 "liteinst",
-                100,
                 &Outcome::Failed("exit 1".into()),
                 &[own.clone()]
             )
             .is_err()
         );
-        assert!(check_stats_run("liteinst", 100, &Outcome::TimedOut, &[own]).is_err());
+        assert!(check_stats_run("liteinst", &Outcome::TimedOut, &[own]).is_err());
         // Backends other than LiteInst are not asked for dispatch paths.
-        assert!(check_stats_run("ptrace", 100, &Outcome::Ok, &[other]).is_ok());
+        assert_eq!(check_stats_run("ptrace", &Outcome::Ok, &[other]), Ok(None));
     }
 
     #[test]
-    fn check_stats_run_refuses_a_liteinst_run_that_did_not_hook_the_site() {
-        // Every call but the first took the hook: accepted.
-        assert!(check_stats_run("liteinst", 100, &Outcome::Ok, &[liteinst_record(99, 1)]).is_ok());
-        // Every call trapped: the slope would be a trap's cost.
-        let trapped = check_stats_run("liteinst", 100, &Outcome::Ok, &[liteinst_record(0, 100)]);
-        assert!(trapped.unwrap_err().contains("direct_hook=0 is below 99"));
-        // One call short of the floor is still refused.
-        assert!(check_stats_run("liteinst", 100, &Outcome::Ok, &[liteinst_record(98, 2)]).is_err());
+    fn check_stats_run_refuses_a_liteinst_record_without_a_direct_hook_count() {
         // A record without a readable paths list, or without direct_hook, is
         // refused rather than read as zero.
         let bare = "x INFO backend run complete backend=liteinst stats=LiteInst ...".to_string();
-        assert!(check_stats_run("liteinst", 100, &Outcome::Ok, &[bare]).is_err());
+        assert!(check_stats_run("liteinst", &Outcome::Ok, &[bare]).is_err());
         let no_hook = "x INFO backend run complete backend=liteinst stats=LiteInst paths[first_site_seccomp=1]".to_string();
         assert!(
-            check_stats_run("liteinst", 100, &Outcome::Ok, &[no_hook])
+            check_stats_run("liteinst", &Outcome::Ok, &[no_hook])
                 .unwrap_err()
                 .contains("no direct_hook counter")
         );
+    }
+
+    #[test]
+    fn check_hooked_calls_refuses_a_run_that_did_not_hook_the_site() {
+        // Every call but the first took the hook: accepted.
+        assert!(check_hooked_calls(100, 99, 0).is_ok());
+        // Every call trapped: the slope would be a trap's cost.
+        let trapped = check_hooked_calls(100, 0, 0);
+        assert!(trapped.unwrap_err().contains("is 0, below 99"));
+        // One call short of the floor is still refused.
+        assert!(check_hooked_calls(100, 98, 0).is_err());
+        // Hooks at start-up and exit sites do not count toward the floor:
+        // ten of them in the zero-call run leave the same 98 short of 99.
+        assert!(check_hooked_calls(100, 108, 10).is_err());
+        assert!(check_hooked_calls(100, 109, 10).is_ok());
+        // With a small N, hooks at other sites alone would have met the floor
+        // (`--counts 0,10` with nine other hooks and an unpatched site).
+        assert!(check_hooked_calls(10, 9, 9).is_err());
+        // A zero-call run with more hooks than the measured run leaves none.
+        assert!(check_hooked_calls(100, 5, 10).is_err());
+        // The smallest run that owes the hook a call: one hooked call passes,
+        // none is refused.
+        assert!(check_hooked_calls(2, 1, 0).is_ok());
+        assert!(check_hooked_calls(2, 0, 0).is_err());
+        // A largest count below 2 owes the hook nothing, so even counts that
+        // look clean are refused (`--counts 0,1`).
+        for calls in [0, 1] {
+            let owed_nothing = check_hooked_calls(calls, calls, 0);
+            assert!(
+                owed_nothing
+                    .unwrap_err()
+                    .contains("owes no call to direct_hook")
+            );
+        }
     }
 
     #[test]
