@@ -18,11 +18,9 @@ use hermit::canonical_verdict::Verdict;
 use hermit::canonical_verdict::VerificationReport;
 use regex::Regex;
 
-use super::kvm_cancellation::assert_compared;
 use super::kvm_cancellation::bounded_command_with_timeout;
 use super::kvm_cancellation::bounded_read;
-use super::kvm_cancellation::compared_info_stream;
-use super::kvm_cancellation::without_verification;
+use super::kvm_cancellation::bounded_verify_command;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -343,98 +341,6 @@ fn assert_preemption_handoffs(log: &str, stdout: &str, runnable_leader: bool) {
     }
 }
 
-/// The anchors of [`assert_pmu_handoffs`] and [`assert_preemption_handoffs`]
-/// that are INFO records verify compares, checked on run 1's golden log. The
-/// matched verdict carries each of them to run 2, whose log is deleted;
-/// `assert_compared` in `kvm_cancellation.rs` gives the argument.
-///
-/// The clock records those checks bound their windows with are TRACE, so
-/// each window here is bounded by the compared execve records instead. The
-/// worker's timer is sought after the previous round's execve rather than
-/// after the survivor's first clock record that follows it, and the
-/// replacement's timer between this round's execve and the next round's
-/// rather than between the survivor's first clock record and the next execve
-/// or displaced-leader spin after it. Each window contains the original one,
-/// so the original check implies this one: the original round-1 check slices
-/// from round 0's survivor clock record to round 1's execve, so that record
-/// precedes round 1's execve, and every record these checks find is compared.
-/// The clock relations themselves, the timeslice numbering across the
-/// takeover and the displaced leader's preemption count are checked on the
-/// plain traced run.
-fn assert_compared_handoffs(log: &str, stdout: &str, preempted: bool, runnable_leader: bool) {
-    let compared = compared_info_stream(log, "run 1");
-    let lines: Vec<_> = compared.lines().collect();
-    let identity =
-        Regex::new(r"(?m)^before round=(\d+) pid=(\d+) worker=(\d+) peer=(\d+)$").unwrap();
-    let identities: Vec<_> = identity.captures_iter(stdout).collect();
-    assert_eq!(identities.len(), 2, "two actual nonleader exec boundaries");
-    let execs: Vec<_> = identities
-        .iter()
-        .map(|identity| {
-            let worker = &identity[3];
-            // `detlog!` at detcore/src/lib.rs:1887, which logs at INFO
-            // (detcore/src/detlog.rs:144): compared, so run 2's worker made
-            // the same execve.
-            let worker_execve = format!("[detcore, dtid {worker}] inbound syscall: execve(");
-            assert_compared(log, &compared, &worker_execve);
-            lines
-                .iter()
-                .position(|line| line.contains(&worker_execve))
-                .expect("the identified worker really called execve")
-        })
-        .collect();
-    assert!(execs[0] < execs[1], "the two rounds exec in order");
-    for (round, identity) in identities.iter().enumerate() {
-        let leader = &identity[2];
-        let worker = &identity[3];
-        let exec = execs[round];
-        let previous_exec = if round == 0 { 0 } else { execs[round - 1] };
-        let next_exec = execs.get(round + 1).copied().unwrap_or(lines.len());
-        if preempted {
-            // `info!` at detcore/src/lib.rs:775: compared, so run 2's worker
-            // and replacement ended the same timeslices.
-            for tid in [worker, leader] {
-                assert_compared(
-                    log,
-                    &compared,
-                    &format!("[detcore, dtid {tid}] ending timeslice T"),
-                );
-            }
-            // `info!` at detcore/src/lib.rs:1794: compared, so run 2 took the
-            // same PMU timers, in the same order relative to the execve.
-            let timer = |tid: &str| format!("[detcore, dtid {tid}] inbound timer preemption event");
-            let worker_timer = timer(worker);
-            let leader_timer = timer(leader);
-            assert_compared(log, &compared, &worker_timer);
-            assert_compared(log, &compared, &leader_timer);
-            assert!(
-                lines[previous_exec..exec]
-                    .iter()
-                    .any(|line| line.contains(&worker_timer)),
-                "worker must receive an actual PMU timer before exec"
-            );
-            assert!(
-                lines[exec + 1..next_exec]
-                    .iter()
-                    .any(|line| line.contains(&leader_timer)),
-                "replacement must receive an actual PMU timer after exec"
-            );
-            if runnable_leader {
-                // `detlog!` at detcore/src/lib.rs:1887, INFO: compared, so
-                // run 2's displaced leader also entered its runnable spin.
-                let leader_getppid = format!("[detcore, dtid {leader}] inbound syscall: getppid(");
-                assert_compared(log, &compared, &leader_getppid);
-                assert!(
-                    lines[previous_exec..exec]
-                        .iter()
-                        .any(|line| line.contains(&leader_getppid)),
-                    "the displaced leader actually entered its runnable spin"
-                );
-            }
-        }
-    }
-}
-
 fn run_fixture(scenario: Scenario) {
     let exit_only = scenario == Scenario::ExitOnly;
     let preempted = matches!(scenario, Scenario::Preempted | Scenario::RunnableLeader);
@@ -496,7 +402,6 @@ fn run_fixture(scenario: Scenario) {
         compile.display()
     );
     let mut previous_stdout = None;
-    let mut plain_args: Option<Vec<String>> = None;
     for pair in 0..3 {
         let directory = root.join(format!("pair-{pair}"));
         let logs = directory.join("verify-logs");
@@ -566,17 +471,8 @@ fn run_fixture(scenario: Scenario) {
             // executions, and they take more than half of the single-step time.
             args.insert(8, "--skid-margin=1000");
         }
-        // Without its verification options every pair runs the same command.
-        let unverified: Vec<String> = without_verification(&args)
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        if let Some(previous) = &plain_args {
-            assert_eq!(previous, &unverified, "every pair runs one command");
-        }
-        plain_args = Some(unverified);
         let mut command = traced_hermit_command(&args);
-        let status = bounded_command_with_timeout(&mut command, &directory, remaining());
+        let (status, run2_log) = bounded_verify_command(&mut command, &directory, remaining());
         assert_eq!(
             status.code(),
             Some(0),
@@ -659,65 +555,29 @@ fn run_fixture(scenario: Scenario) {
                 .collect()
         };
         // After a match `--keep-logs` keeps only run 1's log, the golden copy;
-        // run 2's log, which matched it, is deleted.
+        // run 2's log, which matched it, is deleted. Its capture is checked in
+        // its place.
         let golden = retained("run1_log_");
         assert_eq!(golden.len(), 1, "one complete retained golden log");
-        let log = String::from_utf8(bounded_read(&golden[0], 64 * MIB)).unwrap();
-        assert_no_single_step_dumps(&log, &golden[0]);
-        if !exit_only {
-            assert_pmu_handoffs(&log, stdout);
-        }
-        if preempted {
-            assert_preemption_handoffs(&log, stdout, scenario == Scenario::RunnableLeader);
-        }
-        if !exit_only {
-            assert_compared_handoffs(
-                &log,
-                stdout,
-                preempted,
-                scenario == Scenario::RunnableLeader,
-            );
-        }
         assert!(
             retained("run2_log_").is_empty(),
             "a matched verification must not retain run 2's log"
         );
+        let run2_log = run2_log.expect("run 2's log, captured while the command ran");
+        for path in [&golden[0], &run2_log] {
+            let log = String::from_utf8(bounded_read(path, 64 * MIB)).unwrap();
+            assert_no_single_step_dumps(&log, path);
+            if !exit_only {
+                assert_pmu_handoffs(&log, stdout);
+            }
+            if preempted {
+                assert_preemption_handoffs(&log, stdout, scenario == Scenario::RunnableLeader);
+            }
+        }
+        fs::remove_file(&run2_log).expect("remove run 2's checked log");
         previous_stdout = Some(output);
         eprintln!("ptrace nonleader exec pair {pair}: two full canonical executions");
     }
-
-    // A whole execution for the TRACE and DEBUG records verify does not
-    // compare: the pairs' command without its verification options, tracing
-    // to stderr at the same level through the same RUST_LOG directives.
-    let plain = root.join("plain");
-    let plain_args = plain_args.expect("three verified pairs");
-    let plain_args: Vec<&str> = plain_args.iter().map(String::as_str).collect();
-    let mut command = traced_hermit_command(&plain_args);
-    let status = bounded_command_with_timeout(&mut command, &plain, remaining());
-    let stderr = plain.join("stderr");
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "ptrace plain traced run: {}\n{}",
-        plain.display(),
-        retained_tail(&stderr, STDERR_TAIL_BYTES)
-    );
-    let output = bounded_read(&plain.join("stdout"), MIB);
-    assert_eq!(
-        Some(&output),
-        previous_stdout.as_ref(),
-        "the plain traced run follows the verified trajectory"
-    );
-    let stdout = std::str::from_utf8(&output).expect("guest trajectory text");
-    let log = String::from_utf8(bounded_read(&stderr, 16 * MIB)).unwrap();
-    assert_no_single_step_dumps(&log, &stderr);
-    if !exit_only {
-        assert_pmu_handoffs(&log, stdout);
-    }
-    if preempted {
-        assert_preemption_handoffs(&log, stdout, scenario == Scenario::RunnableLeader);
-    }
-    eprintln!("ptrace nonleader exec: one plain traced execution");
 }
 
 const PREEMPTION_REFUSAL: &str =
@@ -820,72 +680,6 @@ fn assert_artifact_log(
     log.contains(PREEMPTION_REFUSAL)
 }
 
-/// The anchors of [`assert_artifact_log`] that are INFO records verify
-/// compares, checked on a matched case's golden log. The matched verdict
-/// carries each of them to run 2, whose log is deleted; `assert_compared` in
-/// `kvm_cancellation.rs` gives the argument. The single-step, recorded
-/// timeslice (DEBUG) and refusal (ERROR) checks are made on the case's plain
-/// traced run.
-fn assert_compared_artifact_log(log: &str, worker: &str) {
-    let compared = compared_info_stream(log, "run 1");
-    // `detlog!` at detcore/src/lib.rs:1887, which logs at INFO
-    // (detcore/src/detlog.rs:144): compared, so run 2's worker attempted the
-    // same exec.
-    let worker_execve = format!("[detcore, dtid {worker}] inbound syscall: execve(");
-    assert_compared(log, &compared, &worker_execve);
-    // `info!` at detcore/src/lib.rs:1794: compared, so run 2's worker was
-    // also preempted before that exec.
-    let worker_timer = format!("[detcore, dtid {worker}] inbound timer preemption event");
-    assert_compared(log, &compared, &worker_timer);
-    let exec = compared.find(&worker_execve).unwrap();
-    assert!(
-        compared[..exec].contains(&worker_timer),
-        "the recorded and replayed prefix contains actual PMU preemption"
-    );
-}
-
-/// A plain traced execution of a matched preemption-artifact case, for the
-/// records verify does not compare: the case's command without its
-/// verification options, which also drops the report and log paths.
-fn plain_artifact_case(
-    directory: &Path,
-    guest: &Path,
-    target: &Path,
-    artifact_option: &str,
-    verified_stdout: &str,
-    identity: (&str, &str),
-    timeout: Duration,
-) {
-    let report_path = directory.join("verification.json");
-    let logs = directory.join("verify-logs");
-    let args = artifact_args(guest, target, artifact_option, &report_path, &logs);
-    let mut command = traced_hermit_command(&without_verification(&args));
-    let status = bounded_command_with_timeout(&mut command, directory, timeout);
-    let stderr = directory.join("stderr");
-    // EXIT-CLASS: guest
-    assert_eq!(
-        status.code(),
-        Some(0),
-        "{}",
-        retained_tail(&stderr, STDERR_TAIL_BYTES)
-    );
-    let stdout = String::from_utf8(bounded_read(&directory.join("stdout"), MIB)).unwrap();
-    assert_eq!(
-        stdout, verified_stdout,
-        "the plain traced run follows the verified trajectory"
-    );
-    assert!(
-        !Path::new(&format!("{}.ran", target.display())).exists(),
-        "replacement code must not run"
-    );
-    // This stderr is the trace, and Hermit's own diagnostics are in it too.
-    let log = String::from_utf8(bounded_read(&stderr, 16 * MIB)).unwrap();
-    assert!(
-        !assert_artifact_log(&log, &stderr, artifact_option, false, identity),
-        "specific transfer refusal only on successful exec"
-    );
-}
-
 fn preemption_artifact_case(
     directory: &Path,
     guest: &Path,
@@ -900,7 +694,7 @@ fn preemption_artifact_case(
     let report_path = directory.join("verification.json");
     let args = artifact_args(guest, target, artifact_option, &report_path, &logs);
     let mut command = traced_hermit_command(&args);
-    let status = bounded_command_with_timeout(&mut command, directory, timeout);
+    let (status, run2_log) = bounded_verify_command(&mut command, directory, timeout);
     let stderr = String::from_utf8(bounded_read(&directory.join("stderr"), 16 * MIB)).unwrap();
     let stdout = String::from_utf8(bounded_read(&directory.join("stdout"), MIB)).unwrap();
     let report = VerificationReport::from_current_json_slice(&bounded_read(&report_path, MIB))
@@ -989,15 +783,32 @@ fn preemption_artifact_case(
             let log = String::from_utf8(bounded_read(&path, 64 * MIB)).unwrap();
             diagnostic |=
                 assert_artifact_log(&log, &path, artifact_option, refused, (leader, worker));
-            if !refused {
-                assert_compared_artifact_log(&log, worker);
-            }
         }
+    }
+    if refused {
+        // Run 1's refusal ends the verification before run 2 starts, and
+        // Hermit then deletes run 2's log, which it created empty before run
+        // 1. A capture made before that deletion is empty.
+        if let Some(path) = &run2_log {
+            assert!(
+                bounded_read(path, 64 * MIB).is_empty(),
+                "a refusal has no second verified run"
+            );
+        }
+    } else {
+        let path = run2_log
+            .as_ref()
+            .expect("run 2's log, captured while the command ran");
+        let log = String::from_utf8(bounded_read(path, 64 * MIB)).unwrap();
+        diagnostic |= assert_artifact_log(&log, path, artifact_option, refused, (leader, worker));
     }
     assert_eq!(
         diagnostic, refused,
         "specific transfer refusal only on successful exec"
     );
+    if let Some(path) = run2_log {
+        fs::remove_file(path).expect("remove run 2's checked log");
+    }
     stdout
 }
 
@@ -1068,25 +879,6 @@ pub(super) fn run_preemption_artifacts() {
             .any(|(tid, points)| { tid.to_string() == worker && points.len() > 1 }),
         "the actual exec worker has a nonempty recorded preemption history"
     );
-    let plain_identity = (&identity[1], worker);
-    // A matched case retains only its golden log, so the records verify does
-    // not compare are checked on a plain traced run of the same command. This
-    // one records to its own path: the verified recording, which the replay
-    // cases consume, stays the file the verified run published.
-    let plain = root.join("record-failed-exec").join("plain");
-    let plain_record_option = format!(
-        "--record-preemptions-to={}",
-        plain.join("failed-exec-preemptions.json").display()
-    );
-    plain_artifact_case(
-        &plain,
-        &guest,
-        &target,
-        &plain_record_option,
-        &recorded_stdout,
-        plain_identity,
-        remaining(),
-    );
     let replayed_stdout = preemption_artifact_case(
         &root.join("replay-failed-exec"),
         &guest,
@@ -1099,15 +891,6 @@ pub(super) fn run_preemption_artifacts() {
     assert_eq!(
         recorded_stdout, replayed_stdout,
         "full prefix clocks survive replay"
-    );
-    plain_artifact_case(
-        &root.join("replay-failed-exec").join("plain"),
-        &guest,
-        &target,
-        &replay_option,
-        &replayed_stdout,
-        plain_identity,
-        remaining(),
     );
 
     // This is an intentional filesystem-compatibility negative: the exact
