@@ -13,6 +13,10 @@ Routing (per cell, first match wins; see _route):
   re:    everything else.
 `-c hermit_e2e.routing=local` runs every cell locally (the buck-local test mode).
 
+Container (per local cell; see _container): a privileged-lane cell, a pinned-root-only
+cell and a DBT cell run inside ci/hermetic/run-in-pinned-root.sh, the privileged podman
+container the cargo flow runs every e2e node in. Other local cells run on the host.
+
 RE-routed cells support Buck's test execution caching: when the bundle (hermit, harness,
 fixtures, sources) and the cell are unchanged, Buck answers from the RE action cache
 instead of re-running. Local executions are never cached by Buck, and `--stress-runs`
@@ -38,8 +42,8 @@ LOCAL_TESTS = {
 }
 
 # Cells that pass only inside the pinned-root container the cargo flow uses: neither a
-# buck-local host nor an RE worker provides that identity. They still run (local), and
-# the ingester records them against this reason.
+# buck-local host nor an RE worker provides that identity, so they run locally inside
+# that container (_container).
 PINNED_ROOT_ONLY = {
     "c-programs/environment-and-workdir/custom": "asserts HOSTNAME=hermetic-container.local, the pinned-root PATH and /results paths, which only the pinned-root container provides",
 }
@@ -82,6 +86,22 @@ def _route(cell, pmu_on_re, re_exclusions):
     if pmu_armed(cell) and not pmu_on_re:
         return ("local", "arms the PMU and -c hermit_e2e.pmu_on_re=false")
     return ("re", "")
+
+def _container(cell, where):
+    """Returns (container, reason) for a cell routed `where`: container is "pinned-root" or ""."""
+    if where != "local":
+        return ("", "")
+    if cell["lane"] == "privileged":
+        return ("pinned-root", "privileged lane: the cargo flow runs it in the privileged pinned-root container")
+    pinned = PINNED_ROOT_ONLY.get("{}/{}".format(cell["test"], cell["mode"]))
+    if pinned:
+        return ("pinned-root", "pinned-root-only: " + pinned)
+    if cell["backend"] == "dbt":
+        # The DBT adapter enters the /test mount namespace itself (hermit_test_workdir),
+        # which needs CAP_SYS_ADMIN; the other backends mount /test in hermit's own
+        # user namespace.
+        return ("pinned-root", "dbt backend: entering the /test mount namespace needs CAP_SYS_ADMIN")
+    return ("", "")
 
 def _cell_test_impl(ctx):
     cmd = cmd_args(ctx.attrs.runner, ctx.attrs.args)
@@ -166,6 +186,7 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
         where, reason = _route(cell, pmu_on_re, re_exclusions["tests"])
         if routing == "local":
             where = "local"
+        container, container_reason = _container(cell, where)
         name = cell_slug(cell)
         hermit_e2e_cell_test(
             name = name,
@@ -173,6 +194,8 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
             args = [cell["test"], cell["mode"], cell["backend"]],
             bundle = bundle,
             env = dict({
+                "HERMIT_E2E_CONTAINER": container,
+                "HERMIT_E2E_CONTAINER_REASON": container_reason,
                 "HERMIT_E2E_ROUTE": where,
                 "HERMIT_E2E_ROUTE_REASON": reason,
             }, **({"HERMIT_E2E_NONCE": nonce} if nonce else {})),
@@ -181,7 +204,7 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
                 "hermit_e2e",
                 "hermit_e2e_route_" + where,
                 "hermit_e2e_backend_" + cell["backend"],
-            ],
+            ] + (["hermit_e2e_container_" + container.replace("-", "_")] if container else []),
             route = where,
         )
         by_route[where].append(":" + name)
