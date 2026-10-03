@@ -117,7 +117,11 @@ pub(crate) async fn yield_once() {
 #[derive(Debug)]
 struct InodePool {
     // TODO(T87258449): merge these two maps:
-    inodes: HashMap<RawInode, DetInode>,
+    /// Keyed by device and inode together, never the inode alone: inode
+    /// numbers are unique only within one filesystem, and which numbers
+    /// coincide across filesystems depends on host counters
+    /// (<https://github.com/rrnewton/hermit/issues/3307>).
+    inodes: HashMap<RawFileId, DetInode>,
     detinodes_info: HashMap<DetInode, DetInodeInfo>,
     /// Counter backing the minted [`DetInode`]s. Deliberately a plain integer:
     /// it is the *source* of deterministic inodes, not one itself, and typing
@@ -128,7 +132,7 @@ struct InodePool {
 /// Everything we know (globally) about a DetInode.
 #[derive(Debug)]
 struct DetInodeInfo {
-    raw: RawInode,
+    raw: RawFileId,
     /// The virtual mtime, or `None` while no stat has observed the file and no
     /// write or explicit time update has set it. Many paths (open, read,
     /// getdents) mint a DetInode before any stat, so the first-seen policy is
@@ -247,17 +251,18 @@ impl InodePool {
         }
     }
 
-    // Allocate the next deterministic inode.  This takes the raw-inode and
-    // can return an existing mapping or extend the mapping by creating a
-    // new deterministic inode. The returned inode is strictly increasing
-    // to avoid inode re-use issue in some filesystem like ext4.
+    // Allocate the next deterministic inode.  This takes the raw file
+    // identity (device and inode) and can return an existing mapping or
+    // extend the mapping by creating a new deterministic inode. The returned
+    // inode is strictly increasing to avoid inode re-use issue in some
+    // filesystem like ext4.
     //
     // Also return the virtual mtime. When it is still unresolved, `observed`
     // resolves it under the first-seen policy (see `ObservedMtime`); an
     // unresolved mtime reads as `epoch`.
     fn add_inode(
         &mut self,
-        raw_inode: RawInode,
+        raw_inode: RawFileId,
         observed: ObservedMtime,
         epoch: LogicalTime,
     ) -> (DetInode, LogicalTime) {
@@ -279,6 +284,16 @@ impl InodePool {
                     },
                 );
                 assert!(prev.is_none()); // Should not have been previously used.
+                // Names the host file behind each minted number, so a run pair
+                // whose deterministic inodes diverge can be traced to the host
+                // files involved (https://github.com/rrnewton/hermit/issues/2397).
+                // DEBUG, not INFO: strict verification compares every INFO
+                // record exactly, and host inode numbers differ between runs
+                // (a new pipe or socket gets a fresh one each time).
+                debug!(
+                    "minted deterministic inode {} for host device {:#x} inode {}",
+                    new, raw_inode.device, raw_inode.inode
+                );
                 new
             }
         };
@@ -290,6 +305,26 @@ impl InodePool {
             info.mtime = observed.first_seen_mtime(epoch);
         }
         (dino, info.mtime.unwrap_or(epoch))
+    }
+
+    // Set the logical mtime of the file with this raw identity. A file not
+    // seen before (e.g. because there hasn't been a stat on it) is added
+    // just-in-time; the mtime set here replaces whatever the first-seen
+    // policy would have chosen.
+    fn touch_inode(
+        &mut self,
+        raw_inode: RawFileId,
+        epoch: LogicalTime,
+        mtime: LogicalTime,
+    ) -> DetInode {
+        let (dino, _) = self.add_inode(raw_inode, ObservedMtime::Unobserved, epoch);
+        let info = self
+            .detinodes_info
+            .get_mut(&dino)
+            // TODO(T87258449): remove this `expect`:
+            .expect("Invariant violation: det inode missing from map.");
+        info.mtime = Some(mtime);
+        dino
     }
 
     // remove a det inode
@@ -2610,7 +2645,7 @@ impl GlobalState {
     async fn recv_determinize_inode(
         &self,
         from: Tid,
-        ino: RawInode,
+        ino: RawFileId,
         observed: ObservedMtime,
     ) -> (DetInode, LogicalTime) {
         let _sched = self.lock_rpc_scheduler(false).await;
@@ -2677,7 +2712,7 @@ impl GlobalState {
         self.inodes.lock().unwrap().remove_inode(d_ino);
     }
 
-    async fn recv_touch_file(&self, from: Tid, ino: RawInode) {
+    async fn recv_touch_file(&self, from: Tid, ino: RawFileId) {
         let _sched = self.lock_rpc_scheduler(false).await;
         let mtime = if self.cfg.virtualize_time {
             self.global_time.lock().unwrap().as_nanos()
@@ -2702,7 +2737,7 @@ impl GlobalState {
     /// mtime is the time of its last write, so `tar` extraction, `cp -p` and
     /// `touch -r` could not restore one, and `make` saw files ordered by when
     /// they were unpacked.
-    async fn recv_set_file_mtime(&self, from: Tid, ino: RawInode, mtime: LogicalTime) {
+    async fn recv_set_file_mtime(&self, from: Tid, ino: RawFileId, mtime: LogicalTime) {
         let _sched = self.lock_rpc_scheduler(false).await;
         trace!(
             "[dtid {}] setting mtime on file (rawinode {:?}) to {}",
@@ -2711,19 +2746,9 @@ impl GlobalState {
         self.set_inode_mtime(ino, mtime);
     }
 
-    fn set_inode_mtime(&self, ino: RawInode, mtime: LogicalTime) {
+    fn set_inode_mtime(&self, ino: RawFileId, mtime: LogicalTime) {
         let epoch = self.epoch_logical_time();
-        let mut mg = self.inodes.lock().unwrap();
-        // If we haven't seen this inode yet (e.g. because there hasnt been a
-        // stat on it), this just-in-time adds it; the mtime set below replaces
-        // whatever the first-seen policy would have chosen.
-        let (dino, _) = mg.add_inode(ino, ObservedMtime::Unobserved, epoch);
-        let info = mg
-            .detinodes_info
-            .get_mut(&dino)
-            // TODO(T87258449): remove this `expect`:
-            .expect("Invariant violation: det inode missing from map.");
-        info.mtime = Some(mtime);
+        self.inodes.lock().unwrap().touch_inode(ino, epoch, mtime);
     }
 
     async fn recv_trace_schedevent(
@@ -3077,9 +3102,10 @@ pub enum GlobalRequest {
     /// The last two arguments are the initial contents of the memory word, and the mask.
     FutexAction(DetTid, FutexAction, FutexID, i32, u32),
 
-    /// Translate nondeterministic to deterministic inode, and report what the
-    /// caller observed of the host mtime (see `ObservedMtime`).
-    DeterminizeInode(RawInode, ObservedMtime),
+    /// Translate a nondeterministic file identity (device and inode, as one
+    /// kernel interface reported them) to a deterministic inode, and report
+    /// what the caller observed of the host mtime (see `ObservedMtime`).
+    DeterminizeInode(RawFileId, ObservedMtime),
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1056): Deterministic st_dev remapping RPC.
@@ -3098,11 +3124,11 @@ pub enum GlobalRequest {
     /// unlink an inode
     UnlinkInode(DetInode),
 
-    /// Bump mtime
-    TouchFile(RawInode),
+    /// Bump mtime of the file with this raw identity (device and inode).
+    TouchFile(RawFileId),
 
     /// Set mtime to a guest-requested time (utimensat and friends).
-    SetFileMtime(RawInode, LogicalTime),
+    SetFileMtime(RawFileId, LogicalTime),
 
     /// Retrieve global time.
     GlobalTimeLowerBound,
@@ -3781,10 +3807,13 @@ where
 /// Also return the logical mtime for the inode, though this is only
 /// used if `virtualize_metadata` is set.
 ///
+/// `inode` must pair the raw inode with the raw device reported by the same
+/// kernel interface; see [`RawFileId`].
+///
 /// For callers that have not read the file's metadata. A stat must use
 /// [`determinize_inode_observing_mtime`] so the first-seen mtime policy sees
 /// the host mtime.
-pub async fn determinize_inode<G, T>(guest: &mut G, inode: RawInode) -> (DetInode, LogicalTime)
+pub async fn determinize_inode<G, T>(guest: &mut G, inode: RawFileId) -> (DetInode, LogicalTime)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -3798,7 +3827,7 @@ where
 /// other becomes the epoch.
 pub async fn determinize_inode_observing_mtime<G, T>(
     guest: &mut G,
-    inode: RawInode,
+    inode: RawFileId,
     observed: ObservedMtime,
 ) -> (DetInode, LogicalTime)
 where
@@ -3879,9 +3908,9 @@ where
     }
 }
 
-/// Update the modification time for a file, using its inode.
-/// This will set the mtime to a coherent global-time value.
-pub async fn touch_file<G, T>(guest: &mut G, inode: RawInode)
+/// Update the modification time for a file, using its raw identity (device and
+/// inode). This will set the mtime to a coherent global-time value.
+pub async fn touch_file<G, T>(guest: &mut G, inode: RawFileId)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -3894,7 +3923,7 @@ where
 }
 
 /// Set a file's virtual mtime to a guest-requested time.
-pub async fn set_file_mtime<G, T>(guest: &mut G, inode: RawInode, mtime: LogicalTime)
+pub async fn set_file_mtime<G, T>(guest: &mut G, inode: RawFileId, mtime: LogicalTime)
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
@@ -7198,6 +7227,7 @@ mod tests {
     #[test]
     fn det_inodes_are_minted_not_passed_through() {
         use crate::types::DetInode;
+        use crate::types::RawFileId;
 
         let mut pool = super::InodePool::new();
         let t = LogicalTime::from_nanos(0);
@@ -7205,8 +7235,8 @@ mod tests {
 
         let host_a = 221_742_951; // the value observed leaking into FileContents
         let host_b = 998_877_665;
-        let (a, _) = pool.add_inode(host_a, seen, t);
-        let (b, _) = pool.add_inode(host_b, seen, t);
+        let (a, _) = pool.add_inode(RawFileId::new(0x32, host_a), seen, t);
+        let (b, _) = pool.add_inode(RawFileId::new(0x32, host_b), seen, t);
 
         assert_ne!(a.as_raw(), host_a, "det inode must not be the host inode");
         assert_ne!(b.as_raw(), host_b, "det inode must not be the host inode");
@@ -7214,7 +7244,7 @@ mod tests {
         assert_eq!(b, DetInode::mint(2), "minting is monotonic");
 
         // Re-determinizing the same host inode is stable, not a fresh mint.
-        let (a_again, _) = pool.add_inode(host_a, seen, t);
+        let (a_again, _) = pool.add_inode(RawFileId::new(0x32, host_a), seen, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
     }
 
@@ -7250,25 +7280,485 @@ mod tests {
         let epoch = LogicalTime::from_secs(1_798_761_600);
         let canonical = ObservedMtime::Canonical(LogicalTime::from_secs(1));
         let mut pool = super::InodePool::new();
+        let file = |inode| crate::types::RawFileId::new(0x32, inode);
 
         // An ordinary file reports the epoch.
-        let (_, mtime) = pool.add_inode(10, ObservedMtime::HostSpecific, epoch);
+        let (_, mtime) = pool.add_inode(file(10), ObservedMtime::HostSpecific, epoch);
         assert_eq!(mtime, epoch);
         // A canonical file keeps its mtime.
-        let (_, mtime) = pool.add_inode(11, canonical, epoch);
+        let (_, mtime) = pool.add_inode(file(11), canonical, epoch);
         assert_eq!(mtime, LogicalTime::from_secs(1));
 
         // A read or getdents mints the inode first; the later stat decides.
-        let (_, mtime) = pool.add_inode(12, ObservedMtime::Unobserved, epoch);
+        let (_, mtime) = pool.add_inode(file(12), ObservedMtime::Unobserved, epoch);
         assert_eq!(mtime, epoch, "an unresolved mtime reads as the epoch");
-        let (_, mtime) = pool.add_inode(12, canonical, epoch);
+        let (_, mtime) = pool.add_inode(file(12), canonical, epoch);
         assert_eq!(mtime, LogicalTime::from_secs(1));
 
         // Once resolved, a later observation does not change it.
-        let (_, mtime) = pool.add_inode(10, canonical, epoch);
+        let (_, mtime) = pool.add_inode(file(10), canonical, epoch);
         assert_eq!(mtime, epoch);
-        let (_, mtime) = pool.add_inode(11, ObservedMtime::HostSpecific, epoch);
+        let (_, mtime) = pool.add_inode(file(11), ObservedMtime::HostSpecific, epoch);
         assert_eq!(mtime, LogicalTime::from_secs(1));
+    }
+
+    /// One request a [`PoolMinter`] received. In production `Stat` is
+    /// `mapping_stat_identity` (which may inject a guest `fstatat`), and
+    /// `Inode` and `Device` are each one `determinize_inode` or
+    /// `determinize_device` RPC to the global tool.
+    #[derive(Debug, PartialEq, Eq)]
+    enum MintCall {
+        Stat(crate::procfs::MappingKey, Vec<usize>),
+        Inode(crate::types::RawFileId),
+        Device(u64),
+    }
+
+    /// Fresh run-global identity pools, driven directly rather than over the
+    /// guest RPC that production's minter uses. Every request is recorded in
+    /// `calls`, in the order it was made.
+    ///
+    /// A header resolves to its own `(device, inode)` pair, as on a filesystem
+    /// whose `st_dev` is its superblock device, unless `stat_identities` maps
+    /// that pair to the identity `stat` reports, as on btrfs.
+    struct PoolMinter {
+        inodes: super::InodePool,
+        devices: super::DevicePool,
+        stat_identities: std::collections::BTreeMap<(u64, u64), crate::types::RawFileId>,
+        calls: Vec<MintCall>,
+    }
+
+    impl PoolMinter {
+        fn new(
+            stat_identities: std::collections::BTreeMap<(u64, u64), crate::types::RawFileId>,
+        ) -> Self {
+            Self {
+                inodes: super::InodePool::new(),
+                devices: super::DevicePool::new(),
+                stat_identities,
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl crate::procfs::MappingIdentityMinter for PoolMinter {
+        type Error = std::convert::Infallible;
+
+        async fn stat_identity(
+            &mut self,
+            key: &crate::procfs::MappingKey,
+            starts: &[usize],
+        ) -> Result<crate::types::RawFileId, Self::Error> {
+            self.calls
+                .push(MintCall::Stat(key.clone(), starts.to_vec()));
+            let header = (key.device, key.inode);
+            Ok(self
+                .stat_identities
+                .get(&header)
+                .copied()
+                .unwrap_or(crate::types::RawFileId::new(key.device, key.inode)))
+        }
+
+        async fn inode(&mut self, raw_file: crate::types::RawFileId) -> crate::types::DetInode {
+            self.calls.push(MintCall::Inode(raw_file));
+            self.inodes
+                .add_inode(
+                    raw_file,
+                    super::ObservedMtime::Unobserved,
+                    LogicalTime::from_nanos(0),
+                )
+                .0
+        }
+
+        async fn device(&mut self, raw_device: u64) -> u64 {
+            self.calls.push(MintCall::Device(raw_device));
+            self.devices.determinize(raw_device)
+        }
+    }
+
+    /// Render one maps snapshot as a fresh run would, through the PRODUCTION
+    /// minting loop: `crate::procfs::mint_mapping_identities` is the function
+    /// `initialize_procfs_snapshot` calls (with an RPC-backed minter), so a
+    /// change to its mint ORDER changes what these tests render.
+    fn render_maps_with_fresh_pools(
+        raw: &str,
+        stdio_by_raw_file: &std::collections::BTreeMap<
+            crate::types::RawFileId,
+            crate::types::DetInode,
+        >,
+    ) -> String {
+        render_maps_with_minter(raw, stdio_by_raw_file, PoolMinter::new(Default::default())).0
+    }
+
+    /// [`render_maps_with_fresh_pools`], also returning the minter, whose
+    /// `calls` list every request in order.
+    fn render_maps_with_fresh_pools_and_calls(
+        raw: &str,
+        stdio_by_raw_file: &std::collections::BTreeMap<
+            crate::types::RawFileId,
+            crate::types::DetInode,
+        >,
+    ) -> (String, PoolMinter) {
+        render_maps_with_minter(raw, stdio_by_raw_file, PoolMinter::new(Default::default()))
+    }
+
+    /// Render `raw` through the production minting loop with `minter`, and
+    /// return the minter afterwards.
+    fn render_maps_with_minter(
+        raw: &str,
+        stdio_by_raw_file: &std::collections::BTreeMap<
+            crate::types::RawFileId,
+            crate::types::DetInode,
+        >,
+        mut minter: PoolMinter,
+    ) -> (String, PoolMinter) {
+        let table = match futures::executor::block_on(crate::procfs::mint_mapping_identities(
+            raw.as_bytes(),
+            stdio_by_raw_file,
+            &mut minter,
+        )) {
+            Ok(table) => table,
+            Err(never) => match never {},
+        };
+        let rendered =
+            String::from_utf8(crate::procfs::sanitize_maps(raw.as_bytes(), &table)).unwrap();
+        (rendered, minter)
+    }
+
+    /// The `MappingKey` a maps header line parses to.
+    fn header_key(line: &str) -> crate::procfs::MappingKey {
+        crate::procfs::mapping_header_key(line).unwrap()
+    }
+
+    /// Whitespace-separated column `n` of every rendered maps line.
+    fn maps_column(rendered: &str, n: usize) -> Vec<&str> {
+        rendered
+            .lines()
+            .map(|line| line.split_whitespace().nth(n).unwrap())
+            .collect()
+    }
+
+    /// Two runs with the same guest-visible maps, where the host numbered the
+    /// two newly seen files in opposite orders (as per-CPU shmem/memfd inode
+    /// batches do), must render identical bytes. Minting in sorted RAW order
+    /// gave the lower deterministic inode to whichever file had the lower host
+    /// inode, so the two snapshots below disagreed on both mapping lines.
+    #[test]
+    fn maps_identities_are_minted_in_text_order_not_raw_order() {
+        let snapshot = |first: u64, second: u64| {
+            format!(
+                "10000000-10001000 r-xp 00000000 00:01 {first:<10}               /memfd:first (deleted)\n\
+                 20000000-20001000 r-xp 00000000 00:01 {second:<10}               /memfd:second (deleted)\n\
+                 30000000-30001000 rw-p 00000000 00:01 {first:<10}               /memfd:first (deleted)\n\
+                 7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]\n"
+            )
+        };
+        let low = 131_975;
+        let high = 2_196_480;
+        let no_stdio = std::collections::BTreeMap::new();
+        let raw_a = snapshot(low, high);
+        let (run_a, minter_a) = render_maps_with_fresh_pools_and_calls(&raw_a, &no_stdio);
+        let run_b = render_maps_with_fresh_pools(&snapshot(high, low), &no_stdio);
+        assert_eq!(
+            run_a, run_b,
+            "host inode numbering order leaked into guest-visible maps"
+        );
+
+        // The first file in address order gets the first minted inode, and the
+        // repeated mapping of it reuses that identity rather than minting again.
+        assert_eq!(maps_column(&run_a, 4), ["1", "2", "1", "0"], "{run_a}");
+
+        // The exact request sequence. Each newly seen header first resolves the
+        // identity `stat` reports for its file, then asks for the inode keyed
+        // on that identity and then for its device, and the repeated
+        // `/memfd:first` line is deduplicated BEFORE any of that, so it issues
+        // no second request of any kind; its start address travels with the
+        // first line's key instead. The rendered bytes show none of this: both
+        // pools return the same value for a key they have already seen, and
+        // they are independent of each other. In production each inode or
+        // device request is one RPC to the global tool, and a stat resolution
+        // can inject a guest `fstatat`.
+        let memfd_dev = libc::makedev(0, 1);
+        let lines: Vec<&str> = raw_a.lines().collect();
+        assert_eq!(
+            minter_a.calls,
+            [
+                MintCall::Stat(header_key(lines[0]), vec![0x1000_0000, 0x3000_0000]),
+                MintCall::Inode(crate::types::RawFileId::new(memfd_dev, low)),
+                MintCall::Device(memfd_dev),
+                MintCall::Stat(header_key(lines[1]), vec![0x2000_0000]),
+                MintCall::Inode(crate::types::RawFileId::new(memfd_dev, high)),
+                MintCall::Device(memfd_dev),
+            ],
+            "{run_a}"
+        );
+    }
+
+    /// The device pool is minted by the same loop, so it must follow text
+    /// order too. Here the first file in address order sits on the raw device
+    /// with the HIGHER number; sorted raw order would give the other device
+    /// `00:01`. Swapping which raw device backs which line must not change a
+    /// single rendered byte.
+    ///
+    /// The fourth line adds a third raw device, `00:07`, numerically the
+    /// lowest and last in the text. Text order, sorted raw order and REVERSE
+    /// text order then give three different device columns, so a mint pass that
+    /// visits the pairs backwards is caught as well as one that sorts them.
+    #[test]
+    fn maps_devices_are_minted_in_text_order_not_raw_order() {
+        let snapshot = |first_dev: &str, second_dev: &str| {
+            format!(
+                "10000000-10001000 r-xp 00000000 {first_dev} 5000                       /first/lib.so\n\
+                 20000000-20001000 r-xp 00000000 {second_dev} 6000                       /second/lib.so\n\
+                 30000000-30001000 r--p 00000000 {first_dev} 7000                       /first/other.so\n\
+                 40000000-40001000 r--p 00000000 00:07 8000                       /third/lib.so\n\
+                 7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]\n"
+            )
+        };
+        let no_stdio = std::collections::BTreeMap::new();
+        // 00:2a (42) is numerically above 00:15 (21); run_a puts it first.
+        let run_a = render_maps_with_fresh_pools(&snapshot("00:2a", "00:15"), &no_stdio);
+        let run_b = render_maps_with_fresh_pools(&snapshot("00:15", "00:2a"), &no_stdio);
+        assert_eq!(
+            run_a, run_b,
+            "host device numbering order leaked into guest-visible maps"
+        );
+        // Text order: 00:2a -> 00:01, 00:15 -> 00:02, 00:07 -> 00:03. Sorted raw
+        // order would render 00:03, 00:02, 00:03, 00:01; reverse text order
+        // would render 00:02, 00:03, 00:02, 00:01.
+        assert_eq!(
+            maps_column(&run_a, 3),
+            ["00:01", "00:02", "00:01", "00:03", "00:00"],
+            "{run_a}"
+        );
+        assert_eq!(maps_column(&run_a, 4), ["1", "2", "3", "4", "0"], "{run_a}");
+    }
+
+    /// With inodes keyed on device and inode together
+    /// (<https://github.com/rrnewton/hermit/issues/3307>), the identity that
+    /// keys each mapping's inode is the one `stat` reports, which on btrfs is
+    /// not the header's pair, and the snapshot's distinct headers are
+    /// themselves collected into a keyed table. Neither table's sorted order
+    /// may decide which file is minted first: the headers must be visited in
+    /// the order their first line appears.
+    ///
+    /// The first header, `/z/lib.so`, models a btrfs file: maps prints device
+    /// `00:2a` and `stat` reports `00:2b`. Sorted header order (raw device,
+    /// then raw inode, then pathname) and sorted `stat`-identity order both
+    /// visit `/m` (device `00:15`, inode 1000), then `/a` (`00:15`, 8000), then
+    /// `/z`, which would render inodes 3, 2, 3, 1 and devices 00:02, 00:01,
+    /// 00:02, 00:01. Text order renders 1, 2, 1, 3 and 00:01, 00:02, 00:01,
+    /// 00:02.
+    #[test]
+    fn maps_keys_are_minted_in_text_order_under_device_keying() {
+        use crate::types::DetInode;
+        use crate::types::RawFileId;
+
+        let raw = "10000000-10001000 r--p 00000000 00:2a 9000                       /z/lib.so\n\
+                   20000000-20001000 r--p 00000000 00:15 8000                       /a/lib.so\n\
+                   30000000-30001000 r-xp 00001000 00:2a 9000                       /z/lib.so\n\
+                   40000000-40001000 r--p 00000000 00:15 1000                       /m/lib.so\n\
+                   7ffd00000000-7ffd00021000 rw-p 00000000 00:00 0                          [stack]\n";
+        let maps_dev = libc::makedev(0, 0x2a);
+        let stat_dev = libc::makedev(0, 0x2b);
+        let other_dev = libc::makedev(0, 0x15);
+        let z_stat = RawFileId::new(stat_dev, 9000);
+        let minter = PoolMinter::new(std::collections::BTreeMap::from([(
+            (maps_dev, 9000),
+            z_stat,
+        )]));
+        let (rendered, mut minter) =
+            render_maps_with_minter(raw, &std::collections::BTreeMap::new(), minter);
+        assert_eq!(
+            maps_column(&rendered, 4),
+            ["1", "2", "1", "3", "0"],
+            "{rendered}"
+        );
+        assert_eq!(
+            maps_column(&rendered, 3),
+            ["00:01", "00:02", "00:01", "00:02", "00:00"],
+            "{rendered}"
+        );
+
+        let lines: Vec<&str> = raw.lines().collect();
+        assert_eq!(
+            minter.calls,
+            [
+                MintCall::Stat(header_key(lines[0]), vec![0x1000_0000, 0x3000_0000]),
+                MintCall::Inode(z_stat),
+                MintCall::Device(maps_dev),
+                MintCall::Stat(header_key(lines[1]), vec![0x2000_0000]),
+                MintCall::Inode(RawFileId::new(other_dev, 8000)),
+                MintCall::Device(other_dev),
+                MintCall::Stat(header_key(lines[3]), vec![0x4000_0000]),
+                MintCall::Inode(RawFileId::new(other_dev, 1000)),
+                MintCall::Device(other_dev),
+            ],
+            "{rendered}"
+        );
+
+        // The inode was minted for the identity `stat` reports, so a later
+        // `stat` of `/z/lib.so` finds the same deterministic inode, while the
+        // header's own pair was never entered into the pool.
+        let t = LogicalTime::from_nanos(0);
+        let stat = super::ObservedMtime::HostSpecific;
+        assert_eq!(
+            minter.inodes.add_inode(z_stat, stat, t).0,
+            DetInode::mint(1)
+        );
+        assert_eq!(
+            minter
+                .inodes
+                .add_inode(RawFileId::new(maps_dev, 9000), stat, t)
+                .0,
+            DetInode::mint(4)
+        );
+    }
+
+    /// A mapping of a file that is also inherited stdio reports the fixed stdio
+    /// identity, and that line does not consume a pooled inode: the next newly
+    /// seen file still gets the next pooled number.
+    ///
+    /// The override replaces only the INODE. The stdio line sits on raw device
+    /// `00:2a`, the second raw device in text order, so its minted device is
+    /// `00:02`; a stdio line that skipped device determinization would show
+    /// the raw `00:2a` instead.
+    #[test]
+    fn maps_stdio_override_does_not_consume_a_pooled_inode() {
+        let stdio_det = crate::types::DetInode::mint(1_000_001);
+        let stdio_by_raw_file = std::collections::BTreeMap::from([(
+            crate::types::RawFileId::new(libc::makedev(0, 0x2a), 4242),
+            stdio_det,
+        )]);
+        let raw = "10000000-10001000 r-xp 00000000 00:01 900                        /memfd:a (deleted)\n\
+                   20000000-20001000 rw-p 00000000 00:2a 4242                       /dev/pts/0\n\
+                   30000000-30001000 r-xp 00000000 00:01 901                        /memfd:b (deleted)\n";
+        let rendered = render_maps_with_fresh_pools(raw, &stdio_by_raw_file);
+        assert_eq!(
+            maps_column(&rendered, 4),
+            ["1", "1000001", "2"],
+            "{rendered}"
+        );
+        assert_eq!(
+            maps_column(&rendered, 3),
+            ["00:01", "00:02", "00:01"],
+            "{rendered}"
+        );
+    }
+
+    /// The stdio override is looked up by the identity `stat` reports for the
+    /// mapped file, which is how the stdio map is keyed (from each stdio
+    /// descriptor's cached `stat`). On btrfs the header's device is the
+    /// superblock's, `00:32` here, while `stat` reports the subvolume's,
+    /// `00:33`, so a lookup by the header's pair would miss and the mapped
+    /// stdin file would show a pooled inode where `fstat(0)` shows the stdio
+    /// one. A file on another device that shares the raw inode number must
+    /// not match.
+    #[test]
+    fn maps_stdio_override_matches_the_stat_identity_not_the_header() {
+        use crate::types::RawFileId;
+
+        let stdin_stat = RawFileId::new(libc::makedev(0, 0x33), 4242);
+        let stdio_by_raw_file =
+            std::collections::BTreeMap::from([(stdin_stat, crate::types::DetInode::mint(1_000))]);
+        let raw = "10000000-10001000 r--p 00000000 00:32 4242                       /tmp/stdin.txt\n\
+                   20000000-20001000 r--p 00000000 00:15 4242                       /other/lib.so\n";
+        let minter = PoolMinter::new(std::collections::BTreeMap::from([(
+            (libc::makedev(0, 0x32), 4242),
+            stdin_stat,
+        )]));
+        let (rendered, _) = render_maps_with_minter(raw, &stdio_by_raw_file, minter);
+        assert_eq!(maps_column(&rendered, 4), ["1000", "1"], "{rendered}");
+        assert_eq!(maps_column(&rendered, 3), ["00:01", "00:02"], "{rendered}");
+    }
+
+    /// Two mappings with the SAME raw inode on DIFFERENT raw devices are two
+    /// distinct files and two distinct table keys. Both lines must be
+    /// rewritten: a pair missing from the table is left alone by
+    /// `sanitize_maps`, which would publish the host device and inode.
+    ///
+    /// `InodePool` is keyed on the raw device and inode together
+    /// (<https://github.com/rrnewton/hermit/issues/3307>), so the two files
+    /// get two pooled inodes, 1 and 2, in text order. While the pool was keyed
+    /// on the raw inode alone both lines showed inode 1, and whether two
+    /// different files shared a pooled inode depended on whether the host
+    /// happened to give them the same raw inode number.
+    #[test]
+    fn maps_same_raw_inode_on_two_raw_devices_rewrites_both_lines() {
+        let raw = "10000000-10001000 r-xp 00000000 00:2a 5000                       /first/lib.so\n\
+                   20000000-20001000 r-xp 00000000 00:15 5000                       /second/lib.so\n";
+        let no_stdio = std::collections::BTreeMap::new();
+        let rendered = render_maps_with_fresh_pools(raw, &no_stdio);
+        for host_value in ["00:2a", "00:15", "5000"] {
+            assert!(
+                !rendered.contains(host_value),
+                "host identity {host_value} leaked into guest-visible maps:\n{rendered}"
+            );
+        }
+        assert_eq!(maps_column(&rendered, 3), ["00:01", "00:02"], "{rendered}");
+        assert_eq!(maps_column(&rendered, 4), ["1", "2"], "{rendered}");
+    }
+
+    /// Regression test for <https://github.com/rrnewton/hermit/issues/3307>.
+    ///
+    /// Inode numbers are unique only within one filesystem. Whether a file on
+    /// one filesystem shares its raw inode number with a file on another
+    /// depends on host counters (fresh tmpfs mounts all number from 1; memfds
+    /// and pipes draw from shared counters), so the same guest sees a
+    /// coincidence in one run and not in the next. The deterministic inode of
+    /// every file, and its logical mtime, must not depend on that.
+    ///
+    /// When the pool was keyed on the inode alone, the colliding run gave the
+    /// second file the first file's deterministic inode, minted the third file
+    /// one lower than in the run without the collision, and a write to one
+    /// file changed the reported mtime of the other.
+    #[test]
+    fn det_inodes_do_not_depend_on_raw_inode_coincidences() {
+        use crate::types::DetInode;
+        use crate::types::RawFileId;
+
+        let epoch = LogicalTime::from_nanos(0);
+        let written = LogicalTime::from_nanos(5_000);
+        // What a stat reports for a file whose host mtime is a real timestamp:
+        // the first-seen policy gives the file the epoch.
+        let seen = super::ObservedMtime::HostSpecific;
+        let mint_run = |second_raw_inode: u64| {
+            let mut pool = super::InodePool::new();
+            // Three files on three filesystems, observed in a fixed order.
+            let first = RawFileId::new(0x2f, 2);
+            let second = RawFileId::new(0x30, second_raw_inode);
+            let third = RawFileId::new(0x31, 9);
+            let first_det = pool.add_inode(first, seen, epoch).0;
+            let second_det = pool.add_inode(second, seen, epoch).0;
+            let third_det = pool.add_inode(third, seen, epoch).0;
+            // The guest writes the first file, then stats the second.
+            let touched = pool.touch_inode(first, epoch, written);
+            let second_after_write = pool.add_inode(second, seen, epoch);
+            (
+                [first_det, second_det, third_det],
+                touched,
+                second_after_write,
+            )
+        };
+
+        // Run without a coincidence, and a run whose second file happens to
+        // carry the first file's raw inode number on a different device.
+        let (apart, apart_touched, apart_second) = mint_run(7);
+        let (colliding, colliding_touched, colliding_second) = mint_run(2);
+
+        let expected = [DetInode::mint(1), DetInode::mint(2), DetInode::mint(3)];
+        assert_eq!(apart, expected);
+        assert_eq!(
+            colliding, expected,
+            "a raw inode shared across devices must not change minted inodes"
+        );
+        assert_eq!(apart_touched, DetInode::mint(1));
+        assert_eq!(colliding_touched, DetInode::mint(1));
+        assert_eq!(apart_second, (DetInode::mint(2), epoch));
+        assert_eq!(
+            colliding_second,
+            (DetInode::mint(2), epoch),
+            "writing one file must not change another file's mtime"
+        );
     }
 }
 
