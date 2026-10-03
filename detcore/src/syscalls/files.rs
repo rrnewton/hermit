@@ -3769,8 +3769,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Utimensat,
         staged: Option<[Timespec; 2]>,
     ) -> Result<i64, Errno> {
-        if !guest.config().virtualize_metadata && staged.is_none() {
-            return self.record_or_replay(guest, call).await;
+        if !guest.config().virtualize_metadata {
+            return self.utimensat_without_lookup(guest, call, staged).await;
         }
 
         // The staged times and the buffer for the target lookups share one
@@ -3778,7 +3778,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // has run, so that neither the kernel's read of the times nor a lookup
         // finds the other's bytes, or a restored stack, at its address.
         let mut stack = guest.stack().await;
-        let call = match staged {
+        let staged_call = match staged {
             Some(times) => call.with_times(Some(stack.push(times))),
             None => call,
         };
@@ -3788,19 +3788,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             // The lookup buffer only serves the virtual update, so a scratch
             // stack that cannot hold it, for example one next to the guard
             // page, must not keep the guest's own call from reaching Linux.
-            Err(_) if staged.is_none() => {
+            Err(_) => {
                 info!(
                     "Guest stack scratch cannot hold the utimensat target lookup; \
                      leaving the virtual mtime unchanged."
                 );
-                return self.record_or_replay(guest, call).await;
+                return self.utimensat_without_lookup(guest, call, staged).await;
             }
-            Err(errno) => return Err(errno),
         };
-
-        if !guest.config().virtualize_metadata {
-            return self.record_or_replay(guest, call).await;
-        }
+        let call = staged_call;
 
         // The kernel applies the new times to the real file, but the guest
         // observes the virtual mtime, which otherwise only moves on writes. Copy
@@ -3867,6 +3863,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             set_file_mtime(guest, after.st_ino, LogicalTime::from_nanos(nanos)).await;
         }
         Ok(res)
+    }
+
+    /// Performs a utimensat call without the virtual mtime update. Staged
+    /// times are then the only scratch-stack allocation, as they were before
+    /// the update existed.
+    async fn utimensat_without_lookup<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Utimensat,
+        staged: Option<[Timespec; 2]>,
+    ) -> Result<i64, Errno> {
+        let Some(times) = staged else {
+            return self.record_or_replay(guest, call).await;
+        };
+        let mut stack = guest.stack().await;
+        let call = call.with_times(Some(stack.push(times)));
+        let _guard = stack.commit()?;
+        self.record_or_replay(guest, call).await
     }
 
     /// The metadata of the file a utimensat call targets, with the same target
