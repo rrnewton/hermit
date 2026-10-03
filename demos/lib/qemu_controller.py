@@ -3,10 +3,11 @@
 
 import argparse
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
-from typing import List, Optional
+from typing import List, NamedTuple, Optional, Tuple
 
 from demo_common import qmp_command, stop_process, wait_for_socket
 
@@ -30,6 +31,30 @@ COMMAND_DISK_MARKER = "HERMIT-QEMU-COMMAND-DISK-READY"
 BEGIN_MARKER = "__HERMIT_COMMAND_BEGIN__"
 END_MARKER = "__HERMIT_COMMAND_END__"
 
+# The guest's /init (demos/lib/qemu-assets.sh) frames the command's output: a
+# BEGIN line naming the frame format, the command's stdout and stderr with
+# OUTPUT_PREFIX in front of every line, and an END line carrying the command's
+# exit status. The command's own output can only produce prefixed lines, so it
+# cannot produce either frame line.
+COMMAND_FRAME_FORMAT = 2
+BEGIN_LINE = "{} format={}".format(BEGIN_MARKER, COMMAND_FRAME_FORMAT).encode()
+END_LINE_RE = re.compile(
+    re.escape(END_MARKER.encode()) + rb" status=(0|[1-9][0-9]{0,2})"
+)
+OUTPUT_PREFIX = b"| "
+# Marks a line inside the frame that /init did not prefix (a kernel message, or
+# something written straight to /dev/console) where it appears in the output.
+CONSOLE_LINE_MARK = b"[console] "
+# An /init from before frame format 2 printed exactly this line in place of
+# BEGIN_LINE and printed the command's output unprefixed.
+STALE_BEGIN_LINE = BEGIN_MARKER.encode()
+STALE_GUEST_INIT_MESSAGE = (
+    "the guest printed a bare {} line, so it is running an /init from before "
+    "command frame format {}: the boot snapshot was built from an older "
+    "initramfs. Run demos/clean.sh, then run demo 5 again to rebuild the boot "
+    "snapshot".format(BEGIN_MARKER, COMMAND_FRAME_FORMAT)
+)
+
 
 # QEMU's initial process state influences the VM snapshot. Do not leak harness
 # settings such as QEMU_TIMEOUT or proxy variables into its initial stack.
@@ -37,6 +62,99 @@ QEMU_ENV = {
     "LC_ALL": "C",
     "TZ": "UTC",
 }
+
+
+class StaleGuestInitError(ValueError):
+    """The guest runs an /init that predates the current command frame."""
+
+
+class CommandResult(NamedTuple):
+    """What the guest's /init reported for one command."""
+
+    # The command's stdout and stderr with OUTPUT_PREFIX removed, one line per
+    # prefixed line, plus any unprefixed console line inside the frame after
+    # CONSOLE_LINE_MARK, all in transcript order.
+    output: bytes
+    # The command's exit status, from the END line.
+    exit_status: int
+    # The unprefixed lines inside the frame, without CONSOLE_LINE_MARK.
+    console_lines: Tuple[bytes, ...]
+
+
+def end_line_status(line: bytes) -> Optional[int]:
+    """The exit status an END line carries, or None if ``line`` is not one."""
+    match = END_LINE_RE.fullmatch(line)
+    if match is None:
+        return None
+    status = int(match.group(1))
+    return status if status <= 255 else None
+
+
+class CommandTranscriptParser:
+    """Read the guest's command frame from a serial transcript, chunk by chunk.
+
+    Only complete lines count: a line is read once its newline has arrived, so
+    once a transcript yields a result, every longer transcript that starts with
+    it yields the same result. The guest's console ends lines with CR LF; one
+    CR before the LF is removed and any other CR is kept.
+
+    Lines before BEGIN_LINE are ignored, except STALE_BEGIN_LINE, which raises
+    StaleGuestInitError at once. After BEGIN_LINE, a line starting with
+    OUTPUT_PREFIX is a line of the command's output, a line that is exactly an
+    END line ends the frame, and any other line, including a bare END_MARKER, is
+    kept in the output after CONSOLE_LINE_MARK and listed in console_lines, so
+    it is shown and compared rather than dropped. Frame lines match only as
+    whole lines. Do not feed a parser again after it has raised.
+    """
+
+    def __init__(self) -> None:
+        self._pending = bytearray()
+        self._started = False
+        self._output = bytearray()
+        self._console_lines: List[bytes] = []
+        self.result: Optional[CommandResult] = None
+
+    def feed(self, data: bytes) -> Optional[CommandResult]:
+        """Add transcript bytes; return the result once the END line is in."""
+        if self.result is not None:
+            return self.result
+        search_from = len(self._pending)
+        self._pending.extend(data)
+        line_start = 0
+        while self.result is None:
+            newline = self._pending.find(b"\n", search_from)
+            if newline < 0:
+                break
+            self._take_line(bytes(self._pending[line_start:newline]))
+            line_start = search_from = newline + 1
+        del self._pending[:line_start]
+        return self.result
+
+    def _take_line(self, line: bytes) -> None:
+        if line.endswith(b"\r"):
+            line = line[:-1]
+        if not self._started:
+            if line == BEGIN_LINE:
+                self._started = True
+            elif line == STALE_BEGIN_LINE:
+                raise StaleGuestInitError(STALE_GUEST_INIT_MESSAGE)
+            return
+        if line.startswith(OUTPUT_PREFIX):
+            self._output.extend(line[len(OUTPUT_PREFIX) :] + b"\n")
+            return
+        exit_status = end_line_status(line)
+        if exit_status is not None:
+            self.result = CommandResult(
+                bytes(self._output), exit_status, tuple(self._console_lines)
+            )
+            return
+        self._console_lines.append(line)
+        self._output.extend(CONSOLE_LINE_MARK + line + b"\n")
+
+
+def parse_command_transcript(transcript: bytes) -> Optional[CommandResult]:
+    """The command's result in a whole transcript, or None if it has not ended."""
+    return CommandTranscriptParser().feed(transcript)
 
 
 class FileSerial:
@@ -72,6 +190,24 @@ class FileSerial:
                 self.buffer.extend(chunk)
             else:
                 time.sleep(0.05)
+
+    def wait_for_command_result(self) -> CommandResult:
+        """Tail the transcript until the guest's END line; return the result.
+
+        Raises StaleGuestInitError as soon as the transcript shows an /init
+        from before the current command frame.
+        """
+        self._ensure_open()
+        parser = CommandTranscriptParser()
+        result = parser.feed(bytes(self.buffer))
+        while result is None:
+            chunk = self.handle.read()
+            if chunk:
+                self.buffer.extend(chunk)
+                result = parser.feed(chunk)
+            else:
+                time.sleep(0.05)
+        return result
 
     def close(self) -> None:
         if self.handle is not None:
@@ -209,10 +345,12 @@ def run_controller(arguments: argparse.Namespace) -> int:
             qmp_command(arguments.qmp_socket, "quit", blocking=True)
         else:
             # Nothing is written into the guest. The command image was populated
-            # before QEMU launched, so the guest reads it and emits the markers
-            # itself; the controller only tails the transcript.
+            # before QEMU launched, so the guest reads it and frames the output
+            # itself; the controller only tails the transcript. It waits for the
+            # END line, which the command's own output cannot produce, and
+            # leaves the exit status on that line for the demo to report.
             serial = FileSerial(arguments.serial_log)
-            serial.wait_for(END_MARKER)
+            serial.wait_for_command_result()
             if arguments.no_save_snapshot:
                 # There is no input channel to tell the guest to shut down, so
                 # stop QEMU from the control side.

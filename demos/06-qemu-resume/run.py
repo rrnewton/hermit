@@ -42,9 +42,10 @@ from demo_common import (  # noqa: E402
     wait_for_process,
 )
 from qemu_controller import (  # noqa: E402
-    BEGIN_MARKER,
-    END_MARKER,
+    BEGIN_LINE,
+    StaleGuestInitError,
     build_qemu_command,
+    parse_command_transcript,
 )
 from signal_33 import settle_signal_33_disposition  # noqa: E402
 
@@ -198,19 +199,17 @@ def write_command_image(path: Path, command: str) -> None:
     path.write_bytes(payload + b"\0" * (COMMAND_IMAGE_BYTES - len(payload)))
 
 
-def command_output(transcript: bytes, begin: str, end: str) -> bytes:
-    output = []
-    active = False
-    for line in transcript.decode(errors="replace").splitlines():
-        stripped = line.strip()
-        if stripped == begin:
-            active = True
-            continue
-        if active and end in line:
-            break
-        if active and begin not in line:
-            output.append(line)
-    return ("\n".join(output) + "\n").encode()
+def failed_run_message(return_code: int, serial_log: Path) -> str:
+    """Describe a failed resume, naming a stale guest /init when the log shows one."""
+    message = "Hermit/QEMU exited with status {}".format(return_code)
+    try:
+        parse_command_transcript(serial_log.read_bytes())
+    except OSError:
+        # A run stopped early may not have written the serial log.
+        pass
+    except StaleGuestInitError as error:
+        message += ": {}".format(error)
+    return message
 
 
 def ensure_boot_snapshot() -> None:
@@ -383,15 +382,28 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
         # Check the exit status before reading any artifact: a run stopped early
         # may not have written the serial log yet.
         if return_code != 0:
-            raise RuntimeError("Hermit/QEMU exited with status {}".format(return_code))
+            raise RuntimeError(failed_run_message(return_code, serial_log))
         transcript = serial_log.read_bytes()
 
         copy_file(serial_log, archived_serial_log)
-        guest_output = command_output(transcript, BEGIN_MARKER, END_MARKER)
+        command_result = parse_command_transcript(transcript)
+        if command_result is None:
+            raise RuntimeError(
+                "Hermit/QEMU exited 0, but the serial log {} holds no complete "
+                "command frame: a {} line, the command's output, then an END "
+                "line with the command's exit status".format(
+                    display_path(archived_serial_log, ROOT),
+                    BEGIN_LINE.decode(),
+                )
+            )
+        # The command's stdout and stderr without the guest's "| " prefix, plus
+        # any console line printed inside the frame, marked "[console] ".
+        guest_output = command_result.output
         output_path.write_bytes(guest_output)
         banner("Guest serial output")
         sys.stdout.buffer.write(guest_output)
         sys.stdout.buffer.flush()
+        print("Guest command exit status: {}".format(command_result.exit_status))
 
         banner("Hermit INFO tail (wall-clock timestamps stripped)")
         for line in extract_info_tail(info_log):
@@ -403,6 +415,9 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
             "command_sha256": command_digest,
             "guest_output": str(output_path.resolve()),
             "guest_output_sha256": hashlib.sha256(guest_output).hexdigest(),
+            # Reported and compared between runs; a nonzero status is the
+            # command's own result, not a demo failure.
+            "guest_exit_status": command_result.exit_status,
             "qemu_argv": qemu_argv,
             "serial_log": str(archived_serial_log.resolve()),
             "snapshot_saved": saved_snapshot,

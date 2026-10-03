@@ -57,6 +57,14 @@ resume only once.
 Captured on 2026-09-30: the second resume of a first `uname -a` invocation,
 with the tail of Hermit's log cut (marked `...`).
 
+This capture and the 2026-09-30 measurements below predate the 2026-10-02
+change to the guest's `/init` that frames the command's output (see "How it
+works"). A run of the current demo also prints `Guest command exit status: 0`
+after the guest output and `PASS: guest command exit status matches (0)` in
+the repeat check, and its post-command snapshot hash, scheduler turns, virtual
+times, and log size are expected to differ from the figures here. The sample
+is to be refreshed from the next verified run.
+
 ```text
 ================================================================================
 =====                     Demo 6: QEMU Snapshot Resume                     =====
@@ -115,10 +123,12 @@ wall-clock prefix was removed (see below). The directory named `28ba533b...`
 is the SHA-256 of the command string `uname -a`. Your hashes and virtual times
 will match these only with the same QEMU build, kernel and demo 5 snapshot. As
 in demo 5, a saved reference run no longer applies after you rebuild Hermit,
-change QEMU or the kernel, replace demo 5's snapshot, edit
-`demos/lib/demo_common.py` or `demos/lib/qemu_controller.py`, or run the demo
-with a different Python interpreter: the interpreter that runs `run.py` is also
-the guest's controller program. Run `demos/clean.sh` to start over.
+change QEMU or the kernel, replace demo 5's snapshot, change the guest's
+`/init` or initramfs (`demos/lib/qemu-assets.sh`; demo 5 must then save a new
+boot snapshot), edit `demos/lib/demo_common.py` or
+`demos/lib/qemu_controller.py`, or run the demo with a different Python
+interpreter: the interpreter that runs `run.py` is also the guest's controller
+program. Run `demos/clean.sh` to start over.
 
 On 2026-09-30 six `uname -a` resumes ran: two in a first invocation in this
 checkout, one `make -C demos demo6`, one `make -C demos group3`, and two in a
@@ -152,10 +162,16 @@ Run metadata: ignored/qemu-linux/resume-metadata/28ba533b0f3c4df63d6b4a5ead73860
   guest continues from the exact moment the snapshot was taken and runs the
   command straight away.
 - Where demo 5's repeat check has a `serial output SHA-256` line, this one has
-  `guest output SHA-256`: the output of your command, cut out of the serial
-  transcript from between the command markers. The demo does not hash the rest
-  of the transcript; we compared each run's archived `serial.log` by hand, and
-  it was byte-identical across the repeats of each command above.
+  `guest output SHA-256`: the output of your command, taken from the serial
+  transcript between the guest's BEGIN and END lines with the `| ` in front of
+  each line removed (see "How it works"). The demo does not hash the rest of
+  the transcript; we compared each run's archived `serial.log` by hand, and it
+  was byte-identical across the repeats of each command above.
+- `Guest command exit status:` is the command's own exit status, read from the
+  guest's END line. It is saved in `run-metadata.json` as `guest_exit_status`
+  and compared with the reference run (`PASS: guest command exit status
+  matches`). A nonzero status does not fail the demo, because it is the
+  command's result; a status that differs from the reference run does.
 - The reference run is stored per command (under a directory named after the
   command's SHA-256), so `uname -a` and `ls /` are checked independently.
 - As in demo 5, one value in the Hermit log still depends on how `hermit` was
@@ -202,11 +218,47 @@ start-up. The command travels to the guest on a small raw disk, `/dev/vda`,
 that demo 5 attached (holding `WAIT`) before it saved the snapshot. Before QEMU
 starts, the demo writes the command into that disk image. When the guest
 resumes, its `/init` loop reads the disk's first 512 bytes, finds a command
-instead of `WAIT`, and runs it between the `__HERMIT_COMMAND_BEGIN__` and
-`__HERMIT_COMMAND_END__` markers. The command is on disk before the guest runs,
-so nothing depends on when the host sends it. The controller ([`lib/qemu_controller.py`](../lib/qemu_controller.py))
-waits for the end marker and asks QEMU to save a snapshot named
-`command-<first 16 hex digits of the command's SHA-256>`.
+instead of `WAIT`, and runs it. The command is on disk before the guest runs,
+so nothing depends on when the host sends it.
+
+`/init` frames the command's output so that nothing the command prints can be
+taken for the frame. It prints `__HERMIT_COMMAND_BEGIN__ format=2`, runs the
+command with its standard output and standard error going to a file, prints
+that file with `| ` in front of every line, and then prints
+`__HERMIT_COMMAND_END__ status=N`, where `N` is the command's exit status. The
+controller ([`lib/qemu_controller.py`](../lib/qemu_controller.py)) reads the
+transcript line by line and accepts only these exact whole lines as the frame.
+A command that prints the end marker itself, for example
+`echo __HERMIT_COMMAND_END__; sleep 1000000`, produces the line
+`| __HERMIT_COMMAND_END__`, which neither ends the wait nor cuts the output
+short. When the real END line arrives, the controller asks QEMU to save a
+snapshot named `command-<first 16 hex digits of the command's SHA-256>`. The
+demo removes the `| ` prefixes to get the guest output. Any other line inside
+the frame, such as a kernel message, is kept in the guest output with
+`[console] ` in front of it, so it is shown and compared rather than dropped.
+
+The framing has these consequences and limits:
+
+- The output appears after the command has exited, not while it runs.
+- The command's standard output is a file, not the console. Programs that
+  format for a terminal print differently (BusyBox `ls`, for example, prints
+  one name per line instead of columns), and C programs buffer their standard
+  output, so its lines can come out in a different order relative to standard
+  error than they would at a terminal.
+- A command that writes to `/dev/console` directly bypasses the file and can
+  still print any line, including an END line.
+- The file is `/tmp/.hermit-command-output` in the guest's memory. A command
+  that reads or writes it interferes with its own output.
+- A last line without a newline is printed with one, and NUL bytes are not
+  preserved. Output that a background job writes after the command has exited
+  is not shown.
+- A kernel message printed in the middle of the END line hides that line, so
+  the controller keeps waiting and the run fails at its timeout; it never ends
+  with a cut-off output.
+- A boot snapshot saved before this change still runs the old `/init`, which
+  prints a bare `__HERMIT_COMMAND_BEGIN__` line. The controller stops as soon
+  as it sees that line, and the demo says to run `demos/clean.sh` and then
+  demo 5 again.
 
 The resume runs under `hermit run --strict --epoch 2026-01-01T00:00:00Z
 --no-rcb-time --target-timeslice 100000 --max-timeslice disabled`. It switches

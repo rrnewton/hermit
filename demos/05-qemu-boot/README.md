@@ -71,6 +71,13 @@ after 12.4 to 13.5 seconds.
 Captured on 2026-09-30: the second boot of a first invocation, with most of the
 kernel messages and the tail of Hermit's log cut (marked `...`).
 
+This capture and the 2026-09-30 measurements below predate the 2026-10-02
+change to the guest's `/init`, which changed the initramfs (see demo 6's "How
+it works"). The boot's output has the same form, but the snapshot and serial
+hashes, kernel timestamps, scheduler turns, virtual times, and log size are
+expected to differ from the figures here. The sample is to be refreshed from
+the next verified run.
+
 ```text
 ================================================================================
 =====                     Demo 5: QEMU Linux Snapshot                      =====
@@ -193,7 +200,8 @@ Archived snapshot: ignored/qemu-linux/boot-anchor/boot-snapshot.qcow2
   prints the same addresses.
 - A difference fails the run: the headline becomes `PARTIAL`, the demo exits
   with status 1, and `WARN:` lines name what differed. After you rebuild
-  Hermit, change QEMU, change the kernel, edit `demos/lib/demo_common.py`
+  Hermit, change QEMU, change the kernel, change the guest's `/init` or
+  initramfs (`demos/lib/qemu-assets.sh`), edit `demos/lib/demo_common.py`
   or `demos/lib/qemu_controller.py` (the guest runs copies of both), or run
   the demo with a different Python interpreter (the interpreter that runs
   `run.py` is also the guest's controller program, so a different one changes
