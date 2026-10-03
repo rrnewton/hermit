@@ -6554,6 +6554,8 @@ mod tests {
         let sha = "03bbb83581fad247251df6363f50e61e24c2957e";
         let outside = source_identity(&archive.join("src"), Some(sha));
         let climbed = source_identity(&checkout.join("../src"), Some(sha));
+        // A root that does not resolve cannot be placed inside or outside a checkout.
+        let missing = source_identity(&archive.join("missing"), Some(sha));
         fs::remove_dir_all(&archive).unwrap();
         assert!(
             !std::env::temp_dir()
@@ -6563,6 +6565,8 @@ mod tests {
         );
         assert_eq!(outside, Ok((sha.to_string(), false)));
         assert_eq!(climbed, Ok((sha.to_string(), false)));
+        let error = missing.unwrap_err();
+        assert!(error.contains("cannot resolve --repo-root"), "{error}");
     }
 
     /// A symlink outside any checkout that points at tracked files names

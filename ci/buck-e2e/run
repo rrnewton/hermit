@@ -33,7 +33,8 @@
 #
 # ci/buck-e2e/verdict.py then judges the rows as the cargo flow's e2e nodes judge theirs:
 # the staged test-harness, in import mode, once per (lane, category) bucket of the plan.
-# Its result files go to --work/verdict, which each run removes first (with --no-verdict too).
+# Its result files go to --work/verdict, which a run removes as soon as the checkout passes the
+# before-the-run check, so a run that fails later, or is unjudged, leaves no older verdict there.
 # Exit status: 0 when every plan cell passes (an excused diagnostic failure is printed and,
 # as in the cargo flow, does not fail the run), or, with --no-verdict, once the rows are
 # in IMPORT_DIR; 1 when any cell is FAIL or ERROR or has no result (without --no-verdict),
@@ -87,6 +88,8 @@ require_staged_source() { # require_staged_source WHEN EXIT_STATUS
 }
 require_staged_source "before the run" 2
 mkdir -p "$out" "$work"
+# A previous run's verdict must not stand beside this run's rows, whether it fails or is unjudged.
+rm -rf -- "${work:?}/verdict"
 extra=("$@")
 tpx=(-- --retry 1 --no-retry-on-skip)
 
@@ -128,7 +131,6 @@ python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" 
     echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
     exit 1
 }
-rm -rf -- "${work:?}/verdict"
 ((verdict)) || {
     echo "ci/buck-e2e/run: --no-verdict: the rows in $out are unjudged; this run has no verdict" >&2
     exit 0
