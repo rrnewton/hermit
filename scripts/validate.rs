@@ -1783,7 +1783,7 @@ fn e2e_runner_policy(args: &Args) -> Result<(), String> {
     if args.buck2.is_none() {
         return Err(format!(
             "--e2e-runner {runner} needs --buck2 PATH, the absolute path of the internal buck2 \
-             (on devbig030 ~/.config/hermit/buck2.dotslash; see docs/BUCK2_OSS.md)"
+             (see docs/BUCK2_OSS.md, \"Buck as the E2E runner\")"
         ));
     }
     Ok(())
@@ -6120,7 +6120,7 @@ mod e2e_runner_tests {
         args.iter().map(|arg| arg.to_string()).collect()
     }
 
-    const BUCK2: &str = "/home/someone/.config/hermit/buck2.dotslash";
+    const BUCK2: &str = "/opt/buck2/buck2.dotslash";
 
     #[test]
     fn cargo_is_the_default_and_buck2_needs_a_buck_runner() {
