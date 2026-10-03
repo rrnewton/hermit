@@ -125,9 +125,10 @@ file system or network deterministic.
 > speed: Hermit runs a build's threads one at a time, so large parallel builds
 > are slow. The 58 packages are a sample of quick builds, not a random one: an
 > earlier, unfinished run on the 8,688 packages that the paper made
-> reproducible attempted 46, and in 7 of them the `.deb` archive timestamps
-> still differed by a second or two, one shipped different bytes, and two
-> crashed. Read [the writeup](../ai_docs/reproducible-builds-highlights.md)
+> reproducible attempted 46: 37 gave byte-identical `.deb` files; in 5, only
+> the `.deb` archive timestamps differed, by a second; one shipped different
+> bytes; two crashed; and one was skipped by the harness. Read
+> [the writeup](../ai_docs/reproducible-builds-highlights.md)
 > for the method, the per-package table, and that earlier run.
 
 ## Setup
