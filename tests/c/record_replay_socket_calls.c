@@ -31,6 +31,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -405,10 +406,66 @@ static int bound_state_options(void) {
   return 0;
 }
 
+static int readable_now(int fd) {
+  fd_set set;
+  FD_ZERO(&set);
+  FD_SET(fd, &set);
+  struct timeval zero = {0, 0};
+  return select(fd + 1, &set, NULL, NULL, &zero);
+}
+
+/* Readiness observed through select after replayed socket effects: a
+ * datagram queued by sendmmsg, and a descriptor received over SCM_RIGHTS. */
+static int select_observers(void) {
+  int sv[2];
+  CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, sv) == 0);
+  char data[2] = "m0";
+  struct iovec iov = {data, sizeof data};
+  struct mmsghdr message = {.msg_hdr = {.msg_iov = &iov, .msg_iovlen = 1}};
+  CHECK(sendmmsg(sv[0], &message, 1, 0) == 1);
+  CHECK(readable_now(sv[1]) == 1);
+
+  int null = open("/dev/null", O_RDONLY);
+  CHECK(null >= 0);
+  char control[CMSG_SPACE(sizeof(int))] = {0};
+  struct msghdr send_header = {
+      .msg_iov = &iov,
+      .msg_iovlen = 1,
+      .msg_control = control,
+      .msg_controllen = sizeof control,
+  };
+  struct cmsghdr* cmsg = CMSG_FIRSTHDR(&send_header);
+  cmsg->cmsg_level = SOL_SOCKET;
+  cmsg->cmsg_type = SCM_RIGHTS;
+  cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(cmsg), &null, sizeof null);
+  int pair[2];
+  CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == 0);
+  CHECK(sendmsg(pair[0], &send_header, 0) == (ssize_t)sizeof data);
+  char buffer[2];
+  char received_control[CMSG_SPACE(sizeof(int))];
+  struct iovec receive_iov = {buffer, sizeof buffer};
+  struct msghdr receive_header = {
+      .msg_iov = &receive_iov,
+      .msg_iovlen = 1,
+      .msg_control = received_control,
+      .msg_controllen = sizeof received_control,
+  };
+  CHECK(recvmsg(pair[1], &receive_header, 0) == (ssize_t)sizeof buffer);
+  struct cmsghdr* received = CMSG_FIRSTHDR(&receive_header);
+  CHECK(received != NULL && received->cmsg_type == SCM_RIGHTS);
+  int fd;
+  memcpy(&fd, CMSG_DATA(received), sizeof fd);
+  /* /dev/null is always readable. */
+  CHECK(readable_now(fd) == 1);
+  printf("select observers ok\n");
+  return 0;
+}
+
 int main(void) {
   if (batched_messages() != 0 || partial_side_effects() != 0 ||
       tcp_server() != 0 || connected_state_options() != 0 ||
-      bound_state_options() != 0) {
+      bound_state_options() != 0 || select_observers() != 0) {
     return 1;
   }
   return 0;
