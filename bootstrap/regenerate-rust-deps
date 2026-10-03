@@ -36,17 +36,18 @@ do
     exit 1
   fi
 done
-rm -rf -- \
-  "$third_party_dir/.cargo" \
-  "$third_party_dir/BUCK" \
-  "$third_party_dir/vendor"
-
 # Opt-in: fetch Cargo.lock's git dependencies from local mirrors (docs/BUCK2_OSS.md).
+# Checked before anything is removed, so a refusal leaves the previous output in place.
 if [[ -n ${HERMIT_GIT_DEP_MIRRORS:-} ]]; then
   # shellcheck source=bootstrap/git-dep-mirrors.sh
   source "$script_dir/git-dep-mirrors.sh"
   git_dep_mirrors_apply Cargo.lock "$HERMIT_GIT_DEP_MIRRORS"
 fi
+
+rm -rf -- \
+  "$third_party_dir/.cargo" \
+  "$third_party_dir/BUCK" \
+  "$third_party_dir/vendor"
 
 reindeer_args=(
   --third-party-dir "$third_party_dir"

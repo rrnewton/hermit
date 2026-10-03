@@ -6,7 +6,8 @@
 # HERMIT_GIT_DEP_MIRRORS=DIR names a directory holding a bare mirror per git source,
 # named after the URL's last component: https://github.com/rrnewton/liteinst2 is
 # served from DIR/liteinst2.git, https://github.com/rrnewton/reverie.git from
-# DIR/reverie.git. Once it is set, every git source must come from there: a
+# DIR/reverie.git. Two sources with the same last component would share a mirror, and
+# are refused. Once it is set, every git source must come from there: a
 # missing mirror, or one without a commit Cargo.lock pins, is refused before
 # Reindeer runs. Cargo.lock pins every git source to a commit, so a mirror
 # cannot change what is built, only where the objects come from.
@@ -18,17 +19,24 @@
 
 git_dep_mirrors_apply() {
   local lockfile=$1 dir=$2 url rev name mirror prev='' missing=0 count=${GIT_CONFIG_COUNT:-0} served=0
+  local -A source_of
   [[ -d $dir ]] || { echo "HERMIT_GIT_DEP_MIRRORS=$dir is not a directory" >&2; return 1; }
   dir=$(cd -- "$dir" && pwd)
   # One "URL COMMIT" line per locked git package, sorted so each URL's lines are adjacent.
   local pairs
-  pairs=$(sed -n 's/^source = "git+\([^?#"]*\)[^#"]*#\([0-9a-f]\{40\}\)"$/\1 \2/p' "$lockfile" | sort -u)
+  pairs=$(sed -n 's/^source = "git+\([^?#"]*\)[^#"]*#\([0-9a-f]\{40\}\)"$/\1 \2/p' "$lockfile" | LC_ALL=C sort -u)
   [[ -n $pairs ]] || { echo "HERMIT_GIT_DEP_MIRRORS is set but $lockfile has no git sources" >&2; return 1; }
   while read -r url rev; do
     name=${url##*/}
     mirror=$dir/${name%.git}.git
     if [[ $url != "$prev" ]]; then
       prev=$url
+      if [[ -n ${source_of[$mirror]:-} ]]; then
+        echo "$url and ${source_of[$mirror]} would share the mirror $mirror" >&2
+        missing=1
+        continue
+      fi
+      source_of[$mirror]=$url
       if [[ ! -d $mirror ]]; then
         echo "no mirror of $url: create it with  git clone --mirror $url $mirror" >&2
         missing=1

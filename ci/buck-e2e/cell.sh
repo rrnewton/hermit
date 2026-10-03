@@ -114,7 +114,8 @@ pinned-root)
     # does not hit this. So, in the private copy only, the client's directory gets a link
     # to every library the image's own loader resolves for the client outside it,
     # interpreter included: libc and ld.so come from one glibc, and a library the bundle
-    # ships is never replaced. The staged bundle and RE cells are unchanged.
+    # ships is never replaced. The staged bundle and RE cells are unchanged. Only a DBT
+    # cell loads the client, so only a DBT cell gets the links.
     link_dbt_runtime='set -eu
 r=$1
 shift
@@ -124,11 +125,14 @@ printf "%s\n" "$deps" | while read -r name arrow path rest; do
     case "$arrow $path" in
     "=> not"*) echo "cell.sh: the pinned-root image has no $name, which the DBT client needs" >&2; exit 125 ;;
     "=> $r/"*) ;;
-    "=> /"*) link "$path" "$name" ;;
+    "=> /"*) link "$path" "${name##*/}" ;;
     "("*) case $name in /*) link "$name" "${name##*/}" ;; esac ;;
     esac
 done
 exec "$@"'
+    prologue=()
+    [[ $BACKEND != dbt ]] ||
+        prologue=(sh -c "$link_dbt_runtime" link-dbt-runtime /src/bundle/hermit/install/rsrcs)
     # Outputs go through the wrapper's /results mount (E2E_RESULT_ROOT).
     out=$W/results/buck-cell-out
     o=/results/buck-cell-out
@@ -145,8 +149,7 @@ exec "$@"'
         "$wrapper" --src "$R" --out "$W/pinned" --src-rw \
         --env HERMIT_E2E_EMPTY_WORKDIR --env VALIDATE_RUN_STATE --env E2E_RESULT_ROOT \
         --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS -- \
-        sh -c "$link_dbt_runtime" link-dbt-runtime /src/bundle/hermit/install/rsrcs \
-        env E2E_BUILD_ROOT=/src/bundle/build \
+        "${prologue[@]}" env E2E_BUILD_ROOT=/src/bundle/build \
         HERMIT_BIN=/src/bundle/hermit/hermit HERMIT_INSTALL_DIR=/src/bundle/hermit/install \
         timeout --kill-after=10 "$deadline" \
         /src/bundle/bin/test-harness run --repo-root /src/bundle/src --source-sha "$SHA" \
