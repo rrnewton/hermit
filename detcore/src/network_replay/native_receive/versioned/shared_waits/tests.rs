@@ -32,6 +32,14 @@ async fn fixture_with_child(with_child: bool) -> Fixture {
     fixture_with_inputs(with_child, false).await
 }
 async fn fixture_with_inputs(with_child: bool, ready_poll: bool) -> Fixture {
+    fixture_with_receive_inputs(with_child, ready_poll, false, false).await
+}
+async fn fixture_with_receive_inputs(
+    with_child: bool,
+    ready_poll: bool,
+    eof: bool,
+    split: bool,
+) -> Fixture {
     let mut trace = NetworkReplayEngine::controlled_replay_two_row_trace();
     let now = trace.epoch_global_time().unwrap();
     // Real validated immutable trace: bytes are unavailable at this first
@@ -83,6 +91,40 @@ async fn fixture_with_inputs(with_child: bool, ready_poll: bool) -> Fixture {
             event: NetworkInputKindV2::RawTcpPollState {
                 consumed_prefix: 0,
                 revents: libc::POLLIN,
+            },
+        });
+        let NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { nodes } =
+            &mut trace.release_model
+        else {
+            unreachable!()
+        };
+        nodes.push(NetworkReleaseNodeV4 {
+            id: NetworkReleaseNodeIdV4(cut.0),
+            kind: NetworkReleaseNodeKindV4::Input {
+                input_ordinal: ordinal,
+            },
+            prerequisites,
+        });
+    }
+    if split {
+        trace.inputs[2].release.not_before_global_time =
+            LogicalTime::from_nanos(now.as_nanos() + 74);
+    }
+    if eof {
+        let ordinal = trace.inputs.len() as u64;
+        let cut = NetworkReceiveEntryCutV4(trace.release_model.nodes().len() as u64);
+        let prerequisites = trace.entry_frontier(cut).unwrap();
+        trace.inputs.push(NetworkInputEventV4 {
+            ordinal,
+            channel: NetworkChannelId(1),
+            release: NetworkReleaseV4 {
+                not_before_global_time: LogicalTime::from_nanos(now.as_nanos() + 37),
+                receive_entry_cut: cut,
+                prerequisites: prerequisites.clone(),
+            },
+            event: NetworkInputKindV2::PeerShutdown {
+                stream_offset: 8,
+                direction: NetworkShutdownV2::Write,
             },
         });
         let NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { nodes } =
@@ -789,4 +831,789 @@ async fn shared_wait_due_receive_target_cannot_be_stamped_pending() {
 #[tokio::test]
 async fn shared_wait_due_ready_poll_cannot_be_stamped_pending() {
     due_input_is_not_pending(true).await;
+}
+
+async fn reserve_shared_output(
+    f: &Fixture,
+    call: NetworkStreamCallId,
+    now: LogicalTime,
+) -> (
+    Arc<SharedReplaySource>,
+    crate::network_runtime::NativeSourceInterval,
+) {
+    let prefix = f
+        .runtime
+        .join_shared_foreground_prefix(f.root.clone(), &f.engine, Some(call))
+        .await
+        .unwrap();
+    f.runtime
+        .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+            let grant = f
+                .scheduler
+                .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+            let mut engine = f.engine.lock().unwrap();
+            let SharedReplayReceivePlan::Bytes(plan) = engine
+                .plan_shared_replay_receive(f.root.owner(), call, &grant, now)
+                .unwrap()
+            else {
+                panic!("actual eligible shared bytes");
+            };
+            assert_eq!(plan.length(), 8);
+            f.runtime.prepare_shared_replay_output(
+                &prefix,
+                lineage,
+                &mut engine,
+                call,
+                |engine, admission| {
+                    engine
+                        .reserve_shared_replay_store(&plan, &grant, admission)
+                        .map_err(std::io::Error::other)
+                },
+            )
+        })
+        .unwrap()
+}
+
+fn complete_shared_output(
+    f: &Fixture,
+    source: &Arc<SharedReplaySource>,
+    interval: &crate::network_runtime::NativeSourceInterval,
+) -> std::io::Result<usize> {
+    f.runtime
+        .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+            let grant = f
+                .scheduler
+                .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+            let mut engine = f.engine.lock().unwrap();
+            f.runtime
+                .with_shared_output_interval(interval, &mut engine, source, |engine| {
+                    engine
+                        .complete_shared_replay_store(source, &grant)
+                        .map_err(std::io::Error::other)
+                })
+        })
+}
+
+#[tokio::test]
+async fn shared_wait_output_requires_full_actual_attempt_and_excludes_generic_delivery() {
+    use reverie::syscalls::NativeUserStoreOutcome;
+    let f = fixture().await;
+    let call = f.begin(false).await;
+    let now = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+    let (source, interval) = reserve_shared_output(&f, call.id, now).await;
+    assert_eq!(source.bytes(), b"abcdefgh");
+    let before = f.engine.lock().unwrap().channels[&NetworkChannelId(1)].inbound_consumed;
+    assert!(complete_shared_output(&f, &source, &interval).is_err());
+    {
+        let mut engine = f.engine.lock().unwrap();
+        assert!(
+            engine
+                .read_stream_chunk_view(f.root.owner(), source.lease(), 0, 8)
+                .is_err()
+        );
+        for disposition in [
+            NetworkStreamChunkDisposition::Consumed,
+            NetworkStreamChunkDisposition::Peeked,
+        ] {
+            assert!(
+                engine
+                    .finish_stream_chunk(f.root.owner(), source.lease(), disposition)
+                    .is_err()
+            );
+        }
+        assert!(
+            engine
+                .begin_stream_call_release(f.root.owner(), call.id)
+                .is_err()
+        );
+        assert!(engine.finish().is_err());
+        assert_eq!(
+            engine.channels[&NetworkChannelId(1)].inbound_consumed,
+            before
+        );
+        // Controlled backend premise only. Actual R writer/provenance is a
+        // separate integration test owned by the Global consumer.
+        engine
+            .retain_shared_replay_store_attempt(crate::tool_global::SharedStoreAttempt::controlled(
+                source.clone(),
+                NativeUserStoreOutcome::Attempted {
+                    raw: Ok(8),
+                    postcheck: Ok(()),
+                },
+            ))
+            .unwrap();
+    }
+    assert_eq!(complete_shared_output(&f, &source, &interval).unwrap(), 8);
+    assert!(complete_shared_output(&f, &source, &interval).is_err());
+    let engine = f.engine.lock().unwrap();
+    assert_eq!(
+        engine.channels[&NetworkChannelId(1)].inbound_consumed,
+        before + 8
+    );
+    assert!(!engine.stream_calls.contains_key(&call.id));
+    assert!(!engine.stream_operations.contains_key(&source.lease()));
+    assert!(!engine.stream_delivery.contains_key(&call.open_file));
+}
+
+#[tokio::test]
+async fn shared_wait_output_census_rejects_foreign_ofd_alias_of_same_delivery() {
+    use reverie::syscalls::NativeUserStoreOutcome;
+    let f = fixture().await;
+    let call = f.begin(false).await;
+    let now = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+    let (source, interval) = reserve_shared_output(&f, call.id, now).await;
+    {
+        let mut engine = f.engine.lock().unwrap();
+        assert!(engine.shared_output_peer_census(&source).is_ok());
+        // Deliberately corrupt the otherwise exact Delivery index. Equal
+        // lease numbers cannot discharge another open file's effect debt.
+        let foreign = OpenFileId::new_socket(f.root.owner().thread, 999);
+        assert_ne!(foreign, call.open_file);
+        assert_eq!(engine.stream_delivery.insert(foreign, source.lease()), None);
+        assert!(engine.shared_output_peer_census(&source).is_err());
+        engine
+            .retain_shared_replay_store_attempt(crate::tool_global::SharedStoreAttempt::controlled(
+                source.clone(),
+                NativeUserStoreOutcome::Attempted {
+                    raw: Ok(8),
+                    postcheck: Ok(()),
+                },
+            ))
+            .unwrap();
+    }
+    assert!(complete_shared_output(&f, &source, &interval).is_err());
+    let engine = f.engine.lock().unwrap();
+    assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+    assert_eq!(engine.stream_delivery.len(), 2);
+    assert!(engine.stream_operations.contains_key(&source.lease()));
+    assert!(engine.stream_calls.contains_key(&call.id));
+    assert!(engine.finish().is_err());
+}
+
+#[tokio::test]
+async fn shared_wait_failed_store_retains_actual_runtime_interval_after_preparation_drop() {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::Ordering;
+
+    use reverie::syscalls::Errno;
+    use reverie::syscalls::NativeUserStoreOutcome;
+    for outcome in [
+        NativeUserStoreOutcome::Attempted {
+            raw: Ok(2),
+            postcheck: Ok(()),
+        },
+        NativeUserStoreOutcome::Attempted {
+            raw: Ok(8),
+            postcheck: Err(Errno::EFAULT),
+        },
+    ] {
+        let f = fixture().await;
+        let call = f.begin(false).await;
+        let now = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+        let (source, interval) = reserve_shared_output(&f, call.id, now).await;
+        let interval = Arc::new(interval);
+        let weak = Arc::downgrade(&interval);
+        // Actual runtime interval, supplied backend outcome: this checks
+        // lifetime exclusion, not an actual native guest write.
+        f.engine
+            .lock()
+            .unwrap()
+            .retain_shared_replay_store_attempt(
+                crate::tool_global::SharedStoreAttempt::controlled_with_interval(
+                    source.clone(),
+                    outcome,
+                    interval.clone(),
+                ),
+            )
+            .unwrap();
+        assert!(complete_shared_output(&f, &source, &interval).is_err());
+        drop(interval);
+        assert!(
+            weak.upgrade().is_some(),
+            "original Call retains the interval"
+        );
+        let ran = Arc::new(AtomicBool::new(false));
+        let error = f
+            .runtime
+            .controlled_shared_source_worker_submission(ran.clone())
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "native submission attempted during retained source-read interval"
+        );
+        assert!(!ran.load(Ordering::SeqCst));
+        assert!(weak.upgrade().is_some());
+        let engine = f.engine.lock().unwrap();
+        assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+        assert!(engine.stream_calls.contains_key(&call.id));
+        assert!(engine.stream_operations.contains_key(&source.lease()));
+        assert_eq!(
+            engine.stream_delivery.get(&call.open_file),
+            Some(&source.lease())
+        );
+        assert!(engine.finish().is_err());
+    }
+}
+
+#[tokio::test]
+async fn shared_wait_full_store_interval_lasts_through_prepared_callback_owner() {
+    use reverie::syscalls::NativeUserStoreOutcome;
+    let f = fixture().await;
+    let call = f.begin(false).await;
+    let now = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+    let (source, interval) = reserve_shared_output(&f, call.id, now).await;
+    let interval = Arc::new(interval);
+    let weak = Arc::downgrade(&interval);
+    f.engine
+        .lock()
+        .unwrap()
+        .retain_shared_replay_store_attempt(
+            crate::tool_global::SharedStoreAttempt::controlled_with_interval(
+                source.clone(),
+                NativeUserStoreOutcome::Attempted {
+                    raw: Ok(8),
+                    postcheck: Ok(()),
+                },
+                interval.clone(),
+            ),
+        )
+        .unwrap();
+    assert_eq!(complete_shared_output(&f, &source, &interval).unwrap(), 8);
+    assert!(!f.engine.lock().unwrap().stream_calls.contains_key(&call.id));
+    assert_eq!(
+        Arc::strong_count(&interval),
+        1,
+        "only prepared callback owner remains"
+    );
+    assert!(
+        f.runtime
+            .join_shared_foreground_prefix(f.root.clone(), &f.engine, None)
+            .await
+            .is_err()
+    );
+    assert!(weak.upgrade().is_some());
+    drop(interval);
+    assert!(weak.upgrade().is_none());
+    f.runtime
+        .join_shared_foreground_prefix(f.root.clone(), &f.engine, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.engine.lock().unwrap().channels[&NetworkChannelId(1)].inbound_consumed,
+        8
+    );
+}
+
+#[tokio::test]
+async fn shared_wait_missing_lifetime_lease_refuses_selection_and_reserved_store() {
+    use reverie::syscalls::NativeUserStoreOutcome;
+    for reserved in [false, true] {
+        let f = fixture().await;
+        let call = f.begin(false).await;
+        let due = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+        let prepared = if reserved {
+            Some(reserve_shared_output(&f, call.id, due).await)
+        } else {
+            None
+        };
+        // Deliberate premature acknowledgement adversary. The real Call must
+        // retain this lease until its exact semantic completion.
+        f.engine
+            .lock()
+            .unwrap()
+            .release_stream_call_lifetime(f.root.owner(), call.id, call.open_file)
+            .unwrap();
+        if let Some((source, interval)) = prepared {
+            let mut engine = f.engine.lock().unwrap();
+            assert!(
+                engine.shared_output_peer_census(&source).is_err(),
+                "pre-writer source validation"
+            );
+            engine
+                .retain_shared_replay_store_attempt(
+                    crate::tool_global::SharedStoreAttempt::controlled(
+                        source.clone(),
+                        NativeUserStoreOutcome::Attempted {
+                            raw: Ok(8),
+                            postcheck: Ok(()),
+                        },
+                    ),
+                )
+                .unwrap();
+            drop(engine);
+            assert!(complete_shared_output(&f, &source, &interval).is_err());
+            assert!(
+                f.engine
+                    .lock()
+                    .unwrap()
+                    .stream_operations
+                    .contains_key(&source.lease())
+            );
+        } else {
+            f.runtime
+                .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+                    let grant = f
+                        .scheduler
+                        .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+                    assert!(
+                        f.engine
+                            .lock()
+                            .unwrap()
+                            .plan_shared_replay_receive(f.root.owner(), call.id, &grant, due)
+                            .is_err()
+                    );
+                    Ok(())
+                })
+                .unwrap();
+            assert!(f.engine.lock().unwrap().stream_operations.is_empty());
+        }
+        let engine = f.engine.lock().unwrap();
+        assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+        assert!(engine.stream_calls.contains_key(&call.id));
+        assert!(engine.finish().is_err());
+    }
+}
+
+#[tokio::test]
+async fn shared_wait_missing_lifetime_lease_refuses_eof_before_semantic_mutation() {
+    use reverie::syscalls::NativeUserStoreOutcome;
+    let mut f = fixture_with_receive_inputs(false, false, true, false).await;
+    let first = f.begin(false).await;
+    let due = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+    let (source, interval) = reserve_shared_output(&f, first.id, due).await;
+    f.engine
+        .lock()
+        .unwrap()
+        .retain_shared_replay_store_attempt(crate::tool_global::SharedStoreAttempt::controlled(
+            source.clone(),
+            NativeUserStoreOutcome::Attempted {
+                raw: Ok(8),
+                postcheck: Ok(()),
+            },
+        ))
+        .unwrap();
+    assert_eq!(complete_shared_output(&f, &source, &interval).unwrap(), 8);
+    drop(interval);
+    f.now = due;
+    f.scheduler.controlled_shared_foreground_grant(&f.root);
+    let call = f.begin(false).await;
+    let prefix = f
+        .runtime
+        .join_shared_foreground_prefix(f.root.clone(), &f.engine, Some(call.id))
+        .await
+        .unwrap();
+    f.runtime
+        .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+            let grant = f
+                .scheduler
+                .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+            let mut engine = f.engine.lock().unwrap();
+            f.runtime
+                .with_shared_attempt_prefix(&prefix, &mut engine, |engine, admission| {
+                    let SharedReplayReceivePlan::NoStore(plan) = engine
+                        .plan_shared_replay_receive(f.root.owner(), call.id, &grant, due)
+                        .unwrap()
+                    else {
+                        panic!("actual released EOF remains unconsumed");
+                    };
+                    let before_epoch =
+                        engine.shadow.as_ref().unwrap().sockets[&call.open_file].consume_epoch;
+                    engine
+                        .release_stream_call_lifetime(f.root.owner(), call.id, call.open_file)
+                        .unwrap();
+                    assert!(
+                        engine
+                            .complete_shared_replay_no_store(plan, &grant, admission, due)
+                            .is_err()
+                    );
+                    assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 8);
+                    assert!(!engine.channels[&NetworkChannelId(1)].peer_write_closed);
+                    assert_eq!(
+                        engine.shadow.as_ref().unwrap().sockets[&call.open_file].consume_epoch,
+                        before_epoch
+                    );
+                    assert!(
+                        engine
+                            .native_replay_eof(NetworkChannelId(1), 8)
+                            .unwrap()
+                            .is_some_and(|(_, released, consumed)| released && !consumed)
+                    );
+                    assert!(engine.stream_calls.contains_key(&call.id));
+                    assert!(engine.finish().is_err());
+                    Ok(())
+                })
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shared_wait_short_error_or_control_refuses_pending_without_changing_full_prefix() {
+    for full in [false, true] {
+        for error in [false, true] {
+            let f = fixture_with_receive_inputs(false, false, false, true).await;
+            let call = f.begin(false).await;
+            let length = if full { 8 } else { 2 };
+            let due = LogicalTime::from_nanos(f.now.as_nanos() + if full { 74 } else { 37 });
+            f.runtime
+                .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+                    let grant = f
+                        .scheduler
+                        .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+                    let mut engine = f.engine.lock().unwrap();
+                    engine.release_native_eligible(due).unwrap();
+                    // Explicit unsupported queued boundary, not a fabricated
+                    // provider result or a valid duplicate Connect trace.
+                    engine
+                        .channels
+                        .get_mut(&NetworkChannelId(1))
+                        .unwrap()
+                        .inbound
+                        .push_back(if error {
+                            InboundOutcome::Error {
+                                stream_offset: length,
+                                errno: libc::ECONNRESET,
+                            }
+                        } else {
+                            InboundOutcome::Control(ConnectionOutcome::Connect(
+                                NetworkConnectionResultV2::Connected,
+                            ))
+                        });
+                    let result =
+                        engine.plan_shared_replay_receive(f.root.owner(), call.id, &grant, due);
+                    if full {
+                        let SharedReplayReceivePlan::Bytes(plan) = result.unwrap() else {
+                            panic!("saved target reached before boundary");
+                        };
+                        assert_eq!(plan.length(), 8);
+                    } else {
+                        assert!(result.is_err(), "unsupported short terminal is not Pending");
+                    }
+                    assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+                    assert!(engine.stream_operations.is_empty());
+                    assert!(engine.stream_calls.contains_key(&call.id));
+                    Ok(())
+                })
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn shared_wait_failed_partial_postcheck_and_duplicate_store_keep_effect_debt() {
+    use reverie::syscalls::Errno;
+    use reverie::syscalls::NativeUserStoreOutcome as O;
+    use reverie::syscalls::NativeUserStoreRefusal;
+    for (outcome, duplicate) in [
+        (O::Refused(NativeUserStoreRefusal::WriteDenied), false),
+        (
+            O::Attempted {
+                raw: Err(Errno::EFAULT),
+                postcheck: Ok(()),
+            },
+            false,
+        ),
+        (
+            O::Attempted {
+                raw: Ok(2),
+                postcheck: Ok(()),
+            },
+            false,
+        ),
+        (
+            O::Attempted {
+                raw: Ok(8),
+                postcheck: Err(Errno::EFAULT),
+            },
+            false,
+        ),
+        (
+            O::Attempted {
+                raw: Ok(8),
+                postcheck: Ok(()),
+            },
+            true,
+        ),
+    ] {
+        let f = fixture().await;
+        let call = f.begin(false).await;
+        let (source, interval) =
+            reserve_shared_output(&f, call.id, LogicalTime::from_nanos(f.now.as_nanos() + 37))
+                .await;
+        {
+            let mut engine = f.engine.lock().unwrap();
+            engine
+                .retain_shared_replay_store_attempt(
+                    crate::tool_global::SharedStoreAttempt::controlled(source.clone(), outcome),
+                )
+                .unwrap();
+            if duplicate {
+                assert!(
+                    engine
+                        .retain_shared_replay_store_attempt(
+                            crate::tool_global::SharedStoreAttempt::controlled(
+                                source.clone(),
+                                outcome
+                            )
+                        )
+                        .is_err()
+                );
+            }
+        }
+        assert!(complete_shared_output(&f, &source, &interval).is_err());
+        let mut engine = f.engine.lock().unwrap();
+        assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+        assert_eq!(engine.stream_operations.len(), 1);
+        assert!(engine.stream_calls.contains_key(&call.id));
+        assert!(
+            engine
+                .begin_stream_call_release(f.root.owner(), call.id)
+                .is_err()
+        );
+        assert!(engine.finish().is_err());
+    }
+}
+
+#[tokio::test]
+async fn shared_wait_saved_low_water_keeps_short_prefix_until_fresh_attempt() {
+    let mut f = fixture_with_receive_inputs(false, false, false, true).await;
+    let call = f.begin(false).await;
+    let observed = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+    f.runtime
+        .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+            let grant = f
+                .scheduler
+                .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+            let mut engine = f.engine.lock().unwrap();
+            assert!(matches!(
+                engine
+                    .plan_shared_replay_receive(f.root.owner(), call.id, &grant, observed)
+                    .unwrap(),
+                SharedReplayReceivePlan::Wait
+            ));
+            assert_eq!(
+                engine
+                    .stream_queue_status(call.open_file)
+                    .unwrap()
+                    .queued_bytes,
+                2
+            );
+            assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+            assert!(engine.stream_delivery.is_empty());
+            Ok(())
+        })
+        .unwrap();
+    f.now = observed;
+    f.suspend(call.id).await;
+    f.scheduler.controlled_shared_foreground_grant(&f.root);
+    let prefix = f
+        .runtime
+        .join_shared_foreground_prefix(f.root.clone(), &f.engine, Some(call.id))
+        .await
+        .unwrap();
+    f.runtime
+        .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+            let grant = f
+                .scheduler
+                .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+            let mut engine = f.engine.lock().unwrap();
+            f.runtime
+                .with_shared_attempt_prefix(&prefix, &mut engine, |engine, admission| {
+                    assert_eq!(
+                        engine
+                            .resume_shared_wait(call.id, &grant, admission, observed)
+                            .unwrap(),
+                        1
+                    );
+                    let SharedReplayReceivePlan::Bytes(plan) = engine
+                        .plan_shared_replay_receive(
+                            f.root.owner(),
+                            call.id,
+                            &grant,
+                            LogicalTime::from_nanos(observed.as_nanos() + 37),
+                        )
+                        .unwrap()
+                    else {
+                        panic!("saved target reached");
+                    };
+                    assert_eq!(plan.length(), 8);
+                    assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+                    Ok(())
+                })
+        })
+        .unwrap();
+}
+
+#[tokio::test]
+async fn shared_wait_eof_uses_unique_released_input_and_never_increments_repeated_epoch() {
+    use reverie::syscalls::NativeUserStoreOutcome;
+    let mut f = fixture_with_receive_inputs(false, false, true, false).await;
+    let call = f.begin(false).await;
+    let due = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+    let (source, interval) = reserve_shared_output(&f, call.id, due).await;
+    f.engine
+        .lock()
+        .unwrap()
+        .retain_shared_replay_store_attempt(crate::tool_global::SharedStoreAttempt::controlled(
+            source.clone(),
+            NativeUserStoreOutcome::Attempted {
+                raw: Ok(8),
+                postcheck: Ok(()),
+            },
+        ))
+        .unwrap();
+    assert_eq!(complete_shared_output(&f, &source, &interval).unwrap(), 8);
+    drop(interval);
+    f.now = due;
+    let before_epoch =
+        f.engine.lock().unwrap().shadow.as_ref().unwrap().sockets[&call.open_file].consume_epoch;
+    for repeated in [false, true] {
+        f.scheduler.controlled_shared_foreground_grant(&f.root);
+        let call = f.begin(false).await;
+        let prefix = f
+            .runtime
+            .join_shared_foreground_prefix(f.root.clone(), &f.engine, Some(call.id))
+            .await
+            .unwrap();
+        f.runtime
+            .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+                let grant = f
+                    .scheduler
+                    .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+                let mut engine = f.engine.lock().unwrap();
+                let trace = engine.native_trace_fixture();
+                f.runtime
+                    .with_shared_attempt_prefix(&prefix, &mut engine, |engine, admission| {
+                        let SharedReplayReceivePlan::NoStore(plan) = engine
+                            .plan_shared_replay_receive(f.root.owner(), call.id, &grant, due)
+                            .unwrap()
+                        else {
+                            panic!("exact terminal trace input");
+                        };
+                        assert_eq!(
+                            engine
+                                .complete_shared_replay_no_store(plan, &grant, admission, due)
+                                .unwrap(),
+                            SharedNoStoreResult::Eof
+                        );
+                        assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 8);
+                        assert_eq!(
+                            engine.shadow.as_ref().unwrap().sockets[&call.open_file].consume_epoch,
+                            before_epoch + 1,
+                            "repeated={repeated}"
+                        );
+                        assert!(
+                            engine
+                                .native_replay_eof(NetworkChannelId(1), 8)
+                                .unwrap()
+                                .is_some_and(|(_, released, consumed)| released && consumed)
+                        );
+                        assert_eq!(engine.native_trace_fixture(), trace);
+                        assert!(!engine.stream_calls.contains_key(&call.id));
+                        Ok(())
+                    })
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn shared_wait_output_changed_epoch_prefix_or_consume_generation_keeps_attempt() {
+    use reverie::syscalls::NativeUserStoreOutcome;
+    for variant in 0..3 {
+        let mut f = fixture().await;
+        let call = f.begin(false).await;
+        let (source, interval) =
+            reserve_shared_output(&f, call.id, LogicalTime::from_nanos(f.now.as_nanos() + 37))
+                .await;
+        f.engine
+            .lock()
+            .unwrap()
+            .retain_shared_replay_store_attempt(crate::tool_global::SharedStoreAttempt::controlled(
+                source.clone(),
+                NativeUserStoreOutcome::Attempted {
+                    raw: Ok(8),
+                    postcheck: Ok(()),
+                },
+            ))
+            .unwrap();
+        match variant {
+            0 => f.scheduler.controlled_shared_foreground_grant(&f.root),
+            1 => {
+                // Explicit corrupted queue adversary; never a guest store or
+                // a permitted concurrent consumer of this reserved source.
+                let mut engine = f.engine.lock().unwrap();
+                let Some(InboundOutcome::Stream { bytes, .. }) = engine
+                    .channels
+                    .get_mut(&NetworkChannelId(1))
+                    .unwrap()
+                    .inbound
+                    .front_mut()
+                else {
+                    unreachable!()
+                };
+                bytes[0] = b'x';
+            }
+            2 => {
+                f.engine
+                    .lock()
+                    .unwrap()
+                    .shadow
+                    .as_mut()
+                    .unwrap()
+                    .sockets
+                    .get_mut(&call.open_file)
+                    .unwrap()
+                    .consume_epoch += 1
+            }
+            _ => unreachable!(),
+        }
+        assert!(
+            complete_shared_output(&f, &source, &interval).is_err(),
+            "case {variant}"
+        );
+        let mut engine = f.engine.lock().unwrap();
+        assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+        assert!(engine.stream_operations.contains_key(&source.lease()));
+        assert!(engine.stream_calls.contains_key(&call.id));
+        assert!(
+            engine
+                .begin_stream_call_release(f.root.owner(), call.id)
+                .is_err()
+        );
+        assert!(engine.finish().is_err());
+    }
+}
+
+#[tokio::test]
+async fn shared_wait_unrecorded_terminal_flag_cannot_issue_eof() {
+    let f = fixture().await;
+    let call = f.begin(false).await;
+    f.engine
+        .lock()
+        .unwrap()
+        .channels
+        .get_mut(&NetworkChannelId(1))
+        .unwrap()
+        .peer_write_closed = true;
+    f.runtime
+        .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+            let grant = f
+                .scheduler
+                .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+            let mut engine = f.engine.lock().unwrap();
+            assert_eq!(
+                engine.native_replay_eof(NetworkChannelId(1), 0).unwrap(),
+                None
+            );
+            assert!(
+                engine
+                    .plan_shared_replay_receive(f.root.owner(), call.id, &grant, f.now)
+                    .is_err()
+            );
+            assert!(engine.stream_calls.contains_key(&call.id));
+            assert_eq!(engine.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+            assert!(engine.finish().is_err());
+            Ok(())
+        })
+        .unwrap();
 }

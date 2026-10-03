@@ -2199,6 +2199,23 @@ impl NetworkReplayEngine {
             .map_err(|error| protocol(&error.to_string()))
     }
 
+    /// Preflight the exact existing StreamCall lease before a shared output or
+    /// semantic commit. The fixed acknowledgement kind/resolution then cannot
+    /// fail while this same engine lock is held.
+    pub(super) fn validate_stream_call_lifetime(
+        &self,
+        owner: NetworkStreamOwner,
+        call: NetworkStreamCallId,
+        open_file: OpenFileId,
+    ) -> Result<(), NetworkReplayError> {
+        if !self.fd_table_capability() {
+            return Err(protocol("stream call lost its admitted lifetime table"));
+        }
+        self.lifetime
+            .check_lease(stream_call_pin(owner, call), open_file)
+            .map_err(|error| protocol(&error.to_string()))
+    }
+
     pub(super) fn release_stream_call_lifetime(
         &mut self,
         owner: NetworkStreamOwner,

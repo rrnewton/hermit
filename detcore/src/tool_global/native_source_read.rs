@@ -88,7 +88,9 @@ impl GlobalState {
         }
         check_range(address, length)?;
         if self.shared_mm_attempts_active() {
-            return self.prepare_shared_replay_transmit_source(tid, state, read, address, length).await;
+            return self
+                .prepare_shared_replay_transmit_source(tid, state, read, address, length)
+                .await;
         }
         let owner = NetworkStreamOwner {
             thread: state.dettid,
@@ -156,7 +158,7 @@ impl GlobalState {
         })))
     }
 
-    fn check_native_source_task<T>(
+    pub(in crate::tool_global) fn check_native_source_task<T>(
         &self,
         tid: Tid,
         state: &crate::tool_local::ThreadState<T>,

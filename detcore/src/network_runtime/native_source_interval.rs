@@ -17,6 +17,10 @@ pub(super) struct Interval {
 enum SourceAdmission {
     Settled,
     Shared(crate::network_replay::shared_waits::SharedCallCensus),
+    SharedOutput {
+        peers: crate::network_replay::shared_waits::SharedCallCensus,
+        call: crate::network_replay::NetworkStreamCallId,
+    },
 }
 
 #[derive(Debug)]
@@ -195,3 +199,94 @@ impl NetworkRuntimeResources {
 #[cfg(test)]
 #[path = "native_source_interval/tests.rs"]
 mod tests;
+
+impl RuntimeShared {
+    pub(super) fn reserve_shared_output_interval(
+        self: &Arc<Self>,
+        owned: &mut NativeWorkers,
+        root: Arc<ForegroundRoot>,
+        generation: u64,
+        peers: crate::network_replay::shared_waits::SharedCallCensus,
+        call: crate::network_replay::NetworkStreamCallId,
+        calls: &native_peer::Calls,
+    ) -> std::io::Result<NativeSourceInterval> {
+        if owned.closed
+            || owned.copy_exclusion.is_some()
+            || owned.source_read_active()
+            || !owned.tasks.is_empty()
+            || owned.submission_generation != generation
+            || !root.is_current(root.owner())
+            || !root.has_shared_mm_history()
+        {
+            return Err(std::io::Error::other(
+                "shared output changed joined native admission",
+            ));
+        }
+        if let Some(error) = self.native_terminal_failure.lock().unwrap().as_ref() {
+            return Err(std::io::Error::other(error.clone()));
+        }
+        calls.require_shared_quiescence(&peers)?;
+        let interval = Arc::new(Interval {
+            runtime: Arc::downgrade(self),
+            root,
+            generation,
+            admission: SourceAdmission::SharedOutput { peers, call },
+        });
+        owned.source_read = Arc::downgrade(&interval);
+        Ok(NativeSourceInterval { interval })
+    }
+}
+impl NetworkRuntimeResources {
+    /// Only the exact selected output's Delivery is exempted from the peer
+    /// census, after its source/Call/lease has been positively revalidated.
+    pub(crate) fn with_shared_output_interval<T>(
+        &self,
+        proof: &NativeSourceInterval,
+        engine: &mut crate::network_replay::NetworkReplayEngine,
+        source: &Arc<crate::network_replay::shared_waits::SharedReplaySource>,
+        commit: impl FnOnce(&mut crate::network_replay::NetworkReplayEngine) -> std::io::Result<T>,
+    ) -> std::io::Result<T> {
+        let owned = self.shared.native_workers.lock().unwrap();
+        let interval = &proof.interval;
+        let SourceAdmission::SharedOutput { peers, call } = &interval.admission else {
+            return Err(std::io::Error::other(
+                "shared output lacks its own exact admission",
+            ));
+        };
+        if *call != source.call()
+            || !Arc::ptr_eq(&interval.root, source.root())
+            || !interval.runtime.ptr_eq(&Arc::downgrade(&self.shared))
+            || owned.closed
+            || owned.copy_exclusion.is_some()
+            || owned
+                .source_read
+                .upgrade()
+                .is_none_or(|actual| !Arc::ptr_eq(&actual, interval))
+            || !owned.tasks.is_empty()
+            || owned.submission_generation != interval.generation
+            || !interval.root.is_current(source.owner())
+            || !interval.root.has_shared_mm_history()
+        {
+            return Err(std::io::Error::other(
+                "shared output lost original runtime/root/worker interval",
+            ));
+        }
+        if let Some(error) = self.shared.native_terminal_failure.lock().unwrap().as_ref() {
+            return Err(std::io::Error::other(error.clone()));
+        }
+        let current = engine
+            .shared_output_peer_census(source)
+            .map_err(std::io::Error::other)?;
+        if !peers.same_rows(&current) {
+            return Err(std::io::Error::other(
+                "shared output changed suspended peer census",
+            ));
+        }
+        let calls = self.shared.native_streams.lock().unwrap();
+        calls.require_shared_quiescence(&current)?;
+        let result = commit(engine);
+        drop(calls);
+        drop(owned);
+        result
+    }
+}

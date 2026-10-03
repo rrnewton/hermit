@@ -5,6 +5,14 @@ use crate::network_runtime::shared_waits::SharedAttemptAdmission;
 use crate::resources::NetworkWaitKind;
 use crate::scheduler::ordinary_fd::SharedMmForegroundObservation;
 
+#[path = "shared_waits/replay_store.rs"]
+mod replay_store;
+pub(crate) use replay_store::SharedNoStoreResult;
+pub(crate) use replay_store::SharedReplayBytesPlan;
+pub(crate) use replay_store::SharedReplayNoStorePlan;
+pub(crate) use replay_store::SharedReplayReceivePlan;
+pub(crate) use replay_store::SharedReplaySource;
+
 #[derive(Debug, Clone)]
 pub(crate) struct OriginalPollIntent {
     raw: (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs),
@@ -121,6 +129,7 @@ pub(in crate::network_replay) struct SharedWait {
     binding: crate::types::FdSlotBinding,
     intent: SharedWaitIntent,
     phase: AttemptPhase,
+    output: Option<replay_store::SharedOutput>,
 }
 #[derive(Debug, Clone)]
 enum AttemptPhase {
@@ -319,6 +328,19 @@ impl NetworkReplayEngine {
         call: NetworkStreamCallId,
         state: &StreamCallState,
     ) -> Result<(), NetworkReplayError> {
+        self.shared_wait_non_output_debts_settled(call, state)?;
+        if matches!(&state.shared_attempt, Some(SharedAttempt::Wait(wait)) if wait.output.is_some())
+        {
+            return Err(invalid("shared wait retains its exact output attempt"));
+        }
+        Ok(())
+    }
+
+    fn shared_wait_non_output_debts_settled(
+        &self,
+        call: NetworkStreamCallId,
+        state: &StreamCallState,
+    ) -> Result<(), NetworkReplayError> {
         if state.capture_publication.is_some()
             || state.capture_control.is_some()
             || state.original.is_some()
@@ -357,13 +379,30 @@ impl NetworkReplayEngine {
         selected: Option<NetworkStreamCallId>,
         exclude: Option<NetworkStreamCallId>,
     ) -> Result<SharedCallCensus, NetworkReplayError> {
+        self.shared_call_census_except_delivery(selected, exclude, None)
+    }
+    fn shared_call_census_except_delivery(
+        &self,
+        selected: Option<NetworkStreamCallId>,
+        exclude: Option<NetworkStreamCallId>,
+        delivery: Option<NetworkStreamLeaseId>,
+    ) -> Result<SharedCallCensus, NetworkReplayError> {
         if !self.uses_shared_mm_attempts() || !self.fd_table_capability() {
             return Err(invalid("shared census lacks declared policy/table"));
         }
         self.check_native_retirement()?;
-        if !self.stream_operations.is_empty()
+        if self
+            .stream_operations
+            .keys()
+            .any(|lease| Some(*lease) != delivery)
             || !self.shadow_probes.is_empty()
-            || !self.stream_delivery.is_empty()
+            || self.stream_delivery.iter().any(|(file, lease)| {
+                Some(*lease) != delivery
+                    || self
+                        .stream_operations
+                        .get(lease)
+                        .is_none_or(|operation| operation.open_file != *file)
+            })
             || !self.shadow_deliveries.is_empty()
         {
             return Err(invalid(
@@ -553,6 +592,7 @@ impl NetworkReplayEngine {
             root: grant.root().clone(),
             binding,
             intent,
+            output: None,
             phase: AttemptPhase::Active {
                 ordinal: 0,
                 epoch: grant.epoch(),

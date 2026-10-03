@@ -194,6 +194,62 @@ impl NetworkRuntimeResources {
         })
     }
 
+    /// The existing selected receive Call retains every subsequent output
+    /// effect. Its peer census is held independently through that exact store.
+    pub(crate) fn prepare_shared_replay_output<T>(
+        &self,
+        prefix: &JoinedSharedPrefix,
+        lineage: &SharedForegroundLineage<'_>,
+        engine: &mut NetworkReplayEngine,
+        call: NetworkStreamCallId,
+        reserve: impl FnOnce(
+            &mut NetworkReplayEngine,
+            &SharedAttemptAdmission<'_>,
+        ) -> std::io::Result<T>,
+    ) -> std::io::Result<(T, NativeSourceInterval)> {
+        if prefix.selected != Some(call)
+            || !Arc::ptr_eq(lineage.root(), prefix.root())
+            || prefix.census.rows.iter().any(|row| {
+                !lineage
+                    .members()
+                    .any(|actual| Arc::ptr_eq(actual, &row.root))
+            })
+            || prefix
+                .census
+                .rows
+                .iter()
+                .find(|row| row.call == call)
+                .is_none_or(|row| row.native.is_some() || row.owner != prefix.root().owner())
+            || engine.mode() != crate::network_replay::NetworkEngineMode::Replay
+        {
+            return Err(std::io::Error::other(
+                "shared output changed selected logical Call/complete lineage",
+            ));
+        }
+        self.with_shared_prefix_locks(prefix, engine, |engine, owned, calls| {
+            let peers = engine
+                .shared_call_census_excluding(None, Some(call))
+                .map_err(std::io::Error::other)?;
+            let interval = self.shared.reserve_shared_output_interval(
+                owned,
+                prefix.root().clone(),
+                prefix.prefix.generation,
+                peers,
+                call,
+                calls,
+            )?;
+            let value = reserve(
+                engine,
+                &SharedAttemptAdmission {
+                    prefix,
+                    _workers: owned,
+                    _calls: calls,
+                },
+            )?;
+            Ok((value, interval))
+        })
+    }
+
     fn with_shared_prefix_locks<T>(
         &self,
         prefix: &JoinedSharedPrefix,
@@ -237,6 +293,20 @@ impl NetworkRuntimeResources {
 
 #[cfg(test)]
 impl NetworkRuntimeResources {
+    /// Exercises actual worker admission; the caller supplies no admission
+    /// flags and the marked closure must not run while an interval is held.
+    pub(crate) fn controlled_shared_source_worker_submission(
+        &self,
+        ran: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()> {
+        self.shared
+            .start_native_worker(tokio::runtime::Handle::current(), move || {
+                ran.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            })
+            .map(|(_worker, _reply)| ())
+    }
+
     pub(crate) fn controlled_shared_unknown_capture(
         &self,
         owner: crate::network_replay::NetworkStreamOwner,

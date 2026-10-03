@@ -30,6 +30,7 @@ mod helper_copy;
 pub(crate) mod lifetime;
 mod native_receive;
 pub(crate) use native_receive::shared_waits;
+pub(crate) use native_receive::shared_waits::SharedReplaySource;
 pub(crate) mod original_connect;
 pub(crate) mod replay_connect;
 pub(crate) mod send_timing;
@@ -6342,6 +6343,11 @@ impl NetworkReplayEngine {
         if maximum > NETWORK_STREAM_CHUNK_LIMIT {
             return Err(NetworkReplayError::StreamChunkTooLarge(maximum));
         }
+        if self.has_shared_output_lease(lease) {
+            return Err(NetworkReplayError::FdPublicationProtocol(
+                "shared Replay source requires its original held-output consumer".into(),
+            ));
+        }
         let operation = self.owned_stream_operation(owner, lease)?;
         if self
             .shadow_deliveries
@@ -6415,7 +6421,7 @@ impl NetworkReplayEngine {
         disposition: NetworkStreamChunkDisposition,
         record_drain: bool,
     ) -> Result<(), NetworkReplayError> {
-        if self.stream_calls.values().any(|state| {
+        if self.has_shared_output_lease(lease) || self.stream_calls.values().any(|state| {
             state
                 .replay_receive
                 .as_ref()

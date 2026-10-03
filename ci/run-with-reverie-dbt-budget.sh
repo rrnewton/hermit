@@ -462,11 +462,12 @@ fi
 # vendored DynamoRIO and third-party trees above remain byte-identical.
 # Compiler/generator selection and both measured limits are unchanged.
 # This is source-identity carry, not a new timing or backend qualification.
-# CARRY TO 76e4e74afe7f68cf63ff4424ab0775fbddfc3560 (2026-10-03): the
-# source-worker/ptrace and numeric-memory API changes since489 leave the entire
-# reverie-dbt tree byte-identical. No build setting or measured limit changes;
-# this is source-identity carry, not new timing or backend qualification.
-expected_pin=76e4e74afe7f68cf63ff4424ab0775fbddfc3560
+# CARRY TO 067c8de56f921be8e5554a36ba5e56237032b940 (2026-10-03): peer custody, held stores
+# and checked receive-timer restoration change no reverie-dbt bytes; both
+# 76e4e74 and this pin resolve that entire tree to
+# a62d15302ee5e907667d1c02f6e629177ad87f61. Build settings and measured limits
+# remain unchanged. This carries source identity, not a new timing result.
+expected_pin=067c8de56f921be8e5554a36ba5e56237032b940
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

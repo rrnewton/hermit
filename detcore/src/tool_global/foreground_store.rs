@@ -1,7 +1,11 @@
 //! Local foreground copy issuer. This is deliberately absent from NetworkRequest:
 //! serialized correlation cannot authorize a write or reconstruct its outcome.
 mod scalar_receive;
+mod shared_receive;
 pub(crate) use scalar_receive::ScalarReceive;
+pub(crate) use shared_receive::PreparedSharedReceiveStore;
+pub(crate) use shared_receive::SharedReceiveInvocation;
+pub(crate) use shared_receive::SharedReceivePreparation;
 
 use super::*;
 use crate::network_replay::ForegroundStore;
@@ -9,6 +13,55 @@ use crate::network_replay::FullStoreCompletion;
 use crate::network_replay::ReceiveSelection;
 use crate::network_replay::ReplayReceivePlan;
 use crate::network_replay::StoreOutcome;
+
+/// Actual outcome retained on the original shared Call before backend custody
+/// ends. Only the live held-store issuer in this module constructs production
+/// instances; a source selection or a numeric result cannot construct one.
+#[derive(Debug)]
+pub(crate) struct SharedStoreAttempt {
+    source: Arc<crate::network_replay::SharedReplaySource>,
+    outcome: reverie::syscalls::NativeUserStoreOutcome,
+    _interval: Option<Arc<crate::network_runtime::NativeSourceInterval>>,
+}
+
+impl SharedStoreAttempt {
+    pub(crate) fn source(&self) -> &Arc<crate::network_replay::SharedReplaySource> {
+        &self.source
+    }
+
+    pub(crate) fn outcome(&self) -> &reverie::syscalls::NativeUserStoreOutcome {
+        &self.outcome
+    }
+
+    /// Controlled backend premise only. This does not exercise a native store
+    /// or qualify production callback, register, mapping or peer custody.
+    #[cfg(test)]
+    pub(crate) fn controlled(
+        source: Arc<crate::network_replay::SharedReplaySource>,
+        outcome: reverie::syscalls::NativeUserStoreOutcome,
+    ) -> Self {
+        Self {
+            source,
+            outcome,
+            _interval: None,
+        }
+    }
+
+    /// Supplied backend outcome with a real runtime-issued interval. This
+    /// qualifies ownership/interlocking only, not a native guest write.
+    #[cfg(test)]
+    pub(crate) fn controlled_with_interval(
+        source: Arc<crate::network_replay::SharedReplaySource>,
+        outcome: reverie::syscalls::NativeUserStoreOutcome,
+        interval: Arc<crate::network_runtime::NativeSourceInterval>,
+    ) -> Self {
+        Self {
+            source,
+            outcome,
+            _interval: Some(interval),
+        }
+    }
+}
 
 /// Owned only in one live Guest callback. Its constructor performs the actual
 /// original-entry inspection; an Allowed enum or serialized tuple cannot mint it.
@@ -1181,7 +1234,10 @@ impl GlobalState {
                     .lock()
                     .unwrap()
                     .plan_replay_receive_at(
-                        owner, call, maximum, nonblocking,
+                        owner,
+                        call,
+                        maximum,
+                        nonblocking,
                         Some(self.global_time.lock().unwrap().as_nanos()),
                     )
                     .map_err(|e| fail(&e))?,
@@ -1242,7 +1298,9 @@ impl GlobalState {
                         .with_foreground_prefix(&joined, |admission| {
                             engine
                                 .commit_replay_no_store(
-                                    plan, admission, &root,
+                                    plan,
+                                    admission,
+                                    &root,
                                     self.global_time.lock().unwrap().as_nanos(),
                                 )
                                 .map_err(std::io::Error::other)
@@ -1393,8 +1451,8 @@ impl GlobalState {
                 .unwrap()
                 .prepare_foreground_store(
                     owner,
-                    lease, (root.clone(),
-                    &memory),
+                    lease,
+                    (root.clone(), &memory),
                     span,
                     exclusion,
                     epoch,
@@ -1918,7 +1976,12 @@ impl GlobalState {
         match captured {
             Ok(captured) => {
                 self.complete_private_receive_capture(
-                    tid, state, &root, epoch, (call, control), captured,
+                    tid,
+                    state,
+                    &root,
+                    epoch,
+                    (call, control),
+                    captured,
                 )
                 .await
             }

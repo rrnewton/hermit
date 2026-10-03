@@ -1277,7 +1277,7 @@ impl NetworkLifetime {
         Ok(())
     }
 
-    fn check_lease(&self, lease: LeaseId, expected: OpenFileId) -> Result<(), LifetimeError> {
+    pub(super) fn check_lease(&self, lease: LeaseId, expected: OpenFileId) -> Result<(), LifetimeError> {
         if self.leases.get(&lease) != Some(&expected) {
             return Err(LifetimeError::LeaseIdentity(lease));
         }

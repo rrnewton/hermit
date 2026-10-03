@@ -11,8 +11,8 @@
 
 mod foreground_epoll;
 mod foreground_poll;
-mod guard_probe;
 mod foreground_store;
+mod guard_probe;
 mod native_source_read;
 mod original_connect;
 mod original_source_ioctl;
@@ -20,10 +20,14 @@ mod replay_connect;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
 pub(crate) use foreground_store::CheckedReadRange;
+pub(crate) use foreground_store::PreparedSharedReceiveStore;
 #[cfg(test)]
 pub(crate) use foreground_store::ReceiveRetryFailure;
 pub(crate) use foreground_store::SavedReceivePolicy;
 pub(crate) use foreground_store::ScalarReceive;
+pub(crate) use foreground_store::SharedReceiveInvocation;
+pub(crate) use foreground_store::SharedReceivePreparation;
+pub(crate) use foreground_store::SharedStoreAttempt;
 mod original_installation;
 mod parked;
 use std::cmp::Ordering;
@@ -650,23 +654,44 @@ impl GlobalState {
         read: &crate::network_replay::NetworkFdReadAdmission,
     ) -> Result<(), reverie::Error> {
         let refuse = |message: &str| reverie::Error::Tool(anyhow::anyhow!(message.to_owned()));
-        let owner = NetworkStreamOwner { thread: state.dettid, mm: state.mm_id };
+        let owner = NetworkStreamOwner {
+            thread: state.dettid,
+            mm: state.mm_id,
+        };
         let sched = self.sched.lock().unwrap();
-        let root = self.network_runtime.as_ref()
+        let root = self
+            .network_runtime
+            .as_ref()
             .ok_or_else(|| refuse("local pair poll lacks original runtime"))?
-            .foreground_root(owner).map_err(|e| refuse(&e.to_string()))?;
-        sched.foreground_native_observation(owner, &root).map_err(|e| refuse(&e.to_string()))?;
-        if !root.matches_metadata(&state.file_metadata) || root.files() != read.publication.permit.files {
+            .foreground_root(owner)
+            .map_err(|e| refuse(&e.to_string()))?;
+        sched
+            .foreground_native_observation(owner, &root)
+            .map_err(|e| refuse(&e.to_string()))?;
+        if !root.matches_metadata(&state.file_metadata)
+            || root.files() != read.publication.permit.files
+        {
             return Err(refuse("local pair poll changed original table"));
         }
         let mut local = state.file_metadata.lock().unwrap();
-        if !local.observe_read_descriptor(read)?.is_some_and(|fd| fd.is_local_socket_pair()) {
+        if !local
+            .observe_read_descriptor(read)?
+            .is_some_and(|fd| fd.is_local_socket_pair())
+        {
             return Err(refuse("local pair poll changed exact local endpoint"));
         }
-        let engine = self.network_engine.as_ref().ok_or_else(|| refuse("local pair poll lost engine"))?.lock().unwrap();
-        engine.validate_fd_metadata(owner, root.files(), &state.file_metadata, &local)
+        let engine = self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| refuse("local pair poll lost engine"))?
+            .lock()
+            .unwrap();
+        engine
+            .validate_fd_metadata(owner, root.files(), &state.file_metadata, &local)
             .map_err(|e| refuse(&e.to_string()))?;
-        engine.validate_fd_read_grant(owner, read).map_err(|e| refuse(&e.to_string()))
+        engine
+            .validate_fd_read_grant(owner, read)
+            .map_err(|e| refuse(&e.to_string()))
     }
 
     /// Inspect the version and mode of this actual shared engine. Config policy
@@ -1837,9 +1862,8 @@ impl GlobalTool for GlobalState {
                         let birth = sched.thread_tree.prepare_no_seq_birth(
                             owner,
                             *process,
-                            crate::resources::ExternalOpId::new(dtid, *syscall_count), (*flags,
-                            *child_tid_addr,
-                            *exit_signal),
+                            crate::resources::ExternalOpId::new(dtid, *syscall_count),
+                            (*flags, *child_tid_addr, *exit_signal),
                             *priority_entropy,
                             *fd_permit,
                         );
@@ -1956,14 +1980,14 @@ impl GlobalTool for GlobalState {
                     && runtime
                         .native_birth_semantics_consumed(admission.publication.permit, None, true)
                         .is_err()
-                    {
-                        self.report_backend_failure(reverie::BackendFailure {
-                            pid: from,
-                            tid: from,
-                            phase: "uninvoked birth semantic retirement lost command custody",
-                        });
-                        return (None, R::NoSeqBirthOwnerGone(false));
-                    }
+                {
+                    self.report_backend_failure(reverie::BackendFailure {
+                        pid: from,
+                        tid: from,
+                        phase: "uninvoked birth semantic retirement lost command custody",
+                    });
+                    return (None, R::NoSeqBirthOwnerGone(false));
+                }
                 return (None, R::NoSeqBirthOwnerGone(retired));
             };
             let retired = runtime.wait_native_birth_cleanup(&cleanup).await.is_ok();
@@ -3622,8 +3646,8 @@ impl GlobalState {
                     owner,
                     process,
                     crate::resources::ExternalOpId::new(owner.thread, state.stats.syscall_count),
-                    state.pending_no_seq_birth.as_ref(), (nr,
-                    args),
+                    state.pending_no_seq_birth.as_ref(),
+                    (nr, args),
                     event,
                 )
         };
@@ -4103,9 +4127,9 @@ impl GlobalState {
                 && (sender != child_dettid
                     || (self.cfg.sequentialize_threads && !birth.native_required)
                     || !sched.thread_tree.check_no_seq_birth(birth, child_dettid))
-                {
-                    return SchedulerRpcResult::ThreadExited;
-                }
+            {
+                return SchedulerRpcResult::ThreadExited;
+            }
 
             let native = inherited_birth
                 .as_ref()
@@ -4331,14 +4355,14 @@ impl GlobalState {
             && proof
                 .and_then(|proof| runtime.native_child_semantics_consumed(&proof))
                 .is_err()
-            {
-                self.report_backend_failure(reverie::BackendFailure {
-                    pid: rpc_sender,
-                    tid: rpc_sender,
-                    phase: "registered child lost exact native command retirement",
-                });
-                return SchedulerRpcResult::ThreadExited;
-            }
+        {
+            self.report_backend_failure(reverie::BackendFailure {
+                pid: rpc_sender,
+                tid: rpc_sender,
+                phase: "registered child lost exact native command retirement",
+            });
+            return SchedulerRpcResult::ThreadExited;
+        }
         // The child queue position above determines which equal-priority side
         // gets the first turn when the parent requests ParentContinue.
         // A vfork parent is already blocked by the kernel and is not in the run
@@ -5541,11 +5565,11 @@ impl GlobalState {
                             .unwrap()
                             .get(&receipt.process)
                             .is_some_and(|pending| pending.receipt == *receipt))
-                    {
-                        return GlobalResponse::Network(Err(NetworkRpcError::internal(
-                            "exec mutation lacks the current authenticated preparation",
-                        )));
-                    }
+                {
+                    return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                        "exec mutation lacks the current authenticated preparation",
+                    )));
+                }
                 // The borrowed proof stays inside this scheduler guard through
                 // metadata -> engine admission. NoSeq deliberately has no turn.
                 let ordinary = if matches!(&request, NetworkRequest::BeginOrdinaryFdRead { .. })
@@ -5577,7 +5601,8 @@ impl GlobalState {
                     NetworkRequest::FdMutation(
                         crate::network_replay::NetworkFdMutationRequest::Begin {
                             files,
-                            kind: crate::network_replay::NetworkFdMutationKind::PipePair { .. }
+                            kind:
+                                crate::network_replay::NetworkFdMutationKind::PipePair { .. }
                                 | crate::network_replay::NetworkFdMutationKind::SocketPair { .. },
                         },
                     ) => Some(*files),
@@ -5614,22 +5639,32 @@ impl GlobalState {
                         )));
                     }
                 }
-                let socket_error_root = if matches!(&request,
+                let socket_error_root = if matches!(
+                    &request,
                     NetworkRequest::SubmitStreamPhysical {
-                        effect: NetworkStreamPhysicalEffect::ReadSocketError, ..
+                        effect: NetworkStreamPhysicalEffect::ReadSocketError,
+                        ..
                     } | NetworkRequest::ConfirmStreamPhysical {
-                        result: NetworkStreamPhysicalResult::SocketError(_), ..
-                    }) {
-                    let root = self.network_runtime.as_ref()
+                        result: NetworkStreamPhysicalResult::SocketError(_),
+                        ..
+                    }
+                ) {
+                    let root = self
+                        .network_runtime
+                        .as_ref()
                         .ok_or_else(|| std::io::Error::other("SO_ERROR lacks native runtime"))
                         .and_then(|runtime| runtime.foreground_root(owner));
                     match root {
                         Ok(root) if self.cfg.sequentialize_threads => Some(root),
-                        _ => return GlobalResponse::Network(Err(NetworkRpcError::internal(
-                            "SO_ERROR lacks its sequential foreground root",
-                        ))),
+                        _ => {
+                            return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                                "SO_ERROR lacks its sequential foreground root",
+                            )));
+                        }
                     }
-                } else { None };
+                } else {
+                    None
+                };
                 // Obtain only an Arc under engine, then drop that guard before
                 // taking metadata. Revalidate below after reacquiring engine:
                 // lookup/upgrade alone never authorizes a reader.
@@ -5683,11 +5718,12 @@ impl GlobalState {
                         files,
                         metadata.as_ref().expect("reader metadata"),
                         metadata_guard.as_deref().expect("reader metadata guard"),
-                    ) {
-                        return GlobalResponse::Network(Err(NetworkRpcError::internal(
-                            error.to_string(),
-                        )));
-                    }
+                    )
+                {
+                    return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                        error.to_string(),
+                    )));
+                }
                 let pipe_metadata = match &request {
                     NetworkRequest::FdMutation(
                         crate::network_replay::NetworkFdMutationRequest::PipeResult { fds, .. },
@@ -5701,8 +5737,13 @@ impl GlobalState {
                             changes,
                             ..
                         },
-                    ) => engine.validate_fd_pair_metadata(owner, *permit,
-                        metadata_guard.as_deref().expect("pair metadata"), changes)
+                    ) => engine
+                        .validate_fd_pair_metadata(
+                            owner,
+                            *permit,
+                            metadata_guard.as_deref().expect("pair metadata"),
+                            changes,
+                        )
                         .map_err(|e| reverie::Error::Tool(anyhow::anyhow!(e.to_string()))),
                     _ => Ok(()),
                 };
@@ -5717,11 +5758,12 @@ impl GlobalState {
                 // selected by this release and unrelated channels never gate it.
                 if engine.accepted_mode()
                     && engine.mode() == crate::network_replay::NetworkEngineMode::Replay
-                    && let Err(error) = engine.release_eligible(observed_at) {
-                        return GlobalResponse::Network(Err(NetworkRpcError::internal(
-                            error.to_string(),
-                        )));
-                    }
+                    && let Err(error) = engine.release_eligible(observed_at)
+                {
+                    return GlobalResponse::Network(Err(NetworkRpcError::internal(
+                        error.to_string(),
+                    )));
+                }
                 let result = match &request {
                     NetworkRequest::FdMutation(request) => engine
                         .recv_fd_mutation(owner, request.clone())
@@ -13814,7 +13856,10 @@ mod tests {
         where
             A: Into<reverie::syscalls::Addr<'a, u8>>,
         {
-            assert!(!self.forbid, "source worker fixture used ordinary memory read");
+            assert!(
+                !self.forbid,
+                "source worker fixture used ordinary memory read"
+            );
             reverie::syscalls::LocalMemory::new().read(address, bytes)
         }
 
@@ -13823,7 +13868,10 @@ mod tests {
             address: reverie::syscalls::AddrMut<u8>,
             bytes: &[u8],
         ) -> Result<usize, reverie::Errno> {
-            assert!(!self.forbid, "source worker fixture used ordinary memory write");
+            assert!(
+                !self.forbid,
+                "source worker fixture used ordinary memory write"
+            );
             reverie::syscalls::LocalMemory::new().write(address, bytes)
         }
 
@@ -13832,7 +13880,10 @@ mod tests {
             address: reverie::syscalls::AddrMut<u8>,
             bytes: &[u8],
         ) -> Result<usize, reverie::Errno> {
-            assert!(!self.forbid, "source worker fixture used ordinary memory write");
+            assert!(
+                !self.forbid,
+                "source worker fixture used ordinary memory write"
+            );
             reverie::syscalls::LocalMemory::new().write_with_user_access(address, bytes)
         }
 
@@ -13841,7 +13892,10 @@ mod tests {
             remote: &[std::io::IoSlice],
             local: &mut [std::io::IoSliceMut],
         ) -> Result<usize, reverie::Errno> {
-            assert!(!self.forbid, "source worker fixture used ordinary memory read");
+            assert!(
+                !self.forbid,
+                "source worker fixture used ordinary memory read"
+            );
             reverie::syscalls::LocalMemory::new().read_vectored(remote, local)
         }
 
@@ -13850,7 +13904,10 @@ mod tests {
             local: &[std::io::IoSlice],
             remote: &mut [std::io::IoSliceMut],
         ) -> Result<usize, reverie::Errno> {
-            assert!(!self.forbid, "source worker fixture used ordinary memory write");
+            assert!(
+                !self.forbid,
+                "source worker fixture used ordinary memory write"
+            );
             reverie::syscalls::LocalMemory::new().write_vectored(local, remote)
         }
     }
@@ -14313,7 +14370,9 @@ mod tests {
         unsafe { libc::FD_SET(7, &mut readfds) };
         let call = reverie::syscalls::Select::new()
             .with_nfds(8)
-            .with_readfds(reverie::syscalls::AddrMut::from_ptr(std::ptr::addr_of_mut!(readfds)))
+            .with_readfds(reverie::syscalls::AddrMut::from_ptr(
+                std::ptr::addr_of_mut!(readfds),
+            ))
             .with_writefds(None)
             .with_exceptfds(None)
             .with_timeout(None);
@@ -14342,7 +14401,9 @@ mod tests {
         let mut byte = 0u8;
         let call = reverie::syscalls::Recvfrom::new()
             .with_fd(7)
-            .with_buf(reverie::syscalls::AddrMut::from_ptr(std::ptr::addr_of_mut!(byte)))
+            .with_buf(reverie::syscalls::AddrMut::from_ptr(
+                std::ptr::addr_of_mut!(byte),
+            ))
             .with_len(1)
             .with_flags(0);
         let mut pending = std::pin::pin!(tool.handle_network_io(&mut guest, call.into()));
@@ -14561,7 +14622,9 @@ mod tests {
                         .iter()
                         .filter(|r| matches!(
                             r,
-                            GlobalRequest::Network(NetworkRequest::BeginEmulatedReadFromRead { .. })
+                            GlobalRequest::Network(
+                                NetworkRequest::BeginEmulatedReadFromRead { .. }
+                            )
                         ))
                         .count(),
                     1
