@@ -18,19 +18,22 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 1101 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1106 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
 //!    added (895 portable and 5 privileged), the 189 portable cells of the
 //!    compatibility-corpus fold, the 2 portable select replay cells and the 6
-//!    portable KVM verify selections, the three socket selections, and one
-//!    poll-readiness selection, after applying the later lane moves listed
-//!    in `LATER_LANE_MOVES` (now 1094 portable and 7 privileged).
-//! 3. The committed compatibility cell table has 9008 rows, with
+//!    portable KVM verify selections, the three socket selections, one
+//!    poll-readiness selection, and the 5 portable ptrace verify selections of
+//!    the signal-wake and timerfd tests, after applying the later lane moves
+//!    listed in `LATER_LANE_MOVES` (now 1099 portable and 7 privileged).
+//! 3. The committed compatibility cell table has 9072 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
-//!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
-//!    compatibility-corpus fold, plus the 2 select replay and 6 KVM verify
-//!    selection changes, plus three socket and one poll-readiness selection,
-//!    that keep the row total unchanged.
+//!    exactly the rows slice S13 added or reclassified, the 3024 rows of the
+//!    compatibility-corpus fold and the 64 rows of the four signal-wake and
+//!    timerfd tests, plus the 2 select replay and 6 KVM verify selection
+//!    changes, plus three socket and one poll-readiness selection and the
+//!    dbt-pid-virtualization ptrace selection, that keep the row total
+//!    unchanged.
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
 //!    so folding more tests into that node cannot turn it into a vacuous pass.
 //!
@@ -183,6 +186,39 @@ const KVM_PSELECT_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
     ("kvm", "verify", "green", 1),
     ("kvm", "verify", "not-applicable", -1),
 ];
+
+/// <https://github.com/rrnewton/hermit/pull/3224> adds three c-programs tests
+/// (external-io-signal-interrupt, sigsuspend-alarm-wake and
+/// sigsuspend-sibling-signal-wake) and selects the portable ptrace verify cell
+/// of the existing `c-programs/dbt-pid-virtualization`;
+/// <https://github.com/rrnewton/hermit/pull/3229> adds
+/// `c-programs/timerfd-semantics`. Each new test declares only its ptrace
+/// verify cell enabled, and selects it: one plan cell, and in the cell table
+/// the 16 rows every test has, its ptrace verify row selected (green) and its
+/// other 15 rows not applicable. dbt-pid-virtualization's ptrace verify row
+/// moves from enabled but unselected (red) to selected (green), so the plan
+/// gains five cells and the table 64 rows.
+const SIGNAL_TIMERFD_TESTS: usize = 4;
+const SIGNAL_TIMERFD_SELECTIONS: usize = SIGNAL_TIMERFD_TESTS + 1;
+const SIGNAL_TIMERFD_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "ptrace", "verify", SIGNAL_TIMERFD_SELECTIONS)];
+
+fn signal_timerfd_cell_deltas() -> Vec<(&'static str, &'static str, &'static str, isize)> {
+    let tests = SIGNAL_TIMERFD_TESTS as isize;
+    let mut deltas = vec![
+        ("ptrace", "verify", "green", tests + 1),
+        ("ptrace", "verify", "red", -1),
+        ("native", "naked", "not-applicable", tests),
+    ];
+    for backend in ["dbt", "kvm", "liteinst", "sabre"] {
+        deltas.push((backend, "verify", "not-applicable", tests));
+    }
+    for backend in ["dbt", "kvm", "liteinst", "ptrace", "sabre"] {
+        deltas.push((backend, "chaos", "not-applicable", tests));
+        deltas.push((backend, "replay", "not-applicable", tests));
+    }
+    deltas
+}
 
 /// Cells that later changes moved between lanes after the fold, as
 /// (test, backend, mode, from lane, to lane). Each move keeps the cell and only
@@ -509,18 +545,23 @@ fn the_committed_plan_keeps_its_cell_counts() {
             .count()
     };
     // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
+    // Five portable ptrace verify selections: `SIGNAL_TIMERFD_PLAN_ADDITIONS`.
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
         (
-            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1,
-            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 - moved_out("portable")
+            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + SIGNAL_TIMERFD_SELECTIONS,
+            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + SIGNAL_TIMERFD_SELECTIONS
+                - moved_out("portable")
                 + moved_in("portable"),
             5 - moved_out("privileged") + moved_in("privileged"),
         )
     );
     assert_eq!(
         (lane("portable"), lane("privileged")),
-        (893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1, 7),
+        (
+            893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + SIGNAL_TIMERFD_SELECTIONS,
+            7
+        ),
         "the lane moves above are the only ones since the fold"
     );
     // Every documented move is present in the committed plan exactly once, in
@@ -563,6 +604,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         .chain(KVM_2026_10_03_PLAN_ADDITIONS)
         .chain(KVM_SOCKET_PLAN_ADDITIONS)
         .chain(KVM_PSELECT_PLAN_ADDITIONS)
+        .chain(SIGNAL_TIMERFD_PLAN_ADDITIONS)
     {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
@@ -585,7 +627,8 @@ fn the_committed_plan_keeps_its_cell_counts() {
     // two portable ptrace replay cells of `SELECT_REPLAY_PLAN_ADDITIONS` and
     // six portable KVM verify cells of `KVM_2026_10_03_PLAN_ADDITIONS` and
     // three socket KVM verify cells of `KVM_SOCKET_PLAN_ADDITIONS`, plus the one
-    // poll-readiness cell of `KVM_PSELECT_PLAN_ADDITIONS` above.
+    // poll-readiness cell of `KVM_PSELECT_PLAN_ADDITIONS` and the five portable
+    // ptrace verify cells of `SIGNAL_TIMERFD_PLAN_ADDITIONS` above.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -606,7 +649,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         BTreeMap::from([
             (
                 ("portable".into(), "c-programs".into()),
-                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3 + 1
+                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3 + 1 + SIGNAL_TIMERFD_SELECTIONS
             ),
             (("privileged".into(), "c-programs".into()), 3 + 1),
         ])
@@ -617,7 +660,10 @@ fn the_committed_plan_keeps_its_cell_counts() {
 fn the_committed_cell_table_keeps_its_row_counts() {
     let table = read_json("ci/compat-envelope/cells.json");
     let rows = table["cells"].as_array().unwrap();
-    assert_eq!(rows.len(), 5776 + 208 + 16 * COMPAT_FOLD_TESTS);
+    assert_eq!(
+        rows.len(),
+        5776 + 208 + 16 * COMPAT_FOLD_TESTS + 16 * SIGNAL_TIMERFD_TESTS
+    );
     let mut counts = BTreeMap::<(String, String, String), usize>::new();
     for row in rows {
         assert_ne!(field(row, "category"), RETIRED_BUCKET, "{row}");
@@ -644,6 +690,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .chain(KVM_2026_10_03_CELL_DELTAS.iter().copied())
         .chain(KVM_SOCKET_CELL_DELTAS.iter().copied())
         .chain(KVM_PSELECT_CELL_DELTAS.iter().copied())
+        .chain(signal_timerfd_cell_deltas())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))
