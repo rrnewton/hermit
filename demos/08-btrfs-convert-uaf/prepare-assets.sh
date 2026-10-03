@@ -17,9 +17,10 @@ USAGE:
 
 A bare invocation clones btrfs-progs v7.1, builds the buggy and fixed variants
 with AddressSanitizer, creates a small ext4 image, and then runs `hermit run
---chaos` over seeds until one crashes, reproduces, and is clean with the fixed
-variant. It records that seed in <assets>/.crash-seed. It is idempotent: when
-the cached assets match the sources it only re-checks the recorded seed.
+--chaos` over seeds until one crashes, crashes again with the same complete
+AddressSanitizer report, and is clean with the fixed variant. It records that
+seed in <assets>/.crash-seed. It is idempotent: when the cached assets match
+the sources it only re-checks the recorded seed.
 
 Needs: hermit on PATH, autoconf, automake, file, git, make, mkfs.ext4 (e2fsprogs),
 patch, pkg-config, truncate, a C compiler with AddressSanitizer, and network
@@ -39,6 +40,9 @@ EOF
 done
 
 DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# asan_report: the complete AddressSanitizer report in a run's output.
+# shellcheck source=demos/08-btrfs-convert-uaf/asan-report.sh
+source "$DEMO_DIR/asan-report.sh"
 ROOT="$(cd "$DEMO_DIR/../.." && pwd)"
 ASSETS="${DEMO08_DIR:-$ROOT/ignored/demo08-btrfs}"
 BUILD_ROOT="${DEMO08_BUILD_ROOT:-$ROOT/ignored/demo08-build}"
@@ -172,8 +176,11 @@ run_variant() {
   fi
   # The report text alone does not qualify a seed: the demo requires the ASAN
   # abort (exit 134). A run can print the start of a report and still exit 0,
-  # or be cut off at 124 mid-report. SUMMARY is ASAN's last line, so it marks a
-  # complete report.
+  # or be cut off at 124 mid-report. A report that reaches its SUMMARY line is
+  # classified complete here. The SUMMARY is not ASAN's last line: the
+  # shadow-memory map and the closing ==PID==ABORTING line follow it, and
+  # confirm_seed requires that closing line in both runs before it compares
+  # their reports.
   if grep -qa 'AddressSanitizer: heap-use-after-free' "$output"; then
     uaf=hit
     if grep -qa 'SUMMARY: AddressSanitizer' "$output"; then
@@ -248,16 +255,32 @@ record_run() {
     "$seed" "$source" "$variant" "$engagement" "$uaf" "$rc" "$elapsed" "$qualifies" "$output"
 }
 
+# Save the complete ASAN report in the run output $1 to $2, or stop the
+# calibration. The run qualified, so it exited 134 with the report's SUMMARY
+# line, but a report without ASAN's closing ==PID==ABORTING line cannot be
+# compared whole, and run.sh refuses such a run.
+save_asan_report() {
+  local output=$1 saved=$2 label=$3 seed=$4 report=$5
+  asan_report "$output" >"$saved" ||
+    fail "demo 8 seed $seed: the $label run exited 134 with the report's SUMMARY line, but" \
+      "no complete ASAN report could be saved from $output to $saved. The report must run" \
+      "through ASAN's closing ==PID==ABORTING line, because two runs of one seed are" \
+      "compared on their complete reports (report: $report)"
+}
+
 # Check that a candidate seed passes the same checks as run.sh before recording
-# it: the buggy variant crashes again on the same seed, and the fixed variant on
-# that seed completes cleanly.
+# it: the buggy variant crashes again on the same seed with the same complete
+# ASAN report, from its ERROR line through its closing ABORTING line with only
+# Hermit's own log lines left out, and the fixed variant on that seed completes
+# cleanly. $5 is the output of the seed's first, qualifying run.
 #
 # Return 0 to accept, 1 to reject this seed and keep searching. Only a timeout
 # (rc=124) or a run that Hermit refused on every attempt (rc=122) rejects a
 # seed: the first means the seed does not fit the demo's timeout, the second
 # that the check was not run. Any other disagreement between two runs of one
-# seed is a determinism or environment failure, and searching for a friendlier
-# seed would hide it, so those stop the whole calibration.
+# seed, including two crash reports that differ in any line, is a determinism or
+# environment failure, and searching for a friendlier seed would hide it, so
+# those stop the whole calibration.
 #
 # The two timeout rejections are counted separately: one says the seed is too
 # slow, the other says the fixed control is.
@@ -266,8 +289,11 @@ REJECTED_FIXED_BUDGET=0
 REJECTED_REFUSED=0
 
 confirm_seed() {
-  local report=$1 artifacts=$2 seed=$3 source=$4
-  local rc elapsed engagement uaf output qualifies
+  local report=$1 artifacts=$2 seed=$3 source=$4 first_output=$5
+  local rc elapsed engagement uaf output qualifies first_asan replay_asan
+
+  first_asan="${first_output%.out}.asan.txt"
+  save_asan_report "$first_output" "$first_asan" first "$seed" "$report"
 
   output="$artifacts/calibration-confirm-replay-seed-${seed}.out"
   run_variant_unrefused buggy "$seed" "$artifacts/chaos-buggy.img" "$output" \
@@ -299,6 +325,20 @@ confirm_seed() {
       "determinism or environment failure and must not be worked around by choosing another" \
       "seed (report: $report)"
   fi
+
+  # The replay crashed too, and it must print the same complete report: the
+  # comparison run.sh's Step 4 makes.
+  replay_asan="${output%.out}.asan.txt"
+  save_asan_report "$output" "$replay_asan" replay "$seed" "$report"
+  if ! cmp -s "$first_asan" "$replay_asan"; then
+    diff "$first_asan" "$replay_asan" >&2 || true
+    fail "demo 8 seed $seed crashed on its first run and on its replay, but the two ASAN" \
+      "reports differ ($first_asan and $replay_asan; the differing lines are above). Two runs" \
+      "of one seed must print the same complete report; this is a determinism or environment" \
+      "failure and must not be worked around by choosing another seed (report: $report)"
+  fi
+  echo "  seed=$seed replay printed the same complete ASAN report as the first run" \
+    "($(wc -l <"$replay_asan") lines: $replay_asan)"
 
   output="$artifacts/calibration-confirm-fixed-seed-${seed}.out"
   run_variant_unrefused fixed "$seed" "$artifacts/chaos-fixed.img" "$output" \
@@ -336,8 +376,8 @@ calibrate_crash_seed() {
   local image="$artifacts/chaos-buggy.img"
   local report="$artifacts/calibration.tsv"
   local output seed source rc elapsed fixture cached_fixture engagement uaf qualifies i
-  # complete_reports counts the subset of uaf_hits whose report reached ASAN's
-  # closing SUMMARY, which separates "the report was cut off" from "the report
+  # complete_reports counts the subset of uaf_hits whose report reached its
+  # SUMMARY line, which separates "the report was cut off" from "the report
   # finished and the guest never aborted".
   # refused counts seeds whose search run Hermit refused on every attempt; they
   # were not tested and are not in executed.
@@ -420,7 +460,7 @@ calibrate_crash_seed() {
       qualified=$((qualified + 1))
       # One qualifying run is a candidate. Only a seed that also passes the
       # replay and fixed-variant checks is recorded.
-      if confirm_seed "$report" "$artifacts" "$seed" "$source"; then
+      if confirm_seed "$report" "$artifacts" "$seed" "$source" "$output"; then
         found_seed="$seed"
         found_source="$source"
         break
@@ -487,7 +527,7 @@ calibrate_crash_seed() {
     fail "demo 8 calibration found $uaf_hits use-after-free report(s) in $attempted attempted" \
       "seeds and qualified none: $complete_reports were COMPLETE but the guest did not abort" \
       "with 134, which is what a binary built without abort_on_error produces, and" \
-      "$((uaf_hits - complete_reports)) stopped before ASAN's closing SUMMARY, which is a run" \
+      "$((uaf_hits - complete_reports)) stopped before the report's SUMMARY line, which is a run" \
       "cut off or interleaved with another thread. A qualifying run needs the complete report" \
       "AND the abort. This is not an absent use-after-free (report: $report)"
   fi

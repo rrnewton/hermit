@@ -13,14 +13,15 @@
 # The demo runs AddressSanitizer builds of two btrfs-convert variants: `buggy`
 # (before 73e211a7) and `fixed` (73e211a7). It reports what one native buggy run
 # showed, then shows that the chaos buggy run crashes on a known seed, the chaos
-# fixed run on the same seed is clean, and the crash reproduces byte-for-byte
-# when run again. That held on the host described in README.md, which gives the
-# host's load where it was recorded. If a performance-counter interrupt arrives
-# later than Hermit's safety margin, which heavy host load makes more likely,
-# Reverie prints a HERMIT_SKID_OVERSHOOT line and Hermit refuses the run: it
-# prints "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot
-# count=N" and exits 122, so this script reports rc=122 instead of the expected
-# crash. README.md explains this.
+# fixed run on the same seed is clean, and a second run of the seed prints the
+# same complete AddressSanitizer report, byte for byte, from its ERROR line
+# through its closing ABORTING line. That held on the host described in
+# README.md, which gives the host's load where it was recorded. If a
+# performance-counter interrupt arrives later than Hermit's safety margin, which
+# heavy host load makes more likely, Reverie prints a HERMIT_SKID_OVERSHOOT line
+# and Hermit refuses the run: it prints "HERMIT_POLICY_REFUSAL
+# class=policy-refusal cause=skid-overshoot count=N" and exits 122, so this
+# script reports rc=122 instead of the expected crash. README.md explains this.
 # prepare-assets.sh builds the binaries and the input image; WRITEUP.md tells
 # the story of the bug.
 
@@ -30,6 +31,9 @@ DEMO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$DEMO_DIR/../.." && pwd)"
 ASSETS="${DEMO08_DIR:-$ROOT/ignored/demo08-btrfs}"
 ARTIFACTS="${DEMO08_ARTIFACTS:-$ROOT/target/demos/08-btrfs-convert-uaf}"
+# asan_report: the complete AddressSanitizer report in a run's output.
+# shellcheck source=demos/08-btrfs-convert-uaf/asan-report.sh
+source "$DEMO_DIR/asan-report.sh"
 
 usage() {
   cat <<'EOF'
@@ -133,16 +137,19 @@ fresh_image() {
   cp --reflink=auto "$IMAGE" "$dst"
 }
 
-# The guest-produced core of an ASAN heap-use-after-free report: the error line
-# (faulting heap address and PC), the two program frames, and the SUMMARY.
-# Hermit's own log lines are dropped.
-asan_core() {
+# The lines of a saved ASAN report that this script prints for a reader: the
+# error line (faulting heap address and PC), the two program frames, and the
+# SUMMARY. Display only: Step 4 compares the complete report, not these lines.
+asan_highlights() {
   grep -aE 'AddressSanitizer: heap-use-after-free|task_period_wait|print_copied_inodes|SUMMARY: AddressSanitizer' "$1" || true
 }
 
-# A complete report has both the use-after-free line and the closing SUMMARY.
-# A partial report shows ASAN started describing a fault, not that the program
-# reached the abort. prepare-assets.sh uses the same definition.
+# The run reported a use-after-free and its report reached the SUMMARY line. A
+# report without its SUMMARY shows ASAN started describing a fault, not that the
+# program reached the abort. prepare-assets.sh uses the same definition. The
+# SUMMARY is not ASAN's last line: the shadow-memory map and the closing
+# ==PID==ABORTING line follow it, and Steps 2 and 4 also require that closing
+# line, through asan_report, before they compare two reports.
 complete_asan_uaf() {
   local output="$1"
   grep -qa 'AddressSanitizer: heap-use-after-free' "$output" \
@@ -239,11 +246,20 @@ if [ "$buggy_rc" -ne 134 ]; then
 fi
 if ! complete_asan_uaf "$ARTIFACTS/chaos-buggy.out"; then
   echo "chaos buggy seed $CRASH_SEED exited 134 without a complete ASAN use-after-free report" >&2
-  echo "both the use-after-free line and the closing SUMMARY are required" >&2
+  echo "both the use-after-free line and the report's SUMMARY line are required" >&2
   exit 1
 fi
-asan_core "$ARTIFACTS/chaos-buggy.out" | tee "$ARTIFACTS/asan-report.txt"
-echo "chaos buggy: reproduced the use-after-free"
+# Save the complete report for Step 4 to compare against.
+if ! asan_report "$ARTIFACTS/chaos-buggy.out" >"$ARTIFACTS/asan-report.txt"; then
+  echo "chaos buggy seed $CRASH_SEED exited 134, but its ASAN report stops" \
+    "before ASAN's closing ==PID==ABORTING line, so the complete report" \
+    "cannot be compared" >&2
+  exit 1
+fi
+asan_highlights "$ARTIFACTS/asan-report.txt"
+echo "chaos buggy: reproduced the use-after-free; the complete" \
+  "$(wc -l <"$ARTIFACTS/asan-report.txt")-line ASAN report is in" \
+  "$ARTIFACTS/asan-report.txt"
 echo
 
 # --- Step 3: the chaos fixed run on the same seed is clean --------------------
@@ -278,10 +294,16 @@ echo "chaos fixed: completed rc=0 with no use-after-free (73e211a7 closes the wi
 echo
 
 # --- Step 4: the crash reproduces byte-for-byte -------------------------------
+# The replay must print the same complete ASAN report as Step 2: every line from
+# the ERROR line through the closing ABORTING line, with only Hermit's own log
+# lines left out (asan_report). That includes the heap address, the PC, every
+# stack, and the shadow-memory map.
+#
 # Reuse the exact image path from Step 2 so the command line is byte-identical.
-# Hermit's determinism is per input, and the faulting heap address depends on
-# argv: a different path length shifts the initial heap layout, which would give
-# a different (but still repeatable) address.
+# Hermit's determinism is per input, and the report depends on argv: a different
+# path length shifts the initial heap layout, which can give a different (but
+# still repeatable) heap address or shadow-memory map. README.md gives the
+# measurements.
 echo "--- Step 4: run --sched-seed $CRASH_SEED again and compare the crash ---"
 fresh_image "$CHAOS_IMG"
 replay_rc=0
@@ -298,12 +320,18 @@ if [ "$replay_rc" -ne 134 ]; then
 fi
 if ! complete_asan_uaf "$ARTIFACTS/chaos-buggy-replay.out"; then
   echo "replay exited 134 without a complete ASAN use-after-free report" >&2
-  echo "both the use-after-free line and the closing SUMMARY are required" >&2
+  echo "both the use-after-free line and the report's SUMMARY line are required" >&2
   exit 1
 fi
-asan_core "$ARTIFACTS/chaos-buggy-replay.out" >"$ARTIFACTS/asan-report-replay.txt"
+if ! asan_report "$ARTIFACTS/chaos-buggy-replay.out" >"$ARTIFACTS/asan-report-replay.txt"; then
+  echo "replay exited 134, but its ASAN report stops before ASAN's closing" \
+    "==PID==ABORTING line, so the complete report cannot be compared" >&2
+  exit 1
+fi
 if cmp -s "$ARTIFACTS/asan-report.txt" "$ARTIFACTS/asan-report-replay.txt"; then
-  echo "replay: ASAN report byte-identical (same heap address, PC, and frames)"
+  echo "replay: ASAN report byte-identical: all" \
+    "$(wc -l <"$ARTIFACTS/asan-report.txt") lines from the ERROR line through" \
+    "ABORTING, including the heap address, PC, every stack, and the shadow memory"
 else
   echo "replay: ASAN reports differ between runs" >&2
   diff "$ARTIFACTS/asan-report.txt" "$ARTIFACTS/asan-report-replay.txt" >&2 || true
