@@ -15289,6 +15289,10 @@ fn validate_scorecard_snapshot(
         "no_verdict_evidence",
         "pressure_evidence",
         "declared_guest_exit",
+        // Typed by `SeriesComparison`, whose own deny_unknown_fields refuses an
+        // unknown key inside it; `validate_for_read` refuses any value but the
+        // stripped, non-bitwise comparison the writer records.
+        "comparison",
         "run_index",
         "attempt",
         "num_runs",
@@ -22567,6 +22571,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 no_verdict_evidence: None,
                 pressure_evidence: None,
                 declared_guest_exit: None,
+                comparison: None,
                 run_index: 1,
                 attempt: Some(1),
                 num_runs: 1,
@@ -28105,6 +28110,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 no_verdict_evidence: None,
                 pressure_evidence: None,
                 declared_guest_exit: None,
+                comparison: None,
                 run_index: 1,
                 attempt: None,
                 num_runs,
@@ -40008,5 +40014,247 @@ mod parity_summary_tests {
                 format!("{LEGACY_HEADING}\n`{expected}`\n\n")
             );
         }
+    }
+}
+
+/// Series rows for a verify cell that declares `comparator: stripped` carry
+/// `series.comparison = {"strictness": "stripped", "bitwise_parity": false}`
+/// (<https://github.com/rrnewton/dev-hermit/issues/476>). The snapshot reader
+/// must accept exactly that object, refuse anything else inside it, and count
+/// the row exactly as it counted the same row before the field existed.
+#[cfg(test)]
+mod series_comparison_tests {
+    use super::*;
+
+    /// Not a retired id, so `resolve_series_cell` leaves it unchanged.
+    const CELL: &str = "fixture/stripped-comparison/verify/ptrace";
+
+    /// One row in the shape the series writer records for a passed verify cell
+    /// that declares `comparator: stripped`, modelled on a published row.
+    fn stripped_row(cell: &str, comparison: Option<JsonValue>) -> JsonValue {
+        let mut row = serde_json::json!({
+            "schema": "stress-series/v3",
+            "event_id": "series-fixture-stripped-comparison",
+            "event_type": "series.observation",
+            "emitted_at": "2026-10-03T05:53:45Z",
+            "team": "hermit",
+            "host": "fixture-host",
+            "producer": "validate",
+            "run_id": "fixture-run",
+            "series": {
+                "cell": cell,
+                "tree": "123e6a03ea61e0c16fccd8fcf8e57a07c7aaba99",
+                "outcome": "passed",
+                "result": "pass",
+                "failure_class": null,
+                "run_index": 1,
+                "num_runs": 1,
+                "main_ancestry": true,
+                "source_tree_dirty": false,
+                "depth": {"hermit": {"commits": 10, "first_parent": 9}},
+                "machine_shortname": "fixture-host",
+                "kernel_version": "7.1.3-fixture",
+                "host_capabilities": {
+                    "cpuid-faulting": {"present": true, "evidence": "fixture cpuid probe"},
+                    "kvm": {"present": false, "evidence": "fixture kvm probe"},
+                },
+            },
+        });
+        if let Some(comparison) = comparison {
+            row["series"]["comparison"] = comparison;
+        }
+        row
+    }
+
+    fn stripped() -> JsonValue {
+        serde_json::json!({"strictness": "stripped", "bitwise_parity": false})
+    }
+
+    /// Read `rows` through the same parser and validator as
+    /// `project-and-observe-results --snapshot`.
+    fn read_snapshot(rows: Vec<JsonValue>) -> Result<Vec<SeriesRow>, String> {
+        let rows_sha256 = format!(
+            "{:x}",
+            Sha256::digest(canonical_snapshot_rows_bytes(&rows)?)
+        );
+        let value = serde_json::json!({
+            "schema": SCORECARD_SERIES_SNAPSHOT_SCHEMA,
+            "source": {
+                "repository": TEST_LEDGER_REPOSITORY,
+                "path": SCORECARD_SERIES_SNAPSHOT_SOURCE,
+                "commit": "1".repeat(40),
+                "tree": "2".repeat(40),
+                "published_rows": rows.len(),
+                "local_sources": [],
+            },
+            "rows_read": rows.len(),
+            "rows_sha256": rows_sha256,
+            "rows": rows,
+        });
+        let text = serde_json::to_string(&value).map_err(|error| error.to_string())?;
+        let snapshot: ScorecardSeriesSnapshot =
+            serde_json::from_str(&text).map_err(|error| error.to_string())?;
+        validate_scorecard_snapshot(&snapshot, Path::new("fixture-snapshot"))
+    }
+
+    fn tracked_fixture_cell() -> TrackedCells {
+        let mut tracked = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![TrackedCell {
+                id: CellId {
+                    lane: "portable".into(),
+                    category: "fixture".into(),
+                    test: "fixture/stripped-comparison".into(),
+                    mode: "verify".into(),
+                    backend: "ptrace".into(),
+                },
+                status: CellStatus::Green,
+                ci_disabled_reason: None,
+                not_applicable_reason: None,
+                last_tested: None,
+                observations: Vec::new(),
+                measurement: MeasurementState::NeverMeasured,
+                green_removal_reason: None,
+            }],
+        };
+        refresh_measurement(&mut tracked);
+        tracked
+    }
+
+    #[test]
+    fn a_snapshot_row_with_the_stripped_comparison_is_read() {
+        let rows = read_snapshot(vec![stripped_row(CELL, Some(stripped()))])
+            .expect("a stripped-comparison row is readable");
+        assert_eq!(rows.len(), 1);
+        let encoded = serde_json::to_value(&rows[0]).unwrap();
+        assert_eq!(encoded["series"]["comparison"], stripped());
+    }
+
+    #[test]
+    fn a_row_without_comparison_still_encodes_without_the_key() {
+        // typed_event_digest re-encodes the row; an absent comparison must not
+        // appear as `null`, or every existing attempt binding would move.
+        let rows = read_snapshot(vec![stripped_row(CELL, None)]).unwrap();
+        let encoded = serde_json::to_value(&rows[0]).unwrap();
+        assert!(encoded["series"].get("comparison").is_none(), "{encoded}");
+    }
+
+    #[test]
+    fn an_unknown_key_inside_comparison_is_refused() {
+        let error = read_snapshot(vec![stripped_row(
+            CELL,
+            Some(serde_json::json!({
+                "strictness": "stripped",
+                "bitwise_parity": false,
+                "note": "unexpected",
+            })),
+        )])
+        .unwrap_err();
+        assert!(error.contains("unknown field `note`"), "{error}");
+    }
+
+    #[test]
+    fn only_the_stripped_non_bitwise_comparison_of_a_verify_verdict_is_read() {
+        let refused = |row: JsonValue, expected: &str| {
+            let error = read_snapshot(vec![row]).unwrap_err();
+            assert!(error.contains(expected), "expected {expected:?} in {error}");
+        };
+        for (comparison, expected) in [
+            (
+                serde_json::json!({"strictness": "canonical", "bitwise_parity": false}),
+                "canonical rows carry no comparison",
+            ),
+            (
+                serde_json::json!({"strictness": "stripped", "bitwise_parity": true}),
+                "canonical rows carry no comparison",
+            ),
+            (
+                serde_json::json!({"strictness": "loose", "bitwise_parity": false}),
+                "unknown variant `loose`",
+            ),
+            (
+                serde_json::json!({"strictness": "stripped"}),
+                "missing field `bitwise_parity`",
+            ),
+            (
+                serde_json::json!({"strictness": "stripped", "bitwise_parity": "false"}),
+                "invalid type",
+            ),
+        ] {
+            refused(stripped_row(CELL, Some(comparison)), expected);
+        }
+        refused(
+            stripped_row(
+                "fixture/stripped-comparison/replay/ptrace",
+                Some(stripped()),
+            ),
+            "comparison is recorded only for verify cells",
+        );
+        let mut timeout = stripped_row(CELL, Some(stripped()));
+        timeout["series"]["outcome"] = "timeout".into();
+        timeout["series"]["result"] = "timeout".into();
+        timeout["series"]["failure_class"] = "no_result".into();
+        refused(timeout, "reached no comparison and must not carry one");
+    }
+
+    #[test]
+    fn a_stripped_row_counts_as_a_pass_and_raises_no_bitwise_or_parity_count() {
+        let project = |row: JsonValue| {
+            let rows = read_snapshot(vec![row]).expect("readable snapshot");
+            let mut tracked = tracked_fixture_cell();
+            let outcome =
+                apply_series_rows(Path::new("/absent-host-results"), &mut tracked, &rows, None)
+                    .expect("the row projects");
+            refresh_measurement(&mut tracked);
+            (tracked, outcome)
+        };
+        let (stripped_cells, stripped_outcome) = project(stripped_row(CELL, Some(stripped())));
+        let (plain_cells, plain_outcome) = project(stripped_row(CELL, None));
+
+        assert_eq!(stripped_outcome.rows, 1);
+        assert_eq!(stripped_outcome.cells, 1);
+        assert!(
+            stripped_outcome.skipped.is_empty(),
+            "{:?}",
+            stripped_outcome.skipped
+        );
+        let cell = &stripped_cells.cells[0];
+        assert_eq!(cell.measurement, MeasurementState::MeasuredAndPassed);
+        assert_eq!(cell.observations.len(), 1);
+        let observation = &cell.observations[0];
+        assert_eq!(observation.results, BTreeSet::from([ObservedResult::Pass]));
+        // The canonical (bitwise) and backend-parity receipts are the only
+        // places a bitwise or parity count is read from.
+        assert!(observation.canonical_comparisons.is_empty());
+        assert!(observation.backend_parity_comparisons.is_empty());
+        assert!(cell.last_tested.is_none());
+
+        // Counting is exactly that of the same row without the field.
+        assert_eq!(
+            (
+                stripped_outcome.rows,
+                stripped_outcome.cells,
+                stripped_outcome.runs,
+                stripped_outcome.no_verdict_rows,
+                stripped_outcome.represented_rows,
+            ),
+            (
+                plain_outcome.rows,
+                plain_outcome.cells,
+                plain_outcome.runs,
+                plain_outcome.no_verdict_rows,
+                plain_outcome.represented_rows,
+            )
+        );
+        assert_eq!(stripped_cells.cells, plain_cells.cells);
+        assert_eq!(
+            render_measurement_section(&stripped_cells),
+            render_measurement_section(&plain_cells)
+        );
+        let parity = parity_summary_without_store(&stripped_cells);
+        assert_eq!(parity, parity_summary_without_store(&plain_cells));
+        assert_eq!(parity.rows_read, 0);
+        assert!(parity.runs.is_empty());
     }
 }
