@@ -162,6 +162,29 @@ def parse_args() -> argparse.Namespace:
 
 
 COMMAND_IMAGE_BYTES = 4096
+# The guest's init reads only the first 512 bytes of the command disk
+# (`dd bs=512 count=1` in demos/lib/qemu-assets.sh) and runs the first line of
+# what it read. A longer command would reach the guest cut off at byte 512 and
+# run in that cut-off form, so the host refuses it before starting anything.
+GUEST_COMMAND_READ_BYTES = 512
+# The command and the newline that ends it must both fit in what the guest reads.
+MAX_GUEST_COMMAND_BYTES = GUEST_COMMAND_READ_BYTES - 1
+
+
+def check_guest_command(command: str) -> bytes:
+    """Return the command's UTF-8 bytes; refuse one the guest would not run whole."""
+    if "\n" in command or "\r" in command:
+        raise ValueError("guest command must be a single line")
+    encoded = command.encode()
+    if len(encoded) > MAX_GUEST_COMMAND_BYTES:
+        raise ValueError(
+            "guest command is {} bytes; the guest reads only the first {} bytes "
+            "of its command disk, so a command can be at most {} bytes (UTF-8) "
+            "plus the newline after it".format(
+                len(encoded), GUEST_COMMAND_READ_BYTES, MAX_GUEST_COMMAND_BYTES
+            )
+        )
+    return encoded
 
 
 def write_command_image(path: Path, command: str) -> None:
@@ -171,13 +194,7 @@ def write_command_image(path: Path, command: str) -> None:
     only its backing file differs; a geometry change between the two would not
     match the device state recorded in the snapshot.
     """
-    payload = command.encode() + b"\n"
-    if len(payload) > COMMAND_IMAGE_BYTES:
-        raise ValueError(
-            "guest command is {} bytes, over the {}-byte image".format(
-                len(payload), COMMAND_IMAGE_BYTES
-            )
-        )
+    payload = check_guest_command(command) + b"\n"
     path.write_bytes(payload + b"\0" * (COMMAND_IMAGE_BYTES - len(payload)))
 
 
@@ -436,8 +453,9 @@ def main() -> int:
     settle_signal_33_disposition()
     arguments = parse_args()
     guest_command = " ".join(arguments.command).strip() or "uname -a"
-    if "\n" in guest_command or "\r" in guest_command:
-        raise ValueError("guest command must be a single line")
+    # Refuse a command the guest cannot run whole before taking the demo lock,
+    # copying the boot snapshot, or starting Hermit.
+    check_guest_command(guest_command)
     save_snapshot = not arguments.no_save_snapshot
     result = resume_once(guest_command, save_snapshot)
     # The first run of a command only records its reference run. Resume a second
