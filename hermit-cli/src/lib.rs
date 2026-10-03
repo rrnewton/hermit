@@ -847,40 +847,48 @@ fn liteinst_runtime_pin_matches(path: &Path) -> io::Result<()> {
 
 fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
     liteinst_runtime_pin_matches(path)?;
+    validate_preload_constructor_library(
+        path,
+        "LiteInst runtime",
+        &[
+            "reverie_liteinst_initialize",
+            "reverie_liteinst_site_trap_count",
+            "reverie_liteinst_site_hook_count",
+        ],
+        "reverie_liteinst_initialize",
+    )
+}
+
+/// Checks that `path` is an x86-64 shared object that exports every name in
+/// `required` and registers `initializer_name` in its constructor array, so
+/// that preloading it runs that initializer. `label` names the library in every
+/// error message. Returns the canonical path.
+fn validate_preload_constructor_library(
+    path: &Path,
+    label: &str,
+    required: &[&str],
+    initializer_name: &str,
+) -> io::Result<PathBuf> {
     let bytes = fs::read(path).map_err(|error| {
         io::Error::new(
             error.kind(),
-            format!(
-                "failed to read LiteInst runtime {}: {error}",
-                path.display()
-            ),
+            format!("failed to read {label} {}: {error}", path.display()),
         )
     })?;
     let elf = Elf::parse(&bytes).map_err(|error| {
         io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "LiteInst runtime {} is not an ELF DSO: {error}",
-                path.display()
-            ),
+            format!("{label} {} is not an ELF DSO: {error}", path.display()),
         )
     })?;
     if elf.header.e_type != header::ET_DYN || elf.header.e_machine != header::EM_X86_64 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "LiteInst runtime {} is not an x86-64 shared object",
-                path.display()
-            ),
+            format!("{label} {} is not an x86-64 shared object", path.display()),
         ));
     }
 
-    let required = [
-        "reverie_liteinst_initialize",
-        "reverie_liteinst_site_trap_count",
-        "reverie_liteinst_site_hook_count",
-    ];
-    for name in required {
+    for &name in required {
         if !elf
             .dynsyms
             .iter()
@@ -889,7 +897,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!(
-                    "LiteInst runtime {} is missing required export {name}",
+                    "{label} {} is missing required export {name}",
                     path.display()
                 ),
             ));
@@ -899,10 +907,12 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
         .dynsyms
         .iter()
         .enumerate()
-        .find(|(_, symbol)| {
-            elf.dynstrtab.get_at(symbol.st_name) == Some("reverie_liteinst_initialize")
-        })
-        .ok_or_else(|| io::Error::other("checked LiteInst initializer disappeared"))?;
+        .find(|(_, symbol)| elf.dynstrtab.get_at(symbol.st_name) == Some(initializer_name))
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "checked {label} initializer {initializer_name} disappeared"
+            ))
+        })?;
     let init_array = elf
         .section_headers
         .iter()
@@ -910,10 +920,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
         .ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "LiteInst runtime {} has no constructor array",
-                    path.display()
-                ),
+                format!("{label} {} has no constructor array", path.display()),
             )
         })?;
     let init_start = init_array.sh_addr;
@@ -943,7 +950,7 @@ fn validate_liteinst_runtime_library(path: &Path) -> io::Result<PathBuf> {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "LiteInst runtime {} does not register reverie_liteinst_initialize as a preload constructor",
+                "{label} {} does not register {initializer_name} as a preload constructor",
                 path.display()
             ),
         ));
@@ -1000,6 +1007,129 @@ pub fn liteinst_runtime_library_path() -> io::Result<PathBuf> {
     ))
 }
 
+/// Environment variable that selects where `--backend=liteinst` runs Detcore.
+///
+/// Unset keeps the ptrace-hosted hybrid, which is still the default. `1` runs
+/// Detcore's Tool inside the guest through the `detcore-liteinst` preload, with
+/// no ptrace tracer on the syscall path
+/// (<https://github.com/rrnewton/hermit/issues/3520>). Any other value is
+/// refused.
+pub const LITEINST_IN_GUEST_ENV: &str = "HERMIT_LITEINST_IN_GUEST";
+
+/// Environment variable naming the in-guest Detcore preload
+/// (`libdetcore_liteinst.so`) explicitly.
+pub const LITEINST_TOOL_RUNTIME_ENV: &str = "HERMIT_LITEINST_TOOL_RUNTIME";
+
+/// Where `--backend=liteinst` runs Detcore's Tool.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum LiteinstRuntime {
+    /// Detcore runs in the Hermit process under a ptrace tracer; the guest
+    /// preload patches sites and unpatched syscalls stop in ptrace.
+    HostHybrid,
+    /// Detcore's Tool runs in the guest (`detcore-liteinst`) and reaches its
+    /// global state in Hermit over the coordinator socket.
+    InGuest,
+}
+
+impl LiteinstRuntime {
+    /// Parses a value of [`LITEINST_IN_GUEST_ENV`]; `None` means unset.
+    pub fn parse(value: Option<&OsStr>) -> Result<Self, Error> {
+        match value {
+            None => Ok(Self::HostHybrid),
+            Some(value) if value == OsStr::new("1") => Ok(Self::InGuest),
+            Some(value) => Err(anyhow!(
+                "{LITEINST_IN_GUEST_ENV}={:?} is not a LiteInst runtime selection: leave it unset \
+                 for the ptrace-hosted hybrid, or set it to 1 for in-guest Detcore",
+                value
+            )),
+        }
+    }
+
+    /// Reads [`LITEINST_IN_GUEST_ENV`] from this process's environment.
+    pub fn from_env() -> Result<Self, Error> {
+        Self::parse(std::env::var_os(LITEINST_IN_GUEST_ENV).as_deref())
+    }
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3520): Review in-guest Detcore runtime discovery.
+/// Returns the in-guest Detcore preload built beside the Hermit binary by
+/// `cargo build -p detcore-liteinst`, or the one [`LITEINST_TOOL_RUNTIME_ENV`]
+/// names.
+///
+/// Unlike the hybrid runtime, this library records no Reverie revision yet, so
+/// a stale build is not detected. Staging it with a revision marker is part of
+/// making in-guest the default (<https://github.com/rrnewton/hermit/issues/3520>).
+#[doc(hidden)]
+pub fn liteinst_tool_runtime_library_path() -> io::Result<PathBuf> {
+    if let Some(path) = std::env::var_os(LITEINST_TOOL_RUNTIME_ENV) {
+        let path = PathBuf::from(path);
+        if !path.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("{LITEINST_TOOL_RUNTIME_ENV} does not name a regular file"),
+            ));
+        }
+        return validate_liteinst_tool_runtime_library(&path).map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("{LITEINST_TOOL_RUNTIME_ENV} is invalid: {error}"),
+            )
+        });
+    }
+
+    let executable = std::env::current_exe()?;
+    let directory = executable.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "Hermit executable has no parent directory",
+        )
+    })?;
+    if let Some(path) = [
+        directory.join("libdetcore_liteinst.so"),
+        directory.join("deps/libdetcore_liteinst.so"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+    {
+        return validate_liteinst_tool_runtime_library(&path);
+    }
+    Err(io::Error::new(
+        io::ErrorKind::NotFound,
+        format!(
+            "libdetcore_liteinst.so was not built beside {}",
+            executable.display()
+        ),
+    ))
+}
+
+fn validate_liteinst_tool_runtime_library(path: &Path) -> io::Result<PathBuf> {
+    validate_preload_constructor_library(
+        path,
+        "in-guest Detcore runtime",
+        &["detcore_liteinst_initialize"],
+        "detcore_liteinst_initialize",
+    )
+}
+
+/// Refuses an in-guest LiteInst run that would arm Detcore's preemption timer.
+///
+/// Reverie's in-guest Tool host accepts `set_timer` and arms nothing, so Detcore
+/// would believe a timeslice is enforced while the guest runs unpreempted. The
+/// CLI refuses `--max-timeslice` earlier with a policy refusal; this keeps
+/// library callers from reaching the same silent gap.
+#[cfg(feature = "liteinst")]
+fn refuse_in_guest_liteinst_timers(config: &DetConfig) -> Result<(), Error> {
+    if config.max_timeslice.is_some() {
+        return Err(anyhow!(
+            "in-guest LiteInst ({LITEINST_IN_GUEST_ENV}=1) cannot deliver Detcore's preemption \
+             timer yet, so it refuses a run with a maximum timeslice; pass \
+             --max-timeslice=disabled"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(feature = "liteinst")]
 fn liteinst_unavailable_reason() -> Option<String> {
     liteinst_runtime_unavailable_reason()
@@ -1016,11 +1146,19 @@ fn liteinst_unavailable_reason() -> Option<String> {
 
 #[cfg(feature = "liteinst")]
 fn liteinst_runtime_unavailable_reason() -> Option<String> {
-    liteinst_runtime_library_path().err().map(|error| {
-        format!(
-            "the LiteInst preload runtime is unavailable: {error}; build the locked liteinst-runtime-build manifest and stage its constructor-enabled DSO beside hermit"
-        )
-    })
+    match LiteinstRuntime::from_env() {
+        Err(error) => Some(error.to_string()),
+        Ok(LiteinstRuntime::InGuest) => liteinst_tool_runtime_library_path().err().map(|error| {
+            format!(
+                "the in-guest Detcore runtime is unavailable: {error}; build it with `cargo build -p detcore-liteinst` in the target directory of this hermit binary, or name it with {LITEINST_TOOL_RUNTIME_ENV}"
+            )
+        }),
+        Ok(LiteinstRuntime::HostHybrid) => liteinst_runtime_library_path().err().map(|error| {
+            format!(
+                "the LiteInst preload runtime is unavailable: {error}; build the locked liteinst-runtime-build manifest and stage its constructor-enabled DSO beside hermit"
+            )
+        }),
+    }
 }
 
 fn kvm_device_unavailable_reason(path: &Path) -> Option<String> {
@@ -1121,7 +1259,12 @@ impl Backend {
     }
 
     fn uses_ptrace_pmu_timers(self) -> bool {
-        matches!(self, Self::Ptrace | Self::Liteinst | Self::E9patch)
+        match self {
+            Self::Ptrace | Self::E9patch => true,
+            // In-guest Detcore has no ptrace tracer to arm the PMU timer from.
+            Self::Liteinst => !matches!(LiteinstRuntime::from_env(), Ok(LiteinstRuntime::InGuest)),
+            Self::Dbt | Self::Sabre | Self::Kvm => false,
+        }
     }
 
     /// Returns backends whose Hermit integration prerequisites are met.
@@ -2424,7 +2567,27 @@ pub fn run_with_backend_timeout(
 
 // TODO-HUMAN-REVIEW(PR-749): Review LiteInst backend configuration normalization.
 #[doc(hidden)]
-pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetConfig {
+pub fn prepare_backend_config(config: DetConfig, backend: Backend) -> DetConfig {
+    // An unrecognized selector value configures the hybrid here; the run refuses
+    // that value before it dispatches.
+    let liteinst_runtime = if backend == Backend::Liteinst {
+        LiteinstRuntime::from_env().unwrap_or(LiteinstRuntime::HostHybrid)
+    } else {
+        LiteinstRuntime::HostHybrid
+    };
+    prepare_backend_config_for_liteinst_runtime(config, backend, liteinst_runtime)
+}
+
+/// [`prepare_backend_config`] with the LiteInst runtime given explicitly rather
+/// than read from [`LITEINST_IN_GUEST_ENV`]. Other backends ignore it.
+#[doc(hidden)]
+pub fn prepare_backend_config_for_liteinst_runtime(
+    mut config: DetConfig,
+    backend: Backend,
+    liteinst_runtime: LiteinstRuntime,
+) -> DetConfig {
+    let in_guest_liteinst =
+        backend == Backend::Liteinst && liteinst_runtime == LiteinstRuntime::InGuest;
     config.discover_live_file_metadata = backend == Backend::Sabre;
     // Guest-visible wall and monotonic clocks must stay in the same global
     // virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
@@ -2435,9 +2598,12 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     // Wake pending RPCs on logical removal, reject stale requests, and account
     // the eventual deregistration exactly once. KVM has no native task exit
-    // that can resolve a removed thread's pending Tool future.
+    // that can resolve a removed thread's pending Tool future, and in-guest
+    // LiteInst, like DBT, has no ptrace exit-group teardown to resolve it.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3520): Review in-guest LiteInst killed-thread RPC cancellation.
     config.cancel_killed_thread_rpcs =
-        matches!(backend, Backend::Sabre | Backend::Dbt | Backend::Kvm);
+        in_guest_liteinst || matches!(backend, Backend::Sabre | Backend::Dbt | Backend::Kvm);
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.backend_serializes_fork_children = false;
@@ -2616,22 +2782,45 @@ async fn dispatch_backend(
     if backend == Backend::Liteinst {
         #[cfg(feature = "liteinst")]
         {
-            let preload = liteinst_runtime_library_path()?;
             let stats_request = backend_stats::request();
-            let (exit_status, mut global_state, stats) = if stats_request.is_enabled() {
-                let (exit_status, global_state, stats) =
-                    reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<Detcore>(
-                        command, config, preload,
-                    )
-                    .await?;
-                (exit_status, global_state, Some(stats))
-            } else {
-                let (exit_status, global_state) =
-                    reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
-                        command, config, preload,
-                    )
-                    .await?;
-                (exit_status, global_state, None)
+            let (exit_status, mut global_state, stats) = match LiteinstRuntime::from_env()? {
+                LiteinstRuntime::InGuest => {
+                    refuse_in_guest_liteinst_timers(&config)?;
+                    let preload = liteinst_tool_runtime_library_path()?;
+                    if stats_request.is_enabled() {
+                        let (exit_status, global_state, stats) =
+                            reverie_liteinst::LiteinstBackend::run_with_preload_and_stats::<Detcore>(
+                                command, config, preload,
+                            )
+                            .await?;
+                        (exit_status, global_state, Some(stats))
+                    } else {
+                        let (exit_status, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
+                                command, config, preload,
+                            )
+                            .await?;
+                        (exit_status, global_state, None)
+                    }
+                }
+                LiteinstRuntime::HostHybrid => {
+                    let preload = liteinst_runtime_library_path()?;
+                    if stats_request.is_enabled() {
+                        let (exit_status, global_state, stats) =
+                            reverie_liteinst::LiteinstBackend::run_host_with_preload_and_stats::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        (exit_status, global_state, Some(stats))
+                    } else {
+                        let (exit_status, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_host_with_preload::<Detcore>(
+                                command, config, preload,
+                            )
+                            .await?;
+                        (exit_status, global_state, None)
+                    }
+                }
             };
             if liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
@@ -2891,22 +3080,51 @@ async fn dispatch_output_backend(
         #[cfg(feature = "liteinst")]
         {
             command.stdin(output_backend_stdin()?);
-            let preload = liteinst_runtime_library_path()?;
             let stats_request = backend_stats::request();
-            let (output, mut global_state, stats) = if stats_request.is_enabled() {
-                let (output, global_state, stats) =
-                    reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload_and_stats::<
-                        Detcore,
-                    >(command, config, preload)
-                    .await?;
-                (output, global_state, Some(stats))
-            } else {
-                let (output, global_state) =
-                    reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<Detcore>(
-                        command, config, preload,
-                    )
-                    .await?;
-                (output, global_state, None)
+            let (output, mut global_state, stats) = match LiteinstRuntime::from_env()? {
+                LiteinstRuntime::InGuest => {
+                    refuse_in_guest_liteinst_timers(&config)?;
+                    let preload = liteinst_tool_runtime_library_path()?;
+                    let (output, global_state, stats) = if stats_request.is_enabled() {
+                        let (output, global_state, stats) =
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload_and_stats::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        (output, global_state, Some(stats))
+                    } else {
+                        let (output, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        (output, global_state, None)
+                    };
+                    let output = Output {
+                        status: output.status.into(),
+                        stdout: output.stdout,
+                        stderr: output.stderr,
+                    };
+                    (output, global_state, stats)
+                }
+                LiteinstRuntime::HostHybrid => {
+                    let preload = liteinst_runtime_library_path()?;
+                    if stats_request.is_enabled() {
+                        let (output, global_state, stats) =
+                            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload_and_stats::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        (output, global_state, Some(stats))
+                    } else {
+                        let (output, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_host_with_output_and_preload::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        (output, global_state, None)
+                    }
+                }
             };
             let status = output.status;
             if liteinst_requires_forced_shutdown(status) {
@@ -3926,6 +4144,8 @@ mod tests {
     use super::ExitStatus;
     use super::HermitData;
     use super::Id;
+    use super::LITEINST_IN_GUEST_ENV;
+    use super::LiteinstRuntime;
     use super::SABRE_RPC_SOCKET_ENV;
     use super::collect_recording_ids;
     #[cfg(feature = "dbt")]
@@ -3944,6 +4164,7 @@ mod tests {
     use super::liteinst_unavailable_reason;
     use super::output_backend_stdin_file;
     use super::prepare_backend_config;
+    use super::prepare_backend_config_for_liteinst_runtime;
     use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
     use super::resolve_sabre_binary_from;
@@ -4200,6 +4421,56 @@ mod tests {
             prepare_backend_config(config, Backend::Ptrace)
                 .max_timeslice
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn liteinst_runtime_selector_accepts_only_unset_or_one() {
+        assert_eq!(
+            LiteinstRuntime::parse(None).unwrap(),
+            LiteinstRuntime::HostHybrid
+        );
+        assert_eq!(
+            LiteinstRuntime::parse(Some(std::ffi::OsStr::new("1"))).unwrap(),
+            LiteinstRuntime::InGuest
+        );
+        for value in ["", "0", "true", "yes", " 1", "1 "] {
+            let error = LiteinstRuntime::parse(Some(std::ffi::OsStr::new(value))).unwrap_err();
+            let message = error.to_string();
+            assert!(
+                message.contains(LITEINST_IN_GUEST_ENV) && message.contains(&format!("{value:?}")),
+                "{value:?}: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn in_guest_liteinst_cancels_killed_thread_rpcs() {
+        let config = super::DetConfig::default();
+        assert!(
+            prepare_backend_config_for_liteinst_runtime(
+                config.clone(),
+                Backend::Liteinst,
+                LiteinstRuntime::InGuest,
+            )
+            .cancel_killed_thread_rpcs
+        );
+        assert!(
+            !prepare_backend_config_for_liteinst_runtime(
+                config.clone(),
+                Backend::Liteinst,
+                LiteinstRuntime::HostHybrid,
+            )
+            .cancel_killed_thread_rpcs
+        );
+        // The LiteInst runtime selection changes no other backend.
+        assert!(
+            !prepare_backend_config_for_liteinst_runtime(
+                config,
+                Backend::Ptrace,
+                LiteinstRuntime::InGuest,
+            )
+            .cancel_killed_thread_rpcs
         );
     }
 

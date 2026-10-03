@@ -8996,6 +8996,159 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
     }
 }
 
+/// In-guest LiteInst (`HERMIT_LITEINST_IN_GUEST=1`,
+/// https://github.com/rrnewton/hermit/issues/3520) cannot deliver Detcore's
+/// preemption timer yet: the in-guest Tool host accepts `set_timer` and arms
+/// nothing. A run with the default maximum timeslice must be REFUSED before
+/// dispatch, not run unpreempted. The refusal comes from argument validation,
+/// so it holds in builds without the `liteinst` feature or runtime too.
+#[test]
+fn liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let output = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "1")
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    // EXIT-CLASS: hermit
+    assert_eq!(
+        output.status.code(),
+        Some(HERMIT_POLICY_REFUSAL_EXIT),
+        "in-guest LiteInst must refuse a maximum timeslice it cannot enforce. Got \
+         {:?}. stderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        stderr.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("pass --max-timeslice=disabled"),
+        "the refusal must say how to run without the timer. stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
+        "the guest must not run"
+    );
+}
+
+/// The selector accepts only "unset" (the ptrace-hosted hybrid) and `1`, so a
+/// typo cannot silently pick the hybrid.
+#[test]
+fn liteinst_in_guest_selector_rejects_unknown_values() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let output = hermit_command(&[
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/echo",
+        "unreachable",
+    ])
+    .env("HERMIT_LITEINST_IN_GUEST", "yes")
+    .stdin(Stdio::null())
+    .output()
+    .expect("failed to run hermit");
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("HERMIT_LITEINST_IN_GUEST=\"yes\" is not a LiteInst runtime selection"),
+        "stderr:\n{stderr}"
+    );
+    assert!(
+        !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
+        "the guest must not run"
+    );
+}
+
+/// In-guest LiteInst runs Detcore's Tool in the guest preload, with no ptrace
+/// tracer on the guest.
+///
+/// `TracerPid` is read through the guest's own `/proc`, which can report 0 for a
+/// tracer outside the guest's PID namespace. The ptrace backend is the control:
+/// if it also reads 0 here, the probe cannot see a tracer and the test fails
+/// instead of passing vacuously.
+#[test]
+#[cfg(feature = "liteinst")]
+#[ignore = "needs the in-guest Detcore runtime from `cargo build -p detcore-liteinst`"]
+fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+    let run = |backend: &str, program: &[&str]| {
+        let mut args = vec![
+            "--backend",
+            backend,
+            "run",
+            "--max-timeslice=disabled",
+            "--",
+        ];
+        args.extend(program);
+        let mut command = hermit_command(&args);
+        if backend == "liteinst" {
+            command.env("HERMIT_LITEINST_IN_GUEST", "1");
+        }
+        let output = command
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run hermit with {args:?}: {error}"));
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "{args:?}: status {:?}, stderr:\n{stderr}",
+            output.status
+        );
+        if backend == "liteinst" {
+            assert!(
+                stderr.contains(
+                    "hermit: [liteinst in-guest] Detcore Tool hosted by the guest preload"
+                ),
+                "{args:?}: stderr:\n{stderr}"
+            );
+            assert!(
+                !stderr.contains("[liteinst host hybrid]"),
+                "{args:?}: stderr:\n{stderr}"
+            );
+        }
+        String::from_utf8_lossy(&output.stdout).into_owned()
+    };
+    let tracer_pid = |status: &str| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("TracerPid:"))
+            .map(|value| value.trim().to_owned())
+            .unwrap_or_else(|| panic!("no TracerPid line in:\n{status}"))
+    };
+
+    run("liteinst", &["/bin/true"]);
+    assert_eq!(
+        run("liteinst", &["/bin/echo", "hello", "in-guest"]),
+        "hello in-guest\n"
+    );
+    let control = tracer_pid(&run("ptrace", &["/bin/cat", "/proc/self/status"]));
+    assert_ne!(
+        control, "0",
+        "under the ptrace backend the guest read TracerPid 0, so this probe cannot \
+         see a tracer and proves nothing about in-guest LiteInst"
+    );
+    assert_eq!(
+        tracer_pid(&run("liteinst", &["/bin/cat", "/proc/self/status"])),
+        "0"
+    );
+}
+
 /// `--timeout` qualification is a static policy fact, so an UNAVAILABLE
 /// backend must get the same refusal as an available one
 /// (https://github.com/rrnewton/hermit/issues/3418). Before the fix the run
