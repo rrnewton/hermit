@@ -156,24 +156,6 @@ fn check_outputs(directory: &Path) {
     }
 }
 
-/// Hard-links the run 2 log listed in `logs`, if there is one, to `capture`.
-/// Returns whether the link exists.
-pub(super) fn link_run2_log(logs: &Path, capture: &Path) -> bool {
-    for entry in fs::read_dir(logs).expect("verify log directory") {
-        let entry = entry.expect("verify log entry");
-        if !entry.file_name().to_string_lossy().starts_with("run2_log_") {
-            continue;
-        }
-        return match fs::hard_link(entry.path(), capture) {
-            Ok(()) => true,
-            // Deleted after it was listed; no later poll can see it either.
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => panic!("capture {}: {error}", entry.path().display()),
-        };
-    }
-    false
-}
-
 fn bounded_command(command: &mut Command, directory: &Path) -> ExitStatus {
     bounded_command_with_timeout(command, directory, Duration::from_secs(57))
 }
@@ -188,18 +170,12 @@ pub(super) fn bounded_command_with_timeout(
 
 /// [`bounded_command_with_timeout`] for a `hermit run --verify --keep-logs`
 /// command whose `--verify-log-dir` is `directory/verify-logs`. Also returns
-/// run 2's log, which Hermit deletes after a match.
+/// run 2's log, which Hermit deletes after a match, hard-linked on a poll
+/// while the command runs as the `run2_log` module describes.
 ///
-/// Hermit creates both runs' logs in that directory before run 1 starts
-/// (`temp_log_files_in` in `hermit-cli/src/bin/hermit/verify.rs`, called by
-/// `verify` in `hermit-cli/src/bin/hermit/run.rs`), and run 2 writes its log
-/// through that file's descriptor. After a match it keeps run 1's log, the
-/// golden copy, and deletes run 2's (the `keep_golden_log_only` branch in
-/// `verify.rs`). A hard link made on any poll while the command runs therefore
-/// still holds run 2's complete log once the command exits. The link is
-/// `directory/captured-run2.log`. The caller checks it like a retained log
-/// and then removes it, so a passing test keeps only the golden log, as
-/// Hermit does. `None` means no poll saw a run 2 log.
+/// The link is `directory/captured-run2.log`. The caller checks it like a
+/// retained log and then removes it, so a passing test keeps only the golden
+/// log, as Hermit does. `None` means no poll saw a run 2 log.
 pub(super) fn bounded_verify_command(
     command: &mut Command,
     directory: &Path,
@@ -210,7 +186,7 @@ pub(super) fn bounded_verify_command(
     let mut captured = false;
     let status = bounded_command_polling(command, directory, wall_limit, || {
         if !captured {
-            captured = link_run2_log(&logs, &capture);
+            captured = super::run2_log::link_run2_log(&logs, &capture);
         }
     });
     (status, captured.then_some(capture))
