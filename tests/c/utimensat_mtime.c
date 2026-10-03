@@ -279,6 +279,47 @@ int main(void) {
   munmap(data_view, page);
   close(memfd);
 
+  // When the stat buffer spans a writable page and a read-only one, Hermit's
+  // scratch write fails after filling the writable part. If that part shares
+  // its memory with the path, Linux must still get the path and the page must
+  // be left as it was. The virtual mtime is not checked: Hermit skips it here.
+  int split_fd = memfd_create("utimensat-split", 0);
+  if (split_fd < 0 || ftruncate(split_fd, 2 * page) != 0) {
+    perror("split memfd");
+    return 2;
+  }
+  char* split_stack = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, split_fd, 0);
+  char* split_data = mmap(NULL, 2 * page, PROT_READ | PROT_WRITE, MAP_SHARED, split_fd, 0);
+  if (split_stack == MAP_FAILED || split_data == MAP_FAILED ||
+      mprotect(split_stack + page, page, PROT_READ) != 0) {
+    perror("split stack");
+    return 2;
+  }
+  memset(split_data, 0x5a, 2 * page);
+  strcpy(split_data + page - 72, "a");
+  char* split_expected = malloc(2 * page);
+  memcpy(split_expected, split_data, 2 * page);
+  struct timespec split_times[2] = {{0, UTIME_OMIT}, {EARLY + 10, 23}};
+  ret = syscall_at(
+      split_stack + page + 200,
+      SYS_utimensat,
+      AT_FDCWD,
+      (long)(split_data + page - 72),
+      (long)split_times,
+      0);
+  if (ret != 0) {
+    fprintf(stderr, "utimensat with a half read-only shared stack returned %ld\n", ret);
+    failures++;
+  }
+  if (memcmp(split_data, split_expected, 2 * page) != 0) {
+    fprintf(stderr, "utimensat changed a half read-only shared stack\n");
+    failures++;
+  }
+  free(split_expected);
+  munmap(split_stack, 2 * page);
+  munmap(split_data, 2 * page);
+  close(split_fd);
+
   // A raw syscall may run with its stack pointer near zero, where Hermit's
   // scratch addresses would wrap below address zero. The call must still
   // reach Linux.
