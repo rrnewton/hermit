@@ -20,4 +20,4 @@ doctest = false
 [dependencies]
 detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
 libc = "0.2.186"
-reverie-liteinst = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b4ffc27d4376d5a0ee9d42170652e89c8501d2a6", default-features = false }
+reverie-liteinst = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "43787c969834724c3eaa5827c12ec3adf3a83599", default-features = false }

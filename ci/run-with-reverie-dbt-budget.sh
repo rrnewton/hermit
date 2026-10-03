@@ -693,7 +693,21 @@ fi
 # rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
 # CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
 # 1050 effective-job-seconds budget are unchanged.
-expected_pin=b4ffc27d4376d5a0ee9d42170652e89c8501d2a6
+# CARRY TO 43787c969834724c3eaa5827c12ec3adf3a83599 (2026-10-03): from
+# b4ffc27d4376d5a0ee9d42170652e89c8501d2a6, all seven DBT recipe/provenance inputs below
+# are byte-identical. The four commits in
+# https://github.com/rrnewton/reverie/pull/910 change only reverie-kvm
+# pipe-owner support and tests; all 27 Cargo manifests are unchanged.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# Source identity carries the existing CMAKE/CMAKE_GENERATOR policy,
+# MAX_PARALLEL_JOBS=16 and 1050 effective-job-seconds; no new timing claim.
+expected_pin=43787c969834724c3eaa5827c12ec3adf3a83599
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
