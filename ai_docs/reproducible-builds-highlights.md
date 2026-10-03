@@ -27,21 +27,48 @@ every package is its own control. All 58 native pairs differed.
 The 58-package run does not replace an earlier, still unfinished run against a
 larger target: the 8,688 Wheezy packages that the ASPLOS 2020 study found were
 not reproducible natively but were made reproducible by DetTrace, Hermit's
-predecessor. Through its third batch (2026-07-31), under one fixed Hermit
-binary whose commit the record does not name, that run attempted 46 packages
-with two independent build roots each. 37 produced fully byte-identical `.deb`
-files; that count comes from the experiment's results file, and not all 37
-build outputs were kept. Of the pairs still on disk, 23 have at least one
-`.deb` on each side, and 19 of those 23 are identical. The rest found real
-gaps: 7 packages (5 in batches 1 and 2, 2 in batch 3) differed only in `.deb`
-archive timestamps, by 1 to 2 seconds, with identical contents; one,
-`389-adminutil`, shipped different bytes, a modification time inside a static
-library archive in `libadminutil-dev`; two, `3depict` and `7kaa`, crashed, a
-failure traced to hardware performance-counter skid under host load; and one,
-`a56`, was skipped by the harness. So the 58-package run's zero differences
-hold for that sample, not for Hermit in general. The counts in this section
-are the earlier run's complete published results; its per-package record is
-not published separately.
+predecessor. Through its third batch of 2026-07-31, that run attempted 46 of
+those packages, each with two independent build roots under
+`hermit run --strict`. Each package has exactly one outcome:
+
+| Outcome of the two builds | Packages |
+| --- | --- |
+| Byte-identical `.deb` files | 37 |
+| Only `.deb` archive timestamps differed | 5 |
+| Shipped bytes differed (`389-adminutil`) | 1 |
+| Hermit crashed (`3depict`, `7kaa`) | 2 |
+| Skipped by the harness (`a56`) | 1 |
+| Attempted | 46 |
+
+The five timestamp-only packages are `a52dec`, `bdfresize`, `bible-kjv`,
+`binfmtc`, and `bison++`. In each, every file's contents were identical, and
+one or two modification times in the `.deb` file's tar headers differed by 1
+second. `389-adminutil` builds three `.deb` files. Two differed in that same
+way, by 1 to 2 seconds. The third, `libadminutil-dev`, shipped different
+bytes: its static library archives record a modification time for each member,
+and those times differed. The package is counted once, in its own row. The two
+crashes were traced to hardware performance-counter skid under host load: the
+counter had already passed the point where Hermit meant to start
+single-stepping, by 230 and 325 retired conditional branches. `a56` was skipped
+because its build gives files to user 0, which the unprivileged build cannot
+do; it is not a result about Hermit. The 58-package run's zero differences
+therefore hold for that sample, not for Hermit in general.
+
+Two Hermit builds were used, both release builds that include the same Reverie
+fix, <https://github.com/rrnewton/reverie/pull/287>. `hello` and `hostname`
+were built with one made from <https://github.com/rrnewton/hermit/pull/1160>,
+and the other 44 packages with one made from commit `f3b29a1f1c3c`, the head of
+<https://github.com/rrnewton/hermit/pull/1168>; `hostname` was built again with
+the second and gave the same `.deb`. These counts are transcribed from the
+experiment's results file, `experiments/debian_reproducible_builds_2026/PILOT_RESULTS.md`
+in the team's private dev-hermit workspace repository (section "Cumulative
+(through 2026-07-31 batch 3)", last changed in commit `05ed0bc90d83` on
+2026-07-31). Not all build outputs were kept. A recount on 2026-08-18 of the
+two-root outputs then retained found 23 packages with at least one `.deb` on
+each side, 19 of them identical and 4 different, and excluded one more,
+`3depict`, which had no `.deb` on either side. Those outputs were kept outside
+version control and are no longer in the experiment's working directory, so
+neither count can be recomputed from them now.
 
 ## Terms
 
