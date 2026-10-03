@@ -1158,7 +1158,7 @@ impl std::error::Error for LiteinstInGuestRefusal {}
 /// This runs where the guest is spawned (inside the container for the CLI),
 /// so it resolves the program in the filesystem the guest sees. It pins the
 /// resolved program on `command` ([`pin_spawn_program`]), so the launch
-/// executes the file this check inspected.
+/// executes the same path this check inspected.
 #[cfg(feature = "liteinst")]
 fn refuse_in_guest_liteinst_run(command: &mut Command, config: &DetConfig) -> Result<(), Error> {
     let reason = if config.max_timeslice.is_some() {
@@ -1195,12 +1195,15 @@ const MAX_INTERPRETER_DEPTH: usize = 4;
 /// would run guest code unmonitored, so each is refused. `#!` scripts are
 /// checked through their interpreter, read as the kernel's script handler
 /// reads it ([`script::KernelScript`]). A program or interpreter that is not a
-/// regular file is refused before anything is read from it: the kernel
-/// executes only regular files, and reading a FIFO that has no writer would
-/// block the check.
+/// regular file is refused before it is opened: the kernel executes only
+/// regular files, opening a device can act on it, opening a socket fails, and
+/// reading a FIFO that has no writer would block the check.
 ///
-/// The check is advisory, not containment: a file replaced between this check
-/// and the `execve` is not checked again.
+/// Every fact about one file (its type, header, ELF headers, mode bits and
+/// capabilities) is read through one open descriptor, so they all describe
+/// the same file. The check is still advisory, not containment: the `execve`
+/// opens the path again, and a file replaced at that path in between is not
+/// checked again.
 ///
 /// Not covered, and recorded on
 /// <https://github.com/rrnewton/hermit/issues/3520>:
@@ -1231,24 +1234,37 @@ fn in_guest_liteinst_program_gap(command: &mut Command) -> Result<Option<String>
     let mut path = pin_spawn_program(command)?;
     for _ in 0..=MAX_INTERPRETER_DEPTH {
         let shown = path.display().to_string();
-        // O_NONBLOCK keeps the open of a FIFO that has no writer from blocking;
-        // it does not change how a regular file is read.
-        let file = fs::OpenOptions::new()
+        let not_regular = || {
+            Ok(Some(format!(
+                "{shown} is not a regular file, and the kernel executes only regular files"
+            )))
+        };
+        if !fs::metadata(&path)
+            .with_context(|| format!("cannot read guest program {shown}"))?
+            .is_file()
+        {
+            return not_regular();
+        }
+        // The path can change type after the check above. O_NONBLOCK then keeps
+        // the open of a FIFO that has no writer from blocking, and O_NOCTTY
+        // keeps a terminal from becoming Hermit's controlling terminal; neither
+        // changes how a regular file is read. The descriptor's own type is
+        // checked again below.
+        let mut file = fs::OpenOptions::new()
             .read(true)
-            .custom_flags(libc::O_NONBLOCK)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
             .open(&path)
             .with_context(|| format!("cannot read guest program {shown}"))?;
-        let is_file = file
+        if !file
             .metadata()
             .with_context(|| format!("cannot read guest program {shown}"))?
-            .is_file();
-        if !is_file {
-            return Ok(Some(format!(
-                "{shown} is not a regular file, and the kernel executes only regular files"
-            )));
+            .is_file()
+        {
+            return not_regular();
         }
         let mut header = Vec::new();
-        file.take(256)
+        (&file)
+            .take(256)
             .read_to_end(&mut header)
             .with_context(|| format!("cannot read guest program {shown}"))?;
         match KernelScript::from_buf(&header) {
@@ -1271,7 +1287,7 @@ fn in_guest_liteinst_program_gap(command: &mut Command) -> Result<Option<String>
             }
             KernelScript::NotScript => {}
         }
-        let Some(startup) = interp::elf_startup(&path)
+        let Some(startup) = interp::elf_startup(&mut file)
             .with_context(|| format!("cannot read the ELF headers of guest program {shown}"))?
         else {
             return Ok(Some(format!(
@@ -1285,7 +1301,7 @@ fn in_guest_liteinst_program_gap(command: &mut Command) -> Result<Option<String>
         } else if !startup.has_interp {
             "is statically linked (it has no PT_INTERP), so no dynamic loader runs to load the \
              runtime"
-        } else if is_secure_execution_image(&path)? {
+        } else if is_secure_execution_image(&file, &shown)? {
             "is set-user-ID, set-group-ID or has file capabilities, so the kernel runs it in \
              secure-execution mode, where the dynamic loader ignores LD_PRELOAD"
         } else if startup.has_preinit_array {
@@ -1294,7 +1310,7 @@ fn in_guest_liteinst_program_gap(command: &mut Command) -> Result<Option<String>
             return Ok(None);
         };
         return Ok(Some(format!(
-            "guest program {shown} {reason}, so it would run unmonitored"
+            "guest program {shown} {reason}, so it would run unmonitored if Hermit launched it"
         )));
     }
     Ok(Some(format!(
@@ -1326,25 +1342,24 @@ fn pin_spawn_program(command: &mut Command) -> Result<PathBuf, Error> {
     Ok(program)
 }
 
-/// Whether executing `path` puts the kernel in secure-execution mode
-/// (`AT_SECURE`): set-user-ID, set-group-ID (with group execute, as the kernel
-/// requires), or a `security.capability` attribute.
+/// Whether executing `file` (shown as `shown`) puts the kernel in
+/// secure-execution mode (`AT_SECURE`): set-user-ID, set-group-ID (with group
+/// execute, as the kernel requires), or a `security.capability` attribute.
 #[cfg(feature = "liteinst")]
-fn is_secure_execution_image(path: &Path) -> Result<bool, Error> {
-    let mode = fs::metadata(path)
-        .with_context(|| format!("cannot stat guest program {}", path.display()))?
+fn is_secure_execution_image(file: &fs::File, shown: &str) -> Result<bool, Error> {
+    let mode = file
+        .metadata()
+        .with_context(|| format!("cannot stat guest program {shown}"))?
         .permissions()
         .mode();
     if mode & 0o4000 != 0 || mode & 0o2010 == 0o2010 {
         return Ok(true);
     }
-    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
-        .context("guest program path contains a NUL byte")?;
-    // SAFETY: both strings are NUL-terminated, and a zero-sized query writes no
-    // value.
+    // SAFETY: the descriptor is open for the call, the name is NUL-terminated,
+    // and a zero-sized query writes no value.
     let size = unsafe {
-        libc::getxattr(
-            c_path.as_ptr(),
+        libc::fgetxattr(
+            file.as_raw_fd(),
             c"security.capability".as_ptr(),
             std::ptr::null_mut(),
             0,
@@ -1356,8 +1371,7 @@ fn is_secure_execution_image(path: &Path) -> Result<bool, Error> {
     match io::Error::last_os_error().raw_os_error() {
         Some(libc::ENODATA) | Some(libc::ENOTSUP) => Ok(false),
         _ => Err(Error::new(io::Error::last_os_error()).context(format!(
-            "cannot read the file capabilities of guest program {}",
-            path.display()
+            "cannot read the file capabilities of guest program {shown}"
         ))),
     }
 }
@@ -4432,11 +4446,20 @@ mod tests {
         let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
         assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o700) }, 0);
         let script = write_guest_program(directory.path(), "to-fifo", &shebang_to(&fifo), 0o755);
+        // A socket cannot be opened at all (ENXIO), and opening a device can
+        // act on it; both must be refused, not reported as unreadable.
+        let socket = directory.path().join("socket");
+        let _listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let to_socket =
+            write_guest_program(directory.path(), "to-socket", &shebang_to(&socket), 0o755);
+        let device = PathBuf::from("/dev/null");
+        let to_device =
+            write_guest_program(directory.path(), "to-device", &shebang_to(&device), 0o755);
         // `./fifo` reaches the check through find_program's working-directory
-        // branch, which does not require a regular file; the script reaches
-        // the FIFO as its interpreter. Nothing opens the FIFO for writing, so
-        // a blocking open or read would never return: each check runs on its
-        // own thread and must answer within 10 s.
+        // branch, which does not require a regular file; the scripts reach the
+        // FIFO, the socket and the device as their interpreters. Nothing opens
+        // the FIFO for writing, so a blocking open or read would never return:
+        // each check runs on its own thread and must answer within 10 s.
         let cases = [
             (
                 "program",
@@ -4445,6 +4468,8 @@ mod tests {
                 fs::canonicalize(&fifo).unwrap(),
             ),
             ("interpreter", script, None, fifo.clone()),
+            ("socket interpreter", to_socket, None, socket.clone()),
+            ("device interpreter", to_device, None, device),
         ];
         for (name, program, current_dir, shown) in cases {
             let (sender, receiver) = std::sync::mpsc::channel();
