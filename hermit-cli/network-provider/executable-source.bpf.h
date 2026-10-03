@@ -15,7 +15,11 @@ static long exe_observe_vma(struct task_struct *task,struct vm_area_struct *vma,
                             struct ap_exe_vma_context *ctx) {
     struct ap_executable_source *e=ctx->receipt;
     struct ap_executable_observation *o=ctx->observation;
-    if(ctx->called++) {e->problem|=AP_EXE_CONTEXT;return 0;}
+    /* The helper calls the covering VMA once. Its verifier callback model
+     * revisits this frame until state converges: keep an exact finite
+     * cardinality class (zero / one / multiple), never a growing counter. */
+    if(ctx->called) {ctx->called=2;e->problem|=AP_EXE_CONTEXT;return 0;}
+    ctx->called=1;
     struct mm_struct *mm=CORE(vma->vm_mm);
     struct file *file=CORE(vma->vm_file),*exe=mm?CORE(mm->exe_file):0;
     struct inode *inode=file?CORE(file->f_inode):0;

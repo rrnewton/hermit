@@ -126,6 +126,26 @@ static void unrelated_ptrace_requests(void) {
     executable_source_returned(wrong_iov,&submitted);
     CHECK(row.problem && published==1 && !VALID());
 }
+static void callback_cardinality(void) {
+    reset();phase(false,0);
+    CHECK(!row.problem && row.phases==(AP_EXE_ENTERED|AP_EXE_OBSERVED));
+    struct ap_exe_vma_context context={&row,&row.entered,config.anchor_ip,0};
+    CHECK(exe_observe_vma(&target,&vma,&context)==0 && context.called==1 && !row.problem);
+    const struct ap_executable_observation original=row.entered;
+    /* Every repeated callback remains duplicate, including the verifier's
+     * observed hundreds of visits. It cannot rewrite the first observation. */
+    for(unsigned n=2;n<=1024;n++) {
+        inode.i_size++;
+        CHECK(exe_observe_vma(&target,&vma,&context)==0 && context.called==2 &&
+            row.problem==AP_EXE_CONTEXT && !memcmp(&original,&row.entered,sizeof(original)));
+    }
+    reset();no_callback=true;phase(false,0);
+    CHECK(row.problem==AP_EXE_HELPER && !VALID());
+    reset();double_callback=true;phase(false,0);
+    CHECK(row.problem==(AP_EXE_CONTEXT|AP_EXE_HELPER) && !VALID());
+    phase(true,0);
+    CHECK(row.problem==(AP_EXE_CONTEXT|AP_EXE_HELPER) && !VALID() && published==1);
+}
 int main(void) {
     reset();phase(false,0);CHECK(!VALID() && !published && row.phases==3);phase(true,0);
     CHECK(VALID() && published==1 && find_calls==2 && !failures);
@@ -160,5 +180,7 @@ int main(void) {
     reset();phase(false,0);phase(true,0);phase(true,0);CHECK(failures && published==1);
     CHECK(checks==77); /* All original controls ran before the additive cases. */
     unrelated_ptrace_requests();
+    CHECK(checks==98); /* All preexisting controls remain unchanged. */
+    callback_cardinality();
     printf("executable actual producer: %u checks\n",checks);return 0;
 }
