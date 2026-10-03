@@ -20,11 +20,31 @@ from pathlib import Path
 DEMO_DIR = Path(__file__).resolve().parent.parent
 QEMU_ASSETS_SCRIPT = DEMO_DIR / "lib" / "qemu-assets.sh"
 
-# The stand-in BusyBox answers only the question qemu-assets.sh asks it. The
-# applet usr/local/bin/extra makes the script create a directory of its own.
+# The applets the guest's /init runs, where BusyBox installs them, plus a few
+# it does not run. The applet usr/local/bin/extra makes the script create a
+# directory of its own.
+APPLETS = (
+    "bin/cttyhack",
+    "bin/date",
+    "bin/dd",
+    "bin/mount",
+    "bin/sh",
+    "bin/sleep",
+    "bin/uname",
+    "sbin/poweroff",
+    "usr/bin/chpst",
+    "usr/bin/env",
+    "usr/bin/head",
+    "usr/bin/setsid",
+    "usr/bin/tr",
+    "usr/local/bin/extra",
+)
+
+# The stand-in BusyBox answers only the question qemu-assets.sh asks it, with
+# the applets in place of {applets}.
 FAKE_BUSYBOX = """#!/bin/sh
 if [ "$1" = --list-full ]; then
-  printf '%s\\n' bin/sh sbin/poweroff usr/bin/env usr/local/bin/extra
+  printf '%s\\n' {applets}
   exit 0
 fi
 exit 1
@@ -36,6 +56,9 @@ printf '%s: ELF 64-bit LSB executable, x86-64, statically linked\\n' "$1"
 """
 
 DIRECTORY_MODE = stat.S_IFDIR | 0o755
+# /tmp: everyone may create files there, and only a file's owner may remove or
+# rename it.
+STICKY_DIRECTORY_MODE = stat.S_IFDIR | 0o1777
 EXECUTABLE_MODE = stat.S_IFREG | 0o755
 DATA_FILE_MODE = stat.S_IFREG | 0o644
 SYMLINK_MODE = stat.S_IFLNK | 0o777
@@ -48,7 +71,12 @@ def _write_executable(path: Path, text: str, mode: int = 0o755) -> None:
 
 def parse_newc(archive: bytes) -> dict:
     """Map each entry name of a newc cpio archive to its stored mode."""
-    modes = {}
+    return {name: mode for name, (mode, _) in parse_newc_entries(archive).items()}
+
+
+def parse_newc_entries(archive: bytes) -> dict:
+    """Map each entry name of a newc cpio archive to its mode and contents."""
+    entries = {}
     offset = 0
     while True:
         header = archive[offset : offset + 110]
@@ -60,16 +88,18 @@ def parse_newc(archive: bytes) -> dict:
         name = archive[name_start : name_start + name_size - 1].decode()
         offset = (name_start + name_size + 3) & ~3
         if name == "TRAILER!!!":
-            return modes
+            return entries
         if name.startswith("./"):
             name = name[2:]
-        modes[name] = mode
+        entries[name] = (mode, archive[offset : offset + file_size])
         offset = (offset + file_size + 3) & ~3
 
 
 class InitramfsBuildTest(unittest.TestCase):
-    def _build(self, umask: int, busybox_mode: int = 0o755) -> bytes:
-        """Run qemu-assets.sh under `umask` and return the initramfs bytes."""
+    def _run_script(
+        self, umask: int, busybox_mode: int = 0o755, applets=APPLETS
+    ) -> "tuple[subprocess.CompletedProcess, Path]":
+        """Run qemu-assets.sh under `umask`; return its result and assets dir."""
         holder = tempfile.TemporaryDirectory()
         self.addCleanup(holder.cleanup)
         scratch = Path(holder.name)
@@ -79,7 +109,9 @@ class InitramfsBuildTest(unittest.TestCase):
         _write_executable(fake_bin / "qemu-img", "#!/bin/sh\nexit 0\n")
         _write_executable(fake_bin / "qemu-system-x86_64", "#!/bin/sh\nexit 0\n")
         busybox = scratch / "busybox"
-        _write_executable(busybox, FAKE_BUSYBOX, busybox_mode)
+        _write_executable(
+            busybox, FAKE_BUSYBOX.format(applets=" ".join(applets)), busybox_mode
+        )
         kernel = scratch / "bzImage"
         kernel.write_bytes(b"stand-in kernel image\n")
         assets = scratch / "assets"
@@ -106,6 +138,11 @@ class InitramfsBuildTest(unittest.TestCase):
             text=True,
             timeout=120,
         )
+        return result, assets
+
+    def _build(self, umask: int, busybox_mode: int = 0o755) -> bytes:
+        """Run qemu-assets.sh under `umask` and return the initramfs bytes."""
+        result, assets = self._run_script(umask, busybox_mode)
         self.assertEqual(
             0,
             result.returncode,
@@ -124,7 +161,6 @@ class InitramfsBuildTest(unittest.TestCase):
             "proc",
             "sbin",
             "sys",
-            "tmp",
             "usr",
             "usr/bin",
             "usr/local",
@@ -134,11 +170,12 @@ class InitramfsBuildTest(unittest.TestCase):
             self.assertEqual(
                 oct(DIRECTORY_MODE), oct(modes[name]), "directory /" + name
             )
+        self.assertEqual(oct(STICKY_DIRECTORY_MODE), oct(modes["tmp"]), "directory /tmp")
         for name in ("bin/busybox", "init"):
             self.assertEqual(oct(EXECUTABLE_MODE), oct(modes[name]), "/" + name)
         for name in ("etc/group", "etc/passwd"):
             self.assertEqual(oct(DATA_FILE_MODE), oct(modes[name]), "/" + name)
-        for name in ("bin/sh", "sbin/poweroff", "usr/bin/env", "usr/local/bin/extra"):
+        for name in APPLETS:
             self.assertEqual(oct(SYMLINK_MODE), oct(modes[name]), "/" + name)
 
     def test_a_restrictive_umask_does_not_change_the_stored_modes(self):
@@ -159,6 +196,29 @@ class InitramfsBuildTest(unittest.TestCase):
         # A BusyBox from a read-only store, such as Nix's, is installed 0555.
         modes = parse_newc(self._build(umask=0o022, busybox_mode=0o555))
         self._assert_fixed_modes(modes)
+
+    def test_init_has_the_frame_separator_byte_and_runs_the_command_unprivileged(self):
+        init = parse_newc_entries(self._build(umask=0o022))["init"][1]
+        self.assertNotIn(b"@HERMIT_FRAME_SEP@", init)
+        self.assertIn(b"\nSEP='\x01'\n", init)
+        self.assertEqual(init.count(b"\x01"), 1)
+        self.assertIn(
+            b'\nchpst -u 1000:1000 sh -c "$CMD" </dev/null '
+            b">/tmp/.hermit-command-output 2>&1\n",
+            init,
+        )
+        self.assertIn(b"""\nprintf '__HERMIT_COMMAND_END__%sstatus=%s\\n' "$SEP" "$STATUS"\n""", init)
+
+    def test_a_busybox_without_an_applet_init_runs_is_refused(self):
+        without = tuple(
+            applet for applet in APPLETS if applet not in ("usr/bin/chpst", "bin/dd")
+        )
+        result, assets = self._run_script(umask=0o022, applets=without)
+        self.assertNotEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertIn(
+            "BusyBox lacks applets the guest's /init runs (chpst dd)", result.stderr
+        )
+        self.assertFalse((assets / "initramfs.cpio.gz").exists())
 
 
 if __name__ == "__main__":

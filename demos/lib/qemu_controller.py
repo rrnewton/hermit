@@ -34,26 +34,48 @@ END_MARKER = "__HERMIT_COMMAND_END__"
 # The guest's /init (demos/lib/qemu-assets.sh) frames the command's output: a
 # BEGIN line naming the frame format, the command's stdout and stderr with
 # OUTPUT_PREFIX in front of every line, and an END line carrying the command's
-# exit status. The command's own output can only produce prefixed lines, so it
-# cannot produce either frame line.
-COMMAND_FRAME_FORMAT = 2
+# exit status after END_SEPARATOR. /init runs the command as an unprivileged
+# user that holds no descriptor for the console and cannot open it, so the
+# command's output reaches the console only through /init, which prefixes
+# every line and removes every END_SEPARATOR byte from it. Neither a line of
+# output nor the tail of one that a kernel message splits off can therefore be
+# an END line, and no kernel line can be one either: KERNEL_COMMAND_LINE sets
+# printk.time=1, so every line the kernel prints starts with "[". The framing
+# comment in qemu-assets.sh lists what this rests on.
+COMMAND_FRAME_FORMAT = 3
 BEGIN_LINE = "{} format={}".format(BEGIN_MARKER, COMMAND_FRAME_FORMAT).encode()
+END_SEPARATOR = b"\x01"
 END_LINE_RE = re.compile(
-    re.escape(END_MARKER.encode()) + rb" status=(0|[1-9][0-9]{0,2})"
+    re.escape(END_MARKER.encode() + END_SEPARATOR) + rb"status=(0|[1-9][0-9]{0,2})"
 )
 OUTPUT_PREFIX = b"| "
-# Marks a line inside the frame that /init did not prefix (a kernel message, or
-# something written straight to /dev/console) where it appears in the output.
+# Marks a line inside the frame that /init did not prefix (a kernel message)
+# where it appears in the output.
 CONSOLE_LINE_MARK = b"[console] "
-# An /init from before frame format 2 printed exactly this line in place of
-# BEGIN_LINE and printed the command's output unprefixed.
-STALE_BEGIN_LINE = BEGIN_MARKER.encode()
-STALE_GUEST_INIT_MESSAGE = (
-    "the guest printed a bare {} line, so it is running an /init from before "
-    "command frame format {}: the boot snapshot was built from an older "
-    "initramfs. Run demos/clean.sh, then run demo 5 again to rebuild the boot "
-    "snapshot".format(BEGIN_MARKER, COMMAND_FRAME_FORMAT)
-)
+# A whole line matching this, other than BEGIN_LINE, is the BEGIN line of an
+# /init with another frame format: before format 2 /init printed the bare
+# marker, and format 2 printed "format=2". Only whole lines count, so a kernel
+# message printed onto the end of the current BEGIN line does not look stale.
+STALE_BEGIN_RE = re.compile(re.escape(BEGIN_MARKER.encode()) + rb"(?: format=[0-9]+)?")
+# The guest kernel's command line, for the boot and for every restore of the
+# boot snapshot. printk.time=1 makes the kernel start every line it prints with
+# a "[seconds]" timestamp, whatever its configuration, so no kernel line can
+# start with END_MARKER.
+KERNEL_COMMAND_LINE = "console=ttyS0 reboot=t printk.time=1"
+
+
+def stale_guest_init_message(line: bytes) -> str:
+    """Why a run stopped at an old BEGIN line, and how to rebuild."""
+    return (
+        'the guest printed "{}" where an /init of command frame format {} prints '
+        '"{}", so the boot snapshot was built from an initramfs with another '
+        "/init. Run demos/clean.sh, then run demo 5 again to rebuild the boot "
+        "snapshot".format(
+            line.decode("ascii", "replace"),
+            COMMAND_FRAME_FORMAT,
+            BEGIN_LINE.decode(),
+        )
+    )
 
 
 # QEMU's initial process state influences the VM snapshot. Do not leak harness
@@ -98,13 +120,15 @@ class CommandTranscriptParser:
     it yields the same result. The guest's console ends lines with CR LF; one
     CR before the LF is removed and any other CR is kept.
 
-    Lines before BEGIN_LINE are ignored, except STALE_BEGIN_LINE, which raises
-    StaleGuestInitError at once. After BEGIN_LINE, a line starting with
+    Lines before BEGIN_LINE are ignored, except a whole line matching
+    STALE_BEGIN_RE, the BEGIN line of an /init with another frame format, which
+    raises StaleGuestInitError at once. After BEGIN_LINE, a line starting with
     OUTPUT_PREFIX is a line of the command's output, a line that is exactly an
-    END line ends the frame, and any other line, including a bare END_MARKER, is
-    kept in the output after CONSOLE_LINE_MARK and listed in console_lines, so
-    it is shown and compared rather than dropped. Frame lines match only as
-    whole lines. Do not feed a parser again after it has raised.
+    END line ends the frame, and any other line, including an END line of an
+    older frame format or a bare END_MARKER, is kept in the output after
+    CONSOLE_LINE_MARK and listed in console_lines, so it is shown and compared
+    rather than dropped. Frame lines match only as whole lines. Do not feed a
+    parser again after it has raised.
     """
 
     def __init__(self) -> None:
@@ -136,8 +160,8 @@ class CommandTranscriptParser:
         if not self._started:
             if line == BEGIN_LINE:
                 self._started = True
-            elif line == STALE_BEGIN_LINE:
-                raise StaleGuestInitError(STALE_GUEST_INIT_MESSAGE)
+            elif STALE_BEGIN_RE.fullmatch(line):
+                raise StaleGuestInitError(stale_guest_init_message(line))
             return
         if line.startswith(OUTPUT_PREFIX):
             self._output.extend(line[len(OUTPUT_PREFIX) :] + b"\n")
@@ -282,7 +306,7 @@ def build_qemu_command(
             "-initrd",
             str(initrd),
             "-append",
-            "console=ttyS0 reboot=t",
+            KERNEL_COMMAND_LINE,
         ]
     )
     return command

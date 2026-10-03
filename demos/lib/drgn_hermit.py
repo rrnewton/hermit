@@ -24,6 +24,7 @@ import time
 from typing import Iterator, Optional, Tuple
 
 from demo_common import hermit_tmp_args, make_socket_path
+from qemu_controller import KERNEL_COMMAND_LINE
 
 
 XZ_MAGIC = b"\xfd7zXZ\x00"
@@ -669,7 +670,7 @@ class HermitGuestProgram:
             "-rtc", "base=2022-01-01T00:00:00,clock=vm",
             "-kernel", str(self.config.kernel),
             "-initrd", str(self.config.initrd),
-            "-append", "console=ttyS0 reboot=t",
+            "-append", KERNEL_COMMAND_LINE,
         ]
         if self.config.qemu_bios is not None:
             qemu_command[1:1] = ["-L", str(self.config.qemu_bios)]
