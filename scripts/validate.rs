@@ -16694,8 +16694,11 @@ mod nextest_timeout_tests {
                 .unwrap()
                 .len(),
             // 900 before the strict compatibility corpus moved into
-            // compat.yaml (fold 1 of https://github.com/rrnewton/hermit/issues/3448).
-            900 + hermit_manifest_plan::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT,
+            // compat.yaml (fold 1 of https://github.com/rrnewton/hermit/issues/3448),
+            // plus the select replay cells of
+            // https://github.com/rrnewton/hermit/pull/3580.
+            900 + hermit_manifest_plan::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
+                + hermit_manifest_plan::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {
