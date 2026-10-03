@@ -1839,6 +1839,88 @@ fn record_starting_in_unwritable_page_leaves_next_page_untouched() {
     run_five_times(record_before_writable_page_guest);
 }
 
+fn store_crossing_into_write_only_page_guest() {
+    let page = 4096;
+    let root = tempfile::tempdir().unwrap();
+    for index in 0..20 {
+        File::create(root.path().join(name(index))).unwrap();
+    }
+    let expected = listing_of(20);
+
+    // A page the guest cannot write, then a write-only page; the buffer starts
+    // `before` bytes before the second page. Linux's first store is the first
+    // record's placeholder `d_off`, 8 bytes in, then its `d_ino` at the start,
+    // each one store, which writes nothing if any byte of it faults. 4 bytes
+    // before, the `d_off` lands in the second page, holding 0, the position of
+    // `.`, and the `d_ino` faults: the call fails with only the `d_off`
+    // stored. 12 bytes before, the `d_off` itself faults and nothing is
+    // stored. A copy that writes a crossing store's second-page part first
+    // must put that part back, though no vectored copy can read a write-only
+    // page.
+    for protection in [libc::PROT_NONE, libc::PROT_READ] {
+        for (call, name_offset) in [(libc::SYS_getdents64, 19), (libc::SYS_getdents, 18)] {
+            for (before, stored) in [(4usize, Some(4..12)), (12, None)] {
+                let context = format!(
+                    "syscall {call}, first page protection {protection}, \
+                     {before} bytes before the second page"
+                );
+                let map = guarded_pages(2, 2, libc::PROT_NONE);
+                assert_eq!(unsafe { libc::mprotect(map.cast(), page, protection) }, 0);
+                assert_eq!(
+                    unsafe { libc::mprotect(map.add(page).cast(), page, libc::PROT_WRITE) },
+                    0
+                );
+                let dir = File::open(root.path()).unwrap();
+                let fd = dir.as_raw_fd();
+                let result = unsafe { libc::syscall(call, fd, map.add(page - before), 256) };
+                assert_eq!(result, -1, "{context}");
+                assert_eq!(
+                    std::io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EFAULT),
+                    "{context}"
+                );
+                assert_eq!(
+                    unsafe {
+                        libc::mprotect(map.cast(), 2 * page, libc::PROT_READ | libc::PROT_WRITE)
+                    },
+                    0
+                );
+                let bytes = unsafe { std::slice::from_raw_parts(map, 2 * page) };
+                let mut left = vec![0xaa; 2 * page];
+                if let Some(stored) = stored {
+                    left[page + stored.start..page + stored.end]
+                        .copy_from_slice(&0i64.to_ne_bytes());
+                }
+                let changed: Vec<usize> =
+                    (0..2 * page).filter(|&at| bytes[at] != left[at]).collect();
+                assert!(
+                    changed.is_empty(),
+                    "{context}: bytes {changed:?} differ from what Linux leaves"
+                );
+                let mut names = Vec::new();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = unsafe { libc::syscall(call, fd, buf.as_mut_ptr(), 4096) };
+                    assert!(n >= 0, "{context}");
+                    if n == 0 {
+                        break;
+                    }
+                    names.extend(record_names(&buf[..n as usize], name_offset));
+                }
+                assert_eq!(names, expected, "{context}");
+                unsafe { libc::munmap(map.cast(), 2 * page) };
+            }
+        }
+    }
+
+    println!("store crossing into write-only page ok");
+}
+
+#[test]
+fn store_crossing_into_write_only_page_leaves_what_linux_leaves() {
+    run_five_times_without_hashing_buffers(store_crossing_into_write_only_page_guest);
+}
+
 fn fresh_write_only_buffer_guest() {
     let root = tempfile::tempdir().unwrap();
     for index in 0..20 {
