@@ -37,6 +37,8 @@ use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
+use hermit::LITEINST_IN_GUEST_ENV;
+use hermit::LiteinstRuntime;
 use hermit::Shebang;
 use hermit::SkidOvershootError;
 use hermit::happens_before::DebugInfoResolver;
@@ -2204,6 +2206,65 @@ fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
     );
 }
 
+#[cfg(test)]
+fn liteinst_in_guest_refusal(
+    runtime: LiteinstRuntime,
+    options: &[&str],
+) -> Result<(), anyhow::Error> {
+    let mut argv = vec!["hermit", "--backend=liteinst", "run"];
+    argv.extend_from_slice(options);
+    argv.push("fakeprog");
+    run_opts_for(&argv).refuse_unqualified_liteinst_in_guest_options(runtime)
+}
+
+#[test]
+fn liteinst_in_guest_refuses_options_it_cannot_honour() {
+    // The default maximum timeslice is on, and the in-guest Tool host cannot
+    // deliver its timer.
+    let error = liteinst_in_guest_refusal(LiteinstRuntime::InGuest, &[]).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains("pass --max-timeslice=disabled"),
+        "{error:#}"
+    );
+    for (option, reason) in [
+        ("--verify", "--verify compares Detcore's internal logs"),
+        (
+            "--run-evidence-dir=/unused/new-path",
+            "--run-evidence-dir has not been qualified",
+        ),
+        ("--timeout=3", "--timeout has not been qualified"),
+        ("--skid-margin=500", "--skid-margin configures"),
+        ("--gdbserver", "--gdbserver needs the ptrace tracer"),
+    ] {
+        let error = liteinst_in_guest_refusal(
+            LiteinstRuntime::InGuest,
+            &["--max-timeslice=disabled", option],
+        )
+        .unwrap_err();
+        assert!(
+            error.downcast_ref::<PolicyRefusal>().is_some(),
+            "{option}: {error:#}"
+        );
+        assert!(error.to_string().contains(reason), "{option}: {error:#}");
+    }
+    liteinst_in_guest_refusal(LiteinstRuntime::InGuest, &["--max-timeslice=disabled"]).unwrap();
+}
+
+#[test]
+fn liteinst_host_hybrid_is_not_subject_to_the_in_guest_refusals() {
+    liteinst_in_guest_refusal(
+        LiteinstRuntime::HostHybrid,
+        &[
+            "--verify",
+            "--timeout=3",
+            "--skid-margin=500",
+            "--gdbserver",
+        ],
+    )
+    .unwrap();
+}
+
 #[test]
 fn deprecated_preemption_timeout_alias_round_trips_canonically() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--preemption-timeout=100000", "fakeprog"]);
@@ -3198,6 +3259,53 @@ impl RunOpts {
         }
     }
 
+    /// Where this run hosts Detcore when it uses LiteInst. Every other backend,
+    /// and `--namespace-only` (which runs no backend), reports the hybrid so the
+    /// selector variable is read only when it can matter.
+    fn liteinst_runtime(&self) -> Result<LiteinstRuntime, Error> {
+        if self.namespace_only || self.selected_backend() != Backend::Liteinst {
+            return Ok(LiteinstRuntime::HostHybrid);
+        }
+        LiteinstRuntime::from_env()
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3635): Review the in-guest LiteInst option refusals.
+    /// Refuses options that in-guest LiteInst cannot honour yet, so a run never
+    /// silently drops one of them.
+    fn refuse_unqualified_liteinst_in_guest_options(
+        &self,
+        runtime: LiteinstRuntime,
+    ) -> Result<(), Error> {
+        if runtime != LiteinstRuntime::InGuest {
+            return Ok(());
+        }
+        let config = &self.det_opts.det_config;
+        let reason = if config.max_timeslice.is_some() {
+            "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
+             set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
+             --max-timeslice=disabled"
+        } else if self.verify {
+            "--verify compares Detcore's internal logs, and the in-guest Tool does not forward \
+             its records to Hermit yet"
+        } else if self.run_evidence_dir.is_some() {
+            "--run-evidence-dir has not been qualified for the in-guest runtime"
+        } else if self.timeout.is_some() {
+            "--timeout has not been qualified for the in-guest runtime, whose run future does \
+             not kill the guest when it is dropped"
+        } else if self.skid_margin.is_some() {
+            "--skid-margin configures the Reverie ptrace PMU timer, which the in-guest runtime \
+             does not arm"
+        } else if config.gdbserver {
+            "--gdbserver needs the ptrace tracer, which the in-guest runtime does not attach"
+        } else {
+            return Ok(());
+        };
+        Err(Error::new(PolicyRefusal).context(format!(
+            "{LITEINST_IN_GUEST_ENV}=1 (in-guest LiteInst) refuses this run: {reason}"
+        )))
+    }
+
     /// Which comparator a `--verify` run uses, as a function of the request
     /// ALONE.
     ///
@@ -3336,6 +3444,10 @@ impl RunOpts {
         if let Some(path) = &self.backend_engagement_json {
             clear_machine_record(path, "backend engagement")?;
         }
+        // Before `--verify` reads stdin to its end below: a run that in-guest
+        // LiteInst refuses must not wait for its input. `validate_args` repeats
+        // the check for its other callers.
+        self.refuse_unqualified_liteinst_in_guest_options(self.liteinst_runtime()?)?;
         if self.verify {
             validate_log_level(global)?;
         }
@@ -3508,10 +3620,19 @@ impl RunOpts {
         }
 
         if backend == Backend::Liteinst {
-            self.verify_liteinst_activation()?;
-            eprintln!(
-                "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
-            );
+            match self.liteinst_runtime()? {
+                LiteinstRuntime::HostHybrid => {
+                    self.verify_liteinst_activation()?;
+                    eprintln!(
+                        "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
+                    );
+                }
+                // The probe above asserts the hybrid's trap/hook split, which
+                // does not describe an in-guest Tool.
+                LiteinstRuntime::InGuest => eprintln!(
+                    "hermit: [liteinst in-guest] Detcore Tool hosted by the guest preload; the host-hybrid activation probe does not apply"
+                ),
+            }
         }
 
         if self.no_namespace {
@@ -3552,9 +3673,15 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
-        let perf_supported =
-            !self.arms_reverie_ptrace_pmu_timer() || reverie_ptrace::is_perf_supported();
-        self.validate_args_with_perf_support(perf_supported)
+        let liteinst_runtime = self.liteinst_runtime()?;
+        // In-guest LiteInst arms no ptrace PMU timer. Reporting perf as present
+        // keeps `--max-timeslice` from being downgraded with a warning, so the
+        // refusal below sees it and stops the run instead.
+        let perf_supported = !self.arms_reverie_ptrace_pmu_timer()
+            || liteinst_runtime == LiteinstRuntime::InGuest
+            || reverie_ptrace::is_perf_supported();
+        self.validate_args_with_perf_support(perf_supported)?;
+        self.refuse_unqualified_liteinst_in_guest_options(liteinst_runtime)
     }
 
     /// Whether this run would arm Reverie ptrace's PMU timer for
