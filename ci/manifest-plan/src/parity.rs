@@ -5103,7 +5103,8 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 3700);
+        // Four new c-programs tests add four cells each; see the census below.
+        assert_eq!(parsed.cells.len(), 3700 + 16);
         assert_eq!(
             parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
             [&ParityBackend::Dbt]
@@ -5163,10 +5164,17 @@ mod tests {
         // https://github.com/rrnewton/reverie/issues/905
         // One ordinary syncfs KVM candidate adds one to each live counter:
         // https://github.com/rrnewton/reverie/issues/838
+        // https://github.com/rrnewton/hermit/pull/3224 adds three c-programs
+        // tests (external-io-signal-interrupt, sigsuspend-alarm-wake and
+        // sigsuspend-sibling-signal-wake) and
+        // https://github.com/rrnewton/hermit/pull/3229 adds
+        // c-programs/timerfd-semantics. Each declares only its ptrace verify
+        // cell, so each adds one not-applicable cell per backend here: 16
+        // cells (4 per backend) and no applicable, selectable or selected one.
         assert_eq!(
             row(&counts.all),
             (
-                3700,
+                3700 + 16,
                 843 + 6 + 3 + 1 + 1 + 1,
                 527 + 6 + 3 + 1 + 1 + 1,
                 194 + 6 + 3 + 1 + 1 + 1,
@@ -5181,19 +5189,19 @@ mod tests {
         assert_eq!(
             by_backend,
             [
-                ("dbt", (925, 85, 26, 16, 2)),
+                ("dbt", (925 + 4, 85, 26, 16, 2)),
                 (
                     "kvm",
                     (
-                        925,
+                        925 + 4,
                         250 + 6 + 3 + 1 + 1 + 1,
                         243 + 6 + 3 + 1 + 1 + 1,
                         77 + 6 + 3 + 1 + 1 + 1,
                         76 + 6 + 3 + 1 + 1 + 1
                     )
                 ),
-                ("liteinst", (925, 149, 146, 99, 98)),
-                ("sabre", (925, 359, 112, 2, 1)),
+                ("liteinst", (925 + 4, 149, 146, 99, 98)),
+                ("sabre", (925 + 4, 359, 112, 2, 1)),
             ]
         );
     }
