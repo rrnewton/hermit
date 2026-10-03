@@ -2197,11 +2197,32 @@ fn record_path_queries_and_legacy_mutations() {
 /// reads must replay from the recording
 /// (https://github.com/rrnewton/hermit/issues/3591). The file lives in a host
 /// directory the replay chroot lacks, so replay's descriptor is a placeholder
-/// and a live call there answers EINVAL or EOPNOTSUPP.
+/// and a live call there answers EINVAL or EOPNOTSUPP. The directory carries
+/// an attribute from before recording, which the replay root lacks.
 #[test]
 fn record_fd_metadata_calls() {
     let _guard = hermit_record_lock();
     let host_dir = tempfile::tempdir().expect("failed to create host directory");
+    let dir = std::ffi::CString::new(host_dir.path().as_os_str().as_encoded_bytes())
+        .expect("host directory path contains a NUL byte");
+    // SAFETY: every pointer names a live NUL-terminated string, and the value
+    // is the one byte before its terminator.
+    let set = unsafe {
+        libc::setxattr(
+            dir.as_ptr(),
+            c"user.pre".as_ptr(),
+            c"p".as_ptr().cast(),
+            1,
+            0,
+        )
+    };
+    assert_eq!(
+        set,
+        0,
+        "failed to set user.pre on {:?}: {}",
+        host_dir.path(),
+        std::io::Error::last_os_error()
+    );
     canonical_record_replay_command(
         "descriptor metadata calls",
         &workload("c_record_replay_fd_metadata").path,

@@ -478,18 +478,21 @@ impl Tool for Replayer {
                 self.handle_simple(guest, syscall).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            Syscall::Fchmod(_)
-            | Syscall::Fchown(_)
-            | Syscall::Fsetxattr(_)
-            | Syscall::Fremovexattr(_) => {
+            Syscall::Fchmod(_) | Syscall::Fchown(_) => {
                 self.handle_descriptor_metadata_change(guest, syscall).await
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(PR-3601)
-            Syscall::Setxattr(_)
+            // TODO-HUMAN-REVIEW(PR-3601): every xattr query replays from the
+            // recording, so no replayed call reads the replay root's
+            // attributes. Running a change there would only test whether that
+            // root started with the host's attributes, which it does not: it is
+            // built without them, possibly on another filesystem.
+            Syscall::Fsetxattr(_)
+            | Syscall::Fremovexattr(_)
+            | Syscall::Setxattr(_)
             | Syscall::Lsetxattr(_)
             | Syscall::Removexattr(_)
-            | Syscall::Lremovexattr(_) => self.handle_confined_path_mutation(guest, syscall).await,
+            | Syscall::Lremovexattr(_) => self.handle_simple(guest, syscall).await,
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-3601)
             Syscall::Getxattr(_)
@@ -1645,11 +1648,6 @@ impl Replayer {
             | Syscall::Chown(_)
             | Syscall::Lchown(_)
             | Syscall::Mknod(_) => true,
-            // TODO-HUMAN-REVIEW(PR-3601): the path xattr calls take no dirfd.
-            Syscall::Setxattr(_)
-            | Syscall::Lsetxattr(_)
-            | Syscall::Removexattr(_)
-            | Syscall::Lremovexattr(_) => true,
             Syscall::Utimensat(call) => self.dirfd_is_confined(pid, call.dirfd()),
             Syscall::Symlinkat(call) => self.dirfd_is_confined(pid, call.newdirfd()),
             Syscall::Linkat(call) => {
@@ -1720,12 +1718,11 @@ impl Replayer {
     }
 
     // TODO-HUMAN-REVIEW(PR-3601)
-    /// Replays a metadata change made through a descriptor: fchmod, fchown,
-    /// fsetxattr or fremovexattr. A placeholder descriptor has no metadata to
-    /// change, so the recorded result stands alone. A file in the replay root
-    /// gets the change reapplied, because later path calls such as
-    /// removexattr or chmod run there and must find what the recording
-    /// found.
+    /// Replays a metadata change made through a descriptor: fchmod or fchown.
+    /// A placeholder descriptor has no metadata to change, so the recorded
+    /// result stands alone. A file in the replay root gets the change
+    /// reapplied, because later path calls such as chmod run there and must
+    /// find what the recording found.
     async fn handle_descriptor_metadata_change<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1734,8 +1731,6 @@ impl Replayer {
         let fd = match syscall {
             Syscall::Fchmod(call) => call.fd(),
             Syscall::Fchown(call) => call.fd(),
-            Syscall::Fsetxattr(call) => call.fd(),
-            Syscall::Fremovexattr(call) => call.fd(),
             _ => unreachable!("descriptor metadata handler received {syscall:?}"),
         };
         let recorded = next_event!(guest, Return);

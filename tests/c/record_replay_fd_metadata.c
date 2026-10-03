@@ -29,6 +29,8 @@
 
 #define NAME "user.hermit"
 #define VALUE "recorded"
+// Set on the host directory by the test harness before recording.
+#define PRE "user.pre"
 
 static int failures;
 
@@ -152,13 +154,24 @@ int main(int argc, char** argv) {
   }
   expect_value("close", close(fd), 0);
 
-  // A file the guest creates in its working directory exists in the replay
-  // root too (replay enters the recorded directory), so path calls there run
-  // live and must see the attributes descriptor calls set or removed.
+  // The working directory and a file the guest creates in it exist in the
+  // replay root too (replay enters the recorded directory), so descriptor and
+  // path calls mix there. The replay root is built without the host's
+  // attributes: the directory's user.pre, which the test harness set before
+  // recording, is absent from it, yet removing and re-creating it must replay
+  // what the recording saw.
   if (chdir(argv[1]) != 0) {
     perror("chdir");
     return 2;
   }
+  int dir = open(".", O_RDONLY | O_DIRECTORY);
+  expect("open-dir", dir, 0);
+  expect_value("dir-fremovexattr-pre", fremovexattr(dir, PRE), 0);
+  expect("dir-fremovexattr-pre-gone", fremovexattr(dir, PRE), ENODATA);
+  expect_value(
+      "dir-setxattr-pre-create", setxattr(".", PRE, "p", 1, XATTR_CREATE), 0);
+  expect_value("dir-removexattr-pre", removexattr(".", PRE), 0);
+  expect_value("close-dir", close(dir), 0);
   int local = open("local", O_CREAT | O_RDWR | O_TRUNC, 0644);
   expect("open-local", local, 0);
   expect_value(
