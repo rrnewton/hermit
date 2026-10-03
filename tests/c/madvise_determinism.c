@@ -16,6 +16,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
 #include <sys/wait.h>
@@ -39,6 +40,26 @@ expect_errno(void* address, size_t length, int advice, int expected) {
         expected,
         errno);
     return 1;
+  }
+  return 0;
+}
+
+/* A dropped shared file page reads back what was written through the
+ * descriptor after the mapping was made, which replay's anonymous stand-in
+ * never saw. Closes `fd`. */
+static int check_shared_coherence(int fd, size_t page_size) {
+  if (fd < 0 || pwrite(fd, "A", 1, 0) != 1) {
+    return 1;
+  }
+  unsigned char* shared = mmap(NULL, page_size, PROT_READ, MAP_SHARED, fd, 0);
+  if (shared == MAP_FAILED || pwrite(fd, "B", 1, 0) != 1 ||
+      madvise(shared, page_size, MADV_DONTNEED) != 0 || shared[0] != 'B') {
+    fprintf(stderr, "shared MADV_DONTNEED read %c, not B\n",
+            shared == MAP_FAILED ? '?' : shared[0]);
+    return 2;
+  }
+  if (munmap(shared, page_size) != 0 || close(fd) != 0) {
+    return 3;
   }
   return 0;
 }
@@ -94,23 +115,16 @@ static int check_semantic_advice(
     return 13;
   }
 
-  /* A dropped shared file page reads back what was written through the
-   * descriptor after the mapping was made, which replay's anonymous stand-in
-   * never saw. */
-  int memfd = memfd_create("madvise_determinism", 0);
-  if (memfd < 0 || pwrite(memfd, "A", 1, 0) != 1) {
+  /* The same after a write through the descriptor, for a memfd and for a
+   * regular file. */
+  if (check_shared_coherence(memfd_create("madvise_determinism", 0), page_size)) {
     return 14;
   }
-  unsigned char* coherent =
-      mmap(NULL, page_size, PROT_READ, MAP_SHARED, memfd, 0);
-  if (coherent == MAP_FAILED || pwrite(memfd, "B", 1, 0) != 1 ||
-      madvise(coherent, page_size, MADV_DONTNEED) != 0 || coherent[0] != 'B') {
-    fprintf(stderr, "shared MADV_DONTNEED read %c, not B\n",
-            coherent == MAP_FAILED ? '?' : coherent[0]);
+  char temp_path[] = "/tmp/madvise_determinism.XXXXXX";
+  int temp = mkstemp(temp_path);
+  if (temp < 0 || unlink(temp_path) != 0 ||
+      check_shared_coherence(temp, page_size)) {
     return 15;
-  }
-  if (munmap(coherent, page_size) != 0 || close(memfd) != 0) {
-    return 16;
   }
 
   /* Dropping a page of this program's own text, which replay maps from the
