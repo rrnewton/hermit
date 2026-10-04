@@ -588,11 +588,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // added in 76521affca5b without a pin change, retains all 848 prior
     // identities (`cargo nextest list --profile ci` over this node's selection
     // measured 849 on eb12bc206386).
+    // hermit-manifest-plan's parity::tests::an_imported_log_index_is_trusted_whole_or_not_at_all
+    // and parity::tests::an_imported_row_is_measured_only_from_its_restored_logs,
+    // added in 9fd0c01a390b without a pin change, retain all 849 prior
+    // identities (measured 851 on 13437c69bd97).
     // One DBT signal-capability configuration control
     // (every_config_source_clears_the_ptrace_only_signal_capabilities;
-    // https://github.com/rrnewton/hermit/pull/3224) retains all 849 prior
-    // identities (measured 850).
-    ("test.regular_crates", 850),
+    // https://github.com/rrnewton/hermit/pull/3224) retains all 851 prior
+    // identities (measured 852).
+    ("test.regular_crates", 852),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1094,9 +1098,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // bring the measured count to 847, and the optional-cell sync test of
     // 6166181d8f listed there to 848.
     // The result-owner index test of 76521affca5b listed for
-    // test.regular_crates retains all 848 prior identities.
+    // test.regular_crates retains all 848 prior identities, and the two
+    // imported-log parity tests of 9fd0c01a390b listed there retain all 849.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3224 test.
-    ("test.regular_crates_on_host", 850),
+    ("test.regular_crates_on_host", 852),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
