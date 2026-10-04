@@ -58,7 +58,7 @@ before tasks (84 total; first 16 shown, pid comm):
      13 kworker/R-mm_pe
      14 kworker/u4:1
      15 ksoftirqd/0
-  ... 68 unchanged rows omitted from display
+  ... 68 rows omitted from display
 after tasks (85 total; first 16 shown, pid comm):
       0 swapper/0
       1 sh
@@ -76,7 +76,7 @@ after tasks (85 total; first 16 shown, pid comm):
      13 kworker/R-mm_pe
      14 kworker/u4:1
      15 ksoftirqd/0
-  ... 69 unchanged rows omitted from display
+  ... 69 rows omitted from display
 task-list diff (- before, + after):
   -     1 init
   -    95 sleep
@@ -88,10 +88,14 @@ RESULT: restored demo 5 boot snapshot; requested_sleep_us=1000; task_lists_diffe
 === Demo 7: drgn Kernel Task Evolution: SUCCESS ===
 ```
 
-Edited by hand: the `RESULT` field `requested_sleep_us` was named
-`fixed_virtual_advance_us` when this output was captured and was renamed on
-2026-10-02; its value 1000 and the rest of the block are as printed then, and
-the block is to be refreshed from the next verified run of this demo.
+Edited by hand: two parts of this block differ from the output as captured.
+The `RESULT` field `requested_sleep_us` was named `fixed_virtual_advance_us`
+and was renamed on 2026-10-02; its value 1000 is as printed. The two
+`rows omitted from display` lines said `68 unchanged rows` and
+`69 unchanged rows`; the word was dropped on 2026-10-04 because a row that is
+not shown can be in the difference (processes 95, 101 and 102 here). The rest
+of the block is as printed then, and the block is to be refreshed from the
+next verified run of this demo.
 
 Elided (`...`): your Hermit version and the path of the `hermit` on your
 `PATH`. Everything from `evolution 1` to `RESULT` was byte-identical in ten
@@ -135,10 +139,13 @@ The demo restores the snapshot with QEMU's virtual CPU paused, running QEMU
 under `hermit run --strict --no-rcb-time --target-timeslice 100000
 --max-timeslice disabled` (set in the shared
 [`lib/drgn_hermit.py`](../lib/drgn_hermit.py)). Unlike demos 5 and 6 it passes
-no `--epoch`, so Hermit's virtual clocks start at the host time of each run;
-the guest's own clock comes from QEMU (`-rtc base=2022-01-01T00:00:00,clock=vm`),
-and the demo compares the task lists rather than Hermit's log. Runs started at
-different host times produced the same result. Before
+no `--epoch`, and it passes the environment it runs in on to Hermit, so if
+`HERMIT_EPOCH` is set there, Hermit's virtual clocks start at that time, as
+they would with `--epoch`; otherwise they start at the host time of each run.
+The guest's own clock comes from QEMU
+(`-rtc base=2022-01-01T00:00:00,clock=vm`), and the demo compares the task
+lists rather than Hermit's log. Runs started at different host times produced
+the same result. Before
 QEMU starts, the fixed command
 (`for n in 1 2; do sleep 1000 & done; usleep 1000; echo ...`) is written to the
 guest's command disk, the same mechanism as

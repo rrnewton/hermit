@@ -121,7 +121,8 @@ def _print_tasks(label, rows, limit):
     for pid, comm in shown:
         print("  {:5d} {}".format(pid, comm))
     if len(rows) > limit:
-        print("  ... {} unchanged rows omitted from display".format(len(rows) - limit))
+        # Only counted: a row not shown can be in the task-list diff.
+        print("  ... {} rows omitted from display".format(len(rows) - limit))
 
 
 def _print_diff(removed, added):
