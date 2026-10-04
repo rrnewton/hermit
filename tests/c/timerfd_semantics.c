@@ -37,6 +37,14 @@
  *       An unread periodic timer raises one edge, and the first expiry after
  *       a read raises the next; an edge event cut by maxevents is still
  *       delivered on the next wait; EPOLLONESHOT disables until EPOLL_CTL_MOD.
+ *   epoll_lt_rotation / epoll_lt_rotation_across_mod / epoll_lt_host_fairness /
+ *   epoll_lt_host_fairness_pipe_first
+ *       With maxevents 1, two always-ready level-triggered items take turns,
+ *       as Linux re-queues a delivered one at the tail of the ready list:
+ *       two expired timerfds, also when both interests are re-applied with
+ *       EPOLL_CTL_MOD after every wait (MOD leaves a queued item in place),
+ *       and an expired timerfd beside a readable pipe in either registration
+ *       order.
  *   invalid_timespec
  *       A negative or out-of-range timespec is EINVAL and leaves the timer as
  *       it was.
@@ -403,6 +411,87 @@ static void check_epoll_et_maxevents(void) {
     close(ep);
     close(a);
     close(b);
+}
+
+/* Four timeout-0 epoll_wait calls with maxevents 1; stores each call's data
+ * and returns the number of calls that reported exactly one EPOLLIN event.
+ * With remod, every call is followed by EPOLL_CTL_MOD re-applying both
+ * interests unchanged (first_fd with data 1, second_fd with data 2), as an
+ * event loop that re-arms its interests on every iteration does. */
+static int epoll_wait_one_each(int ep, uint64_t seen[4], int remod, int first_fd,
+                               int second_fd) {
+    int good = 0;
+    for (int i = 0; i < 4; i++) {
+        struct epoll_event out[1];
+        memset(out, 0, sizeof out);
+        int n = epoll_wait(ep, out, 1, 0);
+        seen[i] = n == 1 ? out[0].data.u64 : 0;
+        if (n == 1 && out[0].events == EPOLLIN) good++;
+        if (!remod) continue;
+        struct epoll_event mod;
+        memset(&mod, 0, sizeof mod);
+        mod.events = EPOLLIN;
+        mod.data.u64 = 1;
+        if (epoll_ctl(ep, EPOLL_CTL_MOD, first_fd, &mod) != 0) good = -100;
+        mod.data.u64 = 2;
+        if (epoll_ctl(ep, EPOLL_CTL_MOD, second_fd, &mod) != 0) good = -100;
+    }
+    return good;
+}
+
+/* Linux re-queues a delivered level-triggered item at the tail of the ready
+ * list (ep_send_events), and EPOLL_CTL_MOD leaves an item already on the
+ * ready list in place (ep_modify), so with maxevents 1 two always-ready items
+ * take turns, with or without the re-arming: both appear within two calls,
+ * and four calls alternate. */
+static void check_epoll_lt_alternation(const char *name, int first_fd, int second_fd,
+                                       int remod) {
+    int ep = epoll_with(first_fd, EPOLLIN, 1);
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN;
+    ev.data.u64 = 2;
+    if (ep < 0 || epoll_ctl(ep, EPOLL_CTL_ADD, second_fd, &ev) != 0) {
+        fail(name, "setup errno=%ld%ld", errno, 0);
+        if (ep >= 0) close(ep);
+        return;
+    }
+    sleep_ns(10 * MS);
+    uint64_t seen[4];
+    int good = epoll_wait_one_each(ep, seen, remod, first_fd, second_fd);
+    int alternates = seen[0] != seen[1] && seen[1] != seen[2] && seen[2] != seen[3];
+    if (good != 4 || !alternates)
+        fail(name, "calls01=%ld calls23=%ld", (long)(seen[0] * 10 + seen[1]),
+             (long)(seen[2] * 10 + seen[3]));
+    else ok(name);
+    close(ep);
+}
+
+static void check_epoll_lt_rotation(void) {
+    /* Two expired level-triggered timerfds: neither may starve the other. */
+    int a = armed_tfd(CLOCK_MONOTONIC, 0, 1 * MS, 0, 0);
+    int b = armed_tfd(CLOCK_MONOTONIC, 0, 1 * MS, 0, 0);
+    check_epoll_lt_alternation("epoll_lt_rotation", a, b, 0);
+    check_epoll_lt_alternation("epoll_lt_rotation_across_mod", a, b, 1);
+    close(a);
+    close(b);
+}
+
+static void check_epoll_lt_host_fairness(void) {
+    /* An always-readable pipe (its byte is never read) and an expired
+     * level-triggered timerfd: neither may starve the other, whichever
+     * was registered first. */
+    int p[2];
+    if (pipe(p) != 0 || write(p[1], "x", 1) != 1) {
+        fail("epoll_lt_host_fairness", "pipe errno=%ld%ld", errno, 0);
+        return;
+    }
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 1 * MS, 0, 0);
+    check_epoll_lt_alternation("epoll_lt_host_fairness", tfd, p[0], 0);
+    check_epoll_lt_alternation("epoll_lt_host_fairness_pipe_first", p[0], tfd, 0);
+    close(tfd);
+    close(p[0]);
+    close(p[1]);
 }
 
 static void check_epoll_oneshot(void) {
@@ -881,6 +970,8 @@ int main(void) {
     check_epoll_dup_alive();
     check_epoll_et_periodic();
     check_epoll_et_maxevents();
+    check_epoll_lt_rotation();
+    check_epoll_lt_host_fairness();
     check_epoll_oneshot();
     check_invalid_timespec();
     check_cancel_on_set_flags();

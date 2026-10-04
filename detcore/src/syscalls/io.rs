@@ -94,6 +94,119 @@ struct EpollTimerEvent {
     event: libc::epoll_event,
 }
 
+/// One wait round on an epoll that may shadow virtual timerfds, decided
+/// before the host probe so that the timers can claim maxevents slots
+/// ahead of it.
+struct EpollTimerRound {
+    /// Whether the epoll still shadows any live virtual timerfd interest.
+    watched: bool,
+    /// The virtual timerfd events ready now, in the epoll's ready order.
+    ready: Vec<EpollTimerEvent>,
+    /// The maxevents the host probe may fill when the ready timers have the
+    /// first claim, or None to probe with the guest's own maxevents. Zero
+    /// means the timers fill every slot and the host is not probed.
+    host_limit: Option<i32>,
+}
+
+/// The per-round state of a wait that may involve virtual timerfds.
+enum TimerWaitRound {
+    /// poll and ppoll report every ready entry, so their timer scan simply
+    /// follows the host probe.
+    Poll,
+    /// epoll decides its timer events before the probe.
+    Epoll(EpollTimerRound),
+}
+
+impl TimerWaitRound {
+    fn host_limit(&self) -> Option<i32> {
+        match self {
+            TimerWaitRound::Poll => None,
+            TimerWaitRound::Epoll(round) => round.host_limit,
+        }
+    }
+}
+
+/// A host probe of a wait whose output capacity a round can lower: epoll's
+/// maxevents. poll and ppoll never get a host limit (see
+/// [`TimerWaitRound::Poll`]), so theirs is the identity.
+trait TimerWaitProbe: Copy {
+    fn with_host_limit(self, limit: i32) -> Self;
+}
+
+impl TimerWaitProbe for syscalls::EpollWait {
+    fn with_host_limit(self, limit: i32) -> Self {
+        self.with_maxevents(limit)
+    }
+}
+
+impl TimerWaitProbe for syscalls::EpollPwait {
+    fn with_host_limit(self, limit: i32) -> Self {
+        self.with_maxevents(limit)
+    }
+}
+
+impl TimerWaitProbe for syscalls::Poll {
+    fn with_host_limit(self, _limit: i32) -> Self {
+        self
+    }
+}
+
+impl TimerWaitProbe for syscalls::Ppoll {
+    fn with_host_limit(self, _limit: i32) -> Self {
+        self
+    }
+}
+
+/// Linux's largest maxevents: `EP_MAX_EVENTS`, `INT_MAX / sizeof(struct
+/// epoll_event)`. epoll_wait fails with EINVAL above it or at zero or below.
+const EP_MAX_EVENTS: i32 = (i32::MAX as usize / std::mem::size_of::<libc::epoll_event>()) as i32;
+
+/// The lowest top of the user address range on any x86_64 host (4-level
+/// paging). Linux checks the whole output array against its own limit before
+/// waiting; a round lowers maxevents only when that check cannot fail on any
+/// host, so the probe keeps reporting Linux's EFAULT for a bad array.
+const EPOLL_EVENTS_ADDRESS_LIMIT: u64 = 0x7fff_ffff_f000;
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3229): virtual timerfd and host fairness under maxevents.
+/// The maxevents a host probe may fill when `ready` virtual timer events
+/// have the first claim on `maxevents`, or None when the probe must keep the
+/// guest's own maxevents because Linux would reject the call: maxevents out
+/// of range (EINVAL) or an output array that may cross the top of the user
+/// address range (EFAULT).
+fn epoll_host_limit(events_raw: Option<usize>, maxevents: i32, ready: usize) -> Option<i32> {
+    if ready == 0 || !(1..=EP_MAX_EVENTS).contains(&maxevents) {
+        return None;
+    }
+    let events = events_raw? as u64;
+    let bytes = maxevents as u64 * std::mem::size_of::<libc::epoll_event>() as u64;
+    if events.checked_add(bytes)? > EPOLL_EVENTS_ADDRESS_LIMIT {
+        return None;
+    }
+    let claimed = ready.min(maxevents as usize) as i32;
+    Some(maxevents - claimed)
+}
+
+/// Which side claims maxevents slots first on the epoll's next wait, given
+/// this round's outcome; None keeps the current order.
+///
+/// When the timers had the first claim (`host_limit` is Some) and the host
+/// filled all of its share, it may have had more ready, so the host goes
+/// first next time. When the host had the first claim and pushed out at
+/// least one ready timer event, the timers go first next time. Otherwise
+/// nothing was cut, and the order stays. The host keeps its own ready order
+/// within its share, so neither side can starve the other.
+fn next_epoll_fill_order(
+    host_limit: Option<i32>,
+    host_events: i64,
+    omitted_timers: usize,
+) -> Option<bool> {
+    match host_limit {
+        Some(limit) => (host_events >= i64::from(limit)).then_some(false),
+        None => (host_events > 0 && omitted_timers > 0).then_some(true),
+    }
+}
+
 /// What a blocking wait that may involve virtual timerfds rescans after each
 /// host probe. A virtual timerfd never arms its host vessel, so the host probe
 /// alone can never report it.
@@ -1206,8 +1319,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             let result = match result {
                 Ok(host) => {
-                    self.merge_timer_wait_set(guest, TimerWaitSet::Poll { fds_raw, nfds }, host)
-                        .await
+                    self.merge_timer_wait_set(
+                        guest,
+                        TimerWaitSet::Poll { fds_raw, nfds },
+                        TimerWaitRound::Poll,
+                        host,
+                    )
+                    .await
                 }
                 Err(errno) => Err(errno.into()),
             };
@@ -1283,7 +1401,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 fds_raw: call.fds().map(|a| a.as_raw()),
                 nfds: call.nfds(),
             };
-            self.merge_timer_wait_set(guest, set, host).await
+            self.merge_timer_wait_set(guest, set, TimerWaitRound::Poll, host)
+                .await
         } else {
             let fds_raw = call.fds().map(|a| a.as_raw());
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
@@ -1413,25 +1532,59 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(host_result + extra)
     }
 
+    /// Decide the virtual timer side of one wait round before its host
+    /// probe. Only an epoll needs to (see [`TimerWaitRound`]).
+    async fn timer_wait_round<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        set: TimerWaitSet,
+    ) -> Result<TimerWaitRound, Error> {
+        match set {
+            TimerWaitSet::Poll { .. } => Ok(TimerWaitRound::Poll),
+            TimerWaitSet::Epoll {
+                epfd,
+                events_raw,
+                maxevents,
+            } => Ok(TimerWaitRound::Epoll(
+                self.epoll_timer_round(guest, epfd, events_raw, maxevents)
+                    .await?,
+            )),
+        }
+    }
+
     /// Merge virtual timerfd readiness into a successful host probe result.
     async fn merge_timer_wait_set<G: Guest<Self>>(
         &self,
         guest: &mut G,
         set: TimerWaitSet,
+        round: TimerWaitRound,
         host_result: i64,
     ) -> Result<i64, Error> {
-        match set {
-            TimerWaitSet::Poll { fds_raw, nfds } => {
+        match (set, round) {
+            (TimerWaitSet::Poll { fds_raw, nfds }, _) => {
                 self.merge_poll_timerfds(guest, fds_raw, nfds, host_result)
                     .await
             }
-            TimerWaitSet::Epoll {
-                epfd,
-                events_raw,
-                maxevents,
-            } => {
-                self.merge_epoll_timer_events(guest, epfd, events_raw, maxevents, host_result)
-                    .await
+            (
+                TimerWaitSet::Epoll {
+                    epfd,
+                    events_raw,
+                    maxevents,
+                },
+                TimerWaitRound::Epoll(round),
+            ) => {
+                self.merge_epoll_timer_events(
+                    guest,
+                    epfd,
+                    events_raw,
+                    maxevents,
+                    round,
+                    host_result,
+                )
+                .await
+            }
+            (TimerWaitSet::Epoll { .. }, TimerWaitRound::Poll) => {
+                unreachable!("an epoll wait set always gets an epoll round")
             }
         }
     }
@@ -1441,12 +1594,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// Like `retry_nonblocking_syscall_with_timeout`, each retry takes a
     /// scheduler turn and probes the host with a zero timeout; in addition it
-    /// rescans the virtual timers after every probe. Readiness is therefore
-    /// judged against the timer state at the logical time of that retry, so a
-    /// timer that another thread arms, re-arms, reads or (for epoll) adds while
-    /// this thread waits is seen at the next retry. The loop keeps no timer
-    /// deadline of its own: it ends only on readiness, the guest deadline, a
-    /// host error, or a signal.
+    /// rescans the virtual timers on every retry (an epoll just before its
+    /// probe, a poll just after). Readiness is therefore judged against the
+    /// timer state at the logical time of that retry, so a timer that another
+    /// thread arms, re-arms, reads or (for epoll) adds while this thread waits
+    /// is seen at the next retry. The loop keeps no timer deadline of its own:
+    /// it ends only on readiness, the guest deadline, a host error, or a
+    /// signal.
     // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd blocking wait loop.
     async fn wait_with_timerfds<G: Guest<Self>, C>(
         &self,
@@ -1457,7 +1611,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         fyi: &'static str,
     ) -> Result<i64, Error>
     where
-        C: NonblockableSyscall + TimeoutableSyscall + Into<Syscall> + Copy,
+        C: NonblockableSyscall + TimeoutableSyscall + TimerWaitProbe + Into<Syscall> + Copy,
     {
         // The probe's scratch memory must outlive every injection below.
         let (probe, _probe_guard) = call.into_nonblocking(guest).await;
@@ -1468,10 +1622,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let ResumeStatus::Signaled(_) = resource_request(guest, rsrc.clone()).await {
                 return Err(probe.signal_interrupt_errno().into());
             }
-            let result = match guest.inject_with_retry(probe).await.map_err(Error::from) {
-                Ok(value) => Ok(value),
-                Err(Error::Errno(errno)) => Err(errno),
-                Err(error) => return Err(error),
+            let round = self.timer_wait_round(guest, set).await?;
+            let result = match round.host_limit() {
+                // The ready timers fill every slot: there is nothing to probe.
+                Some(0) => Ok(0),
+                limit => {
+                    let probe = limit.map_or(probe, |limit| probe.with_host_limit(limit));
+                    match guest.inject_with_retry(probe).await.map_err(Error::from) {
+                        Ok(value) => Ok(value),
+                        Err(Error::Errno(errno)) => Err(errno),
+                        Err(error) => return Err(error),
+                    }
+                }
             };
             let blocked = probe.syscall_would_have_blocked(result);
             let host = if blocked {
@@ -1479,7 +1641,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             } else {
                 probe.normalize_nonblocking_result(result, rsrc.poll_attempt > 0)?
             };
-            let total = self.merge_timer_wait_set(guest, set, host).await?;
+            let total = self.merge_timer_wait_set(guest, set, round, host).await?;
             if total != 0 || !blocked {
                 return Ok(total);
             }
@@ -1610,6 +1772,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                                     data: event.u64,
                                     edge_reported: None,
                                     oneshot_disarmed: false,
+                                    // epoll_timer_add assigns the ready rank.
+                                    ready_rank: 0,
                                     target: link.clone(),
                                 },
                             )
@@ -1633,29 +1797,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::EpollPwait,
     ) -> Result<i64, Error> {
+        if call.sigmask().is_some() {
+            return self.handle_masked_epoll_pwait(guest, call).await;
+        }
         if self.epoll_has_timerfds(guest, call.epfd()) {
-            if call.sigmask().is_none() {
-                return self.handle_internal_epoll_pwait(guest, call).await;
-            }
-            // A wait that need not block is one timeout-0 probe under the
-            // caller's mask, which is atomic exactly as on Linux. Probe the
-            // host first, so a ready host fd returns at once, as it does on
-            // Linux, instead of the refusal below.
-            let ready = self.epoll_timer_scan(guest, call.epfd()).await?;
-            let dettid = guest.thread_state().dettid;
-            resource_request(guest, Resources::new(dettid)).await; // empty request
-            let host = guest.inject(call.with_timeout(0)).await?;
-            if !ready.is_empty() || call.timeout() == 0 || host != 0 {
-                return self.merge_timer_wait_set(guest, call.into(), host).await;
-            }
-            // Blocking with a temporary mask cannot be reproduced by a polling
-            // loop (see below), and the host wait would never observe the
-            // virtual timer. Refuse rather than hang or change signal
-            // semantics.
-            tracing::warn!(
-                "epoll_pwait with a signal mask must block on a virtual timerfd; unsupported"
-            );
-            return Err(Errno::ENOSYS.into());
+            return self.handle_internal_epoll_pwait(guest, call).await;
         }
         // This used to unconditionally inject the raw
         // call and wait for it to return. With an infinite timeout under
@@ -1675,18 +1821,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         // handled correctly. The callers that land here are programs issuing
         // `epoll_pwait` DIRECTLY -- libuv does, which is how the original
         // `cmake` hang was found. With a NULL sigmask the two calls are
-        // semantically identical, so route them together.
-        //
-        // A NON-NULL sigmask keeps the previous behavior: its whole purpose is
-        // to swap the signal mask atomically for the duration of the wait, and
-        // a timeout-0 polling loop cannot reproduce that atomicity. Such calls
-        // remain able to block the scheduler; that is a known remaining gap
-        // rather than something this change silently pretends to fix.
-        if call.sigmask().is_some() {
-            let dettid = guest.thread_state().dettid;
-            resource_request(guest, Resources::new(dettid)).await; // empty request
-            return Ok(self.record_or_replay(guest, call).await?);
-        }
+        // semantically identical, so route them together. A non-NULL sigmask
+        // is handled by `handle_masked_epoll_pwait`.
         if self.cfg.recordreplay_modes && call.timeout() == 0 {
             // Cannot block, but still yield a scheduler turn so a polling thread
             // cannot monopolize the guest between preemptions.
@@ -1699,6 +1835,84 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             self.handle_internal_epoll_pwait(guest, call).await
         }
+    }
+
+    /// epoll_pwait with a non-NULL signal mask.
+    ///
+    /// The scheduler turn comes first. Whether the epoll watches a virtual
+    /// timerfd, and which of its timers are ready, are both decided after
+    /// it: another thread may arm, read, close, add or remove a timerfd
+    /// while this one waits for its turn, and the decision must use the
+    /// state at the turn, the logical time of the call. Deciding the entry
+    /// before the turn and scanning after it could return 0 from an
+    /// infinite wait whose timer a peer consumed in between, or refuse a
+    /// wait whose timer a peer armed in between.
+    ///
+    /// With a virtual timerfd interest, a wait that need not block is one
+    /// timeout-0 probe under the caller's mask, which is atomic exactly as
+    /// on Linux. The host is probed too, so a ready host fd returns at once,
+    /// as it does on Linux, instead of the refusal below.
+    ///
+    /// Without one, this keeps the previous behavior. A non-NULL sigmask's
+    /// whole purpose is to swap the signal mask atomically for the duration
+    /// of the wait, and a timeout-0 polling loop cannot reproduce that
+    /// atomicity. Such calls remain able to block the scheduler; that is a
+    /// known remaining gap rather than something this change silently
+    /// pretends to fix.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): masked epoll_pwait decides on the timer
+    // state of its own turn.
+    async fn handle_masked_epoll_pwait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::EpollPwait,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        resource_request(guest, Resources::new(dettid)).await; // empty request
+        if !self.epoll_has_timerfds(guest, call.epfd()) {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        let set = TimerWaitSet::from(call);
+        let round = self.timer_wait_round(guest, set).await?;
+        if let TimerWaitRound::Epoll(EpollTimerRound { watched: false, .. }) = round {
+            // No timerfd interest is live at the turn: this is the plain
+            // masked wait above, whose turn is already taken.
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        let host = match round.host_limit() {
+            Some(0) => {
+                // The ready timers fill every slot, so there is no host
+                // probe. Linux installs the mask before it looks at the
+                // epoll, and its timeout-0 wait never checks for signals
+                // and restores the old mask before returning, so only
+                // the mask's own checks remain to be made here.
+                if call.sigsetsize() != KERNEL_SIGSET_SIZE {
+                    return Err(Errno::EINVAL.into());
+                }
+                if let Some(mask) = call.sigmask() {
+                    read_kernel_sigset(guest, mask).await?;
+                }
+                0
+            }
+            limit => {
+                let probe = call.with_timeout(0);
+                guest
+                    .inject(limit.map_or(probe, |limit| probe.with_host_limit(limit)))
+                    .await?
+            }
+        };
+        let total = self.merge_timer_wait_set(guest, set, round, host).await?;
+        if total > 0 || call.timeout() == 0 {
+            return Ok(total);
+        }
+        // Blocking with a temporary mask cannot be reproduced by a polling
+        // loop (see above), and the host wait would never observe the
+        // virtual timer. Refuse rather than hang or change signal
+        // semantics.
+        tracing::warn!(
+            "epoll_pwait with a signal mask must block on a virtual timerfd; unsupported"
+        );
+        Err(Errno::ENOSYS.into())
     }
 
     /// Handle a guest-internal `epoll_pwait` (NULL sigmask) that can be fully
@@ -1728,8 +1942,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await;
             }
-            let host = guest.inject(call).await?; // Already non-blocking.
-            self.merge_timer_wait_set(guest, call.into(), host).await
+            self.epoll_wait_once(guest, call).await
         } else {
             // Every blocking wait rescans the epoll's timer interests on each
             // retry, so a timerfd added by epoll_ctl while this thread waits
@@ -1803,28 +2016,66 @@ impl<T: RecordOrReplay> Detcore<T> {
             .unwrap_or(false)
     }
 
-    /// Virtual timerfd events this epoll would report at virtual now.
+    /// One timeout-0 epoll wait (epoll_wait, or epoll_pwait with a NULL
+    /// mask) that may merge virtual timerfd events: decide the round, probe
+    /// the host with what is left of maxevents, and merge.
+    async fn epoll_wait_once<G: Guest<Self>, C>(&self, guest: &mut G, call: C) -> Result<i64, Error>
+    where
+        C: TimerWaitProbe + SyscallInfo + Into<TimerWaitSet>,
+    {
+        let set: TimerWaitSet = call.into();
+        let round = self.timer_wait_round(guest, set).await?;
+        let host = match round.host_limit() {
+            // The ready timers fill every slot: there is nothing to probe.
+            // The epoll and maxevents are valid (see epoll_host_limit), and
+            // there is no signal mask to install, so the call cannot fail.
+            Some(0) => 0,
+            // Already non-blocking.
+            limit => {
+                guest
+                    .inject(limit.map_or(call, |limit| call.with_host_limit(limit)))
+                    .await?
+            }
+        };
+        self.merge_timer_wait_set(guest, set, round, host).await
+    }
+
+    /// The virtual timer side of one epoll wait round: the timerfd events
+    /// this epoll would report at virtual now, in its ready order, and the
+    /// maxevents its host probe may fill.
     ///
     /// Only EPOLLIN is ever reported (a timerfd is never writable). An
     /// EPOLLONESHOT interest that already fired stays silent until MOD. An
     /// EPOLLET interest reports once per arming generation: Linux raises one
     /// wakeup per settime or consuming read, even for a periodic timer, because
-    /// its hrtimer is forwarded only by a read. Nothing is committed here; see
-    /// `merge_epoll_timer_events`.
-    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd epoll readiness, ET and
-    // ONESHOT semantics.
-    async fn epoll_timer_scan<G: Guest<Self>>(
+    /// its hrtimer is forwarded only by a read. The ready order rotates as
+    /// events are delivered (see `DetFd::epoll_timer_interests`), and when the
+    /// epoll gives the timers the first claim on maxevents the host probe is
+    /// limited to the slots they leave (see `epoll_host_limit`). Nothing is
+    /// committed here; see `merge_epoll_timer_events`.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd epoll readiness, ready
+    // order, ET and ONESHOT semantics.
+    async fn epoll_timer_round<G: Guest<Self>>(
         &self,
         guest: &mut G,
         epfd: i32,
-    ) -> Result<Vec<EpollTimerEvent>, Error> {
-        let interests = guest
+        events_raw: Option<usize>,
+        maxevents: i32,
+    ) -> Result<EpollTimerRound, Error> {
+        let (interests, timers_first) = guest
             .thread_state()
-            .with_detfd(epfd, |detfd| detfd.epoll_timer_interests())
+            .with_detfd(epfd, |detfd| {
+                (detfd.epoll_timer_interests(), detfd.epoll_timers_first())
+            })
             .unwrap_or_default();
-        let mut ready = Vec::new();
+        let mut round = EpollTimerRound {
+            watched: !interests.is_empty(),
+            ready: Vec::new(),
+            host_limit: None,
+        };
         if interests.is_empty() {
-            return Ok(ready);
+            return Ok(round);
         }
         let now = thread_observe_time(guest).await;
         for (key, interest) in interests {
@@ -1842,7 +2093,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 continue;
             }
-            ready.push(EpollTimerEvent {
+            round.ready.push(EpollTimerEvent {
                 key,
                 generation: state.generation,
                 event: libc::epoll_event {
@@ -1851,7 +2102,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
             });
         }
-        Ok(ready)
+        if timers_first {
+            round.host_limit = epoll_host_limit(events_raw, maxevents, round.ready.len());
+        }
+        Ok(round)
     }
 
     /// Ready virtual timerfds present in a select read bitmap.
@@ -1981,8 +2235,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let timeout_millis = call.timeout();
         if timeout_millis == 0 {
-            let host = guest.inject(call).await?;
-            self.merge_timer_wait_set(guest, call.into(), host).await
+            self.epoll_wait_once(guest, call).await
         } else {
             // See handle_internal_epoll_pwait: the loop rescans timer interests.
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
@@ -1991,30 +2244,37 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Append ready virtual timerfd events after the host probe's events
-    /// (host events keep their order; timerfd events follow in key order),
-    /// up to maxevents. Only events actually written are delivered: an
-    /// EPOLLET edge or EPOLLONESHOT interest left out by maxevents stays
-    /// pending for the next wait, as on Linux.
+    /// Append a round's ready virtual timerfd events after the host probe's
+    /// events, up to maxevents. Host events keep their order and come first
+    /// in the array; the timerfd events follow in the epoll's ready order.
+    /// When the round gave the timers the first claim, the probe was limited
+    /// to the slots they leave, so every claimed event fits.
+    ///
+    /// Only events actually written are delivered: an EPOLLET edge or
+    /// EPOLLONESHOT interest left out by maxevents stays pending for the next
+    /// wait, as on Linux, and each delivered interest moves to the back of
+    /// the ready order, as Linux moves a delivered level-triggered item to
+    /// the tail of its ready list. Then the epoll records which side claims
+    /// maxevents first next time (see `next_epoll_fill_order`).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd epoll delivery and fairness.
     async fn merge_epoll_timer_events<G: Guest<Self>>(
         &self,
         guest: &mut G,
         epfd: i32,
         events_raw: Option<usize>,
         maxevents: i32,
+        round: EpollTimerRound,
         host_result: i64,
     ) -> Result<i64, Error> {
-        if host_result < 0 {
-            return Ok(host_result);
-        }
-        let ready = self.epoll_timer_scan(guest, epfd).await?;
-        if ready.is_empty() {
+        if host_result < 0 || round.ready.is_empty() {
             return Ok(host_result);
         }
         let events_raw = events_raw.ok_or(Errno::EFAULT)?;
         let maxevents = maxevents.max(0) as i64;
         let mut written = host_result;
-        for ready in ready {
+        let mut delivered = 0;
+        for ready in &round.ready {
             if written >= maxevents {
                 break;
             }
@@ -2025,6 +2285,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 detfd.epoll_timer_delivered(ready.key, ready.generation)
             })?;
             written += 1;
+            delivered += 1;
+        }
+        let omitted = round.ready.len() - delivered;
+        if let Some(timers_first) = next_epoll_fill_order(round.host_limit, host_result, omitted) {
+            guest
+                .thread_state()
+                .with_detfd(epfd, |detfd| detfd.set_epoll_timers_first(timers_first))?;
         }
         Ok(written)
     }
@@ -2569,6 +2836,55 @@ impl<T: RecordOrReplay> Detcore<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ep_max_events_matches_linux() {
+        // x86_64 packs struct epoll_event into 12 bytes; Linux's
+        // EP_MAX_EVENTS is INT_MAX / 12.
+        assert_eq!(std::mem::size_of::<libc::epoll_event>(), 12);
+        assert_eq!(EP_MAX_EVENTS, 178_956_970);
+    }
+
+    #[test]
+    fn epoll_host_limit_leaves_the_slots_the_ready_timers_do_not_claim() {
+        let events = Some(0x1000_0000_usize);
+        assert_eq!(epoll_host_limit(events, 1, 1), Some(0));
+        assert_eq!(epoll_host_limit(events, 4, 1), Some(3));
+        assert_eq!(epoll_host_limit(events, 4, 4), Some(0));
+        assert_eq!(epoll_host_limit(events, 4, 9), Some(0));
+        assert_eq!(
+            epoll_host_limit(events, EP_MAX_EVENTS, 2),
+            Some(EP_MAX_EVENTS - 2)
+        );
+        // No ready timer claims anything: probe with the guest's maxevents.
+        assert_eq!(epoll_host_limit(events, 4, 0), None);
+        // Linux rejects these before it waits, so the probe must keep the
+        // guest's maxevents to report the same error.
+        assert_eq!(epoll_host_limit(events, 0, 1), None);
+        assert_eq!(epoll_host_limit(events, -1, 1), None);
+        assert_eq!(epoll_host_limit(events, EP_MAX_EVENTS + 1, 1), None);
+        assert_eq!(epoll_host_limit(None, 4, 1), None);
+        // The whole array must lie below the lowest user address limit.
+        let top = EPOLL_EVENTS_ADDRESS_LIMIT as usize;
+        assert_eq!(epoll_host_limit(Some(top - 12), 1, 1), Some(0));
+        assert_eq!(epoll_host_limit(Some(top - 12), 2, 1), None);
+        assert_eq!(epoll_host_limit(Some(usize::MAX - 4), 1, 1), None);
+    }
+
+    #[test]
+    fn epoll_fill_order_changes_only_when_a_side_was_cut() {
+        // The timers went first and the host filled all of its share (or
+        // had none): the host goes first next time.
+        assert_eq!(next_epoll_fill_order(Some(0), 0, 0), Some(false));
+        assert_eq!(next_epoll_fill_order(Some(3), 3, 0), Some(false));
+        // The timers went first and the host had less than its share.
+        assert_eq!(next_epoll_fill_order(Some(3), 2, 0), None);
+        // The host went first and pushed out a ready timer.
+        assert_eq!(next_epoll_fill_order(None, 1, 1), Some(true));
+        // The host went first and cut nothing, or only timers competed.
+        assert_eq!(next_epoll_fill_order(None, 1, 0), None);
+        assert_eq!(next_epoll_fill_order(None, 0, 2), None);
+    }
 
     #[test]
     fn zero_timeout_socket_poll_requests_a_strong_one_turn_yield() {
