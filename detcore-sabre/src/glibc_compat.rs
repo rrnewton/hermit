@@ -8,7 +8,7 @@
 
 //! Plugin-private definitions of two glibc symbols newer than the oldest
 //! supported host's glibc (2.34), so the guest's dynamic loader never has to
-//! find them (https://github.com/rrnewton/hermit/issues/3652).
+//! find them (<https://github.com/rrnewton/hermit/issues/3652>).
 //!
 //! Statically linked C code would otherwise import them from the guest's libc:
 //!
