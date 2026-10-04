@@ -33,6 +33,7 @@ from demo_common import (  # noqa: E402
     hermit_binary,
     hermit_log_environment,
     hermit_tmp_args,
+    initramfs_producer,
     load_committed_anchor,
     make_temp_result_dir,
     print_comparison,
@@ -45,6 +46,7 @@ from demo_common import (  # noqa: E402
     stop_process,
     stop_process_group,
     wait_for_process,
+    write_boot_snapshot_record,
 )
 from qemu_controller import build_qemu_command  # noqa: E402
 from signal_33 import settle_signal_33_disposition  # noqa: E402
@@ -191,6 +193,11 @@ def boot_once() -> str:
         raise RuntimeError("qemu-system-x86_64 is required")
 
     ASSETS.mkdir(parents=True, exist_ok=True)
+    # The initramfs this boot runs, recorded next to the snapshot it saves so
+    # that demo 6 can tell whether the /init in the snapshot's memory came from
+    # the initramfs that qemu-assets.sh builds now (see verify_boot_snapshot).
+    # Taken before QEMU reads the initramfs.
+    producer = initramfs_producer(ROOT, ASSETS)
     anchor_dir = ASSETS / "boot-anchor"
     # Everything for this run lives in a private working directory so any number
     # of runs can boot QEMU concurrently without sharing sockets, disks, or logs.
@@ -360,10 +367,17 @@ def boot_once() -> str:
         (snapshot_disk.with_suffix(snapshot_disk.suffix + ".id")).write_text(
             snapshot_sha + "\n"
         )
+        if SNAPSHOT_DISK_OVERRIDE:
+            # Demo 6 restores an explicit QEMU_BOOT_SNAPSHOT_DISK only with this
+            # record next to it.
+            write_boot_snapshot_record(snapshot_disk, snapshot_sha, producer)
         # Shared handoff artifact consumed by demo 6; publish atomically so a
-        # concurrent reader never sees a half-written qcow2.
+        # concurrent reader never sees a half-written qcow2. Its record follows
+        # it; a reader that finds the new snapshot with the previous record sees
+        # a SHA-256 that does not match and does not restore it.
         baseline_disk = ASSETS / "hermit-boot.qcow2"
         publish_file_atomic(snapshot_disk, baseline_disk)
+        write_boot_snapshot_record(baseline_disk, snapshot_sha, producer)
         archived_disk = run_dir / "boot-snapshot.qcow2"
         copy_file(snapshot_disk, archived_disk)
         # serial_log already lives inside run_dir, so it is published with the

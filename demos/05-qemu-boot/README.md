@@ -252,6 +252,10 @@ Archived snapshot: ignored/qemu-linux/boot-anchor/boot-snapshot.qcow2
 - The snapshot is published as `ignored/qemu-linux/hermit-boot.qcow2` (or under
   `QEMU_ASSETS`). [Demo 6](../06-qemu-resume/README.md) and
   [demo 7](../07-drgn-kernel/README.md) restore it instead of booting again.
+  Next to it, `hermit-boot.qcow2.producer.json` records the snapshot's SHA-256
+  and the `INITRAMFS_VERSION` and SHA-256 of the initramfs this boot started
+  from; demo 6 restores the snapshot only when that record matches the current
+  initramfs. A snapshot saved at `QEMU_SNAPSHOT_DISK` gets the same record.
 
 ## How it works
 
