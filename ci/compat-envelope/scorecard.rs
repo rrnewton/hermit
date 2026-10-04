@@ -2221,6 +2221,12 @@ impl ResultRow {
                     report.verdict
                 ));
             }
+            if Self::matched_report_names_divergence(&report, attempt) {
+                return Err(format!(
+                    "attempt {} stripped match report names a divergence",
+                    index + 1
+                ));
+            }
             if !self.matched_attempt_passed(index, attempt, &report)? {
                 return Err(format!(
                     "attempt {} matched report belongs to an attempt that did not pass",
@@ -2229,6 +2235,32 @@ impl ResultRow {
             }
         }
         Ok(())
+    }
+
+    /// Whether a matched report, or the attempt that carries it, names a
+    /// divergence: a first divergent scheduler turn, virtual time, record,
+    /// syscall or message. A match found no divergence, so any of them
+    /// contradicts the report.
+    fn matched_report_names_divergence(
+        report: &canonical_verdict::VerificationReport,
+        attempt: &JsonValue,
+    ) -> bool {
+        report.first_divergent_scheduler_turn.is_some()
+            || report.first_divergent_virtual_nanoseconds.is_some()
+            || report.first_divergent_record.is_some()
+            || report.first_divergent_syscall.is_some()
+            || report.first_divergent_left_message.is_some()
+            || report.first_divergent_right_message.is_some()
+            || [
+                "first_divergent_scheduler_turn",
+                "first_divergent_virtual_nanoseconds",
+                "first_divergent_record",
+                "first_divergent_syscall",
+                "first_divergent_left_message",
+                "first_divergent_right_message",
+            ]
+            .iter()
+            .any(|field| attempt.get(field).is_some_and(|value| !value.is_null()))
     }
 
     fn embedded_report(
@@ -2889,25 +2921,7 @@ impl ResultRow {
                                 }
                                 // A matched report names no divergence, in the
                                 // report or in the attempt that carries it.
-                                if report.first_divergent_scheduler_turn.is_some()
-                                    || report.first_divergent_virtual_nanoseconds.is_some()
-                                    || report.first_divergent_record.is_some()
-                                    || report.first_divergent_syscall.is_some()
-                                    || report.first_divergent_left_message.is_some()
-                                    || report.first_divergent_right_message.is_some()
-                                    || [
-                                        "first_divergent_scheduler_turn",
-                                        "first_divergent_virtual_nanoseconds",
-                                        "first_divergent_record",
-                                        "first_divergent_syscall",
-                                        "first_divergent_left_message",
-                                        "first_divergent_right_message",
-                                    ]
-                                    .iter()
-                                    .any(|field| {
-                                        attempt.get(field).is_some_and(|value| !value.is_null())
-                                    })
-                                {
+                                if Self::matched_report_names_divergence(&report, attempt) {
                                     return Err(format!(
                                         "attempt {} matched report the runner did not pass carries a divergence coordinate",
                                         index + 1
@@ -3008,6 +3022,17 @@ impl ResultRow {
                         .ok_or_else(|| format!("attempt {} has invalid shell_command", index + 1))?
                         .into();
                     if stripped_match {
+                        // A matched report names no divergence. The check
+                        // above covers only an attempt the runner did not
+                        // pass; a passing attempt's stripped report that
+                        // names one, in the report or in the attempt, is the
+                        // same contradiction and earns no stripped pass.
+                        if Self::matched_report_names_divergence(&report, attempt) {
+                            return Err(format!(
+                                "attempt {} stripped match report names a divergence",
+                                index + 1
+                            ));
+                        }
                         // The runner's own stripped rule stands in for the
                         // exact BitwiseInfoV1 policy check below. A report
                         // that fails it earns no credit, as a canonical one
@@ -35113,6 +35138,53 @@ mod post_verdict_transaction_tests {
                 error.contains("cannot support a green result"),
                 "{label} verify-results: {error}"
             );
+        }
+    }
+
+    /// A matched stripped report names no divergence: a divergence coordinate
+    /// in the report, or in the passing attempt that carries it, contradicts
+    /// the match, so the row is refused rather than credited as a stripped
+    /// pass.
+    #[test]
+    fn goalpost_matched_stripped_rejects_divergence_metadata() {
+        let measured = "a".repeat(40);
+        let (_, stripped) = stripped_row(&measured);
+        for (field, value) in [
+            ("first_divergent_scheduler_turn", serde_json::json!(1)),
+            ("first_divergent_virtual_nanoseconds", serde_json::json!(1)),
+            ("first_divergent_record", serde_json::json!(1)),
+            ("first_divergent_syscall", serde_json::json!(1)),
+            (
+                "first_divergent_left_message",
+                serde_json::json!("different left record"),
+            ),
+            (
+                "first_divergent_right_message",
+                serde_json::json!("different right record"),
+            ),
+        ] {
+            for location in ["report", "attempt"] {
+                let row = if location == "report" {
+                    with_edited_report(&stripped, &|report| {
+                        report[field] = value.clone();
+                    })
+                } else {
+                    let mut row = stripped.clone();
+                    row["attempts"][0][field] = value.clone();
+                    row
+                };
+                let row: ResultRow = serde_json::from_value(row).unwrap();
+                assert!(
+                    row.comparison_evidence().is_err(),
+                    "{location} {field} was credited"
+                );
+                // The verify-results admission of a stripped PASS refuses the
+                // same contradiction.
+                assert!(
+                    row.require_canonical_pass_evidence().is_err(),
+                    "{location} {field} was admitted as a green stripped pass"
+                );
+            }
         }
     }
 
