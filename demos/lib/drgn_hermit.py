@@ -82,6 +82,10 @@ class GuestConfig:
     kernel: Path
     initrd: Path
     vmlinux: Path
+    # The boot snapshot, by the name ensure_boot_snapshot checked. Demo 5's
+    # record of it is read next to this name (verify_boot_snapshot reads
+    # <snapshot_disk>.producer.json), so a symlinked name must not be resolved:
+    # the record next to the symlink's target is not the one that was checked.
     snapshot_disk: Path
     snapshot_name: str
     advance_command: str
@@ -966,7 +970,8 @@ class HermitGuestProgram:
         shutil.copyfile(str(self.config.snapshot_disk), str(working_snapshot))
         # Demo 5 does not take a lock, so it may have replaced the boot
         # snapshot, or its record, after ensure_boot_snapshot checked them.
-        # Check the copy that QEMU restores, as demo 6 does.
+        # Check the copy that QEMU restores, as demo 6 does, against the record
+        # next to config.snapshot_disk, the name ensure_boot_snapshot checked.
         try:
             verify_boot_snapshot(
                 self.config.snapshot_disk,

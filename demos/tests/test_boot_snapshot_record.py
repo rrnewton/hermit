@@ -93,6 +93,68 @@ class _StandIns(unittest.TestCase):
             dc.verify_boot_snapshot(snapshot, self.root, self.assets, disk=disk)
         self.assertEqual(str(caught.exception), expected)
 
+    def symlinked_snapshot(self) -> Path:
+        """A boot snapshot reached through a symlink: alias.qcow2 names
+        store/boot-1.qcow2, which holds SNAPSHOT. Neither has a record yet.
+        Returns the symlink."""
+        target = self.directory / "store" / "boot-1.qcow2"
+        target.parent.mkdir()
+        target.write_bytes(SNAPSHOT)
+        alias = self.directory / "alias.qcow2"
+        alias.symlink_to(target)
+        return alias
+
+    def symlinked_snapshot_cases(self, alias: Path):
+        """The records of the symlinked snapshot ``alias`` that are refused.
+
+        Each case is (name, prepare, reason): ``prepare`` writes the records,
+        and ``reason`` is what verify_boot_snapshot says about them when it is
+        given ``alias`` and checks the bytes at ``disk``. Only the record next
+        to the name ``alias`` counts, so the cases with a matching record next
+        to the symlink's target are refused too.
+        """
+        target = alias.resolve()
+        other = b"another boot snapshot"
+
+        def no_record():
+            pass
+
+        def other_bytes():
+            dc.write_boot_snapshot_record(
+                alias, _sha256(other), dc.initramfs_producer(self.root, self.assets)
+            )
+
+        def missing(disk):
+            return (
+                "it has no record of the initramfs it was booted from ({} is "
+                "missing)".format(dc.boot_snapshot_record_path(alias))
+            )
+
+        def mismatched(disk):
+            return "{} has SHA-256 {}, not the {} that demo 5 recorded for it".format(
+                disk, _sha256(SNAPSHOT), _sha256(other)
+            )
+
+        return (
+            ("no record", no_record, missing),
+            (
+                "a matching record next to the target only",
+                lambda: self.record(target),
+                missing,
+            ),
+            ("a record of other bytes", other_bytes, mismatched),
+            (
+                "a record of other bytes next to the name and a matching one "
+                "next to the target",
+                lambda: (other_bytes(), self.record(target)),
+                mismatched,
+            ),
+        )
+
+    def clear_records(self, alias: Path) -> None:
+        for snapshot in (alias, alias.resolve()):
+            dc.boot_snapshot_record_path(snapshot).unlink(missing_ok=True)
+
 
 class BootSnapshotRecordTest(_StandIns):
     """The record, and what verify_boot_snapshot accepts."""
@@ -515,6 +577,29 @@ class Demo6EnsureBootSnapshotTest(_StandIns):
         self.ensure(custom)
         self.assertEqual(self.commands, [])
 
+    def test_a_symlinked_custom_snapshot_is_judged_by_the_record_next_to_its_name(self):
+        # Demo 6 reads the record next to the name QEMU_BOOT_SNAPSHOT_DISK
+        # gives, never next to the symlink's target; demo 7 does the same
+        # (Demo7SymlinkedSnapshotTest).
+        alias = self.symlinked_snapshot()
+        self.record(alias)
+        self.ensure(alias, demo5=self.demo5_saves())
+        self.assertEqual(self.commands, [])
+        for name, prepare, reason in self.symlinked_snapshot_cases(alias):
+            with self.subTest(case=name):
+                self.clear_records(alias)
+                prepare()
+                with self.assertRaises(RuntimeError) as caught:
+                    self.ensure(alias, demo5=self.demo5_saves())
+                self.assertTrue(
+                    str(caught.exception).startswith(
+                        "refusing to restore the custom boot snapshot {} "
+                        "(QEMU_BOOT_SNAPSHOT_DISK): {}".format(alias, reason(alias))
+                    ),
+                    str(caught.exception),
+                )
+                self.assertEqual(self.commands, [])
+
     def test_a_missing_custom_snapshot_is_refused_as_before(self):
         custom = self.directory / "custom-boot.qcow2"
         with self.assertRaises(RuntimeError) as caught:
@@ -537,12 +622,14 @@ class Demo6ResumeCopyTest(_StandIns):
     def setUpClass(cls):
         cls.demo6 = runpy.run_path(str(DEMOS_DIR / "06-qemu-resume" / "run.py"))
 
-    def resume(self, after_check=None):
+    def resume(self, after_check=None, boot_snapshot=None):
         """Run resume_once until it would start Hermit.
 
         ensure_boot_snapshot is replaced by ``after_check``, which runs where
-        the real one would have accepted the snapshot. Returns what the demo
-        raised and how often it started Hermit and released the demo lock.
+        the real one would have accepted the snapshot. ``boot_snapshot`` is
+        QEMU_BOOT_SNAPSHOT_DISK, the default snapshot unless given. Returns what
+        the demo raised and how often it started Hermit and released the demo
+        lock.
         """
         resume_once = self.demo6["resume_once"]
         started = []
@@ -557,7 +644,7 @@ class Demo6ResumeCopyTest(_StandIns):
             "ROOT": self.root,
             "QEMU": "qemu-system-x86_64",
             "SNAPSHOT_DISK": self.assets / "hermit-snapshot.qcow2",
-            "BOOT_SNAPSHOT_DISK": self.snapshot,
+            "BOOT_SNAPSHOT_DISK": self.snapshot if boot_snapshot is None else boot_snapshot,
             "check_dependencies": lambda root: "dependency check replaced by the test",
             "hermit_binary": lambda: "hermit",
             "ensure_boot_snapshot": after_check or (lambda: None),
@@ -619,6 +706,32 @@ class Demo6ResumeCopyTest(_StandIns):
         self.assertIsInstance(outcome, ReachedHermit)
         self.assertEqual(len(started), 1)
         self.assertEqual(released, ["lock"])
+
+    def test_a_symlinked_boot_snapshot_is_checked_against_the_record_next_to_its_name(self):
+        # The copy is checked against the record next to the name
+        # QEMU_BOOT_SNAPSHOT_DISK gives, the record ensure_boot_snapshot read;
+        # demo 7 does the same (Demo7SymlinkedSnapshotTest).
+        alias = self.symlinked_snapshot()
+        copy = self.assets / "hermit-snapshot.qcow2"
+        self.record(alias)
+        outcome, started, released = self.resume(boot_snapshot=alias)
+        self.assertIsInstance(outcome, ReachedHermit, repr(outcome))
+        self.assertEqual(len(started), 1)
+        for name, prepare, reason in self.symlinked_snapshot_cases(alias):
+            with self.subTest(case=name):
+                self.clear_records(alias)
+                prepare()
+                outcome, started, released = self.resume(boot_snapshot=alias)
+                self.assertIs(type(outcome), RuntimeError, repr(outcome))
+                self.assertTrue(
+                    str(outcome).startswith(
+                        "the copy {} of the boot snapshot {} does not match demo 5's "
+                        "record: {}".format(copy, alias, reason(copy))
+                    ),
+                    str(outcome),
+                )
+                self.assertEqual(started, [])
+                self.assertEqual(released, ["lock"])
 
 
 class ReachedTheNextStep(Exception):
@@ -1111,6 +1224,152 @@ class Demo7RestoreCopyTest(_StandIns):
         self.assertIn(
             "it was booted from an initramfs with SHA-256 {}".format(_sha256(INITRAMFS)),
             str(caught),
+        )
+        self.assertFalse(started)
+
+
+class Demo7SymlinkedSnapshotTest(_StandIns):
+    """Demo 7 reads demo 5's record next to the boot snapshot's name as
+    DEMO07_SNAPSHOT_DISK gives it, both before its first pass and when each
+    pass checks its copy (https://github.com/rrnewton/hermit/pull/3703). The
+    name may be a symlink and is not resolved, so the record next to the
+    symlink's target is never the one read; and the record still binds the
+    bytes, because each check hashes what the name reaches or the copy QEMU
+    restores. These run demo 7's own _config, _ensure_boot_snapshot and a
+    pass's start(), in main()'s order, with demo 5, drgn and Hermit replaced."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("hermit", "qemu", "bzImage", "vmlinux"):
+            (self.directory / name).write_bytes(b"")
+        names = ("drgn", "drgn.helpers", "drgn.helpers.linux", "drgn.helpers.linux.list")
+        stubs = {name: types.ModuleType(name) for name in names}
+        stubs["drgn.helpers.linux.list"].list_for_each_entry = mock.Mock()
+        with mock.patch.dict(sys.modules, stubs), mock.patch.object(sys, "path", list(sys.path)):
+            self.module = runpy.run_path(
+                str(DEMOS_DIR / "07-drgn-kernel" / "task_evolution.py"),
+                run_name="demo07_task_evolution",
+            )
+        self.alias = self.symlinked_snapshot()
+        self.rebuilds = []
+        for patch in (
+            mock.patch.dict(
+                self.module["_config"].__globals__,
+                {
+                    "ROOT": self.root,
+                    "hermit_binary": lambda: str(self.directory / "hermit"),
+                    "_rebuild_boot_snapshot": lambda: self.rebuilds.append("demo 5"),
+                },
+            ),
+            mock.patch.dict(
+                os.environ,
+                {
+                    "QEMU_BIN": str(self.directory / "qemu"),
+                    "DEMO07_KERNEL": str(self.directory / "bzImage"),
+                    "DEMO07_INITRD": str(self.initramfs),
+                    "DEMO07_VMLINUX": str(self.directory / "vmlinux"),
+                    "DEMO07_SNAPSHOT_DISK": str(self.alias),
+                    "DEMO07_ARTIFACTS": str(self.directory / "artifacts"),
+                    "DEMO07_ASSETS": str(self.assets),
+                    "QEMU_SOCKET_DIR": str(self.directory / "sockets"),
+                },
+            ),
+        ):
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def first_check(self):
+        """Demo 7's check before its first pass; returns what it raised."""
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.module["_ensure_boot_snapshot"]()
+        except Exception as error:  # noqa: BLE001 - returned to the test
+            return error
+        return None
+
+    def restore(self, config):
+        """Run a pass's start() until it would start Hermit. Returns what it
+        raised and whether it started Hermit."""
+        popen = mock.Mock(side_effect=ReachedHermit)
+        program = dh.HermitGuestProgram(config)
+        with mock.patch.object(
+            dh, "ensure_vmlinux", return_value=config.vmlinux
+        ), mock.patch.object(dh.subprocess, "Popen", popen):
+            try:
+                program.start()
+            except Exception as error:  # noqa: BLE001 - returned to the test
+                return error, popen.called
+        self.fail("start() returned without starting Hermit")
+
+    def assert_refused(self, first, restored, reason) -> None:
+        """Both checks refused the symlinked snapshot, for ``reason``."""
+        self.assertIsInstance(first, RuntimeError, repr(first))
+        self.assertIsInstance(first.__cause__, dc.BootSnapshotMismatch)
+        self.assertTrue(
+            str(first).startswith(
+                "refusing to restore the custom boot snapshot {} "
+                "(DEMO07_SNAPSHOT_DISK): {}".format(self.alias, reason(self.alias))
+            ),
+            str(first),
+        )
+        caught, started = restored
+        self.assertIsInstance(caught, RuntimeError, repr(caught))
+        self.assertIsInstance(caught.__cause__, dc.BootSnapshotMismatch)
+        match = re.match(
+            r"the copy (\S+/snapshot\.qcow2) of the boot snapshot (\S+) does not "
+            r"match demo 5's record: ",
+            str(caught),
+        )
+        self.assertIsNotNone(match, str(caught))
+        self.assertEqual(match.group(2), str(self.alias))
+        self.assertTrue(
+            str(caught)[match.end() :].startswith(reason(match.group(1))), str(caught)
+        )
+        self.assertFalse(started)
+        self.assertEqual(self.rebuilds, [])
+
+    def test_a_valid_snapshot_reached_through_a_symlink_passes_and_is_restored(self):
+        # demo 5's record sits next to the name, alias.qcow2, and none next to
+        # the target: the check of each copy must read the same record as the
+        # first check did.
+        self.record(self.alias)
+        self.assertFalse(dc.boot_snapshot_record_path(self.alias.resolve()).exists())
+        config = self.module["_config"]()
+        self.assertIsNone(self.first_check())
+        caught, started = self.restore(config)
+        self.assertIsInstance(caught, ReachedHermit, repr(caught))
+        self.assertTrue(started)
+        self.assertEqual(self.rebuilds, [])
+
+    def test_a_symlinked_snapshot_without_a_matching_record_is_refused(self):
+        for name, prepare, reason in self.symlinked_snapshot_cases(self.alias):
+            with self.subTest(case=name):
+                self.clear_records(self.alias)
+                prepare()
+                config = self.module["_config"]()
+                self.assert_refused(self.first_check(), self.restore(config), reason)
+
+    def test_a_symlink_pointed_at_other_bytes_after_the_check_is_not_restored(self):
+        # The record binds the bytes, not the name: a symlink that names other
+        # bytes by the time a pass copies it is refused at that pass.
+        self.record(self.alias)
+        config = self.module["_config"]()
+        self.assertIsNone(self.first_check())
+        other = self.directory / "store" / "boot-2.qcow2"
+        other.write_bytes(b"a boot snapshot published after the check")
+        self.alias.unlink()
+        self.alias.symlink_to(other)
+        caught, started = self.restore(config)
+        self.assertIsInstance(caught, RuntimeError, repr(caught))
+        self.assertRegex(
+            str(caught),
+            r"^the copy (\S+/snapshot\.qcow2) of the boot snapshot {} does not match "
+            r"demo 5's record: \1 has SHA-256 {}, not the {} that demo 5 recorded "
+            r"for it".format(
+                re.escape(str(self.alias)),
+                _sha256(b"a boot snapshot published after the check"),
+                _sha256(SNAPSHOT),
+            ),
         )
         self.assertFalse(started)
 

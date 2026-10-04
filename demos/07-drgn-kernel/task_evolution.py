@@ -51,6 +51,26 @@ def _optional_path(variable: str):
     return Path(value).resolve() if value else None
 
 
+def _boot_snapshot_disk() -> Path:
+    """DEMO07_SNAPSHOT_DISK exactly as run.sh gave it, with no symlink resolved.
+
+    Demo 5 writes its record of a boot snapshot next to the name it was given,
+    as <name>.producer.json, and verify_boot_snapshot reads the record next to
+    the name it is given. The check before the first pass
+    (_ensure_boot_snapshot) and the check of each pass's copy
+    (HermitGuestProgram.start, through _config) are both given this one name,
+    so they read the same record, the one demo 6 reads for the same name.
+    Resolving a symlinked name, as _required_path does, would send the check of
+    each copy to a record next to the symlink's target instead.
+    """
+    value = os.environ.get("DEMO07_SNAPSHOT_DISK")
+    if not value:
+        raise RuntimeError(
+            "DEMO07_SNAPSHOT_DISK is not set; run demos/07-drgn-kernel/run.sh"
+        )
+    return Path(value)
+
+
 def _config() -> GuestConfig:
     return GuestConfig(
         root=ROOT,
@@ -59,7 +79,7 @@ def _config() -> GuestConfig:
         kernel=_required_path("DEMO07_KERNEL"),
         initrd=_required_path("DEMO07_INITRD"),
         vmlinux=_required_path("DEMO07_VMLINUX"),
-        snapshot_disk=_required_path("DEMO07_SNAPSHOT_DISK"),
+        snapshot_disk=_boot_snapshot_disk(),
         snapshot_name=os.environ.get("DEMO07_SNAPSHOT_NAME", "hermit-boot"),
         advance_command=DEFAULT_ADVANCE_COMMAND,
         artifact_dir=_required_path("DEMO07_ARTIFACTS"),
@@ -85,7 +105,9 @@ def _ensure_boot_snapshot() -> None:
     """Check demo 5's boot snapshot before any pass restores it.
 
     The paths are compared as run.sh gave them, so the default snapshot,
-    $DEMO07_ASSETS/hermit-boot.qcow2, is rebuilt and any other is refused.
+    $DEMO07_ASSETS/hermit-boot.qcow2, is rebuilt and any other is refused. The
+    snapshot is named by _boot_snapshot_disk, the name every pass's check of its
+    copy uses too.
     """
     for variable in ("DEMO07_SNAPSHOT_DISK", "DEMO07_ASSETS"):
         if not os.environ.get(variable):
@@ -93,7 +115,7 @@ def _ensure_boot_snapshot() -> None:
                 "{} is not set; run demos/07-drgn-kernel/run.sh".format(variable)
             )
     ensure_boot_snapshot(
-        Path(os.environ["DEMO07_SNAPSHOT_DISK"]),
+        _boot_snapshot_disk(),
         ROOT,
         Path(os.environ["DEMO07_ASSETS"]),
         _rebuild_boot_snapshot,
