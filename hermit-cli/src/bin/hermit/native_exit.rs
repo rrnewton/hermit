@@ -5,6 +5,8 @@
 //! dedicated channel. Nothing here changes guest scheduling or host signals.
 
 use std::mem::ManuallyDrop;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
 use std::os::fd::OwnedFd;
 use std::panic::AssertUnwindSafe;
 
@@ -27,46 +29,135 @@ pub(super) fn with_early_owner<T>(
         // without terminal cleanup. Only an attempted setup failure is fatal.
         return work(None);
     }
-    // SAFETY: the Cargo/OSS main is synchronous and its pinned fbinit wrapper
-    // starts no threads. This call precedes tracing, Tokio and guest setup.
-    // No owner is captured by a child callback. This main thread stays alive,
-    // without exec or credential/namespace changes, through the exact wait.
-    let authority = unsafe { StartupAuthority::assert_exclusive_early_launch() };
-    let owner = match BrokerOwner::bootstrap(authority) {
-        Ok(owner) => owner,
-        Err(failure) => {
-            let primary = anyhow::anyhow!("native exit broker bootstrap: {failure:?}");
-            // Unexpected received rights remain owned until native CLI exit;
-            // do not ordinarily close an unclassified foreign reference.
-            let mut retained = ManuallyDrop::new(failure);
-            if let Some(owner) = retained.child.take()
-                && let Err(cleanup) = settle(*owner)
-            {
-                return Err(primary.context(format!("bootstrap child cleanup: {cleanup:#}")));
+    with_optional_peer_pidfd_capability(probe_peer_pidfd, work, |work| {
+        // SAFETY: the Cargo/OSS main is synchronous and its pinned fbinit wrapper
+        // starts no threads. This call precedes tracing, Tokio and guest setup.
+        // No owner is captured by a child callback. This main thread stays alive,
+        // without exec or credential/namespace changes, through the exact wait.
+        let authority = unsafe { StartupAuthority::assert_exclusive_early_launch() };
+        let owner = match BrokerOwner::bootstrap(authority) {
+            Ok(owner) => owner,
+            Err(failure) => {
+                let primary = anyhow::anyhow!("native exit broker bootstrap: {failure:?}");
+                // Unexpected received rights remain owned until native CLI exit;
+                // do not ordinarily close an unclassified foreign reference.
+                let mut retained = ManuallyDrop::new(failure);
+                if let Some(owner) = retained.child.take()
+                    && let Err(cleanup) = settle(*owner)
+                {
+                    return Err(primary.context(format!("bootstrap child cleanup: {cleanup:#}")));
+                }
+                return Err(primary);
             }
-            return Err(primary);
+        };
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| work(Some(&owner))));
+        if super::owned_container::has_retained_owner() {
+            retain_original_thread(owner, "container producer remains unresolved");
         }
+        let settled = settle(owner);
+        match result {
+            Ok(Ok(value)) => settled.map(|()| value),
+            Ok(Err(primary)) => match settled {
+                Ok(()) => Err(primary),
+                Err(cleanup) => {
+                    Err(primary.context(format!("native broker cleanup failed: {cleanup:#}")))
+                }
+            },
+            Err(payload) => {
+                if let Err(cleanup) = settled {
+                    eprintln!("HERMIT_CLEANUP_FAILED: native broker after panic: {cleanup:#}");
+                }
+                std::panic::resume_unwind(payload)
+            }
+        }
+    })
+}
+
+/// Branch only on host capability availability. This private seam carries no
+/// startup authority: the real early-main caller alone constructs that proof.
+/// The probe has no guest-visible effects and grants no process-death authority.
+fn with_optional_peer_pidfd_capability<T, W>(
+    probe: impl FnOnce() -> std::io::Result<bool>,
+    work: W,
+    supported: impl FnOnce(W) -> Result<T, Error>,
+) -> Result<T, Error>
+where
+    W: FnOnce(Option<&BrokerOwner>) -> Result<T, Error>,
+{
+    let available = probe().map_err(|error| {
+        anyhow::Error::new(error).context("native exit SO_PEERPIDFD capability probe")
+    })?;
+    if available {
+        // A later bootstrap/adoption error must never retry work unconfigured.
+        supported(work)
+    } else {
+        // Ordinary KVM remains available without the optional cleanup protocol.
+        // The unconfigured producer still refuses nonzero PDEATHSIG with ENOSYS.
+        work(None)
+    }
+}
+
+/// Only an unavailable SO_PEERPIDFD option permits the unconfigured route.
+/// Errors creating the socketpair never pass through this classifier.
+fn peer_pidfd_option_error(error: std::io::Error) -> std::io::Result<bool> {
+    if error.raw_os_error() == Some(libc::ENOPROTOOPT) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
+}
+
+fn probe_peer_pidfd() -> std::io::Result<bool> {
+    let mut raw_pair = [-1; 2];
+    // SAFETY: raw_pair is a writable two-descriptor output. These pristine
+    // local endpoints carry no guest descriptors, messages, or protocol state.
+    if unsafe {
+        libc::socketpair(
+            libc::AF_UNIX,
+            libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+            0,
+            raw_pair.as_mut_ptr(),
+        )
+    } != 0
+    {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: successful socketpair installed two new descriptors owned here.
+    let pair = unsafe {
+        [
+            OwnedFd::from_raw_fd(raw_pair[0]),
+            OwnedFd::from_raw_fd(raw_pair[1]),
+        ]
     };
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| work(Some(&owner))));
-    if super::owned_container::has_retained_owner() {
-        retain_original_thread(owner, "container producer remains unresolved");
+    let mut raw_pidfd = -1;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SO_PEERPIDFD is the existing libc Linux ABI constant (77). The result is
+    // discarded: it demonstrates this option, not the launcher's quiescence or
+    // any later job client's identity. Workers still obtain their own pidfds.
+    // SAFETY: both local output objects have the size declared to getsockopt.
+    if unsafe {
+        libc::getsockopt(
+            pair[0].as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERPIDFD,
+            (&mut raw_pidfd as *mut libc::c_int).cast(),
+            &mut length,
+        )
+    } != 0
+    {
+        return peer_pidfd_option_error(std::io::Error::last_os_error());
     }
-    let settled = settle(owner);
-    match result {
-        Ok(Ok(value)) => settled.map(|()| value),
-        Ok(Err(primary)) => match settled {
-            Ok(()) => Err(primary),
-            Err(cleanup) => {
-                Err(primary.context(format!("native broker cleanup failed: {cleanup:#}")))
-            }
-        },
-        Err(payload) => {
-            if let Err(cleanup) = settled {
-                eprintln!("HERMIT_CLEANUP_FAILED: native broker after panic: {cleanup:#}");
-            }
-            std::panic::resume_unwind(payload)
-        }
+    if raw_pidfd < 0 || pair.iter().any(|fd| fd.as_raw_fd() == raw_pidfd) {
+        return Err(std::io::Error::from_raw_os_error(libc::EPROTO));
     }
+    // SAFETY: successful SO_PEERPIDFD returns a new owned descriptor, distinct
+    // from the socketpair. Own it before validating length so a malformed
+    // successful reply with a real descriptor cannot leak that descriptor.
+    let _pidfd = unsafe { OwnedFd::from_raw_fd(raw_pidfd) };
+    if length as usize != std::mem::size_of::<libc::c_int>() {
+        return Err(std::io::Error::from_raw_os_error(libc::EPROTO));
+    }
+    Ok(true)
 }
 
 /// Preserve the real owner on its creator thread. Existing outer CLI/manifest
@@ -251,5 +342,94 @@ mod tests {
         assert!(waited_status(0).is_ok());
         assert!(waited_status(1 << 8).is_err());
         assert!(waited_status(libc::SIGKILL).is_err());
+    }
+    #[test]
+    fn unavailable_peer_pidfd_runs_unconfigured_without_startup_authority() {
+        let calls = std::cell::Cell::new(0);
+        let result = with_optional_peer_pidfd_capability(
+            || peer_pidfd_option_error(std::io::Error::from_raw_os_error(libc::ENOPROTOOPT)),
+            |owner| {
+                assert!(owner.is_none());
+                calls.set(calls.get() + 1);
+                Ok(23)
+            },
+            |_| panic!("unavailable capability must not attempt broker startup"),
+        )
+        .unwrap();
+        assert_eq!(result, 23);
+        assert_eq!(calls.get(), 1);
+    }
+
+    #[test]
+    fn peer_pidfd_probe_errors_preserve_errno_and_run_no_callback() {
+        for errno in [libc::EPERM, libc::EMFILE, libc::EINTR, libc::EINVAL] {
+            let called = std::cell::Cell::new(false);
+            let attempted = std::cell::Cell::new(false);
+            let error = with_optional_peer_pidfd_capability(
+                || peer_pidfd_option_error(std::io::Error::from_raw_os_error(errno)),
+                |_| {
+                    called.set(true);
+                    Ok(())
+                },
+                |_| {
+                    attempted.set(true);
+                    Ok(())
+                },
+            )
+            .unwrap_err();
+            assert!(!called.get());
+            assert!(!attempted.get());
+            assert_eq!(
+                error
+                    .downcast_ref::<std::io::Error>()
+                    .unwrap()
+                    .raw_os_error(),
+                Some(errno)
+            );
+        }
+    }
+
+    #[test]
+    fn socketpair_error_does_not_claim_unavailable_peer_pidfd_option() {
+        let error = with_optional_peer_pidfd_capability(
+            || Err(std::io::Error::from_raw_os_error(libc::ENOPROTOOPT)),
+            |_| -> Result<(), Error> { panic!("socketpair failure must not run guest work") },
+            |_| panic!("socketpair failure must not attempt broker startup"),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::ENOPROTOOPT)
+        );
+    }
+
+    #[test]
+    fn available_peer_pidfd_never_falls_back_after_attempted_setup_failure() {
+        let called = std::cell::Cell::new(false);
+        let attempts = std::cell::Cell::new(0);
+        let error = with_optional_peer_pidfd_capability(
+            || Ok(true),
+            |_| {
+                called.set(true);
+                Ok(())
+            },
+            |_| {
+                attempts.set(attempts.get() + 1);
+                Err(std::io::Error::from_raw_os_error(libc::EPERM).into())
+            },
+        )
+        .unwrap_err();
+        assert!(!called.get());
+        assert_eq!(attempts.get(), 1);
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EPERM)
+        );
     }
 }
