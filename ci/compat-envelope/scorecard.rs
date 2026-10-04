@@ -38107,6 +38107,322 @@ mod post_verdict_transaction_tests {
         }
     }
 
+    fn review3655_has_canonical_failure(cell: &TrackedCell) -> bool {
+        cell.observations.iter().any(|observation| {
+            observation
+                .canonical_comparisons
+                .iter()
+                .any(|comparison| comparison.result == ObservedResult::DeterminismFailure)
+        })
+    }
+
+    fn review3655_assert_failure_or_atomic_refusal(
+        fixture: &Fixture,
+        id: &CellId,
+        before: &GeneratedFiles,
+        result: Result<(), String>,
+    ) {
+        match result {
+            Ok(()) => {
+                let tracked = fixture.cells();
+                let cell = tracked_cell(&tracked, id);
+                assert!(
+                    review3655_has_canonical_failure(cell),
+                    "a below-L2 pass retired the active canonical failure"
+                );
+                assert!(
+                    matches!(
+                        cell.measurement,
+                        MeasurementState::Diverged | MeasurementState::DivergedUnlocated
+                    ),
+                    "the canonical failure was rendered as {:?}",
+                    cell.measurement
+                );
+            }
+            Err(error) => {
+                assert!(
+                    error.contains("canonical")
+                        || error.contains("comparison")
+                        || error.contains("comparator"),
+                    "unrelated refusal: {error}"
+                );
+                assert!(
+                    read_history_files(&fixture.root).unwrap() == *before,
+                    "the refusing import changed history"
+                );
+            }
+        }
+    }
+
+    // Expect FAIL at c900554692a6: terminal_attempt=2 discards attempt 1 before
+    // assigning comparison domains. A fix may preserve both domains or refuse
+    // the comparator switch explicitly, but cannot silently retain only the pass.
+    #[test]
+    fn goalpost3655_a_later_stripped_outer_retry_cannot_erase_canonical_evidence() {
+        let _fixture_lock = history_fixture_lock();
+        for reverse in [false, true] {
+            let fixture = Fixture::new();
+            let measured = fixture.options.results_head.clone().unwrap();
+            let (id, mut stripped) = stripped_row(&measured);
+            let run = "one-run-with-different-comparison-domains";
+            stripped["run_id"] = run.into();
+            stripped["attempt"] = 2.into();
+            let failed = canonical_divergence_row(&measured, run);
+            let typed: ResultRow = serde_json::from_value(stripped.clone()).unwrap();
+            assert!(
+                matches!(
+                    typed.comparison_evidence_from(ResultInput::Retained),
+                    Ok(ValidateRowEvidence::StrippedMatched)
+                ),
+                "valid stripped control"
+            );
+            // canonical_divergence_row already checks the canonical control.
+            let rows = if reverse {
+                vec![stripped, failed]
+            } else {
+                vec![failed, stripped]
+            };
+            goalpost_write_retained_rows(&fixture, &rows);
+            match read_retained_results(
+                &fixture.root,
+                &fixture.options.results,
+                &BTreeSet::from([id.clone()]),
+            ) {
+                Err(error) => assert!(
+                    error.contains("comparison")
+                        || error.contains("comparator")
+                        || error.contains("mix"),
+                    "unrelated refusal: {error}"
+                ),
+                Ok(retained) => {
+                    assert!(
+                        retained
+                            .cells
+                            .iter()
+                            .flat_map(|cell| &cell.candidates)
+                            .any(|candidate| candidate.row.run_id == run
+                                && candidate.row.attempt == 1
+                                && candidate.row.outcome == "FAIL"),
+                        "the stripped terminal retry erased the canonical failure"
+                    );
+                    assert_eq!(retained.terminal_comparisons, 1);
+                    assert_eq!(retained.stale_coordinate_rows, 0);
+                    assert!(retained.no_result_cells.is_empty());
+                }
+            }
+        }
+    }
+
+    // A real same-policy retry can end without a comparison. Expect FAIL here:
+    // the terminal no-verdict row makes the retained reader discard the earlier
+    // canonical failure, and an independent stripped run turns the cell green.
+    #[test]
+    fn goalpost3655_a_no_verdict_retry_plus_a_stripped_run_cannot_erase_a_failure() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        capture_empty_series(&fixture);
+        let older = fixture.options.results_head.clone().unwrap();
+        let newer = fixture.options.expected_head.clone();
+        let (id, stripped) = stripped_row(&newer);
+        let failed = canonical_divergence_row(&older, "canonical-retry-run");
+        let report =
+            serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap();
+        let mut no_verdict = with_report(&failed, &report);
+        no_verdict["attempt"] = 2.into();
+        no_verdict["outcome"] = "ERROR".into();
+        no_verdict["result"] = JsonValue::Null;
+        no_verdict["failure_class"] = "no_result".into();
+        no_verdict["error_kind"] = "incomplete-verification-evidence".into();
+        no_verdict["attempts"][0]["outcome"] = "ERROR".into();
+        no_verdict["attempts"][0]["status"] = 75.into();
+        no_verdict["attempts"][0]["error_kind"] = "incomplete-verification-evidence".into();
+        for field in [
+            "first_divergent_scheduler_turn",
+            "first_divergent_virtual_nanoseconds",
+            "first_divergent_record",
+            "first_divergent_syscall",
+        ] {
+            no_verdict[field] = JsonValue::Null;
+        }
+        for field in [
+            "first_divergent_scheduler_turn",
+            "first_divergent_virtual_nanoseconds",
+            "first_divergent_record",
+            "first_divergent_syscall",
+            "first_divergent_left_message",
+            "first_divergent_right_message",
+        ] {
+            if no_verdict["attempts"][0]
+                .as_object()
+                .unwrap()
+                .contains_key(field)
+            {
+                no_verdict["attempts"][0][field] = JsonValue::Null;
+            }
+        }
+        let typed: ResultRow = serde_json::from_value(no_verdict.clone()).unwrap();
+        assert!(
+            matches!(
+                typed.comparison_evidence_from(ResultInput::Retained),
+                Ok(ValidateRowEvidence::Unavailable { .. } | ValidateRowEvidence::NotRun { .. })
+            ),
+            "the second retry is a valid no-verdict control"
+        );
+        assert_eq!(
+            failed["argv"], no_verdict["argv"],
+            "same comparator and command"
+        );
+        import_retained_rows(&fixture, std::slice::from_ref(&failed)).unwrap();
+        assert!(review3655_has_canonical_failure(tracked_cell(
+            &fixture.cells(),
+            &id
+        )));
+        let before = read_history_files(&fixture.root).unwrap();
+        let result = import_retained_rows(&fixture, &[failed, no_verdict, stripped]);
+        review3655_assert_failure_or_atomic_refusal(&fixture, &id, &before, result);
+    }
+
+    // The other ruling's arm must remain a hard refusal even before the ordinary
+    // terminal-row collapse. Expect FAIL: the later stripped row hides this
+    // individually refused canonical Matched/verified/non-bitwise report.
+    #[test]
+    fn goalpost3655_a_stripped_terminal_retry_cannot_hide_a_refused_canonical_match() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let run = "refused-canonical-then-stripped";
+        let (id, mut stripped) = stripped_row(&measured);
+        stripped["run_id"] = run.into();
+        stripped["attempt"] = 2.into();
+        let canonical_template = canonical_divergence_row(&measured, run);
+        let mut report = verify_canonical_report(&measured);
+        report["bitwise_parity"] = false.into();
+        let mut refused = with_report(&canonical_template, &report);
+        refused["outcome"] = "PASS".into();
+        refused["result"] = "pass".into();
+        refused["failure_class"] = JsonValue::Null;
+        refused["attempts"][0]["outcome"] = "PASS".into();
+        refused["attempts"][0]["status"] = 0.into();
+        for field in [
+            "first_divergent_scheduler_turn",
+            "first_divergent_virtual_nanoseconds",
+            "first_divergent_record",
+            "first_divergent_syscall",
+        ] {
+            refused[field] = JsonValue::Null;
+            refused["attempts"][0][field] = JsonValue::Null;
+        }
+        let typed: ResultRow = serde_json::from_value(refused.clone()).unwrap();
+        let control = typed
+            .comparison_evidence_from(ResultInput::Retained)
+            .unwrap_err();
+        assert!(
+            control.contains(INCONSISTENT_MATCH),
+            "wrong negative control: {control}"
+        );
+        goalpost_write_retained_rows(&fixture, &[refused, stripped]);
+        let error = match read_retained_results(
+            &fixture.root,
+            &fixture.options.results,
+            &BTreeSet::from([id]),
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("the stripped terminal row carried a refused canonical match through"),
+        };
+        assert!(
+            error.contains(INCONSISTENT_MATCH)
+                || error.contains("comparison")
+                || error.contains("comparator")
+                || error.contains("mix"),
+            "unrelated refusal: {error}"
+        );
+    }
+
+    // Expect FAIL at c900554692a6: remove_imported_validate_projection clears
+    // the existing canonical domain although the replacement input has only
+    // stripped evidence. This is not the same complete-corpus test as F1 added.
+    #[test]
+    fn goalpost3655_a_stripped_only_import_cannot_retire_an_active_canonical_failure() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        capture_empty_series(&fixture);
+        let older = fixture.options.results_head.clone().unwrap();
+        let newer = fixture.options.expected_head.clone();
+        let (id, stripped) = stripped_row(&newer);
+        let failed = canonical_divergence_row(&older, "active-older-canonical-failure");
+        import_retained_rows(&fixture, &[failed]).unwrap();
+        assert!(
+            review3655_has_canonical_failure(tracked_cell(&fixture.cells(), &id)),
+            "the first import must establish a real active failure"
+        );
+        let before = read_history_files(&fixture.root).unwrap();
+        let result = import_retained_rows(&fixture, &[stripped]);
+        review3655_assert_failure_or_atomic_refusal(&fixture, &id, &before, result);
+    }
+
+    // Expect FAIL at c900554692a6: two below-L2 pressure passes are treated as
+    // two canonical matches by retained_coordinate_decision and produce WRONG.
+    // Both retained domains remain present in the second input, so this probe
+    // does not fail by the stripped-only projection-deletion case above.
+    #[test]
+    fn goalpost3655_stripped_pressure_matches_cannot_retire_a_canonical_divergence() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        capture_empty_series(&fixture);
+        let older = fixture.options.results_head.clone().unwrap();
+        let newer = fixture.options.expected_head.clone();
+        let (id, stripped) = stripped_row(&newer);
+        let failed = canonical_divergence_row(&older, "older-canonical-with-position");
+        import_retained_rows(&fixture, std::slice::from_ref(&failed)).unwrap();
+        let before = read_history_files(&fixture.root).unwrap();
+        assert!(review3655_has_canonical_failure(tracked_cell(
+            &fixture.cells(),
+            &id
+        )));
+        let report = canonical_verdict::VerificationReport::from_current_json_slice(
+            stripped["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        )
+        .unwrap();
+        assert!(
+            require_stripped_comparison(&report).is_ok(),
+            "valid below-L2 match"
+        );
+        assert!(report.verified && !report.bitwise_parity);
+        assert!(
+            report.require_canonical_match().is_err(),
+            "not a canonical pass"
+        );
+        let invocation: PressureInvocation = serde_json::from_value(stripped.clone()).unwrap();
+        let summary = PressureSummary {
+            schema: PRESSURE_SUMMARY_SCHEMA,
+            hermit_sha: newer,
+            detcore_tree: git_rev_parse(&fixture.root, "HEAD:detcore").unwrap(),
+            source_tree_dirty: false,
+            rows: (1..=2)
+                .map(|repetition| PressureSummaryRow {
+                    cell: id.clone(),
+                    repetition: Some(repetition),
+                    attempt: 1,
+                    result: "pass".into(),
+                    verification: Some(report.clone()),
+                    evidence_errors: Vec::new(),
+                    invocation: Some(invocation.clone()),
+                })
+                .collect(),
+        };
+        let path = fixture
+            ._directory
+            .path()
+            .join("stripped-current-pressure.json");
+        fs::write(&path, serde_json::to_vec(&summary).unwrap()).unwrap();
+        goalpost_write_retained_rows(&fixture, &[failed, stripped]);
+        let result = import_results(&fixture.root, &fixture.options.results, &[path]);
+        review3655_assert_failure_or_atomic_refusal(&fixture, &id, &before, result);
+    }
+
     // Expect FAIL at c900554692a6, PASS with the F2 storage/binding changes absent:
     // stress-series/v2 remains admitted for historical projection, but a correct
     // attempt-1 event with a Detcore tree has a Result key, while the pass now has
