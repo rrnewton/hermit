@@ -296,7 +296,7 @@ mod tests {
         assert!(!mount_ids_are_ordered_subset(&[10, 10], &[10, 20, 30]));
     }
 
-    const SEED: &[u8] = b"76 1 0:50 / /mnt/xarfuse/uid-212630/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 rw,nosuid,nodev,relatime master:48 - fuse.squashfuse_ll squashfuse_ll rw,user_id=212630,group_id=100,allow_other";
+    const SEED: &[u8] = b"76 1 0:50 / /mnt/xarfuse/uid-1000/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 rw,nosuid,nodev,relatime master:48 - fuse.squashfuse_ll squashfuse_ll rw,user_id=1000,group_id=100,allow_other";
 
     /// The class is the seed name on a SquashFUSE mount, not the directory:
     /// a long-lived SquashFUSE mount under the same prefix stays, a changed
@@ -330,10 +330,11 @@ mod tests {
         }
     }
 
-    /// Named-tool seeds, rows copied from a 2026-10-04 devbig030 host mount
-    /// monitor (two lived four to five seconds; `chef` was remounted under a
-    /// new mount ID), are the same class as per-process seeds. A long-lived
-    /// SquashFUSE mount and a seed-named mount of another type stay.
+    /// Named-tool seeds are the same class as per-process seeds. The rows are
+    /// copied from a 2026-10-04 host mount monitor (two lived four to five
+    /// seconds; `chef` was remounted under a new mount ID); the host is
+    /// recorded in docs/TESTING_ENVIRONMENTS.md under "Named measurement hosts".
+    /// A long-lived SquashFUSE mount and a seed-named mount of another type stay.
     #[test]
     fn named_host_seeds_are_excluded() {
         for named_seed in [

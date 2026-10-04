@@ -4771,9 +4771,9 @@ Rss:                   4 kB\n" as &[u8];
         }
     }
 
-    const SEED_ROW: &[u8] = b"76 1 0:50 / /mnt/xarfuse/uid-212630/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 rw,nosuid,nodev,relatime master:48 - fuse.squashfuse_ll squashfuse_ll rw,user_id=212630,group_id=100,allow_other\n";
+    const SEED_ROW: &[u8] = b"76 1 0:50 / /mnt/xarfuse/uid-1000/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 rw,nosuid,nodev,relatime master:48 - fuse.squashfuse_ll squashfuse_ll rw,user_id=1000,group_id=100,allow_other\n";
     const SEED_ROW_2: &[u8] = b"83 1 0:57 / /mnt/xarfuse/uid-0/695e3eea-seed-nspid4026531836_cgpid52904797-ns-4026531832 rw,nosuid,nodev,relatime master:55 - fuse.squashfuse_ll squashfuse_ll rw,user_id=0,group_id=0,allow_other\n";
-    const LEGIT_ROWS: &[u8] = b"18 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime master:18 - proc proc rw\n100 1 0:70 / /test rw,relatime - tmpfs none rw,uid=212630,gid=100\n37 32 0:36 / /data/users/newton/local/fbsource rw,nosuid,relatime master:34 - fuse edenfs: rw,user_id=212630,group_id=100\n";
+    const LEGIT_ROWS: &[u8] = b"18 1 0:21 / /proc rw,nosuid,nodev,noexec,relatime master:18 - proc proc rw\n100 1 0:70 / /test rw,relatime - tmpfs none rw,uid=1000,gid=100\n37 32 0:36 / /data/users/example/local/fbsource rw,nosuid,relatime master:34 - fuse edenfs: rw,user_id=1000,group_id=100\n";
 
     /// Discriminating regression for the host-membership leak: two host
     /// tables differing only in seed-row membership/order (host churn
