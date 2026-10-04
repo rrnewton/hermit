@@ -53,6 +53,13 @@ impl ForegroundRoot {
         policy_tests::SharedBirthFixture::new_after_setup(thread, before).await
     }
     #[cfg(test)]
+    pub(crate) async fn controlled_shared_birth_after_close_setup_with_profile(
+        thread: i32,
+        before: impl FnOnce(&Arc<Self>, &InitialTableClaim),
+    ) -> policy_tests::SharedBirthFixture {
+        policy_tests::SharedBirthFixture::new_after_setup_with_profile(thread, before).await
+    }
+    #[cfg(test)]
     pub(crate) async fn controlled_shared_birth_after_entry(
         thread: i32,
         before: impl FnOnce(

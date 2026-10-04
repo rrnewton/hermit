@@ -82,6 +82,39 @@ impl SharedBirthFixture {
     pub(crate) fn into_runtime_and_retention(self) -> (NetworkRuntimeResources, Box<dyn std::any::Any>) {
         (self.runtime, Box::new((self._birth, self._peer)))
     }
+    pub(crate) fn into_runtime_and_profile_service(
+        self,
+    ) -> (
+        NetworkRuntimeResources,
+        Box<dyn std::any::Any>,
+        crate::network_runtime::current_close_profile::tests::Service,
+    ) {
+        let service = crate::network_runtime::current_close_profile::tests::serve_existing(
+            &self.runtime,
+            self.parent,
+            self._peer,
+            |peer| &mut peer.peer,
+        );
+        (self.runtime, Box::new(self._birth), service)
+    }
+    pub(crate) async fn new_after_setup_with_profile(
+        thread: i32,
+        setup: impl FnOnce(&Arc<ForegroundRoot>, &InitialTableClaim),
+    ) -> Self {
+        Self::new_with_observer_and_wire(
+            thread,
+            Some(libc::SYS_clone as i32),
+            |root, claim| {
+                setup(root, claim);
+                None
+            },
+            |_, _, _| {},
+            |runtime, _, _| Some(runtime),
+            ProviderWireFormat::Abi12Copy5,
+        )
+        .await
+        .expect("profile fixture retains the original birth path")
+    }
     pub(crate) async fn new(thread: i32) -> Self {
         Self::new_after_entry(thread, |_, _, _| {}).await
     }
@@ -141,6 +174,35 @@ impl SharedBirthFixture {
             NetworkFdPublicationPermit,
         ) -> Option<NetworkRuntimeResources>,
     ) -> Option<Self> {
+        Self::new_with_observer_and_wire(
+            thread,
+            syscall,
+            setup,
+            before,
+            observe,
+            ProviderWireFormat::Abi7Copy4,
+        )
+        .await
+    }
+    async fn new_with_observer_and_wire(
+        thread: i32,
+        syscall: Option<i32>,
+        setup: impl FnOnce(
+            &Arc<ForegroundRoot>,
+            &InitialTableClaim,
+        ) -> Option<NetworkFdPublicationPermit>,
+        before: impl FnOnce(
+            &NetworkRuntimeResources,
+            &Arc<ForegroundRoot>,
+            &crate::network_runtime::JoinedNativePrefix,
+        ),
+        observe: impl FnOnce(
+            NetworkRuntimeResources,
+            &Arc<ForegroundRoot>,
+            NetworkFdPublicationPermit,
+        ) -> Option<NetworkRuntimeResources>,
+        wire: ProviderWireFormat,
+    ) -> Option<Self> {
         let mut pair = [-1; 2];
         assert_eq!(
             unsafe {
@@ -158,13 +220,17 @@ impl SharedBirthFixture {
             NetworkRuntimeResources::from_authenticated_startup(
                 OwnedFd::from_raw_fd(pair[0]),
                 [184; 16],
-                ProviderWireFormat::Abi7Copy4,
+                wire,
             )
         };
         let mut peer = BirthPeer {
             owner,
-            peer: AcceptedSession::new(unsafe { OwnedFd::from_raw_fd(pair[1]) }, [184; 16])
-                .unwrap(),
+            peer: AcceptedSession::from_wire(
+                unsafe { OwnedFd::from_raw_fd(pair[1]) },
+                [184; 16],
+                wire,
+            )
+            .unwrap(),
         };
         let (mut tasks, parent_owner, metadata, memory, claim) = controlled_tasks(thread);
         tasks

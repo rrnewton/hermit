@@ -1779,6 +1779,17 @@ fn validate_startup(started: &StartupReceipt, artifact: &ProviderArtifact) -> io
         // ABI11 adds one executable-source sidecar map, with no new attachments.
         expected_counts[0] += 1;
     }
+    if artifact.wire_format == detcore::network_runtime::ProviderWireFormat::Abi12Copy5 {
+        if !matches!(
+            artifact.topology,
+            detcore::network_runtime::ProviderTopology::FtraceV1 { .. }
+        ) {
+            return Err(io::Error::other(
+                "accepted ABI12 receipt requires copy5 ftrace topology",
+            ));
+        }
+        expected_counts = [26, 49, 49];
+    }
     if [artifact.maps, artifact.programs, artifact.links] != expected_counts
         || artifact.object_sha256 == [0; 32]
         || artifact.library_sha256 == [0; 32]
@@ -3537,6 +3548,219 @@ mod recovery_receipt_tests {
         let terminal = serde_json::json!({"schema":"hermit-accepted-parent-terminal-v1","run":run,"original_ids":ids,"counts":counts,"wrapper_wait":0,"loader":startup.loader,"query_wait":0,"query":startup.query,"readback":{"request":{"run":run,"ids":ids,"counts":counts,"closed_ns":100,"deadline_ns":100+CLOSE_NS},"passes_ns":[101,102]},"terminal_observed_ns":103,"service_stdout":stdout,"service_stderr":""});
         (temp, recovery, startup, terminal)
     }
+    fn abi12_artifact() -> ProviderArtifact {
+        let mut profile = artifact();
+        profile.wire_format = detcore::network_runtime::ProviderWireFormat::Abi12Copy5;
+        profile.topology = detcore::network_runtime::ProviderTopology::FtraceV1 {
+            contract_sha256: [9; 32],
+        };
+        [profile.maps, profile.programs, profile.links] = [26, 49, 49];
+        profile
+    }
+
+    fn abi12_ids(profile: &ProviderArtifact) -> Vec<(u32, u32)> {
+        [profile.maps, profile.programs, profile.links]
+            .into_iter()
+            .enumerate()
+            .flat_map(|(kind, count)| (1..=count).map(move |id| (kind as u32, id as u32)))
+            .collect()
+    }
+
+    // Ordinary receipt grammar only: controlled service/absence rows, real
+    // retained-file publication and admission. No BPF operation is performed.
+    fn abi12_populated(
+        profile: &ProviderArtifact,
+        ids: Vec<(u32, u32)>,
+    ) -> (tempfile::TempDir, AcceptedRecovery, StartupReceipt, Value) {
+        let (_seed_temp, _seed, mut startup, mut terminal) = fixture();
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let root = crate::unix_guard_package::RecoveryDeploymentRoot::open_at(temp.path()).unwrap();
+        let mut recovery = AcceptedRecovery::retain(root, "1a".repeat(16));
+        recovery.initialize(profile.clone()).unwrap();
+        startup.artifact = profile.clone();
+        let counts = [profile.maps, profile.programs, profile.links];
+        let inventory_ids = ids
+            .iter()
+            .map(|(kind, id)| serde_json::json!({"kind":kind,"id":id}))
+            .collect::<Vec<_>>();
+        let mut service: Vec<Value> = terminal["service_stdout"]
+            .as_str()
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        service[0]["inventories"][0]["ids"] = serde_json::json!(inventory_ids);
+        service[1]["close_receipts"][0]["inventory"]["ids"] = serde_json::json!(inventory_ids);
+        let stdout = service
+            .iter()
+            .map(|row| serde_json::to_string(row).unwrap() + "\n")
+            .collect::<String>();
+        recovery.files[1]
+            .as_mut()
+            .unwrap()
+            .write_all(stdout.as_bytes())
+            .unwrap();
+        recovery.files[1].as_ref().unwrap().sync_all().unwrap();
+        terminal["service_stdout"] = stdout.into();
+        terminal["original_ids"] = serde_json::json!(ids);
+        terminal["counts"] = serde_json::json!(counts);
+        terminal["readback"]["request"]["ids"] = serde_json::json!(ids);
+        terminal["readback"]["request"]["counts"] = serde_json::json!(counts);
+        (temp, recovery, startup, terminal)
+    }
+
+    #[test]
+    fn abi12_exact_124_normal_receipt_publishes_and_reads_back() {
+        let profile = abi12_artifact();
+        let (_temp, mut recovery, startup, terminal) =
+            abi12_populated(&profile, abi12_ids(&profile));
+        validate_startup(&startup, &profile).unwrap();
+        recovery
+            .started(serde_json::to_value(startup).unwrap())
+            .unwrap();
+        recovery.finish(terminal).unwrap();
+        let readback =
+            validate_accepted_receipt(&recovery.root, &recovery.label, &profile).unwrap();
+        assert_eq!(readback.counts, [26, 49, 49]);
+        assert_eq!(readback.original_ids.len(), 124);
+        assert_eq!(
+            readback
+                .original_ids
+                .iter()
+                .filter(|(kind, _)| *kind == 0)
+                .count(),
+            26
+        );
+        assert!(readback.original_ids.contains(&(0, 26)));
+        assert!(recovery.finished);
+        assert!(!recovery.failed);
+    }
+
+    #[test]
+    fn abi12_normal_receipt_refuses_missing_extra_duplicate_or_mistyped_map() {
+        for variant in 0..4 {
+            let profile = abi12_artifact();
+            let mut ids = abi12_ids(&profile);
+            let last_map = ids.iter().position(|pair| *pair == (0, 26)).unwrap();
+            match variant {
+                0 => {
+                    ids.remove(last_map);
+                }
+                1 => ids.push((0, 27)),
+                2 => ids.push((0, 26)),
+                3 => ids[last_map] = (1, 50),
+                _ => unreachable!(),
+            }
+            // READY, both close inventories, and readback all carry the same
+            // false population: exact typed counts, not mere agreement, refuse.
+            let (_temp, mut recovery, startup, terminal) = abi12_populated(&profile, ids);
+            recovery
+                .started(serde_json::to_value(startup).unwrap())
+                .unwrap();
+            assert!(recovery.finish(terminal).is_err(), "variant {variant}");
+            assert!(validate_accepted_receipt(&recovery.root, &recovery.label, &profile).is_err());
+        }
+    }
+
+    #[test]
+    fn abi12_startup_and_terminal_refuse_crossed_wire_topology_and_counts() {
+        // Copy4 is outside the published ABI12 enum. Reject its actual wire
+        // spelling at the real artifact, startup, publication, and completed
+        // journal boundaries instead of constructing an impossible typed value.
+        let profile = abi12_artifact();
+        let mut encoded_artifact = serde_json::to_value(&profile).unwrap();
+        assert!(serde_json::from_value::<ProviderArtifact>(encoded_artifact.clone()).is_ok());
+        encoded_artifact["wire_format"] = "abi12-copy4".into();
+        assert!(serde_json::from_value::<ProviderArtifact>(encoded_artifact).is_err());
+        let (_temp, mut recovery, startup, terminal) =
+            abi12_populated(&profile, abi12_ids(&profile));
+        let mut encoded_startup = serde_json::to_value(startup).unwrap();
+        assert!(serde_json::from_value::<StartupReceipt>(encoded_startup.clone()).is_ok());
+        encoded_startup["artifact"]["wire_format"] = "abi12-copy4".into();
+        assert!(serde_json::from_value::<StartupReceipt>(encoded_startup.clone()).is_err());
+        assert!(recovery.started(encoded_startup).is_err());
+        assert!(recovery.started.is_none());
+        assert!(recovery.failed);
+        assert!(recovery.finish(terminal).is_err());
+
+        let (_temp, mut recovery, startup, terminal) =
+            abi12_populated(&profile, abi12_ids(&profile));
+        recovery
+            .started(serde_json::to_value(startup).unwrap())
+            .unwrap();
+        recovery.finish(terminal).unwrap();
+        validate_accepted_receipt(&recovery.root, &recovery.label, &profile).unwrap();
+        let original = receipt_read(recovery.files[0].as_ref().unwrap()).unwrap();
+        let rows: Vec<Value> = std::str::from_utf8(&original)
+            .unwrap()
+            .lines()
+            .map(|row| serde_json::from_str(row).unwrap())
+            .collect();
+        assert_eq!(rows.len(), 3);
+        for index in [0, 1] {
+            let mut changed = rows.clone();
+            if index == 0 {
+                assert!(serde_json::from_value::<BeforeReceipt>(changed[0].clone()).is_ok());
+                changed[0]["artifact"]["wire_format"] = "abi12-copy4".into();
+                assert!(serde_json::from_value::<BeforeReceipt>(changed[0].clone()).is_err());
+            } else {
+                assert!(serde_json::from_value::<StartedReceipt>(changed[1].clone()).is_ok());
+                changed[1]["observed"]["artifact"]["wire_format"] = "abi12-copy4".into();
+                assert!(serde_json::from_value::<StartedReceipt>(changed[1].clone()).is_err());
+            }
+            let file = recovery.files[0].as_mut().unwrap();
+            file.set_len(0).unwrap();
+            file.seek(SeekFrom::Start(0)).unwrap();
+            for row in changed {
+                writeln!(file, "{}", serde_json::to_string(&row).unwrap()).unwrap();
+            }
+            file.sync_all().unwrap();
+            assert!(validate_accepted_receipt(&recovery.root, &recovery.label, &profile).is_err());
+        }
+
+        let mut profiles = Vec::new();
+        for topology in [
+            detcore::network_runtime::ProviderTopology::ClassicV40,
+            detcore::network_runtime::ProviderTopology::GroupedV1 {
+                contract_sha256: [9; 32],
+            },
+        ] {
+            let mut wrong = abi12_artifact();
+            wrong.topology = topology;
+            profiles.push(wrong);
+        }
+        for counts in [
+            [24, 49, 49],
+            [25, 49, 49],
+            [27, 49, 49],
+            [26, 48, 49],
+            [26, 50, 49],
+            [26, 49, 48],
+            [26, 49, 50],
+            [25, 50, 49],
+        ] {
+            let mut wrong = abi12_artifact();
+            [wrong.maps, wrong.programs, wrong.links] = counts;
+            profiles.push(wrong);
+        }
+        for profile in profiles {
+            let (_temp, mut recovery, startup, terminal) =
+                abi12_populated(&profile, abi12_ids(&profile));
+            assert!(validate_startup(&startup, &profile).is_err());
+            let typed: TerminalReceipt = serde_json::from_value(terminal).unwrap();
+            assert!(
+                validate_terminal(&startup, &typed, typed.service_stdout.as_bytes(), b"").is_err()
+            );
+            assert!(
+                recovery
+                    .started(serde_json::to_value(startup).unwrap())
+                    .is_err()
+            );
+            assert!(validate_accepted_receipt(&recovery.root, &recovery.label, &profile).is_err());
+        }
+    }
+
     #[test]
     fn strict_accepted_receipt_reads_real_files_and_exact_111_id_grammar_fixture() {
         let (_temp, mut r, startup, terminal) = fixture();

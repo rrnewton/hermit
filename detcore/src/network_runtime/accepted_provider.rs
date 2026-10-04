@@ -87,6 +87,7 @@ macro_rules! wire {
         }
     }
 }
+pub(super) mod current_close_profile;
 pub(super) mod executable_source;
 
 wire!(Identity,ffi::Identity,{provider:u64,object:u64,namespace:u64});
@@ -370,6 +371,20 @@ impl AuxiliaryRole {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub(super) enum Request {
+    PrepareCurrentCloseProfile {
+        call: u64,
+        intent: current_close_profile::Intent,
+    },
+    CollectCurrentCloseProfile {
+        call: u64,
+        command: u64,
+        prepared_request: u64,
+    },
+    RetireCurrentCloseProfile {
+        call: u64,
+        prepared: u64,
+        completed: u64,
+    },
     PrepareExecutableSource {
         intent: executable_source::Intent,
     },
@@ -554,6 +569,8 @@ pub(super) enum Request {
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(super) enum Reply {
+    CurrentCloseProfile(Observation<current_close_profile::Effect>),
+    CurrentCloseProfileRetired(CallStatus),
     ExecutableSource(Observation<executable_source::Effect>),
     ExecutableSourceRetired(CallStatus),
     NativeBirth(Observation<NativeBirth>),
@@ -1507,7 +1524,10 @@ impl Provider {
             .ok_or_else(|| io::Error::other("accepted provider session is not ready"))?;
         if matches!(
             envelope.operation,
-            Operation::PrepareExecutableSource
+            Operation::PrepareCurrentCloseProfile
+                | Operation::CollectCurrentCloseProfile
+                | Operation::RetireCurrentCloseProfile
+                | Operation::PrepareExecutableSource
                 | Operation::CollectExecutableSource
                 | Operation::RetireExecutableSource
                 | Operation::PrepareOriginalFileObservation

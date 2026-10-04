@@ -338,6 +338,9 @@ const ACCEPTED_CONTROLS: &[&str] = &[
     "executable-source-test.c",
     "executable-source-producer-test.c",
     "executable-source-driver-test.c",
+    "current-close-profile-test.c",
+    "current-close-profile-producer-test.c",
+    "current-close-profile-driver-test.c",
     "grouped-wire-test.c",
 ];
 const UNIX_CONTROLS: &[(&str, &[&str])] = &[
@@ -423,7 +426,7 @@ const INITIAL_CONTROL_CONCURRENCY: usize = 2;
 
 fn initial_control_partition<'a>(controls: &'a [&'static str]) -> Result<&'a [&'static str]> {
     let (wire, independent) = controls.split_last().context("missing controls")?;
-    ensure!(*wire == "grouped-wire-test.c" && independent.len() == 27,
+    ensure!(*wire == "grouped-wire-test.c" && independent.len() == 30,
         "initial control partition changed");
     Ok(independent)
 }
@@ -1039,9 +1042,9 @@ mod initial_gate_batch_tests {
         assert_eq!(INITIAL_CONTROL_CONCURRENCY, 2);
         let independent = initial_control_partition(ACCEPTED_CONTROLS).unwrap();
         assert_eq!(ACCEPTED_CONTROLS.last(), Some(&"grouped-wire-test.c"));
-        assert_eq!(independent.len(), 27);
+        assert_eq!(independent.len(), 30);
         assert!(!independent.contains(&"grouped-wire-test.c"));
-        assert_eq!(expected_stage_count(true), 121);
+        assert_eq!(expected_stage_count(true), 127);
         assert!(initial_control_partition(&[]).is_err());
         assert!(initial_control_partition(&ACCEPTED_CONTROLS[1..]).is_err());
         assert!(initial_control_partition(&ACCEPTED_CONTROLS[..24]).is_err());
@@ -1661,7 +1664,7 @@ raise SystemExit(status)
         assert_eq!(source_neighbor.command.get_args().map(|arg| arg.to_str().unwrap()).collect::<Vec<_>>(), ["full"]);
         // The TX compile/run pair and the exact command-wire/task-map controls
         // precede the unchanged 56-node postwire DAG above.
-        assert_eq!(expected_stage_count(true), 65 + plan.len());
+        assert_eq!(expected_stage_count(true), 71 + plan.len());
     }
 
     #[test]
@@ -1822,11 +1825,11 @@ raise SystemExit(status)
 mod tests {
     #[test]
     fn owned_and_tx_controls_preserve_the_original_population() {
-        assert_eq!(super::ACCEPTED_CONTROLS.len(), 28);
+        assert_eq!(super::ACCEPTED_CONTROLS.len(), 31);
         assert_eq!(super::OWNED_DRIVER_CONTROLS,
             ["owned-inventory", "owned-identity", "owned-fault", "owned-gate",
              "owned-command-wire", "owned-task-map"]);
-        assert_eq!(super::expected_stage_count(true), 121);
+        assert_eq!(super::expected_stage_count(true), 127);
         assert_eq!(super::expected_stage_count(false), 7);
     }
 
@@ -1834,7 +1837,10 @@ mod tests {
     fn exact_stage_completion_refuses_omitted_extra_and_failed_stages() {
         let good = serde_json::json!({"receipt":{"passed":true}});
         let expected = super::expected_stage_count(true);
-        assert!(super::stages_complete(&vec![good.clone(); 121], expected));
+        assert!(super::stages_complete(&vec![good.clone(); 127], expected));
+        assert!(!super::stages_complete(&vec![good.clone(); 121], expected));
+        assert!(!super::stages_complete(&vec![good.clone(); 126], expected));
+        assert!(!super::stages_complete(&vec![good.clone(); 128], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 115], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 120], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 122], expected));
@@ -1847,14 +1853,14 @@ mod tests {
         assert!(!super::stages_complete(&vec![good.clone(); 112], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 114], expected));
         assert!(!super::stages_complete(&vec![good.clone(); 105], expected));
-        let mut failed = vec![good; 121];
-        failed[110]["receipt"]["passed"] = serde_json::json!(false);
-        assert!(!super::stages_complete(&failed, expected));
-        for at in [111, 112, 113, 114, 115, 116, 117, 118, 119, 120] {
-            failed[at-1]["receipt"]["passed"] = serde_json::json!(true);
+        let mut failed = vec![good; 127];
+        assert!(super::stages_complete(&failed, expected));
+        for at in 0..127 {
             failed[at]["receipt"]["passed"] = serde_json::json!(false);
             assert!(!super::stages_complete(&failed, expected));
+            failed[at]["receipt"]["passed"] = serde_json::json!(true);
         }
+        assert!(super::stages_complete(&failed, expected));
     }
     use super::*;
     use super::driver_ftrace_process::LIMITS;
@@ -1963,12 +1969,15 @@ mod tests {
             fs::write(case.path.join(name), name).unwrap();
         }
         let before = control_sources(&case.path, true).unwrap();
-        assert_eq!(ACCEPTED_CONTROLS.len(), 28);
-        assert_eq!(before.len(), 36);
+        assert_eq!(ACCEPTED_CONTROLS.len(), 31);
+        assert_eq!(before.len(), 39);
         assert_eq!(
             before.keys().map(String::as_str).collect::<Vec<_>>(),
             [
                 "birth-cleanup-driver-test.c",
+                "current-close-profile-driver-test.c",
+                "current-close-profile-producer-test.c",
+                "current-close-profile-test.c",
                 "driver-ftrace-facade.h",
                 "driver-ftrace-process.rs",
                 "driver-ftrace-test.c",

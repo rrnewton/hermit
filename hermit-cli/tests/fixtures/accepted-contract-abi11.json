@@ -1,8 +1,8 @@
 {
   "schema": 1,
-  "abi_version": "415052555354000c",
+  "abi_version": "415052555354000b",
   "btf_sha256": "b1900bfa83ccf813cc6eecb6c64d1c002b6b877dade7b0bb9439729b0868ba88",
-  "maps": 26,
+  "maps": 25,
   "programs": 49,
   "links": 49,
   "shared_links": [],
@@ -61,24 +61,10 @@
     "fd-session-dispatch.inc",
     "stream-tx.h",
     "stream-tx.bpf.h",
-    "stream-tx-driver.h",
-    "current-close-profile.h",
-    "current-close-profile.bpf.h",
-    "current-close-profile-driver.h",
-    "current-close-target.h",
-    "current-close-image.h"
+    "stream-tx-driver.h"
   ],
   "hooks": {
-    "fixup_exception": [
-      [
-        8,
-        4,
-        8,
-        8
-      ],
-      4,
-      4
-    ],
+    "fixup_exception": [[8, 4, 8, 8], 4, 4],
     "fdget": [
       [
         4
@@ -868,7 +854,5 @@
       }
     ]
   },
-  "copy_version": 5,
-  "current_close_profile_version": 1,
-  "current_close_profile_bytes": 576
+  "copy_version": 5
 }

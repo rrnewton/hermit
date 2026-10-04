@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::network_replay::finite_close::FiniteCloseBirth;
+use crate::network_runtime::current_close_profile::CompletedCurrentCloseProfile;
 use crate::network_runtime::shared_waits::JoinedSharedPrefix;
 use crate::network_runtime::shared_waits::SharedAttemptAdmission;
 use crate::scheduler::ordinary_fd::SharedMmForegroundObservation;
@@ -15,6 +16,9 @@ pub(crate) struct ForegroundCloseOrigin {
     admission: Admission,
     raw: [usize; 6],
     birth: Arc<FiniteCloseBirth>,
+    // Comparison data only. The actual reader transfers once to OriginalCall.
+    read: NetworkFdReadAdmission,
+    profile: Arc<CompletedCurrentCloseProfile>,
     prefix: JoinedSharedPrefix,
 }
 impl ForegroundCloseOrigin {
@@ -33,6 +37,7 @@ pub(crate) struct ForegroundCloseEntry {
     pub(crate) read: NetworkFdReadAdmission,
     pub(crate) arguments: Arguments,
     pub(crate) raw: [usize; 6],
+    pub(crate) profile: Arc<CompletedCurrentCloseProfile>,
 }
 impl NetworkReplayEngine {
     pub(crate) fn foreground_close_candidate(
@@ -57,42 +62,24 @@ impl NetworkReplayEngine {
         }
         Ok(())
     }
-    pub(crate) fn begin_foreground_close(
-        &mut self,
-        entry: ForegroundCloseEntry,
+    /// Check the complete selected logical/physical prefix before requesting
+    /// current release evidence. No host observation can choose this class.
+    pub(crate) fn validate_foreground_close_selection(
+        &self,
+        read: &NetworkFdReadAdmission,
         grant: &SharedMmForegroundObservation<'_>,
         prefix: &JoinedSharedPrefix,
         physical: &SharedAttemptAdmission<'_>,
-    ) -> Result<Arc<ForegroundCloseOrigin>, NetworkReplayError> {
-        let ForegroundCloseEntry {
-            read,
-            arguments,
-            raw,
-        } = entry;
+        raw: [usize; 6],
+    ) -> Result<(), NetworkReplayError> {
         self.check_native_retirement()?;
-        self.validate_fd_read_grant(grant.owner(), &read)?;
-        let binding = read
-            .binding
-            .ok_or_else(|| protocol("finite Close lacks OFD"))?;
-        let birth = self
-            .finite_close_birth_for_read(grant.owner(), &read)?
-            .ok_or_else(|| protocol("finite Close lost birth eligibility"))?;
+        self.validate_fd_read_grant(grant.owner(), read)?;
+        self.validate_foreground_close_birth_root(grant.owner(), read, grant.root())?;
         if !self.uses_shared_mm_attempts()
             || !grant.admits_initial_singleton()
-            || !birth.matches_initial_root(grant.root())
-            || arguments.kind != Kind::Close
-            || !arguments.kind.valid_operands(
-                arguments.address,
-                arguments.length,
-                arguments.original_count,
-            )
-            || arguments.operation.tid != grant.owner().thread
-            || arguments.files != grant.root().files()
-            || arguments.files != read.publication.permit.files
-            || arguments.fd != read.fd
-            || arguments.binding != Some(binding)
+            || read.publication.permit.files != grant.root().files()
             || read.external_grant.is_some()
-            || raw[0] != arguments.fd as usize
+            || raw[0] != read.fd as usize
             || !Arc::ptr_eq(grant.root(), prefix.root())
             || !physical.is_original_prefix(prefix)
             || !physical.matches_peers(self, None)?
@@ -106,10 +93,53 @@ impl NetworkReplayEngine {
                 .any(|state| state.owner == grant.owner())
         {
             return Err(protocol(
+                "finite Close changed selected singleton/prefix/read",
+            ));
+        }
+        Ok(())
+    }
+    pub(crate) fn begin_foreground_close(
+        &mut self,
+        entry: ForegroundCloseEntry,
+        grant: &SharedMmForegroundObservation<'_>,
+        prefix: &JoinedSharedPrefix,
+        physical: &SharedAttemptAdmission<'_>,
+    ) -> Result<Arc<ForegroundCloseOrigin>, NetworkReplayError> {
+        let ForegroundCloseEntry {
+            read,
+            arguments,
+            raw,
+            profile,
+        } = entry;
+        self.validate_foreground_close_selection(&read, grant, prefix, physical, raw)?;
+        profile
+            .validate_read(grant.root(), grant.epoch(), &read, raw)
+            .map_err(|error| protocol(&error.to_string()))?;
+        let binding = read
+            .binding
+            .ok_or_else(|| protocol("finite Close lacks OFD"))?;
+        let birth = self
+            .finite_close_birth_for_read(grant.owner(), &read)?
+            .ok_or_else(|| protocol("finite Close lost birth eligibility"))?;
+        if arguments.kind != Kind::Close
+            || !arguments.kind.valid_operands(
+                arguments.address,
+                arguments.length,
+                arguments.original_count,
+            )
+            || arguments.operation.tid != grant.owner().thread
+            || arguments.files != grant.root().files()
+            || arguments.files != read.publication.permit.files
+            || arguments.fd != read.fd
+            || arguments.binding != Some(binding)
+            || raw[0] != arguments.fd as usize
+        {
+            return Err(protocol(
                 "finite Close changed original singleton/tuple/custody",
             ));
         }
         self.validate_finite_close_birth(binding.open_file, &birth)?;
+        let retained_read = read.clone();
         let admission = self.begin_original_call_with_read(
             grant.owner(),
             arguments,
@@ -122,6 +152,8 @@ impl NetworkReplayEngine {
             admission: admission.clone(),
             raw,
             birth,
+            read: retained_read,
+            profile,
             prefix: prefix.clone(),
         });
         // Reader transfer has completed; this infallible attachment is its sole
@@ -188,6 +220,10 @@ impl NetworkReplayEngine {
         {
             return Err(protocol("finite Close changed retained Normal/entry/Call"));
         }
+        origin
+            .profile
+            .validate_read(grant.root(), grant.epoch(), &origin.read, raw)
+            .map_err(|error| protocol(&error.to_string()))?;
         let binding = origin
             .admission
             .arguments

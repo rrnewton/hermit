@@ -150,7 +150,7 @@ pub fn validate(contract: &Contract) -> Result<()> {
         } else {
             matches!(contract.accepted_copy_version(), Ok(4 | 5))
         })
-            && contract.maps == (if contract.ftrace_only { 24 } else { 23 }) + usize::from(contract.abi_version == "415052555354000b")
+            && contract.maps == (if contract.ftrace_only { 24 } else { 23 }) + match contract.abi_version.as_str() { "415052555354000b" => 1, "415052555354000c" => 2, _ => 0 }
             && contract.programs == if contract.ftrace_only { 49 } else { 44 }
             && contract.links == if contract.ftrace_only { 49 } else { 44 }
             && contract.shared_links.is_empty(),
@@ -191,7 +191,7 @@ pub fn validate(contract: &Contract) -> Result<()> {
     // count/site test intact. Its explicit adapter/copy pair is validated normally.
     let legacy = Contract::parse(include_bytes!("accepted-classic-v40-contract.json"))?;
     let mut sources = legacy.source_files;
-    if contract.abi_version != "415052555354000b" {
+    if !matches!(contract.abi_version.as_str(), "415052555354000b" | "415052555354000c") {
         sources.retain(|name| !matches!(name.as_str(), "executable-source.h" | "executable-source.bpf.h" | "executable-source-driver.h" | "executable-source-image.h"));
     }
     if contract.ftrace_only {
@@ -201,6 +201,11 @@ pub fn validate(contract: &Contract) -> Result<()> {
     }
     if contract.accepted_copy_version()? == 5 && !contract.ftrace_only {
         sources.extend(FRONTIER_SOURCES.iter().map(|name| (*name).to_owned()));
+    }
+    if contract.abi_version == "415052555354000c" {
+        sources.extend(["current-close-profile.h", "current-close-profile.bpf.h",
+            "current-close-profile-driver.h", "current-close-target.h", "current-close-image.h"]
+            .into_iter().map(str::to_owned));
     }
     ensure!(
         contract.source_files == sources,
@@ -255,7 +260,7 @@ mod tests {
     }
     #[test]
     fn ftrace_topology_retains_role_coverage_without_group_runtime_sources() {
-        let parsed=Contract::parse(include_bytes!("accepted-contract.json")).unwrap();
+        let parsed=Contract::parse(include_bytes!("../tests/fixtures/accepted-contract-abi11.json")).unwrap();
         assert!(parsed.ftrace_only);
         assert_eq!((parsed.maps,parsed.programs,parsed.links),(25,49,49));
         assert_eq!(parsed.maps+parsed.programs+parsed.links,123);
@@ -396,7 +401,7 @@ mod tests {
     }
 
     fn current() -> Value {
-        serde_json::from_slice(include_bytes!("accepted-contract.json")).unwrap()
+        serde_json::from_slice(include_bytes!("../tests/fixtures/accepted-contract-abi11.json")).unwrap()
     }
 
     #[test]
@@ -429,7 +434,7 @@ mod tests {
     fn ftrace_contract_preserves_role_coverage_and_exact_source_population() {
         let historical = value();
         let selected = current();
-        let parsed = Contract::parse(include_bytes!("accepted-contract.json")).unwrap();
+        let parsed = Contract::parse(include_bytes!("../tests/fixtures/accepted-contract-abi11.json")).unwrap();
         assert_eq!(parsed.accepted_copy_version().unwrap(), 5);
         assert_eq!(parsed.abi_version, "415052555354000b");
         assert!(parsed.ftrace_only);
@@ -526,4 +531,68 @@ mod tests {
         explicit_old["copy_version"] = json!(4);
         assert_eq!(Contract::parse(&serde_json::to_vec(&explicit_old).unwrap()).unwrap().accepted_copy_version().unwrap(), 4);
     }
+    #[test]
+    fn current_close_profile_fields_reject_explicit_null_and_wrong_types() {
+        for raw in [
+            include_str!("../tests/fixtures/accepted-contract-abi11.json"),
+            include_str!("accepted-classic-v40-contract.json"),
+            include_str!("accepted-grouped-v4-contract.json"),
+            include_str!("accepted-contract.json"),
+        ] {
+            let original: Value = serde_json::from_str(raw).unwrap();
+            let parsed = Contract::parse(raw.as_bytes()).unwrap();
+            if parsed.abi_version != "415052555354000c" {
+                assert_eq!(parsed.current_close_profile_version, None);
+                assert_eq!(parsed.current_close_profile_bytes, None);
+            }
+            for field in ["current_close_profile_version", "current_close_profile_bytes"] {
+                for value in [
+                    Value::Null,
+                    json!(true),
+                    json!("1"),
+                    json!(1.0),
+                    json!(576.0),
+                    json!([]),
+                    json!({}),
+                ] {
+                    let mut changed = original.clone();
+                    changed[field] = value;
+                    let bytes = serde_json::to_vec(&changed).unwrap();
+                    assert!(serde_json::from_slice::<Contract>(&bytes).is_err(), "{field}");
+                    assert!(Contract::parse(&bytes).is_err(), "{field}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn current_close_profile_requires_exact_abi12_feature_and_inventory() {
+        let current: Value = serde_json::from_slice(include_bytes!("accepted-contract.json")).unwrap();
+        let parsed = Contract::parse(&serde_json::to_vec(&current).unwrap()).unwrap();
+        assert_eq!((parsed.maps, parsed.programs, parsed.links), (26, 49, 49));
+        assert_eq!(parsed.maps + parsed.programs + parsed.links, 124);
+        assert_eq!(parsed.current_close_profile_version, Some(1));
+        assert_eq!(parsed.current_close_profile_bytes, Some(576));
+        for (field, bad) in [("maps", json!(25)), ("maps", json!(27)),
+            ("programs", json!(48)), ("links", json!(50)), ("copy_version", json!(4)),
+            ("ftrace_only", json!(false)), ("current_close_profile_version", json!(0)),
+            ("current_close_profile_version", json!(2)), ("current_close_profile_bytes", json!(544)),
+            ("current_close_profile_bytes", json!(575)), ("current_close_profile_bytes", json!(577))] {
+            let mut changed = current.clone(); changed[field] = bad; refuses(&changed);
+        }
+        for field in ["current_close_profile_version", "current_close_profile_bytes"] {
+            let mut changed = current.clone(); changed.as_object_mut().unwrap().remove(field); refuses(&changed);
+            let mut legacy = self::current(); legacy[field] = current[field].clone(); refuses(&legacy);
+        }
+        for source in ["current-close-profile.h", "current-close-profile.bpf.h",
+            "current-close-profile-driver.h", "current-close-target.h", "current-close-image.h"] {
+            let mut changed = current.clone();
+            changed["source_files"].as_array_mut().unwrap().retain(|v| v.as_str() != Some(source));
+            refuses(&changed);
+        }
+        // Each retired topology retains its original exact population.
+        let legacy = Contract::parse(include_bytes!("../tests/fixtures/accepted-contract-abi11.json")).unwrap();
+        assert_eq!((legacy.maps, legacy.programs, legacy.links), (25, 49, 49));
+    }
+
 }

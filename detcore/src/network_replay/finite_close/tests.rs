@@ -41,16 +41,17 @@ struct BirthFixture {
     root: Arc<crate::network_runtime::ForegroundRoot>,
 }
 
-// Only provider rows/query outcomes are controlled. The scheduler issues its
-// real Normal observation, Plan::complete issues the sealed host receipt, and
-// the actual original installation publisher plus both ACKs issue the OFD flag.
+// Provider installation rows are controlled. The scheduler issues its real
+// Normal observation, and the actual installation publisher plus both ACKs
+// retain logical Socket origin. This fixture does not certify physical Close;
+// every foreground use additionally needs the current release-profile proof.
 fn born(replay: bool) -> BirthFixture {
     use crate::network_replay::original_connect::Arguments;
     use crate::network_replay::original_connect::Kind;
     use crate::network_runtime::original_installation::installation_fixture;
     use crate::network_runtime::original_installation::installation_with_controlled_birth;
-    use crate::network_runtime::socket_birth_policy::SocketBirthAuthority;
-    use crate::network_runtime::socket_birth_policy::controlled_birth_receipt;
+    use crate::network_runtime::socket_origin::SocketBirthAuthority;
+    use crate::network_runtime::socket_origin::controlled_birth_receipt;
     let raw = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
     let (root, metadata, _memory, claim) = crate::network_runtime::controlled_foreground_root(raw);
     let owner = root.owner();

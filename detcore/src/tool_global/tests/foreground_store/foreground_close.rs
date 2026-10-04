@@ -60,6 +60,8 @@ struct StagingGuest<'a> {
     thread: crate::ThreadState<()>,
     tid: Tid,
     reply: ReadReply,
+    allow_profile_registers: bool,
+    register_reads: usize,
     requests: Mutex<Vec<GlobalRequest>>,
     responses: Mutex<Vec<GlobalResponse>>,
     admitted: Mutex<Option<NetworkFdReadAdmission>>,
@@ -142,7 +144,16 @@ impl Guest<Detcore> for StagingGuest<'_> {
         &mut self.thread
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
-        panic!("unexpected registers")
+        assert!(self.allow_profile_registers, "unexpected registers");
+        assert!(
+            self.thread.original_connect.is_none(),
+            "profile precedes private original staging"
+        );
+        self.register_reads += 1;
+        assert_eq!(self.register_reads, 1, "one original register observation");
+        // Controlled kernel-response premise only. The production path must
+        // collect the retained provider proof; these values are not authority.
+        unsafe { std::mem::zeroed() }
     }
     async fn stack(&mut self) -> Self::Stack {
         panic!("unexpected stack")
@@ -224,6 +235,8 @@ fn guest(f: &Fixture, reply: ReadReply) -> StagingGuest<'_> {
         thread: f.thread.clone(),
         tid: f.tid,
         reply,
+        allow_profile_registers: false,
+        register_reads: 0,
         requests: Mutex::new(Vec::new()),
         responses: Mutex::new(Vec::new()),
         admitted: Mutex::new(None),
@@ -317,8 +330,8 @@ async fn foreground_close_bad_reader_is_error_not_generic_fallback() {
     }
 }
 
-// Controlled provider/query/getter facts enter through Plan::complete and the
-// real original Socket publication transaction. No FiniteCloseBirth constructor.
+// Controlled original Socket installation supplies logical origin through the
+// real publication transaction. Fresh physical Close proof is a separate premise.
 fn born_fixture() -> Fixture {
     use crate::network_replay::NetworkFdMutationBegin;
     use crate::network_replay::NetworkFdMutationKind;
@@ -326,7 +339,7 @@ fn born_fixture() -> Fixture {
     use crate::network_replay::original_connect::Kind;
     use crate::network_replay::original_installation::FreshStreamEnrollment;
     use crate::network_runtime::original_installation::Source;
-    use crate::network_runtime::original_installation::installation_fixture;
+    use crate::network_runtime::original_installation::installation_fixture_for_root;
     let raw = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
     let tid = Tid::from_raw(raw);
     let (runtime, root, metadata, memory, claim) =
@@ -407,10 +420,9 @@ fn born_fixture() -> Fixture {
         .original_socket_birth_authority(owner, &socket, &target)
         .unwrap()
         .unwrap();
-    let policy = crate::network_runtime::socket_birth_policy::controlled_birth_receipt(
-        authority, owner, &socket,
-    )
-    .unwrap();
+    let policy =
+        crate::network_runtime::socket_origin::controlled_birth_receipt(authority, owner, &socket)
+            .unwrap();
     let mut observed_metadata = metadata.lock().unwrap();
     let mut engine = global.network_engine.as_ref().unwrap().lock().unwrap();
     engine
@@ -420,8 +432,9 @@ fn born_fixture() -> Fixture {
         .original_call_prepared(owner, &socket, None, 71)
         .unwrap();
     engine.original_connect_invoked(owner, &socket).unwrap();
+    let (provider, task, start, table) = root.native_identity();
     engine
-        .original_connect_selected(owner, &socket, 71, (7, 31, 101, 13, 19))
+        .original_connect_selected(owner, &socket, 71, (provider, task, start, table, 19))
         .unwrap();
     engine.original_connect_returned(owner, &socket, 5).unwrap();
     engine
@@ -430,9 +443,8 @@ fn born_fixture() -> Fixture {
     engine
         .original_connect_pin_released(owner, &socket)
         .unwrap();
-    let receipt = installation_fixture(
-        owner,
-        metadata.clone(),
+    let receipt = installation_fixture_for_root(
+        &root,
         mutation.publication.permit,
         Source::Socket(socket.call),
         71,
@@ -520,8 +532,17 @@ fn check_normal_clock(f: &Fixture, now: LogicalTime) {
     );
 }
 
+fn enable_current_close_peer(
+    f: &mut Fixture,
+) -> crate::network_runtime::current_close_profile::tests::Service {
+    let selected = owner(f);
+    let runtime = f.global.network_runtime.as_mut().unwrap();
+    let root = runtime.foreground_root(selected).unwrap();
+    crate::network_runtime::current_close_profile::tests::install(runtime, root)
+}
+
 #[tokio::test]
-async fn foreground_close_full_caller_unconnected_birth_keeps_normal_alarm_and_actual_abort() {
+async fn foreground_close_full_caller_without_current_profile_keeps_reader_and_normal_alarm() {
     let f = born_fixture();
     let mut g = guest(&f, ReadReply::Original);
     let tool: Detcore = Detcore::new(f.tid, &f.config);
@@ -539,28 +560,14 @@ async fn foreground_close_full_caller_unconnected_birth_keeps_normal_alarm_and_a
         .await
         .unwrap_err();
     let reverie::Error::Tool(error) = error else {
-        panic!("known pre-provider stop");
+        panic!("known pre-profile stop");
     };
     assert_eq!(
         error.root_cause().to_string(),
-        "accepted runtime has no endpoint"
+        "current Close requires actual ABI12-copy5 provider"
     );
-    let local = g
-        .thread
-        .original_connect
-        .as_ref()
-        .expect("retained original intent");
-    let admission = local
-        .admission
-        .as_ref()
-        .expect("actual reader transferred before preparation");
-    assert!(!local.invoked);
-    assert_eq!(local.returned, None);
-    assert_eq!(
-        local.arguments.kind,
-        crate::network_replay::original_connect::Kind::Close
-    );
-    assert_eq!(local.raw_arguments, [5, 0, 0, 0, 0, 0]);
+    assert!(g.thread.original_connect.is_none());
+    assert_eq!(g.register_reads, 0);
     let requests = g.requests.lock().unwrap();
     assert_eq!(
         requests
@@ -575,16 +582,50 @@ async fn foreground_close_full_caller_unconnected_birth_keeps_normal_alarm_and_a
     assert!(!requests.iter().any(|r| matches!(
         r,
         GlobalRequest::Network(NetworkRequest::FinishFdRead { .. })
+            | GlobalRequest::Network(NetworkRequest::NativeSubmitOriginalConnect { .. })
     )));
-    assert!(!requests.iter().any(|r| matches!(
-        r,
-        GlobalRequest::Network(NetworkRequest::NativeSubmitOriginalConnect { .. })
-    )));
+    let read = g.admitted.lock().unwrap().clone().unwrap();
     let mut engine = f.global.network_engine.as_ref().unwrap().lock().unwrap();
-    // The existing runtime setup branch positively resolves a known unsubmitted
-    // preparation; absence is checked only after that actual abort returned.
+    engine.validate_fd_read_grant(owner(&f), &read).unwrap();
     assert!(
-        matches!(engine.foreground_close_origin(owner(&f), admission), Err(NetworkReplayError::UnknownStreamCall(call)) if call == admission.call)
+        engine
+            .begin_fd_read(owner(&f), read.publication.permit.files, 5)
+            .is_err()
+    );
+    engine.validate_fd_read_grant(owner(&f), &read).unwrap();
+    assert_eq!(engine.native_trace_fixture(), before);
+    drop(engine);
+    check_normal_clock(&f, time);
+}
+
+#[tokio::test]
+async fn foreground_close_completed_profile_keeps_actual_known_original_setup_abort() {
+    let mut f = born_fixture();
+    let service = enable_current_close_peer(&mut f);
+    let time = arm_alarm(&f);
+    let before = f
+        .global
+        .network_engine
+        .as_ref()
+        .unwrap()
+        .lock()
+        .unwrap()
+        .native_trace_fixture();
+    let prepared = begin_at_barrier(&f).await;
+    let admission = prepared.origin.admission().clone();
+    // The profile group is positively ACKed and empty before removing this
+    // controlled endpoint. The following original setup failure is real.
+    service.finish_detach(f.global.network_runtime.as_mut().unwrap(), 1);
+    let error = f
+        .global
+        .prepare_foreground_original_close(prepared)
+        .await
+        .unwrap_err();
+    assert_eq!(error.to_string(), "accepted runtime has no endpoint");
+    let mut engine = f.global.network_engine.as_ref().unwrap().lock().unwrap();
+    assert!(
+        matches!(engine.foreground_close_origin(owner(&f), &admission),
+        Err(NetworkReplayError::UnknownStreamCall(call)) if call == admission.call)
     );
     let NetworkFdReadBegin::Admitted(read) = engine
         .begin_fd_read(owner(&f), admission.arguments.files, 5)
@@ -625,17 +666,39 @@ async fn begin_at_barrier(
         length: 0,
         original_count: 0,
     };
+    let armed = f
+        .global
+        .prepare_foreground_close_profile(f.tid, &f.thread, &read, [5, 0, 0, 0, 0, 0])
+        .await
+        .unwrap();
+    // The fixture provider supplies an explicitly controlled GETREGSET result;
+    // all request identities, collection, and group ACK are actual consumers.
+    let profile = f
+        .global
+        .collect_foreground_close_profile(&armed)
+        .await
+        .unwrap();
+    assert!(armed.settled());
     f.global
-        .begin_foreground_original_close(f.tid, &f.thread, read, arguments, [5, 0, 0, 0, 0, 0])
+        .begin_foreground_original_close(
+            f.tid,
+            &f.thread,
+            read,
+            arguments,
+            [5, 0, 0, 0, 0, 0],
+            profile,
+        )
         .await
         .unwrap()
 }
 
 #[tokio::test]
 async fn foreground_close_barrier_revalidates_tuple_and_actual_epoch() {
-    let f = born_fixture();
+    let mut f = born_fixture();
+    let service = enable_current_close_peer(&mut f);
     let time = arm_alarm(&f);
     let prepared = begin_at_barrier(&f).await;
+    service.finish(1);
     let admission = prepared.origin.admission();
     f.global
         .validate_foreground_close_callback(f.tid, &f.thread, admission, [5, 0, 0, 0, 0, 0])
@@ -688,8 +751,10 @@ async fn foreground_close_barrier_revalidates_tuple_and_actual_epoch() {
 
 #[tokio::test]
 async fn foreground_close_consumed_before_submission_keeps_exact_call_debt() {
-    let f = born_fixture();
+    let mut f = born_fixture();
+    let service = enable_current_close_peer(&mut f);
     let prepared = begin_at_barrier(&f).await;
+    service.finish(1);
     let admission = prepared.origin.admission().clone();
     let local = crate::network_replay::original_connect::Local {
         arguments: admission.arguments.clone(),
@@ -832,19 +897,25 @@ async fn foreground_close_alias_uses_same_birth_and_exact_selected_reader() {
     let mut f = born_fixture();
     install_alias(&mut f, 9);
     f.original = Close::new().with_fd(9);
+    let service = enable_current_close_peer(&mut f);
     let mut g = guest(&f, ReadReply::Original);
+    g.allow_profile_registers = true;
     let tool: Detcore = Detcore::new(f.tid, &f.config);
     let error = tool
         .controlled_foreground_close(&mut g, f.original)
         .await
         .unwrap_err();
     let reverie::Error::Tool(error) = error else {
-        panic!("actual pre-provider abort");
+        panic!("actual retained provider refusal");
     };
-    assert_eq!(
-        error.root_cause().to_string(),
-        "accepted runtime has no endpoint"
+    assert!(
+        error
+            .root_cause()
+            .to_string()
+            .starts_with("original preparation unresolved:")
     );
+    assert_eq!(service.original_rejections(), 1);
+    assert_eq!(g.register_reads, 1);
     let read = g.admitted.lock().unwrap().clone().unwrap();
     assert_eq!(read.fd, 9);
     assert_eq!(read.binding, Some(g.thread.descriptor_binding(9).unwrap()));
@@ -853,20 +924,54 @@ async fn foreground_close_alias_uses_same_birth_and_exact_selected_reader() {
         g.thread.descriptor_binding(5).unwrap().open_file
     );
     let local = g.thread.original_connect.as_ref().unwrap();
+    assert_eq!(
+        local.arguments.kind,
+        crate::network_replay::original_connect::Kind::Close
+    );
     assert_eq!(local.arguments.fd, 9);
     assert_eq!(local.raw_arguments, [9, 0, 0, 0, 0, 0]);
     assert!(local.admission.is_some());
     assert!(!local.invoked);
+    assert_eq!(local.returned, None);
+    assert!(
+        f.global
+            .network_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .foreground_close_origin(owner(&f), local.admission.as_ref().unwrap())
+            .unwrap()
+            .is_some()
+    );
     assert!(!g.requests.lock().unwrap().iter().any(|r| matches!(
         r,
         GlobalRequest::Network(NetworkRequest::FinishFdRead { .. })
     )));
+    assert_eq!(
+        g.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| matches!(
+                r,
+                GlobalRequest::Network(NetworkRequest::BeginFdRead { .. })
+            ))
+            .count(),
+        1
+    );
+    assert!(!g.requests.lock().unwrap().iter().any(|r| matches!(
+        r,
+        GlobalRequest::Network(NetworkRequest::NativeSubmitOriginalConnect { .. })
+    )));
+    service.finish_after_original_refusal(1);
 }
 
 // Existing birth fixture uses /dev/null PIDFD stand-ins and controlled provider
 // responses. Terminal delivery below calls the real Tool consumer, but does not
 // execute a kernel wait4 or establish a native child-exit result.
 struct SharedFixture {
+    profile_service: Option<crate::network_runtime::current_close_profile::tests::Service>,
     f: Fixture,
     child: Arc<crate::network_runtime::ForegroundRoot>,
     child_state: crate::ThreadState<()>,
@@ -881,7 +986,7 @@ impl SharedFixture {
         use crate::network_replay::original_connect::Kind;
         use crate::network_replay::original_installation::FreshStreamEnrollment;
         use crate::network_runtime::original_installation::Source;
-        use crate::network_runtime::original_installation::installation_fixture;
+        use crate::network_runtime::original_installation::installation_fixture_for_root;
         let raw = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
         let tid = Tid::from_raw(raw);
         let template = crate::network_replay::replay_connect::fixture(LogicalTime::ZERO, false)
@@ -899,7 +1004,7 @@ impl SharedFixture {
         let mut global = GlobalState::initialize(&config, false);
         let mut engine = NetworkReplayEngine::record_shared_mm_attempts(template.epoch);
         engine.fd_table_fixture_enable();
-        let birth = crate::network_runtime::ForegroundRoot::controlled_shared_birth_after_close_setup(raw, |root, claim| {
+        let birth = crate::network_runtime::ForegroundRoot::controlled_shared_birth_after_close_setup_with_profile(raw, |root, claim| {
             let mut scheduler = global.sched.lock().unwrap();
             scheduler.controlled_foreground_store_grant(root);
             let owner = root.owner();
@@ -915,16 +1020,17 @@ impl SharedFixture {
             // Same production issuer as Global uses; current Normal and the
             // exact initial root are borrowed before the controlled child birth.
             let grant = scheduler.foreground_native_observation(owner, root).unwrap();
-            let authority = crate::network_runtime::socket_birth_policy::SocketBirthAuthority::from_original(root.clone(), &grant, &socket).unwrap();
-            let policy = crate::network_runtime::socket_birth_policy::controlled_birth_receipt(authority, owner, &socket).unwrap();
+            let authority = crate::network_runtime::socket_origin::SocketBirthAuthority::from_original(root.clone(), &grant, &socket).unwrap();
+            let policy = crate::network_runtime::socket_origin::controlled_birth_receipt(authority, owner, &socket).unwrap();
             engine.original_connect_provider_submitted(owner, &socket).unwrap();
             engine.original_call_prepared(owner, &socket, None, 71).unwrap();
             engine.original_connect_invoked(owner, &socket).unwrap();
-            engine.original_connect_selected(owner, &socket, 71, (7, 31, 101, 13, 19)).unwrap();
+            let (provider, task, start, table) = root.native_identity();
+            engine.original_connect_selected(owner, &socket, 71, (provider, task, start, table, 19)).unwrap();
             engine.original_connect_returned(owner, &socket, 5).unwrap();
             engine.original_connect_provider_retired(owner, &socket, 5).unwrap();
             engine.original_connect_pin_released(owner, &socket).unwrap();
-            let receipt = installation_fixture(owner, metadata.clone(), mutation.publication.permit, Source::Socket(socket.call), 71, 5, false);
+            let receipt = installation_fixture_for_root(root, mutation.publication.permit, Source::Socket(socket.call), 71, 5, false);
             let receipt = crate::network_runtime::original_installation::installation_with_controlled_birth(receipt, policy).unwrap();
             engine.confirm_fd_mutation_result(owner, mutation.publication.permit, Ok(5)).unwrap();
             engine.publish_original_installation(owner, &mutation.publication, &receipt,
@@ -1003,7 +1109,7 @@ impl SharedFixture {
                 )
                 .unwrap();
         }
-        let (runtime, retained) = birth.into_runtime_and_retention();
+        let (runtime, retained, profile_service) = birth.into_runtime_and_profile_service();
         global.network_runtime = Some(runtime);
         global.network_engine = Some(Arc::new(Mutex::new(engine)));
         let mut f = Fixture {
@@ -1015,6 +1121,7 @@ impl SharedFixture {
         };
         install_alias(&mut f, 9);
         Self {
+            profile_service: Some(profile_service),
             f,
             child,
             child_state,
@@ -1045,7 +1152,7 @@ impl SharedFixture {
 #[tokio::test]
 async fn foreground_close_live_child_alias_and_parent_are_known_generic() {
     for child_selected in [false, true] {
-        let shared = SharedFixture::new().await;
+        let mut shared = SharedFixture::new().await;
         let f = &shared.f;
         let mut g = guest(f, ReadReply::Original);
         if child_selected {
@@ -1076,6 +1183,8 @@ async fn foreground_close_live_child_alias_and_parent_are_known_generic() {
         ));
         assert_eq!(f.global.global_time.lock().unwrap().as_nanos(), time);
         assert_eq!(f.global.sched.lock().unwrap().thread_tree.size(), history);
+        assert_eq!(g.register_reads, 0);
+        shared.profile_service.take().unwrap().finish(0);
     }
 }
 
@@ -1097,6 +1206,7 @@ async fn foreground_close_after_final_wait_callback_and_cleanup_preserves_histor
     assert_eq!(f.global.sched.lock().unwrap().thread_tree.size(), history);
     let time = arm_alarm(f);
     let prepared = begin_at_barrier(f).await;
+    shared.profile_service.take().unwrap().finish(1);
     f.global
         .validate_foreground_close_callback(
             f.tid,
@@ -1164,9 +1274,11 @@ async fn foreground_close_option_attempt_precedes_fault_and_never_rearms_aliases
 
 #[tokio::test]
 async fn foreground_close_submitted_consumption_keeps_unreturned_call_and_normal_clock() {
-    let f = born_fixture();
+    let mut f = born_fixture();
+    let service = enable_current_close_peer(&mut f);
     let time = arm_alarm(&f);
     let prepared = begin_at_barrier(&f).await;
+    service.finish(1);
     let admission = prepared.origin.admission().clone();
     {
         let mut engine = f.global.network_engine.as_ref().unwrap().lock().unwrap();

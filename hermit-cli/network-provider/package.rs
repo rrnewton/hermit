@@ -308,8 +308,8 @@ fn run() -> Result<()> {
     }
     let contract_name = format!("{}-contract.json", args.component);
     let contract = Contract::parse(&read_regular(&args.source.join(&contract_name), 32768)?)?;
-    ensure!(args.component != "accepted" || contract.abi_version == "415052555354000b",
-        "current accepted producer requires blocking-TX ABI10; historical packages keep their original sources");
+    ensure!(args.component != "accepted" || contract.abi_version == "415052555354000c",
+        "current accepted producer requires current-Close ABI12; historical packages keep their original sources");
     let accepted = args.component == "accepted";
     let tx_config = if accepted { Some(package_support::blocking_tx_config()?) } else { None };
     let grouped_build = contract.grouped_event.is_some();
@@ -396,6 +396,8 @@ fn run() -> Result<()> {
                         None => false,
                     })
                     && manifest.get("blocking_tx_config") == tx_config.as_ref()
+                    && manifest.get("current_close_profile_version").and_then(Value::as_u64) == contract.current_close_profile_version
+                    && manifest.get("current_close_profile_bytes").and_then(Value::as_u64) == contract.current_close_profile_bytes
                     && manifest["btf_sha256"] == contract.btf_sha256
                     && manifest["sources"] == serde_json::to_value(&source_digests)?
                     && manifest["maps"] == contract.maps
@@ -474,6 +476,9 @@ fn run() -> Result<()> {
     if ftrace {
         flags.push(os("-DAP_FTRACE_PROVIDER=1"));
     }
+    if contract.abi_version == "415052555354000c" {
+        flags.push(os("-DAP_CURRENT_CLOSE_PROFILE_ENABLED=1"));
+    }
     let src = if accepted {
         args.source.clone()
     } else {
@@ -481,6 +486,9 @@ fn run() -> Result<()> {
     };
     let mut bpf = flags.clone();
     bpf.extend([
+        // Retain BTF/CO-RE and source lines without repeated column locations.
+        // This bounds debug metadata without changing BPF instructions.
+        os("-gno-column-info"),
         // Keep generated-header and compilation-directory DWARF independent
         // of the package output path, without stripping debug or BTF sections.
         os("-fdebug-compilation-dir=."),
@@ -634,6 +642,11 @@ fn run() -> Result<()> {
         "blocking-TX embedded config changed during compile");
     let mut manifest = json!({"schema":1,"kind":kind,"abi_version":contract.abi_version,"object":object_name,"library":library_name,"object_sha256":digest(&object),"library_sha256":digest(&library),"btf_sha256":contract.btf_sha256,"maps":contract.maps,"programs":contract.programs,"links":contract.links,"sources":source_digests,"compile_only":true,"supported_kernel_contract":"Exact reviewed BTF; fresh exact-artifact native qualification required before activation","compile_seconds":started.elapsed().as_secs_f64()});
     if ftrace {manifest["ftrace_only"]=json!(true);}
+    if let (Some(version), Some(bytes)) = (contract.current_close_profile_version, contract.current_close_profile_bytes) {
+        manifest["current_close_profile_version"] = json!(version);
+        manifest["current_close_profile_bytes"] = json!(bytes);
+    }
+
     if let Some(tx_config) = tx_config { manifest["blocking_tx_config"] = tx_config; }
     if accepted {
         manifest["copy_version"] = json!(contract.accepted_copy_version()?);

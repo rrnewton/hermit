@@ -44,7 +44,11 @@ _Static_assert(sizeof(struct ap_program_id)==8,"identifier ABI");
 /* ABI11 adds a distinct472-byte executable-source sidecar while retaining
  * the72-byte internal command. Older hosts reject before resolving operations. */
 #if AP_NATIVE_COPY_VERSION == 4ULL || AP_NATIVE_COPY_VERSION == 5ULL
+#ifdef AP_CURRENT_CLOSE_PROFILE_ENABLED
+u64 ap_adapter_abi_version(void) { return 0x415052555354000cULL; }
+#else
 u64 ap_adapter_abi_version(void) { return 0x415052555354000bULL; }
+#endif
 #else
 #error "No authenticated adapter ABI for this copy grammar"
 #endif
@@ -53,6 +57,8 @@ u64 ap_adapter_task_command_size(void) { return sizeof(struct ap_task_command); 
 #include "fd-enrollment.h"
 #include "executable-source.h"
 u64 ap_adapter_executable_source_size(void) {return sizeof(struct ap_executable_source);}
+#include "current-close-profile.h"
+u64 ap_adapter_current_close_profile_size(void) {return sizeof(struct ap_close_profile);}
 _Static_assert(sizeof(struct ap_fd_enrollment)==112,"enrollment ABI");
 _Static_assert(offsetof(struct ap_fd_enrollment,phases)==72,"enrollment phases ABI");
 _Static_assert(offsetof(struct ap_fd_enrollment,slots)==88,"enrollment counts ABI");

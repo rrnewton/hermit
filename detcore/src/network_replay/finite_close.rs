@@ -1,27 +1,27 @@
-//! Close eligibility is private history of one actual original Socket. Neither
-//! a recorded public profile nor a duplicate descriptor can manufacture it.
+//! Logical Close candidacy follows one actual original Socket and identical
+//! guest option attempts in Record and Replay. It never certifies native Close
+//! finiteness: every candidate requires a separate fresh release profile.
 use std::sync::Arc;
 
 use super::*;
 use crate::network_runtime::original_installation::FileIdentity;
 use crate::network_runtime::original_installation::Installation;
 use crate::network_runtime::original_installation::Source;
-use crate::network_runtime::socket_birth_policy::Completed;
-use crate::network_runtime::socket_birth_policy::decline_diagnostic;
+use crate::network_runtime::socket_origin::Completed;
 
 #[derive(Debug)]
 pub(in crate::network_replay) struct FiniteCloseBirth {
     file: OpenFileId,
     identity: FileIdentity,
     call: NetworkStreamCallId,
-    policy: Arc<Completed>,
+    origin: Arc<Completed>,
 }
 impl FiniteCloseBirth {
     pub(in crate::network_replay) fn matches_initial_root(
         &self,
         root: &crate::network_runtime::ForegroundRoot,
     ) -> bool {
-        self.policy.matches_initial_root(root)
+        self.origin.matches_initial_root(root)
     }
 }
 #[derive(Debug, Clone)]
@@ -40,10 +40,6 @@ impl NetworkReplayEngine {
     ) -> Result<Option<Arc<FiniteCloseBirth>>, NetworkReplayError> {
         self.validate_fd_read(owner, read)?;
         let Some(binding) = read.binding else {
-            decline_diagnostic(format_args!(
-                "phase=close-birth fd={} reason=no-binding",
-                read.fd
-            ));
             return Ok(None);
         };
         let Some(socket) = self
@@ -51,36 +47,27 @@ impl NetworkReplayEngine {
             .as_ref()
             .and_then(|s| s.sockets.get(&binding.open_file))
         else {
-            decline_diagnostic(format_args!(
-                "phase=close-birth fd={} ofd={:?} reason=no-socket",
-                read.fd, binding.open_file
-            ));
             return Ok(None);
         };
         let Some(provenance) = &socket.finite_close else {
-            decline_diagnostic(format_args!(
-                "phase=close-birth fd={} ofd={:?} reason=no-birth",
-                read.fd, binding.open_file
-            ));
             return Ok(None);
         };
         if provenance.revoked {
-            decline_diagnostic(format_args!(
-                "phase=close-birth fd={} ofd={:?} birth_call={} reason=revoked",
-                read.fd,
-                binding.open_file,
-                provenance.birth.call.native_command_call()
-            ));
             return Ok(None);
         }
         self.validate_finite_close_birth(binding.open_file, &provenance.birth)?;
-        decline_diagnostic(format_args!(
-            "phase=close-birth fd={} ofd={:?} birth_call={} reason=present",
-            read.fd,
-            binding.open_file,
-            provenance.birth.call.native_command_call()
-        ));
         Ok(Some(provenance.birth.clone()))
+    }
+    /// Existing checked original-installation authority, not an inferred
+    /// numeric fd/file association. Aliases retain this same OFD identity.
+    pub(crate) fn foreground_close_file_identity(
+        &self,
+        owner: NetworkStreamOwner,
+        read: &NetworkFdReadAdmission,
+    ) -> Result<FileIdentity, NetworkReplayError> {
+        self.finite_close_birth_for_read(owner, read)?
+            .map(|birth| birth.identity)
+            .ok_or_else(|| invalid("finite Close lost original file identity"))
     }
     pub(in crate::network_replay) fn validate_finite_close_birth(
         &self,
@@ -119,12 +106,15 @@ impl NetworkReplayEngine {
             return Err(NetworkReplayError::UnresolvedStreamOperation(control));
         }
         let file = held.open_file;
-        let safe = level == libc::SOL_SOCKET
+        // These options have modeled Replay semantics. This only preserves
+        // logical candidacy; host-rewritten native effects still require the
+        // current physical certificate before Close.
+        let modeled = level == libc::SOL_SOCKET
             && matches!(
                 option,
                 libc::SO_RCVTIMEO | libc::SO_SNDTIMEO | libc::SO_RCVLOWAT
             );
-        if !safe
+        if !modeled
             && let Some(provenance) = self
                 .shadow
                 .as_mut()
@@ -132,13 +122,6 @@ impl NetworkReplayEngine {
                 .and_then(|s| s.finite_close.as_mut())
         {
             provenance.revoked = true;
-            decline_diagnostic(format_args!(
-                "phase=birth-revoked ofd={:?} birth_call={} level={} option={}",
-                file,
-                provenance.birth.call.native_command_call(),
-                level,
-                option
-            ));
         }
         Ok(())
     }
@@ -147,14 +130,14 @@ impl NetworkReplayEngine {
         binding: crate::types::FdSlotBinding,
         receipt: &Installation,
     ) -> Result<(), NetworkReplayError> {
-        let Some(policy) = receipt.finite_close_birth() else {
+        let Some(origin) = receipt.finite_close_birth() else {
             return Ok(());
         };
         let Source::Socket(call) = receipt.source() else {
             return Err(invalid("Close birth is not an original Socket"));
         };
         if !self.uses_shared_mm_attempts()
-            || !policy.validates(receipt.original_owner(), call)
+            || !origin.validates(receipt.original_owner(), call)
             || binding.slot.fd != receipt.fd()
             || binding.slot.files != receipt.files()
             || !binding.open_file.is_socket()
@@ -168,7 +151,7 @@ impl NetworkReplayEngine {
             .and_then(|s| s.finite_close.as_ref())
             && (prior.birth.identity != receipt.file_identity()
                 || prior.birth.call != call
-                || !prior.birth.policy.same(policy))
+                || !prior.birth.origin.same(origin))
         {
             return Err(invalid(
                 "Close birth cannot replace retained original incarnation",
@@ -183,18 +166,7 @@ impl NetworkReplayEngine {
         binding: crate::types::FdSlotBinding,
         receipt: &Installation,
     ) {
-        if self.uses_shared_mm_attempts()
-            && let Source::Socket(call) = receipt.source()
-        {
-            decline_diagnostic(format_args!(
-                "phase=birth-enroll call={} fd={} ofd={:?} proof={}",
-                call.native_command_call(),
-                binding.slot.fd,
-                binding.open_file,
-                receipt.finite_close_birth().is_some()
-            ));
-        }
-        let Some(policy) = receipt.finite_close_birth() else {
+        let Some(origin) = receipt.finite_close_birth() else {
             return;
         };
         let Source::Socket(call) = receipt.source() else {
@@ -213,7 +185,7 @@ impl NetworkReplayEngine {
                     file: binding.open_file,
                     identity: receipt.file_identity(),
                     call,
-                    policy: policy.clone(),
+                    origin: origin.clone(),
                 }),
                 revoked: false,
             });

@@ -173,6 +173,10 @@ pub struct Contract {
     pub abi_version: String,
     #[serde(default)]
     pub copy_version: Option<u64>,
+    #[serde(default, deserialize_with = "present_u64")]
+    pub current_close_profile_version: Option<u64>,
+    #[serde(default, deserialize_with = "present_u64")]
+    pub current_close_profile_bytes: Option<u64>,
     pub btf_sha256: String,
     pub maps: usize,
     pub programs: usize,
@@ -187,6 +191,11 @@ pub struct Contract {
     pub hooks: BTreeMap<String, (Vec<usize>, usize, usize)>,
 }
 
+// Absent legacy fields are distinct from explicit null, float or boolean values.
+fn present_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
+}
+
 impl Contract {
     /// Native accepted-provider grammar; old ABI7 absence means exactly V4.
     /// ABI8 and ABI9 have no implicit grammar. ABI9 carries the dispatch-bearing
@@ -195,6 +204,7 @@ impl Contract {
         match (self.abi_version.as_str(), self.copy_version) {
             ("4150525553540007", None | Some(4)) => Ok(4),
             ("4150525553540008", Some(5)) => Ok(5),
+            ("415052555354000c", Some(5)) => Ok(5),
             ("4150525553540009", Some(version @ (4 | 5))) => Ok(version),
             ("415052555354000a" | "415052555354000b", Some(version @ (4 | 5))) => Ok(version),
             _ => anyhow::bail!("unsupported accepted adapter/copy version pair"),
@@ -203,6 +213,18 @@ impl Contract {
 
     pub fn parse(raw: &[u8]) -> Result<Self> {
         let result: Self = serde_json::from_slice(raw)?;
+        if result.abi_version == "415052555354000c" {
+            ensure!(result.copy_version == Some(5) && result.ftrace_only
+                && result.grouped_event.is_some() && result.shared_links.is_empty()
+                && result.current_close_profile_version == Some(1)
+                && result.current_close_profile_bytes == Some(576),
+                "ABI12 requires the exact current-Close profile and ftrace copy5");
+        } else {
+            ensure!(result.current_close_profile_version.is_none()
+                && result.current_close_profile_bytes.is_none(),
+                "legacy ABI cannot declare current-Close profile fields");
+        }
+
         // Contracts without shared attachments still require one link per
         // program. Every additional link is declared and exactly accounted,
         // with overflow refused.
@@ -1581,6 +1603,8 @@ mod tests {
             schema: 1,
             abi_version: "test".into(),
             copy_version: None,
+            current_close_profile_version: None,
+            current_close_profile_bytes: None,
             btf_sha256: digest(&raw),
             maps: 1,
             programs: 1,

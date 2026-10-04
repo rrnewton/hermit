@@ -90,6 +90,7 @@ struct BirthPreparation {
     syscall: i32,
 }
 enum Preparation {
+    CurrentClose(u64, super::current_close_profile::Intent),
     Executable(super::executable_source::Intent),
     Birth(BirthPreparation),
     Original(OriginalPreparation),
@@ -100,6 +101,23 @@ enum Preparation {
 
 trait Backend {
     type Pin;
+    fn prepare_current_close(
+        &mut self,
+        _pin: &Self::Pin,
+        _intent: super::current_close_profile::Intent,
+    ) -> io::Result<Observation<u64>> {
+        Err(io::Error::other("backend lacks current_close source"))
+    }
+    fn collect_current_close(
+        &mut self,
+        _pin: &Self::Pin,
+        _command: u64,
+    ) -> io::Result<Observation<super::current_close_profile::Effect>> {
+        Err(io::Error::other("backend lacks current_close collection"))
+    }
+    fn ack_current_close(&mut self, _command: CommandResult) -> io::Result<CallStatus> {
+        Err(io::Error::other("backend lacks current_close ACK"))
+    }
     fn prepare_executable(
         &mut self,
         _pin: &Self::Pin,
@@ -269,6 +287,29 @@ trait Backend {
 struct Physical<'a>(&'a mut ffi::Session);
 impl Backend for Physical<'_> {
     type Pin = OwnedFd;
+    fn prepare_current_close(
+        &mut self,
+        pin: &OwnedFd,
+        intent: super::current_close_profile::Intent,
+    ) -> io::Result<Observation<u64>> {
+        Ok(self
+            .0
+            .prepare_current_close_profile(pin.as_fd(), intent.into())?
+            .into())
+    }
+    fn collect_current_close(
+        &mut self,
+        pin: &OwnedFd,
+        command: u64,
+    ) -> io::Result<Observation<super::current_close_profile::Effect>> {
+        Ok(self
+            .0
+            .collect_current_close_profile(pin.as_fd(), command)?
+            .into())
+    }
+    fn ack_current_close(&mut self, command: CommandResult) -> io::Result<CallStatus> {
+        Ok(self.0.ack_command(&command.into()).into())
+    }
     fn prepare_executable(
         &mut self,
         pin: &OwnedFd,
@@ -582,12 +623,18 @@ impl Backend for Physical<'_> {
     }
 }
 
+struct CurrentCloseActive {
+    intent: super::current_close_profile::Intent,
+    collected: Option<(u64, Observation<super::current_close_profile::Effect>)>,
+    ack_submitted: bool,
+}
 struct ExecutableActive {
     intent: super::executable_source::Intent,
     collected: Option<(u64, Observation<super::executable_source::Effect>)>,
     ack_submitted: bool,
 }
 struct Active {
+    current_close: Option<CurrentCloseActive>,
     executable: Option<ExecutableActive>,
     original_kind: Option<crate::network_replay::original_connect::Kind>,
     original_call: Option<u64>,
@@ -656,6 +703,108 @@ impl Registrations {
             .ok_or_else(|| io::Error::other("setter lacks task owner"))?;
         let request: Request = serde_json::from_slice(&envelope.body)?;
         let reply = match (envelope.operation, request) {
+            (
+                Operation::CollectCurrentCloseProfile,
+                Request::CollectCurrentCloseProfile {
+                    call,
+                    command,
+                    prepared_request,
+                },
+            ) if rights.is_empty() && envelope.accept.is_none() => {
+                let pins = prepared_rights
+                    .filter(|p| p.len() == 1)
+                    .ok_or_else(|| io::Error::other("current_close collection lost target"))?;
+                let identity = backend.identity(&pins[0])?;
+                let active = self
+                    .0
+                    .get_mut(&owner.thread)
+                    .filter(|r| r.owner == owner && r.identity == identity)
+                    .and_then(|r| r.active.as_mut())
+                    .filter(|a| {
+                        a.operation == Operation::PrepareCurrentCloseProfile
+                            && a.original_call == Some(call)
+                            && a.request == prepared_request
+                            && a.command == Some(command)
+                            && !a.finish_submitted
+                    })
+                    .ok_or_else(|| {
+                        io::Error::other("current_close collection changed active command")
+                    })?;
+                let current_close = active.current_close.as_mut().ok_or_else(|| {
+                    io::Error::other("current_close collection lost original intent")
+                })?;
+                active.finish_submitted = true;
+                let observed = backend.collect_current_close(&pins[0], command)?;
+                // Retain even a negative/partial C result; it never authorizes ACK.
+                current_close.collected = Some((envelope.sequence, observed.clone()));
+                Reply::CurrentCloseProfile(observed)
+            }
+            (
+                Operation::RetireCurrentCloseProfile,
+                Request::RetireCurrentCloseProfile {
+                    call,
+                    prepared,
+                    completed,
+                },
+            ) if rights.is_empty()
+                && envelope.accept.is_none()
+                && envelope.sequence > completed =>
+            {
+                let pins = prepared_rights
+                    .filter(|p| p.len() == 1)
+                    .ok_or_else(|| io::Error::other("current_close ACK lost target"))?;
+                let identity = backend.identity(&pins[0])?;
+                let registration = self
+                    .0
+                    .get_mut(&owner.thread)
+                    .filter(|r| r.owner == owner && r.identity == identity)
+                    .ok_or_else(|| io::Error::other("current_close ACK changed task lifetime"))?;
+                let active = registration
+                    .active
+                    .as_mut()
+                    .filter(|a| {
+                        a.operation == Operation::PrepareCurrentCloseProfile
+                            && a.original_call == Some(call)
+                            && a.request == prepared
+                            && a.finish_submitted
+                    })
+                    .ok_or_else(|| io::Error::other("current_close ACK changed active command"))?;
+                let command = active
+                    .command
+                    .ok_or_else(|| io::Error::other("current_close ACK unknown command"))?;
+                let current_close = active
+                    .current_close
+                    .as_mut()
+                    .ok_or_else(|| io::Error::other("current_close ACK lost original intent"))?;
+                let (sequence, observed) = current_close
+                    .collected
+                    .as_ref()
+                    .filter(|(sequence, _)| *sequence == completed)
+                    .ok_or_else(|| io::Error::other("current_close ACK lost exact collection"))?;
+                if *sequence <= prepared || current_close.ack_submitted {
+                    return Err(io::Error::other(
+                        "current_close ACK already submitted or reordered",
+                    ));
+                }
+                let mut intent = current_close.intent.clone();
+                intent.command = command;
+                super::current_close_profile::validate_collection(
+                    observed,
+                    &intent,
+                    observed.raw.command.identity.provider,
+                    observed.raw.command.task,
+                    observed.raw.command.start_boottime,
+                )?;
+                current_close.ack_submitted = true;
+                let status = backend.ack_current_close(observed.raw.command.clone())?;
+                if status.operation == "ap_ack_command"
+                    && status.returned == 0
+                    && status.errno.is_none()
+                {
+                    registration.active = None;
+                }
+                Reply::CurrentCloseProfileRetired(status)
+            }
             (
                 Operation::CollectExecutableSource,
                 Request::CollectExecutableSource {
@@ -1006,7 +1155,8 @@ impl Registrations {
                 Reply::OriginalFileObservationRetired(status)
             }
             (
-                operation @ (Operation::PrepareExecutableSource
+                operation @ (Operation::PrepareCurrentCloseProfile
+                | Operation::PrepareExecutableSource
                 | Operation::PrepareSetter
                 | Operation::PrepareAccept
                 | Operation::PrepareTableEnrollment
@@ -1016,7 +1166,8 @@ impl Registrations {
             ) if rights.len()
                 == if matches!(
                     operation,
-                    Operation::PrepareExecutableSource
+                    Operation::PrepareCurrentCloseProfile
+                        | Operation::PrepareExecutableSource
                         | Operation::PrepareTableEnrollment
                         | Operation::PrepareOriginalConnect
                         | Operation::PrepareNativeBirth
@@ -1027,6 +1178,16 @@ impl Registrations {
                 } =>
             {
                 let preparation = match (operation, request) {
+                    (
+                        Operation::PrepareCurrentCloseProfile,
+                        Request::PrepareCurrentCloseProfile { call, intent },
+                    ) if call != 0
+                        && intent.valid_unarmed()
+                        && intent.owner_mm == owner.mm.generation()
+                        && envelope.accept.is_none() =>
+                    {
+                        Preparation::CurrentClose(call, intent)
+                    }
                     (
                         Operation::PrepareExecutableSource,
                         Request::PrepareExecutableSource { intent },
@@ -1160,7 +1321,8 @@ impl Registrations {
                 };
                 let pidfd = &rights[if matches!(
                     operation,
-                    Operation::PrepareExecutableSource
+                    Operation::PrepareCurrentCloseProfile
+                        | Operation::PrepareExecutableSource
                         | Operation::PrepareTableEnrollment
                         | Operation::PrepareOriginalConnect
                         | Operation::PrepareNativeBirth
@@ -1227,6 +1389,14 @@ impl Registrations {
                         ));
                     }
                     receipt.active = Some(Active {
+                        current_close: match &preparation {
+                            Preparation::CurrentClose(_, intent) => Some(CurrentCloseActive {
+                                intent: intent.clone(),
+                                collected: None,
+                                ack_submitted: false,
+                            }),
+                            _ => None,
+                        },
                         executable: match &preparation {
                             Preparation::Executable(intent) => Some(ExecutableActive {
                                 intent: intent.clone(),
@@ -1242,6 +1412,7 @@ impl Registrations {
                         original_call: match &preparation {
                             Preparation::Original(r) => Some(r.call),
                             Preparation::Birth(r) => Some(r.call),
+                            Preparation::CurrentClose(call, _) => Some(*call),
                             Preparation::Executable(r) => Some(r.call),
                             _ => None,
                         },
@@ -1253,6 +1424,9 @@ impl Registrations {
                         birth_observation_submitted: false,
                     });
                     let outcome = match preparation {
+                        Preparation::CurrentClose(_, intent) => {
+                            backend.prepare_current_close(pidfd, intent)?
+                        }
                         Preparation::Executable(intent) => {
                             backend.prepare_executable(pidfd, intent)?
                         }
@@ -4063,6 +4237,7 @@ mod control_selection_tests {
                 last_allocator: None,
                 auxiliary: None,
                 active: Some(Active {
+                    current_close: None,
                     executable: None,
                     original_kind: Some(kind),
                     original_call: Some(17),
@@ -4455,6 +4630,206 @@ mod executable_tests {
                 let active = registrations.0[&owner().thread].active.as_ref().unwrap();
                 assert!(active.executable.as_ref().unwrap().collected.is_some());
                 assert!(active.executable.as_ref().unwrap().ack_submitted);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod current_close_tests {
+    use super::super::current_close_profile::Intent;
+    use super::super::current_close_profile::controlled_collection;
+    use super::*;
+    struct Controlled {
+        prepare: usize,
+        collect: usize,
+        ack: usize,
+        fail_ack: bool,
+        intent: Option<Intent>,
+    }
+    fn status(operation: &str) -> CallStatus {
+        CallStatus {
+            operation: operation.into(),
+            returned: 0,
+            errno: None,
+        }
+    }
+    impl Backend for Controlled {
+        type Pin = u64;
+        fn identity(&self, pin: &u64) -> io::Result<PidfdIdentity> {
+            Ok(PidfdIdentity {
+                device: 1,
+                inode: *pin,
+            })
+        }
+        fn register(&mut self, _: &u64) -> io::Result<CallStatus> {
+            Ok(status("ap_register_task"))
+        }
+        fn prepare(&mut self, _: &u64, _: Setter) -> io::Result<Observation<u64>> {
+            panic!("wrong setter route")
+        }
+        fn finish(&mut self, _: &u64, _: u64) -> io::Result<Observation<CommandResult>> {
+            panic!("wrong setter finish")
+        }
+        fn prepare_current_close(
+            &mut self,
+            _: &u64,
+            mut intent: Intent,
+        ) -> io::Result<Observation<u64>> {
+            self.prepare += 1;
+            intent.command = 7;
+            self.intent = Some(intent);
+            Ok(Observation {
+                status: status("ap_prepare_current_close_profile"),
+                raw: 7,
+            })
+        }
+        fn collect_current_close(
+            &mut self,
+            _: &u64,
+            command: u64,
+        ) -> io::Result<Observation<super::super::current_close_profile::Effect>> {
+            self.collect += 1;
+            assert_eq!(command, 7);
+            Ok(controlled_collection(
+                self.intent.clone().unwrap(),
+                17,
+                19,
+                23,
+            ))
+        }
+        fn ack_current_close(&mut self, command: CommandResult) -> io::Result<CallStatus> {
+            self.ack += 1;
+            assert_eq!(command.command, 7);
+            assert_eq!(command.operation, 27);
+            if self.fail_ack {
+                return Err(io::Error::other("controlled lost actual ACK"));
+            }
+            Ok(status("ap_ack_command"))
+        }
+    }
+    fn owner() -> NetworkStreamOwner {
+        let thread = DetTid::from_raw(41);
+        NetworkStreamOwner {
+            thread,
+            mm: crate::types::MmId::initial(thread),
+        }
+    }
+    fn request(sequence: u64, operation: Operation, body: Request) -> Envelope {
+        Envelope {
+            run: [7; 16],
+            sequence,
+            owner: Some(owner()),
+            accept: None,
+            operation,
+            body: serde_json::to_vec(&body).unwrap(),
+        }
+    }
+    fn prepare() -> Envelope {
+        request(
+            1,
+            Operation::PrepareCurrentCloseProfile,
+            Request::PrepareCurrentCloseProfile {
+                call: 13,
+                intent: Intent {
+                    command: 0,
+                    registration: 11,
+                    owner_mm: owner().mm.generation(),
+                    normal_epoch: 0,
+                    expected_table: 5,
+                    expected_file: 7,
+                    fd: 4,
+                    reserved: 0,
+                    syscall_nr: 3,
+                },
+            },
+        )
+    }
+    fn collect() -> Envelope {
+        request(
+            2,
+            Operation::CollectCurrentCloseProfile,
+            Request::CollectCurrentCloseProfile {
+                call: 13,
+                command: 7,
+                prepared_request: 1,
+            },
+        )
+    }
+    fn retire() -> Envelope {
+        request(
+            3,
+            Operation::RetireCurrentCloseProfile,
+            Request::RetireCurrentCloseProfile {
+                call: 13,
+                prepared: 1,
+                completed: 2,
+            },
+        )
+    }
+    #[test]
+    fn current_close_registration_retains_active_until_exact_ack_and_unknown_is_sticky() {
+        for fail_ack in [false, true] {
+            let mut backend = Controlled {
+                prepare: 0,
+                collect: 0,
+                ack: 0,
+                fail_ack,
+                intent: None,
+            };
+            let mut registrations = Registrations::default();
+            registrations
+                .dispatch(&mut backend, &prepare(), &[41], None)
+                .unwrap();
+            assert_eq!(registrations.active_count(), 1);
+            assert!(
+                registrations
+                    .dispatch(&mut backend, &prepare(), &[41], None)
+                    .is_err()
+            );
+            assert!(
+                registrations
+                    .dispatch(&mut backend, &collect(), &[], Some(&[42]))
+                    .is_err()
+            );
+            let body = registrations
+                .dispatch(&mut backend, &collect(), &[], Some(&[41]))
+                .unwrap();
+            assert!(matches!(
+                serde_json::from_slice::<Reply>(&body).unwrap(),
+                Reply::CurrentCloseProfile(_)
+            ));
+            assert_eq!(registrations.active_count(), 1, "collection is not ACK");
+            assert!(
+                registrations
+                    .dispatch(&mut backend, &collect(), &[], Some(&[41]))
+                    .is_err()
+            );
+            let mut wrong = retire();
+            wrong.body = serde_json::to_vec(&Request::RetireCurrentCloseProfile {
+                call: 14,
+                prepared: 1,
+                completed: 2,
+            })
+            .unwrap();
+            assert!(
+                registrations
+                    .dispatch(&mut backend, &wrong, &[], Some(&[41]))
+                    .is_err()
+            );
+            let result = registrations.dispatch(&mut backend, &retire(), &[], Some(&[41]));
+            assert_eq!(result.is_ok(), !fail_ack);
+            assert_eq!(registrations.active_count(), usize::from(fail_ack));
+            assert!(
+                registrations
+                    .dispatch(&mut backend, &retire(), &[], Some(&[41]))
+                    .is_err()
+            );
+            assert_eq!((backend.prepare, backend.collect, backend.ack), (1, 1, 1));
+            if fail_ack {
+                let active = registrations.0[&owner().thread].active.as_ref().unwrap();
+                assert!(active.current_close.as_ref().unwrap().collected.is_some());
+                assert!(active.current_close.as_ref().unwrap().ack_submitted);
             }
         }
     }

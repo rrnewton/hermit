@@ -36,6 +36,9 @@ type NativeBirthTestGroup = (
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(super) enum Operation {
+    PrepareCurrentCloseProfile,
+    CollectCurrentCloseProfile,
+    RetireCurrentCloseProfile,
     PrepareExecutableSource,
     CollectExecutableSource,
     RetireExecutableSource,
@@ -74,6 +77,14 @@ pub(super) enum Operation {
 }
 
 impl Operation {
+    fn current_close(self) -> bool {
+        matches!(
+            self,
+            Self::PrepareCurrentCloseProfile
+                | Self::CollectCurrentCloseProfile
+                | Self::RetireCurrentCloseProfile
+        )
+    }
     fn executable(self) -> bool {
         matches!(
             self,
@@ -90,14 +101,17 @@ impl Operation {
             | Self::PrepareSetter
             | Self::MatchAccepted
             | Self::PrepareAccept => 2, // socket + task pidfd
-            Self::PrepareExecutableSource
+            Self::PrepareCurrentCloseProfile
+            | Self::PrepareExecutableSource
             | Self::ObserveTerminalSocket
             | Self::PrepareTableEnrollment
             | Self::PrepareOriginalConnect
             | Self::PrepareOriginalFileObservation
             | Self::PrepareNativeBirth
             | Self::ObserveNativeBirth => 1, // exact held target PIDFD_THREAD
-            Self::CollectExecutableSource
+            Self::CollectCurrentCloseProfile
+            | Self::RetireCurrentCloseProfile
+            | Self::CollectExecutableSource
             | Self::RetireExecutableSource
             | Self::RetireTerminalSocketObservation
             | Self::CollectOriginalFileObservation
@@ -191,6 +205,37 @@ fn receipt(envelope: &Envelope, body: &[u8]) -> ObservationReceipt {
         accept: envelope.accept,
         body: body.to_vec(),
     }
+}
+
+fn validate_current_close_retirement(
+    owner: NetworkStreamOwner,
+    call: u64,
+    sequences: [u64; 3],
+    envelope: &Envelope,
+    body: &[u8],
+    rights: usize,
+) -> io::Result<()> {
+    use super::accepted_provider::Reply;
+    use super::accepted_provider::Request;
+    let [prepared, completed, retired] = sequences;
+    if retired <= completed
+        || envelope.sequence != retired
+        || envelope.owner != Some(owner)
+        || envelope.accept.is_some()
+        || rights != 0
+        || envelope.operation != Operation::RetireCurrentCloseProfile
+        || !matches!(serde_json::from_slice::<Request>(&envelope.body),
+            Ok(Request::RetireCurrentCloseProfile { call: c, prepared: p, completed: d })
+                if (c,p,d) == (call,prepared,completed))
+        || !matches!(serde_json::from_slice::<Reply>(body),
+            Ok(Reply::CurrentCloseProfileRetired(status)) if status.operation == "ap_ack_command"
+                && status.returned == 0 && status.errno.is_none())
+    {
+        return Err(protocol(
+            "current_close retirement changed exact group or actual ACK",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_executable_retirement(
@@ -290,6 +335,7 @@ impl<T> Outbox<T> {
     ) -> Result<u64, (io::Error, Vec<T>)> {
         // Failure returns ownership rather than letting temporary arguments drop.
         if envelope.operation == Operation::Reply
+            || envelope.operation.current_close() && !self.wire_format.has_current_close_profile()
             || envelope.operation.executable() && !self.wire_format.has_executable_source()
             || envelope.expected_rights() != Some(rights.len())
         {
@@ -1701,7 +1747,8 @@ impl<T> Inbox<T> {
             .ok_or_else(|| protocol("sent original ACK missing"))?;
         if !matches!(
             entry.envelope.operation,
-            Operation::RetireExecutableSource
+            Operation::RetireCurrentCloseProfile
+                | Operation::RetireExecutableSource
                 | Operation::RetireOriginalConnect
                 | Operation::RetireNativeBirth
                 | Operation::RetireOriginalFileObservation
@@ -1721,6 +1768,12 @@ impl<T> Inbox<T> {
                     && status.returned == 0
                     && status.errno.is_none()
                     && status.operation == "ap_retire_auxiliary_task"
+            }
+            super::accepted_provider::Reply::CurrentCloseProfileRetired(status) => {
+                entry.envelope.operation == Operation::RetireCurrentCloseProfile
+                    && status.returned == 0
+                    && status.errno.is_none()
+                    && status.operation == "ap_ack_command"
             }
             super::accepted_provider::Reply::ExecutableSourceRetired(status) => {
                 entry.envelope.operation == Operation::RetireExecutableSource
@@ -2019,6 +2072,90 @@ impl AcceptedSession {
         }
         self.outgoing.entries.remove(&observed);
         self.outgoing.entries.remove(&retired);
+        Ok(())
+    }
+
+    pub(super) fn check_incoming_current_close_profile(
+        &self,
+        owner: NetworkStreamOwner,
+        call: u64,
+        prepared: u64,
+        completed: u64,
+    ) -> io::Result<()> {
+        let mut views = Vec::new();
+        for sequence in [prepared, completed] {
+            let entry = self
+                .incoming
+                .entries
+                .get(&sequence)
+                .ok_or_else(|| protocol("current_close incoming frame missing"))?;
+            let IncomingState::Completed(body) = &entry.state else {
+                return Err(protocol("current_close incoming frame unresolved"));
+            };
+            views.push((&entry.envelope, body.as_slice(), entry.rights.len()));
+        }
+        super::accepted_provider::current_close_profile::validate_group(
+            owner, call, prepared, completed, &views,
+        )
+    }
+    pub(super) fn retire_incoming_current_close_profile(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: u64,
+        sequences: [u64; 3],
+    ) -> io::Result<()> {
+        let [prepared, completed, retired] = sequences;
+        self.check_incoming_current_close_profile(owner, call, prepared, completed)?;
+        let entry = self
+            .incoming
+            .entries
+            .get(&retired)
+            .ok_or_else(|| protocol("current_close ACK frame missing"))?;
+        let IncomingState::Completed(body) = &entry.state else {
+            return Err(protocol("current_close ACK remains unresolved"));
+        };
+        validate_current_close_retirement(
+            owner,
+            call,
+            sequences,
+            &entry.envelope,
+            body,
+            entry.rights.len(),
+        )?;
+        self.incoming.entries.remove(&prepared);
+        self.incoming.entries.remove(&completed);
+        Ok(())
+    }
+    pub(super) fn retire_outgoing_current_close_profile(
+        &mut self,
+        owner: NetworkStreamOwner,
+        call: u64,
+        sequences: [u64; 3],
+    ) -> io::Result<()> {
+        let [prepared, completed, retired] = sequences;
+        let views = self.outgoing.acknowledged_group(&[prepared, completed])?;
+        super::accepted_provider::current_close_profile::validate_group(
+            owner, call, prepared, completed, &views,
+        )?;
+        let entry = self
+            .outgoing
+            .entries
+            .get(&retired)
+            .ok_or_else(|| protocol("current_close outgoing ACK missing"))?;
+        let SendState::Acknowledged(body) = &entry.state else {
+            return Err(protocol("current_close outgoing ACK unresolved"));
+        };
+        validate_current_close_retirement(
+            owner,
+            call,
+            sequences,
+            &entry.envelope,
+            body,
+            entry.rights.len(),
+        )?;
+        for sequence in sequences {
+            self.outgoing.entries.remove(&sequence);
+        }
         Ok(())
     }
 
@@ -2551,6 +2688,8 @@ impl AcceptedSession {
             e.run == self.run
                 && e.expected_rights() == Some(raw.rights.len())
                 && (!e.operation.executable() || self.incoming.wire_format.has_executable_source())
+                && (!e.operation.current_close()
+                    || self.incoming.wire_format.has_current_close_profile())
         }) && raw.control_valid
             && raw.flags == libc::MSG_CMSG_CLOEXEC;
         if !valid {
@@ -6752,6 +6891,50 @@ mod executable_wire_tests {
                 (Operation::PrepareExecutableSource, vec![41]),
                 (Operation::CollectExecutableSource, vec![]),
                 (Operation::RetireExecutableSource, vec![]),
+            ] {
+                let mut outbox = Outbox {
+                    wire_format: wire,
+                    ..Outbox::default()
+                };
+                let envelope = Envelope {
+                    run: [7; 16],
+                    sequence: 0,
+                    owner: None,
+                    accept: None,
+                    operation,
+                    body: b"controlled rejected predecode".to_vec(),
+                };
+                let (_, retained) = outbox.prepare(envelope, rights.clone()).unwrap_err();
+                assert_eq!(retained, rights);
+                assert!(outbox.entries.is_empty());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod current_close_wire_tests {
+    use super::*;
+    #[test]
+    fn current_close_commands_require_abi12_copy5_without_losing_rejected_rights() {
+        assert!(super::super::ProviderWireFormat::from_versions(0x4150_5255_5354_000c, 4).is_err());
+        assert!(
+            super::super::ProviderWireFormat::from_package("415052555354000c", Some(4)).is_err()
+        );
+        assert!(
+            serde_json::from_str::<super::super::ProviderWireFormat>(r#""abi12-copy4""#).is_err()
+        );
+        for wire in [
+            super::super::ProviderWireFormat::Abi7Copy4,
+            super::super::ProviderWireFormat::Abi8Copy5,
+            super::super::ProviderWireFormat::Abi9Copy5,
+            super::super::ProviderWireFormat::Abi10Copy5,
+            super::super::ProviderWireFormat::Abi11Copy5,
+        ] {
+            for (operation, rights) in [
+                (Operation::PrepareCurrentCloseProfile, vec![41]),
+                (Operation::CollectCurrentCloseProfile, vec![]),
+                (Operation::RetireCurrentCloseProfile, vec![]),
             ] {
                 let mut outbox = Outbox {
                     wire_format: wire,

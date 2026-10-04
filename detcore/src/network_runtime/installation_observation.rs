@@ -51,7 +51,6 @@ pub(super) struct Capture {
     pub candidate_stat: Option<crate::stat::DetStat>,
     pub observation: Option<Observation<CommandResult>>,
     pub metadata: Option<HeldMetadata>,
-    pub(super) finite_close: Option<super::socket_birth_policy::Observation>,
     pub error: Option<String>,
     pub release: Option<CallStatus>,
 }
@@ -63,7 +62,6 @@ pub(crate) struct Checked {
     pub cookie: u64,
     raw: RawState,
     pub metadata: HeldMetadata,
-    pub(super) finite_close: Option<super::socket_birth_policy::Observation>,
 }
 fn status(operation: &str, returned: i32) -> CallStatus {
     let errno = (returned < 0).then(|| {
@@ -209,7 +207,6 @@ pub(super) fn capture(
         candidate_stat: None,
         observation: None,
         metadata: None,
-        finite_close: None,
         error: None,
         release: None,
     };
@@ -233,8 +230,6 @@ pub(super) fn capture(
         // An unknown/reused file does not supply metadata for this Call. The
         // later exact journal cut, never this mismatch, can prove retirement.
         if matches {
-            result.finite_close = (effect.original.selection.requested_fd == libc::AF_INET)
-                .then(|| super::socket_birth_policy::observe(target, held.as_fd()));
             result.metadata = Some(metadata(held.as_fd(), stat)?);
         }
         Ok(())
@@ -297,15 +292,6 @@ impl Capture {
     /// publication must independently prove the complete ordered retirement.
     pub(super) fn checked(&self, effect: &OriginalEffect) -> io::Result<Option<Checked>> {
         let command = self.command(effect)?;
-        if self
-            .finite_close
-            .as_ref()
-            .is_some_and(|birth| !birth.policy.released())
-        {
-            return Err(io::Error::other(
-                "Socket birth policy descriptor release remains unresolved",
-            ));
-        }
         if self.capture.operation != "pidfd_getfd original installation" {
             return Err(io::Error::other("installation capture changed operation"));
         }
@@ -314,7 +300,6 @@ impl Capture {
                 && self.candidate_stat.is_none()
                 && self.observation.is_none()
                 && self.metadata.is_none()
-                && self.finite_close.is_none()
                 && self.error.is_none()
                 && self.release.is_none()
             {
@@ -338,8 +323,7 @@ impl Capture {
             .candidate_stat
             .ok_or_else(|| io::Error::other("held observation lacks actual fstat"))?;
         if stat.mode & libc::S_IFMT != libc::S_IFSOCK {
-            if self.observation.is_none() && self.metadata.is_none() && self.finite_close.is_none()
-            {
+            if self.observation.is_none() && self.metadata.is_none() {
                 return Ok(None);
             }
             return Err(io::Error::other(
@@ -349,7 +333,7 @@ impl Capture {
         let command =
             command.ok_or_else(|| io::Error::other("held socket observation did not complete"))?;
         if command.identity.object != self.file {
-            if self.metadata.is_none() && self.finite_close.is_none() {
+            if self.metadata.is_none() {
                 return Ok(None);
             }
             return Err(io::Error::other(
@@ -370,7 +354,6 @@ impl Capture {
             cookie: command.cookie,
             raw: command.state.into(),
             metadata,
-            finite_close: self.finite_close.clone(),
         }))
     }
 }
@@ -509,7 +492,6 @@ pub(super) fn fixture() -> (OriginalEffect, Capture) {
                 send_timeout: (0, 0),
             }),
         }),
-        finite_close: None,
         error: None,
         release: Some(CallStatus {
             operation: "close installation observation".into(),

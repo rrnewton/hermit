@@ -21,7 +21,7 @@ mod original_source_ioctl;
 mod replay_connect;
 mod shared_origin;
 mod shared_send;
-mod socket_birth_policy;
+mod socket_origin;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
 pub(crate) use foreground_store::CheckedReadRange;

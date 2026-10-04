@@ -1,5 +1,6 @@
-//! Keep a proven finite Close on the original Normal turn. Unknown provenance
-//! returns to the unchanged external Close before any original Call is staged.
+//! Keep a proven finite Close on the original Normal turn. Logical provenance
+//! selects the same class in Record and Replay. Every candidate must then pass
+//! a fresh physical release proof; failure never falls through to generic Close.
 use super::*;
 
 impl<T: RecordOrReplay> Detcore<T> {
@@ -25,6 +26,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let read = self.begin_network_fd_read(guest, call.fd()).await?;
         let mut transferred = false;
+        let mut profile_pending = false;
         let result = async {
             if !guest
                 .local_global_state()
@@ -35,16 +37,38 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(None);
             }
             self.check_original_call_staging(guest, crate::OriginalFileExecution::Native)?;
+            let (_, args) = Syscall::from(call).into_parts();
+            let raw = [
+                args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+            ];
+            // An unknown pre-effect observation must retain this existing
+            // reader until the owning task's terminal cleanup resolves debt.
+            profile_pending = true;
+            let prepared_profile = guest
+                .local_global_state()
+                .unwrap()
+                .prepare_foreground_close_profile(guest.tid(), guest.thread_state(), &read, raw)
+                .await
+                .map_err(engine_rpc_error)?;
+            // This must precede original-call/private-register staging. Actual
+            // provider GETREGSET entry/return is required by collection; cached
+            // or plausible register values cannot supply a physical profile.
+            let _registers = guest.regs().await;
+            let profile_result = guest
+                .local_global_state()
+                .unwrap()
+                .collect_foreground_close_profile(&prepared_profile)
+                .await;
+            // Even an unsafe physical profile can be positively ACKed before
+            // refusal. Only that settled fact permits the normal reader release.
+            profile_pending = !prepared_profile.settled();
+            let profile = profile_result.map_err(engine_rpc_error)?;
             let arguments = self.stage_original_call_local(
                 guest,
                 call.into(),
                 crate::network_replay::original_connect::Kind::Close,
                 (call.fd(), 0, 0),
             )?;
-            let (_, args) = Syscall::from(call).into_parts();
-            let raw = [
-                args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
-            ];
             let prepared = guest
                 .local_global_state()
                 .unwrap()
@@ -54,6 +78,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     read.clone(),
                     arguments,
                     raw,
+                    profile,
                 )
                 .await
                 .map_err(engine_rpc_error)?;
@@ -97,7 +122,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             finish_shadow_operation(returned, retirement).map(Some)
         }
         .await;
-        if transferred {
+        if transferred || profile_pending {
             return result;
         }
         let released = self

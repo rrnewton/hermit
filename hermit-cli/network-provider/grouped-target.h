@@ -2042,11 +2042,17 @@ static int ap_check_grouped_image(FILE *input) {
     return 0;
 }
 #include "executable-source-image.h"
+#ifdef AP_CURRENT_CLOSE_PROFILE_ENABLED
+#include "current-close-image.h"
+#endif
 static int ap_require_grouped_target(void) {
     if(ap_require_retirement_target())return -1;
     FILE *input=fopen(AP_COPY_KERNEL_IMAGE,"re");if(!input)return -1;
     int rc=ap_check_grouped_image(input);
     if(!rc)rc=ap_check_executable_image(input);
+#ifdef AP_CURRENT_CLOSE_PROFILE_ENABLED
+    if(!rc)rc=ap_check_current_close_image(input);
+#endif
     int saved=errno;
     if(fclose(input) && !rc)return -1;
     errno=saved;return rc;

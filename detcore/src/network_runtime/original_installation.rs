@@ -357,7 +357,7 @@ pub(crate) struct Installation {
     reconciled: Option<Vec<super::accepted_provider::FdEvent>>,
     allocated: Option<AllocatedProfile>,
     epoll: Option<EpollProfile>,
-    finite_close: Option<Arc<super::socket_birth_policy::Completed>>,
+    finite_close: Option<Arc<super::socket_origin::Completed>>,
 }
 
 impl Installation {
@@ -593,12 +593,23 @@ impl Installation {
         Ok(self)
     }
 
-    pub(crate) fn finite_close_birth(&self) -> Option<&Arc<super::socket_birth_policy::Completed>> {
+    pub(crate) fn finite_close_birth(&self) -> Option<&Arc<super::socket_origin::Completed>> {
         self.finite_close.as_ref()
     }
 
     pub(crate) fn original_owner(&self) -> NetworkStreamOwner {
         self.owner.owner
+    }
+    pub(super) fn matches_socket_origin_root(&self, root: &super::ForegroundRoot) -> bool {
+        self.owner.owner == root.owner()
+            && self.owner.files == root.files()
+            && (
+                self.owner.provider,
+                self.owner.task,
+                self.owner.start,
+                self.owner.table,
+            ) == root.native_identity()
+            && self.file != 0
     }
     pub(crate) fn files(&self) -> crate::types::FilesId {
         self.owner.files
@@ -949,17 +960,15 @@ impl super::NetworkRuntimeResources {
                                 "Socket birth precedes actual preparation worker join",
                             ));
                         }
-                        if let Some(observed) = effect
+                        // Settle/validate an existing auxiliary observation
+                        // independently. Its optional metadata is not logical
+                        // Close classification authority.
+                        effect
                             .socket
                             .as_ref()
                             .map(|c| c.checked(&effect))
-                            .transpose()?
-                            .flatten()
-                            && let Some(observation) = observed.finite_close.as_ref()
-                        {
-                            receipt.finite_close =
-                                plan.complete(owner, admission, &observation.policy, observation)?;
-                        }
+                            .transpose()?;
+                        receipt.finite_close = Some(plan.complete(owner, admission, &receipt)?);
                     }
                 } else if admission.arguments.kind
                     == crate::network_replay::original_connect::Kind::Openat
@@ -1438,25 +1447,17 @@ impl super::RuntimeShared {
                         (begin, end, through),
                         journal.history(),
                     )?;
-                    if admission.arguments.kind == Kind::Socket && effect.socket.is_some() {
-                        // Only the original retained capture can preserve birth.
-                        // A later publisher's terminal getter is not its issuer.
+                    if admission.arguments.kind == Kind::Socket {
+                        // Only the retained original successful Socket and its
+                        // joined preparation issue logical origin. A terminal
+                        // getter neither issues nor revokes that provenance.
                         if let Some(plan) = &state.socket_birth {
                             if !state.socket_birth_preparation_joined {
                                 return Err(io::Error::other(
                                     "Socket birth precedes actual preparation worker join",
                                 ));
                             }
-                            if let Some(observation) =
-                                socket.as_ref().and_then(|s| s.finite_close.as_ref())
-                            {
-                                receipt.finite_close = plan.complete(
-                                    owner,
-                                    admission,
-                                    &observation.policy,
-                                    observation,
-                                )?;
-                            }
+                            receipt.finite_close = Some(plan.complete(owner, admission, &receipt)?);
                         }
                     } else if admission.arguments.kind == Kind::Openat {
                         receipt.allocated = Some(allocated_profile(&effect.original)?);
@@ -1823,10 +1824,67 @@ pub(crate) fn installation_fixture(
     fd: i32,
     interference: bool,
 ) -> Installation {
+    installation_fixture_for_owner(
+        Owner {
+            owner,
+            metadata,
+            files: permit.files,
+            provider: 7,
+            task: 31,
+            start: 101,
+            table: 13,
+        },
+        permit,
+        source,
+        command,
+        fd,
+        interference,
+    )
+}
+
+/// Controlled journal premise tied to the fixture's real root identities.
+/// The production checked constructor still validates the paired install rows.
+#[cfg(test)]
+pub(crate) fn installation_fixture_for_root(
+    root: &super::ForegroundRoot,
+    permit: NetworkFdPublicationPermit,
+    source: Source,
+    command: u64,
+    fd: i32,
+    interference: bool,
+) -> Installation {
+    let (provider, task, start, table) = root.native_identity();
+    installation_fixture_for_owner(
+        Owner {
+            owner: root.owner(),
+            metadata: root.metadata().unwrap(),
+            files: root.files(),
+            provider,
+            task,
+            start,
+            table,
+        },
+        permit,
+        source,
+        command,
+        fd,
+        interference,
+    )
+}
+
+#[cfg(test)]
+fn installation_fixture_for_owner(
+    owner: Owner,
+    permit: NetworkFdPublicationPermit,
+    source: Source,
+    command: u64,
+    fd: i32,
+    interference: bool,
+) -> Installation {
     use super::accepted_provider_ffi as ffi;
     let mut history = History::default();
     let status = ffi::FdStatus {
-        next_table: 13,
+        next_table: owner.table,
         next_file: 19,
         next_event: if interference { 4 } else { 2 },
         ..Default::default()
@@ -1834,9 +1892,9 @@ pub(crate) fn installation_fixture(
     let first = ffi::FdEvent {
         sequence: 1,
         kind: 1,
-        task: 31,
-        task_start: 101,
-        table: 13,
+        task: owner.task,
+        task_start: owner.start,
+        table: owner.table,
         file: 19,
         accept_command: command,
         fd,
@@ -1882,15 +1940,7 @@ pub(crate) fn installation_fixture(
             .unwrap();
     }
     Installation::checked(
-        Owner {
-            owner,
-            metadata,
-            files: permit.files,
-            provider: 7,
-            task: 31,
-            start: 101,
-            table: 13,
-        },
+        owner,
         permit,
         source,
         (command, fd, 19),
@@ -2660,12 +2710,12 @@ mod recovery_tests {
 #[path = "original_installation/native_publication.rs"]
 mod native_publication;
 
-/// Adds only a controlled host-policy premise to an existing authenticated
+/// Adds only controlled logical origin to an existing authenticated
 /// Socket fixture; the real installation publisher still issues OFD history.
 #[cfg(test)]
 pub(crate) fn installation_with_controlled_birth(
     mut installation: Installation,
-    birth: Arc<super::socket_birth_policy::Completed>,
+    birth: Arc<super::socket_origin::Completed>,
 ) -> io::Result<Installation> {
     let Source::Socket(call) = installation.source else {
         return Err(io::Error::other(

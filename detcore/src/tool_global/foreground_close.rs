@@ -5,6 +5,8 @@ use crate::network_replay::original_connect::Admission;
 use crate::network_replay::original_connect::Arguments;
 use crate::network_replay::original_connect::foreground_close::ForegroundCloseEntry;
 use crate::network_replay::original_connect::foreground_close::ForegroundCloseOrigin;
+use crate::network_runtime::current_close_profile::CompletedCurrentCloseProfile;
+use crate::network_runtime::current_close_profile::PreparedCurrentCloseProfile;
 use crate::scheduler::ordinary_fd::SharedMmForegroundObservation;
 
 fn failed(error: impl std::fmt::Display) -> NetworkRpcError {
@@ -93,7 +95,7 @@ impl GlobalState {
         {
             return Ok(false);
         }
-        let result = self.with_foreground_close(tid, state, |engine, grant, metadata| {
+        self.with_foreground_close(tid, state, |engine, grant, metadata| {
             engine.validate_fd_read_grant(owner, read).map_err(failed)?;
             let observed = metadata.observe_fd_read(read).map_err(failed)?;
             if observed.binding != read.binding
@@ -111,18 +113,74 @@ impl GlobalState {
                 .validate_foreground_close_birth_root(owner, read, grant.root())
                 .map_err(failed)?;
             Ok(true)
-        });
-        crate::network_runtime::socket_birth_policy::decline_diagnostic(format_args!(
-            "phase=close-census fd={} outcome={}",
-            read.fd,
-            match &result {
-                Ok(true) => "initial-singleton",
-                Ok(false) => "other-topology",
-                Err(_) => "error",
-            }
-        ));
-        result
+        })
     }
+    /// Observe current physical release configuration only after selecting the
+    /// common logical class. Any failed/unsafe result aborts that class rather
+    /// than selecting a different scheduler path in Record and Replay.
+    pub(crate) async fn prepare_foreground_close_profile<T>(
+        &self,
+        tid: Tid,
+        state: &crate::tool_local::ThreadState<T>,
+        read: &crate::network_replay::NetworkFdReadAdmission,
+        raw: [usize; 6],
+    ) -> Result<PreparedCurrentCloseProfile, NetworkRpcError> {
+        let runtime = self
+            .network_runtime
+            .as_ref()
+            .ok_or_else(|| failed("finite Close runtime absent"))?;
+        let engine = self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| failed("finite Close engine absent"))?;
+        let (root, epoch) = self.with_foreground_close(tid, state, |_, grant, _| {
+            Ok((grant.root().clone(), grant.epoch()))
+        })?;
+        let prefix = runtime
+            .join_shared_foreground_prefix(root.clone(), engine, None)
+            .await
+            .map_err(failed)?;
+        let file = self.with_foreground_close(tid, state, |engine, grant, metadata| {
+            if !Arc::ptr_eq(grant.root(), &root) || grant.epoch() != epoch {
+                return Err(failed("finite Close observation crossed selected turn"));
+            }
+            let observed = metadata.observe_fd_read(read).map_err(failed)?;
+            if observed.binding != read.binding
+                || observed.socket != read.binding.map(|b| b.open_file)
+            {
+                return Err(failed(
+                    "finite Close observation changed selected descriptor",
+                ));
+            }
+            runtime
+                .with_shared_attempt_prefix(&prefix, engine, |engine, physical| {
+                    engine
+                        .validate_foreground_close_selection(read, grant, &prefix, physical, raw)
+                        .map_err(std::io::Error::other)?;
+                    engine
+                        .foreground_close_file_identity(grant.owner(), read)
+                        .map_err(std::io::Error::other)
+                })
+                .map_err(failed)
+        })?;
+        runtime
+            .prepare_current_close_profile(root, epoch, read.clone(), raw, file)
+            .await
+            .map_err(failed)
+    }
+
+    pub(crate) async fn collect_foreground_close_profile(
+        &self,
+        prepared: &PreparedCurrentCloseProfile,
+    ) -> Result<Arc<CompletedCurrentCloseProfile>, NetworkRpcError> {
+        self.network_runtime
+            .as_ref()
+            .ok_or_else(|| failed("finite Close runtime absent"))?
+            .collect_current_close_profile(prepared, true)
+            .await
+            .map_err(failed)
+    }
+
     pub(crate) async fn begin_foreground_original_close<T>(
         &self,
         tid: Tid,
@@ -130,6 +188,7 @@ impl GlobalState {
         read: crate::network_replay::NetworkFdReadAdmission,
         arguments: Arguments,
         raw: [usize; 6],
+        profile: Arc<CompletedCurrentCloseProfile>,
     ) -> Result<PreparedForegroundClose, NetworkRpcError> {
         let runtime = self
             .network_runtime
@@ -173,6 +232,7 @@ impl GlobalState {
                                 read,
                                 arguments,
                                 raw,
+                                profile,
                             },
                             grant,
                             &prefix,

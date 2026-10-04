@@ -26,6 +26,9 @@ use crate::types::OpenFileId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum Effect {
+    PrepareCurrentCloseProfile(NetworkStreamLeaseId),
+    CollectCurrentCloseProfile(NetworkStreamLeaseId),
+    RetireCurrentCloseProfile(NetworkStreamLeaseId),
     PrepareExecutableSource(crate::network_replay::NetworkStreamCallId),
     CollectExecutableSource(crate::network_replay::NetworkStreamCallId),
     RetireExecutableSource(crate::network_replay::NetworkStreamCallId),
@@ -84,13 +87,34 @@ struct Submitted {
     sequence: Option<u64>,
     error: Option<String>,
     copy_authority_issued: bool,
+    current_close_issued: bool,
     birth_semantic: Option<BirthSemantic>,
     birth_completion: Option<BirthCompletion>,
     birth_creator_terminal: bool,
     birth_cleanup: Option<std::sync::Arc<super::native_birth::NativeBirthCleanup>>,
 }
+#[cfg(test)]
+#[derive(Clone, PartialEq, Eq)]
+struct FixtureRequest {
+    key: Effect,
+    owner: NetworkStreamOwner,
+    operation: Operation,
+    body: Vec<u8>,
+    sequence: Option<u64>,
+    error: Option<String>,
+}
+#[cfg(test)]
+pub(super) struct FixtureHistory(Vec<FixtureRequest>);
+
 #[derive(Debug, Default)]
-struct Requests(BTreeMap<Effect, Submitted>, u64, u64);
+struct Requests(
+    BTreeMap<Effect, Submitted>,
+    u64,
+    u64,
+    // Publication leases increase for the run. Advance only after the exact
+    // profile ACK group retires, so removing its frames cannot rearm that read.
+    Option<NetworkStreamLeaseId>,
+);
 impl Requests {
     fn consume_birth(
         &mut self,
@@ -186,6 +210,13 @@ impl Requests {
                 "retired observation cannot be submitted again",
             ));
         }
+        if matches!(key, Effect::PrepareCurrentCloseProfile(lease)
+            if self.3.is_some_and(|retired| lease <= retired))
+        {
+            return Err(io::Error::other(
+                "retired current Close observation cannot be submitted again",
+            ));
+        }
         if let Some(prior) = self.0.get(&key) {
             if prior.owner != owner || prior.operation != operation || prior.body != body {
                 return Err(io::Error::other(
@@ -229,6 +260,7 @@ impl Requests {
                 sequence: None,
                 error: None,
                 copy_authority_issued: false,
+                current_close_issued: false,
                 birth_semantic: None,
                 birth_completion: None,
                 birth_creator_terminal: false,
@@ -439,7 +471,9 @@ impl Controller {
         if state.requests.0.keys().any(|key| {
             matches!(
                 key,
-                Effect::PrepareNativeBirth(_) | Effect::PrepareExecutableSource(_)
+                Effect::PrepareNativeBirth(_)
+                    | Effect::PrepareExecutableSource(_)
+                    | Effect::PrepareCurrentCloseProfile(_)
             )
         }) {
             return Ok(false);
@@ -550,6 +584,9 @@ impl Controller {
             | Request::ReadCreation { .. }
             | Request::AwaitCreation { .. }
             | Request::RetireObservation { .. } => Operation::DrainCreations,
+            Request::PrepareCurrentCloseProfile { .. } => Operation::PrepareCurrentCloseProfile,
+            Request::CollectCurrentCloseProfile { .. } => Operation::CollectCurrentCloseProfile,
+            Request::RetireCurrentCloseProfile { .. } => Operation::RetireCurrentCloseProfile,
             Request::PrepareExecutableSource { .. } => Operation::PrepareExecutableSource,
             Request::CollectExecutableSource { .. } => Operation::CollectExecutableSource,
             Request::RetireExecutableSource { .. } => Operation::RetireExecutableSource,
@@ -1503,6 +1540,164 @@ impl Controller {
                 .unwrap()
                 .0;
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn current_close_fixture_history(&self) -> FixtureHistory {
+        let state = self.state.lock().unwrap();
+        FixtureHistory(
+            state
+                .requests
+                .0
+                .iter()
+                .map(|(key, request)| FixtureRequest {
+                    key: *key,
+                    owner: request.owner,
+                    operation: request.operation,
+                    body: request.body.clone(),
+                    sequence: request.sequence,
+                    error: request.error.clone(),
+                })
+                .collect(),
+        )
+    }
+    #[cfg(test)]
+    pub(super) fn current_close_fixture_requests(&self) -> Vec<Request> {
+        self.state
+            .lock()
+            .unwrap()
+            .requests
+            .0
+            .values()
+            .map(|request| serde_json::from_slice(&request.body).unwrap())
+            .collect()
+    }
+    #[cfg(test)]
+    pub(super) fn current_close_fixture_matches_history(&self, before: &FixtureHistory) -> bool {
+        self.current_close_fixture_history().0 == before.0
+    }
+    #[cfg(test)]
+    pub(super) fn current_close_fixture_preserves_history(&self, before: &FixtureHistory) -> bool {
+        let state = self.state.lock().unwrap();
+        state.failure.is_none()
+            && state.pending_send.is_empty()
+            && state.requests.0.len() == before.0.len()
+            && before.0.iter().all(|prior| {
+                state.requests.0.get(&prior.key).is_some_and(|now| {
+                    now.owner == prior.owner
+                        && now.operation == prior.operation
+                        && now.body == prior.body
+                        && now.sequence == prior.sequence
+                        && now.error == prior.error
+                })
+            })
+            && !state.requests.0.keys().any(|key| {
+                matches!(
+                    key,
+                    Effect::PrepareCurrentCloseProfile(_)
+                        | Effect::CollectCurrentCloseProfile(_)
+                        | Effect::RetireCurrentCloseProfile(_)
+                )
+            })
+    }
+    #[cfg(test)]
+    pub(super) fn current_close_fixture_history_empty(&self) -> bool {
+        let state = self.state.lock().unwrap();
+        state.requests.0.is_empty() && state.pending_send.is_empty() && state.failure.is_none()
+    }
+    #[cfg(test)]
+    pub(super) fn current_close_fixture_original_refusal(&self) -> io::Result<bool> {
+        let state = self.state.lock().unwrap();
+        if state.requests.0.len() != 1 || !state.pending_send.is_empty() || state.failure.is_some()
+        {
+            return Ok(false);
+        }
+        let (key, request) = state.requests.0.first_key_value().unwrap();
+        if !matches!(key, Effect::PrepareOriginalConnect(_))
+            || request.operation != Operation::PrepareOriginalConnect
+        {
+            return Ok(false);
+        }
+        let Some(sequence) = request.sequence else {
+            return Ok(false);
+        };
+        let Some(body) = state.session.response(sequence)? else {
+            return Ok(false);
+        };
+        Ok(
+            matches!(serde_json::from_slice::<Reply>(body),Ok(Reply::Prepared(p)) if p.raw==0
+            && p.status.operation=="ap_prepare_original_close" && p.status.returned==-1 && p.status.errno==Some(libc::EIO)),
+        )
+    }
+    /// Issue exactly one trigger token from the retained preparation. Merely
+    /// retrieving a response again may never authorize another GETREGSET.
+    pub(super) fn claim_current_close_prepared(
+        &self,
+        permit: crate::network_replay::NetworkFdPublicationPermit,
+        sequence: u64,
+    ) -> io::Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let entry = state
+            .requests
+            .0
+            .get_mut(&Effect::PrepareCurrentCloseProfile(permit.lease))
+            .filter(|e| {
+                e.owner == permit.owner
+                    && e.sequence == Some(sequence)
+                    && e.operation == Operation::PrepareCurrentCloseProfile
+                    && !e.current_close_issued
+            })
+            .ok_or_else(|| {
+                io::Error::other("current Close trigger was already issued or changed preparation")
+            })?;
+        entry.current_close_issued = true;
+        Ok(())
+    }
+
+    pub(super) fn retire_current_close_profile(
+        &self,
+        owner: NetworkStreamOwner,
+        permit: crate::network_replay::NetworkFdPublicationPermit,
+        sequences: [u64; 3],
+    ) -> io::Result<()> {
+        let keys = [
+            Effect::PrepareCurrentCloseProfile(permit.lease),
+            Effect::CollectCurrentCloseProfile(permit.lease),
+            Effect::RetireCurrentCloseProfile(permit.lease),
+        ];
+        let mut state = self.state.lock().unwrap();
+        for (key, sequence) in keys.into_iter().zip(sequences) {
+            if state
+                .requests
+                .0
+                .get(&key)
+                .is_none_or(|r| r.owner != owner || r.sequence != Some(sequence))
+                || state.pending_send.contains(&sequence)
+            {
+                return Err(io::Error::other(
+                    "current_close source retirement changed retained requests",
+                ));
+            }
+        }
+        if state
+            .requests
+            .3
+            .is_some_and(|retired| permit.lease <= retired)
+        {
+            return Err(io::Error::other(
+                "current Close retirement did not advance its original read",
+            ));
+        }
+        state.session.retire_outgoing_current_close_profile(
+            owner,
+            permit.native_command_call(),
+            sequences,
+        )?;
+        state.requests.3 = Some(permit.lease);
+        for key in keys {
+            state.requests.0.remove(&key);
+        }
+        Ok(())
     }
 
     pub(super) fn retire_executable_source(

@@ -54,6 +54,10 @@ struct Contract {
     grouped_event: GroupedDeclaration,
     #[serde(default)]
     ftrace_only: bool,
+    #[serde(default, deserialize_with = "present_u64")]
+    current_close_profile_version: Option<u64>,
+    #[serde(default, deserialize_with = "present_u64")]
+    current_close_profile_bytes: Option<u64>,
     schema: u32,
     abi_version: String,
     #[serde(default)]
@@ -70,6 +74,10 @@ struct Manifest {
     grouped_event: GroupedDeclaration,
     #[serde(default)]
     ftrace_only: bool,
+    #[serde(default, deserialize_with = "present_u64")]
+    current_close_profile_version: Option<u64>,
+    #[serde(default, deserialize_with = "present_u64")]
+    current_close_profile_bytes: Option<u64>,
     schema: u32,
     kind: String,
     abi_version: String,
@@ -94,6 +102,11 @@ fn present_string<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
     String::deserialize(deserializer).map(Some)
+}
+
+// Absent legacy fields are distinct from explicit null, float or boolean values.
+fn present_u64<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<u64>, D::Error> {
+    u64::deserialize(deserializer).map(Some)
 }
 
 // Explicitly sort every object regardless of serde_json feature unification.
@@ -152,6 +165,33 @@ fn package_metadata(
             "provider nonclassic topology differs from compiled contract",
         ));
     }
+    let current_close = contract.abi_version == "415052555354000c";
+    let expected_profile = if current_close {
+        if wire_format != ProviderWireFormat::Abi12Copy5
+            || !contract.ftrace_only
+            || !matches!(&contract.grouped_event, GroupedDeclaration::Present(_))
+        {
+            return Err(io::Error::other(
+                "current-Close provider requires ABI12 copy5 ftrace topology",
+            ));
+        }
+        (Some(1), Some(576))
+    } else {
+        (None, None)
+    };
+    if (
+        contract.current_close_profile_version,
+        contract.current_close_profile_bytes,
+    ) != expected_profile
+        || (
+            manifest.current_close_profile_version,
+            manifest.current_close_profile_bytes,
+        ) != expected_profile
+    {
+        return Err(io::Error::other(
+            "current-Close provider declaration differs from its exact wire format",
+        ));
+    }
     let topology = match (&contract.grouped_event, contract.ftrace_only) {
         (GroupedDeclaration::Absent, false) => {
             if (contract.maps, contract.programs, contract.links)
@@ -177,7 +217,11 @@ fn package_metadata(
                 || (contract.maps, contract.programs, contract.links)
                     != if ftrace {
                         (
-                            24 + usize::from(contract.abi_version == "415052555354000b"),
+                            if current_close {
+                                26
+                            } else {
+                                24 + usize::from(contract.abi_version == "415052555354000b")
+                            },
                             49,
                             49,
                         )
@@ -589,7 +633,13 @@ mod tests {
             "object": OBJECT, "library": LIBRARY,
             "object_sha256": "11".repeat(32), "library_sha256": "22".repeat(32),
         });
-        for key in ["copy_version", "grouped_event", "ftrace_only"] {
+        for key in [
+            "copy_version",
+            "grouped_event",
+            "ftrace_only",
+            "current_close_profile_version",
+            "current_close_profile_bytes",
+        ] {
             if let Some(field) = contract.get(key) {
                 value[key] = field.clone();
             }
@@ -624,7 +674,12 @@ mod tests {
     }
     #[test]
     fn current_ftrace_manifest_requires_exact_123_shape() {
-        let contract: serde_json::Value = serde_json::from_str(ACCEPTED_CONTRACT).unwrap();
+        let historical = include_str!("../tests/fixtures/accepted-contract-abi11.json");
+        assert_eq!(
+            *Digest::new(historical.as_bytes()),
+            digest_hex("8c8c7f81f92823cb5d280268cecbd973ed71e153ac26a5e92ec8d6fce2557bfc").unwrap()
+        );
+        let contract: serde_json::Value = serde_json::from_str(historical).unwrap();
         let manifest = manifest_for(&contract);
         assert_eq!(
             (
@@ -665,6 +720,137 @@ mod tests {
                 "hard Ftrace topology predicate accepted paired {counts:?}");
         }
     }
+    #[test]
+    fn abi12_ftrace_manifest_requires_exact_124_shape() {
+        let contract: serde_json::Value = serde_json::from_str(ACCEPTED_CONTRACT).unwrap();
+        let manifest = manifest_for(&contract);
+        assert_eq!(contract["abi_version"], "415052555354000c");
+        assert_eq!(contract["copy_version"], 5);
+        assert_eq!(contract["current_close_profile_version"], 1);
+        assert_eq!(contract["current_close_profile_bytes"], 576);
+        assert_eq!(
+            (
+                manifest["maps"].as_u64(),
+                manifest["programs"].as_u64(),
+                manifest["links"].as_u64()
+            ),
+            (Some(26), Some(49), Some(49))
+        );
+        assert!(metadata(&contract, &manifest).is_ok());
+        for counts in [
+            [24, 49, 49],
+            [25, 49, 49],
+            [27, 49, 49],
+            [26, 48, 49],
+            [26, 50, 49],
+            [26, 49, 48],
+            [26, 49, 50],
+            [25, 50, 49],
+            [25, 49, 50],
+        ] {
+            let mut wrong = manifest.clone();
+            let mut paired = contract.clone();
+            for (key, count) in ["maps", "programs", "links"].into_iter().zip(counts) {
+                wrong[key] = serde_json::json!(count);
+                paired[key] = serde_json::json!(count);
+            }
+            assert!(metadata(&contract, &wrong).is_err(), "{counts:?}");
+            assert!(metadata(&paired, &wrong).is_err(), "paired {counts:?}");
+        }
+    }
+
+    #[test]
+    fn abi12_profile_fields_are_required_typed_exact_and_not_legacy_authority() {
+        let contract: serde_json::Value = serde_json::from_str(ACCEPTED_CONTRACT).unwrap();
+        let manifest = manifest_for(&contract);
+        for (key, incorrect) in [
+            ("current_close_profile_version", serde_json::json!(2)),
+            ("current_close_profile_bytes", serde_json::json!(544)),
+            ("current_close_profile_bytes", serde_json::json!(575)),
+            ("current_close_profile_bytes", serde_json::json!(577)),
+        ] {
+            for value in [
+                incorrect,
+                serde_json::Value::Null,
+                serde_json::json!(true),
+                serde_json::json!("1"),
+                serde_json::json!(1.0),
+                serde_json::json!(576.0),
+            ] {
+                let mut changed = contract.clone();
+                changed[key] = value.clone();
+                let mut changed_manifest = manifest.clone();
+                changed_manifest[key] = value;
+                assert!(
+                    metadata(&contract, &changed_manifest).is_err(),
+                    "manifest {key}"
+                );
+                assert!(metadata(&changed, &manifest).is_err(), "contract {key}");
+                assert!(
+                    metadata(&changed, &changed_manifest).is_err(),
+                    "paired {key}"
+                );
+            }
+            let mut missing = contract.clone();
+            missing.as_object_mut().unwrap().remove(key);
+            let mut missing_manifest = manifest.clone();
+            missing_manifest.as_object_mut().unwrap().remove(key);
+            assert!(metadata(&contract, &missing_manifest).is_err());
+            assert!(metadata(&missing, &manifest).is_err());
+            assert!(metadata(&missing, &missing_manifest).is_err());
+            let raw = serde_json::to_string(&manifest).unwrap();
+            let duplicate = format!("{{\"{key}\":{},{}", manifest[key], &raw[1..]);
+            assert!(package_metadata(ACCEPTED_CONTRACT, duplicate.as_bytes()).is_err());
+        }
+        let legacy: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/accepted-contract-abi11.json"
+        ))
+        .unwrap();
+        assert!(metadata(&legacy, &manifest_for(&legacy)).is_ok());
+        for key in [
+            "current_close_profile_version",
+            "current_close_profile_bytes",
+        ] {
+            let mut changed = legacy.clone();
+            changed[key] = contract[key].clone();
+            assert!(
+                metadata(&changed, &manifest_for(&changed)).is_err(),
+                "legacy {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn abi12_refuses_other_copy_versions_and_non_ftrace_topologies() {
+        let contract: serde_json::Value = serde_json::from_str(ACCEPTED_CONTRACT).unwrap();
+        for copy in [0, 4, 6] {
+            let mut changed = contract.clone();
+            changed["copy_version"] = serde_json::json!(copy);
+            assert!(
+                metadata(&changed, &manifest_for(&changed)).is_err(),
+                "copy {copy}"
+            );
+        }
+        for classic in [false, true] {
+            let mut changed = contract.clone();
+            changed["ftrace_only"] = false.into();
+            if classic {
+                changed.as_object_mut().unwrap().remove("grouped_event");
+                changed["maps"] = 23.into();
+                changed["programs"] = 46.into();
+                changed["links"] = 58.into();
+            } else {
+                changed["maps"] = 23.into();
+                changed["programs"] = 44.into();
+                changed["links"] = 44.into();
+            }
+            assert!(
+                metadata(&changed, &manifest_for(&changed)).is_err(),
+                "classic {classic}"
+            );
+        }
+    }
+
     #[test]
     fn package_topology_preserves_absence_and_rejects_crossed_or_unknown_contracts() {
         let grouped = grouped_fixture();

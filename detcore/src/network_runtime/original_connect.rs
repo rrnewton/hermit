@@ -1003,7 +1003,7 @@ impl NetworkRuntimeResources {
         admission: Admission,
         task: OwnedFd,
         publication: NativeCaptureRecovery,
-        authority: super::socket_birth_policy::SocketBirthAuthority,
+        authority: super::socket_origin::SocketBirthAuthority,
     ) -> std::io::Result<()> {
         self.prepare_original_with_birth(owner, admission, task, publication, Some(authority))
             .await
@@ -1015,7 +1015,7 @@ impl NetworkRuntimeResources {
         admission: Admission,
         task: OwnedFd,
         publication: NativeCaptureRecovery,
-        birth_authority: Option<super::socket_birth_policy::SocketBirthAuthority>,
+        birth_authority: Option<super::socket_origin::SocketBirthAuthority>,
     ) -> std::io::Result<()> {
         let birth_requested = birth_authority.is_some();
         let target = std::sync::Arc::new(task);
@@ -1096,13 +1096,9 @@ impl NetworkRuntimeResources {
                 executor,
                 authority.clone(),
             )?;
-            // All directory/namespace observations execute inside this exact
-            // retained native worker before provider submission; no guest code
-            // or second task can mutate the admitted sole-root birth interval.
-            let birth = birth_authority.map(|authority| {
-                super::socket_birth_policy::Plan::capture(authority, capture_target.as_fd())
-            });
-            let birth_released = birth.as_ref().is_none_or(|plan| plan.released());
+            // Retain only the original logical Socket authority. Current
+            // release configuration is observed separately at original Close.
+            let birth = birth_authority.map(super::socket_origin::Plan::capture);
             if admitted.arguments.kind.allocator() {
                 let mut calls = shared.native_streams.lock().unwrap();
                 let state = calls.original(owner, admitted.call)?;
@@ -1110,15 +1106,6 @@ impl NetworkRuntimeResources {
                 state.allocation_userns = userns;
                 state.allocation_netns = netns;
                 state.socket_birth = birth;
-            }
-            if !birth_released {
-                // The raw failed close remains on the retained Original. Its
-                // auxiliary-debt guard prevents final removal, and no provider
-                // command or original Socket invocation has been admitted.
-                shared.retire_original_before_submission(owner, &admitted, &authority)?;
-                return Err(std::io::Error::other(
-                    "Socket birth pre-entry release is unresolved",
-                ));
             }
             let held = shared
                 .native_streams
@@ -1226,7 +1213,7 @@ impl NetworkRuntimeResources {
         &self,
         owner: NetworkStreamOwner,
         admission: &Admission,
-    ) -> std::io::Result<Option<super::socket_birth_policy::SocketBirthAuthority>> {
+    ) -> std::io::Result<Option<super::socket_origin::SocketBirthAuthority>> {
         if admission.arguments.kind != Kind::Socket {
             return Ok(None);
         }

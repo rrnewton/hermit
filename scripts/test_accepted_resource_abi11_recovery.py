@@ -504,7 +504,25 @@ class Abi11PackageTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.package = Path(self.temp.name)
-        self.contract_path = Path(ar.__file__).resolve().parents[1] / "hermit-cli/network-provider/accepted-contract.json"
+        # Keep the unchanged ABI11 producer's original source layout and exact
+        # old contract. The selected checkout now produces ABI12; its contract
+        # must never be relabelled as the historical recovery authority.
+        producer = Path(ar.__file__).resolve()
+        historical = self.package / "historical-source"
+        script = historical / "scripts" / producer.name
+        script.parent.mkdir(parents=True)
+        script.write_bytes(producer.read_bytes())
+        script.with_name("network_recovery.py").write_bytes(producer.with_name("network_recovery.py").read_bytes())
+        fixture = producer.parents[1] / "hermit-cli/tests/fixtures/accepted-contract-abi11.json"
+        self.contract_path = historical / "hermit-cli/network-provider/accepted-contract.json"
+        self.contract_path.parent.mkdir(parents=True)
+        self.contract_path.write_bytes(fixture.read_bytes())
+        self.assertEqual(nr.digest(self.contract_path.read_bytes()), ar.CONTRACT_RAW)
+        # Relocate only __file__ for these package tests; actual producer code,
+        # dependency, bounded contract/artifact reads and all checks are unchanged.
+        relocated = mock.patch.object(ar, "__file__", str(script))
+        relocated.start()
+        self.addCleanup(relocated.stop)
         self.contract = nr.decode(self.contract_path.read_bytes())
         self.manifest = {key: self.contract[key] for key in
                          ("schema", "abi_version", "copy_version", "maps", "programs", "links",
@@ -548,8 +566,9 @@ class Abi11PackageTests(unittest.TestCase):
                           self.manifest["object_sha256"], self.manifest["library_sha256"],
                           self.contract["btf_sha256"], 25, 49, 49])
         for key, value in (("abi_version", "4150525553540009"), ("abi_version", "415052555354000a"),
+                           ("abi_version", "415052555354000c"),
                            ("copy_version", 4), ("copy_version", 5.0), ("schema", True),
-                           ("maps", 24), ("maps", 25.0), ("programs", 48), ("links", 50),
+                           ("maps", 24), ("maps", 26), ("maps", 25.0), ("programs", 48), ("links", 50),
                            ("ftrace_only", 1), ("grouped_event", {}), ("kind", "foreign"),
                            ("object", "../accepted-provider.bpf.o"), ("library", "foreign.so"),
                            ("object_sha256", "0" * 64), ("library_sha256", "0" * 64),

@@ -115,7 +115,7 @@ pub(super) struct OriginalConnect {
     // Kernel-returned namespace capability from this exact original task before
     // provider submission. CLONE_FILES never grants namespace equivalence.
     pub allocation_netns: Option<std::sync::Arc<OwnedFd>>,
-    pub socket_birth: Option<super::socket_birth_policy::Plan>,
+    pub socket_birth: Option<super::socket_origin::Plan>,
     pub socket_birth_preparation_joined: bool,
     pub socket_observation_request: Option<u64>,
     pub socket_observation: Option<super::installation_observation::Capture>,
@@ -1383,21 +1383,6 @@ impl Calls {
         {
             return Err(io::Error::other(
                 "original allocation still owns its auxiliary socket observation",
-            ));
-        }
-        if self
-            .owned(owner, call)?
-            .invocation
-            .as_ref()
-            .is_some_and(|state| {
-                state
-                    .socket_birth
-                    .as_ref()
-                    .is_some_and(|plan| !plan.released())
-            })
-        {
-            return Err(io::Error::other(
-                "Socket birth pre-entry release is unresolved",
             ));
         }
         self.calls.remove(&call);

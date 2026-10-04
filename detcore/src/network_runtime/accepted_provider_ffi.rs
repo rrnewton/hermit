@@ -273,6 +273,7 @@ const _: () = {
 };
 #[path = "accepted_provider_ffi/blocking_tx.rs"]
 mod blocking_tx;
+pub mod current_close_profile;
 pub mod executable_source;
 
 /// Exact physical cleanup evidence, not an observed syscall result.
@@ -543,6 +544,11 @@ fn authenticate_provider_declarations(
             "provider executable source layout mismatch".into(),
         ));
     }
+    if wire.has_current_close_profile() && read(c"ap_adapter_current_close_profile_size")? != 576 {
+        return Err(LoadError(
+            "provider current Close profile layout mismatch".into(),
+        ));
+    }
     topology
         .observe_driver(read(c"ap_provider_topology_version")?)
         .map_err(|error| LoadError(error.to_string()))
@@ -588,6 +594,7 @@ struct GroupedApi {
         unsafe extern "C" fn(*mut SessionPtr, *mut c_void, *mut c_void, u64, u64) -> c_int,
 }
 struct Api {
+    current_close_profile: Option<current_close_profile::Api>,
     executable_source: Option<executable_source::Api>,
     blocking_tx: Option<blocking_tx::Api>,
     grouped: Option<GroupedApi>,
@@ -857,7 +864,26 @@ impl Library {
         } else {
             None
         };
+        let current_close_profile = if wire_format.has_current_close_profile() {
+            Some(current_close_profile::Api {
+                prepare: symbol!(
+                    "ap_prepare_current_close_profile",
+                    current_close_profile::Prepare
+                ),
+                collect: symbol!(
+                    "ap_collect_current_close_profile",
+                    current_close_profile::Collect
+                ),
+                validate: symbol!(
+                    "ap_validate_current_close_profile",
+                    current_close_profile::Validate
+                ),
+            })
+        } else {
+            None
+        };
         let api = Api {
+            current_close_profile,
             executable_source,
             blocking_tx,
             grouped,
@@ -1797,6 +1823,49 @@ impl Session {
             status: CallStatus::capture("ap_prepare_original_read", rc),
             raw,
         }
+    }
+
+    pub fn prepare_current_close_profile(
+        &mut self,
+        target: BorrowedFd<'_>,
+        intent: current_close_profile::Intent,
+    ) -> io::Result<Observation<u64>> {
+        let api = self
+            .library
+            .api
+            .current_close_profile
+            .as_ref()
+            .ok_or_else(|| io::Error::other("current Close requires ABI12-copy5"))?;
+        if intent.command != 0 {
+            return Err(io::Error::other(
+                "current Close command must be freshly assigned",
+            ));
+        }
+        let mut raw = 0;
+        let rc = unsafe { (api.prepare)(self.pointer(), target.as_raw_fd(), &intent, &mut raw) };
+        Ok(Observation {
+            status: CallStatus::capture("ap_prepare_current_close_profile", rc),
+            raw,
+        })
+    }
+    pub fn collect_current_close_profile(
+        &mut self,
+        target: BorrowedFd<'_>,
+        command: u64,
+    ) -> io::Result<Observation<current_close_profile::Effect>> {
+        let api = self
+            .library
+            .api
+            .current_close_profile
+            .as_ref()
+            .ok_or_else(|| io::Error::other("current Close requires ABI12-copy5"))?;
+        current_close_profile::read(
+            self.wire_format(),
+            |result, receipt| unsafe {
+                (api.collect)(self.pointer(), target.as_raw_fd(), command, result, receipt)
+            },
+            |result, receipt| unsafe { (api.validate)(self.pointer(), result, receipt) },
+        )
     }
 
     /// Inactive raw observation API: no source capability is issued by this adapter.

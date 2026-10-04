@@ -33,6 +33,9 @@ pub enum ProviderWireFormat {
     /// Same executable observation ABI with receive-copy version5.
     #[serde(rename = "abi11-copy5")]
     Abi11Copy5,
+    /// ABI12 adds a distinct current-Close observation map with copy5.
+    #[serde(rename = "abi12-copy5")]
+    Abi12Copy5,
 }
 
 impl ProviderWireFormat {
@@ -48,6 +51,7 @@ impl ProviderWireFormat {
             (0x4150_5255_5354_000a, 5) => Ok(Self::Abi10Copy5),
             (0x4150_5255_5354_000b, 4) => Ok(Self::Abi11Copy4),
             (0x4150_5255_5354_000b, 5) => Ok(Self::Abi11Copy5),
+            (0x4150_5255_5354_000c, 5) => Ok(Self::Abi12Copy5),
             _ => Err(io::Error::other(
                 "unsupported provider adapter/copy version pair",
             )),
@@ -67,6 +71,7 @@ impl ProviderWireFormat {
             ("415052555354000a", Some(5)) => Ok(Self::Abi10Copy5),
             ("415052555354000b", Some(4)) => Ok(Self::Abi11Copy4),
             ("415052555354000b", Some(5)) => Ok(Self::Abi11Copy5),
+            ("415052555354000c", Some(5)) => Ok(Self::Abi12Copy5),
             _ => Err(io::Error::other(
                 "unsupported provider package wire declaration",
             )),
@@ -81,6 +86,7 @@ impl ProviderWireFormat {
             Self::Abi9Copy4 | Self::Abi9Copy5 => 0x4150_5255_5354_0009,
             Self::Abi10Copy4 | Self::Abi10Copy5 => 0x4150_5255_5354_000a,
             Self::Abi11Copy4 | Self::Abi11Copy5 => 0x4150_5255_5354_000b,
+            Self::Abi12Copy5 => 0x4150_5255_5354_000c,
         }
     }
 
@@ -94,27 +100,40 @@ impl ProviderWireFormat {
                 | Self::Abi10Copy5
                 | Self::Abi11Copy4
                 | Self::Abi11Copy5
+                | Self::Abi12Copy5
         )
     }
 
-    /// Only ABI10 carries the enlarged internal command and distinct capture.
+    /// ABI10 and later carry the enlarged internal command and distinct capture.
     pub(crate) fn has_blocking_tx(self) -> bool {
         matches!(
             self,
-            Self::Abi10Copy4 | Self::Abi10Copy5 | Self::Abi11Copy4 | Self::Abi11Copy5
+            Self::Abi10Copy4
+                | Self::Abi10Copy5
+                | Self::Abi11Copy4
+                | Self::Abi11Copy5
+                | Self::Abi12Copy5
         )
     }
 
-    /// Only ABI11 may call the472-byte executable receipt writer.
+    /// ABI11 and later may call the472-byte executable receipt writer.
     pub(crate) fn has_executable_source(self) -> bool {
-        matches!(self, Self::Abi11Copy4 | Self::Abi11Copy5)
+        matches!(self, Self::Abi11Copy4 | Self::Abi11Copy5 | Self::Abi12Copy5)
+    }
+
+    pub(crate) fn has_current_close_profile(self) -> bool {
+        matches!(self, Self::Abi12Copy5)
     }
 
     /// Receive-copy grammar bound before any observation is parsed.
     pub fn copy_version(self) -> u64 {
         match self {
             Self::Abi7Copy4 | Self::Abi9Copy4 | Self::Abi10Copy4 | Self::Abi11Copy4 => 4,
-            Self::Abi8Copy5 | Self::Abi9Copy5 | Self::Abi10Copy5 | Self::Abi11Copy5 => 5,
+            Self::Abi8Copy5
+            | Self::Abi9Copy5
+            | Self::Abi10Copy5
+            | Self::Abi11Copy5
+            | Self::Abi12Copy5 => 5,
         }
     }
 }
@@ -141,7 +160,7 @@ mod tests {
             7,
             8,
             0x4150_5255_5354_0006,
-            0x4150_5255_5354_000c,
+            0x4150_5255_5354_000d,
             u64::MAX,
         ] {
             for copy in [4, 5] {
@@ -233,5 +252,38 @@ mod tests {
             assert!(!old.has_blocking_tx());
         }
         assert!(serde_json::from_str::<ProviderWireFormat>("\"abi10-copy6\"").is_err());
+    }
+}
+
+#[cfg(test)]
+mod current_close_tests {
+    use super::*;
+    #[test]
+    fn current_close_format_is_explicit_abi12_copy5_without_legacy_fallback() {
+        let w = ProviderWireFormat::Abi12Copy5;
+        assert_eq!(
+            ProviderWireFormat::from_versions(0x4150_5255_5354_000c, 5).unwrap(),
+            w
+        );
+        assert_eq!(
+            ProviderWireFormat::from_package("415052555354000c", Some(5)).unwrap(),
+            w
+        );
+        assert_eq!(w.abi_version(), 0x4150_5255_5354_000c);
+        assert_eq!(w.copy_version(), 5);
+        assert!(w.has_executable_source() && w.has_blocking_tx() && w.has_source_ioctl_dispatch());
+        assert!(w.has_current_close_profile());
+        assert_eq!(
+            serde_json::from_str::<ProviderWireFormat>(r#""abi12-copy5""#).unwrap(),
+            w
+        );
+        assert!(serde_json::from_str::<ProviderWireFormat>(r#""abi12-copy4""#).is_err());
+        for copy in [None, Some(0), Some(3), Some(4), Some(6)] {
+            assert!(ProviderWireFormat::from_package("415052555354000c", copy).is_err());
+            if let Some(copy) = copy {
+                assert!(ProviderWireFormat::from_versions(0x4150_5255_5354_000c, copy).is_err());
+            }
+        }
+        assert!(!ProviderWireFormat::Abi11Copy5.has_current_close_profile());
     }
 }
