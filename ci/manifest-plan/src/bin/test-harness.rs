@@ -7740,7 +7740,6 @@ sys.exit(1 if failed else 0)
             "test.envelope_levels",
             "test.rr_suite_contract",
             "test.sabre_examples",
-            "test.liteinst_strict",
         ]
         .into_iter()
         .collect::<std::collections::BTreeSet<_>>();
@@ -7782,9 +7781,11 @@ sys.exit(1 if failed else 0)
         // the dbt-parity shard (23 to 22; the shard is now dbt-runtime-abi) and
         // check.backend_parity_suites left the integration shard when
         // tests/backend-parity was retired (22 to 21). test.detcore_time joined
-        // the unit shard when it was enrolled (21 to 22).
-        assert_eq!(physical_rows, 22);
-        assert_eq!(resolved.len(), 22);
+        // the unit shard when it was enrolled (21 to 22). test.liteinst_strict
+        // left with its liteinst shard when LiteInst became in-guest only
+        // (https://github.com/rrnewton/hermit/issues/3520; 22 to 21).
+        assert_eq!(physical_rows, 21);
+        assert_eq!(resolved.len(), 21);
         assert_eq!(actual_aliases, expected_aliases);
         // Run the complete real budget audit too: all original workflow,
         // critical-path and exact inversion-baseline comparisons remain active.
