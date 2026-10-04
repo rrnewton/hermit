@@ -1528,7 +1528,11 @@ class PinnedGuestPathContract(unittest.TestCase):
         self.assertTrue(paths)
         for path in paths:
             self.assertRegex(path, r"^/usr/bin/[A-Za-z0-9_-]+$")
-        source = (here.parents[1] / "hermit-cli/tests/liteinst_advanced.rs").read_text()
+        # The in-guest LiteInst program tests, run by test.cli in the pinned
+        # root (formerly hermit-cli/tests/liteinst_advanced.rs).
+        source = (
+            here.parents[1] / "hermit-cli/tests/common/liteinst_in_guest_programs.rs"
+        ).read_text()
         literals = set(re.findall(r'"(/usr/bin/[A-Za-z0-9_-]+)"', source))
         self.assertTrue(literals, "the source population must not disappear")
         self.assertEqual(

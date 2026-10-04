@@ -259,6 +259,18 @@
       "why": "tests/c/dbt_wait_lifecycle.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml: Direct C guest for wait4/waitid accounting and SIGCHLD handler delivery; the manifest selects its ptrace, LiteInst and DBT verify cells with an exact stdout golden"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/dlopen_cpuid_vendor.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/dlopen_cpuid_vendor.c is owned by hermit-cli/tests/cli.rs: The in-guest LiteInst program tests (hermit-cli/tests/common/liteinst_in_guest_programs.rs) compile this guest, which executes CPUID in its main executable and then dlopens tests/c/dlopen_cpuid_vendor_lib.c whose constructor executes CPUID in code mapped after start-up, and require both vendor strings under ptrace and in-guest LiteInst; it remains a guest fixture because a generic manifest cannot build and pass the companion shared library."
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/dlopen_cpuid_vendor_lib.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/dlopen_cpuid_vendor_lib.c is owned by hermit-cli/tests/cli.rs: The in-guest LiteInst program tests compile this shared library, whose constructor executes CPUID leaf 0, and pass it to tests/c/dlopen_cpuid_vendor.c to load with dlopen; it remains a guest fixture because it is a shared object, not a runnable guest."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/dup_shared_offset.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -650,15 +662,9 @@
     },
     {
       "disposition": "guest-fixture",
-      "path": "tests/c/liteinst_host_activation.c",
-      "runner": "hermit-cli/tests/liteinst_host_activation.rs",
-      "why": "tests/c/liteinst_host_activation.c is owned by hermit-cli/tests/liteinst_host_activation.rs: The Rust integration test compiles this activation-aware guest and asserts host-selected LiteInst registration and hook counters; it remains a guest fixture because a generic E2E manifest cannot build the selected runtime or verify controller-owned activation provenance."
-    },
-    {
-      "disposition": "guest-fixture",
       "path": "tests/c/liteinst_inert_runtime.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this export-shaped but constructor-free DSO, selects the LiteInst backend, injects it as the runtime override, and asserts rejection before any activation claim; it remains a guest fixture because a generic manifest cannot express that build, injection, and fail-closed diagnostic contract."
+      "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this export-shaped but constructor-free DSO, selects the LiteInst backend, injects it as the in-guest Detcore runtime override, and asserts rejection before the guest is dispatched; it remains a guest fixture because a generic manifest cannot express that build, injection, and fail-closed diagnostic contract."
     },
     {
       "disposition": "manifest-test",
