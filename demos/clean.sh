@@ -92,6 +92,7 @@ transient_globs=(
   "run-metadata.json.tmp.*"
   "hermit-boot.qcow2.tmp.*"
   "hermit-boot.qcow2.producer.json.tmp.*"
+  "hermit-snapshot.qcow2.producer.json.tmp.*"
   ".bzImage.*"
   ".initramfs.cpio.gz.*"
   ".initramfs-version.*"
