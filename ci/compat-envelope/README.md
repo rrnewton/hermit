@@ -324,13 +324,20 @@ DRIFTED replaces it with the current position; WRONG discards it because the
 current comparison matches; UNCHECKABLE withholds it because the current row
 did not establish a trustworthy result. Each outcome is printed per cell.
 Only current rows counted as canonical can make the outcome FRESH, DRIFTED or
-WRONG. A row with a typed verification report counts as a match only if the
-report is a canonical bitwise match (`require_canonical_match`), and as a
-divergence only if the report compared canonical evidence
-(`require_canonical_comparison`); a row without a report is counted by its
-result alone. Any other row, such as a below-L2 stripped match or a match
-without bitwise parity, is counted apart and named in the printed reason; with
-no canonical current row the outcome is UNCHECKABLE.
+WRONG. A row counts as a match only if its typed verification report is a
+canonical bitwise match (`require_canonical_match`), and as a divergence only
+if the report compared canonical evidence (`require_canonical_comparison`). A
+pass without a report shows no canonical comparison, so it is not counted and
+cannot retire a retained canonical divergence; pressure evidence alone
+therefore cannot retire a chaos cell's canonical divergence when its chaos
+rows are such passes. A row without a report and without a verdict still
+counts, and keeps the outcome UNCHECKABLE. Any other row, such as a below-L2
+stripped match, is counted apart and named in the printed reason; with no
+canonical current row the outcome is UNCHECKABLE. A current pass whose matched
+report is neither a verified bitwise-identical match nor a verified stripped
+match without bitwise parity, such as a canonical match without bitwise
+parity, is refused as internally inconsistent and leaves the outcome
+UNCHECKABLE.
 One matching run is UNCHECKABLE rather than WRONG because these cells can match
 once and diverge on another run. WRONG requires at least two distinct canonical
 current matches and no current divergence under any comparison; every
@@ -523,7 +530,11 @@ After a clean periodic run, deliberately merge its red-cell measurements with:
 
 The command requires the summary's Hermit commit and Detcore tree to equal the
 clean checkout at `HEAD`, refuses infrastructure-error rows, and updates only
-red-cell observations. For repeated measurements of the same Detcore tree, it
+red-cell observations. A `pass` row whose typed report is a match is merged
+only if that report is a verified bitwise-identical match or a verified
+stripped match without bitwise parity; any other matched report, such as a
+canonical match without bitwise parity, is skipped and named as internally
+inconsistent, and a summary whose every row is skipped is refused. For repeated measurements of the same Detcore tree, it
 retains the exact Hermit commits measured, every observed result, and the
 earliest and latest first-divergence scheduler turn and virtual nanosecond. A
 determinism, replay, or parity failure with no measurable divergence point
