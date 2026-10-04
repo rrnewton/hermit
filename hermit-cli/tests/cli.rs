@@ -96,6 +96,8 @@ static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(feature = "liteinst")]
+static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
@@ -612,6 +614,33 @@ stdout:
 {}
 stderr:
 {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+#[cfg(feature = "liteinst")]
+fn liteinst_in_guest_wait_signals_guest() -> &'static Path {
+    LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST.get_or_init(|| {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/liteinst_in_guest_wait_signals.c");
+        let build_root =
+            Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-in-guest-wait-signals");
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the in-guest wait-signals guest directory");
+        let guest = build_root.join("liteinst_in_guest_wait_signals");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the in-guest wait-signals guest");
+        assert!(
+            output.status.success(),
+            "in-guest wait-signals guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -12459,6 +12488,260 @@ fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
         in_guest.runtime_mapped,
         "the in-guest Detcore runtime {IN_GUEST_RUNTIME} is not mapped into the guest"
     );
+}
+
+/// Signals that arrive while in-guest Detcore is blocked in a guest's `wait4`
+/// (guest `hermit-cli/tests/fixtures/liteinst_in_guest_wait_signals.c`).
+///
+/// Detcore blocks every signal it can around a blocking `wait4` and restores
+/// the guest's mask afterwards. Under in-guest LiteInst both are real
+/// `rt_sigprocmask` calls made by the guest preload. Before
+/// https://github.com/rrnewton/reverie/pull/913 the preload refused, with
+/// EPERM, any set that blocked its own SIGSYS, so a guest that forked and
+/// waited failed at its first `wait4`.
+///
+/// Each mode runs natively, once under the ptrace backend and three times
+/// under in-guest LiteInst. Every run must print the mode's expected lines and
+/// end with its expected status. The native run shows that the expected lines
+/// are what Linux does. When the guest is killed by a signal, `hermit` raises
+/// the same signal on itself (`ExitStatus::raise_or_exit`), so every runner
+/// must end in that signal death.
+///
+/// block-all prints the mask the guest gets when it asks to block all 64
+/// signals. Linux never blocks SIGKILL or SIGSTOP, and each backend keeps a few
+/// more signals for itself, so that one line is expected per backend. The masks
+/// below name every signal each backend leaves unblocked.
+///
+/// Two modes do not run in-guest until their gaps are fixed. They still run
+/// natively and under ptrace, so their expected lines stay checked:
+/// - terminate-during-wait: a guest process killed by a signal is never
+///   reported to the Detcore scheduler, so the run never finishes
+///   (https://github.com/rrnewton/hermit/issues/3688);
+/// - write-only-set: in-guest Detcore cannot read a system-call argument from a
+///   page mapped write-only (https://github.com/rrnewton/reverie/issues/921).
+///
+/// In-guest runs are compared by output and exit status only. In-guest
+/// LiteInst refuses `--verify` until it forwards guest records (landing 4b of
+/// https://github.com/rrnewton/hermit/issues/3520), so the schedule itself is
+/// not compared here.
+#[test]
+#[cfg(feature = "liteinst")]
+#[ignore = "needs the in-guest Detcore runtime from `cargo build -p detcore-liteinst`"]
+fn liteinst_in_guest_signals_during_a_blocking_wait4_match_ptrace() {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+    use std::sync::mpsc;
+
+    const DEADLINE: Duration = Duration::from_secs(60);
+    const IN_GUEST_RUNS: usize = 3;
+
+    #[derive(Clone, Copy)]
+    enum Exit {
+        Code(i32),
+        Signal(i32),
+    }
+
+    let bit = |signal: i32| 1_u64 << (signal - 1);
+    let all_but = |unblocked: &[i32]| {
+        unblocked
+            .iter()
+            .fold(u64::MAX, |mask, &signal| mask & !bit(signal))
+    };
+    // Linux never blocks these two.
+    let native_mask = all_but(&[libc::SIGKILL, libc::SIGSTOP]);
+    // The ptrace backend also leaves these two unblocked:
+    // - SIGSTKFLT, reverie's perf-event timer signal (`reverie::PERF_EVENT_SIGNAL`).
+    //   Detcore removes it from every mask a guest installs
+    //   (`without_perf_event_signal` in `detcore/src/syscalls/signal.rs`).
+    // - SIGTRAP, as measured. Detcore counts SIGTRAP as taken by ptrace
+    //   (`APPROPRIATED_SIGNALS`, same file). This test does not depend on which
+    //   component unblocks it.
+    let ptrace_mask = all_but(&[libc::SIGKILL, libc::SIGSTOP, libc::SIGSTKFLT, libc::SIGTRAP]);
+    // In-guest LiteInst has no tracer and leaves SIGTRAP blocked. It leaves
+    // these three unblocked:
+    // - SIGSTKFLT, for the same Detcore reason.
+    // - SIGSYS and SIGSEGV. The guest runtime keeps both for itself and removes
+    //   them from any set the guest installs
+    //   (https://github.com/rrnewton/reverie/pull/913). SIGSYS is the seccomp
+    //   trap for system calls that are not patched. SIGSEGV is how the kernel
+    //   reports a trapped RDTSC or CPUID instruction. The runtime keeps it
+    //   while either is trapped, and Detcore's default configuration traps
+    //   RDTSC.
+    let in_guest_mask = all_but(&[
+        libc::SIGKILL,
+        libc::SIGSTOP,
+        libc::SIGSTKFLT,
+        libc::SIGSYS,
+        libc::SIGSEGV,
+    ]);
+
+    let expected_stdout = |mode: &str, block_all_mask: u64| -> String {
+        match mode {
+            "sigchld-during-wait" => "sigchld-during-wait slow=5 fast=3\nmask-after=0\n".to_owned(),
+            "ignored-during-wait" => "ignored-during-wait child=5\nmask-after=0\n".to_owned(),
+            "terminate-during-wait" => "terminate-during-wait waiting\n".to_owned(),
+            "terminate-then-exit" => "terminate-then-exit waiting\n".to_owned(),
+            "guest-blocked" => {
+                "guest-blocked child=5 pending=1 taken=12 pending-after=0\nmask-after=0x800\n"
+                    .to_owned()
+            }
+            "block-all" => format!(
+                "how=-1 without a set: result=0 old-matches=1\n\
+                 how=-1 with a set: result=-1 errno=EINVAL\n\
+                 mask unchanged by the refused call=1\n\
+                 block-all mask={block_all_mask:#x}\n\
+                 block-all child=5 mask-kept=1\n\
+                 block-all SIGUSR1 pending=1 SIGCHLD pending=1\n\
+                 block-all taken=10\n"
+            ),
+            "write-only-set" => "write-only-set SIGUSR2 blocked=1\n".to_owned(),
+            _ => panic!("no expected output for mode {mode}"),
+        }
+    };
+    // Each mode, how it ends, and the issue that keeps it from running
+    // in-guest, if one does.
+    let modes = [
+        ("sigchld-during-wait", Exit::Code(0), None),
+        ("ignored-during-wait", Exit::Code(0), None),
+        (
+            "terminate-during-wait",
+            Exit::Signal(libc::SIGUSR1),
+            Some("https://github.com/rrnewton/hermit/issues/3688"),
+        ),
+        ("terminate-then-exit", Exit::Signal(libc::SIGUSR1), None),
+        ("guest-blocked", Exit::Code(0), None),
+        ("block-all", Exit::Code(0), None),
+        (
+            "write-only-set",
+            Exit::Code(0),
+            Some("https://github.com/rrnewton/reverie/issues/921"),
+        ),
+    ];
+
+    let run = |runner: &str, mode: &str| -> (ExitStatus, String, String) {
+        let guest = liteinst_in_guest_wait_signals_guest()
+            .to_str()
+            .expect("guest path is not UTF-8");
+        let mut command = match runner {
+            "native" => {
+                let mut command = Command::new(guest);
+                command.arg(mode);
+                command
+            }
+            "ptrace" => hermit_command(&[
+                "--backend",
+                "ptrace",
+                "run",
+                "--max-timeslice=disabled",
+                "--",
+                guest,
+                mode,
+            ]),
+            "in-guest" => {
+                let mut command = hermit_command(&[
+                    "--backend",
+                    "liteinst",
+                    "run",
+                    "--max-timeslice=disabled",
+                    "--",
+                    guest,
+                    mode,
+                ]);
+                command.env("HERMIT_LITEINST_IN_GUEST", "1");
+                command
+            }
+            _ => panic!("unknown runner {runner}"),
+        };
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap_or_else(|error| panic!("{runner} {mode}: failed to spawn: {error}"));
+        // Read both pipes on their own threads, so a full pipe cannot stall the
+        // run and an open one cannot stall the test past its deadline.
+        let (sender, receiver) = mpsc::channel();
+        let pipes: [Box<dyn Read + Send>; 2] = [
+            Box::new(child.stdout.take().expect("piped stdout")),
+            Box::new(child.stderr.take().expect("piped stderr")),
+        ];
+        for (stream, mut pipe) in pipes.into_iter().enumerate() {
+            let sender = sender.clone();
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+                let _ = sender.send((stream, result));
+            });
+        }
+        drop(sender);
+        let deadline = Instant::now() + DEADLINE;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("failed to poll the run") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                // SAFETY: `killpg` has no memory-safety preconditions; the group
+                // was created for this run by `process_group(0)`, and its leader
+                // has not been reaped.
+                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+                let _ = child.wait();
+                panic!(
+                    "{runner} {mode}: still running after {DEADLINE:?}; killed its process group"
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let mut outputs = [String::new(), String::new()];
+        for _ in 0..2 {
+            let (stream, result) = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| {
+                    panic!("{runner} {mode}: output still open 10 s after exit {status:?}")
+                });
+            let bytes = result.unwrap_or_else(|error| panic!("{runner} {mode}: read: {error}"));
+            outputs[stream] = String::from_utf8_lossy(&bytes).into_owned();
+        }
+        let [stdout, stderr] = outputs;
+        (status, stdout, stderr)
+    };
+
+    let check = |runner: &str, mode: &str, exit: Exit, block_all_mask: u64, attempt: usize| {
+        let (status, stdout, stderr) = run(runner, mode);
+        let context = format!(
+            "{runner} run {attempt} of {mode}: status {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        match exit {
+            Exit::Signal(signal) => assert_eq!(status.signal(), Some(signal), "{context}"),
+            Exit::Code(code) => assert_eq!(status.code(), Some(code), "{context}"),
+        }
+        assert_eq!(stdout, expected_stdout(mode, block_all_mask), "{context}");
+        if runner == "in-guest" {
+            assert!(
+                stderr.contains(
+                    "hermit: [liteinst in-guest] selected: the guest preload is to host the \
+                     Detcore Tool"
+                ),
+                "{context}"
+            );
+            assert!(!stderr.contains("[liteinst host hybrid]"), "{context}");
+        }
+    };
+
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (mode, exit, in_guest_gap) in modes {
+        check("native", mode, exit, native_mask, 1);
+        check("ptrace", mode, exit, ptrace_mask, 1);
+        match in_guest_gap {
+            Some(issue) => eprintln!("{mode}: not run in-guest until {issue} is fixed"),
+            None => {
+                for attempt in 1..=IN_GUEST_RUNS {
+                    check("in-guest", mode, exit, in_guest_mask, attempt);
+                }
+            }
+        }
+    }
 }
 
 /// `--timeout` qualification is a static policy fact, so an UNAVAILABLE
