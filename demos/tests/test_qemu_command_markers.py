@@ -951,26 +951,41 @@ class Demo6ResumeTest(unittest.TestCase):
         log_cap = self.demo6["LogCapExceeded"](
             Path("hermit-info.log"), 538072392, 536870912, 29.25
         )
-        for stopped_by, cause in (
+        # The size is checked before the deadline, so the cap can be what is
+        # reported when the check comes after QEMU_TIMEOUT too; the message
+        # then says no more than it does before QEMU_TIMEOUT.
+        late_log_cap = self.demo6["LogCapExceeded"](
+            Path("hermit-info.log"), 538072392, 536870912, 120.25
+        )
+        for name, stopped_by, cause in (
             (
+                "log cap",
                 log_cap,
                 "Hermit's INFO log hermit-info.log grew to 538072392 bytes, past "
-                "the 536870912-byte cap (QEMU_MAX_LOG_BYTES), 29.2s into the "
-                "resume, so the run was stopped before QEMU_TIMEOUT (120s)",
+                "the 536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked 29.2s "
+                "into the resume (QEMU_TIMEOUT is 120s), so the run was stopped",
             ),
             (
+                "log cap checked after QEMU_TIMEOUT",
+                late_log_cap,
+                "Hermit's INFO log hermit-info.log grew to 538072392 bytes, past "
+                "the 536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked 120.2s "
+                "into the resume (QEMU_TIMEOUT is 120s), so the run was stopped",
+            ),
+            (
+                "timeout",
                 TimeoutError("process exceeded timeout of 120s"),
                 "Hermit/QEMU did not exit within QEMU_TIMEOUT (120s)",
             ),
         ):
-            with self.subTest(stopped_by=type(stopped_by).__name__):
+            with self.subTest(stopped_by=name):
                 with mock.patch.dict(self.demo6["stopped_run_message"].__globals__, {"TIMEOUT": 120}):
                     with self.assertRaises(RuntimeError) as caught:
                         self._resume(transcript, command, stopped_by=stopped_by)
                 self.assertEqual(
                     str(caught.exception),
-                    cause + "; the guest command had not finished: the serial log "
-                    "has the " + FRAME_BEGIN.decode() + " line but no END line",
+                    cause + "; the guest command was not seen to finish: the serial "
+                    "log has the " + FRAME_BEGIN.decode() + " line but no END line",
                 )
                 self.assertIs(caught.exception.__cause__, stopped_by)
 
@@ -1002,13 +1017,35 @@ class Demo6ResumeTest(unittest.TestCase):
         for transcript, expected in (
             (
                 b"[    0.000000] Linux version 6.17.13\r\n",
-                "the guest had not started the command: the serial log has no "
+                "the guest was not seen to start the command: the serial log has no "
+                + FRAME_BEGIN.decode()
+                + " line",
+            ),
+            (
+                # A command that started, and here finished, after a BEGIN line
+                # that a kernel message split: the frame never starts, so the
+                # serial log cannot tell it from a command not yet started.
+                FRAME_BEGIN
+                + b"[    3.141592] random: crng init done\r\n| done\r\n"
+                + _end(0)
+                + b"\r\n",
+                "the guest was not seen to start the command: the serial log has no "
                 + FRAME_BEGIN.decode()
                 + " line",
             ),
             (
                 FRAME_BEGIN + b"\r\n| started\r\n__HERMIT_COMMAND_END__ status=0\r\n",
-                "the guest command had not finished: the serial log has the "
+                "the guest command was not seen to finish: the serial log has the "
+                + FRAME_BEGIN.decode()
+                + " line but no END line",
+            ),
+            (
+                # A finished command whose END line a kernel message split: the
+                # serial log cannot tell it from a command still running.
+                FRAME_BEGIN
+                + b"\r\n| done\r\n__HERMIT_COMMAND_END__\x01sta"
+                + b"[    3.141592] random: crng init done\r\ntus=0\r\n",
+                "the guest command was not seen to finish: the serial log has the "
                 + FRAME_BEGIN.decode()
                 + " line but no END line",
             ),

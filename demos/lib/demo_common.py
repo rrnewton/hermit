@@ -1576,6 +1576,9 @@ class LogCapExceeded(RuntimeError):
     ``final_check`` set and ``exit_status`` the launched process's exit
     status. Nothing was then seen still writing to the log, so the message
     says only when the size was checked.
+
+    ``elapsed`` is read when the size is found past the cap, before the group
+    is stopped, so the time it takes to stop the group is not counted in it.
     """
 
     def __init__(
@@ -1609,7 +1612,8 @@ class LogCapExceeded(RuntimeError):
         self.log_path = Path(log_path)
         self.log_size = log_size
         self.max_log_bytes = max_log_bytes
-        # Seconds from the start of the run (or of the wait) until the cap was seen.
+        # Seconds from the start of the run (or of the wait) until the size was
+        # found past the cap, read before the group was stopped.
         self.elapsed = elapsed
         self.exit_status = exit_status
         self.final_check = final_check
@@ -1744,12 +1748,14 @@ def wait_for_process(
             if log_path is not None and max_log_bytes is not None:
                 log_size = _log_size(log_path)
                 if log_size > max_log_bytes:
+                    # Read when the cap was seen, not after the group is stopped.
+                    elapsed = time.monotonic() - started
                     stop_process_group(process)
                     raise LogCapExceeded(
                         Path(log_path),
                         log_size,
                         max_log_bytes,
-                        time.monotonic() - started,
+                        elapsed,
                     )
 
             now = time.monotonic()
@@ -2191,12 +2197,14 @@ def drain_output(
         if log_path is not None and max_log_bytes is not None:
             log_size = _log_size(log_path)
             if log_size > max_log_bytes:
+                # Read when the cap was seen, not after the group is stopped.
+                elapsed = time.monotonic() - started
                 stop_process_group(process)
                 raise LogCapExceeded(
                     Path(log_path),
                     log_size,
                     max_log_bytes,
-                    time.monotonic() - started,
+                    elapsed,
                     exit_status=process.returncode,
                 )
         if time.monotonic() >= deadline:
