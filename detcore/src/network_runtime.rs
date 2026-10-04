@@ -863,11 +863,14 @@ impl NetworkRuntimeOwner {
                 .await
                 .map_err(|_| std::io::Error::other("accepted terminal transport deadline"))
                 .and_then(|result| result);
-                let driver = self.shared.stop_resolved_driver(
-                    &controller,
-                    deadline,
-                    original.is_err() || observations.is_err(),
-                );
+                let driver = self
+                    .shared
+                    .stop_resolved_driver(
+                        &controller,
+                        deadline,
+                        original.is_err() || observations.is_err(),
+                    )
+                    .await;
                 observations.and(driver)
             }
             None | Some(Err(_)) => Ok(()),
@@ -949,12 +952,12 @@ impl NetworkRuntimeOwner {
             }
             if !self.shared.accepted.lock().unwrap().collections_settled()?
                 || !self.shared.physical.lock().unwrap().enrollments_settled()
-                || !controller.quiescent()?
             {
                 return Err(std::io::Error::other(
                     "accepted terminal requests remain unresolved",
                 ));
             }
+            controller.wait_quiescent().await?;
             Ok(())
         };
         let primary = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), operation)
@@ -968,11 +971,10 @@ impl NetworkRuntimeOwner {
         // An admitted capture can still submit its original provider request.
         // Keep transport progress alive through actual native-worker completion.
         let workers = self.shared.finish_native_after_backend(deadline).await;
-        let driver = self.shared.stop_resolved_driver(
-            &controller,
-            deadline,
-            primary.is_err() || original.is_err(),
-        );
+        let driver = self
+            .shared
+            .stop_resolved_driver(&controller, deadline, primary.is_err() || original.is_err())
+            .await;
         let settled = self.shared.native_streams.lock().unwrap().settled();
         primary.and(original).and(driver).and(workers).and(settled)
     }
@@ -999,12 +1001,33 @@ impl RuntimeShared {
     }
 
     /// Stop the native driver only when no terminal request can still need it.
-    fn stop_resolved_driver(
+    async fn stop_resolved_driver(
         &self,
         controller: &accepted_controller::Controller,
         deadline: std::time::Instant,
         unresolved: bool,
     ) -> std::io::Result<()> {
+        // Do not stop the driver which still owns the exact ACK/removal.
+        // These guards must hold before waiting and again before the join.
+        if unresolved
+            || !self.native_workers_terminated()
+            || !self.native_streams.lock().unwrap().originals().is_empty()
+        {
+            return Err(std::io::Error::other(
+                "accepted native driver retained for unresolved terminal requests",
+            ));
+        }
+        tokio::time::timeout_at(
+            tokio::time::Instant::from_std(deadline),
+            controller.wait_quiescent(),
+        )
+        .await
+        .map_err(|_| {
+            std::io::Error::other(
+                "accepted native driver retained for unresolved terminal requests",
+            )
+        })??;
+
         // stop_and_join sets the stop latch even when its deadline expired.
         // A timeout or semantic error is not proof that required requests
         // drained: retain this same driver to receive their eventual replies.

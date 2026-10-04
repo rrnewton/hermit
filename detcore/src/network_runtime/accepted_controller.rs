@@ -489,6 +489,19 @@ impl Controller {
         Ok(true)
     }
 
+    /// Wait for exact transport retirement without publishing a guest event.
+    pub(super) async fn wait_quiescent(&self) -> io::Result<()> {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.quiescent()? {
+                return Ok(());
+            }
+            changed.await;
+        }
+    }
+
     pub(super) fn accepted_preparations(
         &self,
     ) -> io::Result<Vec<(NetworkStreamOwner, NetworkAcceptLeaseId, u64)>> {
@@ -1063,7 +1076,11 @@ impl Controller {
         Ok(())
     }
 
-    fn retire_consumed_births(state: &mut State, run: [u8; 16]) -> io::Result<()> {
+    fn retire_consumed_births(
+        state: &mut State,
+        changed: &tokio::sync::Notify,
+        run: [u8; 16],
+    ) -> io::Result<()> {
         // Bounded by active command groups. Work is owned by Controller's
         // existing driver even after a GlobalRPC future has disappeared.
         let ready: Vec<_> = state
@@ -1233,6 +1250,9 @@ impl Controller {
             for (key, _) in keys {
                 requests.0.remove(&key);
             }
+            // Receiving the ACK wakes one pass earlier. Validated removal is
+            // the separate transition which can make strict quiescence true.
+            changed.notify_waiters();
         }
         Ok(())
     }
@@ -1697,6 +1717,7 @@ impl Controller {
         for key in keys {
             state.requests.0.remove(&key);
         }
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -1733,6 +1754,7 @@ impl Controller {
         for key in keys {
             state.requests.0.remove(&key);
         }
+        self.changed.notify_waiters();
         Ok(())
     }
 
@@ -1759,7 +1781,7 @@ impl Controller {
         run: [u8; 16],
     ) -> io::Result<()> {
         Self::reconcile_terminal_births(state, run)?;
-        Self::retire_consumed_births(state, run)?;
+        Self::retire_consumed_births(state, changed, run)?;
         while let Some(next) = state.pending_send.front().copied() {
             if !state.session.try_send(next)? {
                 break;
@@ -3041,5 +3063,439 @@ mod executable_tests {
                 .0
                 .contains_key(&Effect::PrepareExecutableSource(call))
         );
+    }
+}
+
+#[cfg(test)]
+mod terminal_drain_tests {
+    use std::future::Future;
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::Context;
+    use std::task::Poll;
+    use std::task::Wake;
+    use std::task::Waker;
+    use std::time::Duration;
+    use std::time::Instant;
+
+    use super::*;
+
+    struct Wakes(AtomicUsize);
+    impl Wake for Wakes {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    async fn consumed_birth_cleanup(normal: bool) {
+        use super::super::NetworkRuntimeResources;
+        use super::super::ProviderWireFormat;
+        use super::super::accepted_driver;
+        let mut pair = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let (mut owner, runtime) = unsafe {
+            NetworkRuntimeResources::from_authenticated_startup(
+                OwnedFd::from_raw_fd(pair[0]),
+                [7; 16],
+                ProviderWireFormat::Abi12Copy5,
+            )
+        };
+        let controller = Arc::new(
+            Controller::new(
+                runtime
+                    .shared
+                    .endpoint
+                    .as_ref()
+                    .unwrap()
+                    .as_fd()
+                    .try_clone_to_owned()
+                    .unwrap(),
+                [7; 16],
+            )
+            .unwrap(),
+        );
+        *runtime.shared.controller.lock().unwrap() = Some(Ok(controller.clone()));
+        let mut peer =
+            AcceptedSession::new(unsafe { OwnedFd::from_raw_fd(pair[1]) }, [7; 16]).unwrap();
+        let pin = std::fs::File::open("/dev/null").unwrap();
+        let (who, observed, completed, rows) =
+            super::super::accepted_transport::native_birth_test_group(1, 9, 0);
+        let lease = serde_json::from_str("9").unwrap();
+        let permit = crate::network_replay::NetworkFdPublicationPermit {
+            owner: who,
+            lease,
+            files: crate::types::FilesId::initial(who.thread),
+        };
+        for ((envelope, body, rights), key) in rows.into_iter().zip([
+            Effect::PrepareNativeBirth(lease),
+            Effect::ObserveNativeBirth(lease),
+            Effect::CollectNativeBirth(lease),
+        ]) {
+            let request = serde_json::from_slice(&envelope.body).unwrap();
+            let sequence = controller
+                .prepare(key, who, &request, || {
+                    (0..rights)
+                        .map(|_| pin.as_fd().try_clone_to_owned())
+                        .collect()
+                })
+                .unwrap();
+            assert_eq!(sequence, envelope.sequence);
+            Controller::progress_io(
+                &mut controller.state.lock().unwrap(),
+                &controller.changed,
+                [7; 16],
+            )
+            .unwrap();
+            assert!(
+                matches!(peer.try_receive().unwrap(), Some(Received::Request(s)) if s == sequence)
+            );
+            peer.dispatch(sequence, |_, _| Ok(body.clone())).unwrap();
+            if sequence == completed {
+                peer.acknowledge_command_completion(sequence, |_, _| Ok(serde_json::to_vec(
+                    &serde_json::json!({"Observed":{"operation":"ap_ack_command","returned":0,"errno":null}})
+                ).unwrap())).unwrap();
+            }
+            assert!(peer.try_reply(sequence).unwrap());
+            Controller::progress_io(
+                &mut controller.state.lock().unwrap(),
+                &controller.changed,
+                [7; 16],
+            )
+            .unwrap();
+        }
+        controller
+            .native_birth_semantics_consumed(
+                permit,
+                BirthSemantic::Child {
+                    child: 62,
+                    terminal: false,
+                },
+            )
+            .unwrap();
+        controller
+            .native_birth_completion_consumed(permit, BirthCompletion::Returned(Ok(62)))
+            .unwrap();
+        let (arrived_tx, arrived_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let shared = runtime.shared.clone();
+        let driven = controller.clone();
+        let passes = AtomicUsize::new(0);
+        *runtime.shared.driver.lock().unwrap() = Some(Ok(accepted_driver::Driver::start(
+            controller.clone(),
+            move || {
+                shared.retain_completed_collections(&driven)?;
+                let pass = passes.fetch_add(1, Ordering::SeqCst);
+                if pass < 3 {
+                    arrived_tx.send(pass).map_err(io::Error::other)?;
+                    if pass < 2 {
+                        release_rx
+                            .recv_timeout(Duration::from_secs(3))
+                            .map_err(io::Error::other)?;
+                    }
+                }
+                Ok(())
+            },
+        )
+        .unwrap()));
+        assert_eq!(arrived_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 0);
+        let Some(Received::Request(retirement)) = peer.try_receive().unwrap() else {
+            panic!("original retirement not sent");
+        };
+        assert_eq!(retirement, completed + 1);
+        let original = Instant::now() + Duration::from_secs(1);
+        *owner.shared.transport_terminal_deadline.lock().unwrap() = Some(original);
+        let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+        let waker = Waker::from(wakes.clone());
+        let mut context = Context::from_waker(&waker);
+        let mut finishing: std::pin::Pin<Box<dyn Future<Output = io::Result<()>> + '_>> = if normal
+        {
+            Box::pin(unsafe { owner.finish_accepted_transport(original) })
+        } else {
+            Box::pin(unsafe { owner.finish_native_controller_tasks() })
+        };
+        let first = finishing.as_mut().poll(&mut context);
+        let pending_before_ack = first.is_pending();
+        let mut early = match first {
+            Poll::Ready(result) => Some(result),
+            Poll::Pending => None,
+        };
+        peer.retire_incoming_native_birth(who, 9, 1, observed, completed)
+            .unwrap();
+        peer.dispatch(retirement, |_, _| {
+            serde_json::to_vec(&Reply::Retired).map_err(io::Error::other)
+        })
+        .unwrap();
+        assert!(peer.try_reply(retirement).unwrap());
+        peer.retire_sent_original_ack(retirement).unwrap();
+        release_tx.send(()).unwrap();
+        assert_eq!(arrived_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 1);
+        let ack_before_removal = controller.retained_response(retirement).unwrap().is_some()
+            && !controller.quiescent().unwrap();
+        let pending_after_ack = if early.is_none() {
+            match finishing.as_mut().poll(&mut context) {
+                Poll::Pending => true,
+                Poll::Ready(result) => {
+                    early = Some(result);
+                    false
+                }
+            }
+        } else {
+            false
+        };
+        wakes.0.store(0, Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        assert_eq!(arrived_rx.recv_timeout(Duration::from_secs(3)).unwrap(), 2);
+        let notified_after_removal = wakes.0.load(Ordering::SeqCst) > 0;
+        let result = match early {
+            Some(result) => result,
+            None => {
+                tokio::time::timeout_at(tokio::time::Instant::from_std(original), &mut finishing)
+                    .await
+                    .expect("original cleanup deadline")
+            }
+        };
+        drop(finishing);
+        let joined_at_return = runtime
+            .shared
+            .driver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .joined();
+        let deadline_at_return = *runtime.shared.transport_terminal_deadline.lock().unwrap();
+        // Teardown is unconditional before the old-source positive assertion:
+        // release both barriers and join the same real driver even on RED.
+        owner.stop_collection_fixture(Instant::now() + Duration::from_secs(2));
+        let state = controller.state.lock().unwrap();
+        assert!(state.requests.0.is_empty());
+        assert_eq!(state.session.terminal_custody().outgoing, 0);
+        assert_eq!(state.session.terminal_custody().retained_rights, 0);
+        assert_eq!(peer.terminal_custody().incoming, 0);
+        assert_eq!(peer.terminal_custody().retained_rights, 0);
+        assert!(peer.try_receive().unwrap().is_none());
+        assert_eq!(deadline_at_return, Some(original));
+        assert!(
+            pending_before_ack,
+            "cleanup must await the original birth retirement ACK: {result:?}"
+        );
+        assert!(
+            ack_before_removal,
+            "ACK receipt is not validated group removal"
+        );
+        assert!(
+            pending_after_ack,
+            "cleanup must await validated retirement removal"
+        );
+        assert!(
+            notified_after_removal,
+            "validated removal must wake the existing cleanup waiter without another message"
+        );
+        result.unwrap();
+        assert!(
+            joined_at_return,
+            "successful cleanup must actually join the same driver"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_backend_waits_for_consumed_birth_ack_and_validated_removal() {
+        consumed_birth_cleanup(false).await;
+    }
+
+    #[tokio::test]
+    async fn normal_terminal_waits_for_consumed_birth_ack_and_validated_removal() {
+        consumed_birth_cleanup(true).await;
+    }
+
+    #[tokio::test]
+    async fn quiescence_wait_preserves_ready_and_sticky_failure_edges() {
+        for fail_after_registration in [false, true] {
+            let mut pair = [-1; 2];
+            assert_eq!(
+                unsafe {
+                    libc::socketpair(
+                        libc::AF_UNIX,
+                        libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                        0,
+                        pair.as_mut_ptr(),
+                    )
+                },
+                0
+            );
+            let controller =
+                Controller::new(unsafe { OwnedFd::from_raw_fd(pair[0]) }, [8; 16]).unwrap();
+            let _peer = unsafe { OwnedFd::from_raw_fd(pair[1]) };
+            controller.wait_quiescent().await.unwrap();
+            let thread = crate::types::DetTid::from_raw(91);
+            let who = NetworkStreamOwner {
+                thread,
+                mm: crate::types::MmId::initial(thread),
+            };
+            controller
+                .prepare(Effect::Observation(1), who, &Request::ReadStatus, || {
+                    Ok(vec![])
+                })
+                .unwrap();
+            let wakes = Arc::new(Wakes(AtomicUsize::new(0)));
+            let waker = Waker::from(wakes.clone());
+            let mut waiting = Box::pin(controller.wait_quiescent());
+            if fail_after_registration {
+                assert!(
+                    waiting
+                        .as_mut()
+                        .poll(&mut Context::from_waker(&waker))
+                        .is_pending()
+                );
+            }
+            controller.fail(&io::Error::other("first terminal failure"));
+            controller.fail(&io::Error::other("later failure cannot replace the first"));
+            assert_eq!(
+                waiting.await.unwrap_err().to_string(),
+                "first terminal failure"
+            );
+            if fail_after_registration {
+                assert!(wakes.0.load(Ordering::SeqCst) > 0);
+            }
+            assert_eq!(
+                controller.wait_quiescent().await.unwrap_err().to_string(),
+                "first terminal failure"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn canceled_quiescence_wait_and_late_ack_cannot_renew_terminal_deadline() {
+        use super::super::NetworkRuntimeResources;
+        use super::super::ProviderWireFormat;
+        let mut pair = [-1; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC | libc::SOCK_NONBLOCK,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        let (mut owner, runtime) = unsafe {
+            NetworkRuntimeResources::from_authenticated_startup(
+                OwnedFd::from_raw_fd(pair[0]),
+                [9; 16],
+                ProviderWireFormat::Abi8Copy5,
+            )
+        };
+        let controller = runtime.accepted_controller().unwrap();
+        let mut peer =
+            AcceptedSession::new(unsafe { OwnedFd::from_raw_fd(pair[1]) }, [9; 16]).unwrap();
+        let thread = crate::types::DetTid::from_raw(91);
+        let who = NetworkStreamOwner {
+            thread,
+            mm: crate::types::MmId::initial(thread),
+        };
+        let sequence = controller
+            .prepare(Effect::Observation(1), who, &Request::ReadStatus, || {
+                Ok(vec![])
+            })
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                match peer.try_receive().unwrap() {
+                    Some(Received::Request(s)) => {
+                        assert_eq!(s, sequence);
+                        break;
+                    }
+                    None => tokio::task::yield_now().await,
+                    _ => panic!("different original request"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let original = Instant::now() + Duration::from_secs(1);
+        *owner.shared.transport_terminal_deadline.lock().unwrap() = Some(original);
+        let before_cancel = {
+            let mut waiting = Box::pin(unsafe { owner.finish_native_controller_tasks() });
+            waiting
+                .as_mut()
+                .poll(&mut Context::from_waker(Waker::noop()))
+                .is_pending()
+        };
+        let outcome = unsafe { owner.finish_native_controller_tasks().await };
+        let deadline_after_retry = *owner.shared.transport_terminal_deadline.lock().unwrap();
+        let joined_before_ack = runtime
+            .shared
+            .driver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .joined();
+        peer.dispatch(sequence, |_, _| {
+            serde_json::to_vec(&Reply::Status(
+                super::super::accepted_provider::Observation {
+                    status: super::super::accepted_provider::CallStatus {
+                        operation: "ap_read_status".into(),
+                        returned: 0,
+                        errno: None,
+                    },
+                    raw: super::super::accepted_provider_ffi::Status::default().into(),
+                },
+            ))
+            .map_err(io::Error::other)
+        })
+        .unwrap();
+        assert!(peer.try_reply(sequence).unwrap());
+        tokio::time::timeout(Duration::from_secs(1), controller.response(sequence))
+            .await
+            .unwrap()
+            .unwrap();
+        let late = unsafe { owner.finish_native_controller_tasks().await };
+        let deadline_after_late = *owner.shared.transport_terminal_deadline.lock().unwrap();
+        let joined_after_late = runtime
+            .shared
+            .driver
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .joined();
+        owner.stop_collection_fixture(Instant::now() + Duration::from_secs(2));
+        assert!(before_cancel);
+        assert!(
+            outcome
+                .unwrap_err()
+                .to_string()
+                .contains("retained for unresolved")
+        );
+        assert!(Instant::now() >= original);
+        assert_eq!(deadline_after_retry, Some(original));
+        assert!(!joined_before_ack);
+        assert!(late.is_err());
+        assert_eq!(deadline_after_late, Some(original));
+        assert!(!joined_after_late);
+        assert!(peer.try_receive().unwrap().is_none());
     }
 }
