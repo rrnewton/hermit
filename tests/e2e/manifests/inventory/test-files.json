@@ -2008,7 +2008,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/utimensat_rename_race.c",
       "runner": "hermit-cli/tests/utimensat_mtime.rs",
-      "why": "tests/c/utimensat_rename_race.c is owned by hermit-cli/tests/utimensat_mtime.rs: Two-thread guest in which one thread sets an explicit mtime on a name through utimensat while the other renames prepared, hard-linked files over that name; it reports which files it sees with the explicit mtime. The Rust integration test runs it natively and under hermit run --no-sequentialize-threads and requires every file the guest sees with the explicit mtime to really have it on the host. Driven only by its own integration test and nondeterministic by design, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
+      "why": "tests/c/utimensat_rename_race.c is owned by hermit-cli/tests/utimensat_mtime.rs: Two-thread guest in which one thread sets an explicit mtime on a name through utimensat while the other renames prepared, hard-linked files over that name; it reports which files it sees with the explicit mtime. The Rust integration test runs it natively and under hermit run with and without --no-sequentialize-threads: sequentialized, every file the guest sees with the explicit mtime must really have it on the host and the final call must reach the last file; relaxed, Hermit leaves every virtual mtime alone, so the guest sees none while the last file's real mtime is set. Driven only by its own integration test and nondeterministic by design, so it is a test-owned guest fixture rather than a manifest-discovered CI program."
     },
     {
       "disposition": "manifest-test",
