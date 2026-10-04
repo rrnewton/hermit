@@ -5152,7 +5152,12 @@ impl RunOpts {
         if skid_overshoots > 0 {
             return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
         }
-        announce_verification_outcome(&outcome, SecondRun::Rerun, success_message, failure_message);
+        announce_verification_outcome(
+            &outcome,
+            SecondRun::Rerun,
+            success_message,
+            failure_message,
+        )?;
 
         // On divergence, still return the nonzero status and skip
         // the backend banner — but EMIT THE GUEST'S OUTPUT FIRST when both runs
@@ -5928,7 +5933,7 @@ mod tests {
         // Run mode compares two independent runs, never a replay, so its match
         // line must not use the replay wording for the time note.
         let call = &verification[announce..];
-        let call = &call[..call.find(");").expect("end of announcement call")];
+        let call = &call[..call.find(")?;").expect("end of announcement call")];
         assert!(call.contains("SecondRun::Rerun"), "{call}");
     }
 

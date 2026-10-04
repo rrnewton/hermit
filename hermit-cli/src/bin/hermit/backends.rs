@@ -1293,7 +1293,7 @@ pub(super) fn run_dbt(
         SecondRun::Rerun,
         success_message,
         "Failure: nondeterministic.",
-    );
+    )?;
     if !outcome.verified() {
         return outcome.into_exit_status();
     }

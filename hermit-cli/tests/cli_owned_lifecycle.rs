@@ -112,3 +112,12 @@ fn native_exit_fatal_retention_never_announces_buffered_success() {
 fn native_exit_settled_announcement_follows_publication_with_exact_bytes() {
     lifecycle("native-exit-settled-announcement");
 }
+
+#[test]
+fn native_exit_no_json_fatal_retention_never_announces_buffered_success() {
+    lifecycle("native-exit-fatal-success-announcement-no-json");
+}
+#[test]
+fn native_exit_no_json_settled_announcement_preserves_exact_bytes() {
+    lifecycle("native-exit-settled-announcement-no-json");
+}

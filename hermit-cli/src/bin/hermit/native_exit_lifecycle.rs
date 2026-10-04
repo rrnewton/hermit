@@ -119,7 +119,7 @@ fn channel_ready(fd: RawFd) -> bool {
 
 fn buffer_real_comparison(
     directory: &Path,
-    destination: &Path,
+    destination: Option<&Path>,
     announce: bool,
 ) -> Result<(), Error> {
     // Real comparator and typed report, with explicitly host-fixture operands.
@@ -167,7 +167,9 @@ fn buffer_real_comparison(
         directory.join("expected-verified.json"),
         format!("{}\n", serde_json::to_string(&report)?),
     )?;
-    verify::write_report_json(destination, &report)?;
+    if let Some(destination) = destination {
+        verify::write_report_json(destination, &report)?;
+    }
     if announce {
         const SUCCESS: &str = "Success: deterministic. Determinism verified.";
         let mut expected = Vec::new();
@@ -201,6 +203,8 @@ fn buffer_real_comparison(
 }
 
 fn invocation(mode: &str, deadline: Instant, directory: &Path) -> i32 {
+    let no_json = mode.ends_with("-no-json");
+    let mode = mode.strip_suffix("-no-json").unwrap_or(mode);
     let announce = mode.ends_with("-announcement");
     let mode = mode.strip_suffix("-announcement").unwrap_or(mode);
     let settled = mode == "native-exit-child-settled";
@@ -208,7 +212,23 @@ fn invocation(mode: &str, deadline: Instant, directory: &Path) -> i32 {
     let successful_work = mode == "native-exit-child-fatal-success";
     assert!(settled || panic_reporter || successful_work || mode == "native-exit-child-fatal-io");
     let destination = directory.join("verify.json");
-    let deferred = verify::DeferredVerification::begin(&destination).unwrap();
+    let deferred = if no_json {
+        verify::DeferredVerification::begin_optional(None).unwrap()
+    } else {
+        verify::DeferredVerification::begin(&destination).unwrap()
+    };
+    // This sentinel is outside the requested-report domain. Preserve every
+    // existing pending-file assertion while proving no-JSON never touches it.
+    if no_json {
+        fs::write(
+            &destination,
+            format!(
+                "{}\n",
+                serde_json::to_string(&verify::VerificationReport::no_result()).unwrap()
+            ),
+        )
+        .unwrap();
+    }
     let pending = fs::read(&destination).unwrap();
     assert_eq!(
         pending,
@@ -259,7 +279,11 @@ fn invocation(mode: &str, deadline: Instant, directory: &Path) -> i32 {
                     serde_json::to_vec(&stopped)?,
                 )?;
             }
-            buffer_real_comparison(directory, &destination, announce)?;
+            buffer_real_comparison(
+                directory,
+                (!no_json).then_some(destination.as_path()),
+                announce,
+            )?;
             anyhow::ensure!(
                 fs::read(&destination)? == pending,
                 "pending comparison leaked before native settlement"
@@ -380,15 +404,25 @@ fn invocation(mode: &str, deadline: Instant, directory: &Path) -> i32 {
     assert!(settled, "fatal invocation returned instead of aborting");
     drop(result.unwrap());
     assert!(normal.get());
-    assert_eq!(
-        fs::read(&destination).unwrap(),
-        fs::read(directory.join("expected-verified.json")).unwrap()
-    );
+    if no_json {
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            pending,
+            "no-JSON path wrote a report"
+        );
+    } else {
+        assert_eq!(
+            fs::read(&destination).unwrap(),
+            fs::read(directory.join("expected-verified.json")).unwrap()
+        );
+    }
     0
 }
 
 fn supervisor(mode: &str, deadline: Instant, end: u64) -> i32 {
     let requested_mode = mode;
+    let no_json = mode.ends_with("-no-json");
+    let mode = mode.strip_suffix("-no-json").unwrap_or(mode);
     let announce = mode.ends_with("-announcement");
     let mode = mode.strip_suffix("-announcement").unwrap_or(mode);
     let settled = mode == "native-exit-settled";
@@ -561,10 +595,18 @@ fn supervisor(mode: &str, deadline: Instant, end: u64) -> i32 {
         assert!(path.join("normally-settled").is_file());
         assert_eq!(drops, b"factory\nresult\n");
         assert!(!path.join("reporter-entered").exists());
-        assert_eq!(
-            fs::read(path.join("verify.json")).unwrap(),
-            fs::read(path.join("expected-verified.json")).unwrap()
-        );
+        if no_json {
+            assert_eq!(
+                fs::read(path.join("verify.json")).unwrap(),
+                fs::read(path.join("expected-no-result.json")).unwrap(),
+                "no-JSON sentinel changed"
+            );
+        } else {
+            assert_eq!(
+                fs::read(path.join("verify.json")).unwrap(),
+                fs::read(path.join("expected-verified.json")).unwrap()
+            );
+        }
     } else {
         let expected_pid: i32 = fs::read_to_string(path.join("broker-pid"))
             .unwrap()
