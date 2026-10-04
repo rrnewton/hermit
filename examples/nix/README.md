@@ -36,7 +36,7 @@ likes.
 
     env -i PATH=/usr/bin:/bin HOME=/homeless-shelter TMPDIR=/tmp \
       HERMIT <hermit run args> --bind <tmpDir>:/tmp/build --workdir /tmp/build -- \
-      /usr/bin/env -i <the derivation's environment> <builder> <args>
+      /usr/bin/env -i TZ=UTC <the derivation's environment> <builder> <args>
 
 The derivation is unchanged, so the output path is the same store path a
 native build would produce, and a Hermit build can be checked against the
@@ -54,6 +54,11 @@ Two details matter for reproducibility:
 - **Nix starts the program inside that directory.** The script changes to `/`
   before starting Hermit so that the random name does not reach Hermit through
   its own working directory.
+- **The guest sees the host's `/etc`.** glibc would apply the host's
+  `/etc/localtime`, while Nix's sandbox has none and gives UTC. The script sets
+  `TZ=UTC` ahead of the derivation's environment, so a derivation that sets
+  `TZ` itself keeps its value. A program that reads other files under `/etc`
+  still sees the host's (https://github.com/rrnewton/hermit/issues/3649).
 
 ### 2. `realBuilder` override: `hermit-wrap.nix`
 
@@ -71,10 +76,10 @@ host filesystem, and a host with a usable PMU (Hermit counts retired
 conditional branches for deterministic preemption).
 
 A stdenv build with a fixupPhase also needs
-https://github.com/rrnewton/hermit/pull/3534 and
-https://github.com/rrnewton/hermit/pull/3554, both still open. nixpkgs'
-`audit-tmpdir.sh` reads from named FIFOs and process substitutions, and
-without those changes the build hangs there
+https://github.com/rrnewton/hermit/pull/3554, still open
+(https://github.com/rrnewton/hermit/pull/3534, the other half, is merged).
+nixpkgs' `audit-tmpdir.sh` reads from named FIFOs and process substitutions,
+and without both changes the build hangs there
 (https://github.com/rrnewton/hermit/issues/2203).
 
 With `external-builders`:
@@ -108,8 +113,17 @@ the clock, `/dev/urandom`, `$RANDOM` and a UUID into their output, one of them
 a full stdenv build including fixupPhase. Through `external-builders`, each
 gave one output hash in 20 builds with `run` and with `run --strict`, and in
 10 builds with `--no-rcb-time`. The same derivations built natively gave a
-different hash on every build. `--native-fixed-output` and real nixpkgs
-packages have not been tested yet.
+different hash on every build.
+
+Real nixpkgs packages, built through `external-builders` with
+`--native-fixed-output --no-rcb-time --max-timeslice=disabled`: `hello` and
+`duktape` gave the same output as a native build, byte for byte. Five packages
+whose two sandboxed native builds differ (chibi, sagittarius-scheme, aichat,
+rav1e, gdbHostCpuOnly) each gave one output in two Hermit builds, but not the
+native output. Known reasons a Hermit output differs from a native one: the
+build directory is `/tmp/build`, not `/build`, and Hermit gives a file it has
+not seen before an mtime of `--epoch`, which moves stdenv's
+`SOURCE_DATE_EPOCH` (https://github.com/rrnewton/hermit/issues/3639).
 
 With `hermit-wrap.nix`:
 
