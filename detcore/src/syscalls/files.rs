@@ -4698,11 +4698,21 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Whether timerfds are virtual (driven by logical time) in this run.
     ///
-    /// Only sequentialized, non-record/replay runs merge virtual readiness
-    /// into poll, select and epoll waits; every other mode keeps the host
-    /// timerfd, which is armed and read by the kernel as before.
+    /// Only sequentialized, non-record/replay runs with virtual time merge
+    /// virtual readiness into poll, select and epoll waits; every other mode
+    /// keeps the host timerfd, which is armed and read by the kernel as before.
+    ///
+    /// Without virtual time (`--no-virtualize-time`) the guest's clock reads
+    /// return host time, so an absolute deadline it computes is a host
+    /// instant. Read against the logical clock, a host CLOCK_MONOTONIC
+    /// instant lies far in the logical past and fires at once, and a host
+    /// CLOCK_REALTIME instant can lie months in the logical future. The
+    /// kernel timerfd keeps the timer on the clock the guest reads.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): timerfds stay on the host clock when time is
+    // not virtualized.
     pub(crate) fn virtual_timerfds(&self) -> bool {
-        self.cfg.sequentialize_threads && !self.cfg.recordreplay_modes
+        self.cfg.sequentialize_threads && self.cfg.virtualize_time && !self.cfg.recordreplay_modes
     }
 
     /// Serialize a notification descriptor control operation.

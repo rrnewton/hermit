@@ -1397,3 +1397,90 @@ fn nanosleep_rejects_malformed_timespec_but_not_a_past_deadline() {
         true,
     );
 }
+
+/// Without virtual time, an absolute timerfd deadline is a host instant.
+///
+/// `--no-virtualize-time` keeps sequentialized scheduling but lets clock reads
+/// return host time, so a guest that arms a timerfd at "now + 200 ms" computes
+/// a host deadline. Linux reports about 200 ms left and expires the timer once
+/// that much host time has passed. Hermit's virtual timerfds read the same
+/// value against the logical clock instead: a host CLOCK_MONOTONIC instant lies
+/// far in the logical past and fired at once (0 ns left), and a host
+/// CLOCK_REALTIME instant lay months in the logical future, so the blocking
+/// read waited for it. The remaining time can be at most the 200 ms requested,
+/// because the deadline was computed before the timer was armed.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3229): timerfds stay on the host clock when time is not
+// virtualized.
+#[test]
+fn timerfd_absolute_deadline_follows_the_host_clock_without_virtual_time() {
+    let config = detcore::Config {
+        virtualize_time: false,
+        virtualize_metadata: false,
+        sequentialize_threads: true,
+        ..Default::default()
+    };
+    check_fn_with_config::<Detcore, _>(
+        || {
+            const NANOS_PER_SEC: i64 = 1_000_000_000;
+            const LEAD_NS: i64 = 200_000_000;
+            for (clock, name) in [
+                (libc::CLOCK_MONOTONIC, "CLOCK_MONOTONIC"),
+                (libc::CLOCK_REALTIME, "CLOCK_REALTIME"),
+            ] {
+                let fd = unsafe { libc::timerfd_create(clock, libc::TFD_CLOEXEC) };
+                assert!(fd >= 0, "{name}: timerfd_create failed");
+
+                let mut now = MaybeUninit::<libc::timespec>::uninit();
+                assert_eq!(unsafe { libc::clock_gettime(clock, now.as_mut_ptr()) }, 0);
+                let now = unsafe { now.assume_init() };
+                let deadline = now.tv_sec * NANOS_PER_SEC + now.tv_nsec + LEAD_NS;
+                let value = libc::itimerspec {
+                    it_interval: libc::timespec {
+                        tv_sec: 0,
+                        tv_nsec: 0,
+                    },
+                    it_value: libc::timespec {
+                        tv_sec: deadline / NANOS_PER_SEC,
+                        tv_nsec: deadline % NANOS_PER_SEC,
+                    },
+                };
+                assert_eq!(
+                    unsafe {
+                        libc::timerfd_settime(fd, libc::TFD_TIMER_ABSTIME, &value, ptr::null_mut())
+                    },
+                    0,
+                    "{name}: timerfd_settime failed"
+                );
+
+                let mut current = MaybeUninit::<libc::itimerspec>::uninit();
+                assert_eq!(
+                    unsafe { libc::timerfd_gettime(fd, current.as_mut_ptr()) },
+                    0,
+                    "{name}: timerfd_gettime failed"
+                );
+                let current = unsafe { current.assume_init() };
+                let remaining = current.it_value.tv_sec * NANOS_PER_SEC + current.it_value.tv_nsec;
+                assert!(
+                    remaining > LEAD_NS / 2 && remaining <= LEAD_NS,
+                    "{name}: {remaining} ns left on a deadline {LEAD_NS} ns after the host clock"
+                );
+
+                // A blocking read returns once the host deadline passes.
+                let mut expirations = 0_u64;
+                let read = unsafe {
+                    libc::read(fd, ptr::from_mut(&mut expirations).cast(), size_of::<u64>())
+                };
+                assert_eq!(
+                    read,
+                    size_of::<u64>() as isize,
+                    "{name}: blocking read failed"
+                );
+                assert!(expirations >= 1, "{name}: read {expirations} expirations");
+                assert_eq!(unsafe { libc::close(fd) }, 0);
+            }
+        },
+        config,
+        true,
+    );
+}
