@@ -29,7 +29,10 @@ build_dependencies=(
     xxd
 )
 
-native_libraries=(libunwind elfutils zlib openssl)
+# xz provides liblzma. libunwind's pkg-config metadata names -llzma in
+# Libs.private and reverie-ptrace asks for that --static closure, so a link
+# without liblzma.so fails late with `unable to find library -llzma`.
+native_libraries=(libunwind elfutils zlib openssl xz)
 
 check_build_dependencies() {
     local search_path=${1:-$PATH}
@@ -92,6 +95,10 @@ check_native_libraries() {
         || ! path_has_file "$library_path" libssl.so \
         || ! path_has_file "$library_path" libcrypto.so; then
         missing+=(openssl)
+    fi
+    if ! path_has_file "$include_path" lzma.h \
+        || ! path_has_file "$library_path" liblzma.so; then
+        missing+=(xz)
     fi
 
     if ((${#missing[@]} > 0)); then
@@ -197,13 +204,15 @@ self_test() {
         "$fixture/lib/libelf.so" \
         "$fixture/lib/libz.so" \
         "$fixture/lib/libssl.so" \
-        "$fixture/lib/libcrypto.so"
+        "$fixture/lib/libcrypto.so" \
+        "$fixture/include/lzma.h" \
+        "$fixture/lib/liblzma.so"
     output=$(check_native_libraries "$fixture/include" "$fixture/lib" 2>&1) || {
         echo "assert-build-dependencies --self-test: complete native library fixture was rejected" >&2
         echo "$output" >&2
         return 1
     }
-    [[ $output == *"4/4 native libraries and development headers are present"* ]] || {
+    [[ $output == *"5/5 native libraries and development headers are present"* ]] || {
         echo "assert-build-dependencies --self-test: native library success count was not reported" >&2
         echo "$output" >&2
         return 1
@@ -224,8 +233,23 @@ self_test() {
         echo "$output" >&2
         return 1
     }
+    touch "$fixture/lib/libunwind-ptrace.so"
 
-    echo "PASS: assert-build-dependencies accepts 18/18 executables and 4/4 native libraries, and names xxd and libunwind when required files are absent"
+    # The runtime liblzma.so.5 alone does not satisfy -llzma; the link needs
+    # the unversioned development name.
+    rm "$fixture/lib/liblzma.so"
+    touch "$fixture/lib/liblzma.so.5"
+    set +e
+    output=$(check_native_libraries "$fixture/include" "$fixture/lib" 2>&1)
+    rc=$?
+    set -e
+    [[ $rc -eq 2 && $output == *"missing required native library: xz"* \
+        && $output == *"1 of 5 native libraries are missing"* ]] || {
+        echo "assert-build-dependencies --self-test: missing liblzma.so was not refused as xz ($rc): $output" >&2
+        return 1
+    }
+
+    echo "PASS: assert-build-dependencies accepts 18/18 executables and 5/5 native libraries, and names xxd, libunwind and xz when required files are absent"
 
     local guest_root=$fixture/guest-root manifest path
     manifest=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/guest-paths.txt
