@@ -125,6 +125,14 @@
  *       send reads back through the new number, a re-arming through the new
  *       number reads back through the original, and so does a disarming
  *       through the original.
+ *   preadv2_hipri / preadv2_nowait / preadv2_dsync / preadv2_nowait_pending /
+ *   preadv2_hipri_blocking / preadv2_dsync_blocking
+ *       preadv2 at offset -1 with RWF_HIPRI reads an expired timer's count on
+ *       every kernel. With RWF_NOWAIT or RWF_DSYNC it reads it where timerfd
+ *       reads through read_iter, and is EOPNOTSUPP on older kernels. RWF_NOWAIT
+ *       on a blocking timer that has not fired is EAGAIN (or EOPNOTSUPP) and
+ *       leaves the timer armed. Expired blocking timers return their count
+ *       without waiting.
  *
  * With the single argument `sharing`, only fork_expired, fork_rearm,
  * fork_disarm and the ppoll cases run. They check what a forked child shares
@@ -157,6 +165,16 @@
 #include <unistd.h>
 
 #define MS (1000L * 1000L)
+
+#ifndef RWF_HIPRI
+#define RWF_HIPRI 0x00000001
+#endif
+#ifndef RWF_DSYNC
+#define RWF_DSYNC 0x00000002
+#endif
+#ifndef RWF_NOWAIT
+#define RWF_NOWAIT 0x00000008
+#endif
 
 static int failures = 0;
 
@@ -1986,6 +2004,55 @@ static void check_scm_rights(int use_sendmmsg) {
     close(sv[1]);
 }
 
+/* preadv2 at offset -1 with one flag on a timer that expired 20 ms ago.
+ * RWF_HIPRI is accepted and ignored by every kernel. Where timerfd reads
+ * through read_iter, RWF_NOWAIT acts as O_NONBLOCK and RWF_DSYNC is ignored;
+ * older kernels refuse every flag but RWF_HIPRI with EOPNOTSUPP. */
+static void check_preadv2_expired(const char *name, int tfd_flags, int rwf) {
+    int tfd = armed_tfd(CLOCK_MONOTONIC, tfd_flags, 10 * MS, 0, 0);
+    sleep_ns(30 * MS);
+    uint64_t count = 0;
+    struct iovec whole = {&count, sizeof count};
+    errno = 0;
+    ssize_t r = preadv2(tfd, &whole, 1, -1, rwf);
+    int err = errno;
+    close(tfd);
+    if (r == 8 && count == 1) ok(name);
+    else if (rwf != RWF_HIPRI && r == -1 && err == EOPNOTSUPP) ok(name);
+    else fail(name, "r=%ld errno_or_count=%ld", (long)r, r == 8 ? (long)count : err);
+}
+
+/* RWF_NOWAIT on a blocking timer due in 100 s does not wait, and the timer
+ * stays armed. */
+static void check_preadv2_nowait_pending(void) {
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 100000 * MS, 0, 0);
+    uint64_t count = 0;
+    struct iovec whole = {&count, sizeof count};
+    errno = 0;
+    ssize_t r = preadv2(tfd, &whole, 1, -1, RWF_NOWAIT);
+    int err = errno;
+    struct itimerspec cur;
+    memset(&cur, 0, sizeof cur);
+    long got = timerfd_gettime(tfd, &cur);
+    close(tfd);
+    if (r != -1 || (err != EAGAIN && err != EOPNOTSUPP))
+        fail("preadv2_nowait_pending", "r=%ld errno=%ld", (long)r, err);
+    else if (got != 0 || cur.it_value.tv_sec < 50)
+        fail("preadv2_nowait_pending", "gettime=%ld left_sec=%ld", got, (long)cur.it_value.tv_sec);
+    else ok("preadv2_nowait_pending");
+}
+
+/* The blocking forms run last: a read that waits on a timer that never fires
+ * would stop the program here rather than hide the cases after it. */
+static void check_preadv2_flags(void) {
+    check_preadv2_expired("preadv2_hipri", TFD_NONBLOCK, RWF_HIPRI);
+    check_preadv2_expired("preadv2_nowait", TFD_NONBLOCK, RWF_NOWAIT);
+    check_preadv2_expired("preadv2_dsync", TFD_NONBLOCK, RWF_DSYNC);
+    check_preadv2_nowait_pending();
+    check_preadv2_expired("preadv2_hipri_blocking", 0, RWF_HIPRI);
+    check_preadv2_expired("preadv2_dsync_blocking", 0, RWF_DSYNC);
+}
+
 /* The fork and ppoll cases that check sharing and readiness only, never the
  * guest's clock; the `sharing` argument runs only these. */
 static void check_sharing_cases(void) {
@@ -2077,6 +2144,7 @@ int main(int argc, char **argv) {
     wait_form_masked_wait(2);
     check_scm_rights(0);
     check_scm_rights(1);
+    check_preadv2_flags();
     check_sharing_cases();
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
