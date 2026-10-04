@@ -3780,6 +3780,931 @@ pub fn retained_verify_invocation_error(result: &CellResult) -> Option<String> {
     None
 }
 
+/// Why the result rows of one cell's retry history did not all run the same
+/// guest the same way, or `None` when they did.
+///
+/// [`retained_verify_invocation_error`] checks each row's command lines
+/// against the row's own labels, but two rows that are each internally
+/// consistent can still run different guests or arguments. A reader that
+/// discounts an earlier row as infrastructure because a later row passed
+/// needs both rows to be runs of the same thing
+/// (<https://github.com/rrnewton/hermit/issues/1845>).
+///
+/// The runner gives each outer attempt its own cell directory
+/// ([`cell_artifact_path`]: `<root>/runs/<run>/<cell slug>`, with
+/// `-attempt-<n>` after the slug from attempt 2), runs the same guest in it
+/// with the same run context from the same host working directory (the
+/// checkout root), and builds every path it creates for the attempt (the
+/// verify report, retained logs, the source bound at the fixed guest working
+/// directory, equalized input binds, guest `HOME` and fixture directory,
+/// SaBRe path evidence) inside that directory. So, with each row's own cell
+/// directory set aside, every row records the same command:
+///
+/// - each row's `artifact_dir` is the directory [`cell_artifact_path`] gives
+///   for the row's run, cell and attempt, and every row has the same result
+///   root (none, for a run identifier that is an absolute path) and run;
+/// - every row records the same test, mode, backend, test digest, Hermit
+///   source and Hermit binary;
+/// - every row retains at least one inner attempt, with the same sequence of
+///   inner attempt indices;
+/// - every inner attempt of every row, and every row's own copy, runs the same
+///   guest argv in the same working directory, and inner attempts at the same
+///   position, and the rows' own copies, carry the same argv and environment.
+///
+/// "Set aside" is exact, and only where the executor writes a path that
+/// differs from attempt to attempt (`verified_invocation_argv`,
+/// [`build_spec`], `cell_env`): among Hermit's options, which start at the
+/// second argument and end at the first `--`, the path after `--verify-json`
+/// or `--verify-log-dir`, the source of a `--bind=SOURCE:TARGET`, and the
+/// value of an `--env` assignment to a guest `HOME`, `XDG_CONFIG_HOME` or
+/// `E2E_FIXTURE_DIR` (`CELL_DIRECTORY_GUEST_ENV`); each guest argument after
+/// that `--`; and the value of each of those process variables and of
+/// `HERMIT_SABRE_PATH_EVIDENCE` (`CELL_DIRECTORY_PROCESS_ENV`). See
+/// `CellRelativeArg` and `CellRelativeCommand`. The first argument, the
+/// Hermit binary, is always compared as written, whatever its text.
+/// There, a path that is the row's own cell directory, or a path below it
+/// without a `..` component whose first component is an entry the executor
+/// creates there for the attempt (`is_cell_directory_entry`: `home`,
+/// `fixtures`, `verify-<n>.json`, ...), compares equal to the same path below
+/// any other row's own cell directory (`CellRelativePath`). Anything else is
+/// compared as written: the directory embedded in longer text
+/// (`/prefix<dir>/program`), followed by anything but `/` (`<dir>:program`),
+/// a path below it that the executor does not create (`<dir>/repo/program`,
+/// a source checkout placed inside the directory, the same for every
+/// attempt), or a path into another row's directory. Everything else the
+/// executor writes the same for every attempt, so it is compared byte for
+/// byte wherever it points: the Hermit binary (`argv[0]`), every other option
+/// and option value (a `--workdir`, a `--bind` target, a `--mount`, the value
+/// of any other `--env` assignment), the value of any other process variable,
+/// and the host working directory.
+///
+/// Then, because a text compared as written is the same in every row even
+/// when it points into one row's cell directory, no recorded text of any row
+/// (each argument, effective argument, guest argument, environment name and
+/// value, and working directory, of the row's own copy and of each inner
+/// attempt) may name another row's cell directory itself, or a path there at
+/// or below an entry the executor creates for that attempt, or a path that
+/// enters that directory and then climbs with `..`, anywhere in the text, as
+/// the row's commands resolve it (`CommandPaths`): a relative path below each
+/// of the row's host working directories and guest working directories
+/// (`--workdir`), and a path at or below a bind's guest target (`--bind`,
+/// `--tmp`, `--mount`) below the bind's source too, with `//`, `.` and `..`
+/// read lexically. "Anywhere" is every span of the text that starts at its
+/// start, after a character a longer argument embeds a path behind (`:`,
+/// `,`, `=`, a space, a quote, ...), or at a `/`, and ends at such a
+/// character or at the text's end (`embedded_paths`). So a directory whose
+/// own path contains such a character (a run identifier `group run`) is
+/// still read whole, and so is an absolute path glued to an option
+/// (`-I<dir>/tmp`); a relative path glued to an option (`-I../tmp`) is not
+/// seen, any more than a path a guest computes. The row's own cell
+/// directory, spelled whole as the row records it (followed by the text's
+/// end, a `/` or such a character), is read as that directory: no path is
+/// cut from inside the spelling, and at the start of a path the spelling is
+/// read as its lexical form first. So a run identifier with `..`
+/// (`<slug>/..`, or `<slug>/tmp run/../..` with such a character), whose
+/// spelling passes through another attempt's directory, does not make the
+/// row's own paths look like a climb out of that directory, or like that
+/// directory's `tmp`; a `..` after the spelling still counts. A text that
+/// splits the spelling itself, as a shell splits an unquoted word while the
+/// guest runs, is read whole, like any other path a guest computes, and a
+/// longer path that only contains the spelling is read as written. The
+/// directory is matched by its whole path, so
+/// a run identifier, result root or checkout that only contains a component
+/// with the directory's name is not it, while a path that contains the whole
+/// directory after a `/` (`/prefix<dir>/home`) is read as reaching it.
+///
+/// The executor never makes an attempt's command reach another attempt's
+/// directory, with one layout the record cannot tell apart from that: a
+/// source checkout placed inside the first attempt's cell directory, below an
+/// entry the executor creates there (`<dir>/home/checkout`). Every row then
+/// records the same checkout path, but that entry is attempt 1's: its guest,
+/// whose `HOME` it is, could have written anything there, and a later
+/// attempt that runs it is indistinguishable from one that reuses attempt
+/// 1's output. Such a history is refused as well, which withholds the
+/// recovery credit and hides no failure. (Below `tmp`, which the executor
+/// empties before every inner attempt, a checkout does not survive until the
+/// attempt runs.) So a history that reaches another attempt's directory was
+/// not produced by the runner's retry, or cannot be told apart from one that
+/// was not. The reading is lexical, so a symlink, or a path a guest computes
+/// while it runs, is not seen.
+///
+/// Last, the shell command of every row's own copy and of each of its inner
+/// attempts must be the one rendered from that command's working directory,
+/// environment and argv ([`shell_command`]), so it carries nothing the texts
+/// read above do not.
+pub fn retained_history_invocation_error(rows: &[CellResult]) -> Option<String> {
+    let Some(first) = rows.first() else {
+        return Some("the history has no result row".into());
+    };
+    let first_root = match authenticated_result_root(first) {
+        Ok(root) => root,
+        Err(error) => return Some(error),
+    };
+    let Some(first_attempt) = first.attempts.first() else {
+        return Some(format!(
+            "result attempt {} retains no inner attempt",
+            first.attempt
+        ));
+    };
+    let first_dir = first.artifact_dir.as_str();
+    let guest = CellRelativeGuest::of(&first_attempt.guest_argv, &first_attempt.cwd, first_dir);
+    let first_row_command = CellRelativeCommand::of(&first.argv, &first.env, first_dir);
+    let first_indices: Vec<&str> = first.attempts.iter().map(|a| a.index.as_str()).collect();
+    for row in rows {
+        let number = row.attempt;
+        let root = match authenticated_result_root(row) {
+            Ok(root) => root,
+            Err(error) => return Some(error),
+        };
+        if root != first_root || row.run_id != first.run_id {
+            return Some(format!(
+                "result attempt {number} comes from another result root or run than attempt {}",
+                first.attempt
+            ));
+        }
+        if row.test != first.test
+            || row.mode != first.mode
+            || row.backend != first.backend
+            || row.test_sha256 != first.test_sha256
+            || row.hermit_sha != first.hermit_sha
+            || row.source_tree_dirty != first.source_tree_dirty
+            || row.binary_sha256 != first.binary_sha256
+            || row.binary_build_sha != first.binary_build_sha
+        {
+            return Some(format!(
+                "result attempt {number} records another cell, test digest, Hermit source or Hermit binary than attempt {}",
+                first.attempt
+            ));
+        }
+        let indices: Vec<&str> = row.attempts.iter().map(|a| a.index.as_str()).collect();
+        if indices != first_indices {
+            return Some(format!(
+                "result attempt {number} retains inner attempts {indices:?}, not attempt {}'s {first_indices:?}",
+                first.attempt
+            ));
+        }
+        let dir = row.artifact_dir.as_str();
+        for (attempt, reference) in row.attempts.iter().zip(&first.attempts) {
+            let index = attempt.index.as_str();
+            if CellRelativeGuest::of(&attempt.guest_argv, &attempt.cwd, dir) != guest {
+                return Some(format!(
+                    "result attempt {number}'s inner attempt {index} runs another guest argv or working directory than attempt {}'s inner attempt {}, with each row's cell directory set aside",
+                    first.attempt, first_attempt.index
+                ));
+            }
+            if CellRelativeCommand::of(&attempt.argv, &attempt.env, dir)
+                != CellRelativeCommand::of(&reference.argv, &reference.env, first_dir)
+            {
+                return Some(format!(
+                    "result attempt {number}'s inner attempt {index} carries another argv or environment than attempt {}'s, with each row's cell directory set aside",
+                    first.attempt
+                ));
+            }
+        }
+        if CellRelativeGuest::of(&row.guest_argv, &row.cwd, dir) != guest
+            || CellRelativeCommand::of(&row.argv, &row.env, dir) != first_row_command
+        {
+            return Some(format!(
+                "result attempt {number}'s own command copy runs another guest, argv, environment or working directory than attempt {}'s, with each row's cell directory set aside",
+                first.attempt
+            ));
+        }
+    }
+    for row in rows {
+        let texts = recorded_command_texts(row);
+        let paths = CommandPaths::of(row);
+        for other in rows
+            .iter()
+            .filter(|other| other.artifact_dir != row.artifact_dir)
+        {
+            if let Some(text) = texts
+                .iter()
+                .find(|text| paths.names_cell_directory_entry(text, &other.artifact_dir))
+            {
+                return Some(format!(
+                    "result attempt {}'s command names {text:?}, which is attempt {}'s cell directory or a path the executor creates there",
+                    row.attempt, other.attempt
+                ));
+            }
+        }
+    }
+    for row in rows {
+        if row.shell_command != shell_command(&row.cwd, &row.env, &row.argv) {
+            return Some(format!(
+                "result attempt {}'s shell command is not the one rendered from its cwd, env and argv",
+                row.attempt
+            ));
+        }
+        for attempt in &row.attempts {
+            if attempt.shell_command != shell_command(&attempt.cwd, &attempt.env, &attempt.argv) {
+                return Some(format!(
+                    "result attempt {}'s inner attempt {}'s shell command is not the one rendered from its cwd, env and argv",
+                    row.attempt, attempt.index
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Every distinct text of `row`'s recorded commands, its own copy's and each
+/// inner attempt's: each argument, effective argument and guest argument, the
+/// host working directory, and each environment variable's name and value.
+/// The rendered shell command is not among them: it is rendered from those
+/// texts ([`shell_command`]), which [`retained_history_invocation_error`]
+/// checks.
+fn recorded_command_texts(row: &CellResult) -> BTreeSet<&str> {
+    fn command<'a>(
+        texts: &mut BTreeSet<&'a str>,
+        argv: &'a [String],
+        guest_argv: &'a [String],
+        env: &'a BTreeMap<String, String>,
+        cwd: &'a str,
+    ) {
+        texts.extend(argv.iter().chain(guest_argv).map(String::as_str));
+        texts.extend(
+            env.iter()
+                .flat_map(|(name, value)| [name.as_str(), value.as_str()]),
+        );
+        texts.insert(cwd);
+    }
+    let mut texts: BTreeSet<&str> = row.effective_args.iter().map(String::as_str).collect();
+    command(&mut texts, &row.argv, &row.guest_argv, &row.env, &row.cwd);
+    for attempt in &row.attempts {
+        command(
+            &mut texts,
+            &attempt.argv,
+            &attempt.guest_argv,
+            &attempt.env,
+            &attempt.cwd,
+        );
+    }
+    texts
+}
+
+/// The result root of `row`'s `artifact_dir` when that directory is the one
+/// [`cell_artifact_path`] gives for the row's run, cell and attempt under it,
+/// or `None` when the row's run identifier is an absolute path and the
+/// directory is the one [`cell_artifact_path`] gives under any root.
+///
+/// The runner joins the run identifier verbatim (`E2E_RUN_ID`), so a run
+/// `group/run` puts the directory at `<root>/runs/group/run/<slug>`: the root
+/// is what remains when the whole `runs/<run>/<slug>` the runner appends is
+/// taken off the end. A run identifier that is an absolute path replaces the
+/// root and `runs` in that join, so a run `/retained/run` puts the directory
+/// at `/retained/run/<slug>` whatever the root: that directory is the whole
+/// of what the runner records, and it records no root.
+fn authenticated_result_root(row: &CellResult) -> Result<Option<&Path>, String> {
+    let refused = || {
+        format!(
+            "result attempt {} carries artifact directory {:?}, not the one the runner creates for its run, cell and attempt",
+            row.attempt, row.artifact_dir
+        )
+    };
+    let cell = CellId {
+        test: row.test.clone(),
+        mode: row.mode.clone(),
+        backend: row.backend.clone(),
+    };
+    let below_root = cell_artifact_path(Path::new(""), &row.run_id, &cell, row.attempt);
+    if below_root.has_root() {
+        return if below_root.as_os_str() == OsStr::new(&row.artifact_dir) {
+            Ok(None)
+        } else {
+            Err(refused())
+        };
+    }
+    let root = below_root
+        .to_str()
+        .and_then(|below_root| row.artifact_dir.strip_suffix(below_root))
+        .map(Path::new)
+        .ok_or_else(refused)?;
+    let expected = cell_artifact_path(root, &row.run_id, &cell, row.attempt);
+    if row.artifact_dir.is_empty() || expected.as_os_str() != OsStr::new(&row.artifact_dir) {
+        return Err(refused());
+    }
+    Ok(Some(root))
+}
+
+/// A path as [`retained_history_invocation_error`] compares it across rows:
+/// one the executor creates in the row's own cell directory, kept as the part
+/// below that directory, or anything else, kept as written.
+#[derive(Debug, Eq, PartialEq)]
+enum CellRelativePath<'a> {
+    /// The row's cell directory itself (`""`), or the path below it that
+    /// starts with `/`, has no `..` component, and whose first component
+    /// other than an empty one or `.` is an entry the executor creates there
+    /// ([`is_cell_directory_entry`]).
+    Own(&'a str),
+    /// Any other text, compared byte for byte.
+    Other(&'a str),
+}
+
+impl<'a> CellRelativePath<'a> {
+    /// `text` read as one whole filesystem path in a row whose cell directory
+    /// is `cell_dir`. Only a path that starts with the directory, goes on at
+    /// its end or with `/`, and stays among the entries the executor creates
+    /// for the attempt is the row's own: `<dir>:program`,
+    /// `/prefix<dir>/program` and `<dir>/../other` name other files, and
+    /// `<dir>/repo/program` names a file the executor does not create, the
+    /// same for every attempt (a source checkout placed inside the
+    /// directory), so each is kept as written.
+    fn of(text: &'a str, cell_dir: &str) -> Self {
+        match text.strip_prefix(cell_dir) {
+            Some(below)
+                if !cell_dir.is_empty()
+                    && (below.is_empty() || below.starts_with('/'))
+                    && !below.split('/').any(|component| component == "..")
+                    && below
+                        .split('/')
+                        .find(|component| !matches!(*component, "" | "."))
+                        .is_none_or(is_cell_directory_entry) =>
+            {
+                Self::Own(below)
+            }
+            _ => Self::Other(text),
+        }
+    }
+
+    fn all(texts: &'a [String], cell_dir: &str) -> Vec<Self> {
+        texts.iter().map(|text| Self::of(text, cell_dir)).collect()
+    }
+}
+
+/// The entries the executor creates directly in an attempt's cell
+/// directory, besides each inner attempt's `verify-<attempt>.json` report
+/// ([`is_cell_directory_entry`]): the directories [`prepare_dirs`] makes,
+/// the retained verify logs [`build_spec`] puts below `verify-logs`, and the
+/// per-attempt source of the fixed guest working directory below
+/// [`FIXED_WORKDIR_SOURCE_DIR`]. Everything the executor writes for an
+/// attempt in its cell directory, and so every path it records there that
+/// differs from attempt to attempt, is at or below one of them.
+const CELL_DIRECTORY_ENTRIES: [&str; 8] = [
+    "home",
+    "xdg-config",
+    "tmp",
+    "fixtures",
+    "recording",
+    "captures",
+    "verify-logs",
+    FIXED_WORKDIR_SOURCE_DIR,
+];
+
+/// Whether `name`, one path component directly below a cell directory, is
+/// an entry the executor creates there for an attempt: one of
+/// [`CELL_DIRECTORY_ENTRIES`], or the `verify-<attempt>.json` report
+/// [`build_spec`] writes for an inner attempt.
+fn is_cell_directory_entry(name: &str) -> bool {
+    CELL_DIRECTORY_ENTRIES.contains(&name)
+        || name
+            .strip_prefix("verify-")
+            .and_then(|rest| rest.strip_suffix(".json"))
+            .is_some_and(|attempt| !attempt.is_empty())
+}
+
+/// The characters that can start or end a path embedded in a longer recorded
+/// argument for [`CommandPaths::names_cell_directory_entry`]
+/// ([`embedded_paths`]): the `:` of a bind or a search list, the `,` and `=`
+/// of mount options and assignments, the separators of a shell command, and
+/// the quotes it renders.
+const EMBEDDED_PATH_ENDS: [char; 9] = [':', ',', '=', ';', ' ', '\t', '\n', '\'', '"'];
+
+/// Every path `text` can embed, for
+/// [`CommandPaths::names_cell_directory_entry`]: each nonempty span of `text`
+/// that starts at its start, just after one of [`EMBEDDED_PATH_ENDS`], or at
+/// a `/`, and ends just before one of them or at its end, except that no
+/// span starts or ends strictly inside a whole occurrence of one of `whole`
+/// (the row's own cell directory as the row records it): a place where a
+/// span may start at which the text continues with that spelling, followed
+/// by the text's end, a `/` or one of [`EMBEDDED_PATH_ENDS`]
+/// ([`ends_spelling`]).
+///
+/// A span may contain those characters, because a path may: a run
+/// identifier `group run` puts a space in every cell directory of the run,
+/// and cutting the text at that space would hide the directory. A span that
+/// starts at a `/` is an absolute path glued to the text before it, such as
+/// a compiler's `-I<dir>/tmp`; it may also be a path that only ends with
+/// another (`/prefix<dir>/home`), which can only make more texts name a
+/// directory. A relative path glued to the text before it (`-I../tmp`) is
+/// not a span. The row's own directory spelled whole is read as that
+/// directory, and no path is cut from inside it: a run identifier that holds
+/// such a character and climbs with `..` (`<slug>/tmp run/../..`) spells the
+/// row's directory through another attempt's, and a piece of that spelling
+/// cut at the character (`.../<slug>/tmp`) is not a path the row's command
+/// names. A text that splits that spelling itself, as a shell splits an
+/// unquoted word while the guest runs, is read whole. Every character that
+/// starts or ends a span is ASCII, so each span begins and ends at a
+/// character boundary.
+fn embedded_paths<'t>(text: &'t str, whole: &[String]) -> BTreeSet<&'t str> {
+    let mut starts = BTreeSet::from([0]);
+    let mut ends = BTreeSet::from([text.len()]);
+    for (at, character) in text.char_indices() {
+        if EMBEDDED_PATH_ENDS.contains(&character) {
+            starts.insert(at + character.len_utf8());
+            ends.insert(at);
+        } else if character == '/' {
+            starts.insert(at);
+        }
+    }
+    let inside: Vec<std::ops::Range<usize>> = starts
+        .iter()
+        .flat_map(|&at| {
+            whole
+                .iter()
+                .filter(move |spelling| text[at..].starts_with(spelling.as_str()))
+                .map(move |spelling| at + spelling.len())
+                .filter(|&end| ends_spelling(&text[end..]))
+                .map(move |end| at + 1..end)
+        })
+        .collect();
+    let outside = |at: &usize| !inside.iter().any(|range| range.contains(at));
+    starts.retain(outside);
+    ends.retain(outside);
+    let mut paths = BTreeSet::new();
+    for &start in &starts {
+        for &end in ends.range(start + 1..) {
+            paths.insert(&text[start..end]);
+        }
+    }
+    paths
+}
+
+/// Whether `rest`, the text after a spelling of a directory, leaves that
+/// spelling whole: it is empty or starts with a `/` or one of
+/// [`EMBEDDED_PATH_ENDS`], so the spelling is not the start of a longer name
+/// (`<dir>-attempt-2`).
+fn ends_spelling(rest: &str) -> bool {
+    rest.chars()
+        .next()
+        .is_none_or(|next| next == '/' || EMBEDDED_PATH_ENDS.contains(&next))
+}
+
+/// Where the commands of one row resolve the paths they record, for
+/// [`CommandPaths::names_cell_directory_entry`]: the host working directory
+/// of the row's own copy and of each inner attempt, and, among Hermit's
+/// options in each of their argvs (every argument after the first, up to the
+/// first `--` after it), each guest working directory (`--workdir`) and each
+/// bind: `--bind=SOURCE[:TARGET]`, split at the first `:` as reverie's `Bind`
+/// parses it; `--tmp=PATH`, which Hermit binds over the guest's `/tmp`; and a
+/// `--mount` whose comma-separated fields (each trimmed, as reverie's `Mount`
+/// reads them) name a `source` or `src` and a `target`, `destination`, `dest`
+/// or `dst`, read as a bind of every such source at every such target,
+/// because reverie keeps the last of a repeated field and prefers `target` to
+/// its aliases, and taking them all can only add paths. Hermit ignores a
+/// `--bind` whose target is outside the guest's `/tmp`; keeping it here can
+/// only add paths too. An option's value is the text after its `=`, or else
+/// the next argument, whatever that argument is. It also keeps the row's own
+/// cell directory as the row records it (`own`).
+#[derive(Debug, Default)]
+struct CommandPaths<'a> {
+    cwds: BTreeSet<&'a str>,
+    workdirs: BTreeSet<&'a str>,
+    /// Each bind's source and guest target.
+    binds: BTreeSet<(&'a str, &'a str)>,
+    /// The row's own cell directory, as written and, when relative, below
+    /// each host working directory.
+    own: Vec<String>,
+}
+
+impl<'a> CommandPaths<'a> {
+    fn of(row: &'a CellResult) -> Self {
+        let mut paths = Self::default();
+        let commands = std::iter::once((&row.cwd, &row.argv)).chain(
+            row.attempts
+                .iter()
+                .map(|attempt| (&attempt.cwd, &attempt.argv)),
+        );
+        for (cwd, argv) in commands {
+            paths.cwds.insert(cwd.as_str());
+            let options = argv.get(1..).unwrap_or_default();
+            let options = &options[..options
+                .iter()
+                .position(|arg| arg == "--")
+                .unwrap_or(options.len())];
+            for (at, arg) in options.iter().enumerate() {
+                let (option, value) = match arg.split_once('=') {
+                    Some((option, value)) => (option, Some(value)),
+                    None => (arg.as_str(), options.get(at + 1).map(String::as_str)),
+                };
+                match (option, value) {
+                    ("--workdir", Some(workdir)) => {
+                        paths.workdirs.insert(workdir);
+                    }
+                    ("--bind", Some(bind)) => {
+                        paths
+                            .binds
+                            .insert(bind.split_once(':').unwrap_or((bind, bind)));
+                    }
+                    ("--tmp", Some(tmp)) => {
+                        paths.binds.insert((tmp, "/tmp"));
+                    }
+                    ("--mount", Some(mount)) => {
+                        let fields = |names: &[&str]| -> Vec<&'a str> {
+                            mount
+                                .split(',')
+                                .filter_map(|field| field.trim().split_once('='))
+                                .filter(|(name, _)| names.contains(name))
+                                .map(|(_, path)| path)
+                                .collect()
+                        };
+                        for source in fields(&["source", "src"]) {
+                            for target in fields(&["target", "destination", "dest", "dst"]) {
+                                paths.binds.insert((source, target));
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        paths.own = paths.anchored(&row.artifact_dir);
+        paths
+    }
+
+    /// `path` with a leading spelling of the row's own cell directory (one of
+    /// `own`, verbatim, followed by nothing, a `/` or one of
+    /// [`EMBEDDED_PATH_ENDS`], [`ends_spelling`]) replaced by that spelling's
+    /// lexical form ([`lexical_components`]), or `path` unchanged.
+    /// Both read as the same place; only the walk through the spelling
+    /// differs, which [`reaches_cell_directory_entry`] would otherwise read
+    /// as entering another directory the spelling passes through and
+    /// climbing out of it.
+    fn own_normalized(&self, path: &str) -> String {
+        for own in &self.own {
+            let Some(rest) = path.strip_prefix(own.as_str()) else {
+                continue;
+            };
+            if !ends_spelling(rest) {
+                continue;
+            }
+            let components = lexical_components(own).join("/");
+            let lexical = if own.starts_with('/') {
+                format!("/{components}")
+            } else if components.is_empty() {
+                ".".to_owned()
+            } else {
+                components
+            };
+            return format!("{lexical}{rest}");
+        }
+        path.to_owned()
+    }
+
+    /// `path` itself and, when it is relative, `path` below each host
+    /// working directory, where Hermit resolves a relative path among its
+    /// options.
+    fn anchored(&self, path: &str) -> Vec<String> {
+        let mut paths = vec![path.to_owned()];
+        if !path.starts_with('/') {
+            paths.extend(self.cwds.iter().map(|cwd| format!("{cwd}/{path}")));
+        }
+        paths
+    }
+
+    /// Every path `text`, one path cut from a recorded text, can name in a
+    /// command of the row: the text itself; when it is relative, the text
+    /// below each host working directory and below each guest working
+    /// directory (itself [`Self::anchored`]), where a relative path is
+    /// resolved on the host and in the guest; and, for each of those that is
+    /// at or below a bind's target (itself [`Self::anchored`], as mount(2)
+    /// resolves the relative target of a `--mount`, which Hermit passes on
+    /// unchanged), the same path below the bind's source
+    /// ([`Self::anchored`]), and so on through every bind in turn. A path is
+    /// matched against a target component by component both as written
+    /// (`below_bind_target`) and with each `..` resolved, so a `..` that
+    /// leaves the target reaches into the source too.
+    fn reachable(&self, text: &str) -> BTreeSet<String> {
+        let mut paths = BTreeSet::from([text.to_owned()]);
+        if !text.starts_with('/') {
+            for base in self.cwds.iter().map(|cwd| (*cwd).to_owned()).chain(
+                self.workdirs
+                    .iter()
+                    .flat_map(|workdir| self.anchored(workdir)),
+            ) {
+                paths.insert(format!("{base}/{text}"));
+            }
+        }
+        let mut frontier: Vec<String> = paths.iter().cloned().collect();
+        for _ in 0..self.binds.len() {
+            let mut next = Vec::new();
+            for path in &frontier {
+                for (source, target) in &self.binds {
+                    for target in self.anchored(target) {
+                        for rest in below_bind_target(path, &target) {
+                            for source in self.anchored(source) {
+                                let rebased = if rest.is_empty() {
+                                    source
+                                } else {
+                                    format!("{source}/{rest}")
+                                };
+                                if paths.insert(rebased.clone()) {
+                                    next.push(rebased);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if next.is_empty() {
+                break;
+            }
+            frontier = next;
+        }
+        paths
+    }
+
+    /// Whether `text` names `cell_dir` (another row's cell directory, itself
+    /// [`Self::anchored`]) or a path at or below an entry the executor creates
+    /// there ([`is_cell_directory_entry`]), anywhere in it, as one of this
+    /// row's commands would resolve it. Each path the text embeds
+    /// ([`embedded_paths`], none cut from inside the row's own directory
+    /// spelled whole), and each path the row can resolve it to
+    /// ([`Self::reachable`]), with a leading spelling of the row's own
+    /// directory read as its lexical form ([`Self::own_normalized`]), is read
+    /// component by component (`reaches_cell_directory_entry`): with `//`,
+    /// `.` and `..` read lexically, so the directory reached through parents
+    /// spelled another way counts, and a path that enters the directory and
+    /// then climbs with `..` counts wherever it lands. The directory is
+    /// matched whole, so another directory that only shares its name (a run
+    /// identifier, a result root or a checkout with a component equal to it)
+    /// names nothing, and so do a directory whose name only starts with it
+    /// (`<dir>-attempt-2`, the next attempt's) and a path below it at an
+    /// entry the executor does not create, with no `..` after entering it
+    /// (`<dir>/repo/program`, a source checkout placed inside it). The
+    /// reading is lexical: a symlink, or a path a guest computes while it
+    /// runs, is not seen.
+    fn names_cell_directory_entry(&self, text: &str, cell_dir: &str) -> bool {
+        let dirs = self.anchored(cell_dir);
+        embedded_paths(text, &self.own).into_iter().any(|path| {
+            self.reachable(path).iter().any(|path| {
+                let path = self.own_normalized(path);
+                dirs.iter()
+                    .any(|dir| reaches_cell_directory_entry(&path, dir))
+            })
+        })
+    }
+}
+
+/// `path`'s components, with each empty one and each `.` dropped and each
+/// `..` taking off the component before it: at the root of an absolute path
+/// it takes off nothing, and at the start of a relative path it is kept.
+fn lexical_components(path: &str) -> Vec<&str> {
+    let rooted = path.starts_with('/');
+    let mut components = Vec::new();
+    for component in path.split('/') {
+        match component {
+            "" | "." => {}
+            ".." => leave_component(&mut components, rooted),
+            name => components.push(name),
+        }
+    }
+    components
+}
+
+/// Take the last of `components` off for a `..`, as [`lexical_components`]
+/// reads it.
+fn leave_component(components: &mut Vec<&str>, rooted: bool) {
+    match components.last() {
+        Some(last) if *last != ".." => {
+            components.pop();
+        }
+        _ if !rooted => components.push(".."),
+        _ => {}
+    }
+}
+
+/// The rest of `path` below the bind target `target`, as written with each
+/// empty component and each `.` dropped, and with each `..` resolved
+/// ([`lexical_components`]): each distinct rest of a reading in which
+/// `path`'s components start with `target`'s, none when neither does, and
+/// none for an empty target. An absolute path is below only an absolute
+/// target, and a relative one only a relative target.
+fn below_bind_target(path: &str, target: &str) -> Vec<String> {
+    if target.is_empty() || path.starts_with('/') != target.starts_with('/') {
+        return Vec::new();
+    }
+    let target = lexical_components(target);
+    let as_written: Vec<&str> = path
+        .split('/')
+        .filter(|component| !matches!(*component, "" | "."))
+        .collect();
+    let mut rests = Vec::new();
+    for components in [as_written, lexical_components(path)] {
+        if let Some(rest) = components.strip_prefix(target.as_slice()) {
+            let rest = rest.join("/");
+            if !rests.contains(&rest) {
+                rests.push(rest);
+            }
+        }
+    }
+    rests
+}
+
+/// Whether `path` reaches the directory `dir`, read component by component
+/// with each empty component and each `.` dropped and each `..` taking off
+/// the component before it ([`lexical_components`]): it ends at `dir`
+/// itself, or at or below an entry the executor creates there
+/// ([`is_cell_directory_entry`]), or it enters `dir` and then has a `..`
+/// anywhere after, which may climb out of a path the executor does not
+/// create back into one it does. An absolute path reaches only an absolute
+/// directory, and a relative one only a relative directory. A directory
+/// with no component (`/`, or empty) is reached by nothing; the runner never
+/// creates one, and [`retained_history_invocation_error`] refuses every row
+/// whose directory is not the one the runner creates before it reaches this
+/// check.
+fn reaches_cell_directory_entry(path: &str, dir: &str) -> bool {
+    let rooted = dir.starts_with('/');
+    let dir = lexical_components(dir);
+    if dir.is_empty() || path.starts_with('/') != rooted {
+        return false;
+    }
+    let mut walked = Vec::new();
+    let mut entered = false;
+    for component in path.split('/') {
+        match component {
+            "" | "." => continue,
+            ".." if entered => return true,
+            ".." => leave_component(&mut walked, rooted),
+            name => walked.push(name),
+        }
+        entered = walked.starts_with(&dir);
+    }
+    walked == dir
+        || walked
+            .strip_prefix(dir.as_slice())
+            .and_then(|below| below.first())
+            .is_some_and(|entry| is_cell_directory_entry(entry))
+}
+
+/// The guest variables whose `--env` value the executor writes in the cell
+/// directory, a different path for every attempt: [`cell_env`] puts each
+/// below the attempt's directory and [`append_guest_env_args`] forwards it.
+/// (An equalized cell forwards their fixed guest paths instead,
+/// [`EQUALIZED_INPUTS`].) A verify cell's other forwarded values are the
+/// same for every attempt: `E2E_TMPDIR` is a fixed guest path, and the
+/// manifest's own variables ([`cell_mode_env`]) are literals.
+const CELL_DIRECTORY_GUEST_ENV: [&str; 3] = ["HOME", "XDG_CONFIG_HOME", "E2E_FIXTURE_DIR"];
+
+/// The process variables the executor sets to a path in the cell directory:
+/// those of [`CELL_DIRECTORY_GUEST_ENV`] ([`cell_env`]) and SaBRe's path
+/// evidence ([`build_spec`]). Every other variable it sets
+/// ([`execution_cell_env`], [`build_spec`]) is the same for every attempt.
+const CELL_DIRECTORY_PROCESS_ENV: [&str; 4] = [
+    "HOME",
+    "XDG_CONFIG_HOME",
+    "E2E_FIXTURE_DIR",
+    "HERMIT_SABRE_PATH_EVIDENCE",
+];
+
+/// The Hermit options [`verified_invocation_argv`] and
+/// [`append_execution_root_args`] write with their value in the next
+/// argument. That argument is the option's value, never an option itself.
+const SEPARATE_VALUE_OPTIONS: [&str; 8] = [
+    "--log",
+    "--backend",
+    "--verify-json",
+    "--verify-log-dir",
+    "--data-dir",
+    "--record-timeout",
+    "--workdir",
+    "--env",
+];
+
+/// One argument of a recorded command line, read where the executor writes
+/// a path that differs from attempt to attempt ([`verified_invocation_argv`]):
+/// among Hermit's options, which start at the second argument and end at the
+/// first `--` after it, the verify report and
+/// retained log directory, the source of a `--bind`, and the value of an
+/// `--env` assignment to a variable of [`CELL_DIRECTORY_GUEST_ENV`]; and each
+/// guest argument after that `--`. Every other argument is kept as written.
+#[derive(Debug, Eq, PartialEq)]
+enum CellRelativeArg<'a> {
+    /// The value of `--verify-json` or `--verify-log-dir`.
+    Output(CellRelativePath<'a>),
+    /// `--bind=SOURCE:TARGET`, split at the first `:` as reverie's `Bind`
+    /// parses it: the source the executor creates in the cell directory, and
+    /// the guest target, which it writes the same for every attempt.
+    Bind {
+        source: CellRelativePath<'a>,
+        target: &'a str,
+    },
+    /// The `NAME=VALUE` value of `--env`, split at the first `=`, for a
+    /// `NAME` of [`CELL_DIRECTORY_GUEST_ENV`].
+    Env {
+        name: &'a str,
+        value: CellRelativePath<'a>,
+    },
+    /// A guest argument, as one path.
+    Guest(CellRelativePath<'a>),
+    /// Any other argument, compared byte for byte.
+    Literal(&'a str),
+}
+
+impl<'a> CellRelativeArg<'a> {
+    /// `argv` read argument by argument. The first argument is the program
+    /// the executor runs, the Hermit binary, and is always [`Self::Literal`]:
+    /// it is neither an option nor the `--` that ends them, whatever its
+    /// text. Hermit's options start at the second argument.
+    fn all(argv: &'a [String], cell_dir: &str) -> Vec<Self> {
+        let Some((program, args)) = argv.split_first() else {
+            return Vec::new();
+        };
+        let mut options = true;
+        let mut value_of: Option<&str> = None;
+        std::iter::once(Self::Literal(program.as_str()))
+            .chain(args.iter().map(|arg| {
+                let arg = arg.as_str();
+                if !options {
+                    return Self::Guest(CellRelativePath::of(arg, cell_dir));
+                }
+                if arg == "--" {
+                    options = false;
+                    return Self::Literal(arg);
+                }
+                match value_of.take() {
+                    Some("--verify-json" | "--verify-log-dir") => {
+                        Self::Output(CellRelativePath::of(arg, cell_dir))
+                    }
+                    Some("--env") => match arg.split_once('=') {
+                        Some((name, value)) if CELL_DIRECTORY_GUEST_ENV.contains(&name) => {
+                            Self::Env {
+                                name,
+                                value: CellRelativePath::of(value, cell_dir),
+                            }
+                        }
+                        _ => Self::Literal(arg),
+                    },
+                    Some(_) => Self::Literal(arg),
+                    None => {
+                        value_of = SEPARATE_VALUE_OPTIONS
+                            .into_iter()
+                            .find(|option| *option == arg);
+                        match arg
+                            .strip_prefix("--bind=")
+                            .and_then(|bind| bind.split_once(':'))
+                        {
+                            Some((source, target)) => Self::Bind {
+                                source: CellRelativePath::of(source, cell_dir),
+                                target,
+                            },
+                            None => Self::Literal(arg),
+                        }
+                    }
+                }
+            }))
+            .collect()
+    }
+}
+
+/// The guest one attempt runs, with its cell directory set aside, and the
+/// host working directory it runs from, as written: the executor runs every
+/// attempt from the checkout root, never from a cell directory.
+#[derive(Debug, Eq, PartialEq)]
+struct CellRelativeGuest<'a> {
+    guest_argv: Vec<CellRelativePath<'a>>,
+    cwd: &'a str,
+}
+
+impl<'a> CellRelativeGuest<'a> {
+    fn of(guest_argv: &'a [String], cwd: &'a str, cell_dir: &str) -> Self {
+        Self {
+            guest_argv: CellRelativePath::all(guest_argv, cell_dir),
+            cwd,
+        }
+    }
+}
+
+/// One attempt's argv and environment with its cell directory set aside
+/// where the executor writes it: the arguments as [`CellRelativeArg`] reads
+/// them, and the value of each process variable of
+/// [`CELL_DIRECTORY_PROCESS_ENV`]. Any other variable's value is kept as
+/// written.
+#[derive(Debug, Eq, PartialEq)]
+struct CellRelativeCommand<'a> {
+    argv: Vec<CellRelativeArg<'a>>,
+    env: BTreeMap<&'a str, CellRelativePath<'a>>,
+}
+
+impl<'a> CellRelativeCommand<'a> {
+    fn of(argv: &'a [String], env: &'a BTreeMap<String, String>, cell_dir: &str) -> Self {
+        Self {
+            argv: CellRelativeArg::all(argv, cell_dir),
+            env: env
+                .iter()
+                .map(|(name, value)| {
+                    let name = name.as_str();
+                    let value = if CELL_DIRECTORY_PROCESS_ENV.contains(&name) {
+                        CellRelativePath::of(value, cell_dir)
+                    } else {
+                        CellRelativePath::Other(value)
+                    };
+                    (name, value)
+                })
+                .collect(),
+        }
+    }
+}
+
 /// Why `attempt`'s argv is not one `verified_invocation_argv` writes for a
 /// verify attempt on `backend` whose row's relaxations record the run flags
 /// `relaxation_flags` (sorted), that expects a guest exit when `expects_exit`
@@ -13166,6 +14091,43 @@ int main(int argc, char **argv) {
     }
 
     #[test]
+    fn a_checkout_below_the_cell_temporary_directory_is_gone_before_the_attempt_runs() {
+        // `retained_history_invocation_error` refuses a retry history whose
+        // rows run a source checkout placed below an entry the executor
+        // creates in the first attempt's cell directory. Below `tmp`, such a
+        // checkout cannot even run: the executor empties `tmp` before every
+        // inner attempt, so the attempt's working directory is gone before it
+        // starts.
+        let root =
+            std::env::temp_dir().join(format!("hermit-runner-tmp-checkout-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let mut spec = bounded_spec(&root, "cell", "printf ran > ran");
+        let checkout = spec.cell_dir.join("tmp/checkout");
+        fs::create_dir_all(&checkout).unwrap();
+        fs::write(checkout.join("program"), "kept").unwrap();
+        spec.cwd = checkout.clone();
+        let attempt = execute_spec_until(
+            &spec,
+            Instant::now() + Duration::from_secs(5),
+            5,
+            5,
+            None,
+            &mut Vec::new(),
+        );
+        assert!(spec.cell_dir.join("tmp").is_dir());
+        assert!(
+            !checkout.exists(),
+            "the executor emptied the temporary directory"
+        );
+        // The working directory is gone, so the guest never starts: the
+        // spawn fails and no attempt result, passing or not, is produced.
+        let error = attempt.expect_err("an attempt in an emptied directory cannot start");
+        assert!(error.contains("No such file or directory"), "{error}");
+        assert!(!spec.cell_dir.join("tmp/checkout/ran").exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn cpu_burner_is_stopped_by_the_cpu_budget() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-live-cpu-budget-{}",
@@ -16338,6 +17300,2200 @@ exit "$(cat "$PWD/exit-status")"
                 .is_some_and(|reason| reason.contains("1 HERMIT_SKID_OVERSHOOT")),
             "comparison-null infrastructure error must retain its cause: {result:?}"
         );
+    }
+
+    /// A reader that discounts an earlier row of a retry history as
+    /// infrastructure because a later row passed needs every row to have run
+    /// the same guest the same way ([`retained_history_invocation_error`],
+    /// <https://github.com/rrnewton/hermit/issues/1845>). The executor gives
+    /// each outer attempt its own cell directory, so the rows it writes for
+    /// one cell differ in the paths it creates there and nowhere else. Each
+    /// such history below is accepted, whatever execution root, log
+    /// retention, backend, guest environment or number of inner attempts
+    /// produced it, and each history that differs from one of them in one
+    /// respect is refused by the named check.
+    #[test]
+    fn every_row_of_a_retry_history_runs_the_same_guest_with_its_own_cell_directory_set_aside() {
+        use CellRelativePath::Other;
+        use CellRelativePath::Own;
+        const DIR: &str = "/r/runs/x/cell";
+        let path = |text: &'static str| CellRelativePath::of(text, DIR);
+        assert_eq!(path("/r/runs/x/cell"), Own(""));
+        assert_eq!(path("/r/runs/x/cell/verify-1.json"), Own("/verify-1.json"));
+        assert_eq!(path("/r/runs/x/cell/./fixtures"), Own("/./fixtures"));
+        assert_eq!(path("/r/runs/x/cell//home/x"), Own("//home/x"));
+        assert_eq!(path("/r/runs/x/cell/workdir/1"), Own("/workdir/1"));
+        assert_eq!(
+            path("/r/runs/x/cell/verify-logs/verify-1"),
+            Own("/verify-logs/verify-1")
+        );
+        for other in [
+            "/r/runs/x/cell:program",
+            "/prefix/r/runs/x/cell/program",
+            "/r/runs/x/cell/../cell-attempt-2/data",
+            "/r/runs/x/cell/..",
+            "/r/runs/x/cell/fixtures/../repo",
+            "/r/runs/x/cell-attempt-2/data",
+            "/r/runs/x/cellar",
+            // An entry name glued to the directory without a `/`.
+            "/r/runs/x/cellhome",
+            "/r/runs/x/celltmp/input",
+            "/r/runs/x/cellverify-1.json",
+            // Below the directory, but at no entry the executor creates
+            // there: a source checkout placed inside it names the same file
+            // for every attempt.
+            "/r/runs/x/cell/repo/tests/random.sh",
+            "/r/runs/x/cell/data",
+            "/r/runs/x/cell/./data",
+            "/r/runs/x/cell/verify-.json",
+            "/r/runs/x/cell/verify-1.json.bak",
+            "",
+        ] {
+            assert_eq!(path(other), Other(other), "{other:?} is not below {DIR}");
+        }
+        assert_eq!(CellRelativePath::of("/anything", ""), Other("/anything"));
+        // An empty directory owns nothing, not even a path that starts at an
+        // entry name.
+        assert_eq!(CellRelativePath::of("/home/x", ""), Other("/home/x"));
+        assert_eq!(CellRelativePath::of("", ""), Other(""));
+        // Where a text names a cell directory, or a path the executor
+        // creates there, anywhere in it, as a command with `paths` resolves
+        // it.
+        let names = |paths: &CommandPaths, text: &str, dir: &str| {
+            paths.names_cell_directory_entry(text, dir)
+        };
+        let bare = CommandPaths::default();
+        let within = |cwds: &[&'static str],
+                      workdirs: &[&'static str],
+                      binds: &[(&'static str, &'static str)]| CommandPaths {
+            cwds: cwds.iter().copied().collect(),
+            workdirs: workdirs.iter().copied().collect(),
+            binds: binds.iter().copied().collect(),
+            own: Vec::new(),
+        };
+        for named in [
+            "/r/runs/x/cell",
+            "/r/runs/x/cell/",
+            "/r/runs/x/cell/home",
+            "/r/runs/x/cell/./home",
+            "/r/runs/x/cell//home",
+            "/r/runs/x/cell/..",
+            "/r/runs/x/cell/../cell-attempt-2/tmp",
+            "/r/runs/x/cell/repo/../tmp/input",
+            "/r/runs/x/cell/repo/../../x/cell-attempt-2",
+            "/r/runs/x/cell/verify-2.json",
+            "/r/runs/x/cell:program",
+            "--bind=/r/runs/x/cell/fixtures:/tmp/e2e/fixtures",
+            "--mount=type=bind,source=/r/runs/x/cell,target=/x",
+            "HOME=/r/runs/x/cell/home",
+            "cd '/r/runs/x/cell/tmp' && hermit",
+            "/r/runs/x/cell-attempt-2/home:/r/runs/x/cell/home",
+            // The same directory reached through parents spelled another
+            // way.
+            "/r//runs/x/./cell/tmp/input",
+            "/r/runs/y/../x/cell/home",
+            "/r/runs/x/cell-attempt-2/../cell/tmp",
+            "/r/runs/x/cell/.",
+            "/../r/runs/x/cell/home",
+            // An absolute path glued to an option, and a path that only ends
+            // with the directory's whole path, which can only refuse more.
+            "-I/r/runs/x/cell/tmp/include",
+            "-I/r/runs/x/cell-attempt-2/../cell/tmp",
+            "/prefix/r/runs/x/cell/tmp",
+        ] {
+            assert!(
+                names(&bare, named, DIR),
+                "{named:?} names {DIR} or a path the executor creates there"
+            );
+        }
+        for unnamed in [
+            "/r/runs/x/cell-attempt-2/home",
+            "/r/runs/x/cellar/home",
+            "/r/runs/x/cell/repo/tests/random.sh",
+            "/r/runs/x/cell/data/input",
+            "--bind=/r/runs/x/cell-attempt-2/fixtures:/tmp/e2e/fixtures",
+            "/r/runs/x/cel",
+            "/r/runs/x/precell/tmp",
+            "/r/runs/x/cell.d/tmp",
+            "/elsewhere/cell/repo/program",
+            "cell-attempt-2/tmp/input",
+            // Another directory that only shares a component with the
+            // directory's name: a run identifier, a result root or a checkout
+            // containing it.
+            "/guest/cell/fixtures/program",
+            "--workdir=/elsewhere/cell",
+            "/r/runs/cell/tmp/run/cell-attempt-2/verify-1.json",
+            "/checkout/cell/tmp/repo",
+            // A relative path, with no working directory to resolve it in.
+            "../x/cell/tmp/input",
+            "cell/home",
+            "../tmp/input",
+            "r/runs/x/cell/home",
+            // A relative path glued to an option is not read.
+            "-I../tmp/input",
+            "",
+        ] {
+            assert!(
+                !names(&bare, unnamed, DIR),
+                "{unnamed:?} names neither {DIR} nor a path the executor creates there"
+            );
+        }
+        // A directory whose own path holds a character that also ends a path
+        // embedded in a longer text, as a run identifier can put there, is
+        // still read whole.
+        for (dir, text, expected) in [
+            ("/r/runs/group run/cell", "/r/runs/group run/cell/tmp", true),
+            (
+                "/r/runs/group run/cell",
+                "/r/runs/group run/cell/repo/../tmp/input",
+                true,
+            ),
+            (
+                "/r/runs/group run/cell",
+                "-I/r/runs/group run/cell/tmp",
+                true,
+            ),
+            (
+                "/r/runs/group run/cell",
+                "cd '/r/runs/group run/cell/home' && x",
+                true,
+            ),
+            (
+                "/r/runs/group,run/cell",
+                "--mount=source=/r/runs/group,run/cell/home,target=/x",
+                true,
+            ),
+            (
+                "/r/runs/group=run/cell",
+                "HOME=/r/runs/group=run/cell/home",
+                true,
+            ),
+            (
+                "/r/runs/group;run/cell",
+                "/r/runs/group;run/cell/fixtures/program",
+                true,
+            ),
+            (
+                "/r/runs/group'run/cell",
+                "/r/runs/group'run/cell/verify-1.json",
+                true,
+            ),
+            (
+                "/r/runs/group\"run/cell",
+                "/r/runs/group\"run/cell/home",
+                true,
+            ),
+            (
+                "/r/runs/group\trun/cell",
+                "/r/runs/group\trun/cell/home",
+                true,
+            ),
+            (
+                "/r/runs/group run/cell",
+                "/r/runs/group run/cell-attempt-2/tmp",
+                false,
+            ),
+            (
+                "/r/runs/group run/cell",
+                "HOME=/r/runs/group run/cell-attempt-2/home",
+                false,
+            ),
+            (
+                "/r/runs/group run/cell",
+                "/r/runs/group run/cell/repo/program",
+                false,
+            ),
+            (
+                "/r/runs/group=run/cell",
+                "HOME=/r/runs/group=run/cell-attempt-2/home",
+                false,
+            ),
+        ] {
+            assert_eq!(
+                names(&bare, text, dir),
+                expected,
+                "{text:?} names {dir:?} or a path the executor creates there"
+            );
+        }
+        // The row's own directory, spelled with a `..` that passes through
+        // another attempt's directory, is read as its lexical form at the
+        // start of a path; a `..` after that spelling still climbs.
+        let spelled = |own: &str| CommandPaths {
+            own: vec![own.to_owned()],
+            ..CommandPaths::default()
+        };
+        let first = "/r/runs/cell/../cell";
+        let second = spelled("/r/runs/cell/../cell-attempt-2");
+        for (paths, text, expected) in [
+            (&second, "/r/runs/cell/../cell-attempt-2/home", false),
+            (&second, "/r/runs/cell/../cell-attempt-2", false),
+            (&second, "HOME=/r/runs/cell/../cell-attempt-2/home", false),
+            (&second, "-I/r/runs/cell/../cell-attempt-2/tmp", false),
+            (&second, "/r/runs/cell/../cell-attempt-2/../cell/tmp", true),
+            (
+                &second,
+                "/r/runs/cell/../cell-attempt-2/../cell/../elsewhere",
+                true,
+            ),
+            (
+                &second,
+                "/r/runs/cell/../cell-attempt-2/repo/../../cell/home",
+                true,
+            ),
+            (&second, "/r/runs/cell/../cell/tmp", true),
+            (&second, "/r/runs/cell/repo/../tmp", true),
+            (&second, "/r/runs/cell/../cell-attempt-2x/home", true),
+            (&bare, "/r/runs/cell/../cell-attempt-2/home", true),
+        ] {
+            assert_eq!(
+                names(paths, text, first),
+                expected,
+                "{text:?} names {first:?} or a path the executor creates there, as {paths:?} reads it"
+            );
+        }
+        let relative = spelled("res/runs/cell/../cell-attempt-2");
+        assert!(!names(
+            &relative,
+            "res/runs/cell/../cell-attempt-2/home",
+            "res/runs/cell/../cell"
+        ));
+        assert!(names(
+            &relative,
+            "res/runs/cell/../cell-attempt-2/../cell/home",
+            "res/runs/cell/../cell"
+        ));
+        // A spelling that also holds a character that ends an embedded path
+        // (a run identifier `cell/tmp run/../..`) is not cut there: the piece
+        // before the space, `/r/runs/cell/tmp`, is the other attempt's
+        // temporary directory, and only a text that does not spell the row's
+        // own directory whole is read as naming it.
+        let first = "/r/runs/cell/tmp run/../../cell";
+        let second = spelled("/r/runs/cell/tmp run/../../cell-attempt-2");
+        for (paths, text, expected) in [
+            (
+                &second,
+                "/r/runs/cell/tmp run/../../cell-attempt-2/verify-1.json",
+                false,
+            ),
+            (&second, "/r/runs/cell/tmp run/../../cell-attempt-2", false),
+            (
+                &second,
+                "--verify-json=/r/runs/cell/tmp run/../../cell-attempt-2/verify-1.json",
+                false,
+            ),
+            (
+                &second,
+                "HOME=/r/runs/cell/tmp run/../../cell-attempt-2/home",
+                false,
+            ),
+            (
+                &second,
+                "-I/r/runs/cell/tmp run/../../cell-attempt-2/tmp",
+                false,
+            ),
+            (
+                &second,
+                "--bind=/r/runs/cell/tmp run/../../cell-attempt-2:/x",
+                false,
+            ),
+            (
+                &second,
+                "--mount=source=/r/runs/cell/tmp run/../../cell-attempt-2,target=/x",
+                false,
+            ),
+            (
+                &second,
+                "/r/runs/cell/tmp run/../../cell-attempt-2/../cell/tmp",
+                true,
+            ),
+            (
+                &second,
+                "/r/runs/cell/tmp run/../../cell-attempt-2,/../cell/tmp",
+                true,
+            ),
+            (
+                &second,
+                "/r/runs/cell/tmp run/../../cell-attempt-2:/r/runs/cell/tmp",
+                true,
+            ),
+            (&second, "/r/runs/cell/tmp run/../../cell/tmp", true),
+            (
+                &second,
+                "/r/runs/cell/tmp run/../../cell-attempt-2/r/runs/cell/tmp",
+                true,
+            ),
+            (
+                &second,
+                "/r/runs/cell/tmp run/../../cell-attempt-2x/home",
+                true,
+            ),
+            (
+                &second,
+                "/r/runs/cell/tmp walk/../../cell-attempt-2/home",
+                true,
+            ),
+            (&second, "/r/runs/cell/tmp", true),
+            (
+                &bare,
+                "/r/runs/cell/tmp run/../../cell-attempt-2/home",
+                true,
+            ),
+        ] {
+            assert_eq!(
+                names(paths, text, first),
+                expected,
+                "{text:?} names {first:?} or a path the executor creates there, as {paths:?} reads it"
+            );
+        }
+        let relative = spelled("res/runs/cell/tmp run/../../cell-attempt-2");
+        assert!(!names(
+            &relative,
+            "res/runs/cell/tmp run/../../cell-attempt-2/home",
+            "res/runs/cell/tmp run/../../cell"
+        ));
+        assert!(names(
+            &relative,
+            "res/runs/cell/tmp walk/../../cell-attempt-2/home",
+            "res/runs/cell/tmp run/../../cell"
+        ));
+        let own = vec!["/r/c d".to_owned()];
+        assert_eq!(
+            embedded_paths("x=/r/c d/e f", &own),
+            BTreeSet::from([
+                "x",
+                "x=/r/c d/e",
+                "x=/r/c d/e f",
+                "/r/c d/e",
+                "/r/c d/e f",
+                "/e",
+                "/e f",
+                "f"
+            ])
+        );
+        assert_eq!(
+            embedded_paths("x=/r/c dd/e", &own),
+            embedded_paths("x=/r/c dd/e", &[])
+        );
+        assert_eq!(
+            spelled("/r/x/../cell").own_normalized("/r/x/../cell:/y"),
+            "/r/cell:/y"
+        );
+        assert_eq!(
+            spelled("/../r/./x//cell").own_normalized("/../r/./x//cell/home"),
+            "/r/x/cell/home"
+        );
+        assert_eq!(
+            spelled("../r/./x//cell").own_normalized("../r/./x//cell"),
+            "../r/x/cell"
+        );
+        assert_eq!(
+            spelled("/r/x/cell").own_normalized("/r/x/cellar/home"),
+            "/r/x/cellar/home"
+        );
+        assert_eq!(
+            spelled("/r/x/cell").own_normalized("/s/r/x/cell/home"),
+            "/s/r/x/cell/home"
+        );
+        for (paths, named) in [
+            // A relative path below a host or guest working directory.
+            (within(&["/r/runs/y"], &[], &[]), "../x/cell/tmp/input"),
+            (within(&["/r/runs/x"], &[], &[]), "cell/home"),
+            (within(&["/r/runs/x/cell/repo"], &[], &[]), "../tmp/input"),
+            (within(&[], &["/r/runs/x/cell/repo"], &[]), "../tmp/program"),
+            (within(&[], &["/r/runs/x/cell"], &[]), "home/input"),
+            (
+                within(&["/r/runs/x"], &["cell/repo"], &[]),
+                "../tmp/program",
+            ),
+            // A path at or below a bind's guest target, below its source.
+            (
+                within(&[], &[], &[("/r", "/prefix/r")]),
+                "/prefix/r/runs/x/cell/tmp",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x", "/guest")]),
+                "/guest/cell/fixtures/program",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x/cell", "/elsewhere/cell")]),
+                "--workdir=/elsewhere/cell",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x/cell/repo", "/src")]),
+                "/src/../tmp/input",
+            ),
+            (
+                within(&["/r/runs/x"], &[], &[("cell", "/guest")]),
+                "/guest/home",
+            ),
+            (
+                within(&[], &["/guest/repo"], &[("/r/runs/x/cell", "/guest")]),
+                "../tmp/input",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x", "/a"), ("/a", "/b")]),
+                "/b/cell/home",
+            ),
+            (
+                within(&[], &[], &[("/a", "/b"), ("/r/runs/x", "/a")]),
+                "/b//./cell/home",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x/cell/repo", "/src")]),
+                "/src/./../tmp",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x/cell", "/guest")]),
+                "/elsewhere/../guest/home",
+            ),
+            // A target of more than one component reached only through a
+            // `..`, which no span of the text spells as written.
+            (
+                within(&[], &[], &[("/r/runs/x/cell", "/g/h")]),
+                "/g/elsewhere/../h/home",
+            ),
+            // A relative path just after a delimiter, below a host working
+            // directory.
+            (within(&["/r/runs/x"], &[], &[]), "HOME=cell/home"),
+            (within(&["/r/runs/x"], &[], &[]), "--bind=cell/tmp:/tmp"),
+            // A relative bind target, below a host working directory.
+            (
+                within(&["/c"], &[], &[("/r/runs/x", "guest")]),
+                "/c/guest/cell/tmp/program",
+            ),
+        ] {
+            assert!(
+                names(&paths, named, DIR),
+                "{named:?} names {DIR} or a path the executor creates there, with {paths:?}"
+            );
+        }
+        for (paths, unnamed) in [
+            (within(&["/r/runs/x"], &[], &[]), "cell-attempt-2/tmp/input"),
+            (within(&[], &["/r/runs/x/cell/repo"], &[]), "program"),
+            (
+                within(&["/r/runs/x/cell/repo"], &[], &[]),
+                "tests/random.sh",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x/cell-attempt-2", "/guest")]),
+                "/guest/tmp",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x", "/guest")]),
+                "/guest/cell-attempt-2/home",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x/cell/repo", "/src")]),
+                "/src/tests/random.sh",
+            ),
+            (
+                within(&[], &[], &[("/r/runs/x/cell", "/guest")]),
+                "/guestx/home",
+            ),
+            // A relative path is below no absolute bind target.
+            (
+                within(&[], &[], &[("/r/runs/x/cell", "/guest")]),
+                "guest/home",
+            ),
+        ] {
+            assert!(
+                !names(&paths, unnamed, DIR),
+                "{unnamed:?} names neither {DIR} nor a path the executor creates there, with {paths:?}"
+            );
+        }
+        // A relative directory is resolved below each host working
+        // directory too.
+        assert!(names(
+            &within(&["/checkout"], &[], &[]),
+            "/checkout/results/runs/x/cell/tmp",
+            "results/runs/x/cell"
+        ));
+        assert!(names(
+            &bare,
+            "results/runs/x/cell/tmp",
+            "results/runs/x/cell"
+        ));
+        assert!(!names(
+            &bare,
+            "/checkout/results/runs/x/cell/tmp",
+            "results/runs/x/cell"
+        ));
+        // A relative path that starts by climbing stays above a relative
+        // directory.
+        assert!(!names(&bare, "../cell/home", "cell"));
+        assert!(names(&bare, "x/../cell/home", "cell"));
+        // A directory with no component is reached by nothing.
+        assert!(!names(&bare, "/anything", ""));
+        assert!(!names(&bare, "/home/x", "/"));
+        // A directory is matched by its whole path, however it is spelled.
+        assert!(!names(&bare, "/r/runs/x/cell/tmp", "/r/runs/x/"));
+        assert!(names(&bare, "/r/runs/x/tmp/input", "/r/runs/x/"));
+        assert!(names(&bare, "/r/runs/tmp/input", "/r/runs/x/.."));
+        assert!(!names(&bare, "/tmp/input", "/r/runs/x/."));
+        let argv = |words: &[&str]| -> Vec<String> { words.iter().map(|w| (*w).into()).collect() };
+        let hermit = argv(&[
+            "/r/runs/x/cell/hermit",
+            "--verify-json",
+            "/r/runs/x/cell/verify-1.json",
+            "--keep-logs",
+            "--verify-log-dir",
+            "/r/runs/x/cell/verify-logs/verify-1",
+            "--workdir",
+            "/r/runs/x/cell/cwd",
+            "--bind=/r/runs/x/cell/fixtures:/tmp/e2e/fixtures",
+            "--bind=/r/runs/x/cell/workdir/1:/tmp/test",
+            "--bind=/r/runs/x/cell/data:/r/runs/x/cell/target",
+            "--bind=/r/runs/x/cell",
+            "--mount=type=tmpfs,target=/r/runs/x/cell/tmp",
+            "--env",
+            "HOME=/r/runs/x/cell/home",
+            "--env",
+            "PATH=/r/runs/x/cell/bin",
+            "--env",
+            "E2E_TMPDIR=/r/runs/x/cell/tmp",
+            "--data-dir",
+            "/r/runs/x/cell/recording",
+            "/r/runs/x/cell/loose",
+            "--",
+            "/r/runs/x/cell/fixtures/program",
+            "--verify-json",
+            "/r/runs/x/cell/tmp/input",
+            "/r/runs/x/cell/data/input",
+            "--bind=/r/runs/x/cell/data:/tmp/data",
+            "--env",
+            "HOME=/r/runs/x/cell/home",
+            "--",
+        ]);
+        let literal = CellRelativeArg::Literal;
+        let guest = CellRelativeArg::Guest;
+        assert_eq!(
+            CellRelativeArg::all(&hermit, DIR),
+            vec![
+                literal("/r/runs/x/cell/hermit"),
+                literal("--verify-json"),
+                CellRelativeArg::Output(Own("/verify-1.json")),
+                literal("--keep-logs"),
+                literal("--verify-log-dir"),
+                CellRelativeArg::Output(Own("/verify-logs/verify-1")),
+                literal("--workdir"),
+                literal("/r/runs/x/cell/cwd"),
+                CellRelativeArg::Bind {
+                    source: Own("/fixtures"),
+                    target: "/tmp/e2e/fixtures",
+                },
+                CellRelativeArg::Bind {
+                    source: Own("/workdir/1"),
+                    target: "/tmp/test",
+                },
+                CellRelativeArg::Bind {
+                    source: Other("/r/runs/x/cell/data"),
+                    target: "/r/runs/x/cell/target",
+                },
+                literal("--bind=/r/runs/x/cell"),
+                literal("--mount=type=tmpfs,target=/r/runs/x/cell/tmp"),
+                literal("--env"),
+                CellRelativeArg::Env {
+                    name: "HOME",
+                    value: Own("/home"),
+                },
+                literal("--env"),
+                literal("PATH=/r/runs/x/cell/bin"),
+                literal("--env"),
+                literal("E2E_TMPDIR=/r/runs/x/cell/tmp"),
+                literal("--data-dir"),
+                literal("/r/runs/x/cell/recording"),
+                literal("/r/runs/x/cell/loose"),
+                literal("--"),
+                guest(Own("/fixtures/program")),
+                guest(Other("--verify-json")),
+                guest(Own("/tmp/input")),
+                guest(Other("/r/runs/x/cell/data/input")),
+                guest(Other("--bind=/r/runs/x/cell/data:/tmp/data")),
+                guest(Other("--env")),
+                guest(Other("HOME=/r/runs/x/cell/home")),
+                guest(Other("--")),
+            ]
+        );
+        // The first argument is the program the executor runs, the Hermit
+        // binary: never one of Hermit's options or the `--` that ends them,
+        // whatever its text.
+        assert_eq!(
+            CellRelativeArg::all(
+                &argv(&[
+                    "--",
+                    "--workdir",
+                    "/r/runs/x/cell/home",
+                    "--",
+                    "/r/runs/x/cell/home",
+                ]),
+                DIR
+            ),
+            vec![
+                literal("--"),
+                literal("--workdir"),
+                literal("/r/runs/x/cell/home"),
+                literal("--"),
+                guest(Own("/home")),
+            ]
+        );
+        assert_eq!(
+            CellRelativeArg::all(
+                &argv(&[
+                    "--bind=/r/runs/x/cell/fixtures/hermit:/x",
+                    "--bind=/r/runs/x/cell/fixtures:/x",
+                ]),
+                DIR
+            ),
+            vec![
+                literal("--bind=/r/runs/x/cell/fixtures/hermit:/x"),
+                CellRelativeArg::Bind {
+                    source: Own("/fixtures"),
+                    target: "/x",
+                },
+            ]
+        );
+        assert_eq!(
+            CellRelativeArg::all(
+                &argv(&["--verify-json", "/r/runs/x/cell/verify-1.json"]),
+                DIR
+            ),
+            vec![
+                literal("--verify-json"),
+                literal("/r/runs/x/cell/verify-1.json"),
+            ]
+        );
+        assert_eq!(CellRelativeArg::all(&[], DIR), vec![]);
+        // The argument after each option the executor writes with a separate
+        // value is that value: neither a `--bind` nor an option whose own
+        // value follows.
+        for option in [
+            "--log",
+            "--backend",
+            "--verify-json",
+            "--verify-log-dir",
+            "--data-dir",
+            "--record-timeout",
+            "--workdir",
+            "--env",
+        ] {
+            let output = ["--verify-json", "--verify-log-dir"].contains(&option);
+            let value = |text: &'static str| {
+                if output {
+                    CellRelativeArg::Output(Other(text))
+                } else {
+                    literal(text)
+                }
+            };
+            assert_eq!(
+                CellRelativeArg::all(
+                    &argv(&[
+                        "hermit",
+                        option,
+                        "--bind=/r/runs/x/cell/fixtures:/tmp/data",
+                        "--bind=/r/runs/x/cell/fixtures:/tmp/data",
+                    ]),
+                    DIR
+                ),
+                vec![
+                    literal("hermit"),
+                    literal(option),
+                    value("--bind=/r/runs/x/cell/fixtures:/tmp/data"),
+                    CellRelativeArg::Bind {
+                        source: Own("/fixtures"),
+                        target: "/tmp/data",
+                    },
+                ],
+                "the value of {option}"
+            );
+            assert_eq!(
+                CellRelativeArg::all(
+                    &argv(&[
+                        "hermit",
+                        option,
+                        "--verify-json",
+                        "/r/runs/x/cell/verify-1.json",
+                        "--verify-json",
+                        "/r/runs/x/cell/verify-1.json",
+                    ]),
+                    DIR
+                ),
+                vec![
+                    literal("hermit"),
+                    literal(option),
+                    value("--verify-json"),
+                    literal("/r/runs/x/cell/verify-1.json"),
+                    literal("--verify-json"),
+                    CellRelativeArg::Output(Own("/verify-1.json")),
+                ],
+                "the value of {option}"
+            );
+        }
+        let env = BTreeMap::from(
+            [
+                ("HOME", "/r/runs/x/cell/home"),
+                ("XDG_CONFIG_HOME", "/r/runs/x/cell/xdg-config"),
+                ("E2E_FIXTURE_DIR", "/r/runs/x/cell/fixtures"),
+                ("HERMIT_SABRE_PATH_EVIDENCE", "/r/runs/x/cell/captures/e"),
+                ("E2E_TMPDIR", "/r/runs/x/cell/tmp"),
+                ("FIXTURE_PATH", "/r/runs/x/cell/data/input"),
+            ]
+            .map(|(name, value)| (name.to_owned(), value.to_owned())),
+        );
+        assert_eq!(
+            CellRelativeCommand::of(&[], &env, DIR).env,
+            BTreeMap::from([
+                ("HOME", Own("/home")),
+                ("XDG_CONFIG_HOME", Own("/xdg-config")),
+                ("E2E_FIXTURE_DIR", Own("/fixtures")),
+                ("HERMIT_SABRE_PATH_EVIDENCE", Own("/captures/e")),
+                ("E2E_TMPDIR", Other("/r/runs/x/cell/tmp")),
+                ("FIXTURE_PATH", Other("/r/runs/x/cell/data/input")),
+            ])
+        );
+
+        /// `row` as the executor writes it for `cell` as outer attempt
+        /// `attempt` of `context`'s run, with its artifact directory
+        /// [`cell_artifact_path`] gives and every path the executor creates
+        /// built inside `dir`. Each inner attempt `n` is labelled `n` and runs
+        /// `guest`, where each `@` names `dir` (`@/fixtures/program` is the
+        /// program a C cell's preparation builds).
+        fn written_in(
+            row: &CellResult,
+            context: &RunContext,
+            cell: &SelectedCell,
+            attempt: u64,
+            dir: &Path,
+            guest: &[&str],
+        ) -> CellResult {
+            let mut row = row.clone();
+            row.attempt = attempt;
+            row.run_id = context.run_id.clone();
+            row.test = cell.id.test.clone();
+            row.mode = cell.id.mode.clone();
+            row.backend = cell.id.backend.clone();
+            row.artifact_dir =
+                cell_artifact_path(&context.result_root, &context.run_id, &cell.id, attempt)
+                    .display()
+                    .to_string();
+            let guest: Vec<String> = guest
+                .iter()
+                .map(|arg| arg.replace('@', &dir.display().to_string()))
+                .collect();
+            for (position, inner) in row.attempts.iter_mut().enumerate() {
+                let index = (position + 1).to_string();
+                let spec = build_spec(
+                    context,
+                    cell,
+                    dir.to_path_buf(),
+                    guest.clone(),
+                    &index,
+                    None,
+                    3,
+                )
+                .unwrap();
+                inner.index = index;
+                inner.cwd = spec.cwd.to_string_lossy().into_owned();
+                inner.shell_command = shell_command(&inner.cwd, &spec.env, &spec.argv);
+                inner.argv = spec.argv;
+                inner.guest_argv = spec.guest_argv;
+                inner.env = spec.env;
+            }
+            if let Some(first) = row.attempts.first() {
+                row.argv = first.argv.clone();
+                row.guest_argv = first.guest_argv.clone();
+                row.env = first.env.clone();
+                row.cwd = first.cwd.clone();
+                row.shell_command = first.shell_command.clone();
+            }
+            row.effective_args = row.argv.iter().skip(1).cloned().collect();
+            row
+        }
+        /// [`written_in`] in the attempt's own cell directory.
+        fn written(
+            row: &CellResult,
+            context: &RunContext,
+            cell: &SelectedCell,
+            attempt: u64,
+            guest: &[&str],
+        ) -> CellResult {
+            let dir = cell_artifact_path(&context.result_root, &context.run_id, &cell.id, attempt);
+            written_in(row, context, cell, attempt, &dir, guest)
+        }
+        fn accepted(label: &str, rows: &[CellResult]) {
+            assert_ne!(
+                rows[0].argv, rows[1].argv,
+                "{label}: the rows' command lines do not name their own directories"
+            );
+            assert_eq!(
+                retained_history_invocation_error(rows),
+                None,
+                "{label} is a history the executor writes"
+            );
+        }
+        fn refused(label: &str, rows: &[CellResult], check: &str) {
+            let error = retained_history_invocation_error(rows)
+                .unwrap_or_else(|| panic!("{label} was accepted"));
+            assert!(
+                error.contains(check),
+                "{label} was refused by another check: {error}"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-history-invocation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let context = |edit: &dyn Fn(&mut RunContext)| {
+            let mut context = run_context(&root);
+            context.run_verify_strict = true;
+            edit(&mut context);
+            context
+        };
+        let skid = || {
+            attempt_from_script(
+                "ptrace",
+                &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+                Some(&skid_report(2)),
+            )
+        };
+        let base = verify_row_from_attempts(vec![skid()]);
+        let two = verify_row_from_attempts(vec![skid(), skid()]);
+        // The options of each recorded command, read both ways.
+        let options = |cwd: &str, words: &[&str]| -> CellResult {
+            let mut row = base.clone();
+            row.cwd = cwd.into();
+            row.argv = words.iter().map(|word| (*word).into()).collect();
+            row.attempts.clear();
+            row
+        };
+        let recorded = options(
+            "/checkout",
+            &[
+                "--workdir=/hermit",
+                "--workdir",
+                "/one",
+                "--workdir=two",
+                "--bind",
+                "/s1:/t1",
+                "--bind=/s2",
+                "--mount=type=bind,src=/s3,dst=/t3",
+                "--mount",
+                "destination=/t4,source=/s4,readonly",
+                "--mount=type=tmpfs,target=/t5",
+                "--tmp=/s6",
+                "--mount=type=bind,dst=/t7,source=/s7, target=/t8,src=/s8",
+                "--",
+                "--workdir",
+                "/guest-only",
+                "--bind=/g:/h",
+            ],
+        );
+        let paths = CommandPaths::of(&recorded);
+        assert_eq!(paths.cwds, BTreeSet::from(["/checkout"]));
+        assert_eq!(paths.workdirs, BTreeSet::from(["/one", "two"]));
+        assert_eq!(
+            paths.binds,
+            BTreeSet::from([
+                ("/s1", "/t1"),
+                ("/s2", "/s2"),
+                ("/s3", "/t3"),
+                ("/s4", "/t4"),
+                ("/s6", "/tmp"),
+                ("/s7", "/t7"),
+                ("/s7", "/t8"),
+                ("/s8", "/t7"),
+                ("/s8", "/t8")
+            ])
+        );
+        let mut attempted = recorded.clone();
+        attempted.argv = vec!["hermit".into(), "--workdir".into()];
+        attempted.attempts = vec![base.attempts[0].clone()];
+        attempted.attempts[0].cwd = "/inner".into();
+        attempted.attempts[0].argv = vec!["hermit".into(), "--workdir".into(), "/three".into()];
+        let paths = CommandPaths::of(&attempted);
+        assert_eq!(paths.cwds, BTreeSet::from(["/checkout", "/inner"]));
+        assert_eq!(paths.workdirs, BTreeSet::from(["/three"]));
+        // A relative cell directory is the row's own as written and below
+        // each host working directory, so a path that spells it through a
+        // host working directory is read as its lexical form too.
+        let mut relative = recorded.clone();
+        relative.artifact_dir = "res/runs/cell/../cell-attempt-2".into();
+        let paths = CommandPaths::of(&relative);
+        assert_eq!(
+            paths.own,
+            [
+                "res/runs/cell/../cell-attempt-2",
+                "/checkout/res/runs/cell/../cell-attempt-2"
+            ]
+        );
+        assert!(!paths.names_cell_directory_entry(
+            "/checkout/res/runs/cell/../cell-attempt-2/home",
+            "res/runs/cell/../cell"
+        ));
+        assert!(paths.names_cell_directory_entry(
+            "/checkout/res/runs/cell/../cell-attempt-2/../cell/home",
+            "res/runs/cell/../cell"
+        ));
+        let cell = cell_recorded_by(&base);
+        let on = |backend: &str| {
+            let mut row = base.clone();
+            row.backend = Some(backend.into());
+            cell_recorded_by(&row)
+        };
+        let fixed = context(&|_| {});
+        let program = ["@/fixtures/program", "@/tmp/input"];
+        let history = |context: &RunContext, cell: &SelectedCell, row: &CellResult| {
+            vec![
+                written(row, context, cell, 1, &program),
+                written(row, context, cell, 2, &program),
+            ]
+        };
+
+        // Every history the executor writes.
+        let control = history(&fixed, &cell, &base);
+        assert!(control[1].artifact_dir.ends_with("-attempt-2"));
+        assert!(
+            control[0]
+                .argv
+                .iter()
+                .any(|arg| arg.ends_with(":/tmp/test"))
+        );
+        assert_eq!(control[0].guest_argv[0], "/tmp/e2e/fixtures/program");
+        assert!(control[0].guest_argv[1].starts_with(&control[0].artifact_dir));
+        accepted("a ptrace skid row and its retry", &control);
+        accepted(
+            "rows whose verify logs were kept",
+            &history(&context(&|context| context.keep_logs = true), &cell, &base),
+        );
+        accepted(
+            "rows from the hermetic /test root",
+            &history(
+                &context(&|context| context.isolated_workdir = Some(PathBuf::from("/test"))),
+                &cell,
+                &base,
+            ),
+        );
+        let dbt = history(&fixed, &on("dbt"), &base);
+        assert!(dbt[0].guest_argv[0].starts_with(&dbt[0].artifact_dir));
+        accepted("DBT rows, whose guest paths are not equalized", &dbt);
+        let sabre = history(&fixed, &on("sabre"), &base);
+        assert!(sabre[0].env["HERMIT_SABRE_PATH_EVIDENCE"].starts_with(&sabre[0].artifact_dir));
+        accepted("SaBRe rows with their path evidence", &sabre);
+        let mut workdir = cell.clone();
+        workdir.test.modes.get_mut("verify").unwrap().workdir = Some("/srv/work".into());
+        let workdir_rows = history(&fixed, &workdir, &base);
+        assert!(
+            workdir_rows[0]
+                .argv
+                .windows(2)
+                .any(|pair| pair == ["--workdir", "/srv/work"])
+        );
+        accepted("rows whose manifest names their workdir", &workdir_rows);
+        let mut mode_env = cell.clone();
+        mode_env
+            .test
+            .modes
+            .get_mut("verify")
+            .unwrap()
+            .env
+            .insert("FIXTURE_MODE".into(), "on".into());
+        let mode_env_rows = history(&fixed, &mode_env, &base);
+        accepted("rows whose manifest adds a guest variable", &mode_env_rows);
+        accepted(
+            "rows with two inner attempts",
+            &history(&fixed, &cell, &two),
+        );
+        let nested = history(
+            &context(&|context| context.run_id = "group/run".into()),
+            &cell,
+            &base,
+        );
+        assert!(nested[0].artifact_dir.contains("/runs/group/run/"));
+        accepted(
+            "rows of a run whose identifier names a nested directory",
+            &nested,
+        );
+        // A run identifier that is an absolute path replaces the result root
+        // and `runs` in the runner's join, so each row's directory is the
+        // run's directory and the cell slug, under no root.
+        let absolute = root.join("absolute-run").display().to_string();
+        let absolute_run = context(&|context| context.run_id = absolute.clone());
+        let absolute_rows = history(&absolute_run, &cell, &base);
+        assert_eq!(
+            absolute_rows[1].artifact_dir,
+            cell_artifact_path(Path::new("/elsewhere"), &absolute, &cell.id, 2)
+                .display()
+                .to_string()
+        );
+        assert!(
+            absolute_rows[0]
+                .artifact_dir
+                .starts_with(&format!("{absolute}/"))
+        );
+        assert!(!absolute_rows[0].artifact_dir.contains("/runs/"));
+        accepted(
+            "rows of a run whose identifier is an absolute path",
+            &absolute_rows,
+        );
+        // A run identifier, result root or checkout with a component equal
+        // to the cell slug, followed by a directory with an entry's name, is
+        // not the first attempt's directory, though every path of the retry
+        // passes through a directory with that name.
+        let slug = Path::new(&control[0].artifact_dir)
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        let slug_run = history(
+            &context(&|context| context.run_id = format!("{slug}/tmp/run")),
+            &cell,
+            &base,
+        );
+        assert!(
+            slug_run[1]
+                .argv
+                .iter()
+                .any(|arg| arg.contains(&format!("/runs/{slug}/tmp/run/{slug}-attempt-2/verify-")))
+        );
+        accepted(
+            "rows of a run whose identifier is the cell slug and a temporary directory",
+            &slug_run,
+        );
+        let slug_results = history(
+            &context(&|context| context.result_root = root.join(&slug).join("tmp")),
+            &cell,
+            &base,
+        );
+        assert!(
+            slug_results[1]
+                .artifact_dir
+                .contains(&format!("/{slug}/tmp/runs/"))
+        );
+        accepted(
+            "rows under a result root that is the cell slug and a temporary directory",
+            &slug_results,
+        );
+        let slug_checkout = {
+            let mut context = run_context(&root.join(&slug).join("tmp").join("checkout"));
+            context.run_verify_strict = true;
+            context
+        };
+        let slug_checkout_rows = history(&slug_checkout, &cell, &base);
+        assert!(slug_checkout_rows[1].argv[0].contains(&format!("/{slug}/tmp/checkout/")));
+        assert!(
+            slug_checkout_rows[1]
+                .cwd
+                .contains(&format!("/{slug}/tmp/checkout"))
+        );
+        accepted(
+            "rows of a checkout below the cell slug and a temporary directory",
+            &slug_checkout_rows,
+        );
+        // Each row written for `context`, running `guest` with every `@`
+        // naming the row's own directory and every `^` the first attempt's.
+        let both_run = |context: &RunContext, guest: &[&str]| -> Vec<CellResult> {
+            let first = cell_artifact_path(&context.result_root, &context.run_id, &cell.id, 1)
+                .display()
+                .to_string();
+            let guest: Vec<String> = guest.iter().map(|arg| arg.replace('^', &first)).collect();
+            let guest: Vec<&str> = guest.iter().map(String::as_str).collect();
+            [1, 2]
+                .map(|attempt| written(&base, context, &cell, attempt, &guest))
+                .into()
+        };
+        // A run identifier holding a character that also ends a path embedded
+        // in a longer text puts that character in every cell directory of the
+        // run. Each row's own paths are still its own, and a guest path into
+        // the first attempt's directory is still read whole: one that climbs
+        // out of a path the executor does not create into its temporary
+        // directory, and one glued to an option.
+        for run in [
+            "group run",
+            "group,run",
+            "group=run",
+            "group;run",
+            "group'run",
+            "group\"run",
+            "group\trun",
+        ] {
+            let delimited = context(&|context| context.run_id = run.into());
+            let rows = history(&delimited, &cell, &base);
+            assert!(rows[1].artifact_dir.contains(&format!("/runs/{run}/")));
+            accepted(&format!("rows of run {run:?}"), &rows);
+            let climbing = both_run(&delimited, &["@/fixtures/program", "^/repo/../tmp/input"]);
+            assert_eq!(climbing[0].guest_argv[1], climbing[1].guest_argv[1]);
+            refused(
+                &format!(
+                    "rows of run {run:?} that both run a guest path climbing into the first attempt's temporary directory"
+                ),
+                &climbing,
+                "result attempt 2's command names",
+            );
+            refused(
+                &format!(
+                    "rows of run {run:?} that both pass the first attempt's temporary directory glued to an option"
+                ),
+                &both_run(&delimited, &["@/fixtures/program", "-I^/tmp/input"]),
+                "result attempt 2's command names",
+            );
+        }
+        // A run identifier that climbs back out of a directory named for the
+        // cell slug spells the retry's directory through the first attempt's.
+        // Each row's own directory, spelled so at the start of a path, is
+        // read as its lexical form, and a `..` after that spelling still
+        // climbs.
+        let traversal = context(&|context| context.run_id = format!("{slug}/.."));
+        let traversal_rows = history(&traversal, &cell, &base);
+        assert!(
+            traversal_rows[1]
+                .artifact_dir
+                .ends_with(&format!("/runs/{slug}/../{slug}-attempt-2"))
+        );
+        accepted(
+            "rows of a run whose identifier climbs back out of a directory named for the cell slug",
+            &traversal_rows,
+        );
+        let second_spelled = traversal_rows[1].artifact_dir.clone();
+        refused(
+            "rows of that run that both run a guest path climbing from the retry's directory into the first attempt's",
+            &both_run(
+                &traversal,
+                &[
+                    "@/fixtures/program",
+                    &format!("{second_spelled}/../{slug}/tmp/input"),
+                ],
+            ),
+            "command names",
+        );
+        refused(
+            "rows of that run that both run a guest path climbing from the first attempt's directory into the retry's",
+            &both_run(
+                &traversal,
+                &[
+                    "@/fixtures/program",
+                    &format!("^/../{slug}-attempt-2/tmp/input"),
+                ],
+            ),
+            "result attempt 1's command names",
+        );
+        refused(
+            "rows of that run that both run a guest path in the first attempt's temporary directory",
+            &both_run(&traversal, &["@/fixtures/program", "^/tmp/input"]),
+            "runs another guest argv or working directory",
+        );
+        // A run identifier that does both, holding such a character and then
+        // climbing back out of a directory named for the cell slug, spells
+        // the retry's directory through the first attempt's, and the piece
+        // of that spelling before the character is the first attempt's
+        // temporary directory. Each row's own directory spelled whole is not
+        // cut there, while guest paths into the first attempt's temporary
+        // directory are still refused: one that climbs out of a path the
+        // executor does not create, one glued to an option, and one that
+        // climbs from the retry's own directory.
+        for delimiter in [' ', ',', '=', ';', '\'', '"', '\t'] {
+            let run = format!("{slug}/tmp{delimiter}run/../..");
+            let combined = context(&|context| context.run_id = run.clone());
+            let rows = history(&combined, &cell, &base);
+            assert!(
+                rows[1]
+                    .artifact_dir
+                    .ends_with(&format!("/runs/{run}/{slug}-attempt-2"))
+            );
+            let first_tmp = format!(
+                "/{}/tmp",
+                lexical_components(&rows[0].artifact_dir).join("/")
+            );
+            assert!(rows[1].argv.iter().any(|arg| arg.contains(&format!(
+                "{first_tmp}{delimiter}run/../../{slug}-attempt-2/verify-"
+            ))));
+            accepted(&format!("rows of run {run:?}"), &rows);
+            let second_spelled = rows[1].artifact_dir.clone();
+            refused(
+                &format!(
+                    "rows of run {run:?} that both run a guest path climbing into the first attempt's temporary directory"
+                ),
+                &both_run(&combined, &["@/fixtures/program", "^/repo/../tmp/input"]),
+                "result attempt 2's command names",
+            );
+            refused(
+                &format!(
+                    "rows of run {run:?} that both pass the first attempt's temporary directory glued to an option"
+                ),
+                &both_run(&combined, &["@/fixtures/program", "-I^/tmp/input"]),
+                "result attempt 2's command names",
+            );
+            refused(
+                &format!(
+                    "rows of run {run:?} that both run a guest path climbing from the retry's directory into the first attempt's"
+                ),
+                &both_run(
+                    &combined,
+                    &[
+                        "@/fixtures/program",
+                        &format!("{second_spelled}/../{slug}/tmp/input"),
+                    ],
+                ),
+                "command names",
+            );
+        }
+        // A source checkout inside the first attempt's directory: every
+        // attempt runs the same script of it from it, and the script's path,
+        // which the executor does not create, is compared as written.
+        let checkout_root =
+            cell_artifact_path(&fixed.result_root, &fixed.run_id, &cell.id, 1).join("repo");
+        let checkout = context(&|context| {
+            context.root = checkout_root.clone();
+            context.prebuilt = true;
+        });
+        let mut script = cell.clone();
+        script.test.program = Some("tests/random.sh".into());
+        script.test.direct = None;
+        fs::create_dir_all(
+            checkout
+                .build_root
+                .join(script.test.id.replace('/', "-"))
+                .join("fixtures"),
+        )
+        .unwrap();
+        let checkout_rows: Vec<CellResult> = [1, 2]
+            .map(|attempt| {
+                let dir = cell_artifact_path(
+                    &checkout.result_root,
+                    &checkout.run_id,
+                    &script.id,
+                    attempt,
+                );
+                let guest = prepare_test(&checkout, &script, &dir).unwrap();
+                let guest: Vec<&str> = guest.iter().map(String::as_str).collect();
+                written_in(&base, &checkout, &script, attempt, &dir, &guest)
+            })
+            .into();
+        assert_eq!(checkout_rows[0].guest_argv, checkout_rows[1].guest_argv);
+        assert_eq!(
+            checkout_rows[1].guest_argv[0],
+            format!("{}/repo/tests/random.sh", checkout_rows[0].artifact_dir)
+        );
+        assert_eq!(
+            checkout_rows[1].cwd,
+            format!("{}/repo", checkout_rows[0].artifact_dir)
+        );
+        accepted(
+            "rows that run a script of a checkout inside the first attempt's directory",
+            &checkout_rows,
+        );
+        // A source checkout below an entry the executor creates in the first
+        // attempt's directory, which that attempt could have written, cannot
+        // be told apart from attempt 1's output, and is refused. Below an
+        // input the executor binds at a fixed guest path, it even writes the
+        // first attempt's guest path through that bind and the retry's as the
+        // host path.
+        for entry in ["home", "recording"] {
+            let entry_checkout_root =
+                cell_artifact_path(&fixed.result_root, &fixed.run_id, &cell.id, 1)
+                    .join(entry)
+                    .join("checkout");
+            let entry_checkout = context(&|context| {
+                context.root = entry_checkout_root.clone();
+                context.prebuilt = true;
+            });
+            let rows: Vec<CellResult> = [1, 2]
+                .map(|attempt| {
+                    let dir = cell_artifact_path(
+                        &entry_checkout.result_root,
+                        &entry_checkout.run_id,
+                        &script.id,
+                        attempt,
+                    );
+                    let guest = prepare_test(&entry_checkout, &script, &dir).unwrap();
+                    let guest: Vec<&str> = guest.iter().map(String::as_str).collect();
+                    written_in(&base, &entry_checkout, &script, attempt, &dir, &guest)
+                })
+                .into();
+            let host_script = format!("{}/{entry}/checkout/tests/random.sh", rows[0].artifact_dir);
+            assert_eq!(rows[1].guest_argv[0], host_script);
+            assert_eq!(
+                rows[0].guest_argv[0],
+                if entry == "home" {
+                    "/tmp/e2e/home/checkout/tests/random.sh".to_owned()
+                } else {
+                    host_script.clone()
+                }
+            );
+            assert_eq!(
+                rows[1].cwd,
+                format!("{}/{entry}/checkout", rows[0].artifact_dir)
+            );
+            refused(
+                &format!(
+                    "rows that run a script of a checkout in the first attempt's {entry} directory"
+                ),
+                &rows,
+                "runs another guest argv or working directory",
+            );
+        }
+        // A variable the executor sets to a path in each row's own directory,
+        // naming another file there.
+        let with_variable = |rows: &[CellResult], name: &str, value: &dyn Fn(&str) -> String| {
+            rows.iter()
+                .cloned()
+                .map(|mut row| {
+                    let value = value(&row.artifact_dir);
+                    row.env.insert(name.into(), value.clone());
+                    row.shell_command = shell_command(&row.cwd, &row.env, &row.argv);
+                    for attempt in &mut row.attempts {
+                        attempt.env.insert(name.into(), value.clone());
+                        attempt.shell_command =
+                            shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+                    }
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+        accepted(
+            "rows whose guest home names another file in each row's own directory",
+            &with_variable(&control, "HOME", &|dir| format!("{dir}/tmp/input")),
+        );
+        refused(
+            "rows whose guest home names a file the executor does not create in each row's own directory",
+            &with_variable(&control, "HOME", &|dir| format!("{dir}/data/input")),
+            "carries another argv or environment",
+        );
+        // A shell command that is not the one rendered from its command's
+        // fields carries text the comparisons above never read.
+        for (label, edit) in [
+            (
+                "a retry whose own shell command names the first attempt's directory",
+                (|rows: &mut [CellResult]| {
+                    let first = rows[0].artifact_dir.clone();
+                    rows[1]
+                        .shell_command
+                        .push_str(&format!(" {first}/tmp/input"));
+                }) as fn(&mut [CellResult]),
+            ),
+            (
+                "a retry whose inner attempt's shell command was edited",
+                |rows| {
+                    let first = rows[0].artifact_dir.clone();
+                    rows[1].attempts[0]
+                        .shell_command
+                        .push_str(&format!(" {first}/tmp/input"));
+                },
+            ),
+            ("a first attempt whose shell command was edited", |rows| {
+                rows[0].shell_command.push(' ');
+            }),
+        ] {
+            let mut rows = control.clone();
+            edit(&mut rows);
+            refused(label, &rows, "shell command is not the one rendered");
+        }
+        // The paths the executor writes in each row's own directory are
+        // exactly those set aside: across the histories above, a variable's
+        // value or an `--env` value lies in its row's directory just when the
+        // variable is listed.
+        let in_own_directory = |rows: &[&[CellResult]]| {
+            let mut process = BTreeSet::new();
+            let mut guest = BTreeSet::new();
+            for row in rows.iter().flat_map(|rows| rows.iter()) {
+                let own = |value: &str| value.starts_with(&format!("{}/", row.artifact_dir));
+                for (name, value) in &row.env {
+                    if own(value) {
+                        process.insert(name.clone());
+                    }
+                }
+                for pair in row.argv.windows(2) {
+                    let assignment = match pair {
+                        [flag, assignment] if flag == "--env" => assignment.split_once('='),
+                        _ => None,
+                    };
+                    if let Some((name, _)) = assignment.filter(|(_, value)| own(value)) {
+                        guest.insert(name.to_owned());
+                    }
+                }
+            }
+            (process, guest)
+        };
+        let listed = |names: &[&str]| -> BTreeSet<String> {
+            names.iter().map(|name| (*name).to_owned()).collect()
+        };
+        assert_eq!(
+            in_own_directory(&[&control, &dbt, &sabre]),
+            (
+                listed(&CELL_DIRECTORY_PROCESS_ENV),
+                listed(&CELL_DIRECTORY_GUEST_ENV)
+            )
+        );
+
+        // One difference each.
+        let [first, second] = <[CellResult; 2]>::try_from(control.clone()).unwrap();
+        let with_second = |row: CellResult| vec![first.clone(), row];
+        refused(
+            "a retry that runs /bin/true",
+            &with_second(written(&base, &fixed, &cell, 2, &["/bin/true"])),
+            "runs another guest argv or working directory",
+        );
+        refused(
+            "a retry with another guest argument",
+            &with_second(written(
+                &base,
+                &fixed,
+                &cell,
+                2,
+                &["@/fixtures/program", "@/tmp/other"],
+            )),
+            "runs another guest argv or working directory",
+        );
+        refused(
+            "a skid row whose guest names the retry's directory",
+            &[
+                written(
+                    &base,
+                    &fixed,
+                    &cell,
+                    1,
+                    &["@/fixtures/program", "@-attempt-2/tmp/input"],
+                ),
+                second.clone(),
+            ],
+            "runs another guest argv or working directory",
+        );
+        refused(
+            "a retry with a guest variable the skid row lacks",
+            &with_second(written(&base, &fixed, &mode_env, 2, &program)),
+            "carries another argv or environment",
+        );
+        refused(
+            "a retry from the hermetic /test root",
+            &with_second(written(
+                &base,
+                &context(&|context| context.isolated_workdir = Some(PathBuf::from("/test"))),
+                &cell,
+                2,
+                &program,
+            )),
+            "carries another argv or environment",
+        );
+        // The program is equalized to its guest path, so only the paths the
+        // executor creates name a directory.
+        let first_dir = PathBuf::from(&first.artifact_dir);
+        let equalized = ["@/fixtures/program"];
+        refused(
+            "a retry whose paths are the skid row's directory",
+            &[
+                written(&base, &fixed, &cell, 1, &equalized),
+                written_in(&base, &fixed, &cell, 2, &first_dir, &equalized),
+            ],
+            "carries another argv or environment",
+        );
+        refused(
+            "a retry whose guest names the skid row's directory",
+            &with_second(written_in(&base, &fixed, &cell, 2, &first_dir, &program)),
+            "runs another guest argv or working directory",
+        );
+        let mut elsewhere = second.clone();
+        elsewhere.cwd = "/elsewhere".into();
+        elsewhere.attempts[0].cwd = "/elsewhere".into();
+        refused(
+            "a retry run from another working directory",
+            &with_second(elsewhere),
+            "inner attempt 1 runs another guest argv or working directory",
+        );
+        let mut inner_elsewhere = second.clone();
+        inner_elsewhere.attempts[0].guest_argv.push("extra".into());
+        refused(
+            "a retry whose inner attempt alone runs another guest",
+            &with_second(inner_elsewhere),
+            "inner attempt 1 runs another guest argv",
+        );
+        let mut copy_elsewhere = second.clone();
+        copy_elsewhere.guest_argv.push("extra".into());
+        refused(
+            "a retry whose own copy alone runs another guest",
+            &with_second(copy_elsewhere),
+            "own command copy",
+        );
+        let mut copy_env = second.clone();
+        copy_env.env.insert("FIXTURE_EXTRA".into(), "1".into());
+        refused(
+            "a retry whose own copy alone carries another variable",
+            &with_second(copy_env),
+            "own command copy",
+        );
+        let mut relocated = second.clone();
+        relocated.artifact_dir = format!("{}-elsewhere", second.artifact_dir);
+        refused(
+            "a retry outside the directory the runner creates for it",
+            &with_second(relocated),
+            "not the one the runner creates",
+        );
+        let mut misnumbered = second.clone();
+        misnumbered.attempt = 3;
+        refused(
+            "a retry in the directory of another attempt",
+            &with_second(misnumbered),
+            "not the one the runner creates",
+        );
+        refused(
+            "a retry from another run",
+            &with_second(written(
+                &base,
+                &context(&|context| context.run_id = "other".into()),
+                &cell,
+                2,
+                &program,
+            )),
+            "another result root or run",
+        );
+        refused(
+            "a retry under another result root",
+            &with_second(written(
+                &base,
+                &context(&|context| context.result_root = root.join("other-results")),
+                &cell,
+                2,
+                &program,
+            )),
+            "another result root or run",
+        );
+        // The runner puts an absolute run's directory at the run's path,
+        // never below the result root's `runs`, and never at a relative run
+        // of the same name.
+        let under_root = |attempt: u64| {
+            let dir = format!(
+                "{}/runs{}",
+                fixed.result_root.display(),
+                cell_artifact_path(Path::new(""), &absolute, &cell.id, attempt).display()
+            );
+            let mut row = written_in(
+                &base,
+                &absolute_run,
+                &cell,
+                attempt,
+                Path::new(&dir),
+                &program,
+            );
+            row.artifact_dir = dir;
+            row
+        };
+        let under_root = [under_root(1), under_root(2)];
+        assert!(
+            under_root[1]
+                .artifact_dir
+                .ends_with(&absolute_rows[1].artifact_dir)
+        );
+        refused(
+            "rows of an absolute run placed below the result root's runs",
+            &under_root,
+            "not the one the runner creates",
+        );
+        let mut relative_named = absolute_rows[1].clone();
+        relative_named.run_id = absolute.trim_start_matches('/').to_owned();
+        refused(
+            "a retry in an absolute run's directory recording the relative run of the same name",
+            &[absolute_rows[0].clone(), relative_named],
+            "not the one the runner creates",
+        );
+        // The executor runs every attempt from the checkout root, so a host
+        // working directory in each row's own directory runs each row from a
+        // different directory, and is compared as written.
+        let own_cwd: Vec<CellResult> = control
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                let cwd = format!("{}/cwd", row.artifact_dir);
+                for attempt in &mut row.attempts {
+                    attempt.cwd = cwd.clone();
+                    attempt.shell_command = shell_command(&cwd, &attempt.env, &attempt.argv);
+                }
+                row.cwd = cwd.clone();
+                row.shell_command = row.attempts[0].shell_command.clone();
+                row
+            })
+            .collect();
+        assert_eq!(control[0].cwd, fixed.root.display().to_string());
+        assert_eq!(control[0].cwd, control[1].cwd);
+        assert_ne!(own_cwd[0].cwd, own_cwd[1].cwd);
+        refused(
+            "rows each run from a working directory in its own directory",
+            &own_cwd,
+            "runs another guest argv or working directory",
+        );
+        // A directory that glues text to the `runs` the runner appends ends
+        // with the runner's `runs/<run>/<slug>` but is not that directory
+        // under any root.
+        let glued = |attempt: u64| {
+            let dir = cell_artifact_path(&fixed.result_root, &fixed.run_id, &cell.id, attempt)
+                .display()
+                .to_string()
+                .replace("/runs/", "/xruns/");
+            let mut row = written_in(&base, &fixed, &cell, attempt, Path::new(&dir), &program);
+            row.artifact_dir = dir;
+            row
+        };
+        let glued = [glued(1), glued(2)];
+        assert!(glued[1].artifact_dir.contains("/xruns/"));
+        refused(
+            "rows whose directory glues text to the runner's runs",
+            &glued,
+            "not the one the runner creates",
+        );
+
+        // Each row's own directory inside longer text, or followed by
+        // anything but `/`, names a different file in each row: Linux runs
+        // `<dir>:program` and `/prefix<dir>/program` as distinct paths. A
+        // `..` leaves the directory, which the executor never writes, so
+        // that path is compared as written too.
+        for (label, guest) in [
+            (
+                "rows whose guest is a sibling of each row's directory",
+                ["@:program", "@/tmp/input"],
+            ),
+            (
+                "rows whose guest path embeds each row's directory",
+                ["/prefix@/program", "@/tmp/input"],
+            ),
+            (
+                "rows whose guest argument names a file the executor does not create in each row's directory",
+                ["@/fixtures/program", "@/data/input"],
+            ),
+            (
+                "rows whose guest argument climbs out of each row's directory",
+                ["@/fixtures/program", "@/../input"],
+            ),
+        ] {
+            let rows = vec![
+                written(&base, &fixed, &cell, 1, &guest),
+                written(&base, &fixed, &cell, 2, &guest),
+            ];
+            refused(label, &rows, "runs another guest argv or working directory");
+        }
+        for (label, name, value) in [
+            (
+                "rows whose guest home is a sibling of each row's directory",
+                "HOME",
+                (|dir: &str| format!("{dir}:program")) as fn(&str) -> String,
+            ),
+            (
+                "rows whose guest home embeds each row's directory",
+                "HOME",
+                |dir| format!("/prefix{dir}/program"),
+            ),
+            (
+                "rows whose guest home lists each row's directory",
+                "HOME",
+                |dir| format!("/usr/bin:{dir}/bin"),
+            ),
+            (
+                "rows whose unlisted variable names a file in each row's own directory",
+                "FIXTURE_PATH",
+                |dir| format!("{dir}/data/input"),
+            ),
+            (
+                "rows whose temporary directory is each row's own directory",
+                "E2E_TMPDIR",
+                |dir| format!("{dir}/tmp"),
+            ),
+        ] {
+            refused(
+                label,
+                &with_variable(&control, name, &value),
+                "carries another argv or environment",
+            );
+        }
+        // Each argument the executor writes the same for every attempt,
+        // naming a path in each row's own directory with every copy of the
+        // command consistent, runs each row differently.
+        let rewritten = |rows: &[CellResult], edit: &dyn Fn(&str, &mut Vec<String>) -> usize| {
+            rows.iter()
+                .cloned()
+                .map(|mut row| {
+                    for attempt in &mut row.attempts {
+                        let edited = edit(&row.artifact_dir, &mut attempt.argv);
+                        assert!(edited > 0, "the edit changes every copy of the command");
+                        attempt.shell_command =
+                            shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+                    }
+                    row.argv = row.attempts[0].argv.clone();
+                    row.shell_command = row.attempts[0].shell_command.clone();
+                    row.effective_args = row.argv.iter().skip(1).cloned().collect();
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+        /// `argv` with `value` after each `option` among Hermit's options,
+        /// and how many it replaced.
+        fn replace_value(argv: &mut [String], option: &str, value: String) -> usize {
+            let mut edited = 0;
+            for position in 1..argv.len() {
+                if argv[position - 1] == option && argv[..position].iter().all(|arg| arg != "--") {
+                    argv[position] = value.clone();
+                    edited += 1;
+                }
+            }
+            edited
+        }
+        /// `argv` with `from` replaced by `to` in each argument, and how many
+        /// arguments it changed.
+        fn replace_text(argv: &mut [String], from: &str, to: &str) -> usize {
+            let mut edited = 0;
+            for arg in argv.iter_mut().filter(|arg| arg.contains(from)) {
+                *arg = arg.replace(from, to);
+                edited += 1;
+            }
+            edited
+        }
+        for (label, rows, edit) in [
+            (
+                "rows each run by a Hermit binary in its own directory",
+                &control,
+                (|dir: &str, argv: &mut Vec<String>| {
+                    argv[0] = format!("{dir}/hermit");
+                    1
+                }) as fn(&str, &mut Vec<String>) -> usize,
+            ),
+            (
+                "rows whose manifest workdir is each row's own directory",
+                &workdir_rows,
+                |dir, argv| replace_value(argv, "--workdir", format!("{dir}/cwd")),
+            ),
+            (
+                "rows whose workdir is a bind of each row's own directory",
+                &workdir_rows,
+                |dir, argv| replace_value(argv, "--workdir", format!("--bind={dir}/cwd:/tmp/cwd")),
+            ),
+            (
+                "rows whose fixture bind target is each row's own directory",
+                &control,
+                |dir, argv| replace_text(argv, ":/tmp/e2e/fixtures", &format!(":{dir}/target")),
+            ),
+            (
+                "rows whose fixture bind has no target",
+                &control,
+                |_, argv| replace_text(argv, ":/tmp/e2e/fixtures", ""),
+            ),
+            (
+                "rows whose manifest variable names each row's own directory",
+                &mode_env_rows,
+                |dir, argv| {
+                    replace_text(argv, "FIXTURE_MODE=on", &format!("FIXTURE_MODE={dir}/data"))
+                },
+            ),
+        ] {
+            let rows = rewritten(rows, &edit);
+            refused(label, &rows, "carries another argv or environment");
+        }
+        let rebound: Vec<CellResult> = control
+            .iter()
+            .cloned()
+            .map(|mut row| {
+                let own = format!("--bind={}/fixtures:", row.artifact_dir);
+                let moved = format!("--bind=/prefix{}/fixtures:", row.artifact_dir);
+                let copies = 1 + row.attempts.len();
+                let mut replaced = 0;
+                for argv in std::iter::once(&mut row.argv)
+                    .chain(row.attempts.iter_mut().map(|attempt| &mut attempt.argv))
+                {
+                    for arg in argv.iter_mut().filter(|arg| arg.starts_with(&own)) {
+                        *arg = arg.replacen(&own, &moved, 1);
+                        replaced += 1;
+                    }
+                }
+                assert_eq!(replaced, copies, "every copy binds the fixtures");
+                row
+            })
+            .collect();
+        refused(
+            "rows whose fixture bind source embeds each row's directory",
+            &rebound,
+            "carries another argv or environment",
+        );
+        // The first argument is the Hermit binary, compared as written even
+        // when it is spelled like the `--` that ends Hermit's options or like
+        // a `--bind`, and the rest of the command names only paths each
+        // row's own directory sets aside.
+        for (label, edit) in [
+            (
+                "rows each run by a program spelled `--` with a workdir in its own directory",
+                (|dir: &str, argv: &mut Vec<String>| {
+                    *argv = vec!["--".into(), "--workdir".into(), format!("{dir}/home")];
+                    1
+                }) as fn(&str, &mut Vec<String>) -> usize,
+            ),
+            (
+                "rows each run by a program spelled as a bind of its own directory",
+                |dir, argv| {
+                    argv[0] = format!("--bind={dir}/fixtures/hermit:/x");
+                    1
+                },
+            ),
+        ] {
+            refused(
+                label,
+                &rewritten(&control, &edit),
+                "carries another argv or environment",
+            );
+        }
+        // A text compared as written is the same in every row even where it
+        // points into one row's directory, so no row's command may name
+        // another row's directory, or a path the executor creates there.
+        let first_named = first.artifact_dir.clone();
+        let second_named = second.artifact_dir.clone();
+        refused(
+            "rows both of whose workdirs are the skid row's guest home",
+            &rewritten(&workdir_rows, &|_, argv| {
+                replace_value(argv, "--workdir", format!("{first_named}/home"))
+            }),
+            "result attempt 2's command names",
+        );
+        refused(
+            "rows both of which mount over the skid row's temporary directory",
+            &rewritten(&control, &|_, argv| {
+                argv.insert(1, format!("--mount=type=tmpfs,target={first_named}/tmp"));
+                1
+            }),
+            "result attempt 2's command names",
+        );
+        refused(
+            "rows both of which bind the skid row's directory",
+            &rewritten(&control, &|_, argv| {
+                argv.insert(
+                    1,
+                    format!("--mount=type=bind,source={first_named},target=/x"),
+                );
+                1
+            }),
+            "result attempt 2's command names",
+        );
+        refused(
+            "rows both of whose unlisted variable names the skid row's guest home",
+            &with_variable(&control, "FIXTURE_PATH", &|_| {
+                format!("{first_named}/home/input")
+            }),
+            "result attempt 2's command names",
+        );
+        let climb = format!("{first_named}/repo/../tmp/input");
+        refused(
+            "rows both of whose guests climb from a checkout in the skid row's directory into its temporary directory",
+            &[1, 2].map(|attempt| {
+                written(
+                    &base,
+                    &fixed,
+                    &cell,
+                    attempt,
+                    &["@/fixtures/program", &climb],
+                )
+            }),
+            "result attempt 2's command names",
+        );
+        let (parent, name) = first_named.rsplit_once('/').unwrap();
+        let respelled = format!("{parent}/./{name}/tmp/input");
+        refused(
+            "rows both of whose guests name the skid row's temporary directory through a respelled parent",
+            &[1, 2].map(|attempt| {
+                written(
+                    &base,
+                    &fixed,
+                    &cell,
+                    attempt,
+                    &["@/fixtures/program", &respelled],
+                )
+            }),
+            "result attempt 2's command names",
+        );
+        let bound = format!("/guest/{name}/tmp/input");
+        let bind_parent = format!("--bind={parent}:/guest");
+        refused(
+            "rows both of which bind the skid row's parent into the guest and name its temporary directory there",
+            &rewritten(
+                &[1, 2].map(|attempt| {
+                    written(
+                        &base,
+                        &fixed,
+                        &cell,
+                        attempt,
+                        &["@/fixtures/program", &bound],
+                    )
+                }),
+                &|_, argv| {
+                    argv.insert(1, bind_parent.clone());
+                    1
+                },
+            ),
+            "result attempt 2's command names",
+        );
+        // The same parent made visible to the guest by the other options
+        // that bind a host path: `--tmp`, a `--mount` whose source reverie
+        // reads as the last `source` field or whose target it reads as
+        // `target` before `dst`, a `--mount` written with the `src` and
+        // `dst` aliases, one with spaces after its commas (reverie trims
+        // each field), and a `--mount` whose target is relative, which
+        // mount(2) resolves below the host working directory.
+        let host_cwd = control[0].cwd.clone();
+        for (label, option, guest) in [
+            (
+                "--tmp at the skid row's parent",
+                format!("--tmp={parent}"),
+                format!("/tmp/{name}/tmp/input"),
+            ),
+            (
+                "a mount whose last source is the skid row's parent",
+                format!("--mount=type=bind,source=/elsewhere,source={parent},target=/guest"),
+                bound.clone(),
+            ),
+            (
+                "a mount of the skid row's parent whose first target field is another",
+                format!("--mount=type=bind,dst=/elsewhere,source={parent},target=/guest"),
+                bound.clone(),
+            ),
+            (
+                "a mount of the skid row's parent written with `src` and `dst`",
+                format!("--mount=type=bind,src={parent},dst=/guest"),
+                bound.clone(),
+            ),
+            (
+                "a mount of the skid row's parent written with spaces after its commas",
+                format!("--mount=type=bind, source={parent}, target=/guest"),
+                bound.clone(),
+            ),
+            (
+                "a mount of the skid row's parent at a relative target",
+                format!("--mount=type=bind,source={parent},target=guest"),
+                format!("{host_cwd}/guest/{name}/tmp/input"),
+            ),
+        ] {
+            refused(
+                &format!("rows both run with {label} that name its temporary directory there"),
+                &rewritten(
+                    &[1, 2].map(|attempt| {
+                        written(
+                            &base,
+                            &fixed,
+                            &cell,
+                            attempt,
+                            &["@/fixtures/program", &guest],
+                        )
+                    }),
+                    &|_, argv| {
+                        argv.insert(1, option.clone());
+                        1
+                    },
+                ),
+                "result attempt 2's command names",
+            );
+        }
+        let reach = format!("{second_named}/repo/../tmp/input");
+        refused(
+            "rows both of whose guests climb from a checkout in the retry's directory into its temporary directory",
+            &[1, 2].map(|attempt| {
+                written(
+                    &base,
+                    &fixed,
+                    &cell,
+                    attempt,
+                    &["@/fixtures/program", &reach],
+                )
+            }),
+            "result attempt 1's command names",
+        );
+        // A path split between texts, each compared as written and naming
+        // nothing alone, that Hermit joins into a path in another row's
+        // directory: a relative guest path below a guest working directory,
+        // or a relative path among Hermit's options below the host working
+        // directory, in a checkout inside the first attempt's directory.
+        let checkout_workdir = format!("{first_named}/repo");
+        let in_checkout = |guest: &str| {
+            rewritten(
+                &[1, 2].map(|attempt| {
+                    written(
+                        &base,
+                        &fixed,
+                        &workdir,
+                        attempt,
+                        &["@/fixtures/program", guest],
+                    )
+                }),
+                &|_, argv| replace_value(argv, "--workdir", checkout_workdir.clone()),
+            )
+        };
+        accepted(
+            "rows both of whose guests run in a checkout in the skid row's directory",
+            &in_checkout("input"),
+        );
+        refused(
+            "rows both of whose guests run in a checkout in the skid row's directory and climb into its temporary directory",
+            &in_checkout("../tmp/input"),
+            "result attempt 2's command names",
+        );
+        let moved = |rows: &[CellResult]| -> Vec<CellResult> {
+            rows.iter()
+                .cloned()
+                .map(|mut row| {
+                    for attempt in &mut row.attempts {
+                        attempt.cwd = checkout_workdir.clone();
+                        attempt.shell_command =
+                            shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+                    }
+                    row.cwd = row.attempts[0].cwd.clone();
+                    row.shell_command = row.attempts[0].shell_command.clone();
+                    row
+                })
+                .collect()
+        };
+        accepted(
+            "rows both run from a checkout in the skid row's directory",
+            &moved(&control),
+        );
+        refused(
+            "rows both run from a checkout in the skid row's directory that bind a relative path into its temporary directory",
+            &rewritten(&moved(&control), &|_, argv| {
+                argv.insert(1, "--bind=../tmp/input:/tmp/e2e/input".into());
+                1
+            }),
+            "result attempt 2's command names",
+        );
+
+        // Every entry the executor creates directly in a cell directory, and
+        // every path in it that a command the executor writes records, is at
+        // or below an entry `is_cell_directory_entry` names, so the paths it
+        // writes differently for each attempt are all set aside.
+        let created = root.join("created-cell");
+        prepare_dirs(&fixed.root, &created).unwrap();
+        let created_text = created.display().to_string();
+        for (label, context, cell) in [
+            ("plain", context(&|_| {}), cell.clone()),
+            (
+                "kept logs",
+                context(&|context| context.keep_logs = true),
+                cell.clone(),
+            ),
+            ("SaBRe", context(&|_| {}), on("sabre")),
+            ("DBT", context(&|_| {}), on("dbt")),
+            (
+                "hermetic /test root",
+                context(&|context| context.isolated_workdir = Some(PathBuf::from("/test"))),
+                cell.clone(),
+            ),
+        ] {
+            for attempt in ["1", "2"] {
+                let guest = vec![
+                    created.join("fixtures/program").display().to_string(),
+                    created.join("tmp/input").display().to_string(),
+                ];
+                let spec =
+                    build_spec(&context, &cell, created.clone(), guest, attempt, None, 3).unwrap();
+                fs::create_dir_all(created.join("tmp")).unwrap();
+                fs::create_dir_all(&spec.fixed_workdir_source).unwrap();
+                let mut recorded = 0;
+                for text in spec
+                    .argv
+                    .iter()
+                    .chain(&spec.guest_argv)
+                    .chain(spec.env.values())
+                {
+                    for (start, _) in text.match_indices(created_text.as_str()) {
+                        let path = text[start..]
+                            .split(EMBEDDED_PATH_ENDS)
+                            .next()
+                            .unwrap_or_default();
+                        assert!(
+                            matches!(
+                                CellRelativePath::of(path, &created_text),
+                                Own(below) if !below.is_empty()
+                            ),
+                            "{label}: attempt {attempt} records {path:?} in {text:?}"
+                        );
+                        recorded += 1;
+                    }
+                }
+                assert!(
+                    recorded > 0,
+                    "{label}: attempt {attempt} records the directory"
+                );
+            }
+        }
+        for entry in fs::read_dir(&created).unwrap() {
+            let name = entry.unwrap().file_name();
+            assert!(
+                is_cell_directory_entry(name.to_str().unwrap()),
+                "the executor creates {name:?} in the cell directory"
+            );
+        }
+        for (label, edit) in [
+            (
+                "a retry of another test source",
+                (|row: &mut CellResult| row.test_sha256 = "other".into()) as fn(&mut CellResult),
+            ),
+            ("a retry by another Hermit binary", |row| {
+                row.binary_sha256 = Some("other".into())
+            }),
+            ("a retry by another Hermit build", |row| {
+                row.binary_build_sha = Some("other".into())
+            }),
+            ("a retry from another Hermit source", |row| {
+                row.hermit_sha = "other".into()
+            }),
+            ("a retry from a dirty source tree", |row| {
+                row.source_tree_dirty = !row.source_tree_dirty
+            }),
+        ] {
+            let mut row = second.clone();
+            edit(&mut row);
+            refused(
+                label,
+                &with_second(row),
+                "test digest, Hermit source or Hermit binary",
+            );
+        }
+        for (label, edit) in [
+            (
+                "a retry of another test, in that test's directory",
+                (|id: &mut CellId| id.test = "c-programs/other".into()) as fn(&mut CellId),
+            ),
+            ("a retry in another mode, in that mode's directory", |id| {
+                id.mode = "run".into()
+            }),
+            (
+                "a retry on another backend, in that backend's directory",
+                |id| id.backend = Some("dbt".into()),
+            ),
+        ] {
+            let mut id = CellId {
+                test: second.test.clone(),
+                mode: second.mode.clone(),
+                backend: second.backend.clone(),
+            };
+            edit(&mut id);
+            let mut row = second.clone();
+            row.artifact_dir = cell_artifact_path(&fixed.result_root, &fixed.run_id, &id, 2)
+                .display()
+                .to_string();
+            row.test = id.test;
+            row.mode = id.mode;
+            row.backend = id.backend;
+            refused(label, &with_second(row), "records another cell");
+        }
+        refused(
+            "a retry with two inner attempts",
+            &with_second(written(&two, &fixed, &cell, 2, &program)),
+            "retains inner attempts",
+        );
+        let mut empty = second.clone();
+        empty.attempts.clear();
+        refused(
+            "a retry that retains no inner attempt",
+            &with_second(empty),
+            "retains inner attempts",
+        );
+        let mut empty_first = first.clone();
+        empty_first.attempts.clear();
+        refused(
+            "a skid row that retains no inner attempt",
+            &[empty_first, second.clone()],
+            "retains no inner attempt",
+        );
+        refused("no rows", &[], "no result row");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The verify cell a row records: the fixture cell on the row's backend,

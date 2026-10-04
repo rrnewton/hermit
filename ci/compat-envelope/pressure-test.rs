@@ -79,6 +79,7 @@ use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::retained_execution_path_error;
+use hermit_manifest_plan::runner::retained_history_invocation_error;
 use hermit_manifest_plan::runner::retained_verify_invocation_error;
 use hermit_manifest_plan::runner::retained_verify_pass_error;
 use hermit_manifest_plan::runner::run_epoch_from_env;
@@ -7193,6 +7194,16 @@ struct RepeatedCellTally {
 /// canonical report under stripped relaxations, stdout the declaration
 /// forbids, or an exit the row does not expect keeps the ordinary reading.
 ///
+/// Every row must also have run the same guest the same way
+/// ([`retained_history_invocation_error`]): each row's artifact directory is
+/// the one the runner creates for its run, cell and attempt, all rows share
+/// one result root, run, test digest, Hermit source and Hermit binary, and,
+/// with each row's own cell directory set aside, every inner attempt runs the
+/// same guest argv in the same working directory and attempts at the same
+/// position carry the same argv and environment. A skid row and a PASS that
+/// each record a consistent command line, but different guests or arguments,
+/// keep the ordinary reading.
+///
 /// That refusal is the one infrastructure failure the runner retries
 /// (<https://github.com/rrnewton/hermit/issues/1845>). It measured the host's
 /// counter-interrupt latency, not the guest, so the pass after it is not a
@@ -7235,6 +7246,7 @@ fn passed_after_skid_retries_only(result: &str, rows: &[CellResult]) -> bool {
             .as_ref()
             .is_none_or(|recorded| recorded == declared)
         && retained_verify_pass_error(selected, declared).is_none()
+        && retained_history_invocation_error(rows).is_none()
 }
 
 /// What one repetition's retained evidence established, as `fold_repetition`
@@ -10268,6 +10280,37 @@ fn matched_pass_row(
     Ok(row)
 }
 
+/// A command field the runner's executor writes the same for every attempt
+/// of a cell, which a historical verdict fixture places in each row's own
+/// artifact directory instead (`<dir>/` and [`OwnField::below`]).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum OwnField {
+    /// The host working directory, `<dir>/cwd`.
+    Cwd,
+    /// The Hermit binary, `<dir>/hermit`.
+    Hermit,
+    /// A guest `--workdir` among Hermit's options, `<dir>/cwd`.
+    Workdir,
+    /// A guest `--workdir` in the guest's home, `<dir>/home`, run by a Hermit
+    /// binary spelled `--`, the text that ends Hermit's options.
+    DashWorkdir,
+    /// A Hermit binary spelled as a bind of a file in the fixture directory,
+    /// `--bind=<dir>/fixtures/hermit:/x`.
+    BindHermit,
+}
+
+impl OwnField {
+    /// The path of the field below the row's artifact directory.
+    fn below(self) -> &'static str {
+        match self {
+            Self::Cwd | Self::Workdir => "cwd",
+            Self::Hermit => "hermit",
+            Self::DashWorkdir => "home",
+            Self::BindHermit => "fixtures/hermit",
+        }
+    }
+}
+
 /// `row` with the command fields the runner's executor writes for a verify
 /// cell on the row's backend (`native` when it records none) that records the
 /// row's relaxations and expected guest exit (`verified_invocation_argv`,
@@ -10342,6 +10385,25 @@ fn with_executor_invocation(mut row: CellResult) -> CellResult {
     row.effective_args = row.argv.iter().skip(1).cloned().collect();
     row.log_level = Some("info".into());
     row
+}
+
+/// The artifact directory the runner creates for `row`'s cell as outer
+/// attempt `attempt` of run `run` under the result root `root`
+/// (`cell_artifact_path`), which the recovery reading authenticates
+/// (`retained_history_invocation_error`).
+fn runner_artifact_dir(root: &Path, run: &str, row: &CellResult, attempt: u64) -> String {
+    hermit_manifest_plan::runner::cell_artifact_path(
+        root,
+        run,
+        &hermit_manifest_plan::runner::CellId {
+            test: row.test.clone(),
+            mode: row.mode.clone(),
+            backend: row.backend.clone(),
+        },
+        attempt,
+    )
+    .to_string_lossy()
+    .into_owned()
 }
 
 fn pressure_timeout_self_test() -> Result<(), String> {
@@ -15210,11 +15272,13 @@ fn self_test(root: &Path) -> Result<(), String> {
             fs::write(dir.join("results.jsonl"), format!("{text}\n"))
                 .map_err(|e| format!("cannot write verdicts fixture: {e}"))
         };
+        // Each observation sits in the directory the runner creates for its
+        // run, cell and attempt.
         let observation = |row: &CellResult, cell: &CellId, run: &str| {
             let mut row = row.clone();
             row.test = cell.test.clone();
             row.run_id = run.into();
-            row.artifact_dir = format!("/retained/runs/{run}/cell");
+            row.artifact_dir = runner_artifact_dir(Path::new("/retained"), run, &row, row.attempt);
             row
         };
         let pass = with_executor_invocation(matched_pass_row(&result_row, &argv, 0, (0, 0), None)?);
@@ -15467,8 +15531,16 @@ fn self_test(root: &Path) -> Result<(), String> {
                 "the relaxed skid fixture is not otherwise skid-only: {relaxed:?}"
             ));
         }
+        // The retry runs in the directory the runner creates for attempt 2.
+        if pass.artifact_dir != runner_artifact_dir(&scratch, &pass.run_id, &pass, 1) {
+            return Err(format!(
+                "the PASS fixture is not in the directory the runner creates for attempt 1: {}",
+                pass.artifact_dir
+            ));
+        }
         let mut retry_pass = pass.clone();
         retry_pass.attempt = 2;
+        retry_pass.artifact_dir = runner_artifact_dir(&scratch, &pass.run_id, &pass, 2);
         // A selected PASS row labelled with an eligible SaBRe execution path
         // its own retained attempts do not decide.
         let mut forged_path_pass = retry_pass.clone();
@@ -15849,6 +15921,113 @@ fn self_test(root: &Path) -> Result<(), String> {
                 "a ptrace skid row whose command line selects liteinst read as skid-only: {liteinst_invocation_skid:?}"
             ));
         }
+        // Rows that each carry a command line the executor writes for what
+        // they record, every copy agreeing with the others, but that run
+        // another guest than the row before or after them, or run it another
+        // way: a PASS and a skid row whose guest is `/bin/true`, a PASS whose
+        // guest environment has a variable the skid row's lacks, and a PASS
+        // run from another working directory. Each passes every check of a
+        // single row; only the runner's history check refuses the history
+        // (`retained_history_invocation_error`), beside the skid row and
+        // retry_pass, which differ only in the directory the runner creates
+        // for each attempt.
+        let with_guest = |row: &CellResult, guest: &[&str]| {
+            let mut row = row.clone();
+            for attempt in &mut row.attempts {
+                attempt.guest_argv = guest.iter().map(|arg| (*arg).to_owned()).collect();
+            }
+            with_executor_invocation(row)
+        };
+        let true_guest_pass = with_guest(&retry_pass, &["/bin/true"]);
+        let true_guest_skid = with_guest(&skid, &["/bin/true"]);
+        let mut env_pass = retry_pass.clone();
+        for attempt in &mut env_pass.attempts {
+            attempt.env.insert("FIXTURE_EXTRA".into(), "1".into());
+        }
+        let env_pass = with_executor_invocation(env_pass);
+        let mut elsewhere_pass = retry_pass.clone();
+        for attempt in &mut elsewhere_pass.attempts {
+            attempt.cwd = "/elsewhere".into();
+        }
+        let elsewhere_pass = with_executor_invocation(elsewhere_pass);
+        // Rows whose guest names the row's own artifact directory (each `@`)
+        // where the executor writes no path: followed by `:`
+        // (`<dir>:program`) or inside longer text (`/prefix<dir>/program`).
+        // Linux runs a distinct file in each row, so only the history check
+        // refuses them, beside rows whose guest is a file below each row's
+        // own directory (`<dir>/fixtures/program`), which it accepts. A row
+        // placed in another directory is rebuilt for that directory.
+        let in_own_directory = |row: &CellResult, guest: &[&str]| {
+            let mut row = row.clone();
+            let dir = row.artifact_dir.clone();
+            for attempt in &mut row.attempts {
+                attempt.guest_argv = guest.iter().map(|arg| arg.replace('@', &dir)).collect();
+            }
+            with_executor_invocation(row)
+        };
+        let below_guest = ["@/fixtures/program"];
+        let sibling_guest = ["@:program"];
+        let embedded_guest = ["/prefix@/program"];
+        let undeclared = skid
+            .declared_stdout
+            .as_ref()
+            .ok_or("the skid fixture records no declared stdout")?;
+        for (case, guest, same) in [
+            ("below-directory", &below_guest, true),
+            ("sibling", &sibling_guest, false),
+            ("embedded", &embedded_guest, false),
+        ] {
+            let own_skid = in_own_directory(&skid, guest);
+            let own_pass = in_own_directory(&retry_pass, guest);
+            if own_skid.guest_argv == own_pass.guest_argv
+                || !own_skid.guest_argv[0].contains(&own_skid.artifact_dir)
+                || !own_pass.guest_argv[0].contains(&own_pass.artifact_dir)
+                || skid_overshoot_only_reports(&own_skid) != Some(2)
+                || retained_verify_invocation_error(&own_skid).is_some()
+                || retained_verify_invocation_error(&own_pass).is_some()
+                || retained_verify_pass_error(&own_pass, undeclared).is_some()
+                || !qualifying_subruns(&own_pass.mode, &own_pass.attempts)
+                || retained_execution_path_error(&own_pass).is_some()
+                || retained_history_invocation_error(&[own_skid.clone(), own_pass.clone()])
+                    .is_none()
+                    != same
+            {
+                return Err(format!(
+                    "the {case} guest fixtures do not isolate the guest's own directory: {own_skid:?} {own_pass:?}"
+                ));
+            }
+        }
+        if let Some(error) = retained_history_invocation_error(&[skid.clone(), retry_pass.clone()])
+        {
+            return Err(format!(
+                "the skid row and its retry do not run the same guest: {error}"
+            ));
+        }
+        if true_guest_skid.guest_argv == skid.guest_argv
+            || skid_overshoot_only_reports(&true_guest_skid) != Some(2)
+            || retained_history_invocation_error(&[true_guest_skid.clone(), retry_pass.clone()])
+                .is_none()
+        {
+            return Err(format!(
+                "the /bin/true skid fixture does not isolate the guest: {true_guest_skid:?}"
+            ));
+        }
+        for (case, row) in [
+            ("/bin/true", &true_guest_pass),
+            ("extra-variable", &env_pass),
+            ("elsewhere", &elsewhere_pass),
+        ] {
+            if (&row.argv, &row.env, &row.cwd)
+                == (&retry_pass.argv, &retry_pass.env, &retry_pass.cwd)
+                || retained_verify_invocation_error(row).is_some()
+                || retained_verify_pass_error(row, undeclared).is_some()
+                || retained_history_invocation_error(&[skid.clone(), row.clone()]).is_none()
+            {
+                return Err(format!(
+                    "the {case} PASS fixture does not isolate the guest invocation: {row:?}"
+                ));
+            }
+        }
         for (case, row) in [
             ("stripped skid", &stripped_skid),
             ("declared skid", &declared_skid),
@@ -15880,6 +16059,9 @@ fn self_test(root: &Path) -> Result<(), String> {
             ("kinded", &kinded_pass),
             ("liteinst-invocation", &liteinst_invocation_pass),
             ("unrecorded-flag", &unrecorded_flag_pass),
+            ("/bin/true", &true_guest_pass),
+            ("extra-variable", &env_pass),
+            ("elsewhere", &elsewhere_pass),
         ] {
             if !qualifying_subruns(&row.mode, &row.attempts)
                 || retained_execution_path_error(row).is_some()
@@ -16160,6 +16342,57 @@ fn self_test(root: &Path) -> Result<(), String> {
                 vec![skid.clone(), unrecorded_flag_pass.clone()],
                 false,
             ),
+            (
+                "skid then /bin/true pass",
+                "pass",
+                vec![skid.clone(), true_guest_pass.clone()],
+                false,
+            ),
+            (
+                "/bin/true skid then pass",
+                "pass",
+                vec![true_guest_skid.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "skid then extra-variable pass",
+                "pass",
+                vec![skid.clone(), env_pass.clone()],
+                false,
+            ),
+            (
+                "skid then elsewhere pass",
+                "pass",
+                vec![skid.clone(), elsewhere_pass.clone()],
+                false,
+            ),
+            (
+                "skid then pass, each running a guest below its own directory",
+                "pass",
+                vec![
+                    in_own_directory(&skid, &below_guest),
+                    in_own_directory(&retry_pass, &below_guest),
+                ],
+                true,
+            ),
+            (
+                "skid then pass, each running a guest beside its own directory",
+                "pass",
+                vec![
+                    in_own_directory(&skid, &sibling_guest),
+                    in_own_directory(&retry_pass, &sibling_guest),
+                ],
+                false,
+            ),
+            (
+                "skid then pass, each running a guest whose path embeds its own directory",
+                "pass",
+                vec![
+                    in_own_directory(&skid, &embedded_guest),
+                    in_own_directory(&retry_pass, &embedded_guest),
+                ],
+                false,
+            ),
         ] {
             if passed_after_skid_retries_only(result, &rows) != recovered {
                 return Err(format!(
@@ -16183,7 +16416,62 @@ fn self_test(root: &Path) -> Result<(), String> {
         // a PASS or a skid row whose command lines select another backend
         // than the one the row records, or carry a run flag its relaxations
         // do not record, beside verdicts-skid-recovered, whose rows also
-        // carry no runtime.
+        // carry no runtime. So is a history whose rows each carry a command
+        // line the executor writes but run different guests (a PASS or a
+        // skid row running `/bin/true`) or run the guest differently (a PASS
+        // with an extra guest variable, or run from another working
+        // directory), beside verdicts-skid-recovered, whose rows differ only
+        // in the directory the runner creates for each attempt.
+        //
+        // Each history retries repetition 1 as `first` then `second`; the
+        // other two repetitions pass cleanly.
+        let judge_retried = |name: &str,
+                             first: CellResult,
+                             second: CellResult,
+                             verdict: &str,
+                             recovered: u64,
+                             history_intact: bool|
+         -> Result<(), String> {
+            let root = scratch.join(name);
+            write(&root, &sample_b, 1, &[first, second])?;
+            for number in 2..=3 {
+                write(
+                    &root,
+                    &sample_b,
+                    number,
+                    &[observation(&pass, &sample_b, &format!("{name}-{number}"))],
+                )?;
+            }
+            let (outcome, written) = judge(&root, 3)?;
+            let summary = &written["cells"][0];
+            let expected_result = if recovered == 1 {
+                "incomplete"
+            } else {
+                "flaky"
+            };
+            if !outcome.as_ref().is_err_and(|error| {
+                error.contains("1 of 1 cell(s) are not CLEAN") && error.contains(verdict)
+            }) || written["cells"].as_array().map(Vec::len) != Some(1)
+                || written["retried_repetitions"] != json!(1)
+                || summary["verdict"] != json!(verdict)
+                || summary["result"] != json!(expected_result)
+                || summary["passes"] != json!(3)
+                || summary["clean_passes"] != json!(2)
+                || summary["retried_repetitions"] != json!(1)
+                || summary["terminal_product_failures"] != json!(0)
+                || summary["infrastructure_failures"] != json!(0)
+                || summary["infrastructure_recovered_passes"] != json!(recovered)
+                || summary["promotion_candidate"] != json!(false)
+                || (history_intact
+                    && (summary["unknown_history_repetitions"] != json!(0)
+                        || summary["evidence_errors"] != json!([])))
+            {
+                return Err(format!(
+                    "{name}: a retried pass was misjudged: {outcome:?} {written}"
+                ));
+            }
+            Ok(())
+        };
         for (name, earlier, later, verdict, recovered, history_intact) in [
             (
                 "verdicts-skid-recovered",
@@ -16433,50 +16721,563 @@ fn self_test(root: &Path) -> Result<(), String> {
                 0,
                 true,
             ),
+            (
+                "verdicts-skid-then-true-guest-pass",
+                &skid,
+                &true_guest_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-true-guest-skid-recovered",
+                &true_guest_skid,
+                &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-skid-then-extra-variable-pass",
+                &skid,
+                &env_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-skid-then-elsewhere-pass",
+                &skid,
+                &elsewhere_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
         ] {
-            let root = scratch.join(name);
             let run = format!("{name}-1");
-            let mut first = observation(earlier, &sample_b, &run);
-            first.artifact_dir = format!("{}/attempt-1", first.artifact_dir);
-            let mut second = observation(later, &sample_b, &run);
-            second.artifact_dir = format!("{}/attempt-2", second.artifact_dir);
-            write(&root, &sample_b, 1, &[first, second])?;
-            for number in 2..=3 {
-                write(
-                    &root,
-                    &sample_b,
-                    number,
-                    &[observation(&pass, &sample_b, &format!("{name}-{number}"))],
-                )?;
-            }
-            let (outcome, written) = judge(&root, 3)?;
-            let summary = &written["cells"][0];
-            let expected_result = if recovered == 1 {
-                "incomplete"
-            } else {
-                "flaky"
+            judge_retried(
+                name,
+                observation(earlier, &sample_b, &run),
+                observation(later, &sample_b, &run),
+                verdict,
+                recovered,
+                history_intact,
+            )?;
+        }
+        // The same skid row and retry, each placed in the directory the
+        // runner creates for it and running a guest that names that
+        // directory where the executor writes no path (after `:`, or inside
+        // longer text): Linux runs a distinct file in each row, so the
+        // history is refused and keeps base's FLAKY reading, beside
+        // verdicts-below-directory-guest-skid-recovered, whose guest is a
+        // file below each row's own directory. A run identifier that names a
+        // nested directory (`E2E_RUN_ID=group/run`), which the runner joins
+        // verbatim, earns credit like verdicts-skid-recovered, and so does
+        // one that is an absolute path, which replaces the result root and
+        // `runs` in that join. The executor runs every attempt from the
+        // checkout root, with the same Hermit binary and guest working
+        // directory, so rows each run from a host working directory in its
+        // own directory (`<dir>/cwd`), by a Hermit binary there
+        // (`<dir>/hermit`), or with a guest `--workdir` there (`<dir>/cwd`),
+        // with every copy of the command consistent, ran differently: each
+        // such history is refused and keeps base's FLAKY reading. The first
+        // argument is the Hermit binary whatever its text, so rows each run by
+        // one spelled `--` with a guest `--workdir` in its own home
+        // (`<dir>/home`), or by one spelled as a bind of a file in its own
+        // fixture directory (`--bind=<dir>/fixtures/hermit:/x`), also ran
+        // differently and are refused. A guest that names the skid row's
+        // directory (each `^`) is the same text in both rows: one at an entry
+        // the executor never creates there (`^/repo/program`, a source
+        // checkout inside it) is the same file in both, and earns credit like
+        // verdicts-skid-recovered, while one at an entry it creates
+        // (`^/tmp/program`), or that climbs back to one
+        // (`^/repo/../tmp/program`), names a path the skid row's attempts
+        // wrote and the retry's did not, and is refused. So is one that
+        // reaches that entry through a parent spelled another way (each `%`
+        // is the skid row's directory with `/./` before its last component),
+        // which the same directory text compared whole would miss.
+        let checkout_guest = ["^/repo/program"];
+        let foreign_guest = ["^/tmp/program"];
+        let climbing_guest = ["^/repo/../tmp/program"];
+        let respelled_guest = ["%/tmp/program"];
+        let named_skid_directory = |arg: &str, dir: &str| {
+            let (parent, last) = dir.rsplit_once('/').unwrap_or(("", dir));
+            arg.replace('%', &format!("{parent}/./{last}"))
+                .replace('^', dir)
+        };
+        // A run identifier that starts with the cell slug and a directory
+        // with an entry's name (`<slug>/tmp/...`) puts every path of the
+        // retry below a directory named like the skid row's, which is still
+        // not the skid row's directory, so it earns credit like
+        // verdicts-nested-run-skid-recovered. Each row's guest is a file in
+        // its own directory, so the retry's guest passes through that
+        // directory, as every path the runner writes for it does.
+        //
+        // A run identifier that contains a character the executor writes
+        // between paths (`group run/...`) puts that character inside both
+        // rows' directories. A guest file in each row's own directory earns
+        // credit like verdicts-nested-run-skid-recovered, while a guest that
+        // climbs back from a checkout to an entry the executor creates in the
+        // skid row's directory (`^/repo/../tmp/program`) is refused and keeps
+        // base's FLAKY reading, like
+        // verdicts-skid-directory-climbing-guest-skid-recovered: the
+        // directory text is read whole, not cut at that character.
+        //
+        // A run identifier that ends by climbing out of a directory named
+        // like the skid row's (`<slug>/..`) spells the retry's directory
+        // through the skid row's (`.../<slug>/../<slug>-attempt-2`), though
+        // the runner creates it beside it. Each row's guest is a file in its
+        // own directory, which earns credit like
+        // verdicts-nested-run-skid-recovered, while a retry guest that climbs
+        // from its own directory to an entry the executor creates in the skid
+        // row's (`<retry dir>/../<slug>/tmp/program`) is refused and keeps
+        // base's FLAKY reading.
+        //
+        // A run identifier that does both (`<slug>/tmp run/../..`) spells the
+        // retry's directory through a directory `tmp run` in the skid row's,
+        // so that spelling cut at its space is the skid row's `tmp`. The
+        // spelling is read whole: each row's guest is a file in its own
+        // directory, which earns credit like
+        // verdicts-nested-run-skid-recovered, while the same climbing retry
+        // guest is refused and keeps base's FLAKY reading.
+        let runner_slug = Path::new(&observation(&skid, &sample_b, "slug").artifact_dir)
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or("the skid row's directory has no name")?;
+        let slug_run = format!("{runner_slug}/tmp/verdicts-slug-run-skid-recovered-1");
+        let traversal_run = format!("verdicts-traversal-run-skid-recovered-1/{runner_slug}/..");
+        let traversal_climbing_run =
+            format!("verdicts-traversal-run-climbing-guest-skid-recovered-1/{runner_slug}/..");
+        let delimiter_traversal_run = format!(
+            "verdicts-delimiter-traversal-run-skid-recovered-1/{runner_slug}/tmp run/../.."
+        );
+        let delimiter_traversal_climbing_run = format!(
+            "verdicts-delimiter-traversal-run-climbing-guest-skid-recovered-1/{runner_slug}/tmp run/../.."
+        );
+        let traversal_climb = format!("@/../{runner_slug}/tmp/program");
+        let traversal_climbing_guest = [traversal_climb.as_str()];
+        for (name, run, guest, own, verdict, recovered) in [
+            (
+                "verdicts-below-directory-guest-skid-recovered",
+                "verdicts-below-directory-guest-skid-recovered-1",
+                Some(&below_guest),
+                None,
+                "INCOMPLETE",
+                1,
+            ),
+            (
+                "verdicts-sibling-guest-skid-recovered",
+                "verdicts-sibling-guest-skid-recovered-1",
+                Some(&sibling_guest),
+                None,
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-embedded-guest-skid-recovered",
+                "verdicts-embedded-guest-skid-recovered-1",
+                Some(&embedded_guest),
+                None,
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-nested-run-skid-recovered",
+                "group/verdicts-nested-run-skid-recovered-1",
+                None,
+                None,
+                "INCOMPLETE",
+                1,
+            ),
+            (
+                "verdicts-absolute-run-skid-recovered",
+                "/retained-absolute/verdicts-absolute-run-skid-recovered-1",
+                None,
+                None,
+                "INCOMPLETE",
+                1,
+            ),
+            (
+                "verdicts-slug-run-skid-recovered",
+                slug_run.as_str(),
+                Some(&below_guest),
+                None,
+                "INCOMPLETE",
+                1,
+            ),
+            (
+                "verdicts-delimiter-run-skid-recovered",
+                "group run/verdicts-delimiter-run-skid-recovered-1",
+                Some(&below_guest),
+                None,
+                "INCOMPLETE",
+                1,
+            ),
+            (
+                "verdicts-delimiter-run-climbing-guest-skid-recovered",
+                "group run/verdicts-delimiter-run-climbing-guest-skid-recovered-1",
+                Some(&climbing_guest),
+                None,
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-traversal-run-skid-recovered",
+                traversal_run.as_str(),
+                Some(&below_guest),
+                None,
+                "INCOMPLETE",
+                1,
+            ),
+            (
+                "verdicts-traversal-run-climbing-guest-skid-recovered",
+                traversal_climbing_run.as_str(),
+                Some(&traversal_climbing_guest),
+                None,
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-delimiter-traversal-run-skid-recovered",
+                delimiter_traversal_run.as_str(),
+                Some(&below_guest),
+                None,
+                "INCOMPLETE",
+                1,
+            ),
+            (
+                "verdicts-delimiter-traversal-run-climbing-guest-skid-recovered",
+                delimiter_traversal_climbing_run.as_str(),
+                Some(&traversal_climbing_guest),
+                None,
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-own-cwd-skid-recovered",
+                "verdicts-own-cwd-skid-recovered-1",
+                None,
+                Some(OwnField::Cwd),
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-own-hermit-skid-recovered",
+                "verdicts-own-hermit-skid-recovered-1",
+                None,
+                Some(OwnField::Hermit),
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-own-workdir-skid-recovered",
+                "verdicts-own-workdir-skid-recovered-1",
+                None,
+                Some(OwnField::Workdir),
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-dash-hermit-own-workdir-skid-recovered",
+                "verdicts-dash-hermit-own-workdir-skid-recovered-1",
+                None,
+                Some(OwnField::DashWorkdir),
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-bind-hermit-skid-recovered",
+                "verdicts-bind-hermit-skid-recovered-1",
+                None,
+                Some(OwnField::BindHermit),
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-skid-directory-checkout-guest-skid-recovered",
+                "verdicts-skid-directory-checkout-guest-skid-recovered-1",
+                Some(&checkout_guest),
+                None,
+                "INCOMPLETE",
+                1,
+            ),
+            (
+                "verdicts-skid-directory-generated-guest-skid-recovered",
+                "verdicts-skid-directory-generated-guest-skid-recovered-1",
+                Some(&foreign_guest),
+                None,
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-skid-directory-climbing-guest-skid-recovered",
+                "verdicts-skid-directory-climbing-guest-skid-recovered-1",
+                Some(&climbing_guest),
+                None,
+                "FLAKY",
+                0,
+            ),
+            (
+                "verdicts-skid-directory-respelled-guest-skid-recovered",
+                "verdicts-skid-directory-respelled-guest-skid-recovered-1",
+                Some(&respelled_guest),
+                None,
+                "FLAKY",
+                0,
+            ),
+        ] {
+            let skid_dir = observation(&skid, &sample_b, run).artifact_dir;
+            let place = |row: &CellResult| {
+                let row = observation(row, &sample_b, run);
+                let mut row = match guest {
+                    Some(guest) => {
+                        let guest: Vec<String> = guest
+                            .iter()
+                            .map(|arg| named_skid_directory(arg, &skid_dir))
+                            .collect();
+                        let guest: Vec<&str> = guest.iter().map(String::as_str).collect();
+                        in_own_directory(&row, &guest)
+                    }
+                    None => row,
+                };
+                if let Some(field) = own {
+                    let path = format!("{}/{}", row.artifact_dir, field.below());
+                    if field == OwnField::Cwd {
+                        for attempt in &mut row.attempts {
+                            attempt.cwd = path.clone();
+                        }
+                    }
+                    row = with_executor_invocation(row);
+                    for attempt in &mut row.attempts {
+                        match field {
+                            OwnField::Cwd => {}
+                            OwnField::Hermit => attempt.argv[0] = path.clone(),
+                            OwnField::Workdir | OwnField::DashWorkdir => {
+                                let separator = attempt
+                                    .argv
+                                    .iter()
+                                    .position(|arg| arg == "--")
+                                    .unwrap_or(attempt.argv.len());
+                                attempt.argv.splice(
+                                    separator..separator,
+                                    ["--workdir".into(), path.clone()],
+                                );
+                                if field == OwnField::DashWorkdir {
+                                    attempt.argv[0] = "--".into();
+                                }
+                            }
+                            OwnField::BindHermit => {
+                                attempt.argv[0] = format!("--bind={path}:/x");
+                            }
+                        }
+                        attempt.shell_command =
+                            literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+                    }
+                    row.argv = row.attempts[0].argv.clone();
+                    row.shell_command = row.attempts[0].shell_command.clone();
+                    row.effective_args = row.argv.iter().skip(1).cloned().collect();
+                }
+                row
             };
-            if !outcome.as_ref().is_err_and(|error| {
-                error.contains("1 of 1 cell(s) are not CLEAN") && error.contains(verdict)
-            }) || written["cells"].as_array().map(Vec::len) != Some(1)
-                || written["retried_repetitions"] != json!(1)
-                || summary["verdict"] != json!(verdict)
-                || summary["result"] != json!(expected_result)
-                || summary["passes"] != json!(3)
-                || summary["clean_passes"] != json!(2)
-                || summary["retried_repetitions"] != json!(1)
-                || summary["terminal_product_failures"] != json!(0)
-                || summary["infrastructure_failures"] != json!(0)
-                || summary["infrastructure_recovered_passes"] != json!(recovered)
-                || summary["promotion_candidate"] != json!(false)
-                || (history_intact
-                    && (summary["unknown_history_repetitions"] != json!(0)
-                        || summary["evidence_errors"] != json!([])))
-            {
+            let (first, second) = (place(&skid), place(&retry_pass));
+            let placed = if run.starts_with('/') {
+                first.artifact_dir.starts_with(&format!("{run}/"))
+                    && !first.artifact_dir.starts_with("/retained/")
+            } else {
+                first
+                    .artifact_dir
+                    .starts_with(&format!("/retained/runs/{run}/"))
+            };
+            if !placed {
                 return Err(format!(
-                    "{name}: a retried pass was misjudged: {outcome:?} {written}"
+                    "{name}: the skid row is not in its run's directory: {}",
+                    first.artifact_dir
                 ));
             }
+            if let Some(field) = own {
+                let read = |cwd: &str, argv: &[String]| -> Option<String> {
+                    match field {
+                        OwnField::Cwd => Some(cwd.to_owned()),
+                        OwnField::Hermit => argv.first().cloned(),
+                        OwnField::Workdir => argv
+                            .windows(2)
+                            .filter(|pair| pair[0] == "--workdir")
+                            .map(|pair| pair[1].clone())
+                            .next(),
+                        OwnField::DashWorkdir => argv
+                            .windows(2)
+                            .filter(|pair| pair[0] == "--workdir")
+                            .map(|pair| pair[1].clone())
+                            .next()
+                            .filter(|_| argv.first().is_some_and(|program| program == "--")),
+                        OwnField::BindHermit => argv
+                            .first()
+                            .and_then(|program| program.strip_prefix("--bind="))
+                            .and_then(|program| program.strip_suffix(":/x"))
+                            .map(str::to_owned),
+                    }
+                };
+                let isolated = read(&first.cwd, &first.argv) != read(&second.cwd, &second.argv)
+                    && [&first, &second].iter().all(|row| {
+                        let path = Some(format!("{}/{}", row.artifact_dir, field.below()));
+                        read(&row.cwd, &row.argv) == path
+                            && row.attempts.iter().all(|attempt| {
+                                read(&attempt.cwd, &attempt.argv) == path
+                                    && attempt.shell_command.contains(&row.artifact_dir)
+                                    && attempt.shell_command
+                                        == literal_shell_command(
+                                            &attempt.cwd,
+                                            &attempt.env,
+                                            &attempt.argv,
+                                        )
+                            })
+                            && retained_verify_invocation_error(row).is_none()
+                    })
+                    && retained_verify_pass_error(&second, undeclared).is_none()
+                    && retained_history_invocation_error(&[first.clone(), second.clone()])
+                        .is_some();
+                if !isolated {
+                    return Err(format!(
+                        "{name}: the {field:?} fixtures do not isolate the history check: {first:?} {second:?}"
+                    ));
+                }
+            }
+            if let Some(guest) = guest.filter(|guest| guest[0].starts_with(['^', '%'])) {
+                let named = named_skid_directory(guest[0], &first.artifact_dir);
+                let shared = first.guest_argv == [named.clone()]
+                    && second.guest_argv == [named]
+                    && [&first, &second]
+                        .iter()
+                        .all(|row| retained_verify_invocation_error(row).is_none())
+                    && retained_verify_pass_error(&second, undeclared).is_none()
+                    && retained_execution_path_error(&second).is_none()
+                    && retained_history_invocation_error(&[first.clone(), second.clone()])
+                        .is_none()
+                        == (verdict == "INCOMPLETE");
+                if !shared {
+                    return Err(format!(
+                        "{name}: the skid-directory guest fixtures do not isolate the history check: {first:?} {second:?}"
+                    ));
+                }
+            }
+            let delimited =
+                run == delimiter_traversal_run || run == delimiter_traversal_climbing_run;
+            if run == traversal_run || run == traversal_climbing_run || delimited {
+                let skid_text = format!("/retained/runs/{run}/{runner_slug}");
+                let skid_tmp = format!(
+                    "/retained/runs/{}/tmp",
+                    run.strip_suffix("/tmp run/../..").unwrap_or(run)
+                );
+                let spelled = first.artifact_dir == skid_text
+                    && (!delimited || second.artifact_dir.starts_with(&format!("{skid_tmp} run/")))
+                    && second.artifact_dir == format!("{skid_text}-attempt-2")
+                    && [&first, &second].iter().all(|row| {
+                        row.guest_argv[0].starts_with(&format!("{}/", row.artifact_dir))
+                            && retained_verify_invocation_error(row).is_none()
+                    })
+                    && retained_verify_pass_error(&second, undeclared).is_none()
+                    && retained_history_invocation_error(&[first.clone(), second.clone()])
+                        .is_none()
+                        == (verdict == "INCOMPLETE");
+                if !spelled {
+                    return Err(format!(
+                        "{name}: the traversal-run fixtures do not spell the retry's directory through the skid row's: {first:?} {second:?}"
+                    ));
+                }
+            }
+            if run == slug_run {
+                let through = format!("/runs/{runner_slug}/tmp/");
+                let shared =
+                    [&first, &second].iter().all(|row| {
+                        row.guest_argv[0].starts_with(&format!("{}/", row.artifact_dir))
+                            && row.guest_argv[0].contains(&through)
+                            && retained_verify_invocation_error(row).is_none()
+                    }) && retained_history_invocation_error(&[first.clone(), second.clone()])
+                        .is_none();
+                if !shared {
+                    return Err(format!(
+                        "{name}: the slug-run fixtures do not pass the retry's guest through a directory named like the skid row's: {first:?} {second:?}"
+                    ));
+                }
+            }
+            judge_retried(name, first, second, verdict, recovered, true)?;
+        }
+        // A guest working directory in a checkout inside the skid row's
+        // directory (`--workdir <skid dir>/repo`, the same text in both
+        // rows) and a relative guest path, each compared as written and
+        // naming no path the executor creates alone: Hermit resolves the
+        // guest path below the working directory, so `../tmp/program` runs
+        // the file the skid row's attempts wrote at `<skid dir>/tmp/program`
+        // and the retry's did not, and the history is refused and keeps
+        // base's FLAKY reading, while `program`, the checkout's own file,
+        // earns credit like
+        // verdicts-skid-directory-checkout-guest-skid-recovered.
+        for (name, guest, verdict, recovered) in [
+            (
+                "verdicts-skid-directory-checkout-workdir-skid-recovered",
+                "program",
+                "INCOMPLETE",
+                1,
+            ),
+            (
+                "verdicts-skid-directory-checkout-workdir-climbing-guest-skid-recovered",
+                "../tmp/program",
+                "FLAKY",
+                0,
+            ),
+        ] {
+            let run = format!("{name}-1");
+            let workdir = format!("{}/repo", observation(&skid, &sample_b, &run).artifact_dir);
+            let place = |row: &CellResult| {
+                let mut row = observation(row, &sample_b, &run);
+                for attempt in &mut row.attempts {
+                    attempt.guest_argv = vec![guest.to_owned()];
+                }
+                let mut row = with_executor_invocation(row);
+                for attempt in &mut row.attempts {
+                    let separator = attempt
+                        .argv
+                        .iter()
+                        .position(|arg| arg == "--")
+                        .unwrap_or(attempt.argv.len());
+                    attempt
+                        .argv
+                        .splice(separator..separator, ["--workdir".into(), workdir.clone()]);
+                    attempt.shell_command =
+                        literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+                }
+                row.argv = row.attempts[0].argv.clone();
+                row.shell_command = row.attempts[0].shell_command.clone();
+                row.effective_args = row.argv.iter().skip(1).cloned().collect();
+                row
+            };
+            let (first, second) = (place(&skid), place(&retry_pass));
+            let history = retained_history_invocation_error(&[first.clone(), second.clone()]);
+            let isolated = [&first, &second].iter().all(|row| {
+                row.guest_argv == [guest]
+                    && row.attempts.iter().all(|attempt| {
+                        attempt.guest_argv == [guest]
+                            && attempt.argv.windows(3).any(|window| {
+                                window[0] == "--workdir"
+                                    && window[1] == workdir
+                                    && window[2] == "--"
+                            })
+                    })
+                    && retained_verify_invocation_error(row).is_none()
+            }) && retained_verify_pass_error(&second, undeclared).is_none()
+                && retained_execution_path_error(&second).is_none()
+                && match verdict {
+                    "INCOMPLETE" => history.is_none(),
+                    _ => history
+                        .as_deref()
+                        .is_some_and(|error| error.contains("result attempt 2's command names")),
+                };
+            if !isolated {
+                return Err(format!(
+                    "{name}: the checkout workdir fixtures do not isolate the history check: {history:?} {first:?} {second:?}"
+                ));
+            }
+            judge_retried(name, first, second, verdict, recovered, true)?;
         }
         // A skid row whose declared-stdout record omits one member, which no
         // runner writes. Read leniently, the omitted member would be null:
@@ -16510,10 +17311,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         ] {
             let root = scratch.join(name);
             let run = format!("{name}-1");
-            let mut first = observation(earlier, &sample_b, &run);
-            first.artifact_dir = format!("{}/attempt-1", first.artifact_dir);
-            let mut second = observation(later, &sample_b, &run);
-            second.artifact_dir = format!("{}/attempt-2", second.artifact_dir);
+            let first = observation(earlier, &sample_b, &run);
+            let second = observation(later, &sample_b, &run);
             let mut first = serde_json::to_value(&first)
                 .map_err(|e| format!("cannot encode {name} fixture: {e}"))?;
             first["declared_stdout"]
