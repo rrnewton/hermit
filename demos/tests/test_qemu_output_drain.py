@@ -69,12 +69,15 @@ import demo_common as dc  # noqa: E402
 # directory that the demo binds at FAKE_HERMIT_BIND_TARGET in the guest.
 #
 # The two processes that write start only once the fake Hermit has exited (their
-# parent PID changes when it does), so everything they write arrives after the
-# demo's wait for Hermit has ended, however slowly a busy machine runs the
-# fake Hermit.
+# parent PID changes when it does) and the demo's wait for it has returned (the
+# test then creates the file FAKE_HERMIT_WAIT_ENDED), so everything they write
+# arrives after the demo's wait for Hermit has ended, however slowly a busy
+# machine runs the fake Hermit or the demo. That wait checks the log once more
+# after Hermit exits, so output written before it returned could be found
+# past the cap there instead of in the drain these tests are about.
 FAKE_HERMIT = r'''
 import json, os, shutil, subprocess, sys, time
-AFTER_EXIT = "import os, sys, time\nwhile os.getppid() == int(sys.argv[1]):\n    time.sleep(0.01)\n"
+AFTER_EXIT = "import os, sys, time\nwhile os.getppid() == int(sys.argv[1]) or not os.path.exists(os.environ['FAKE_HERMIT_WAIT_ENDED']):\n    time.sleep(0.01)\n"
 DESCENDANTS = {
     # Keeps writing to the output it inherited, 1 KiB about every millisecond.
     "orphan-writer": [sys.executable, "-c", AFTER_EXIT + "try:\n    while True:\n        os.write(1, b'x' * 1024)\n        time.sleep(0.001)\nexcept BrokenPipeError:\n    pass\n", str(os.getpid())],
@@ -205,6 +208,7 @@ class _OutputDrainScenarios:
         fake Hermit had started (it had recorded its PIDs) until then.
         """
         real_wait = self.namespace["wait_for_process"]
+        wait_ended = self.directory / "wait-ended"
 
         def wait_when_ready(process, timeout, **keywords):
             # Start the clock once the fake Hermit is up, so that a slow start
@@ -220,7 +224,10 @@ class _OutputDrainScenarios:
             ):
                 time.sleep(0.01)
             self.ready_at = time.monotonic()
-            return real_wait(process, timeout, **keywords)
+            status = real_wait(process, timeout, **keywords)
+            # Only now may the processes the fake Hermit left start writing.
+            wait_ended.touch()
+            return status
 
         replacements = self.replacements()
         replacements.update(
@@ -235,7 +242,11 @@ class _OutputDrainScenarios:
             }
         )
         replacements.update(extra_replacements or {})
-        environment = {"FAKE_HERMIT_MODE": mode, "FAKE_HERMIT_PIDS": str(self.pids_file)}
+        environment = {
+            "FAKE_HERMIT_MODE": mode,
+            "FAKE_HERMIT_PIDS": str(self.pids_file),
+            "FAKE_HERMIT_WAIT_ENDED": str(wait_ended),
+        }
         environment.update(self.fake_environment(mode))
         environment.update(extra_environment or {})
         function = self.namespace[self.function_name]
