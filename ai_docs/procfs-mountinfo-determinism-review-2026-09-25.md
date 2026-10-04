@@ -90,15 +90,27 @@ seed-named row of another filesystem type survive).
   the filter.
 - Unit (hermit-cli): `identity_capture_excludes_host_seed_mounts_and_keeps_order`.
 - E2E: guest `cat` view 101→86 rows, 0 xarfuse, `/test` + edenfs retained.
-- Cell: `system-utils/procfs-sanitized-paths` canonical verify **20/20
-  matched** under its manifest profile; cell re-enabled with pinned evidence
-  (`PROCFS_MOUNTINFO_2026_09_25_*`). That profile is not relaxation-free: the
-  manifest sets `rcb_time: false`, so every run carries `--no-rcb-time`. That
-  setting is inherited from main and was not added by this change;
-  `compare_io_buffers: true` is kept. The cell's earlier failures were
-  intermittent, and seed churn did not necessarily occur during the
-  qualification window, so the 20/20 shows the cell passes but does not by
-  itself show the exclusion works; the unit tests above carry that.
+- Cell: `system-utils/procfs-sanitized-paths` canonical verify, ptrace,
+  under its manifest profile: **60/60 with the harness retry, first-attempt
+  60/60** at ab7f0dd15120aeecea647940feca712741ec214d (2026-10-04 09:38:46Z
+  to 09:41:42Z); the cell stays required in CI with pinned evidence
+  (`PROCFS_MOUNTINFO_2026_09_25_*`). A mountinfo monitor running alongside
+  saw one row change, an excluded per-process seed mount added at 09:41:31Z
+  during repetition 56, which matched. The earlier 180 repetitions at
+  d547b64d3b9f9976232aa1bb71ea7773b7f73d1a (nspid-only grammar) were 180/180
+  with the retry and first-attempt 177/180: two mountinfo-read divergences
+  (one coinciding with a `/run/user/0` tmpfs unmount, one unattributed) and
+  one unrelated `newfstatat` size change on a host directory. Guest-visible
+  host mount churn outside the excluded class, such as `/run/user/<uid>`
+  (<https://github.com/rrnewton/hermit/issues/1820>), can therefore still
+  fail a first attempt, so the claim is "with the harness retry", not
+  "every attempt". The real fix is one shared mount snapshot
+  (<https://github.com/rrnewton/hermit/issues/3627>). That profile is not
+  relaxation-free: the manifest sets `rcb_time: false`, so every run carries
+  `--no-rcb-time`. That setting is inherited from main and was not added by
+  this change; `compare_io_buffers: true` is kept. One seed event in one
+  window does not by itself show the exclusion works; the unit tests above
+  carry that.
 
 ## Mounts view
 `/proc/<pid>/mounts` is not covered. It stays raw host passthrough, as on
