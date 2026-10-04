@@ -2612,3 +2612,738 @@ fn parked_selection_failure_preserves_process_and_optional_task_identity() {
         }
     }
 }
+
+// ChildWait uses the actual scheduler request/observation transitions below.
+// These state tests do not stand in for backend signal frames or guest copyout.
+fn child_wait(
+    s: &mut Scheduler,
+    tid: DetTid,
+    mm: MmId,
+    site: reverie::CallbackSignalSite,
+    spec: ChildWaitSpec,
+    blocked: bool,
+) -> Ivar<SchedResponse> {
+    let parent = s.registered_process(tid).unwrap();
+    let mut resources = Resources::new(tid);
+    resources.insert(ResourceID::WaitChild { parent, spec }, Permission::R);
+    resources.fyi("wait-child-lifecycle");
+    s.install_resource_origin(
+        tid,
+        ResourceOrigin {
+            rpc: RpcOrigin::DirectRequestResources,
+            mm,
+            control: ControlCapability::ChildWait { site },
+        },
+    )
+    .unwrap();
+    let turn = &s.next_turns[&tid];
+    turn.req.put(Ok(resources));
+    let response = turn.resp.clone();
+    if blocked {
+        assert!(
+            s.blocked
+                .child_waiters
+                .insert(tid, (parent, spec))
+                .is_none()
+        );
+    } else {
+        s.run_queue.push_back(tid, DEFAULT_PRIORITY);
+    }
+    response
+}
+
+fn child_spec() -> ChildWaitSpec {
+    ChildWaitSpec {
+        selector: ChildWaitSelector::ProcessGroup(DetPid::from_raw(100)),
+        owner: Some(DetTid::from_raw(100)),
+        exit_class: ChildWaitExitClass::Sigchld,
+    }
+}
+
+fn resume_child_observation(
+    s: &mut Scheduler,
+    tid: DetTid,
+    mm: MmId,
+    c: AlarmControl,
+) -> Ivar<SchedResponse> {
+    let ack = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Finish {
+            wait: c.continuation,
+            lease: c.lease,
+            site: c.site,
+            finish: ObservationFinish::ResumeSameWait,
+            ack: ack.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    let ticket = match ack.try_read().unwrap().unwrap() {
+        FinishAck::AwaitResume(ticket) => ticket,
+        other => panic!("{other:?}"),
+    };
+    let response = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Resume {
+            ticket,
+            site: c.site,
+            response: response.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    assert!(!s.backend_failed());
+    response
+}
+
+#[test]
+fn blocked_child_wait_observation_restores_exact_membership() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    add_process_child(&mut s, 100, 200);
+    let spec = child_spec();
+    let response = child_wait(&mut s, tid, mm, site, spec, true);
+    let request = s.next_turns[&tid].req.clone();
+    let resources = request.try_read().unwrap().unwrap();
+    let before_turn = s.turn;
+    let before_time = s.committed_time;
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    s.select_parked_alarm().unwrap();
+    let c = selected(&response);
+    assert!(!s.blocked.child_waiters.contains_key(&tid));
+    assert!(s.run_queue.contains_tid(tid));
+    assert!(s.next_turns[&tid].req.try_read().is_none());
+    let resumed = resume_child_observation(&mut s, tid, mm, c);
+    assert_eq!(s.blocked.child_waiters.get(&tid), Some(&(tid, spec)));
+    assert!(!s.run_queue.contains_tid(tid));
+    assert_eq!(s.next_turns[&tid].req, request);
+    assert_eq!(request.try_read().unwrap().unwrap(), resources);
+    assert_eq!(s.next_turns[&tid].resp, resumed);
+    assert!(resumed.try_read().is_none());
+    assert_eq!(s.turn, before_turn);
+    assert_eq!(s.committed_time, before_time);
+    assert!(b.permits.lock().unwrap().is_empty());
+    // Repeated ignored/suppressed observations retain the same logical wait.
+    s.select_parked_alarm().unwrap();
+    let second = selected(&resumed);
+    assert_eq!(second.continuation, c.continuation);
+    assert_ne!(second.lease, c.lease);
+    assert_eq!(selected(&response), c);
+}
+
+#[test]
+fn queued_child_wait_observation_restores_original_queue_order() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    add_process_child(&mut s, 100, 200);
+    let (peer, _, _) = add(&mut s, 300, 300);
+    let spec = child_spec();
+    let response = child_wait(&mut s, tid, mm, site, spec, false);
+    let request = s.next_turns[&tid].req.clone();
+    s.run_queue.push_back(peer, DEFAULT_PRIORITY);
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    s.select_parked_alarm().unwrap();
+    let c = selected(&response);
+    let resumed = resume_child_observation(&mut s, tid, mm, c);
+    assert_eq!(s.next_turns[&tid].req, request);
+    assert!(resumed.try_read().is_none());
+    assert!(!s.blocked.child_waiters.contains_key(&tid));
+    assert_eq!(s.run_queue.tentative_pop_next(), Some(tid));
+    assert_eq!(s.run_queue.commit_tentative_pop(), tid);
+    assert_eq!(s.run_queue.tentative_pop_next(), Some(peer));
+    s.run_queue.undo_tentative_pop();
+}
+
+#[test]
+fn child_wait_ready_and_no_child_precede_alarm_selection() {
+    for blocked in [false, true] {
+        for change in 0..4 {
+            let (mut s, b) = fixture();
+            let (tid, mm, site) = add(&mut s, 100, 100);
+            let (child, _, _) = add_process_child(&mut s, 100, 200);
+            let spec = child_spec();
+            let response = child_wait(&mut s, tid, mm, site, spec, blocked);
+            let request = s.next_turns[&tid].req.clone();
+            match change {
+                0 => {
+                    s.logically_exited_processes.insert(child);
+                }
+                1 => {
+                    s.logically_exited_processes.insert(child);
+                    assert!(s.consume_child_wait(tid, child));
+                }
+                2 => {
+                    assert!(
+                        s.thread_tree
+                            .set_process_group(child, DetPid::from_raw(999))
+                    );
+                }
+                3 => {
+                    s.thread_tree
+                        .process_wait
+                        .get_mut(&child)
+                        .unwrap()
+                        .wait_owner = DetTid::from_raw(101);
+                }
+                _ => unreachable!(),
+            }
+            // Consumption wakes a blocked waiter through a deferred admission.
+            // Run the same prefix as the daemon before alarm selection.
+            let pending_wake = blocked && change == 1;
+            assert_eq!(
+                s.pending_run_queue_admissions.get(&tid).copied(),
+                pending_wake.then_some(AdmitIntent::Fixed(AdmitSide::Back))
+            );
+            assert_eq!(s.run_queue.contains_tid(tid), !blocked);
+            assert_eq!(
+                s.blocked.child_waiters.contains_key(&tid),
+                blocked && !pending_wake
+            );
+            let before_turn = s.turn;
+            let before_time = s.committed_time;
+            s.step2_drain_prefix().unwrap();
+            assert!(s.pending_run_queue_admissions.is_empty());
+            assert_eq!(s.run_queue.contains_tid(tid), !blocked || pending_wake);
+            assert_eq!(
+                s.blocked.child_waiters.contains_key(&tid),
+                blocked && !pending_wake
+            );
+            assert_eq!(s.turn, before_turn);
+            assert_eq!(s.committed_time, before_time);
+            b.recipients.lock().unwrap().push(SignalRecipient {
+                task: task(100, 100),
+            });
+            s.select_parked_alarm().unwrap();
+            assert!(
+                response.try_read().is_none(),
+                "blocked {blocked}, change {change}"
+            );
+            assert!(b.permits.lock().unwrap().is_empty());
+            assert_eq!(s.next_turns[&tid].req, request);
+            assert!(s.run_queue.contains_tid(tid));
+            assert!(!s.blocked.child_waiters.contains_key(&tid));
+            assert_eq!(
+                s.ready_child_wait(tid, spec),
+                (change == 0).then_some(child)
+            );
+            assert_eq!(s.has_child_wait_target(tid, spec), change == 0);
+            let original = request.try_read().unwrap().unwrap();
+            assert_eq!(s.step3_peek().unwrap().0, tid);
+            assert!(s.step4_resource_block(tid, &original, &response).is_ok());
+            s.run_queue.undo_tentative_pop();
+        }
+    }
+}
+
+#[test]
+fn child_wait_resume_rechecks_ready_consumed_group_and_owner() {
+    for change in 0..5 {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        let (child, _, _) = add_process_child(&mut s, 100, 200);
+        let spec = child_spec();
+        let response = child_wait(&mut s, tid, mm, site, spec, true);
+        let request = s.next_turns[&tid].req.clone();
+        let resources = request.try_read().unwrap().unwrap();
+        b.recipients.lock().unwrap().push(SignalRecipient {
+            task: task(100, 100),
+        });
+        s.select_parked_alarm().unwrap();
+        let c = selected(&response);
+        // Model changes while the observation owns an empty execution gate;
+        // wake_child_waiters cannot find the removed blocked membership.
+        match change {
+            0 => {}
+            1 => {
+                s.logically_exited_processes.insert(child);
+                s.wake_child_waiters(tid, child);
+            }
+            2 => {
+                s.logically_exited_processes.insert(child);
+                assert!(s.consume_child_wait(tid, child));
+            }
+            3 => {
+                assert!(
+                    s.thread_tree
+                        .set_process_group(child, DetPid::from_raw(999))
+                );
+            }
+            4 => {
+                s.thread_tree
+                    .process_wait
+                    .get_mut(&child)
+                    .unwrap()
+                    .wait_owner = DetTid::from_raw(101);
+            }
+            _ => unreachable!(),
+        }
+        let resumed = resume_child_observation(&mut s, tid, mm, c);
+        assert_eq!(
+            s.blocked.child_waiters.get(&tid).copied(),
+            (change == 0).then_some((tid, spec))
+        );
+        assert_eq!(s.run_queue.contains_tid(tid), change != 0);
+        assert_eq!(s.next_turns[&tid].req, request);
+        assert_eq!(request.try_read().unwrap().unwrap(), resources);
+        assert!(resumed.try_read().is_none());
+        if change != 0 {
+            s.select_parked_alarm().unwrap();
+            assert!(resumed.try_read().is_none());
+            assert!(b.permits.lock().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn child_wait_rejects_malformed_capability_or_membership_before_reservation() {
+    for fault in 0..9 {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        add_process_child(&mut s, 100, 200);
+        let spec = child_spec();
+        let response = child_wait(&mut s, tid, mm, site, spec, true);
+        let mut resources = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+        match fault {
+            0 => {
+                resources.tid = DetTid::from_raw(101);
+            }
+            1 => {
+                resources.poll_attempt = 1;
+            }
+            2 => {
+                resources.insert(ResourceID::InternalIOPolling, Permission::W);
+            }
+            3 => {
+                resources.resources.clear();
+                resources.insert(ResourceID::WaitChild { parent: tid, spec }, Permission::W);
+            }
+            4 => {
+                s.run_queue.push_back(tid, DEFAULT_PRIORITY);
+            }
+            5 => {
+                s.blocked.child_waiters.get_mut(&tid).unwrap().1.owner = None;
+            }
+            6..=8 => {
+                let mut wrong = spec;
+                let parent = if fault == 6 {
+                    DetPid::from_raw(999)
+                } else {
+                    tid
+                };
+                if fault == 7 {
+                    wrong.owner = Some(DetTid::from_raw(101));
+                }
+                if fault == 8 {
+                    wrong.exit_class = ChildWaitExitClass::Clone;
+                }
+                resources.resources.clear();
+                resources.insert(
+                    ResourceID::WaitChild {
+                        parent,
+                        spec: wrong,
+                    },
+                    Permission::R,
+                );
+            }
+            _ => unreachable!(),
+        }
+        let request = Ivar::new();
+        request.put(Ok(resources));
+        s.next_turns.get_mut(&tid).unwrap().req = request.clone();
+        let queue = format!("{:?}", s.run_queue);
+        let membership = s.blocked.child_waiters.clone();
+        b.recipients.lock().unwrap().push(SignalRecipient {
+            task: task(100, 100),
+        });
+        assert_eq!(
+            s.select_parked_alarm(),
+            Err(SelectionFailure {
+                pid: tid,
+                tid: Some(tid),
+                failure: if fault < 4 {
+                    ProtocolFailure::Unsupported
+                } else if fault < 6 {
+                    ProtocolFailure::Phase
+                } else {
+                    ProtocolFailure::Identity
+                },
+            })
+        );
+        assert_eq!(s.next_turns[&tid].req, request);
+        assert_eq!(s.blocked.child_waiters, membership);
+        assert_eq!(format!("{:?}", s.run_queue), queue);
+        assert!(response.try_read().is_none());
+        assert!(b.permits.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn child_wait_reservation_failure_preserves_blocked_request() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    add_process_child(&mut s, 100, 200);
+    let spec = child_spec();
+    let response = child_wait(&mut s, tid, mm, site, spec, true);
+    let request = s.next_turns[&tid].req.clone();
+    b.fail_reservation
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    assert_eq!(
+        s.select_parked_alarm(),
+        Err(SelectionFailure {
+            pid: tid,
+            tid: Some(tid),
+            failure: ProtocolFailure::Identity,
+        })
+    );
+    assert_eq!(s.next_turns[&tid].req, request);
+    assert_eq!(s.blocked.child_waiters.get(&tid), Some(&(tid, spec)));
+    assert!(!s.run_queue.contains_tid(tid));
+    assert!(response.try_read().is_none());
+    assert!(b.permits.lock().unwrap().is_empty());
+}
+
+#[test]
+fn child_wait_caught_selection_wins_later_exit_and_keeps_return_gate() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    let (child, _, _) = add_process_child(&mut s, 100, 200);
+    let response = child_wait(&mut s, tid, mm, site, child_spec(), true);
+    b.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
+    s.select_parked_alarm().unwrap();
+    let c = selected(&response);
+    // A nested caught-signal Tool hook publishes readiness after selection.
+    // It must not turn the already-selected interruption into a child reap.
+    s.logically_exited_processes.insert(child);
+    s.wake_child_waiters(tid, child);
+    let ack = Ivar::new();
+    s.post_control(
+        tid,
+        mm,
+        ControlIntent::Finish {
+            wait: c.continuation,
+            lease: c.lease,
+            site,
+            finish: ObservationFinish::InterruptForCaught {
+                selection: reverie::PreparedSignalToken {
+                    site,
+                    selection_nonce: 1,
+                },
+            },
+            ack: ack.clone(),
+        },
+    )
+    .unwrap();
+    s.drain_control_intents();
+    assert_eq!(ack.try_read(), Some(Ok(FinishAck::Interrupted)));
+    assert_eq!(s.ready_child_wait(tid, child_spec()), Some(child));
+    assert_eq!(
+        s.next_turns[&tid].protocol.owner,
+        NextTurnOwner::ReturningCaught {
+            completed_wait: c.continuation
+        }
+    );
+    assert!(s.next_turns[&tid].req.try_read().is_none());
+    assert!(s.next_turns[&tid].resp.try_read().is_none());
+    assert!(s.run_queue.contains_tid(tid));
+    assert!(!s.blocked.child_waiters.contains_key(&tid));
+    assert_eq!(s.parked.permits.get(&tid), Some(&c.permit));
+    s.select_parked_alarm().unwrap();
+    assert_eq!(b.permits.lock().unwrap().as_slice(), &[c.permit]);
+    let receipt = SignalBoundaryReceipt {
+        permit: c.permit,
+        outcome: SignalBoundaryOutcome::Caught,
+    };
+    s.consume_signal_boundary(receipt).unwrap();
+    s.consume_signal_boundary(receipt).unwrap();
+    assert_eq!(s.next_turns[&tid].protocol.owner, NextTurnOwner::Ordinary);
+    assert!(!s.parked.permits.contains_key(&tid));
+    assert_eq!(s.ready_child_wait(tid, child_spec()), Some(child));
+}
+
+#[test]
+fn child_wait_cancellation_and_terminal_receipt_cannot_restore_membership() {
+    for observed in [false, true] {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        add_process_child(&mut s, 100, 200);
+        let response = child_wait(&mut s, tid, mm, site, child_spec(), true);
+        if observed {
+            b.recipients.lock().unwrap().push(SignalRecipient {
+                task: task(100, 100),
+            });
+            s.select_parked_alarm().unwrap();
+            let c = selected(&response);
+            let ack = Ivar::new();
+            s.post_control(
+                tid,
+                mm,
+                ControlIntent::Finish {
+                    wait: c.continuation,
+                    lease: c.lease,
+                    site,
+                    finish: ObservationFinish::Terminate {
+                        selection: reverie::PreparedSignalToken {
+                            site,
+                            selection_nonce: 2,
+                        },
+                    },
+                    ack: ack.clone(),
+                },
+            )
+            .unwrap();
+            s.drain_control_intents();
+            assert_eq!(ack.try_read(), Some(Ok(FinishAck::Terminate)));
+            assert_eq!(s.parked.permits.get(&tid), Some(&c.permit));
+            let receipt = SignalBoundaryReceipt {
+                permit: c.permit,
+                outcome: SignalBoundaryOutcome::Terminated {
+                    group: false,
+                    wait_status: 14,
+                },
+            };
+            s.consume_signal_boundary(receipt).unwrap();
+            s.consume_signal_boundary(receipt).unwrap();
+        } else {
+            s.logically_kill_thread(&tid, &tid, mm);
+            assert!(matches!(
+                response.try_read(),
+                Some(SchedResponse::Signaled(None))
+            ));
+        }
+        assert!(!s.next_turns.contains_key(&tid));
+        assert!(!s.blocked.child_waiters.contains_key(&tid));
+        // Logical retirement is immediate; physical queue removal is deferred.
+        assert_eq!(
+            s.pending_run_queue_removals.get(&tid),
+            Some(&RemovalDisposition::Retire)
+        );
+        assert_eq!(s.run_queue.contains_tid(tid), observed);
+        assert!(!s.parked.permits.contains_key(&tid));
+        assert!(s.parked.requests.keys().all(|wait| wait.dettid != tid));
+        assert!(s.thread_is_logically_killed(tid));
+        let before_turn = s.turn;
+        let before_time = s.committed_time;
+        s.step2_drain_prefix().unwrap();
+        assert!(s.pending_run_queue_removals.is_empty());
+        assert!(s.pending_run_queue_admissions.is_empty());
+        assert_eq!(s.turn, before_turn);
+        assert_eq!(s.committed_time, before_time);
+        assert!(!s.next_turns.contains_key(&tid));
+        assert!(!s.blocked.child_waiters.contains_key(&tid));
+        assert!(!s.run_queue.contains_tid(tid));
+        assert!(!s.parked.permits.contains_key(&tid));
+        assert!(s.parked.requests.keys().all(|wait| wait.dettid != tid));
+        assert!(s.thread_is_logically_killed(tid));
+    }
+}
+
+#[test]
+fn child_wait_cross_signal_drain_retires_capability_before_due_alarm() {
+    // Blocked, queued, resumed after ignored observation, and pending child
+    // admission are all real positions at the prefix drain (before admissions).
+    for position in 0..4 {
+        for alarm_masked in [false, true] {
+            let (mut s, b) = fixture();
+            let (tid, mm, site) = add(&mut s, 100, 100);
+            let (child, _, _) = add_process_child(&mut s, 100, 200);
+            let spec = child_spec();
+            let mut response = child_wait(&mut s, tid, mm, site, spec, position != 1);
+            if position == 2 {
+                b.recipients.lock().unwrap().push(SignalRecipient {
+                    task: task(100, 100),
+                });
+                s.select_parked_alarm().unwrap();
+                response = resume_child_observation(&mut s, tid, mm, selected(&response));
+                assert_eq!(s.parked.requests.len(), 1);
+                b.recipients.lock().unwrap().clear();
+            }
+            if position == 3 {
+                s.logically_exited_processes.insert(child);
+                s.wake_child_waiters(tid, child);
+                assert!(s.pending_run_queue_admissions.contains_key(&tid));
+            }
+            let original = s.next_turns[&tid].req.clone();
+            s.replace_real_timer(tid, tid, at(0), at(10), at(0), Signal::SIGALRM)
+                .unwrap();
+            for signal in [
+                Signal::SIGUSR2,
+                Signal::SIGURG,
+                Signal::SIGALRM,
+                Signal::SIGUSR1,
+                Signal::SIGUSR2,
+            ] {
+                s.notify_signal_pending(tid, SigWrapper::from(signal));
+            }
+            let before_turn = s.turn;
+            s.step2_drain_prefix().unwrap();
+            assert!(!s.backend_failed());
+            assert!(s.pending_cross_task_signals.is_empty());
+            assert!(s.pending_run_queue_admissions.is_empty());
+            assert!(!s.blocked.child_waiters.contains_key(&tid));
+            assert!(s.run_queue.contains_tid(tid));
+            assert_ne!(s.next_turns[&tid].req, original);
+            assert_eq!(
+                s.next_turns[&tid].protocol.origin.unwrap().control,
+                ControlCapability::None
+            );
+            assert!(s.parked.requests.is_empty());
+            assert!(response.try_read().is_none());
+            assert_eq!(s.turn, before_turn);
+            // A second notification merges with the ordinary legacy batch.
+            s.notify_signal_pending(tid, SigWrapper::from(Signal::SIGWINCH));
+            s.step2_drain_prefix().unwrap();
+            let signals = vec![
+                Signal::SIGUSR1,
+                Signal::SIGUSR2,
+                Signal::SIGALRM,
+                Signal::SIGURG,
+                Signal::SIGWINCH,
+            ]
+            .into_iter()
+            .map(SigWrapper::from)
+            .collect::<Vec<_>>();
+            let resources = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+            assert_eq!(resources.resources.len(), 1);
+            assert_eq!(
+                resources
+                    .resources
+                    .get(&ResourceID::WaitidSignals(signals.clone())),
+                Some(&Permission::W)
+            );
+            // The shared alarm is published after the signal prefix and before
+            // selection, exactly where the stale ChildWait origin used to fail.
+            s.committed_time = at(10);
+            assert!(s.step2b_process_timed());
+            assert_eq!(b.publications.lock().unwrap().len(), 1);
+            if !alarm_masked {
+                b.recipients.lock().unwrap().push(SignalRecipient {
+                    task: task(100, 100),
+                });
+            }
+            s.select_parked_alarm().unwrap();
+            assert!(b.permits.lock().unwrap().is_empty());
+            assert!(response.try_read().is_none());
+            let (selected, _, selected_response) = s.step3_peek().unwrap();
+            assert_eq!(selected, tid);
+            assert!(
+                s.step4_resource_block(tid, &resources, &selected_response)
+                    .is_ok()
+            );
+            assert!(
+                s.step5_guest_unblock(tid, &resources, &selected_response)
+                    .is_ok()
+            );
+            assert!(
+                matches!(response.try_read(), Some(SchedResponse::Signaled(Some(actual))) if actual == signals)
+            );
+            // This is the ordinary grant/return-boundary route, never an
+            // unowned observation or an execution gate silently discarded.
+            let permit = s
+                .authorize_signal_boundary(task(100, 100))
+                .unwrap()
+                .unwrap();
+            assert_eq!(permit.site, None);
+            assert_eq!(s.parked.permits.get(&tid), Some(&permit));
+            s.run_queue.undo_tentative_pop();
+        }
+    }
+}
+
+#[test]
+fn child_wait_repark_after_legacy_signal_keeps_shared_alarm_eligible() {
+    for alarm_masked in [false, true] {
+        let (mut s, b) = fixture();
+        let (tid, mm, site) = add(&mut s, 100, 100);
+        add_process_child(&mut s, 100, 200);
+        let spec = child_spec();
+        let response = child_wait(&mut s, tid, mm, site, spec, true);
+        s.notify_signal_pending(tid, SigWrapper::from(Signal::SIGURG));
+        s.step2_drain_prefix().unwrap();
+        let resources = s.next_turns[&tid].req.try_read().unwrap().unwrap();
+        let (_, _, selected_response) = s.step3_peek().unwrap();
+        assert!(
+            s.step4_resource_block(tid, &resources, &selected_response)
+                .is_ok()
+        );
+        assert!(
+            s.step5_guest_unblock(tid, &resources, &selected_response)
+                .is_ok()
+        );
+        assert!(
+            matches!(response.try_read(), Some(SchedResponse::Signaled(Some(signals))) if signals == vec![SigWrapper::from(Signal::SIGURG)])
+        );
+        s.step6_reenquue(tid, false);
+        // The actual helper rechecks an ignored/blocked legacy signal and asks
+        // for the same ChildWait again. Drive its normal request/park here.
+        s.install_resource_origin(
+            tid,
+            ResourceOrigin {
+                rpc: RpcOrigin::DirectRequestResources,
+                mm,
+                control: ControlCapability::ChildWait { site },
+            },
+        )
+        .unwrap();
+        let mut resources = Resources::new(tid);
+        resources.insert(ResourceID::WaitChild { parent: tid, spec }, Permission::R);
+        resources.fyi("wait-child-lifecycle");
+        s.next_turns[&tid].req.put(Ok(resources.clone()));
+        let new_response = s.next_turns[&tid].resp.clone();
+        assert_eq!(s.step3_peek().unwrap().0, tid);
+        assert!(
+            s.step4_resource_block(tid, &resources, &new_response)
+                .is_err()
+        );
+        assert_eq!(s.blocked.child_waiters.get(&tid), Some(&(tid, spec)));
+        if !alarm_masked {
+            b.recipients.lock().unwrap().push(SignalRecipient {
+                task: task(100, 100),
+            });
+        }
+        s.select_parked_alarm().unwrap();
+        if alarm_masked {
+            assert!(new_response.try_read().is_none());
+            assert!(b.permits.lock().unwrap().is_empty());
+            assert_eq!(s.blocked.child_waiters.get(&tid), Some(&(tid, spec)));
+        } else {
+            assert_eq!(selected(&new_response).site, site);
+            assert!(!s.blocked.child_waiters.contains_key(&tid));
+            assert!(s.run_queue.contains_tid(tid));
+        }
+    }
+}
+
+#[test]
+fn child_wait_cross_signal_rejects_conflicting_ownership_before_rewrite() {
+    let (mut s, b) = fixture();
+    let (tid, mm, site) = add(&mut s, 100, 100);
+    add_process_child(&mut s, 100, 200);
+    let response = child_wait(&mut s, tid, mm, site, child_spec(), true);
+    let request = s.next_turns[&tid].req.clone();
+    // A pending admission cannot also own a still-blocked waiter. Keep the
+    // malformed-state guard rather than accepting any origin mismatch.
+    s.admit_to_run_queue(tid, AdmitIntent::Fixed(AdmitSide::Back));
+    s.notify_signal_pending(tid, SigWrapper::from(Signal::SIGUSR1));
+    s.drain_pending_cross_task_signals();
+    assert!(s.backend_failed());
+    assert_eq!(s.next_turns[&tid].req, request);
+    assert_eq!(
+        s.next_turns[&tid].protocol.origin.unwrap().control,
+        ControlCapability::ChildWait { site }
+    );
+    assert!(response.try_read().is_none());
+    assert!(b.permits.lock().unwrap().is_empty());
+}
