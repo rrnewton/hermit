@@ -2960,6 +2960,7 @@ fn self_test_runner_log_isolation_bracket() -> Result<String, String> {
 fn self_test() -> Result<(), String> {
     println!("  {}", self_test_runner_log_isolation_bracket()?);
     inner_freshness_skip_cli_bracket()?;
+    plan_export_dirtiness_bracket()?;
     run_owned_cache_bracket()?;
     run_state_path_bracket()?;
     println!(
@@ -8432,6 +8433,107 @@ fn worktree_dirty_at(git: fn() -> Command, root: &Path) -> bool {
     unstaged
         || !foreign_porcelain_at(git, root, &["ls-files", "--others", "--exclude-standard"])
             .is_empty()
+}
+
+/// The two dirtiness answers read once at admission.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct AdmissionDirtiness {
+    /// [`tree_dirty`]: the tree differs from HEAD in a way validate did not cause.
+    tree: bool,
+    /// [`worktree_dirty`]: the working tree carries changes `git add` would
+    /// capture. This answer drives the hard gate.
+    worktree: bool,
+}
+
+/// The output path of a plan export (`--write-constructed-dag` or
+/// `--write-generated-plan`), when this run is one.
+///
+/// The export block in `run` selects on this same function, so the run that
+/// skips the admission dirtiness reads is exactly the run that returns at that
+/// block.
+fn plan_export_path(args: &Args) -> Option<&PathBuf> {
+    args.write_constructed_dag
+        .as_ref()
+        .or(args.write_generated_plan.as_ref())
+}
+
+/// Read the admission dirtiness, except for a plan export.
+///
+/// A plan export executes nothing, the dirty-tree gate already ignores it, and
+/// it returns before any later reader of these answers. Reading them anyway
+/// walks the whole checkout up to three times (`git status` also visits every
+/// submodule), which was most of an export's system time; the
+/// `selftest.scorecard` node runs one export under a 15 CPU-second cap. `None`
+/// is not "clean": `run` takes the answers out with `expect` after the export
+/// block, so a reordering that let an export reach a reader would stop the run
+/// loudly instead of treating the checkout as clean.
+fn admission_dirtiness(
+    plan_export: bool,
+    read: impl FnOnce() -> AdmissionDirtiness,
+) -> Option<AdmissionDirtiness> {
+    if plan_export { None } else { Some(read()) }
+}
+
+/// A plan export never reads the admission dirtiness, and every other run
+/// reads it exactly once and keeps both answers.
+fn plan_export_dirtiness_bracket() -> Result<(), String> {
+    for flag in ["--write-constructed-dag", "--write-generated-plan"] {
+        let args = parse_argv(&["full".into(), flag.into(), "/tmp/plan.json".into()])
+            .map_err(|code| format!("plan export dirtiness: {flag} refused with exit {code}"))?;
+        if plan_export_path(&args) != Some(&PathBuf::from("/tmp/plan.json")) {
+            return Err(format!(
+                "plan export dirtiness: {flag} is not recognised as a plan export"
+            ));
+        }
+        let mut reads = 0;
+        let answer = admission_dirtiness(plan_export_path(&args).is_some(), || {
+            reads += 1;
+            AdmissionDirtiness {
+                tree: true,
+                worktree: true,
+            }
+        });
+        if reads != 0 || answer.is_some() {
+            return Err(format!(
+                "plan export dirtiness: {flag} read the checkout's dirtiness {reads} time(s)"
+            ));
+        }
+    }
+    for argv in [vec!["full".to_string()], vec!["--show-plan".to_string()]] {
+        let args = parse_argv(&argv)
+            .map_err(|code| format!("plan export dirtiness: {argv:?} refused with exit {code}"))?;
+        if plan_export_path(&args).is_some() {
+            return Err(format!(
+                "plan export dirtiness: {argv:?} was taken for a plan export"
+            ));
+        }
+        for expected in [
+            AdmissionDirtiness {
+                tree: true,
+                worktree: false,
+            },
+            AdmissionDirtiness {
+                tree: false,
+                worktree: true,
+            },
+        ] {
+            let mut reads = 0;
+            let answer = admission_dirtiness(plan_export_path(&args).is_some(), || {
+                reads += 1;
+                expected
+            });
+            if reads != 1 || answer != Some(expected) {
+                return Err(format!(
+                    "plan export dirtiness: {argv:?} read {reads} time(s) and kept {answer:?}, \
+                     expected one read keeping {expected:?}"
+                ));
+            }
+        }
+    }
+    println!(
+        "  plan export dirtiness: both export flags skip the checkout walks; other runs read both answers once"
+    );
+    Ok(())
 }
 
 /// Whether this checkout is one of ci-hub's disposable validate worktrees.
@@ -25298,16 +25400,19 @@ fn run(
     // that exists nowhere in history and cannot be reproduced or compared.
     // Skipped for a nested payload: the outer run already made this judgement
     // about the same checkout, and a second answer could only disagree.
-    let dirty_at_admission = tree_dirty();
-    let wt_dirty = worktree_dirty();
-    if args.write_constructed_dag.is_none()
-        && args.write_generated_plan.is_none()
-        && dirty_worktree_requires_refusal(
+    // A plan export neither runs this gate nor reads the answers; see
+    // [`admission_dirtiness`].
+    let admission = admission_dirtiness(plan_export_path(&args).is_some(), || AdmissionDirtiness {
+        tree: tree_dirty(),
+        worktree: worktree_dirty(),
+    });
+    if admission.is_some_and(|dirtiness| {
+        dirty_worktree_requires_refusal(
             nesting.nested,
-            wt_dirty,
+            dirtiness.worktree,
             args.skip_inner_dirty_working_tree_and_rebase_freshness_checks,
         )
-    {
+    }) {
         eprintln!("validate: refusing to run on a dirty working tree.");
         eprintln!(
             "  HEAD {} has uncommitted working-tree changes, so a record anchored to it",
@@ -25762,11 +25867,7 @@ fn run(
     // Print the plan and exit. This makes "what will actually run, and under what
     // caps" reviewable without spending a validate slot — and it is how the
     // declared-caps claim above can be checked by eye rather than trusted.
-    if let Some(path) = args
-        .write_constructed_dag
-        .as_ref()
-        .or(args.write_generated_plan.as_ref())
-    {
+    if let Some(path) = plan_export_path(&args) {
         if plan.second.is_some() {
             return RunSummary::refused(
                 2,
@@ -25805,6 +25906,11 @@ fn run(
             ],
         );
     }
+    // Every plan export returned just above, so the admission answers were read.
+    let AdmissionDirtiness {
+        tree: dirty_at_admission,
+        worktree: wt_dirty,
+    } = admission.expect("only a plan export skips the admission dirtiness, and it returned above");
     if args.show_plan {
         let mut all: Vec<&DagConfig> = vec![&plan.cfg];
         if let Some(s) = &plan.second {
