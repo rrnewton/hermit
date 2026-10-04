@@ -189,6 +189,20 @@ pub struct Config {
     pub backend_reports_signal_interrupted_external_io: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): backends that keep timerfds on the host kernel.
+    /// Detcore can drive timerfds from virtual time only when two things hold. First, one tool
+    /// instance holds the open file descriptions of every guest process, so a forked child shares a
+    /// timer with its parent instead of receiving a copy of it. Second, every guest wait that can
+    /// report a timerfd ready reaches Detcore's handlers. The ptrace backend, e9patch preprocessing
+    /// with the ptrace backend, and the LiteInst host hybrid give both. DBT, SaBRe and in-guest
+    /// LiteInst keep each process's Detcore state inside that process, where a fork copies it, and
+    /// the KVM runtime services `ppoll` without Detcore. On those backends timerfds stay host
+    /// kernel objects, as they were before Detcore modeled them.
+    #[serde(default = "default_true")]
+    #[clap(skip = true)]
+    pub backend_supports_virtual_timerfds: bool,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1125): Review backend-owned capability-control prctls.
     /// The execution backend virtualizes capability bounding-set and ambient-capability state.
     #[serde(default)]
@@ -1487,6 +1501,7 @@ mod tests {
         assert!(!config.backend_requires_thread_directed_process_signals);
         assert!(config.backend_supports_parked_write_signal_interruption);
         assert!(config.backend_reports_signal_interrupted_external_io);
+        assert!(config.backend_supports_virtual_timerfds);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);
     }

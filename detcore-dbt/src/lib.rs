@@ -376,11 +376,13 @@ fn load_dbt_config() -> (Config, ConfigSource) {
 /// [`load_dbt_config`] for an explicit [`DETCONFIG_ENV`] value.
 ///
 /// The ptrace-only capabilities are cleared whatever the source. `Config`
-/// defaults both to true, so a standalone run, an unparsable value, or a
-/// value that omits the field would otherwise claim them. DynamoRIO emulates
+/// defaults them to true, so a standalone run, an unparsable value, or a
+/// value that omits a field would otherwise claim them. DynamoRIO emulates
 /// the guest's signal mask inside the runtime, so neither the host thread's
 /// `/proc` signal state nor a report for every signal that interrupts a
-/// blocking call is available here.
+/// blocking call is available here. Each process's Detcore state lives in
+/// that process and a fork copies it, so a modeled timerfd would split into
+/// separate parent and child timers; timerfds stay host kernel objects.
 fn dbt_config_from(value: Option<&str>) -> (Config, ConfigSource) {
     let (mut config, source) = match value {
         Some(value) if !value.is_empty() => match serde_json::from_str::<Config>(value) {
@@ -393,6 +395,9 @@ fn dbt_config_from(value: Option<&str>) -> (Config, ConfigSource) {
     config.sequentialize_threads = true;
     config.backend_supports_parked_write_signal_interruption = false;
     config.backend_reports_signal_interrupted_external_io = false;
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): DBT keeps timerfds on the host kernel.
+    config.backend_supports_virtual_timerfds = false;
     (config, source)
 }
 
@@ -2407,6 +2412,42 @@ mod tests {
                 !config.backend_reports_signal_interrupted_external_io,
                 "{value:?}"
             );
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): DBT keeps timerfds on the host kernel.
+    #[test]
+    fn every_config_source_keeps_timerfds_on_the_host_kernel() {
+        let claims = serde_json::to_string(&Config {
+            backend_supports_virtual_timerfds: true,
+            ..Config::default()
+        })
+        .unwrap();
+        let mut omits: serde_json::Value = serde_json::from_str(&claims).unwrap();
+        assert!(
+            omits
+                .as_object_mut()
+                .unwrap()
+                .remove("backend_supports_virtual_timerfds")
+                .is_some()
+        );
+        let omits = omits.to_string();
+        // The field deserializes to true when absent, so this case would claim
+        // the capability without the reset.
+        let absent: Config = serde_json::from_str(&omits).unwrap();
+        assert!(absent.backend_supports_virtual_timerfds);
+
+        for (value, cli) in [
+            (Some(claims.as_str()), true),
+            (Some(omits.as_str()), true),
+            (Some("{not json"), false),
+            (Some(""), false),
+            (None, false),
+        ] {
+            let (config, source) = dbt_config_from(value);
+            assert_eq!(matches!(source, ConfigSource::Cli), cli, "{value:?}");
+            assert!(!config.backend_supports_virtual_timerfds, "{value:?}");
         }
     }
 

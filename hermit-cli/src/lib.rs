@@ -3013,6 +3013,16 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     // scheduler's pool, as before.
     config.backend_reports_signal_interrupted_external_io =
         matches!(backend, Backend::Ptrace | Backend::E9patch);
+    // Detcore models timerfds only where one tool instance holds every guest
+    // process's open files and every wait reaches Detcore: ptrace, e9patch
+    // preprocessing on ptrace, and the LiteInst host hybrid. A DBT, SaBRe or
+    // in-guest LiteInst fork copies the per-process model, and KVM's runtime
+    // polls host descriptors itself in ppoll, so those keep kernel timerfds.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): backends that keep timerfds on the host kernel.
+    config.backend_supports_virtual_timerfds =
+        matches!(backend, Backend::Ptrace | Backend::E9patch)
+            || (backend == Backend::Liteinst && !in_guest_liteinst);
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
@@ -5401,6 +5411,41 @@ mod tests {
                     .backend_reports_signal_interrupted_external_io,
                 expected,
                 "{backend:?}"
+            );
+        }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): backends that keep timerfds on the host kernel.
+    #[test]
+    fn only_single_tool_backends_model_timerfds() {
+        // Detcore models timerfds only where one tool instance holds every
+        // process's open files and every wait reaches Detcore. A DBT, SaBRe
+        // or in-guest LiteInst fork copies the model, and KVM polls host
+        // descriptors itself in ppoll.
+        for (backend, runtime, expected) in [
+            (Backend::Ptrace, LiteinstRuntime::HostHybrid, true),
+            (Backend::E9patch, LiteinstRuntime::HostHybrid, true),
+            (Backend::Liteinst, LiteinstRuntime::HostHybrid, true),
+            (Backend::Liteinst, LiteinstRuntime::InGuest, false),
+            (Backend::Dbt, LiteinstRuntime::HostHybrid, false),
+            (Backend::Sabre, LiteinstRuntime::HostHybrid, false),
+            (Backend::Kvm, LiteinstRuntime::HostHybrid, false),
+            // The LiteInst runtime selection changes no other backend.
+            (Backend::Ptrace, LiteinstRuntime::InGuest, true),
+            (Backend::Kvm, LiteinstRuntime::InGuest, false),
+        ] {
+            // Start from the opposite value so that a backend the function
+            // forgot to set is caught whichever default the field has.
+            let config = super::DetConfig {
+                backend_supports_virtual_timerfds: !expected,
+                ..super::DetConfig::default()
+            };
+            assert_eq!(
+                prepare_backend_config_for_liteinst_runtime(config, backend, runtime)
+                    .backend_supports_virtual_timerfds,
+                expected,
+                "{backend:?} {runtime:?}"
             );
         }
     }

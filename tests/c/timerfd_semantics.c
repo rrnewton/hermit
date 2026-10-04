@@ -54,9 +54,11 @@
  *   read_restart / read_eintr
  *       A blocking read interrupted by a handler restarts under SA_RESTART and
  *       fails with EINTR without it.
- *   fork_shared
+ *   fork_shared / fork_expired / fork_rearm / fork_disarm
  *       A forked child shares the open file description: its read consumes the
- *       expiration the parent then no longer sees.
+ *       expiration the parent then no longer sees, whether the timer expired
+ *       after the fork or before it, and when the child re-arms the timer to
+ *       fire soon or disarms it, the parent's timer is the one that changed.
  *   poll_cross_arm / poll_cross_rearm / epoll_cross_arm / epoll_cross_rearm
  *       Another thread arming a disarmed timer, or re-arming a distant one to
  *       fire soon, ends a blocked poll or epoll_wait when that timer fires,
@@ -113,6 +115,17 @@
  *   epoll_pwait_masked_ready
  *       epoll_pwait with a signal mask returns a ready pipe beside a distant
  *       timerfd, and an expired timerfd, without blocking.
+ *   ppoll_mixed / ppoll_ready / ppoll_disarmed / ppoll_ready_infinite
+ *       ppoll reports an expired timerfd beside a ready pipe, ends a finite
+ *       and an infinite wait when an armed timer fires, and times out when
+ *       the timer was disarmed before it could fire.
+ *
+ * With the single argument `sharing`, only fork_expired, fork_rearm,
+ * fork_disarm and the ppoll cases run. They check what a forked child shares
+ * and what a wait reports, and never compare an expiry with the guest's
+ * clock, so they also hold on backends that keep timerfds as host kernel
+ * objects (DBT, SaBRe, in-guest LiteInst and KVM). The other cases, fork_shared
+ * among them, time expiries against the guest's clock.
  */
 
 #define _GNU_SOURCE
@@ -637,6 +650,81 @@ static void check_fork_shared(void) {
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
         fail(name, "child_status=%ld%ld", (long)status, 0);
     else if (r != -1 || err != EAGAIN) fail(name, "parent_r=%ld errno=%ld", (long)r, err);
+    else ok(name);
+}
+
+/* The fork cases below wait for an expiry with poll rather than a sleep, so
+ * they hold whether the timer runs on the guest's clock or the host's. */
+static void wait_readable(int fd) {
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    while (poll(&pfd, 1, -1) < 0 && errno == EINTR) {
+    }
+}
+
+static void check_fork_expired(void) {
+    const char *name = "fork_expired";
+    int tfd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, 1 * MS, 0, 0);
+    wait_readable(tfd);
+    pid_t pid = fork();
+    if (pid == 0) {
+        uint64_t count = 0;
+        ssize_t r = read(tfd, &count, sizeof count);
+        _exit(r == 8 && count == 1 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    uint64_t count = 0;
+    errno = 0;
+    ssize_t r = read(tfd, &count, sizeof count);
+    int err = errno;
+    close(tfd);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        fail(name, "child_status=%ld%ld", (long)status, 0);
+    else if (r != -1 || err != EAGAIN) fail(name, "parent_r=%ld errno=%ld", (long)r, err);
+    else ok(name);
+}
+
+/* The child re-arms a distant timer to fire in 10 ms, or disarms one due in
+ * 30 ms; either way the parent's timer is the one that changed. */
+static void check_fork_rearm(int disarm) {
+    const char *name = disarm ? "fork_disarm" : "fork_rearm";
+    int tfd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, (disarm ? 30 : 100000) * MS, 0, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+        struct itimerspec its;
+        memset(&its, 0, sizeof its);
+        if (!disarm) its.it_value = ns_ts(10 * MS);
+        _exit(timerfd_settime(tfd, 0, &its, NULL) == 0 ? 0 : 1);
+    }
+    int status = 0;
+    waitpid(pid, &status, 0);
+    struct itimerspec cur;
+    memset(&cur, 0xff, sizeof cur);
+    int g = timerfd_gettime(tfd, &cur);
+    int64_t left = (int64_t)cur.it_value.tv_sec * 1000000000LL + cur.it_value.tv_nsec;
+    int64_t interval = (int64_t)cur.it_interval.tv_sec * 1000000000LL + cur.it_interval.tv_nsec;
+    uint64_t count = 0;
+    ssize_t r;
+    int err;
+    if (disarm) {
+        /* Long enough for the original arming to have fired. */
+        sleep_ns(60 * MS);
+    } else {
+        wait_readable(tfd);
+    }
+    errno = 0;
+    r = read(tfd, &count, sizeof count);
+    err = errno;
+    close(tfd);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+        fail(name, "child_status=%ld%ld", (long)status, 0);
+    else if (g != 0 || interval != 0) fail(name, "gettime=%ld interval_ns=%ld", g, (long)interval);
+    else if (disarm ? left != 0 : (left < 0 || left > 10 * MS))
+        fail(name, "left_ns=%ld%ld", (long)left, 0);
+    else if (disarm && (r != -1 || err != EAGAIN))
+        fail(name, "read=%ld errno=%ld", (long)r, err);
+    else if (!disarm && (r != 8 || count != 1))
+        fail(name, "read=%ld count=%ld", (long)r, (long)count);
     else ok(name);
 }
 
@@ -1219,6 +1307,54 @@ static void check_epoll_pwait_masked_ready(void) {
     else ok(name);
 }
 
+static void check_ppoll_mixed(void) {
+    const char *name = "ppoll_mixed";
+    int p[2];
+    if (ready_pipe(p) != 0) { fail(name, "pipe errno=%ld%ld", errno, 0); return; }
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 1 * MS, 0, 0);
+    wait_readable(tfd);
+    struct pollfd fds[2] = {{p[0], POLLIN, 0}, {tfd, POLLIN, 0}};
+    struct timespec zero = {0, 0};
+    int n = ppoll(fds, 2, &zero, NULL);
+    int bits = (fds[0].revents == POLLIN ? 1 : 0) + (fds[1].revents == POLLIN ? 2 : 0);
+    if (n != 2 || bits != 3) fail(name, "n=%ld bits=%ld", n, bits);
+    else ok(name);
+    close(p[0]);
+    close(p[1]);
+    close(tfd);
+}
+
+/* A timer armed 20 ms ahead ends a ppoll with a 5 s limit, or none. */
+static void check_ppoll_ready(int infinite) {
+    const char *name = infinite ? "ppoll_ready_infinite" : "ppoll_ready";
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 20 * MS, 0, 0);
+    struct pollfd pfd = {.fd = tfd, .events = POLLIN};
+    struct timespec limit = {5, 0};
+    int n = ppoll(&pfd, 1, infinite ? NULL : &limit, NULL);
+    uint64_t count = 0;
+    ssize_t r = n == 1 ? read(tfd, &count, sizeof count) : -1;
+    close(tfd);
+    if (n != 1 || pfd.revents != POLLIN) fail(name, "n=%ld revents=%ld", n, pfd.revents);
+    else if (r != 8 || count != 1) fail(name, "r=%ld count=%ld", (long)r, (long)count);
+    else ok(name);
+}
+
+/* A timer disarmed before it fires leaves a 100 ms ppoll to time out. */
+static void check_ppoll_disarmed(void) {
+    const char *name = "ppoll_disarmed";
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 20 * MS, 0, 0);
+    struct itimerspec off;
+    memset(&off, 0, sizeof off);
+    int s = timerfd_settime(tfd, 0, &off, NULL);
+    struct pollfd pfd = {.fd = tfd, .events = POLLIN};
+    struct timespec limit = {0, 100 * MS};
+    int n = ppoll(&pfd, 1, &limit, NULL);
+    close(tfd);
+    if (s != 0) fail(name, "settime=%ld errno=%ld", s, errno);
+    else if (n != 0 || pfd.revents != 0) fail(name, "n=%ld revents=%ld", n, pfd.revents);
+    else ok(name);
+}
+
 static void check_fine_periodic_sleep(int close_first) {
     const char *name = close_first ? "close_armed_sleep" : "periodic_sleep";
     int tfd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, 1000, 1000, 0);
@@ -1236,8 +1372,25 @@ static void check_fine_periodic_sleep(int close_first) {
     else ok(name);
 }
 
-int main(void) {
+/* The fork and ppoll cases that check sharing and readiness only, never the
+ * guest's clock; the `sharing` argument runs only these. */
+static void check_sharing_cases(void) {
+    check_fork_expired();
+    check_fork_rearm(0);
+    check_fork_rearm(1);
+    check_ppoll_mixed();
+    check_ppoll_ready(0);
+    check_ppoll_disarmed();
+    check_ppoll_ready(1);
+}
+
+int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IOLBF, 0);
+    if (argc > 1 && strcmp(argv[1], "sharing") == 0) {
+        check_sharing_cases();
+        printf("failures=%d\n", failures);
+        return failures == 0 ? 0 : 1;
+    }
     check_abstime("abstime_realtime", CLOCK_REALTIME);
     check_abstime("abstime_monotonic", CLOCK_MONOTONIC);
     check_abstime_past();
@@ -1286,6 +1439,7 @@ int main(void) {
     check_huge_relative("huge_relative", 17000000000L, 0);
     check_huge_relative("near_max_relative", 9223372035L, 999999999L);
     check_epoll_pwait_masked_ready();
+    check_sharing_cases();
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
 }
