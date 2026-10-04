@@ -9559,6 +9559,22 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
         "  cells with recorded observations: {observed} of {total}\n"
     ));
 
+    out.push_str(&render_provenance_disagreements(&tracked)?);
+    if different_observations > 0 {
+        out.push_str(&format!(
+            "      {different_observations} observation(s) were taken against a DIFFERENT detcore tree\n"
+        ));
+    }
+    if unknown_observations > 0 {
+        out.push_str(&format!(
+            "      {unknown_observations} observation(s) do not record a detcore tree, so their relation to HEAD:detcore is UNKNOWN\n"
+        ));
+    }
+    Ok(out)
+}
+
+/// The pressure/validate disagreement section of the evidence coverage report.
+fn render_provenance_disagreements(tracked: &TrackedCells) -> Result<String, String> {
     // ⚠️ DISAGREEMENT IS INFORMATION, NOT A COLLISION. Owner ruling. A pressure
     // test that stresses a cell harder than validate did and reaches a
     // different result is the system WORKING, so the two provenances are kept
@@ -9566,6 +9582,7 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
     // can never meet. Both results and both sample counts are printed, because
     // "pressure says determinism-failure" means something different at N=1 and
     // at N=40.
+    let mut out = String::new();
     let mut conflicts = Vec::new();
     for cell in &tracked.cells {
         let identities = cell
@@ -9620,26 +9637,54 @@ fn render_evidence_coverage(root: &Path) -> Result<String, String> {
                 &identity[..12.min(identity.len())],
                 pressure.results,
                 n(pressure),
-                pressure.invocations.len(),
+                recorded_runs(pressure),
                 validate.results,
                 n(validate),
-                validate.invocations.len(),
+                recorded_runs(validate),
             ));
         }
-    }
-    if different_observations > 0 {
-        out.push_str(&format!(
-            "      {different_observations} observation(s) were taken against a DIFFERENT detcore tree\n"
-        ));
-    }
-    if unknown_observations > 0 {
-        out.push_str(&format!(
-            "      {unknown_observations} observation(s) do not record a detcore tree, so their relation to HEAD:detcore is UNKNOWN\n"
-        ));
     }
     Ok(out)
 }
 
+/// How many recorded runs an observation holds, as the disagreement report
+/// prints it. A receipt (a canonical or backend-parity comparison) is one
+/// run. An invocation is one run unless it is the plain copy of a receipt
+/// ([`receipt_covers_plain_invocation`]): writers stored that copy beside
+/// every canonical pass until
+/// https://github.com/rrnewton/dev-hermit/issues/540, and still store it
+/// beside a canonical divergence and a parity row. So a canonical pass is
+/// one run in either storage form, and any other invocation counts once, as
+/// it did when the report printed the invocation count.
+fn recorded_runs(observation: &Observation) -> usize {
+    direct_comparison_receipts(observation).count()
+        + observation
+            .invocations
+            .iter()
+            .filter(|invocation| !receipt_covers_plain_invocation(observation, invocation))
+            .count()
+}
+
+/// A plain invocation (no outer attempt, no evidence digest) whose
+/// hermit_sha, run_id and result a receipt in the same observation already
+/// records. It adds no run and no result to that receipt.
+fn receipt_covers_plain_invocation(
+    observation: &Observation,
+    invocation: &ObservedInvocation,
+) -> bool {
+    let (None, None, Some(result)) = (
+        invocation.attempt,
+        invocation.evidence_sha256.as_ref(),
+        invocation.result,
+    ) else {
+        return false;
+    };
+    direct_comparison_receipts(observation).any(|(hermit_sha, run_id, _, comparison_result)| {
+        hermit_sha == invocation.hermit_sha
+            && run_id == invocation.run_id
+            && comparison_result == result
+    })
+}
 fn default_provenance() -> ObservationProvenance {
     ObservationProvenance::PressureTest
 }
@@ -14309,13 +14354,7 @@ fn direct_evidence_keys(
                             opaque = true;
                             continue;
                         };
-                        if direct_comparison_receipts(observation).any(
-                            |(hermit_sha, run_id, _, comparison_result)| {
-                                hermit_sha == invocation.hermit_sha
-                                    && run_id == invocation.run_id
-                                    && comparison_result == result
-                            },
-                        ) {
+                        if receipt_covers_plain_invocation(observation, invocation) {
                             continue;
                         }
                         DirectEvidenceKind::Result(result)
@@ -27180,6 +27219,109 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             )]
     {
         return Err("a canonical divergence lost its plain invocation".into());
+    }
+
+    // The pressure/validate disagreement report prints each side's recorded
+    // runs, because a disagreement at N=1 and at N=40 are different findings.
+    // Counting invocations made a receipt-only canonical pass read as zero
+    // runs (post-facto review of d3c63548055e946eacf5c3fc1dd123ee1b5bfe94).
+    // A canonical pass is one run whether it is stored as its receipt alone or
+    // beside the plain invocation copy that cells written before
+    // https://github.com/rrnewton/dev-hermit/issues/540 hold, and the legacy
+    // form prints what the invocation count printed.
+    for runs in [1usize, 3] {
+        let mut receipt_only = TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![bare_cell(&unlocated_id)],
+        };
+        let mut legacy_copies = Vec::new();
+        for run in 0..runs {
+            let mut row = recovered_pass_row.clone();
+            row.run_id = format!("fixture-disagreement-pass-{run}");
+            apply_validate_results(
+                &mut receipt_only,
+                &BTreeMap::from([(
+                    unlocated_id.clone(),
+                    vec![ResultCandidate {
+                        parity_history: false,
+                        evidence_identity: row.evidence_identity()?,
+                        path: PathBuf::from("fixture/results.jsonl"),
+                        row: row.clone(),
+                    }],
+                )]),
+                "sha-1",
+                "tree-1",
+                &depth_fixture,
+                true,
+                true,
+            )?;
+            legacy_copies.push(ObservedInvocation {
+                hermit_sha: row.hermit_sha.clone(),
+                run_id: row.run_id.clone(),
+                attempt: None,
+                evidence_sha256: None,
+                result: Some(ObservedResult::Pass),
+                argv: row.argv.clone(),
+                guest_argv: row.guest_argv.clone(),
+                env: row.env.clone(),
+                cwd: row.cwd.clone(),
+                shell_command: row.shell_command.clone(),
+                attempts: row
+                    .attempts
+                    .iter()
+                    .map(|attempt| {
+                        serde_json::from_value::<ObservedAttemptInvocation>(attempt.clone())
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|error| format!("disagreement fixture attempt unreadable: {error}"))?,
+            });
+        }
+        let validate_observation = receipt_only.cells[0].observations[0].clone();
+        if receipt_only.cells[0].observations.len() != 1
+            || validate_observation.provenance != ObservationProvenance::Validate
+            || validate_observation.canonical_comparisons.len() != runs
+            || !validate_observation.invocations.is_empty()
+        {
+            return Err(format!(
+                "{runs} canonical PASS run(s) were not stored as {runs} receipt(s) in one observation"
+            ));
+        }
+        let mut legacy = receipt_only.clone();
+        legacy.cells[0].observations[0]
+            .invocations
+            .extend(legacy_copies.iter().cloned());
+        if legacy.cells[0].observations[0].invocations.len() != runs {
+            return Err("the legacy disagreement fixture lost a plain invocation copy".into());
+        }
+        let mut pressure = validate_observation.clone();
+        pressure.provenance = ObservationProvenance::PressureTest;
+        pressure.results = BTreeSet::from([ObservedResult::DeterminismFailure]);
+        pressure.canonical_comparisons.clear();
+        pressure.invocations = BTreeSet::from([ObservedInvocation {
+            run_id: "fixture-disagreement-pressure".into(),
+            result: Some(ObservedResult::DeterminismFailure),
+            ..legacy_copies[0].clone()
+        }]);
+        pressure.first_divergent_record.record(Some(7));
+        let expected = format!(
+            concat!(
+                "         pressure: {{DeterminismFailure}} (positions from 1 run(s), 1 invocation(s))\n",
+                "         validate: {{Pass}} (positions from 0 run(s), {} invocation(s))\n",
+            ),
+            runs
+        );
+        for (label, mut cells) in [("receipt only", receipt_only), ("legacy copy", legacy)] {
+            cells.cells[0].observations.insert(0, pressure.clone());
+            let report = render_provenance_disagreements(&cells)?;
+            if !report.contains("1 cell(s) where PRESSURE AND VALIDATE DISAGREE")
+                || !report.ends_with(&expected)
+            {
+                return Err(format!(
+                    "the disagreement report miscounted {runs} canonical PASS run(s) stored as {label}: {report}"
+                ));
+            }
+        }
     }
 
     // Current producer ERROR diagnoses survive the real fold and stored reader,
