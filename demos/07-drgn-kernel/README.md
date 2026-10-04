@@ -12,8 +12,16 @@ the same task lists and the same difference between them.
 
 ## Prerequisites
 
-- Everything [demo 5](../05-qemu-boot/README.md#prerequisites) needs. If the
-  boot snapshot is missing, this demo runs demo 5 first.
+- Everything [demo 5](../05-qemu-boot/README.md#prerequisites) needs. The
+  snapshot's memory holds the guest's `/init`, which runs this demo's command,
+  so the demo restores the boot snapshot only when demo 5's record of it
+  (`<snapshot>.producer.json`) names that snapshot and the initramfs that
+  `demos/lib/qemu-assets.sh` builds now, the same check demo 6 makes. That the
+  snapshot exists is not enough. If the default snapshot is missing or has no
+  such record, this demo runs demo 5 to build it again. A snapshot named by
+  `DEMO07_SNAPSHOT_DISK` is never rebuilt: without a matching record the demo
+  stops and says how to rebuild it. Each pass checks its own copy of the
+  snapshot against the record again before QEMU restores it.
 - `drgn` on your `PATH` (see the [drgn documentation](https://drgn.readthedocs.io/)
   for installation).
 - `bpftool`, `gcc`, and `readelf`, used to turn the kernel's built-in type
@@ -182,7 +190,7 @@ Controls (environment variables):
 | `DEMO07_RUNS` | `2` | Number of independent passes; at least 2. |
 | `DEMO07_TASK_LIMIT` | `16` | Number of task rows printed (all rows are compared). |
 | `DEMO07_TIMEOUT` | `240` | Seconds allowed for the restore and for the advance. |
-| `DEMO07_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The demo 5 snapshot to restore. |
+| `DEMO07_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The demo 5 snapshot to restore. It is used only with demo 5's matching record; see Prerequisites. |
 | `DEMO07_SNAPSHOT_NAME` | `hermit-boot` | The snapshot's name inside the qcow2 file. |
 | `DEMO07_VMLINUX` | extracted from `bzImage` | A kernel ELF image with type information matching the guest kernel. |
 | `DEMO07_QEMU_BIOS`, `DEMO07_QEMU_LIBRARY_PATH` | unset | Firmware directory and library path for a QEMU installed in a non-standard location. |

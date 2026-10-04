@@ -139,12 +139,17 @@ class EvolutionLineTest(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(module, "_run_once", return_value=passes)
             )
+            # The boot snapshot check is tested in test_boot_snapshot_record.
+            ensure = stack.enter_context(
+                mock.patch.object(module, "_ensure_boot_snapshot")
+            )
             stack.enter_context(mock.patch.dict(os.environ, environment))
             stack.enter_context(contextlib.redirect_stdout(output))
             try:
                 status = module.main()
             except RuntimeError as error:
                 status = error
+        ensure.assert_called_once_with()
         lines = [
             line
             for line in output.getvalue().splitlines()

@@ -155,6 +155,15 @@ class QmpSocketPathTest(unittest.TestCase):
         inputs.mkdir(exist_ok=True)
         for name in ("hermit", "qemu", "bzImage", "initramfs.cpio.gz", "hermit-boot.qcow2"):
             (inputs / name).write_bytes(b"")
+        # The record demo 5 writes, so that start() restores the snapshot: a
+        # stand-in qemu-assets.sh in the checkout names the initramfs version.
+        script = self.work / "demos/lib/qemu-assets.sh"
+        script.parent.mkdir(parents=True, exist_ok=True)
+        script.write_text("INITRAMFS_VERSION=9\n")
+        snapshot = inputs / "hermit-boot.qcow2"
+        dc.write_boot_snapshot_record(
+            snapshot, dc.hash_file(snapshot), dc.initramfs_producer(self.work, inputs)
+        )
         return dh.GuestConfig(
             root=self.work,
             hermit=inputs / "hermit",
@@ -162,10 +171,11 @@ class QmpSocketPathTest(unittest.TestCase):
             kernel=inputs / "bzImage",
             initrd=inputs / "initramfs.cpio.gz",
             vmlinux=inputs / "vmlinux",
-            snapshot_disk=inputs / "hermit-boot.qcow2",
+            snapshot_disk=snapshot,
             snapshot_name="hermit-boot",
             advance_command="echo deterministic",
             artifact_dir=artifact_dir,
+            assets=inputs,
         )
 
     def _start_until_qmp_connect(self, artifact_dir: Path):
@@ -331,9 +341,14 @@ class TaskEvolutionResultTest(unittest.TestCase):
             stack.enter_context(
                 mock.patch.object(self.module, "_run_once", return_value=passes)
             )
+            # The boot snapshot check is tested in test_boot_snapshot_record.
+            ensure = stack.enter_context(
+                mock.patch.object(self.module, "_ensure_boot_snapshot")
+            )
             stack.enter_context(mock.patch.dict(os.environ, environment))
             stack.enter_context(contextlib.redirect_stdout(output))
             self.assertEqual(self.module.main(), 0)
+        ensure.assert_called_once_with()
         lines = output.getvalue().splitlines()
         results = [line for line in lines if line.startswith("RESULT: ")]
         self.assertEqual(len(results), 1, output.getvalue())

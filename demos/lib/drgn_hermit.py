@@ -22,9 +22,14 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
-from demo_common import hermit_tmp_args, make_socket_path
+from demo_common import (
+    BootSnapshotMismatch,
+    hermit_tmp_args,
+    make_socket_path,
+    verify_boot_snapshot,
+)
 from qemu_controller import KERNEL_COMMAND_LINE
 
 
@@ -80,6 +85,9 @@ class GuestConfig:
     snapshot_name: str
     advance_command: str
     artifact_dir: Path
+    # The asset directory whose initramfs.cpio.gz demo 5's record of
+    # snapshot_disk must name (verify_boot_snapshot).
+    assets: Path
     qemu_bios: Optional[Path] = None
     qemu_library_path: Optional[Path] = None
     timeout: float = 240.0
@@ -178,6 +186,65 @@ def _atomic_write(path: Path, data: bytes) -> None:
             os.unlink(temporary)
         except FileNotFoundError:
             pass
+
+
+def ensure_boot_snapshot(
+    snapshot: Path, root: Path, assets: Path, rebuild: Callable[[], None]
+) -> None:
+    """Use demo 5's boot snapshot only if it was booted from the current initramfs.
+
+    These are demo 6's rules (ensure_boot_snapshot in
+    demos/06-qemu-resume/run.py). The snapshot's memory holds the guest /init
+    that runs demo 7's command, so a snapshot booted from another initramfs runs
+    another /init (see verify_boot_snapshot). The default snapshot,
+    ``assets``/hermit-boot.qcow2, is built, or rebuilt, by ``rebuild``, which
+    runs demo 5. A snapshot named by DEMO07_SNAPSHOT_DISK is never built or
+    replaced here: if it is missing or does not match, this refuses and says how
+    to rebuild it. Its existence alone is never enough.
+    """
+    snapshot = Path(snapshot)
+    default_snapshot = Path(assets) / "hermit-boot.qcow2"
+    custom = snapshot != default_snapshot
+    if not snapshot.is_file():
+        if custom:
+            raise RuntimeError(
+                "missing custom boot snapshot: {}; produce it before demo 7".format(
+                    snapshot
+                )
+            )
+        print("Demo 5 boot snapshot missing; running demo 5 first...", flush=True)
+    else:
+        try:
+            verify_boot_snapshot(snapshot, root, assets)
+            return
+        except BootSnapshotMismatch as mismatch:
+            if custom:
+                raise RuntimeError(
+                    "refusing to restore the custom boot snapshot {} "
+                    "(DEMO07_SNAPSHOT_DISK): {}. The snapshot's memory holds the "
+                    "guest /init that runs demo 7's command, so a snapshot booted "
+                    "from another initramfs runs another /init; an /init from an "
+                    "older initramfs runs the command as root with the console as "
+                    "its standard input. Rebuild it by running demo 5 with "
+                    "QEMU_SNAPSHOT_DISK={} and the same QEMU_ASSETS, or unset "
+                    "DEMO07_SNAPSHOT_DISK to use the default snapshot, which demo 7 "
+                    "rebuilds itself".format(snapshot, mismatch, snapshot)
+                ) from mismatch
+            print(
+                "Demo 5 boot snapshot {} is not from the current initramfs: {}; "
+                "running demo 5 again to rebuild it...".format(snapshot, mismatch),
+                flush=True,
+            )
+    rebuild()
+    if not snapshot.is_file():
+        raise RuntimeError("Demo 5 did not produce {}".format(snapshot))
+    try:
+        verify_boot_snapshot(snapshot, root, assets)
+    except BootSnapshotMismatch as mismatch:
+        raise RuntimeError(
+            "Demo 5 ran, but {} still does not match the current initramfs: "
+            "{}".format(snapshot, mismatch)
+        ) from mismatch
 
 
 def ensure_vmlinux(kernel: Path, vmlinux: Path) -> Path:
@@ -885,6 +952,24 @@ class HermitGuestProgram:
             os.mkfifo(str(serial_pipe) + suffix)
         working_snapshot = self.run_dir / "snapshot.qcow2"
         shutil.copyfile(str(self.config.snapshot_disk), str(working_snapshot))
+        # Demo 5 does not take a lock, so it may have replaced the boot
+        # snapshot, or its record, after ensure_boot_snapshot checked them.
+        # Check the copy that QEMU restores, as demo 6 does.
+        try:
+            verify_boot_snapshot(
+                self.config.snapshot_disk,
+                self.config.root,
+                self.config.assets,
+                disk=working_snapshot,
+            )
+        except BootSnapshotMismatch as mismatch:
+            raise RuntimeError(
+                "the copy {} of the boot snapshot {} does not match demo 5's "
+                "record: {}; demo 5 may have replaced the boot snapshot after "
+                "demo 7 checked it, so run demo 7 again".format(
+                    working_snapshot, self.config.snapshot_disk, mismatch
+                )
+            ) from mismatch
         # Demo 5 records this virtio-blk device in the saved VM topology, and the
         # current initramfs waits for its command here rather than on serial. Supply
         # the real deterministic advance command before -loadvm, with the same

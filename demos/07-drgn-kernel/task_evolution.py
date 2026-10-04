@@ -6,6 +6,7 @@ guest's memory without running any code inside the guest.
 
 import os
 from pathlib import Path
+import subprocess
 import sys
 
 from drgn.helpers.linux.list import list_for_each_entry
@@ -16,7 +17,11 @@ ROOT = DEMOS_DIR.parent
 sys.path.insert(0, str(DEMOS_DIR / "lib"))
 
 from demo_common import hermit_binary  # noqa: E402
-from drgn_hermit import GuestConfig, program_from_hermit  # noqa: E402
+from drgn_hermit import (  # noqa: E402
+    GuestConfig,
+    ensure_boot_snapshot,
+    program_from_hermit,
+)
 
 
 ADVANCE_MARKER = b"__HERMIT_DEMO07_ADVANCE_DONE__"
@@ -58,9 +63,40 @@ def _config() -> GuestConfig:
         snapshot_name=os.environ.get("DEMO07_SNAPSHOT_NAME", "hermit-boot"),
         advance_command=DEFAULT_ADVANCE_COMMAND,
         artifact_dir=_required_path("DEMO07_ARTIFACTS"),
+        assets=_required_path("DEMO07_ASSETS"),
         qemu_bios=_optional_path("DEMO07_QEMU_BIOS"),
         qemu_library_path=_optional_path("DEMO07_QEMU_LIBRARY_PATH"),
         timeout=float(os.environ.get("DEMO07_TIMEOUT", "240")),
+    )
+
+
+def _rebuild_boot_snapshot() -> None:
+    """Run demo 5, which saves the default boot snapshot and its record."""
+    environment = dict(os.environ, QEMU_ASSETS=os.environ["DEMO07_ASSETS"])
+    subprocess.run(
+        ["make", "--no-print-directory", "-C", str(DEMOS_DIR), "demo5"],
+        cwd=str(ROOT),
+        env=environment,
+        check=True,
+    )
+
+
+def _ensure_boot_snapshot() -> None:
+    """Check demo 5's boot snapshot before any pass restores it.
+
+    The paths are compared as run.sh gave them, so the default snapshot,
+    $DEMO07_ASSETS/hermit-boot.qcow2, is rebuilt and any other is refused.
+    """
+    for variable in ("DEMO07_SNAPSHOT_DISK", "DEMO07_ASSETS"):
+        if not os.environ.get(variable):
+            raise RuntimeError(
+                "{} is not set; run demos/07-drgn-kernel/run.sh".format(variable)
+            )
+    ensure_boot_snapshot(
+        Path(os.environ["DEMO07_SNAPSHOT_DISK"]),
+        ROOT,
+        Path(os.environ["DEMO07_ASSETS"]),
+        _rebuild_boot_snapshot,
     )
 
 
@@ -142,6 +178,8 @@ def main() -> int:
         raise ValueError("DEMO07_RUNS must be at least 2 to prove reproducibility")
     if task_limit < 1:
         raise ValueError("DEMO07_TASK_LIMIT must be positive")
+    # Every pass restores a copy of this snapshot; start() checks each copy.
+    _ensure_boot_snapshot()
 
     baseline = None
     all_metrics = []
