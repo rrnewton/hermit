@@ -24,12 +24,21 @@ Base: `422f3f3a4e05353edd4f2449affc8df9241bdf51` (exact, fetched 2026-09-25).
 Guest mount namespace under Detcore is a launch-defined, immutable object:
 files.rs already records "Mount/unshare/setns are refused once Detcore
 starts". Membership of the deterministic guest view is therefore the launch
-namespace minus rows that are chosen determinism fidelity trade (real propagated mounts, excluded for determinism scope):
+namespace minus one class of rows, excluded as a chosen determinism fidelity
+trade (they are real propagated mounts, excluded for determinism scope):
 
-**Excluded class** — `fuse.squashfuse_ll` mounts under `/mnt/xarfuse/`:
-per-process ephemeral seed mounts created by host squashfuse infrastructure
-(mountpoint embeds uid + host cgroup PID), imported by shared propagation,
-lifetime bound to unrelated host processes. This is the PID-virtualization
+**Excluded class** — `fuse.squashfuse_ll` mounts whose mount point's last
+path component is a host seed name,
+`<hex>-seed-nspid<digits>_cgpid<digits>-ns-<digits>` (normally shown at
+`/mnt/xarfuse/uid-<uid>/<seed name>`): per-process ephemeral seed mounts
+created by host squashfuse infrastructure (the name embeds host namespace and
+cgroup PIDs), imported by shared propagation, lifetime bound to unrelated host
+processes. The rule keys on the seed name, not the directory, so a long-lived
+SquashFUSE mount such as `/mnt/xarfuse/stable-release` stays visible, and a
+changed guest root that displays the seed as `/xarfuse/uid-<uid>/<seed name>`
+still excludes the row the launch-time capture excluded. The one predicate is
+`detcore_model::procfs::is_ephemeral_host_seed_mount`, applied through the one
+filter `detcore_model::procfs::exclude_ephemeral_host_seed_mounts`. This is the PID-virtualization
 analogue for mounts: other tenants' runtime state. Everything else stays:
 kernel/system rows, shared filesystems (edenfs/manifold/btrfs), binds,
 overlays, tmpfs, and every Hermit-configured mount (`--mount`, container
@@ -57,19 +66,43 @@ procfs code (claims limited to ptrace — no liteinst/sabre cell changes);
 kvm path uses the same CLI provenance capture. Guest mount changes remain
 visible exactly as before: Hermit launch/configured mounts and all
 non-seed host rows (regression test asserts `/test`, edenfs, binds survive;
-unit test asserts non-seed squashfuse and non-fuse xarfuse rows survive).
+unit tests assert that a non-seed SquashFUSE row under `/mnt/xarfuse/` and a
+seed-named row of another filesystem type survive).
 
 ## Evidence
-- Unit: `ephemeral_host_seed_mount_class_is_precise`,
-  `seed_churn_does_not_change_guest_mountinfo_membership` (old leak fails:
-  churn variants differed before, identical after, through sanitize).
+- Unit (detcore-model): `ephemeral_host_seed_mount_class_is_the_seed_name`,
+  `seed_filter_drops_only_seed_rows_and_keeps_order`.
+- Unit (detcore): `seed_churn_does_not_change_guest_mountinfo_membership`
+  (old leak fails: churn variants differed before, identical after, through
+  sanitize), `retained_row_with_seed_parent_still_snapshots`, and the source
+  guard `snapshot_initializer_excludes_host_seed_mounts_at_both_captures`,
+  which fails if either capture in `initialize_procfs_snapshot` stops calling
+  the filter.
+- Unit (hermit-cli): `identity_capture_excludes_host_seed_mounts_and_keeps_order`.
 - E2E: guest `cat` view 101→86 rows, 0 xarfuse, `/test` + edenfs retained.
 - Cell: `system-utils/procfs-sanitized-paths` canonical verify **20/20
-  matched** under its manifest profile (no relaxations); cell re-enabled
-  with pinned evidence (`PROCFS_MOUNTINFO_2026_09_25_*`).
+  matched** under its manifest profile; cell re-enabled with pinned evidence
+  (`PROCFS_MOUNTINFO_2026_09_25_*`). That profile is not relaxation-free: the
+  manifest sets `rcb_time: false`, so every run carries `--no-rcb-time`. That
+  setting is inherited from main and was not added by this change;
+  `compare_io_buffers: true` is kept. The cell's earlier failures were
+  intermittent, and seed churn did not necessarily occur during the
+  qualification window, so the 20/20 shows the cell passes but does not by
+  itself show the exclusion works; the unit tests above carry that.
 
 ## Mounts view
-`/proc/<pid>/mounts` now carries the same exclusion (mounts grammar, ProcfsKind::Mounts), so the two guest views agree. KVM reverie-kvm proc_mounts capture is pre-existing and unmeasured. A retained row whose parent is an excluded seed still snapshots: the constructor's parent pass covers it and its parent id is rewritten deterministically (unit-tested, `retained_row_with_seed_parent_still_snapshots`).
+`/proc/<pid>/mounts` is not covered. It stays raw host passthrough, as on
+main, so it still lists seed rows and the two guest views disagree. Giving it
+the same exclusion and mountinfo's mount-point prefix rewrites is
+<https://github.com/rrnewton/hermit/issues/3719>. KVM reverie-kvm proc_mounts
+capture is pre-existing and unmeasured.
+
+The procfs snapshot capture writes raw kernel bytes into the guest's buffer
+before sanitizing, so excluded rows can be visible in buffer bytes past the
+returned length. That predates this change and affects every snapshotted
+procfs file: <https://github.com/rrnewton/hermit/issues/3718>.
+
+A retained row whose parent is an excluded seed still snapshots: the constructor's parent pass covers it and its parent id is rewritten deterministically (unit-tested, `retained_row_with_seed_parent_still_snapshots`).
 
 Residual: a guest program that itself drives host squashfuse seeds would
 not see its own post-launch seed mounts (they were never deterministic —
