@@ -9743,6 +9743,18 @@ struct FoldOutcome {
     skipped: Vec<(String, String)>,
 }
 
+/// Whether a matched report is one of the two consistent match shapes: a
+/// verified bitwise-identical match, or a verified stripped match that
+/// claims no bitwise parity (a stripped comparison cannot establish it).
+fn admitted_match_report(report: &canonical_verdict::VerificationReport) -> bool {
+    let stripped = report.comparison.as_ref().is_some_and(|comparison| {
+        comparison.strictness == canonical_verdict::LogCompareStrictness::Stripped
+    });
+    report.verdict == canonical_verdict::Verdict::Matched
+        && report.verified
+        && report.bitwise_parity != stripped
+}
+
 fn apply_pressure_summary(
     tracked: &mut TrackedCells,
     summary: &PressureSummary,
@@ -9908,6 +9920,26 @@ fn apply_pressure_summary(
                 display_id(&row.cell),
                 "incomplete invocation: a field is empty, or shell_command does not \
                  reconstruct from cwd, env and argv"
+                    .to_string(),
+            ));
+            continue;
+        }
+        // A typed match report supplies a pass only as one of the two shapes
+        // the validate fold admits: a verified bitwise-identical match, or a
+        // verified stripped match that claims no bitwise parity. Anything
+        // else, a canonical match without bitwise parity in particular, is
+        // refused here rather than stored as a weaker pass.
+        if result == ObservedResult::Pass
+            && row.verification.as_ref().is_some_and(|report| {
+                report.verdict == canonical_verdict::Verdict::Matched
+                    && !admitted_match_report(report)
+            })
+        {
+            skipped.push((
+                display_id(&row.cell),
+                "result pass carries a typed match report that is internally inconsistent: \
+                 neither a verified bitwise-identical match nor a verified stripped match \
+                 without bitwise parity"
                     .to_string(),
             ));
             continue;
@@ -17759,19 +17791,29 @@ fn read_current_pressure_evidence(
 /// that a retained canonical divergence measured.
 ///
 /// The pressure producer requires a canonical comparison and a canonical
-/// match, but this consumer reads summaries named on the command line, and
-/// the fold admits a `pass` row whatever its report says. So a pass counts as
-/// a canonical match only when its report is one (`require_canonical_match`:
-/// a canonical non-vacuous INFO comparison that is verified, matched and
-/// bitwise identical), and a divergence counts only when its report compared
-/// canonical evidence. Anything else, a below-L2 stripped match in
-/// particular, is evidence in another comparison domain: it cannot confirm,
-/// drift or retire a retained canonical result. A result without any report
-/// keeps its earlier treatment; the fold already refuses a divergence that
-/// has none.
+/// match for verify and replay rows, but this consumer reads summaries named
+/// on the command line, and the fold admits a `pass` row with no report or
+/// with either consistent match report (`admitted_match_report`), a stripped
+/// one included. So a pass counts as a canonical match only when its report
+/// is one (`require_canonical_match`: a canonical non-vacuous INFO comparison
+/// that is verified, matched and bitwise identical), and a divergence counts
+/// only when its report compared canonical evidence. Anything else, a
+/// below-L2 stripped match in particular, is evidence in another comparison
+/// domain: it cannot confirm, drift or retire a retained canonical result.
+///
+/// A pass without any report is not a canonical sample either. It shows no
+/// canonical match, so it cannot retire a retained canonical divergence; the
+/// producer requires no report for a chaos row, so a chaos pass is usually
+/// such a pass. A result without a verdict and without a report still
+/// counts, because it leaves the decision UNCHECKABLE in any comparison
+/// domain, and the fold already refuses a divergence that has no report.
 fn current_pressure_result_is_canonical(result: &CurrentPressureResult) -> bool {
     let Some(report) = result.summary.rows[0].verification.as_ref() else {
-        return true;
+        // A pass without a report shows no canonical match, so it cannot
+        // retire a retained canonical divergence. A result without a verdict
+        // leaves the decision UNCHECKABLE in any comparison domain, and the
+        // fold already refuses a divergence that has no report.
+        return result.result != ObservedResult::Pass;
     };
     if result.result == ObservedResult::Pass {
         report.require_canonical_match().is_ok()
@@ -22797,8 +22839,9 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         return Err("changed retained coordinates were not replaced as DRIFTED".into());
     }
 
-    let mut pass_row = pressure_at("pass", coordinates(None, None, None, None));
-    pass_row.verification = None;
+    // These passes carry the fixture's canonical bitwise match report, so the
+    // single-match and two-match rules below are tested on canonical samples.
+    let pass_row = pressure_at("pass", coordinates(None, None, None, None));
     let one_match = retained_coordinate_decision(
         retained_cell(vec![validate_candidate(
             "wrong-retained",
@@ -22835,7 +22878,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 validate_id.clone(),
                 vec![
                     current_run_at("same-cell-run-id", "/repo/match-one", pass_row.clone()),
-                    current_run_at("same-cell-run-id", "/repo/match-two", pass_row),
+                    current_run_at("same-cell-run-id", "/repo/match-two", pass_row.clone()),
                 ],
             )]),
             uncheckable: BTreeMap::new(),
@@ -22847,6 +22890,47 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         return Err(
             "two distinct matching runs did not classify a retained divergence as WRONG".into(),
         );
+    }
+    // A pass without a verification report shows no canonical comparison at
+    // all. Two of them are no canonical sample, so they cannot retire the
+    // retained canonical divergence: it is kept, without its positions.
+    let mut reportless_pass = pass_row.clone();
+    reportless_pass.verification = None;
+    let reportless = retained_coordinate_decision(
+        retained_cell(vec![validate_candidate(
+            "wrong-retained",
+            coordinates(Some(3), Some(30), Some(407), Some(7)),
+        )]),
+        &CurrentPressureEvidence {
+            results: BTreeMap::from([(
+                validate_id.clone(),
+                vec![
+                    current_run_at(
+                        "same-cell-run-id",
+                        "/repo/match-one",
+                        reportless_pass.clone(),
+                    ),
+                    current_run_at("same-cell-run-id", "/repo/match-two", reportless_pass),
+                ],
+            )]),
+            uncheckable: BTreeMap::new(),
+        },
+    );
+    if reportless.state != RetainedComparisonState::Uncheckable
+        || !matches!(
+            reportless.import,
+            ImportEvidence::Retained {
+                store_positions: false,
+                ..
+            }
+        )
+    {
+        return Err(format!(
+            "two distinct passes without a verification report retired a retained canonical \
+             divergence: {} ({})",
+            reportless.state.as_str(),
+            reportless.reason
+        ));
     }
 
     // COMPARISON DOMAINS. A reported pass is a canonical match only when its
@@ -23007,31 +23091,39 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         ));
     }
 
-    let mut intermittent_pass = pressure_at("pass", coordinates(None, None, None, None));
-    intermittent_pass.verification = None;
-    let intermittent = retained_coordinate_decision(
-        retained_cell(vec![validate_candidate(
-            "intermittent-retained",
-            fresh_coordinates,
-        )]),
-        &CurrentPressureEvidence {
-            results: BTreeMap::from([(
-                validate_id.clone(),
-                vec![
-                    current_run("intermittent-match", intermittent_pass),
-                    current_run(
-                        "intermittent-divergence",
-                        pressure_at("determinism-failure", fresh_coordinates),
-                    ),
-                ],
+    // A matching run beside a current divergence at the retained coordinate
+    // leaves it FRESH, whether the match is a canonical sample or a pass
+    // without a report that is not counted at all.
+    let mut reportless_intermittent_pass = canonical_pass.clone();
+    reportless_intermittent_pass.verification = None;
+    for (label, intermittent_pass) in [
+        ("canonical", canonical_pass.clone()),
+        ("reportless", reportless_intermittent_pass),
+    ] {
+        let intermittent = retained_coordinate_decision(
+            retained_cell(vec![validate_candidate(
+                "intermittent-retained",
+                fresh_coordinates,
             )]),
-            uncheckable: BTreeMap::new(),
-        },
-    );
-    if intermittent.state != RetainedComparisonState::Fresh {
-        return Err(
-            "a matching run hid a later current divergence at the retained coordinate".into(),
+            &CurrentPressureEvidence {
+                results: BTreeMap::from([(
+                    validate_id.clone(),
+                    vec![
+                        current_run("intermittent-match", intermittent_pass),
+                        current_run(
+                            "intermittent-divergence",
+                            pressure_at("determinism-failure", fresh_coordinates),
+                        ),
+                    ],
+                )]),
+                uncheckable: BTreeMap::new(),
+            },
         );
+        if intermittent.state != RetainedComparisonState::Fresh {
+            return Err(format!(
+                "a {label} matching run hid a later current divergence at the retained coordinate"
+            ));
+        }
     }
 
     let mut uncheckable_row = pressure_at(
@@ -38538,6 +38630,407 @@ mod post_verdict_transaction_tests {
         goalpost_write_retained_rows(&fixture, &[failed, stripped]);
         let result = import_results(&fixture.root, &fixture.options.results, &[path]);
         review3655_assert_failure_or_atomic_refusal(&fixture, &id, &before, result);
+    }
+
+    // https://github.com/rrnewton/hermit/pull/3655, post-landing review
+    // finding 3: a pressure pass supplies canonical retirement authority only
+    // through a canonical bitwise match report, and a canonical matched report
+    // without bitwise parity is refused rather than stored as a weaker pass.
+
+    /// The stripped compatibility cell's canonical `--verify-strict`
+    /// invocation at `measured`, as a passing pressure row records it.
+    fn review3655_canonical_pressure_invocation(measured: &str) -> PressureInvocation {
+        let row = canonical_divergence_row(measured, "canonical-pressure-run");
+        let mut invocation: PressureInvocation = serde_json::from_value(row).unwrap();
+        for attempt in &mut invocation.attempts {
+            attempt.outcome = "PASS".into();
+            attempt.status = Some(0);
+        }
+        invocation
+    }
+
+    fn review3655_typed_report(report: &JsonValue) -> canonical_verdict::VerificationReport {
+        canonical_verdict::VerificationReport::from_current_json_slice(
+            serde_json::to_string(report).unwrap().as_bytes(),
+        )
+        .unwrap()
+    }
+
+    /// Repetitions 1 and 2 of one invocation of `id`, both `pass`, each
+    /// carrying `verification`.
+    fn review3655_pressure_passes(
+        id: &CellId,
+        hermit_sha: &str,
+        detcore_tree: &str,
+        invocation: &PressureInvocation,
+        verification: Option<canonical_verdict::VerificationReport>,
+    ) -> PressureSummary {
+        PressureSummary {
+            schema: PRESSURE_SUMMARY_SCHEMA,
+            hermit_sha: hermit_sha.into(),
+            detcore_tree: detcore_tree.into(),
+            source_tree_dirty: false,
+            rows: (1..=2)
+                .map(|repetition| PressureSummaryRow {
+                    cell: id.clone(),
+                    repetition: Some(repetition),
+                    attempt: 1,
+                    result: "pass".into(),
+                    verification: verification.clone(),
+                    evidence_errors: Vec::new(),
+                    invocation: Some(invocation.clone()),
+                })
+                .collect(),
+        }
+    }
+
+    /// One current pressure result per row of `summary`, as
+    /// `read_current_pressure_evidence` splits a summary.
+    fn review3655_current_results(summary: &PressureSummary) -> Vec<CurrentPressureResult> {
+        summary
+            .rows
+            .iter()
+            .map(|row| CurrentPressureResult {
+                summary: PressureSummary {
+                    rows: vec![row.clone()],
+                    ..summary.clone()
+                },
+                result: ObservedResult::parse(&row.result).unwrap(),
+                coordinates: DivergenceCoordinates {
+                    scheduler_turn: None,
+                    virtual_nanoseconds: None,
+                    record: None,
+                    syscall: None,
+                },
+                missing_retained_logs: false,
+            })
+            .collect()
+    }
+
+    fn review3655_red_cell(id: &CellId) -> TrackedCells {
+        TrackedCells {
+            schema: SCHEMA,
+            projection: None,
+            cells: vec![TrackedCell {
+                id: id.clone(),
+                status: CellStatus::Red,
+                ci_disabled_reason: None,
+                not_applicable_reason: None,
+                last_tested: None,
+                observations: Vec::new(),
+                measurement: MeasurementState::NeverMeasured,
+                green_removal_reason: None,
+            }],
+        }
+    }
+
+    fn review3655_has_pressure_pass(cell: &TrackedCell) -> bool {
+        cell.observations.iter().any(|observation| {
+            observation.provenance == ObservationProvenance::PressureTest
+                && observation.results.contains(&ObservedResult::Pass)
+        })
+    }
+
+    /// Two distinct current pressure passes without a verification report
+    /// show no canonical comparison, so they cannot retire a retained
+    /// canonical divergence: it stays UNCHECKABLE and keeps no positions.
+    /// Two distinct canonical bitwise matches still retire it (WRONG), so the
+    /// authorized retirement path is unchanged.
+    #[test]
+    fn goalpost3655_untyped_pressure_passes_cannot_retire_a_canonical_divergence() {
+        let older = "a".repeat(40);
+        let newer = "b".repeat(40);
+        let (id, _) = stripped_row(&older);
+        let failed: ResultRow = serde_json::from_value(canonical_divergence_row(
+            &older,
+            "older-canonical-with-position",
+        ))
+        .unwrap();
+        let retained = || RetainedCellResults {
+            id: id.clone(),
+            domain: RetainedComparisonDomain::Canonical,
+            hermit_sha: older.clone(),
+            detcore_tree: "tree-1".into(),
+            depth: fold_depth(),
+            candidates: vec![ResultCandidate {
+                evidence_identity: failed.evidence_identity().unwrap(),
+                path: PathBuf::from("fixture/results.jsonl"),
+                row: failed.clone(),
+                parity_history: false,
+            }],
+        };
+        let invocation = review3655_canonical_pressure_invocation(&newer);
+        let decide = |verification: Option<canonical_verdict::VerificationReport>| {
+            let summary =
+                review3655_pressure_passes(&id, &newer, "tree-1", &invocation, verification);
+            retained_coordinate_decision(
+                retained(),
+                &CurrentPressureEvidence {
+                    results: BTreeMap::from([(id.clone(), review3655_current_results(&summary))]),
+                    uncheckable: BTreeMap::new(),
+                },
+            )
+        };
+
+        let untyped = decide(None);
+        assert_eq!(
+            untyped.state,
+            RetainedComparisonState::Uncheckable,
+            "two reportless passes decided the retained divergence: {}",
+            untyped.reason
+        );
+        assert!(
+            matches!(
+                untyped.import,
+                ImportEvidence::Retained {
+                    store_positions: false,
+                    ..
+                }
+            ),
+            "the retained divergence was not kept without its positions"
+        );
+        assert!(
+            untyped
+                .reason
+                .contains("no current run carries a canonical comparison"),
+            "{}",
+            untyped.reason
+        );
+
+        // Control: two distinct canonical bitwise matches retire it.
+        let canonical = review3655_typed_report(&verify_canonical_report(&newer));
+        canonical
+            .require_canonical_match()
+            .expect("control report must be a canonical bitwise match");
+        let retired = decide(Some(canonical));
+        assert_eq!(
+            retired.state,
+            RetainedComparisonState::Wrong,
+            "{}",
+            retired.reason
+        );
+        assert!(matches!(retired.import, ImportEvidence::None));
+    }
+
+    /// The same transaction through `import-results`: two reportless current
+    /// pressure passes leave the active canonical failure in place, while two
+    /// canonical bitwise matches still retire it.
+    #[test]
+    fn goalpost3655_untyped_pressure_passes_cannot_retire_a_canonical_divergence_through_import() {
+        for typed in [false, true] {
+            let _fixture_lock = history_fixture_lock();
+            let fixture = Fixture::new();
+            capture_empty_series(&fixture);
+            let older = fixture.options.results_head.clone().unwrap();
+            let newer = fixture.options.expected_head.clone();
+            let (id, stripped) = stripped_row(&newer);
+            let failed = canonical_divergence_row(&older, "older-canonical-with-position");
+            import_retained_rows(&fixture, std::slice::from_ref(&failed)).unwrap();
+            let before = read_history_files(&fixture.root).unwrap();
+            assert!(review3655_has_canonical_failure(tracked_cell(
+                &fixture.cells(),
+                &id
+            )));
+            let verification =
+                typed.then(|| review3655_typed_report(&verify_canonical_report(&newer)));
+            let summary = review3655_pressure_passes(
+                &id,
+                &newer,
+                &git_rev_parse(&fixture.root, "HEAD:detcore").unwrap(),
+                &review3655_canonical_pressure_invocation(&newer),
+                verification,
+            );
+            let path = fixture._directory.path().join("current-pressure.json");
+            fs::write(&path, serde_json::to_vec(&summary).unwrap()).unwrap();
+            goalpost_write_retained_rows(&fixture, &[failed, stripped]);
+            let result = import_results(&fixture.root, &fixture.options.results, &[path]);
+            if typed {
+                result.expect("two canonical bitwise matches are a valid import");
+                assert!(
+                    !review3655_has_canonical_failure(tracked_cell(&fixture.cells(), &id)),
+                    "two canonical bitwise matches did not retire the canonical failure"
+                );
+            } else {
+                review3655_assert_failure_or_atomic_refusal(&fixture, &id, &before, result);
+            }
+        }
+    }
+
+    /// A pressure pass whose canonical matched report claims no bitwise
+    /// parity is internally inconsistent, as it is in a validate row. The
+    /// pressure fold skips and names it instead of storing a weaker Pass, a
+    /// summary made only of such rows is refused, and the current-summary
+    /// reader used by `import-results` refuses the row. A stripped match that
+    /// claims bitwise parity is refused the same way. Controls: a canonical
+    /// bitwise match and a verified stripped match without bitwise parity are
+    /// still admitted.
+    #[test]
+    fn goalpost3655_a_pressure_canonical_match_without_bitwise_parity_stays_refused() {
+        let measured = "b".repeat(40);
+        let (id, _) = stripped_row(&measured);
+        let invocation = review3655_canonical_pressure_invocation(&measured);
+        let mut no_bitwise = verify_canonical_report(&measured);
+        no_bitwise["bitwise_parity"] = false.into();
+        let no_bitwise = review3655_typed_report(&no_bitwise);
+        no_bitwise
+            .require_canonical_comparison()
+            .expect("the report compares canonical evidence");
+        assert!(no_bitwise.verified && no_bitwise.verdict == canonical_verdict::Verdict::Matched);
+        assert!(no_bitwise.require_canonical_match().is_err());
+        let mut stripped_bitwise: JsonValue =
+            serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+        stripped_bitwise["bitwise_parity"] = true.into();
+        let stripped_bitwise = review3655_typed_report(&stripped_bitwise);
+
+        for (label, report) in [
+            ("canonical match without bitwise parity", &no_bitwise),
+            ("stripped match claiming bitwise parity", &stripped_bitwise),
+        ] {
+            let summary = review3655_pressure_passes(
+                &id,
+                &measured,
+                "tree-1",
+                &invocation,
+                Some(report.clone()),
+            );
+            let mut tracked = review3655_red_cell(&id);
+            let error = apply_pressure_summary(
+                &mut tracked,
+                &summary,
+                &measured,
+                "tree-1",
+                &BTreeMap::new(),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{label}: the pressure fold stored the rows"));
+            assert!(
+                error.contains("every one of the 2 offered row(s) was untrustworthy")
+                    && error.contains("internally inconsistent"),
+                "{label}: {error}"
+            );
+            assert!(
+                !review3655_has_pressure_pass(&tracked.cells[0])
+                    && tracked.cells[0].observations.is_empty()
+                    && tracked.cells[0].last_tested.is_none(),
+                "{label}: a refused fold changed the cell"
+            );
+            let one = PressureSummary {
+                rows: vec![summary.rows[0].clone()],
+                ..summary.clone()
+            };
+            let error = checked_current_pressure_result(&review3655_red_cell(&id), one, "tree-1")
+                .err()
+                .unwrap_or_else(|| panic!("{label}: the current-summary reader admitted the row"));
+            assert!(
+                error.contains("internally inconsistent"),
+                "{label}: {error}"
+            );
+
+            // Beside a valid canonical pass, the row is skipped and named,
+            // and only the valid row is stored.
+            let mut mixed = review3655_pressure_passes(
+                &id,
+                &measured,
+                "tree-1",
+                &invocation,
+                Some(review3655_typed_report(&verify_canonical_report(&measured))),
+            );
+            mixed.rows[1].verification = Some(report.clone());
+            let mut tracked = review3655_red_cell(&id);
+            let outcome =
+                apply_pressure_summary(&mut tracked, &mixed, &measured, "tree-1", &BTreeMap::new())
+                    .unwrap();
+            assert_eq!(outcome.rows, 1, "{label}");
+            assert_eq!(outcome.skipped.len(), 1, "{label}");
+            assert!(
+                outcome.skipped[0].1.contains("internally inconsistent"),
+                "{label}: {:?}",
+                outcome.skipped
+            );
+        }
+
+        // Controls: both admitted match reports are stored as passes.
+        let mut stripped: JsonValue = serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap();
+        stripped["bitwise_parity"] = false.into();
+        for (label, report) in [
+            (
+                "canonical bitwise match",
+                review3655_typed_report(&verify_canonical_report(&measured)),
+            ),
+            (
+                "stripped match without bitwise parity",
+                review3655_typed_report(&stripped),
+            ),
+        ] {
+            let summary =
+                review3655_pressure_passes(&id, &measured, "tree-1", &invocation, Some(report));
+            let mut tracked = review3655_red_cell(&id);
+            let outcome = apply_pressure_summary(
+                &mut tracked,
+                &summary,
+                &measured,
+                "tree-1",
+                &BTreeMap::new(),
+            )
+            .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!((outcome.rows, outcome.skipped.len()), (2, 0), "{label}");
+            assert!(review3655_has_pressure_pass(&tracked.cells[0]), "{label}");
+        }
+    }
+
+    /// The same refusal through the writers: `update-observations` refuses a
+    /// summary whose only passes carry a canonical match without bitwise
+    /// parity and leaves history unchanged, and `import-results` stores no
+    /// pressure pass from it and keeps the active canonical failure.
+    #[test]
+    fn goalpost3655_a_pressure_canonical_match_without_bitwise_parity_is_refused_by_the_writers() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        capture_empty_series(&fixture);
+        let older = fixture.options.results_head.clone().unwrap();
+        let newer = fixture.options.expected_head.clone();
+        let (id, stripped) = stripped_row(&newer);
+        let detcore_tree = git_rev_parse(&fixture.root, "HEAD:detcore").unwrap();
+        assert_eq!(git_head(&fixture.root).unwrap(), newer);
+        let mut no_bitwise = verify_canonical_report(&newer);
+        no_bitwise["bitwise_parity"] = false.into();
+        let summary = review3655_pressure_passes(
+            &id,
+            &newer,
+            &detcore_tree,
+            &review3655_canonical_pressure_invocation(&newer),
+            Some(review3655_typed_report(&no_bitwise)),
+        );
+        let path = fixture._directory.path().join("no-bitwise-pressure.json");
+        fs::write(&path, serde_json::to_vec(&summary).unwrap()).unwrap();
+
+        let before = read_history_files(&fixture.root).unwrap();
+        let error = update_observations(&fixture.root, std::slice::from_ref(&path), false)
+            .expect_err("update-observations stored a canonical match without bitwise parity");
+        assert!(
+            error.contains("every one of the 2 offered row(s) was untrustworthy")
+                && error.contains("internally inconsistent"),
+            "{error}"
+        );
+        assert!(
+            read_history_files(&fixture.root).unwrap() == before,
+            "the refusing update changed history"
+        );
+        assert!(!review3655_has_pressure_pass(tracked_cell(
+            &fixture.cells(),
+            &id
+        )));
+
+        let failed = canonical_divergence_row(&older, "older-canonical-with-position");
+        import_retained_rows(&fixture, std::slice::from_ref(&failed)).unwrap();
+        let before = read_history_files(&fixture.root).unwrap();
+        goalpost_write_retained_rows(&fixture, &[failed, stripped]);
+        let result = import_results(&fixture.root, &fixture.options.results, &[path]);
+        review3655_assert_failure_or_atomic_refusal(&fixture, &id, &before, result);
+        assert!(
+            !review3655_has_pressure_pass(tracked_cell(&fixture.cells(), &id)),
+            "the import stored a pressure pass from a canonical match without bitwise parity"
+        );
     }
 
     // Expect FAIL at c900554692a6, PASS with the F2 storage/binding changes absent:
