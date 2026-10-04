@@ -149,9 +149,11 @@ fn documented_roots(metadata: &serde_json::Value) -> Result<Vec<(PathBuf, Kind)>
 /// invoked. NAME may be a metavariable (`mod $name;`) and the declaration may
 /// sit inside a repetition (`$(mod $name;)*`) or follow a `{` on the same line.
 /// `mod NAME {` declares no file, and neither does text in a string literal or
-/// a `/* */` comment that closes on the same line.
+/// a `/* */` comment that closes on the same line. A line whose literals this
+/// cannot delimit is matched as written, so a declaration after one is still
+/// seen.
 fn declares_a_module_file(line: &str) -> bool {
-    let code = without_literals(line);
+    let code = without_literals(line).unwrap_or_else(|| line.to_string());
     let mut rest = code.as_str();
     while let Some(at) = rest.find("mod") {
         let before = rest[..at].chars().next_back();
@@ -176,17 +178,26 @@ fn declares_a_module_file(line: &str) -> bool {
 }
 
 /// `line` with the contents of its string literals, character literals and
-/// `/* */` comments replaced by spaces.
-fn without_literals(line: &str) -> String {
+/// `/* */` comments replaced by spaces, or `None` when a string or comment
+/// does not close on the line or a string is raw (`r"..."`, `r#"..."#`), whose
+/// end this does not find. The line may then be the end of a string opened
+/// earlier, or a raw string may hold a `"` or end in `\`.
+fn without_literals(line: &str) -> Option<String> {
     let bytes = line.as_bytes();
     let mut code = String::with_capacity(line.len());
     let mut index = 0;
     while index < bytes.len() {
         let skip_to = match bytes[index] {
             b'"' => {
+                if bytes[..index].iter().rev().find(|b| **b != b'#') == Some(&b'r') {
+                    return None;
+                }
                 let mut end = index + 1;
                 while end < bytes.len() && bytes[end] != b'"' {
                     end += if bytes[end] == b'\\' { 2 } else { 1 };
+                }
+                if end >= bytes.len() {
+                    return None;
                 }
                 end + 1
             }
@@ -195,9 +206,9 @@ fn without_literals(line: &str) -> String {
                 .iter()
                 .position(|b| *b == b'\'')
                 .map_or(index + 1, |offset| index + offset + 3),
-            b'/' if bytes.get(index + 1) == Some(&b'*') => line[index + 2..]
-                .find("*/")
-                .map_or(bytes.len(), |offset| index + offset + 4),
+            b'/' if bytes.get(index + 1) == Some(&b'*') => {
+                index + 4 + line[index + 2..].find("*/")?
+            }
             _ => {
                 let c = line[index..].chars().next().unwrap_or(' ');
                 code.push(c);
@@ -212,7 +223,7 @@ fn without_literals(line: &str) -> String {
         code.extend(std::iter::repeat_n(' ', skip_to - index));
         index = skip_to;
     }
-    code
+    Some(code)
 }
 
 /// `line` without its visibility qualifier (`pub`, `pub(crate)`, ...).
@@ -1401,6 +1412,14 @@ pub fn g() {}
             "[mod $n;]",
             "mod r#x;",
             "#[path = \"é.rs\"] mod x;",
+            // Strings this cannot delimit: raw ones, and the closing line of
+            // one that opened earlier.
+            "let s = r\"\\\"; mod x;",
+            "let s = r#\"a\"b\"#; mod x;",
+            "end\"; mod x;",
+            "let s = r#\"a\"b\"#; mod x; let t = r#\"c\"d\"#;",
+            "let s = r\"\\\"; mod x; let c = '\"';",
+            "f(/* open; mod x;",
         ] {
             assert!(declares_a_module_file(line), "{line}");
         }
@@ -1514,6 +1533,29 @@ pub fn g() {}
         .unwrap();
         let error = module_tree(&directory.join("lib.rs")).unwrap_err();
         assert!(error.contains("lib.rs:2: "), "{error}");
+        // A `mod x;` inside a string in a macro body declares nothing, but one
+        // after a raw string or after the end of a string opened on an earlier
+        // line is not lost to it (review of
+        // https://github.com/rrnewton/hermit/pull/3758).
+        fs::write(
+            directory.join("lib.rs"),
+            "macro_rules! m {\n    () => { const S: &str = \" mod x;\"; };\n}\n",
+        )
+        .unwrap();
+        let tree: Vec<PathBuf> = module_tree(&directory.join("lib.rs")).unwrap();
+        assert_eq!(tree, [directory.join("lib.rs")]);
+        for body in [
+            "const S: &str = r#\"a\"b\"#; mod $n;",
+            "const S: &str = \"one\nline\"; mod $n;",
+        ] {
+            fs::write(
+                directory.join("lib.rs"),
+                format!("macro_rules! decl {{\n    ($n:ident) => {{\n        {body}\n    }};\n}}\ndecl!(e);\n"),
+            )
+            .unwrap();
+            let error = module_tree(&directory.join("lib.rs")).unwrap_err();
+            assert!(error.contains("declares a file"), "{body}: {error}");
+        }
         fs::remove_dir_all(&directory).unwrap();
     }
 
