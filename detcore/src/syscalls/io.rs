@@ -635,11 +635,9 @@ fn scm_rights_fds(control: &[u8]) -> Vec<i32> {
             break;
         }
         if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
-            fds.extend(
-                control[offset + header_len..end]
-                    .chunks_exact(std::mem::size_of::<i32>())
-                    .filter_map(|chunk| chunk.try_into().ok().map(i32::from_ne_bytes)),
-            );
+            let (descriptors, _partial) =
+                control[offset + header_len..end].as_chunks::<{ std::mem::size_of::<i32>() }>();
+            fds.extend(descriptors.iter().copied().map(i32::from_ne_bytes));
         }
         let Some(next) = offset.checked_add(cmsg_align(header.cmsg_len)) else {
             break;
@@ -656,7 +654,7 @@ fn scm_rights_fds(control: &[u8]) -> Vec<i32> {
 /// The (address, length) of a message header's control buffer, if it has one.
 fn message_control(message: &libc::msghdr) -> Option<(usize, usize)> {
     (!message.msg_control.is_null() && message.msg_controllen != 0)
-        .then(|| (message.msg_control as usize, message.msg_controllen))
+        .then_some((message.msg_control as usize, message.msg_controllen))
 }
 
 fn socket_timestamp_messages(control: &[u8]) -> Vec<SocketTimestampMessage> {
