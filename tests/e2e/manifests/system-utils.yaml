@@ -1287,20 +1287,20 @@ test:
         backends_enabled:
           - ptrace
         backends_disabled:
-          dbt: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
-          kvm: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
-          sabre: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
-          liteinst: The procfs read sanitizers are backend-independent; ptrace is the enabled diagnostic witness, but no backend is CI-qualified
+          dbt: The procfs read sanitizers are backend-independent; ptrace is the required CI witness and no other backend is CI-qualified
+          kvm: The procfs read sanitizers are backend-independent; ptrace is the required CI witness and no other backend is CI-qualified
+          sabre: The procfs read sanitizers are backend-independent; ptrace is the required CI witness and no other backend is CI-qualified
+          liteinst: The procfs read sanitizers are backend-independent; ptrace is the required CI witness and no other backend is CI-qualified
       replay:
         ci: false
         backends_enabled: []
         backends_disabled:
-          ptrace: The verify guest owns these assertions, but its ptrace tuple is quarantined from required CI
+          ptrace: The verify guest owns these assertions, and its ptrace tuple is required in CI
           dbt: Record/replay is unsupported by DBT
           kvm: Record/replay is unsupported by KVM
           sabre: Record/replay is unsupported by SaBRe
           liteinst: Record/replay is unsupported by LiteInst
-        ci_disabled_reason: 'NOT-EXERCISED: the verify guest owns these assertions, but its ptrace tuple is quarantined from required CI.'
+        ci_disabled_reason: 'NOT-EXERCISED: the verify guest owns these assertions, and its ptrace tuple is required in CI.'
       chaos:
         ci: false
         backends_enabled: []
@@ -1310,7 +1310,7 @@ test:
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
           liteinst: Chaos scheduling is unsupported by LiteInst
-        ci_disabled_reason: 'NOT-EXERCISED: no scheduling surface; the verify guest owns these assertions but is not CI-qualified.'
+        ci_disabled_reason: 'NOT-EXERCISED: no scheduling surface; the verify guest owns these assertions, and its ptrace tuple is required in CI.'
       custom:
         ci: false
         backends_enabled: []
@@ -1320,7 +1320,7 @@ test:
           kvm: No edge-case Hermit arguments are required
           sabre: No edge-case Hermit arguments are required
           liteinst: No edge-case Hermit arguments are required
-        ci_disabled_reason: 'NOT-EXERCISED: the verify guest owns these assertions, but its ptrace tuple is quarantined from required CI.'
+        ci_disabled_reason: 'NOT-EXERCISED: the verify guest owns these assertions, and its ptrace tuple is required in CI.'
   - id: system-utils/du-tree-summary
     description: GNU du recursively traverses and byte-accounts the shared e2e tree under Hermit
     lane: portable

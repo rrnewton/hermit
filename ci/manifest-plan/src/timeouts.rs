@@ -78,8 +78,10 @@ pub const PTRACE_2026_09_24_EVIDENCE_SHA: &str = "17effafddad25b445d21beb33fd74b
 pub const PTRACE_2026_09_24_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T03:15:24Z";
 pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// One ptrace verify cell re-selected after the guest mount model excluded
-/// ephemeral per-process host FUSE seed mounts (`fuse.squashfuse_ll` under
-/// `/mnt/xarfuse/`): `system-utils/procfs-sanitized-paths` passed twenty
+/// ephemeral per-process host FUSE seed mounts (`fuse.squashfuse_ll` mounts
+/// whose last path component is a host seed name,
+/// `<hex>-seed-nspid<digits>_cgpid<digits>-ns-<digits>`):
+/// `system-utils/procfs-sanitized-paths` passed twenty
 /// consecutive `test-harness run` repetitions, each one first-attempt PASS, at
 /// the evidence head under its manifest comparison profile
 /// (`compare_io_buffers: true, rcb_time: false`), with 14 `fuse.squashfuse_ll`
