@@ -72,6 +72,7 @@ use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
 use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
+use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::FailureClass;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
@@ -817,6 +818,25 @@ fn validate_selection_shape(selection: &CellSelection) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Prefix of the named resource that [`dbt_host_tmp_resource`] gives each
+/// DBT test.
+const DBT_HOST_TMP_RESOURCE_PREFIX: &str = "dbt_host_tmp:";
+
+/// The named resource that keeps two DBT cells of one test from running at
+/// the same time, or `None` for any other backend.
+///
+/// Hermit's other backends give the guest a private `/tmp`; a DBT guest
+/// reads and writes the host's (https://github.com/rrnewton/hermit/issues/3637).
+/// Hermit gives the guest the same pid in every run, so a test names its
+/// temporary files the same way each time, and two DBT runs of one test that
+/// overlap remove or rewrite each other's files. The name belongs to the
+/// test, not the cell, because every mode of a test writes the same files.
+/// The plan grants each name one unit. This decides only when a cell may
+/// start; its command and environment do not change.
+fn dbt_host_tmp_resource(cell: &CellId) -> Option<String> {
+    (cell.backend == "dbt").then(|| format!("{DBT_HOST_TMP_RESOURCE_PREFIX}{}", cell.test))
 }
 
 /// The prefix a cell's harness command starts with: [`DBT_NAMESPACE_WRAPPER`]
@@ -4573,6 +4593,9 @@ fn require_cell_occupancy_fits(
     })?;
     let mut all_seconds = 0_i64;
     let mut kvm_seconds = 0_i64;
+    // Every run of one DBT test, of any mode or repetition, holds that test's
+    // one `dbt_host_tmp_resource` unit, so those runs take turns.
+    let mut serial_seconds = BTreeMap::<String, i64>::new();
     for tracked in cells {
         let budget = budgets
             .get(&(
@@ -4600,20 +4623,42 @@ fn require_cell_occupancy_fits(
                 "the selected KVM cells exceed the supported occupancy range".to_string()
             })?;
         }
+        if let Some(resource) = dbt_host_tmp_resource(&tracked.id) {
+            let serial = serial_seconds.entry(resource).or_default();
+            *serial = serial.checked_add(seconds).ok_or_else(|| {
+                format!(
+                    "the selected cells of DBT test {} exceed the supported occupancy range",
+                    tracked.id.test
+                )
+            })?;
+        }
     }
     // The generated graph permits at most the retained manifest guest cap. If
     // every selected cell consumes its declared cap, this resource limit imposes
-    // this minimum wall time even before build and preparation work. Refuse an
-    // impossible public bound instead of printing a command which cannot satisfy
-    // its own contract.
+    // this minimum wall time even before build and preparation work. The runs
+    // of one DBT test hold one unit between them, so the largest such sum is a
+    // floor of its own however wide the guest caps are. Refuse an impossible
+    // public bound instead of printing a command which cannot satisfy its own
+    // contract.
     let guest_width = jobs.clamp(1, manifest_guest_cap);
     let guest_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
     let kvm_width = jobs.min(manifest_guest_cap).clamp(1, kvm_guest_cap);
     let kvm_floor = kvm_seconds / kvm_width + i64::from(kvm_seconds % kvm_width != 0);
-    let occupancy_floor = guest_floor.max(kvm_floor);
+    let (serial_resource, serial_floor) = serial_seconds
+        .iter()
+        .max_by_key(|(_, seconds)| **seconds)
+        .map_or(("", 0), |(resource, seconds)| (resource.as_str(), *seconds));
+    let occupancy_floor = guest_floor.max(kvm_floor).max(serial_floor);
     if occupancy_floor >= run_timeout_seconds {
+        let serial_note = if serial_floor >= run_timeout_seconds {
+            format!(
+                " (the cells of one DBT test run one at a time, and {serial_resource} alone declares {serial_floor}s)"
+            )
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs}, manifest_guest={manifest_guest_cap}, and kvm_guest={kvm_guest_cap}, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample, reduce --repetitions, adjust safe guest caps, or deliberately raise --run-timeout",
+            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs}, manifest_guest={manifest_guest_cap}, and kvm_guest={kvm_guest_cap}{serial_note}, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample, reduce --repetitions, adjust safe guest caps, or deliberately raise --run-timeout",
             i64::try_from(cells.len())
                 .unwrap_or(i64::MAX)
                 .saturating_mul(repetitions)
@@ -5175,6 +5220,9 @@ fn write_plan_after_scorecard_check(
             if cell.backend == "kvm" {
                 resources.insert("kvm_guest".into(), 1);
             }
+            if let Some(resource) = dbt_host_tmp_resource(cell) {
+                resources.insert(resource, 1);
+            }
             let deps = selected_cell_dependencies(
                 selection.is_exact(),
                 selection.uses_shared_preparation(),
@@ -5300,6 +5348,12 @@ fn write_plan_after_scorecard_check(
         ("manifest_guest".into(), selection.manifest_guest_cap()),
         ("kvm_guest".into(), selection.kvm_guest_cap()),
     ]);
+    dag.resource_caps.extend(
+        cells
+            .iter()
+            .filter_map(|tracked| dbt_host_tmp_resource(&tracked.id))
+            .map(|resource| (resource, 1)),
+    );
     dag.default_step_timeout = max_timeout;
     dag.default_step_cpu_timeout = max_timeout * 2;
     dag.steps = steps;
@@ -5431,6 +5485,12 @@ fn audit_dag(
                     "{tag} requests {demand} unit(s) of {resource}, but the DAG grants {capacity}"
                 ));
             }
+            if resource.starts_with(DBT_HOST_TMP_RESOURCE_PREFIX) && (*demand != 1 || capacity != 1)
+            {
+                return Err(format!(
+                    "{tag} requests {demand} of {capacity} unit(s) of {resource}; one DBT test's host /tmp admits exactly one cell"
+                ));
+            }
         }
         for dep in &step.deps {
             deps.push((tag.clone(), dep.clone()));
@@ -5479,6 +5539,16 @@ fn audit_dag(
         }
         if tag == "pressure.summarize" {
             summaries += 1;
+        }
+    }
+    // The loop above checks the grants that steps demand. A grant no step
+    // demands is still part of the plan, so every DBT host /tmp grant must be
+    // exactly the one unit `dbt_host_tmp_resource` promises.
+    for (resource, capacity) in &dag.resource_caps {
+        if resource.starts_with(DBT_HOST_TMP_RESOURCE_PREFIX) && *capacity != 1 {
+            return Err(format!(
+                "the DAG grants {capacity} unit(s) of {resource}; one DBT test's host /tmp admits exactly one cell"
+            ));
         }
     }
     for (tag, dep) in deps {
@@ -6818,13 +6888,17 @@ fn repetition_passed_cleanly(terminal_result: &str, result_rows: &[CellResult]) 
 /// Qualifying a sample is stricter than the retained legacy clean-pass count.
 /// One framework attempt may contain several declared seeds or subruns; every
 /// one must pass, and none may be an error or a timed-out observation.
-fn qualifying_subruns(mode: &str, attempts: &[AttemptResult]) -> bool {
+fn qualifying_subruns(
+    mode: &str,
+    declared: Option<&ExpectedGuestExit>,
+    attempts: &[AttemptResult],
+) -> bool {
     let mut indices = BTreeSet::new();
     !attempts.is_empty()
         && attempts.iter().all(|attempt| {
             !attempt.index.trim().is_empty()
                 && indices.insert(attempt.index.as_str())
-                && retained_pressure_attempt(mode, attempt).is_ok_and(|retained| {
+                && retained_pressure_attempt(mode, declared, attempt).is_ok_and(|retained| {
                     retained.outcome == "PASS"
                         && retained.error_kind.is_none()
                         && !retained.timed_out
@@ -6864,6 +6938,7 @@ fn canonical_pressure_comparison(mode: &str, report: &VerificationReport) -> boo
 
 fn retained_pressure_attempt(
     mode: &str,
+    declared: Option<&ExpectedGuestExit>,
     attempt: &AttemptResult,
 ) -> Result<SeriesPressureAttempt, String> {
     // The runner reads comparison reports only for these modes. Its generic
@@ -7001,7 +7076,7 @@ fn retained_pressure_attempt(
         timed_out: attempt.timed_out,
         comparison,
     };
-    retained.validate_for_mode(mode)?;
+    retained.validate_for_mode(mode, declared)?;
     Ok(retained)
 }
 
@@ -7015,7 +7090,9 @@ fn retained_typed_no_comparison(cell: &CellId, artifact_dir: &Path, rows: &[Cell
     let Some(attempt) = row.attempts.first() else {
         return false;
     };
-    let Ok(retained) = retained_pressure_attempt(&cell.mode, attempt) else {
+    let Ok(retained) =
+        retained_pressure_attempt(&cell.mode, row.expected_guest_exit.as_ref(), attempt)
+    else {
         return false;
     };
     if !retained
@@ -7102,10 +7179,21 @@ fn inner_pressure_history(
                     row.attempt
                 ));
             }
-            let retained = retained_pressure_attempt(&row.mode, attempt)?;
+            let retained =
+                retained_pressure_attempt(&row.mode, row.expected_guest_exit.as_ref(), attempt)?;
             if let Some(category) = inner_pressure_category(&retained) {
                 categories.insert(category);
             }
+        }
+        // The per-attempt check above admits a declared exit on Hermit's
+        // status alone. A row is credited only as the full summary credits it
+        // ([`matched_attempts_end_as_declared`]): the report and the invocation
+        // must corroborate the declaration too.
+        if !matched_attempts_end_as_declared(row) {
+            return Err(format!(
+                "outer attempt {} passed a matched comparison that does not end as its cell declares: a declared guest exit counts only from verify run with --verify-allow=failure, with Hermit's status, the report's guest disposition and both compared outputs all naming the declaration",
+                row.attempt
+            ));
         }
     }
     Ok(categories)
@@ -7135,7 +7223,12 @@ fn repetition_qualifies_for_promotion(terminal_result: &str, rows: &[CellResult]
         && rows[0].result == Some(ObservedResult::Pass)
         && rows[0].failure_class.is_none()
         && !rows[0].source_tree_dirty
-        && qualifying_subruns(&rows[0].mode, &rows[0].attempts)
+        && qualifying_subruns(
+            &rows[0].mode,
+            rows[0].expected_guest_exit.as_ref(),
+            &rows[0].attempts,
+        )
+        && matched_attempts_end_as_declared(&rows[0])
 }
 
 fn repeated_run_has_unacceptable_product_result(
@@ -10578,6 +10671,196 @@ fn pressure_sample_classification_self_test() -> Result<(), String> {
     Ok(())
 }
 
+/// A DBT cell, and no other, holds the one unit of its test's
+/// [`dbt_host_tmp_resource`] in every plan form: an exact cell, two
+/// repetitions of one exact cell, a cells-file batch, and the green batch.
+/// So the runner never starts a DBT cell while another DBT cell of the same
+/// test is running.
+fn dbt_host_tmp_self_test(
+    root: &Path,
+    checked_scorecard: &CheckedScorecard<'_>,
+    scratch: &Path,
+    green_batch_dag: &DagConfig,
+) -> Result<(), String> {
+    let host_tmp_check = |step: &Step, dag: &DagConfig, dbt: bool| -> Result<(), String> {
+        let held: Vec<_> = step
+            .hint
+            .resources
+            .iter()
+            .filter(|(name, _)| name.starts_with(DBT_HOST_TMP_RESOURCE_PREFIX))
+            .collect();
+        let exclusive = match held.as_slice() {
+            [] => !dbt,
+            [(name, demand)] => {
+                let test = name
+                    .strip_prefix(DBT_HOST_TMP_RESOURCE_PREFIX)
+                    .unwrap_or_default();
+                dbt && **demand == 1
+                    && dag.resource_caps.get(name.as_str()) == Some(&1)
+                    && step
+                        .cmd
+                        .contains(&format!(" --test {} ", shell_quote(test)))
+            }
+            _ => false,
+        };
+        if exclusive {
+            Ok(())
+        } else {
+            Err(format!(
+                "{} {} the one unit of its own test's host /tmp: {:?}",
+                step.tag(),
+                if dbt { "does not hold" } else { "holds" },
+                step.hint.resources
+            ))
+        }
+    };
+    let one_cell_step = |name: &str, dag: &DagConfig| -> Result<Step, String> {
+        let cells: Vec<_> = dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .collect();
+        match cells.as_slice() {
+            [step] => Ok((*step).clone()),
+            _ => Err(format!("{name} has {} cell steps, not one", cells.len())),
+        }
+    };
+    let batch_is_dbt = |step: &Step| step.cmd.contains("--backend 'dbt'");
+    // One verify cell of each kind, red when the red population has one and
+    // green otherwise, so the check does not depend on how many DBT cells are
+    // green today.
+    let red = pressure_cells(root, &CellSelection::default())?;
+    let green = pressure_cells(
+        root,
+        &CellSelection {
+            green: true,
+            repetitions: Some(1),
+            ..CellSelection::default()
+        },
+    )?;
+    for dbt in [true, false] {
+        let (cell, green_population) = red
+            .selected
+            .iter()
+            .map(|cell| (cell, false))
+            .chain(green.selected.iter().map(|cell| (cell, true)))
+            .find(|(cell, _)| cell.id.mode == "verify" && (cell.id.backend == "dbt") == dbt)
+            .ok_or_else(|| {
+                format!(
+                    "self-test needs one executable {} verify cell, red or green",
+                    if dbt { "DBT" } else { "non-DBT" }
+                )
+            })?;
+        let plan = |form: &str, selection: &CellSelection| {
+            let results = scratch.join(format!("host-tmp-{form}-{}", cell.id.backend));
+            write_plan_after_scorecard_check(
+                checked_scorecard,
+                &results,
+                &results.join("dag.json"),
+                selection,
+            )
+            .map(|(_, dag)| dag)
+        };
+        let exact = plan(
+            "exact",
+            &CellSelection {
+                green: green_population,
+                test: Some(cell.id.test.clone()),
+                mode: Some(cell.id.mode.clone()),
+                backend: Some(cell.id.backend.clone()),
+                repetitions: Some(1),
+                run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                ..CellSelection::default()
+            },
+        )?;
+        let label = display_id(&cell.id);
+        let exact_step = one_cell_step(&format!("exact plan for {label}"), &exact)?;
+        host_tmp_check(&exact_step, &exact, dbt)?;
+        if dbt {
+            // Two repetitions of one DBT test share its one unit, so the
+            // runner cannot start the second until the first has ended.
+            let repeated = plan(
+                "repeated",
+                &CellSelection {
+                    green: green_population,
+                    test: Some(cell.id.test.clone()),
+                    mode: Some(cell.id.mode.clone()),
+                    backend: Some(cell.id.backend.clone()),
+                    repetitions: Some(2),
+                    run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                    ..CellSelection::default()
+                },
+            )?;
+            let host_tmp = dbt_host_tmp_resource(&cell.id);
+            let repetitions: Vec<_> = repeated
+                .steps
+                .iter()
+                .filter(|step| step.group == "cell")
+                .collect();
+            if repetitions.len() != 2
+                || repetitions.iter().any(|step| {
+                    host_tmp
+                        .as_ref()
+                        .and_then(|name| step.hint.resources.get(name))
+                        != Some(&1)
+                })
+            {
+                return Err(format!(
+                    "the two repetitions of {label} do not both hold its host /tmp resource"
+                ));
+            }
+            for step in repetitions {
+                host_tmp_check(step, &repeated, true)?;
+            }
+        }
+        if green_population {
+            // Every green cell is in the green batch, which is checked below.
+            if !green_batch_dag
+                .steps
+                .iter()
+                .any(|step| step.group == "cell" && batch_is_dbt(step) == dbt)
+            {
+                return Err(format!(
+                    "green batch has no {} cell step, although {label} is green",
+                    if dbt { "DBT" } else { "non-DBT" }
+                ));
+            }
+        } else {
+            let cells_file = scratch.join(format!("host-tmp-{}.jsonl", cell.id.backend));
+            fs::write(
+                &cells_file,
+                canonical_cells_jsonl(std::slice::from_ref(&cell.id))?,
+            )
+            .map_err(|error| error.to_string())?;
+            let batch = plan(
+                "batch",
+                &CellSelection {
+                    cells_file: Some(cells_file),
+                    repetitions: Some(1),
+                    run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+                    ..CellSelection::default()
+                },
+            )?;
+            let step = one_cell_step(&format!("cells-file plan for {label}"), &batch)?;
+            if batch_is_dbt(&step) != dbt {
+                return Err(format!(
+                    "cells-file plan for {label} selected another backend"
+                ));
+            }
+            host_tmp_check(&step, &batch, dbt)?;
+        }
+    }
+    // The complete green batch: every backend and mode.
+    for step in green_batch_dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+    {
+        host_tmp_check(step, green_batch_dag, batch_is_dbt(step))?;
+    }
+    Ok(())
+}
+
 /// A DBT cell's harness, and no other cell's, starts under
 /// [`DBT_NAMESPACE_WRAPPER`], in both harness forms: an exact cell launches
 /// `target/debug/test-harness` directly, and a batch launches it through
@@ -12175,6 +12458,49 @@ fn self_test(root: &Path) -> Result<(), String> {
         .insert("manifest_guest".into(), 0);
     if audit_dag(&ungrantable_resource, 1, 100, &fixture_timeouts).is_ok() {
         return Err("step whose named resource demand exceeds capacity was accepted".into());
+    }
+    // A DBT test's host /tmp is one unit that one cell holds alone.
+    let host_tmp = dbt_host_tmp_resource(&CellId {
+        lane: "portable".into(),
+        category: "fixture".into(),
+        test: "fixture".into(),
+        mode: "verify".into(),
+        backend: "dbt".into(),
+    })
+    .ok_or("a DBT cell has no host /tmp resource")?;
+    let mut exclusive_host_tmp = fixture.clone();
+    exclusive_host_tmp.steps[0]
+        .hint
+        .resources
+        .insert(host_tmp.clone(), 1);
+    exclusive_host_tmp.resource_caps.insert(host_tmp.clone(), 1);
+    audit_dag(&exclusive_host_tmp, 1, 100, &fixture_timeouts)
+        .map_err(|e| format!("positive DBT host /tmp bracket failed: {e}"))?;
+    let exclusive_host_tmp_round_trip = dag_from_json(&dag_to_json(&exclusive_host_tmp))
+        .map_err(|e| format!("cannot reparse DBT host /tmp fixture: {e}"))?;
+    assert_plan_round_trip(&exclusive_host_tmp, &exclusive_host_tmp_round_trip)
+        .map_err(|e| format!("DBT host /tmp round-trip bracket failed: {e}"))?;
+    let mut shared_host_tmp = exclusive_host_tmp.clone();
+    shared_host_tmp.resource_caps.insert(host_tmp.clone(), 2);
+    let mut doubled_host_tmp = shared_host_tmp.clone();
+    doubled_host_tmp.steps[0].hint.resources.insert(host_tmp, 2);
+    for (label, dag) in [
+        ("capacity", &shared_host_tmp),
+        ("demand", &doubled_host_tmp),
+    ] {
+        if audit_dag(dag, 1, 100, &fixture_timeouts).is_ok() {
+            return Err(format!(
+                "a DBT test's host /tmp with a {label} of two units was accepted"
+            ));
+        }
+    }
+    // A grant no step demands is part of the plan too.
+    let mut unused_host_tmp = fixture.clone();
+    unused_host_tmp
+        .resource_caps
+        .insert(format!("{DBT_HOST_TMP_RESOURCE_PREFIX}unused"), 2);
+    if audit_dag(&unused_host_tmp, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("a two-unit DBT host /tmp grant that no step demands was accepted".into());
     }
     let mut widened_cell_timeout = fixture.clone();
     widened_cell_timeout.steps[0].timeout = 21;
@@ -14214,6 +14540,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 .into(),
         );
     }
+    dbt_host_tmp_self_test(root, &checked_scorecard, &scratch, &green_batch_dag)?;
     dbt_namespace_wrapper_self_test(root, &checked_scorecard, &scratch, &green_batch_dag)?;
     let mut missing_green_artifact = green_batch_dag.clone();
     missing_green_artifact
@@ -18197,24 +18524,29 @@ mod pressure_sample_tests {
         second.index = "2".into();
         assert!(qualifying_subruns(
             "naked",
+            None,
             &[first.clone(), second.clone()]
         ));
-        assert!(!qualifying_subruns("naked", &[]));
+        assert!(!qualifying_subruns("naked", None, &[]));
         for outcome in ["FAIL", "ERROR", "HOST-INAPPLICABLE", "UNKNOWN"] {
             let mut failed = first.clone();
             failed.outcome = outcome.into();
             assert!(
-                !qualifying_subruns("naked", &[failed, second.clone()]),
+                !qualifying_subruns("naked", None, &[failed, second.clone()]),
                 "{outcome}"
             );
         }
         let mut timed_out = first.clone();
         timed_out.timed_out = true;
-        assert!(!qualifying_subruns("naked", &[timed_out, second.clone()]));
+        assert!(!qualifying_subruns(
+            "naked",
+            None,
+            &[timed_out, second.clone()]
+        ));
         let mut error = first.clone();
         error.error_kind = Some("infrastructure".into());
-        assert!(!qualifying_subruns("naked", &[error, second]));
-        assert!(!qualifying_subruns("naked", &[first.clone(), first]));
+        assert!(!qualifying_subruns("naked", None, &[error, second]));
+        assert!(!qualifying_subruns("naked", None, &[first.clone(), first]));
         for mode in ["naked", "custom"] {
             let mut expected_nonzero = no_result_attempt("not_run", Some("cpu-timeout"));
             expected_nonzero.outcome = "PASS".into();
@@ -18223,10 +18555,11 @@ mod pressure_sample_tests {
             let before = serde_json::to_value(&expected_nonzero).unwrap();
             assert!(qualifying_subruns(
                 mode,
+                None,
                 std::slice::from_ref(&expected_nonzero)
             ));
             assert!(
-                retained_pressure_attempt(mode, &expected_nonzero)
+                retained_pressure_attempt(mode, None, &expected_nonzero)
                     .unwrap()
                     .comparison
                     .is_none()
@@ -18234,15 +18567,15 @@ mod pressure_sample_tests {
             assert_eq!(serde_json::to_value(&expected_nonzero).unwrap(), before);
             expected_nonzero.status = None;
             expected_nonzero.signal = Some(11);
-            assert!(qualifying_subruns(mode, &[expected_nonzero]));
+            assert!(qualifying_subruns(mode, None, &[expected_nonzero]));
             let mut timeout = no_result_attempt("not_run", Some("cpu-timeout"));
             timeout.timed_out = true;
             timeout.status = None;
             assert_eq!(
-                inner_pressure_category(&retained_pressure_attempt(mode, &timeout).unwrap()),
+                inner_pressure_category(&retained_pressure_attempt(mode, None, &timeout).unwrap()),
                 Some(RepetitionClassification::NoResult)
             );
-            assert!(!qualifying_subruns(mode, &[timeout]));
+            assert!(!qualifying_subruns(mode, None, &[timeout]));
         }
     }
 
@@ -18351,25 +18684,25 @@ mod pressure_sample_tests {
             let mut second = first.clone();
             second.index = "2".into();
             assert!(
-                qualifying_subruns(mode, &[first.clone(), second.clone()]),
+                qualifying_subruns(mode, None, &[first.clone(), second.clone()]),
                 "{mode}"
             );
             let mut absent = first.clone();
             absent.verification_report = None;
             assert!(
-                !qualifying_subruns(mode, &[absent, second.clone()]),
+                !qualifying_subruns(mode, None, &[absent, second.clone()]),
                 "{mode}: missing first report"
             );
             let mut wrong = first.clone();
             wrong.verification_report_sha256 = Some("0".repeat(64));
             assert!(
-                !qualifying_subruns(mode, &[wrong, second.clone()]),
+                !qualifying_subruns(mode, None, &[wrong, second.clone()]),
                 "{mode}: wrong first digest"
             );
             let mut signal = first.clone();
             signal.signal = Some(9);
             assert!(
-                !qualifying_subruns(mode, &[signal, second.clone()]),
+                !qualifying_subruns(mode, None, &[signal, second.clone()]),
                 "{mode}: contradictory process"
             );
             for (field, value) in [
@@ -18384,10 +18717,10 @@ mod pressure_sample_tests {
                 report[field] = value;
                 replace_report(&mut changed, report);
                 assert!(
-                    retained_pressure_attempt(mode, &changed).is_err(),
+                    retained_pressure_attempt(mode, None, &changed).is_err(),
                     "{mode}: {field}"
                 );
-                assert!(!qualifying_subruns(mode, &[changed, second.clone()]));
+                assert!(!qualifying_subruns(mode, None, &[changed, second.clone()]));
             }
             for (field, value) in [
                 ("strictness", json!("stripped")),
@@ -18407,7 +18740,7 @@ mod pressure_sample_tests {
                 report["comparison"][field] = value;
                 replace_report(&mut changed, report);
                 assert!(
-                    !qualifying_subruns(mode, &[changed, second.clone()]),
+                    !qualifying_subruns(mode, None, &[changed, second.clone()]),
                     "{mode}: {field}"
                 );
             }
@@ -18418,7 +18751,7 @@ mod pressure_sample_tests {
                 report["compared_log_messages"] = counts;
                 replace_report(&mut changed, report);
                 assert!(
-                    !qualifying_subruns(mode, &[changed, second.clone()]),
+                    !qualifying_subruns(mode, None, &[changed, second.clone()]),
                     "{mode}: invalid message counts"
                 );
             }
@@ -18430,10 +18763,435 @@ mod pressure_sample_tests {
                 .unwrap()
                 .remove("exact_remainder");
             replace_report(&mut missing_field, report);
-            assert!(!qualifying_subruns(mode, &[missing_field, second]));
+            assert!(!qualifying_subruns(mode, None, &[missing_field, second]));
         }
         let nonzero_verify = comparison_attempt("verify", 17);
-        assert!(!qualifying_subruns("verify", &[nonzero_verify]));
+        assert!(!qualifying_subruns("verify", None, &[nonzero_verify]));
+    }
+
+    #[test]
+    fn matched_subruns_end_nonzero_only_as_the_cell_declares() {
+        let declare = |code: Option<i32>, signal: Option<i32>| ExpectedGuestExit {
+            code,
+            signal,
+            reason: "the fixture guest fails on purpose".into(),
+        };
+        let code_23 = declare(Some(23), None);
+        let signal_11 = declare(None, Some(11));
+        let exits_0 = comparison_attempt("verify", 0);
+        let exits_23 = comparison_attempt("verify", 23);
+        // A guest killed by signal 11, as the report and both compared outputs
+        // say. Hermit ends with that signal, or with status 128 + 11 when it
+        // cannot re-raise it.
+        let mut killed = comparison_attempt("verify", 0);
+        let mut report: JsonValue =
+            serde_json::from_str(killed.verification_report.as_ref().unwrap()).unwrap();
+        report["guest_exit_code"] = JsonValue::Null;
+        report["guest_signal"] = json!(11);
+        for side in ["left", "right"] {
+            report["compared_outputs"][side]["exit_code"] = JsonValue::Null;
+            report["compared_outputs"][side]["signal"] = json!(11);
+        }
+        replace_report(&mut killed, report);
+        killed.status = None;
+        killed.signal = Some(11);
+        let mut killed_139 = killed.clone();
+        killed_139.status = Some(139);
+        killed_139.signal = None;
+        for (label, declared, attempt) in [
+            ("status 0 without a declaration", None, &exits_0),
+            ("status 0 with a declaration", Some(&code_23), &exits_0),
+            ("the declared code", Some(&code_23), &exits_23),
+            ("the declared signal", Some(&signal_11), &killed),
+            (
+                "the declared signal as 128 + 11",
+                Some(&signal_11),
+                &killed_139,
+            ),
+        ] {
+            let retained = retained_pressure_attempt("verify", declared, attempt)
+                .unwrap_or_else(|error| panic!("{label}: {error}"));
+            assert_eq!(inner_pressure_category(&retained), None, "{label}");
+            assert!(
+                qualifying_subruns("verify", declared, std::slice::from_ref(attempt)),
+                "{label}"
+            );
+        }
+        let mut killed_137 = killed_139.clone();
+        killed_137.status = Some(137);
+        let mut blank_reason = code_23.clone();
+        blank_reason.reason = " ".into();
+        let code_11 = declare(Some(11), None);
+        let signal_23 = declare(None, Some(23));
+        let both = declare(Some(23), Some(23));
+        let exits_22 = comparison_attempt("verify", 22);
+        let exits_151 = comparison_attempt("verify", 151);
+        let replay_23 = comparison_attempt("replay", 23);
+        let mut failed_23 = exits_23.clone();
+        failed_23.outcome = "FAIL".into();
+        for (label, mode, declared, attempt) in [
+            ("status 23 without a declaration", "verify", None, &exits_23),
+            ("another code", "verify", Some(&code_23), &exits_22),
+            (
+                "128 + the declared code",
+                "verify",
+                Some(&code_23),
+                &exits_151,
+            ),
+            (
+                "a signal for a declared code",
+                "verify",
+                Some(&code_11),
+                &killed,
+            ),
+            (
+                "the declared signal's number as a status",
+                "verify",
+                Some(&signal_23),
+                &exits_23,
+            ),
+            (
+                "128 + another signal",
+                "verify",
+                Some(&signal_11),
+                &killed_137,
+            ),
+            // A declaration the runner itself refuses accepts nothing more.
+            ("a blank reason", "verify", Some(&blank_reason), &exits_23),
+            ("both a code and a signal", "verify", Some(&both), &exits_23),
+            ("a replay cell", "replay", Some(&code_23), &replay_23),
+            (
+                "an invocation that did not pass",
+                "verify",
+                Some(&code_23),
+                &failed_23,
+            ),
+        ] {
+            let error = retained_pressure_attempt(mode, declared, attempt).unwrap_err();
+            assert!(
+                error.contains("matched report contradicts its inner process disposition"),
+                "{label}: {error}"
+            );
+            assert!(
+                !qualifying_subruns(mode, declared, std::slice::from_ref(attempt)),
+                "{label}"
+            );
+        }
+        // The declaration reaches the history and the promotion check through
+        // the cell's own CellResult.
+        let mut row = history_row("verify", "PASS", 1, vec![exits_23.clone()]);
+        let error = inner_pressure_history(std::slice::from_ref(&row)).unwrap_err();
+        assert!(
+            error.contains("matched report contradicts its inner process disposition"),
+            "{error}"
+        );
+        assert!(!repetition_qualifies_for_promotion(
+            "pass",
+            std::slice::from_ref(&row)
+        ));
+        row.expected_guest_exit = Some(code_23.clone());
+        // As in the full summary, the row credits a declared exit only from
+        // verify run with --verify-allow=failure.
+        assert!(!matched_attempts_end_as_declared(&row));
+        let error = inner_pressure_history(std::slice::from_ref(&row)).unwrap_err();
+        assert!(
+            error.contains("does not end as its cell declares"),
+            "{error}"
+        );
+        assert!(!repetition_qualifies_for_promotion(
+            "pass",
+            std::slice::from_ref(&row)
+        ));
+        row.attempts[0].argv.push("--verify-allow=failure".into());
+        assert!(matched_attempts_end_as_declared(&row));
+        assert!(
+            inner_pressure_history(std::slice::from_ref(&row))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(repetition_qualifies_for_promotion(
+            "pass",
+            std::slice::from_ref(&row)
+        ));
+        // The declaration admits an exit, never a verdict. A diverged report
+        // whose guest ended as declared is still a divergence.
+        let mut diverged = exits_23.clone();
+        let mut report: JsonValue =
+            serde_json::from_str(diverged.verification_report.as_ref().unwrap()).unwrap();
+        report["verdict"] = json!("diverged");
+        report["verified"] = json!(false);
+        report["bitwise_parity"] = json!(false);
+        replace_report(&mut diverged, report);
+        let error = retained_pressure_attempt("verify", Some(&code_23), &diverged).unwrap_err();
+        assert!(
+            error.contains("diverged report contradicts its inner process disposition"),
+            "{error}"
+        );
+        diverged.outcome = "FAIL".into();
+        let retained = retained_pressure_attempt("verify", Some(&code_23), &diverged).unwrap();
+        assert_eq!(
+            inner_pressure_category(&retained),
+            Some(RepetitionClassification::ProductFailure)
+        );
+        assert!(!qualifying_subruns(
+            "verify",
+            Some(&code_23),
+            std::slice::from_ref(&diverged)
+        ));
+    }
+
+    #[test]
+    fn rows_only_verdicts_credit_a_declared_exit_only_as_report_and_invocation_corroborate() {
+        // `verdicts` judges result rows retained by another runner, with no
+        // verify log or runner evidence, so the rows carry the full summary's
+        // rule themselves: a matched repetition counts a declared guest exit
+        // only from verify run with --verify-allow=failure, with Hermit's
+        // status, the report's guest disposition and both compared outputs
+        // all naming the declaration.
+        let root = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-rows-declared-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir(&root).unwrap();
+        let guard = SelfTestDirectory::new(root.clone());
+        let refusal = "outer attempt 1 passed a matched comparison that does not end as its cell declares: a declared guest exit counts only from verify run with --verify-allow=failure, with Hermit's status, the report's guest disposition and both compared outputs all naming the declaration";
+        // (label, declared (code, signal), Hermit's status, the report's and
+        // both compared outputs' guest (code, signal), whether Hermit ran
+        // with --verify-allow=failure, whether the repetition is credited)
+        type Disposition = (Option<i32>, Option<i32>);
+        let cases: [(&str, Disposition, i32, Disposition, bool, bool); 6] = [
+            (
+                "a corroborated exit code 23",
+                (Some(23), None),
+                23,
+                (Some(23), None),
+                true,
+                true,
+            ),
+            (
+                "a corroborated signal 11 as status 139",
+                (None, Some(11)),
+                139,
+                (None, Some(11)),
+                true,
+                true,
+            ),
+            (
+                "signal 11 as status 139 whose report names exit code 139",
+                (None, Some(11)),
+                139,
+                (Some(139), None),
+                true,
+                false,
+            ),
+            (
+                "exit code 23 whose report names exit code 22",
+                (Some(23), None),
+                23,
+                (Some(22), None),
+                true,
+                false,
+            ),
+            (
+                "exit code 23 without --verify-allow=failure",
+                (Some(23), None),
+                23,
+                (Some(23), None),
+                false,
+                false,
+            ),
+            (
+                "exit code 23 from a guest that exited 0",
+                (Some(23), None),
+                0,
+                (Some(0), None),
+                true,
+                false,
+            ),
+        ];
+        let mut judged = Vec::new();
+        for (index, (label, declared, status, guest, allowed, credited)) in
+            cases.into_iter().enumerate()
+        {
+            let mut attempt = comparison_attempt("verify", 0);
+            let mut report: JsonValue =
+                serde_json::from_str(attempt.verification_report.as_ref().unwrap()).unwrap();
+            report["guest_exit_code"] = json!(guest.0);
+            report["guest_signal"] = json!(guest.1);
+            for side in ["left", "right"] {
+                report["compared_outputs"][side]["exit_code"] = json!(guest.0);
+                report["compared_outputs"][side]["signal"] = json!(guest.1);
+            }
+            replace_report(&mut attempt, report);
+            attempt.status = Some(status);
+            attempt.argv = ["hermit", "run", "--strict", "--verify", "--verify-strict"]
+                .into_iter()
+                .chain(allowed.then_some("--verify-allow=failure"))
+                .chain(["--", "fixture"])
+                .map(str::to_owned)
+                .collect();
+            attempt.shell_command =
+                literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+            let mut row = history_row("verify", "PASS", 1, vec![attempt.clone()]);
+            row.hermit_sha = "0123456789abcdef0123456789abcdef01234567".into();
+            row.argv = attempt.argv.clone();
+            row.guest_argv = attempt.guest_argv.clone();
+            row.env = attempt.env.clone();
+            row.cwd = attempt.cwd.clone();
+            row.shell_command = attempt.shell_command.clone();
+            row.timeout_seconds = 20;
+            row.execution_cpu_timeout_seconds = Some(10);
+            row.execution_wall_timeout_seconds = Some(20);
+            row.expected_guest_exit = Some(ExpectedGuestExit {
+                code: declared.0,
+                signal: declared.1,
+                reason: "the fixture guest exits as declared".into(),
+            });
+            // Ten retained repetitions, read back through the real reader.
+            let case_root = root.join(format!("case-{index}"));
+            let slug = base_cell_slug(&CellId {
+                lane: row.lane.clone(),
+                category: row.category.clone(),
+                test: row.test.clone(),
+                mode: row.mode.clone(),
+                backend: row.backend.clone().unwrap(),
+            });
+            for number in 1..=PROMOTION_REPETITIONS {
+                row.run_id = format!("rows-declared-{index}-{number}");
+                row.run_index = Some(u64::try_from(number).unwrap());
+                let dir = case_root
+                    .join("cells")
+                    .join(format!("{slug}-repetition-{number:04}"));
+                fs::create_dir_all(&dir).unwrap();
+                row.artifact_dir = dir.join("artifacts").to_string_lossy().into_owned();
+                fs::write(
+                    dir.join("results.jsonl"),
+                    format!("{}\n", serde_json::to_string(&row).unwrap()),
+                )
+                .unwrap();
+                let sample = read_rows_repetition(&dir, &slug);
+                assert!(sample.row_valid, "{label}: {:?}", sample.evidence_errors);
+            }
+            let outcome = verdicts(&case_root, PROMOTION_REPETITIONS);
+            let written: JsonValue =
+                serde_json::from_str(&fs::read_to_string(case_root.join("verdicts.json")).unwrap())
+                    .unwrap();
+            judged.push((label, credited, row, outcome, written["cells"][0].clone()));
+        }
+        // Every case is judged before any is checked, so a failure names each
+        // declaration the reader misjudged.
+        let misjudged = judged
+            .iter()
+            .filter(|(_, credited, _, _, summary)| {
+                (summary["promotion_candidate"] == json!(true)) != *credited
+            })
+            .map(|(label, ..)| *label)
+            .collect::<Vec<_>>();
+        assert!(
+            misjudged.is_empty(),
+            "the rows-only reader misjudged {misjudged:?}"
+        );
+        for (label, credited, row, outcome, summary) in judged {
+            assert_eq!(
+                summary["passes"],
+                json!(PROMOTION_REPETITIONS),
+                "{label}: {summary}"
+            );
+            if credited {
+                assert_eq!(outcome, Ok(()), "{label}: {summary}");
+                assert_eq!(summary["verdict"], json!("CLEAN"), "{label}: {summary}");
+                assert_eq!(
+                    summary["classification"],
+                    json!("promotion-candidate"),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["promotion_candidate"],
+                    json!(true),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["qualifying_passes"],
+                    json!(PROMOTION_REPETITIONS),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["unknown_history_repetitions"],
+                    json!(0),
+                    "{label}: {summary}"
+                );
+                assert_eq!(summary["evidence_errors"], json!([]), "{label}: {summary}");
+            } else {
+                let Err(error) = outcome else {
+                    panic!(
+                        "{label}: the rows-only reader credited a declaration its evidence contradicts: {summary}"
+                    );
+                };
+                assert!(
+                    error.contains("1 of 1 cell(s) are not CLEAN")
+                        && error.contains("is INCOMPLETE"),
+                    "{label}: {error}"
+                );
+                assert_eq!(
+                    summary["verdict"],
+                    json!("INCOMPLETE"),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["classification"],
+                    json!("incomplete"),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["promotion_candidate"],
+                    json!(false),
+                    "{label}: {summary}"
+                );
+                assert_eq!(summary["qualifying_passes"], json!(0), "{label}: {summary}");
+                assert_eq!(
+                    summary["unknown_history_repetitions"],
+                    json!(PROMOTION_REPETITIONS),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["evidence_errors"],
+                    json!([refusal]),
+                    "{label}: {summary}"
+                );
+            }
+            // Each invocation alone still passes the per-attempt check: its
+            // status is 0 or the declared one. Only the whole row can show
+            // whether the declaration is corroborated.
+            assert!(
+                qualifying_subruns("verify", row.expected_guest_exit.as_ref(), &row.attempts),
+                "{label}"
+            );
+            assert_eq!(matched_attempts_end_as_declared(&row), credited, "{label}");
+            if credited {
+                assert!(
+                    inner_pressure_history(std::slice::from_ref(&row))
+                        .unwrap()
+                        .is_empty(),
+                    "{label}"
+                );
+            } else {
+                assert_eq!(
+                    inner_pressure_history(std::slice::from_ref(&row)),
+                    Err(refusal.to_string()),
+                    "{label}"
+                );
+            }
+            assert_eq!(
+                repetition_qualifies_for_promotion("pass", std::slice::from_ref(&row)),
+                credited,
+                "{label}"
+            );
+        }
+        guard.remove().unwrap();
     }
 
     fn history_row(
@@ -18574,7 +19332,7 @@ mod pressure_sample_tests {
         report["no_result_reason"] = JsonValue::Null;
         report["infrastructure_error"] = json!({"kind":"skid_overshoot","count":1});
         replace_report(&mut infrastructure, report.clone());
-        let retained = retained_pressure_attempt("verify", &infrastructure).unwrap();
+        let retained = retained_pressure_attempt("verify", None, &infrastructure).unwrap();
         assert_eq!(
             inner_pressure_category(&retained),
             Some(RepetitionClassification::InfrastructureFailure)
@@ -18592,7 +19350,7 @@ mod pressure_sample_tests {
             changed[field] = value;
             replace_report(&mut bad, changed);
             assert!(
-                retained_pressure_attempt("verify", &bad).is_err(),
+                retained_pressure_attempt("verify", None, &bad).is_err(),
                 "{field}"
             );
         }
@@ -18601,13 +19359,13 @@ mod pressure_sample_tests {
         missing_timeout.error_kind = Some("wall-timeout".into());
         assert_eq!(
             inner_pressure_category(
-                &retained_pressure_attempt("verify", &missing_timeout).unwrap()
+                &retained_pressure_attempt("verify", None, &missing_timeout).unwrap()
             ),
             Some(RepetitionClassification::NoResult)
         );
         let mut bad_timeout = missing_timeout.clone();
         bad_timeout.error_kind = None;
-        assert!(retained_pressure_attempt("verify", &bad_timeout).is_err());
+        assert!(retained_pressure_attempt("verify", None, &bad_timeout).is_err());
         for cause in [
             "cpu-timeout",
             "wall-timeout",
@@ -18617,14 +19375,16 @@ mod pressure_sample_tests {
             prelaunch.timed_out = true;
             prelaunch.status = None;
             assert_eq!(
-                inner_pressure_category(&retained_pressure_attempt("verify", &prelaunch).unwrap()),
+                inner_pressure_category(
+                    &retained_pressure_attempt("verify", None, &prelaunch).unwrap()
+                ),
                 Some(RepetitionClassification::NoResult),
                 "{cause}"
             );
             let mut contradiction = prelaunch.clone();
             contradiction.timed_out = false;
             assert!(
-                retained_pressure_attempt("verify", &contradiction).is_err(),
+                retained_pressure_attempt("verify", None, &contradiction).is_err(),
                 "{cause}"
             );
         }
@@ -18641,7 +19401,7 @@ mod pressure_sample_tests {
             report["no_result_reason"][field] = value;
             replace_report(&mut bad, report);
             assert!(
-                retained_pressure_attempt("verify", &bad).is_err(),
+                retained_pressure_attempt("verify", None, &bad).is_err(),
                 "{field}"
             );
         }
@@ -18654,7 +19414,7 @@ mod pressure_sample_tests {
             let mut report = serde_json::to_value(VerificationReport::no_result()).unwrap();
             report["no_result_reason"] = json!({"kind":"container_failed","run":run,"disposition":{"kind":"signaled","signal":14,"core_dumped":false}});
             replace_report(&mut attempt, report.clone());
-            let retained = retained_pressure_attempt("verify", &attempt).unwrap();
+            let retained = retained_pressure_attempt("verify", None, &attempt).unwrap();
             let comparison = retained.comparison.as_ref().unwrap();
             assert_eq!(comparison.verdict, Verdict::NoResult);
             assert!(!comparison.canonical);
@@ -18668,6 +19428,7 @@ mod pressure_sample_tests {
             );
             assert!(!qualifying_subruns(
                 "verify",
+                None,
                 std::slice::from_ref(&attempt)
             ));
             let row = history_row("verify", "FAIL", 1, vec![attempt.clone()]);
@@ -18706,7 +19467,7 @@ mod pressure_sample_tests {
                 }
                 replace_report(&mut bad, bad_report);
                 assert!(
-                    retained_pressure_attempt("verify", &bad).is_err(),
+                    retained_pressure_attempt("verify", None, &bad).is_err(),
                     "{mutation}"
                 );
             }
@@ -18741,12 +19502,12 @@ mod pressure_sample_tests {
                         Some(format!("{:x}", sha2::Sha256::digest(duplicated.as_bytes())));
                     bad.verification_report = Some(duplicated);
                     assert!(
-                        retained_pressure_attempt(mode, &bad)
+                        retained_pressure_attempt(mode, None, &bad)
                             .unwrap_err()
                             .contains("duplicate field")
                     );
                 }
-                let retained = retained_pressure_attempt(mode, &attempt).unwrap();
+                let retained = retained_pressure_attempt(mode, None, &attempt).unwrap();
                 let comparison = retained.comparison.as_ref().unwrap();
                 assert_eq!(comparison.verdict, Verdict::NoResult);
                 assert!(!comparison.canonical);
@@ -18759,7 +19520,11 @@ mod pressure_sample_tests {
                     inner_pressure_category(&retained),
                     Some(RepetitionClassification::NoResult)
                 );
-                assert!(!qualifying_subruns(mode, std::slice::from_ref(&attempt)));
+                assert!(!qualifying_subruns(
+                    mode,
+                    None,
+                    std::slice::from_ref(&attempt)
+                ));
                 assert_eq!(serde_json::to_value(&attempt).unwrap(), original);
                 let row = history_row(mode, "ERROR", 1, vec![attempt.clone()]);
                 let history = inner_pressure_history(&[row]).unwrap();
@@ -18775,7 +19540,7 @@ mod pressure_sample_tests {
                 let mut signaled = attempt.clone();
                 signaled.status = None;
                 signaled.signal = Some(11);
-                retained_pressure_attempt(mode, &signaled).unwrap();
+                retained_pressure_attempt(mode, None, &signaled).unwrap();
                 for edit in [
                     (|a: &mut AttemptResult| a.outcome = "PASS".into()) as fn(&mut AttemptResult),
                     |a| a.outcome = "FAIL".into(),
@@ -18789,7 +19554,7 @@ mod pressure_sample_tests {
                     let mut bad = attempt.clone();
                     edit(&mut bad);
                     assert!(
-                        retained_pressure_attempt(mode, &bad).is_err(),
+                        retained_pressure_attempt(mode, None, &bad).is_err(),
                         "{kind:?} {mode}"
                     );
                 }
@@ -18809,7 +19574,7 @@ mod pressure_sample_tests {
                     changed[field] = contradiction;
                     replace_report(&mut bad, changed);
                     assert!(
-                        retained_pressure_attempt(mode, &bad).is_err(),
+                        retained_pressure_attempt(mode, None, &bad).is_err(),
                         "{kind:?} {mode} {field}"
                     );
                 }
@@ -18818,7 +19583,7 @@ mod pressure_sample_tests {
                 omitted.as_object_mut().unwrap().remove("no_result_reason");
                 replace_report(&mut missing, omitted);
                 assert!(
-                    retained_pressure_attempt(mode, &missing)
+                    retained_pressure_attempt(mode, None, &missing)
                         .unwrap_err()
                         .contains("no_result_reason")
                 );
@@ -18826,9 +19591,9 @@ mod pressure_sample_tests {
                 let mut different_error = attempt;
                 different_error.error_kind = Some("cli-error".into());
                 if kind == SeriesNoVerdictKind::Unspecified {
-                    retained_pressure_attempt(mode, &different_error).unwrap();
+                    retained_pressure_attempt(mode, None, &different_error).unwrap();
                 } else {
-                    assert!(retained_pressure_attempt(mode, &different_error).is_err());
+                    assert!(retained_pressure_attempt(mode, None, &different_error).is_err());
                 }
             }
         }
@@ -21020,6 +21785,57 @@ mod pressure_planning_tests {
     }
 
     #[test]
+    fn dbt_cells_of_one_test_share_one_host_tmp_resource() {
+        let cell = |test: &str, mode: &str, backend: &str| CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: test.into(),
+            mode: mode.into(),
+            backend: backend.into(),
+        };
+        let verify = dbt_host_tmp_resource(&cell("c-programs/syscall-file-io", "verify", "dbt"));
+        assert_eq!(
+            verify.as_deref(),
+            Some("dbt_host_tmp:c-programs/syscall-file-io")
+        );
+        assert_eq!(
+            dbt_host_tmp_resource(&cell("c-programs/syscall-file-io", "replay", "dbt")),
+            verify
+        );
+        assert_ne!(
+            dbt_host_tmp_resource(&cell("c-programs/syscall-file-metadata", "verify", "dbt")),
+            verify
+        );
+        for backend in ["ptrace", "kvm", "liteinst", "sabre", "native"] {
+            assert_eq!(
+                dbt_host_tmp_resource(&cell("c-programs/syscall-file-io", "verify", backend)),
+                None,
+                "{backend}"
+            );
+        }
+    }
+
+    #[test]
+    fn host_tmp_resource_leaves_the_memory_bound_unchanged() {
+        // One more exclusive resource can only lower how many cells run at
+        // once, so the bound computed without it still holds.
+        let mut dag = memory_fixture();
+        let bound = declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap();
+        dag.steps
+            .iter_mut()
+            .find(|step| step.job == "already-prepared-native")
+            .unwrap()
+            .hint
+            .resources
+            .insert("dbt_host_tmp:fixture".into(), 1);
+        dag.resource_caps.insert("dbt_host_tmp:fixture".into(), 1);
+        assert_eq!(
+            declared_memory_at_manifest_guest_cap(&dag, 4, 2, 1).unwrap(),
+            bound
+        );
+    }
+
+    #[test]
     fn memory_phases_refuse_unbounded_resources_or_invalid_kvm_ordering() {
         for resource in ["cargo_writer", "manifest_guest", "kvm_guest"] {
             let mut dag = memory_fixture();
@@ -21112,6 +21928,156 @@ mod pressure_planning_tests {
         validate_guest_caps_against_selected_demand(std::slice::from_ref(&cell), &selection)
             .unwrap();
         assert!(USAGE.contains("identities of executable cells not selected by full"));
+    }
+
+    #[test]
+    fn occupancy_admission_runs_the_cells_of_one_dbt_test_one_at_a_time() {
+        // Every run of every DBT cell of one test holds that test's one-unit
+        // host /tmp grant, so those runs follow one another however many
+        // guest slots are free.
+        let cell = |test: &str, mode: &str, backend: &str| TrackedCell {
+            id: CellId {
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: test.into(),
+                mode: mode.into(),
+                backend: backend.into(),
+            },
+            status: "red".into(),
+            not_applicable_reason: None,
+        };
+        let same = vec![
+            cell("fixture/one", "verify", "dbt"),
+            cell("fixture/one", "replay", "dbt"),
+        ];
+        let split = vec![
+            cell("fixture/one", "verify", "dbt"),
+            cell("fixture/two", "replay", "dbt"),
+        ];
+        let ptrace = vec![
+            cell("fixture/one", "verify", "ptrace"),
+            cell("fixture/one", "replay", "ptrace"),
+        ];
+        let budget = CellBudget {
+            cpu_timeout_seconds: 1,
+            timeout_seconds: 2,
+            attempts: Some(1),
+        };
+        assert_eq!(pressure_timeout(&budget, None), Ok(58));
+        assert_eq!(PRESSURE_RUN_TIMEOUT_SECONDS, 7_200);
+        let budgets = same
+            .iter()
+            .chain(&split)
+            .chain(&ptrace)
+            .map(|tracked| {
+                (
+                    (
+                        tracked.id.test.clone(),
+                        tracked.id.mode.clone(),
+                        tracked.id.backend.clone(),
+                    ),
+                    budget.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let fits = |cells: &[TrackedCell], run_timeout_seconds: i64| {
+            require_cell_occupancy_fits(cells, &budgets, None, run_timeout_seconds, 100, 4, 4, 4)
+        };
+        // Two DBT modes of one test, 100 repetitions each at 58s apiece, hold
+        // that test's grant for 11,600s, although four guest slots alone
+        // would take the 200 runs in 2,900s.
+        for run_timeout_seconds in [PRESSURE_RUN_TIMEOUT_SECONDS, 11_600] {
+            let Err(error) = fits(&same, run_timeout_seconds) else {
+                panic!(
+                    "admission accepted 11,600s of runs that take turns on one DBT test's host /tmp under a {run_timeout_seconds}s whole-run bound"
+                );
+            };
+            assert!(
+                error.contains("selected 200 cell run(s) have at least 11600s"),
+                "{error}"
+            );
+            assert!(
+                error.contains("dbt_host_tmp:fixture/one alone declares 11600s"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!(
+                    "cannot fit the {run_timeout_seconds}s whole-run WALL bound"
+                )),
+                "{error}"
+            );
+        }
+        assert_eq!(fits(&same, 11_601), Ok(()));
+        // The same runs spread over two tests, or on a backend that gives each
+        // guest a private /tmp, share the four guest slots and fit.
+        assert_eq!(fits(&split, PRESSURE_RUN_TIMEOUT_SECONDS), Ok(()));
+        assert_eq!(fits(&ptrace, PRESSURE_RUN_TIMEOUT_SECONDS), Ok(()));
+    }
+
+    #[test]
+    fn audit_refuses_every_dbt_host_tmp_grant_that_is_not_one_unit() {
+        let cmd = "printf '125\\n' > harness-status; status=0; env HERMIT_BIN=\"$PWD/target/ci/hermit\" target/debug/test-harness run --include-manual --test fixture --mode verify --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; mv -- results.in-progress.jsonl results.jsonl; exit \"$status\"";
+        let mut dag = dag_from_json(
+            &json!({
+                "resource_caps": {"manifest_guest": 1},
+                "steps": [
+                    {
+                        "group": "cell",
+                        "job": "fixture",
+                        "cmd": cmd,
+                        "deps": [],
+                        "timeout": 20,
+                        "cpu_timeout": 40,
+                        "hint": {"resources": {"manifest_guest": 1}, "hard_mem_max_bytes": 1024}
+                    },
+                    {
+                        "group": "pressure",
+                        "job": "summarize",
+                        "cmd": "true",
+                        "deps": ["cell.fixture"],
+                        "timeout": 10,
+                        "cpu_timeout": 10,
+                        "hint": {"hard_mem_max_bytes": 1024}
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let times = BTreeMap::from([("cell.fixture".to_string(), 20)]);
+        assert_eq!(audit_dag(&dag, 1, 100, &times), Ok(()));
+        // A grant that a step demands: one unit granted, one unit demanded.
+        let active = format!("{DBT_HOST_TMP_RESOURCE_PREFIX}fixture");
+        dag.resource_caps.insert(active.clone(), 1);
+        dag.steps[0].hint.resources.insert(active.clone(), 1);
+        assert_eq!(audit_dag(&dag, 1, 100, &times), Ok(()));
+        for (demand, capacity) in [(0, 1), (-1, 1), (1, 0), (1, 2), (2, 2), (2, 1)] {
+            let mut bad = dag.clone();
+            bad.resource_caps.insert(active.clone(), capacity);
+            bad.steps[0].hint.resources.insert(active.clone(), demand);
+            assert!(
+                audit_dag(&bad, 1, 100, &times).is_err(),
+                "demand {demand}, capacity {capacity}"
+            );
+        }
+        let mut missing = dag.clone();
+        missing.resource_caps.remove(&active);
+        assert!(audit_dag(&missing, 1, 100, &times).is_err());
+        // A grant no step demands is part of the plan too.
+        let unused = format!("{DBT_HOST_TMP_RESOURCE_PREFIX}unused");
+        for capacity in [2, 0, -1] {
+            let mut bad = dag.clone();
+            bad.resource_caps.insert(unused.clone(), capacity);
+            let Err(error) = audit_dag(&bad, 1, 100, &times) else {
+                panic!("the audit accepted {capacity} unit(s) of {unused}, which no step demands");
+            };
+            assert!(
+                error.contains(&format!("the DAG grants {capacity} unit(s) of {unused}")),
+                "{error}"
+            );
+        }
+        dag.resource_caps.insert(unused, 1);
+        assert_eq!(audit_dag(&dag, 1, 100, &times), Ok(()));
     }
 }
 
