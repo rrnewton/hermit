@@ -20569,16 +20569,21 @@ cp "{}" "$verdict"
                 .contains("cell exceeded 1 s during fixture preparation")
         );
 
+        // A healthy preparation under a deadline succeeds silently. Its bound is
+        // generous: what must hold is the deadline above, and a 1 s bound here
+        // also asserted that spawning `sh -c true` takes under a second, which
+        // fails when a loaded, CPU-capped validation box starves the child
+        // (validate of f85de5d891ab, 2026-10-04: 4,227 of 4,228 tests passed).
         run_preparation(
             &context,
             &cell_dir,
             "/bin/sh",
             &["-c".into(), "true".into()],
-            Instant::now() + Duration::from_secs(1),
+            Instant::now() + Duration::from_secs(60),
             cell.timeout_seconds,
             &mut Vec::new(),
         )
-        .expect("healthy fixture preparation must finish silently under the same bound");
+        .expect("healthy fixture preparation must finish silently under a deadline");
         fs::remove_dir_all(root).unwrap();
     }
 
