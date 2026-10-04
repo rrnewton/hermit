@@ -573,7 +573,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and seed_filter_drops_only_seed_rows_and_keeps_order
     // (https://github.com/rrnewton/hermit/pull/3219) retain all 841 prior
     // identities (`cargo nextest list --profile ci` measured 843).
-    ("test.regular_crates", 843),
+    // detcore-model's procfs::tests::named_host_seeds_are_excluded
+    // (https://github.com/rrnewton/hermit/pull/3219) retains all 843 prior
+    // identities (`cargo nextest list --profile ci` measured 844).
+    ("test.regular_crates", 844),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1045,7 +1048,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // committed_buck_e2e_selection_replaces_22_nodes_with_18 retains all 840.
     // The two detcore-model seed mount tests listed for test.regular_crates
     // retain all 841 prior identities.
-    ("test.regular_crates_on_host", 843),
+    // The detcore-model named-seed test listed for test.regular_crates retains
+    // all 843 prior identities.
+    ("test.regular_crates_on_host", 844),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.

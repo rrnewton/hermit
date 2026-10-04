@@ -29,11 +29,17 @@ trade (they are real propagated mounts, excluded for determinism scope):
 
 **Excluded class** — `fuse.squashfuse_ll` mounts whose mount point's last
 path component is a host seed name,
-`<hex>-seed-nspid<digits>_cgpid<digits>-ns-<digits>` (normally shown at
-`/mnt/xarfuse/uid-<uid>/<seed name>`): per-process ephemeral seed mounts
-created by host squashfuse infrastructure (the name embeds host namespace and
-cgroup PIDs), imported by shared propagation, lifetime bound to unrelated host
-processes. The rule keys on the seed name, not the directory, so a long-lived
+`<hex>-seed-<seed>-ns-<digits>`, where `<seed>` is a non-empty run of ASCII
+letters, digits, `_` and `-` (normally shown at
+`/mnt/xarfuse/uid-<uid>/<seed name>`): seed mounts created by host squashfuse
+infrastructure, imported by shared propagation, lifetime bound to unrelated
+host processes. The seed is either per-process
+(`nspid<digits>_cgpid<digits>`, embedding host namespace and cgroup PIDs) or
+names a host tool (`chef`, `fb-pcie-error-log`,
+`devserver-cleanup_hg_cache`). Named seeds were observed living 4–5 s on
+devbig030, and `chef` was remounted under a new mount ID; a named seed that
+happens to live longer is excluded too, as part of the same fidelity trade.
+The rule keys on the seed name, not the directory, so a long-lived
 SquashFUSE mount such as `/mnt/xarfuse/stable-release` stays visible, and a
 changed guest root that displays the seed as `/xarfuse/uid-<uid>/<seed name>`
 still excludes the row the launch-time capture excluded. The one predicate is
@@ -71,6 +77,10 @@ seed-named row of another filesystem type survive).
 
 ## Evidence
 - Unit (detcore-model): `ephemeral_host_seed_mount_class_is_the_seed_name`,
+  `named_host_seeds_are_excluded` (the three named-seed rows observed in a
+  20-minute mountinfo churn log, plus `/mnt/xarfuse/stable-release` and a
+  tmpfs row carrying a seed path as negatives; it fails under the earlier
+  `nspid<digits>_cgpid<digits>`-only grammar), and
   `seed_filter_drops_only_seed_rows_and_keeps_order`.
 - Unit (detcore): `seed_churn_does_not_change_guest_mountinfo_membership`
   (old leak fails: churn variants differed before, identical after, through
@@ -106,5 +116,6 @@ A retained row whose parent is an excluded seed still snapshots: the constructor
 
 Residual: a guest program that itself drives host squashfuse seeds would
 not see its own post-launch seed mounts (they were never deterministic —
-host-assigned hashes/PIDs); disclosed in the PR. The one `not_run` from the
+host-assigned hashes/PIDs); disclosed in the PR. Churn outside the class,
+such as `/run/user/<uid>` tmpfs mounts, stays visible to the guest. The one `not_run` from the
 retained 18/20 is infrastructure (canonical NotRun stamp), not product.

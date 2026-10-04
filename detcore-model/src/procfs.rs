@@ -24,32 +24,38 @@ pub struct MountInfoRow {
 // TODO-HUMAN-REVIEW(PR-873): Review private mount-root normalization.
 pub const MOUNT_PEER_PREFIXES: [&[u8]; 3] = [b"shared:", b"master:", b"propagate_from:"];
 
-/// True for one ephemeral per-process host FUSE seed mount row in
-/// `/proc/<pid>/mountinfo` grammar: filesystem type `fuse.squashfuse_ll` and
-/// a mount point whose last path component is a host seed name,
-/// `<hex>-seed-nspid<digits>_cgpid<digits>-ns-<digits>`.
+/// True for one ephemeral host FUSE seed mount row in `/proc/<pid>/mountinfo`
+/// grammar: filesystem type `fuse.squashfuse_ll` and a mount point whose last
+/// path component is a host seed name, `<hex>-seed-<seed>-ns-<digits>`, where
+/// `<seed>` is a non-empty run of ASCII letters, digits, `_` and `-`.
 ///
-/// The host's squashfuse infrastructure creates one such mount per host
-/// process, normally at `/mnt/xarfuse/uid-<uid>/<seed name>`. Those rows are
-/// other processes' runtime state imported into the guest namespace by
-/// shared mount propagation: they are not created by Hermit, by the guest
-/// session, or by any ancestor the guest can name, their names embed a host
-/// PID, and they appear and disappear asynchronously as unrelated host
-/// processes live and die. Passing their membership through made
-/// `/proc/<pid>/mountinfo` (and the length of every read of it) a host-timing
-/// observation: in the `procfs-sanitized-paths` divergence, one seed row
-/// changed the tail `read` length between two strict runs.
+/// The host's squashfuse infrastructure creates these mounts, normally at
+/// `/mnt/xarfuse/uid-<uid>/<seed name>`, either one per host process (seed
+/// `nspid<digits>_cgpid<digits>`) or one per named host tool (for example
+/// seed `chef`, `fb-pcie-error-log` or `devserver-cleanup_hg_cache`). Those
+/// rows are other processes' runtime state imported into the guest namespace
+/// by shared mount propagation: they are not created by Hermit, by the guest
+/// session, or by any ancestor the guest can name, and they appear, disappear
+/// and are remounted under new mount IDs asynchronously as unrelated host
+/// processes and tool runs start and stop (named-tool seeds were observed
+/// living four to five seconds, and the `chef` seed was remounted under a new
+/// mount ID). Passing their membership through made `/proc/<pid>/mountinfo`
+/// (and the length of every read of it) a host-timing observation: in the
+/// `procfs-sanitized-paths` divergence, one seed row changed the tail `read`
+/// length between two strict runs.
 ///
 /// This is a chosen determinism fidelity trade. Seed rows are real mounts in
 /// the guest namespace (imported by shared propagation and traversable), and
 /// Linux omits no real mount from mountinfo. Hermit nevertheless excludes the
-/// class because its membership is owned by unrelated host processes and
-/// changes asynchronously, the same scope choice `DETERMINISM_ARGUMENT.md`
-/// makes for other changing host inputs. The class is decided by the seed
-/// name, not by the directory it is shown under, so other SquashFUSE mounts
-/// (for example a long-lived `/mnt/xarfuse/stable-release`) stay visible, and
-/// a guest whose root makes the displayed path `/xarfuse/uid-<uid>/<seed>`
-/// still excludes the same rows the launch-time capture excluded.
+/// class, long-lived named seeds included, because its membership is owned by
+/// unrelated host processes and changes asynchronously, the same scope choice
+/// `DETERMINISM_ARGUMENT.md` makes for other changing host inputs. The class is
+/// decided by the seed name, not by the directory it is shown under, so other
+/// SquashFUSE mounts (for example a long-lived `/mnt/xarfuse/stable-release`)
+/// stay visible, and a guest whose root makes the displayed path
+/// `/xarfuse/uid-<uid>/<seed>` still excludes the same rows the launch-time
+/// capture excluded. Other host mount churn, such as logind's
+/// `/run/user/<uid>` tmpfs mounts, is not in this class and stays visible.
 ///
 /// Only mountinfo rows are classified. `/proc/<pid>/mounts` is passed through
 /// unchanged: <https://github.com/rrnewton/hermit/issues/3719>.
@@ -83,18 +89,31 @@ pub fn exclude_ephemeral_host_seed_mounts(contents: &[u8]) -> Vec<u8> {
     out
 }
 
-/// `<hex>-seed-nspid<digits>_cgpid<digits>-ns-<digits>`, each run non-empty.
+/// `<hex>-seed-<seed>-ns-<digits>`, with a non-empty hex run, a non-empty
+/// seed of ASCII letters, digits, `_` and `-`, and a non-empty digit run.
 fn is_host_seed_name(name: &[u8]) -> bool {
-    fn run(rest: &[u8], class: fn(&u8) -> bool) -> Option<&[u8]> {
-        let len = rest.iter().take_while(|byte| class(byte)).count();
-        (len > 0).then(|| &rest[len..])
-    }
     fn parse(name: &[u8]) -> Option<()> {
-        let rest = run(name, u8::is_ascii_hexdigit)?;
-        let rest = run(rest.strip_prefix(b"-seed-nspid")?, u8::is_ascii_digit)?;
-        let rest = run(rest.strip_prefix(b"_cgpid")?, u8::is_ascii_digit)?;
-        let rest = run(rest.strip_prefix(b"-ns-")?, u8::is_ascii_digit)?;
-        rest.is_empty().then_some(())
+        let hex = name
+            .iter()
+            .take_while(|byte| byte.is_ascii_hexdigit())
+            .count();
+        let rest = name
+            .get(hex..)
+            .filter(|_| hex > 0)?
+            .strip_prefix(b"-seed-")?;
+        let digits = rest
+            .iter()
+            .rev()
+            .take_while(|byte| byte.is_ascii_digit())
+            .count();
+        let seed = rest
+            .get(..rest.len().checked_sub(digits).filter(|_| digits > 0)?)?
+            .strip_suffix(b"-ns-")?;
+        (!seed.is_empty()
+            && seed
+                .iter()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')))
+        .then_some(())
     }
     parse(name).is_some()
 }
@@ -299,7 +318,10 @@ mod tests {
             b"76 1 0:50 / /var/releases/www rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
             b"76 1 0:50 / /mnt/xarfuse/uid-1/e62a203d-seed-nspid1_cgpid2-ns-3x rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
             b"76 1 0:50 / /mnt/xarfuse/uid-1/-seed-nspid1_cgpid2-ns-3 rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
-            b"76 1 0:50 / /mnt/xarfuse/uid-1/e62a203d-seed-nspid_cgpid2-ns-3 rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
+            b"76 1 0:50 / /mnt/xarfuse/uid-1/e62a203d-seed--ns-3 rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
+            b"76 1 0:50 / /mnt/xarfuse/uid-1/e62a203d-seed-chef-ns- rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
+            b"76 1 0:50 / /mnt/xarfuse/uid-1/e62a203d-seed-a.b-ns-3 rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
+            b"76 1 0:50 / /mnt/xarfuse/uid-1/e62a203d-chef-ns-3 rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
             b"76 1 0:50 / /mnt/xarfuse/uid-1/e62a203d-seed-nspid1_cgpid2-ns-3/sub rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
             b"18 1 0:21 / /proc rw,nosuid - proc proc rw".as_slice(),
             b"squashfuse_ll /mnt/xarfuse/uid-1/e62a203d-seed-nspid1_cgpid2-ns-3 fuse.squashfuse_ll rw 0 0".as_slice(),
@@ -308,11 +330,33 @@ mod tests {
         }
     }
 
+    /// Named-tool seeds, rows copied from a 2026-10-04 devbig030 host mount
+    /// monitor (two lived four to five seconds; `chef` was remounted under a
+    /// new mount ID), are the same class as per-process seeds. A long-lived
+    /// SquashFUSE mount and a seed-named mount of another type stay.
+    #[test]
+    fn named_host_seeds_are_excluded() {
+        for named_seed in [
+            b"683 2845 0:111 / /mnt/xarfuse/uid-0/8cce7402-seed-fb-pcie-error-log-ns-4026531832 rw,nosuid,nodev,relatime shared:3548 - fuse.squashfuse_ll squashfuse_ll rw,user_id=0,group_id=0".as_slice(),
+            b"405 2845 0:52 / /mnt/xarfuse/uid-0/de637de8-seed-devserver-cleanup_hg_cache-ns-4026531832 rw,nosuid,nodev,relatime shared:246 - fuse.squashfuse_ll squashfuse_ll rw,user_id=0,group_id=0,allow_other".as_slice(),
+            b"401 2845 0:52 / /mnt/xarfuse/uid-0/06178150-seed-chef-ns-4026531832 rw,nosuid,nodev,relatime shared:246 - fuse.squashfuse_ll squashfuse_ll rw,user_id=0,group_id=0,allow_other".as_slice(),
+        ] {
+            assert!(is_ephemeral_host_seed_mount(named_seed), "{named_seed:?}");
+        }
+        for kept in [
+            b"77 2845 0:51 / /mnt/xarfuse/stable-release rw,relatime - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
+            b"401 2845 0:52 / /mnt/xarfuse/uid-0/06178150-seed-chef-ns-4026531832 rw,nosuid,nodev,relatime shared:246 - tmpfs tmpfs rw".as_slice(),
+        ] {
+            assert!(!is_ephemeral_host_seed_mount(kept), "{kept:?}");
+        }
+    }
+
     #[test]
     fn seed_filter_drops_only_seed_rows_and_keeps_order() {
         let contents = [
             b"18 1 0:21 / /proc rw - proc proc rw\n".as_slice(),
             SEED,
+            b"\n401 1 0:52 / /mnt/xarfuse/uid-0/06178150-seed-chef-ns-4026531832 rw - fuse.squashfuse_ll squashfuse_ll rw".as_slice(),
             b"\n100 1 0:70 / /test rw - tmpfs none rw\n".as_slice(),
             b"77 1 0:51 / /mnt/xarfuse/stable-release rw - fuse.squashfuse_ll squashfuse_ll rw"
                 .as_slice(),

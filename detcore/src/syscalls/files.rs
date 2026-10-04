@@ -1513,10 +1513,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<(), Error> {
         let raw_contents = self.snapshot_procfs(guest, call).await?;
         // The guest mount view is the launch namespace (guest mount/unshare/
-        // setns are refused under Detcore). Ephemeral per-process host FUSE
-        // seed rows are other tenants' propagated runtime state, not part of
-        // that namespace; exclude the class at capture so snapshot identity
-        // assignment and every later read agree on the same membership.
+        // setns are refused under Detcore). Ephemeral host FUSE seed rows
+        // (per-process and named-tool seeds) are other tenants' propagated
+        // runtime state, not part of that namespace; exclude the class at
+        // capture so snapshot identity assignment and every later read agree
+        // on the same membership.
         let contents = if guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
