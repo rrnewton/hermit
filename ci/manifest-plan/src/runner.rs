@@ -3412,6 +3412,198 @@ fn attempt_skid_overshoot_reports(
     .then_some(count)
 }
 
+/// The first-line prefix of every producer failure class the executor keeps
+/// as an `ERROR` whatever report is present (a refused guest launch, an
+/// unavailable backend, backend evidence for another backend, Hermit's
+/// generic command-line error).
+const HERMIT_INTERNAL_FAILURE_CLASS_PREFIX: &str = "HERMIT_INTERNAL_FAILURE class=";
+
+/// Why a retained verify `PASS` row is not one the executor would have
+/// written from its own retained evidence, or `None` when it is.
+///
+/// A reader that has the row but not the cell (the pressure test re-reading a
+/// result history) re-decides the pass from what the row itself retains,
+/// with the checks the executor applies before it writes `PASS`:
+///
+/// - the row is a verify `PASS` labelled as the executor labels one (typed
+///   result `pass`, and no failure class, error kind or reason), and its
+///   execution path is the eligible one its own retained attempts decide
+///   ([`retained_execution_path_error`]);
+/// - it has at least one inner attempt, and every inner attempt has a
+///   nonblank index no other attempt shares and is a `PASS` with no error
+///   kind, reason or timeout, whose first stderr line carries no Hermit
+///   internal-failure class (the executor keeps four such classes as an
+///   `ERROR` after a failed exit; this refuses every one of them, after any
+///   exit, so it never admits a row the executor would not);
+/// - every inner attempt's retained verification report is the exact bytes
+///   its `verification_report_sha256` names and parses as a current report
+///   that passes the comparator the row's relaxations record
+///   ([`row_comparator`]): for `strict`, a canonical comparison with a
+///   canonical match; for `stripped`, the stripped comparison
+///   ([`require_stripped_comparison`]), a verified `matched` verdict and
+///   matching exact outputs;
+/// - the report satisfies the stdout assertions `declared` (the exact bytes
+///   against both compared runs' digests, and the contained text in the
+///   attempt's captured stdout, which must be both runs' stdout);
+/// - the attempt ended as the row's recorded `expected_guest_exit` requires
+///   (that guest disposition and the Hermit status reporting it), or with
+///   Hermit exit status 0 when the row records none;
+/// - the report carries the dispatch record a passing attempt of the row's
+///   backend must carry ([`dispatch_record_error`]).
+///
+/// The row records its comparator, backend and expected exit. It records its
+/// declared stdout only on an infrastructure row, so the caller passes the
+/// declaration an earlier skid row of the same cell recorded
+/// (<https://github.com/rrnewton/hermit/issues/1845>).
+pub fn retained_verify_pass_error(
+    result: &CellResult,
+    declared: &DeclaredStdout,
+) -> Option<String> {
+    if result.mode != "verify" || result.outcome != "PASS" {
+        return Some(format!(
+            "the row is a {} {} row, not a verify PASS",
+            result.mode, result.outcome
+        ));
+    }
+    if result.result != Some(ObservedResult::Pass)
+        || result.failure_class.is_some()
+        || result.error_kind.is_some()
+        || result.reason.is_some()
+    {
+        return Some(
+            "the row is not labelled as a verify PASS is: typed result pass, and no failure class, error kind or reason"
+                .into(),
+        );
+    }
+    if let Some(error) = retained_execution_path_error(result) {
+        return Some(format!(
+            "the row's execution-path evidence does not decide a pass: {error}"
+        ));
+    }
+    if result.attempts.is_empty() {
+        return Some("the row retains no inner attempt".into());
+    }
+    let comparator = row_comparator(result);
+    let mut indices = BTreeSet::new();
+    for attempt in &result.attempts {
+        let index = attempt.index.as_str();
+        if index.trim().is_empty() || !indices.insert(index) {
+            return Some(format!(
+                "inner attempt index {index:?} is blank or repeated"
+            ));
+        }
+        if attempt.outcome != "PASS"
+            || attempt.error_kind.is_some()
+            || attempt.reason.is_some()
+            || attempt.timed_out
+        {
+            return Some(format!(
+                "inner attempt {index} is not a PASS without an error kind, reason or timeout"
+            ));
+        }
+        let first_line = attempt.stderr.lines().next().unwrap_or_default();
+        if first_line.starts_with(HERMIT_INTERNAL_FAILURE_CLASS_PREFIX) {
+            return Some(format!(
+                "inner attempt {index}'s first stderr line is a Hermit internal-failure class ({first_line}), which is never a pass"
+            ));
+        }
+        let Some(raw) = attempt.verification_report.as_deref() else {
+            return Some(format!(
+                "inner attempt {index} retains no verification report"
+            ));
+        };
+        if attempt.verification_report_sha256.as_deref()
+            != Some(hex_digest(raw.as_bytes()).as_str())
+        {
+            return Some(format!(
+                "inner attempt {index}'s retained verification report is not the bytes its verification_report_sha256 names"
+            ));
+        }
+        let report = match current_verification_report(raw.as_bytes()) {
+            Ok(report) => report,
+            Err(error) => {
+                return Some(format!(
+                    "inner attempt {index}'s verification report is not a current report: {error}"
+                ));
+            }
+        };
+        let comparison = match comparator {
+            Comparator::Strict => report
+                .require_canonical_comparison()
+                .and_then(|()| report.require_canonical_match()),
+            Comparator::Stripped => require_stripped_comparison(&report)
+                .and_then(|()| {
+                    (report.verified && report.verdict == Verdict::Matched)
+                        .then_some(())
+                        .ok_or_else(|| {
+                            format!(
+                                "stripped verification did not match: verified={} verdict={}",
+                                report.verified, report.verdict
+                            )
+                        })
+                })
+                .and_then(|()| report.require_exact_output_match()),
+        };
+        if let Err(error) = comparison {
+            return Some(format!(
+                "inner attempt {index}'s verification report does not pass the row's {comparator:?} comparator: {error}"
+            ));
+        }
+        let stdout = declared
+            .exact
+            .as_deref()
+            .map(|expected| check_expected_stdout(expected, &report))
+            .transpose()
+            .and_then(|_| {
+                declared
+                    .contains
+                    .as_deref()
+                    .map(|text| {
+                        check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report)
+                    })
+                    .transpose()
+            });
+        if let Err(error) = stdout {
+            let error = match error {
+                ExpectedStdoutError::Unevidenced(error) | ExpectedStdoutError::Mismatch(error) => {
+                    error
+                }
+            };
+            return Some(format!(
+                "inner attempt {index} does not satisfy a declared stdout assertion: {error}"
+            ));
+        }
+        let disposition = match &result.expected_guest_exit {
+            Some(expected) => expected.check(
+                report.guest_exit_code,
+                report.guest_signal,
+                attempt.status,
+                attempt.signal,
+            ),
+            None if attempt.status == Some(0) && attempt.signal.is_none() => Ok(()),
+            None => Err(format!(
+                "Hermit ended with status {:?} and signal {:?}, not exit status 0",
+                attempt.status, attempt.signal
+            )),
+        };
+        if let Err(error) = disposition {
+            return Some(format!(
+                "inner attempt {index} did not end as the row requires: {error}"
+            ));
+        }
+        if let Some(error) = result
+            .backend
+            .as_deref()
+            .and_then(|backend| dispatch_record_error(backend, report.runtime.as_ref()))
+        {
+            return Some(format!(
+                "inner attempt {index} lacks its backend's dispatch evidence: {error}"
+            ));
+        }
+    }
+    None
+}
+
 fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new(program)
         .args(args)
@@ -15080,6 +15272,314 @@ cp "{}" "$verdict"
         );
         let reread: CellResult = serde_json::from_value(plain_row).unwrap();
         assert_eq!(reread.expected_guest_exit, None);
+    }
+
+    /// A retained verify PASS, as a result history keeps it after a skid
+    /// retry, is re-decided from the row's own evidence by the checks the
+    /// executor applies before it writes PASS (`retained_verify_pass_error`):
+    /// the row's labels and execution path, each inner attempt's labels,
+    /// first stderr line, report digest, the comparator the row's
+    /// relaxations record, the declared stdout, the disposition the row's
+    /// expected guest exit names, and the dispatch record of the row's
+    /// backend. Each refusal below names the check that made it
+    /// (<https://github.com/rrnewton/hermit/issues/1845>).
+    #[test]
+    fn a_retained_verify_pass_is_redecided_from_its_own_evidence() {
+        let none = DeclaredStdout::default();
+        let (pass, _) = expected_exit_row(
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(7), None),
+            "exit 7",
+        );
+        assert_eq!(pass.outcome, "PASS", "{:?}", pass.reason);
+        assert_eq!(retained_verify_pass_error(&pass, &none), None);
+        let (plain, _) = expected_exit_row(None, canonical_verification_report(), "exit 0");
+        assert_eq!(plain.outcome, "PASS", "{:?}", plain.reason);
+        assert_eq!(retained_verify_pass_error(&plain, &none), None);
+        let refused = |label: &str, row: &CellResult, declared: &DeclaredStdout, check: &str| {
+            let error = retained_verify_pass_error(row, declared)
+                .unwrap_or_else(|| panic!("{label} was re-decided as a verify PASS"));
+            assert!(
+                error.contains(check),
+                "{label} was refused by another check: {error}"
+            );
+        };
+        let with_raw_report = |row: &CellResult, raw: String| {
+            let mut row = row.clone();
+            row.attempts[0].verification_report_sha256 = Some(hex_digest(raw.as_bytes()));
+            row.attempts[0].verification_report = Some(raw);
+            row
+        };
+        let with_report = |row: &CellResult, report: &VerificationReport| {
+            with_raw_report(row, serde_json::to_string(report).unwrap())
+        };
+
+        // Labels the executor never writes on a verify PASS row.
+        let mut replay = pass.clone();
+        replay.mode = "replay".into();
+        refused("a replay row", &replay, &none, "not a verify PASS");
+        let mut failed = pass.clone();
+        failed.outcome = "FAIL".into();
+        refused("a FAIL row", &failed, &none, "not a verify PASS");
+        let mut no_result = pass.clone();
+        no_result.result = None;
+        let mut classified = pass.clone();
+        classified.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+        let mut kinded = pass.clone();
+        kinded.error_kind = Some("fixture-kind".into());
+        let mut reasoned = pass.clone();
+        reasoned.reason = Some("fixture reason".into());
+        for (label, row) in [
+            ("a PASS row without a typed result", &no_result),
+            ("a PASS row with a failure class", &classified),
+            ("a PASS row with an error kind", &kinded),
+            ("a PASS row with a reason", &reasoned),
+        ] {
+            refused(label, row, &none, "not labelled as a verify PASS");
+        }
+
+        // A SaBRe path on a ptrace row, which no attempt of the row decides.
+        let mut labelled_path = pass.clone();
+        labelled_path.execution_path = Some(serde_json::json!({"eligible": true}));
+        refused(
+            "a ptrace PASS row recording a SaBRe path",
+            &labelled_path,
+            &none,
+            "execution-path evidence",
+        );
+
+        // Inner attempts the executor never writes under a PASS row.
+        let mut empty = pass.clone();
+        empty.attempts.clear();
+        refused(
+            "a PASS row without attempts",
+            &empty,
+            &none,
+            "no inner attempt",
+        );
+        let mut repeated = pass.clone();
+        repeated.attempts.push(repeated.attempts[0].clone());
+        refused(
+            "a repeated attempt index",
+            &repeated,
+            &none,
+            "blank or repeated",
+        );
+        let mut blank = pass.clone();
+        blank.attempts[0].index = " ".into();
+        refused("a blank attempt index", &blank, &none, "blank or repeated");
+        let mut attempt_reasoned = pass.clone();
+        attempt_reasoned.attempts[0].reason = Some("fixture reason".into());
+        let mut attempt_kinded = pass.clone();
+        attempt_kinded.attempts[0].error_kind = Some("fixture-kind".into());
+        let mut attempt_timed_out = pass.clone();
+        attempt_timed_out.attempts[0].timed_out = true;
+        let mut attempt_error = pass.clone();
+        attempt_error.attempts[0].outcome = "ERROR".into();
+        for (label, row) in [
+            ("an attempt with a reason", &attempt_reasoned),
+            ("an attempt with an error kind", &attempt_kinded),
+            ("a timed-out attempt", &attempt_timed_out),
+            ("an ERROR attempt", &attempt_error),
+        ] {
+            refused(label, row, &none, "is not a PASS without");
+        }
+
+        // Hermit's generic command-line error class on the first stderr line
+        // keeps an executed attempt ERROR even beside a matched report and
+        // the declared exit status, so a retained attempt carrying it is
+        // never a pass either. Only the first line carries Hermit's
+        // classification, for the executor and for this re-decision alike.
+        let cli_error = "HERMIT_INTERNAL_FAILURE class=cli-error";
+        let (executed, _) = expected_exit_row(
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(7), None),
+            &format!("printf '%s\\n' '{cli_error}' >&2; exit 7"),
+        );
+        assert_eq!(executed.outcome, "ERROR", "{executed:?}");
+        let mut producer_failed = pass.clone();
+        producer_failed.attempts[0].stderr = format!("{cli_error}\n");
+        refused(
+            "an attempt reporting Hermit's command-line error",
+            &producer_failed,
+            &none,
+            "internal-failure class",
+        );
+        let (executed_later, _) = expected_exit_row(
+            Some(expected_exit(Some(7), None)),
+            expected_exit_report(Some(7), None),
+            &format!("printf 'guest output\\n%s\\n' '{cli_error}' >&2; exit 7"),
+        );
+        assert_eq!(executed_later.outcome, "PASS", "{executed_later:?}");
+        let mut later_line = pass.clone();
+        later_line.attempts[0].stderr = format!("guest output\n{cli_error}\n");
+        assert_eq!(retained_verify_pass_error(&later_line, &none), None);
+
+        // The retained report must be the bytes its digest names, and a
+        // current report.
+        let mut unreported = pass.clone();
+        unreported.attempts[0].verification_report = None;
+        unreported.attempts[0].verification_report_sha256 = None;
+        refused(
+            "an attempt without a report",
+            &unreported,
+            &none,
+            "no verification report",
+        );
+        let mut misdigested = pass.clone();
+        misdigested.attempts[0].verification_report_sha256 = Some("0".repeat(64));
+        refused("a misdigested report", &misdigested, &none, "not the bytes");
+        refused(
+            "an unreadable report",
+            &with_raw_report(&pass, "{}".into()),
+            &none,
+            "not a current report",
+        );
+
+        // The comparator the row's relaxations record. A canonical report
+        // under the stripped relaxation, and a stripped report under none,
+        // are refused; a stripped report under the stripped relaxation
+        // passes only when it matched and its exact outputs agree.
+        let stripped_relaxation = format!("{STRIPPED_COMPARATOR_RELAXATION_PREFIX}fixture reason");
+        let mut canonical_under_stripped = pass.clone();
+        canonical_under_stripped
+            .relaxations
+            .push(stripped_relaxation.clone());
+        refused(
+            "a canonical report under the stripped relaxation",
+            &canonical_under_stripped,
+            &none,
+            "the row's Stripped comparator",
+        );
+        let stripped_report =
+            with_ptrace_dispatch(serde_json::from_str(PRODUCER_STRIPPED_REPORT).unwrap());
+        let stripped_under_strict = with_report(&plain, &stripped_report);
+        refused(
+            "a stripped report under no relaxation",
+            &stripped_under_strict,
+            &none,
+            "the row's Strict comparator",
+        );
+        let mut stripped = stripped_under_strict.clone();
+        stripped.relaxations.push(stripped_relaxation);
+        assert_eq!(retained_verify_pass_error(&stripped, &none), None);
+        let mut stripped_outputs_differ = stripped_report.clone();
+        stripped_outputs_differ
+            .compared_outputs
+            .as_mut()
+            .unwrap()
+            .right
+            .stdout_bytes += 1;
+        // The report reader already refuses a matched report whose two
+        // operands differ, before the comparator check is reached.
+        refused(
+            "a stripped report whose exact outputs differ",
+            &with_report(&stripped, &stripped_outputs_differ),
+            &none,
+            "operands differ in status, stdout, or stderr",
+        );
+        let mut diverged = expected_exit_report(Some(7), None);
+        diverged.verified = false;
+        diverged.bitwise_parity = false;
+        diverged.verdict = Verdict::Diverged;
+        diverged.first_divergent_record = Some(9);
+        diverged.first_divergent_left_message = Some("left".into());
+        diverged.first_divergent_right_message = Some("right".into());
+        refused(
+            "a canonical divergence",
+            &with_report(&pass, &diverged),
+            &none,
+            "the row's Strict comparator",
+        );
+
+        // The declared stdout, decided from the report's digests and, for
+        // the contained text, from the attempt's captured stdout when it is
+        // both compared runs' stdout.
+        let golden = "golden\n";
+        let mut golden_report = expected_exit_report(Some(7), None);
+        let outputs = golden_report.compared_outputs.as_mut().unwrap();
+        for output in [&mut outputs.left, &mut outputs.right] {
+            output.stdout_sha256 = hex_digest(golden.as_bytes());
+            output.stdout_bytes = golden.len() as u64;
+        }
+        let mut golden_pass = with_report(&pass, &golden_report);
+        golden_pass.attempts[0].stdout = golden.into();
+        let exact = |text: &str| DeclaredStdout {
+            exact: Some(text.into()),
+            contains: None,
+        };
+        let contains = |text: &str| DeclaredStdout {
+            exact: None,
+            contains: Some(text.into()),
+        };
+        assert_eq!(
+            retained_verify_pass_error(&golden_pass, &exact(golden)),
+            None
+        );
+        assert_eq!(
+            retained_verify_pass_error(&golden_pass, &contains("gold")),
+            None
+        );
+        refused(
+            "stdout other than the declared bytes",
+            &pass,
+            &exact(golden),
+            "declared stdout assertion",
+        );
+        refused(
+            "stdout without the declared text",
+            &golden_pass,
+            &contains("silver"),
+            "declared stdout assertion",
+        );
+        let mut uncaptured = golden_pass.clone();
+        uncaptured.attempts[0].stdout = "gold, but not the compared bytes\n".into();
+        refused(
+            "a capture that is not the compared runs' stdout",
+            &uncaptured,
+            &contains("gold"),
+            "declared stdout assertion",
+        );
+
+        // The disposition the row's expected guest exit names: that guest
+        // ending and the Hermit status reporting it, or Hermit exit status 0
+        // when the row names none.
+        let mut undeclared = pass.clone();
+        undeclared.expected_guest_exit = None;
+        refused(
+            "exit status 7 without a declaration",
+            &undeclared,
+            &none,
+            "did not end as the row requires",
+        );
+        refused(
+            "a guest that exited 0 where 7 is expected",
+            &with_report(&pass, &expected_exit_report(Some(0), None)),
+            &none,
+            "did not end as the row requires",
+        );
+        let mut hermit_succeeded = pass.clone();
+        hermit_succeeded.attempts[0].status = Some(0);
+        refused(
+            "Hermit exit status 0 where the guest exited 7",
+            &hermit_succeeded,
+            &none,
+            "did not end as the row requires",
+        );
+
+        // The dispatch record a passing attempt of the row's backend carries.
+        let mut dispatched_report = expected_exit_report(Some(7), None);
+        dispatched_report.runtime = stripped_report.runtime.clone();
+        let dispatched = with_report(&pass, &dispatched_report);
+        assert_eq!(retained_verify_pass_error(&dispatched, &none), None);
+        let mut forged: serde_json::Value = serde_json::to_value(&dispatched_report).unwrap();
+        forged["runtime"]["run1"]["dispatch"]["backend"] = serde_json::json!("liteinst");
+        refused(
+            "another backend's dispatch record",
+            &with_raw_report(&pass, serde_json::to_string(&forged).unwrap()),
+            &none,
+            "dispatch evidence",
+        );
     }
 
     /// A row whose attempt carries an `infrastructure_error` report records

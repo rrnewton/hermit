@@ -78,6 +78,7 @@ use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::retained_execution_path_error;
+use hermit_manifest_plan::runner::retained_verify_pass_error;
 use hermit_manifest_plan::runner::run_epoch_from_env;
 use hermit_manifest_plan::runner::skid_overshoot_only_reports;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
@@ -7164,8 +7165,21 @@ struct RepeatedCellTally {
 /// PASS row's execution path is the eligible one its own retained attempts
 /// decide ([`retained_execution_path_error`]), every row records the PASS
 /// row's relaxations (so each was judged by the same comparator and recipe),
-/// and every other row is one the runner's own retry predicate,
-/// [`skid_overshoot_only_reports`], accepts.
+/// test, category, mode, backend and expected guest exit, every other row is
+/// one the runner's own retry predicate, [`skid_overshoot_only_reports`],
+/// accepts, and every such row records the same declared stdout assertions,
+/// which the PASS row (where the runner records none) records as well if it
+/// records any.
+///
+/// The PASS row is then re-decided from what it retains, as the runner
+/// decides a fresh verify PASS ([`retained_verify_pass_error`]): every inner
+/// report passes the comparator the row's relaxations record, satisfies the
+/// declared stdout assertions the skid rows recorded, ends with the guest
+/// disposition and Hermit status the row's expected guest exit names (or
+/// Hermit exit status 0), and carries the dispatch record of the row's
+/// backend. A forged dispatch record, a canonical report under stripped
+/// relaxations, stdout the declaration forbids, or an exit the row does not
+/// expect keeps the ordinary reading.
 ///
 /// That refusal is the one infrastructure failure the runner retries
 /// (<https://github.com/rrnewton/hermit/issues/1845>). It measured the host's
@@ -7181,6 +7195,13 @@ fn passed_after_skid_retries_only(result: &str, rows: &[CellResult]) -> bool {
     let Ok(selected) = cell_result_after_retries(rows) else {
         return false;
     };
+    let mut predecessors = rows.iter().filter(|row| row.attempt != selected.attempt);
+    let Some(declared) = predecessors
+        .next()
+        .and_then(|row| row.declared_stdout.as_ref())
+    else {
+        return false;
+    };
     result == "pass"
         && selected.outcome == "PASS"
         && selected.attempt > 1
@@ -7188,8 +7209,20 @@ fn passed_after_skid_retries_only(result: &str, rows: &[CellResult]) -> bool {
         && retained_execution_path_error(selected).is_none()
         && rows.iter().all(|row| {
             row.relaxations == selected.relaxations
-                && (row.attempt == selected.attempt || skid_overshoot_only_reports(row).is_some())
+                && row.test == selected.test
+                && row.category == selected.category
+                && row.mode == selected.mode
+                && row.backend == selected.backend
+                && row.expected_guest_exit == selected.expected_guest_exit
+                && (row.attempt == selected.attempt
+                    || (skid_overshoot_only_reports(row).is_some()
+                        && row.declared_stdout.as_ref() == Some(declared)))
         })
+        && selected
+            .declared_stdout
+            .as_ref()
+            .is_none_or(|recorded| recorded == declared)
+        && retained_verify_pass_error(selected, declared).is_none()
 }
 
 /// What one repetition's retained evidence established, as `fold_repetition`
@@ -15426,6 +15459,187 @@ fn self_test(root: &Path) -> Result<(), String> {
                 ));
             }
         }
+        // The selected PASS is re-decided from what it retains, as the runner
+        // decides a fresh verify PASS (`retained_verify_pass_error`). Each
+        // defect below is the only difference from a control that earns
+        // credit, and every one of them consists of qualifying subruns, so
+        // only that re-decision refuses it.
+        let rewrite_report =
+            |row: &CellResult, edit: &dyn Fn(&mut JsonValue)| -> Result<CellResult, String> {
+                let mut row = row.clone();
+                let attempt = &mut row.attempts[0];
+                let mut report: JsonValue = serde_json::from_str(
+                    attempt
+                        .verification_report
+                        .as_deref()
+                        .ok_or("report fixture lost its report")?,
+                )
+                .map_err(|e| format!("invalid report fixture: {e}"))?;
+                edit(&mut report);
+                let raw = serde_json::to_string(&report)
+                    .map_err(|e| format!("cannot encode report fixture: {e}"))?;
+                attempt.verification_report_sha256 =
+                    Some(format!("{:x}", sha2::Sha256::digest(raw.as_bytes())));
+                attempt.verification_report = Some(raw);
+                Ok(row)
+            };
+        // A ptrace PASS whose report carries each run's ptrace dispatch
+        // record, and the same report naming another backend's record, its
+        // digest recomputed: the runner refuses that dispatch record on a
+        // fresh attempt.
+        let runtime = |backend: &str| {
+            let run = json!({
+                "scheduler_turns": 6, "virtual_nanoseconds": 4126085, "syscalls": 40,
+                "dispatch": {
+                    "schema_version": 1, "backend": backend,
+                    "counters": {
+                        "signal_traps": 0, "patched_direct_calls": 0,
+                        "ptrace_seccomp_stops": 40, "ptrace_sigtrap_stops": 0,
+                        "sigill_marker_hits": 0, "ptrace_syscall_entry_stops": 0,
+                        "ptrace_syscall_exit_stops": 0, "refusals": 0
+                    },
+                    "sites": {"candidates": 0, "patched": 0, "fell_back": 0}
+                }
+            });
+            json!({"run1": run.clone(), "run2": run})
+        };
+        let dispatched_pass = rewrite_report(&retry_pass, &|report| {
+            report["runtime"] = runtime("ptrace");
+        })?;
+        let forged_dispatch_pass = rewrite_report(&retry_pass, &|report| {
+            report["runtime"] = runtime("liteinst");
+        })?;
+        // A stripped skid row, and a canonical PASS recorded under the same
+        // stripped relaxation: the comparator the rows record is the stripped
+        // one, which a canonical report does not hold.
+        let stripped_relaxation = format!(
+            "{}fixture reason",
+            hermit_manifest_plan::runner::STRIPPED_COMPARATOR_RELAXATION_PREFIX
+        );
+        let mut stripped_skid = rewrite_report(&skid, &|report| {
+            report["comparison"] = json!({
+                "strictness": "stripped", "display_name": "Stripped", "compare_logs": true,
+                "compare_io_buffers": true, "log_scope": "deterministic",
+                "record_envelope": "all_records_v1", "virtualize_time": true,
+                "strip_lines": true, "canonicalize_addresses": false, "full_trace": false,
+                "exact_remainder": false,
+                "stripped_prefixes": [
+                    "real-wall-clock-prefix/v1",
+                    "unsafe-numeric-address-and-path-normalization/v1"
+                ],
+                "canonicalizations": [], "ignore_lines": false, "skip_commit": false,
+                "skip_detlog": false
+            });
+        })?;
+        stripped_skid.relaxations.push(stripped_relaxation.clone());
+        let mut canonical_under_stripped_pass = retry_pass.clone();
+        canonical_under_stripped_pass
+            .relaxations
+            .push(stripped_relaxation);
+        // A skid row declaring empty stdout, which its compared runs printed,
+        // and a PASS whose compared runs agree on other bytes.
+        let mut declared_skid = skid.clone();
+        declared_skid.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
+            exact: Some(String::new()),
+            contains: None,
+        });
+        let unexpected_stdout = "unexpected\n";
+        let unexpected_stdout_pass = rewrite_report(&retry_pass, &|report| {
+            for side in ["left", "right"] {
+                report["compared_outputs"][side]["stdout_sha256"] = json!(format!(
+                    "{:x}",
+                    sha2::Sha256::digest(unexpected_stdout.as_bytes())
+                ));
+                report["compared_outputs"][side]["stdout_bytes"] = json!(unexpected_stdout.len());
+            }
+        })?;
+        // The PASS row records a declaration of its own only if it is the
+        // skid rows' declaration.
+        let mut recorded_pass = retry_pass.clone();
+        recorded_pass.declared_stdout = skid.declared_stdout.clone();
+        let mut misrecorded_pass = retry_pass.clone();
+        misrecorded_pass.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
+            exact: Some("other\n".into()),
+            contains: None,
+        });
+        // A cell declaring guest exit 7: its skid row and its PASS, a PASS
+        // whose guest exited 0 instead, and a PASS whose guest exited 7 while
+        // Hermit exited 0.
+        let retried = |row: CellResult| CellResult { attempt: 2, ..row };
+        let exit7_pass = retried(matched_pass_row(&result_row, &argv, 7, (7, 7), Some(7))?);
+        let exit0_pass = retried(matched_pass_row(&result_row, &argv, 0, (0, 0), Some(7))?);
+        let status0_pass = retried(matched_pass_row(&result_row, &argv, 0, (7, 7), Some(7))?);
+        let mut exit7_skid = rewrite_report(&skid, &|report| {
+            report["guest_exit_code"] = json!(7);
+            for side in ["left", "right"] {
+                report["compared_outputs"][side]["exit_code"] = json!(7);
+            }
+        })?;
+        exit7_skid.expected_guest_exit = exit7_pass.expected_guest_exit.clone();
+        // Hermit's internal-failure class on the PASS attempt's first stderr
+        // line; on a later line it is guest output.
+        let mut classified_pass = retry_pass.clone();
+        classified_pass.attempts[0].stderr =
+            "HERMIT_INTERNAL_FAILURE class=cli-error\nError: fixture\n".into();
+        let mut later_line_pass = retry_pass.clone();
+        later_line_pass.attempts[0].stderr =
+            "guest output\nHERMIT_INTERNAL_FAILURE class=cli-error\n".into();
+        // Labels the runner never writes on a PASS row.
+        let mut reasoned_pass = retry_pass.clone();
+        reasoned_pass.reason = Some("fixture reason".into());
+        let mut kinded_pass = retry_pass.clone();
+        kinded_pass.error_kind = Some("fixture-kind".into());
+        // Rows that are not the same cell's.
+        let mut other_backend_skid = skid.clone();
+        other_backend_skid.backend = Some("liteinst".into());
+        let mut other_test_skid = skid.clone();
+        other_test_skid.test = "sample/elsewhere".into();
+        let mut other_category_skid = skid.clone();
+        other_category_skid.category = "elsewhere".into();
+        for (case, row) in [
+            ("stripped skid", &stripped_skid),
+            ("declared skid", &declared_skid),
+            ("exit-7 skid", &exit7_skid),
+            ("other-backend skid", &other_backend_skid),
+            ("other-test skid", &other_test_skid),
+            ("other-category skid", &other_category_skid),
+        ] {
+            if skid_overshoot_only_reports(row) != Some(2) {
+                return Err(format!(
+                    "the {case} fixture is not the runner's skid-only row: {row:?}"
+                ));
+            }
+        }
+        for (case, row) in [
+            ("dispatched", &dispatched_pass),
+            ("forged-dispatch", &forged_dispatch_pass),
+            ("canonical-under-stripped", &canonical_under_stripped_pass),
+            ("unexpected-stdout", &unexpected_stdout_pass),
+            ("exit-0", &exit0_pass),
+            ("status-0", &status0_pass),
+            ("classified", &classified_pass),
+            ("later-line", &later_line_pass),
+            ("reasoned", &reasoned_pass),
+            ("kinded", &kinded_pass),
+        ] {
+            if !qualifying_subruns(&row.mode, &row.attempts)
+                || retained_execution_path_error(row).is_some()
+            {
+                return Err(format!(
+                    "the {case} PASS fixture is not otherwise a qualifying PASS: {row:?}"
+                ));
+            }
+        }
+        // The series reader retains a matched verify PASS only beside Hermit
+        // exit status 0, so a PASS whose declared guest exit 7 Hermit
+        // reported is never a qualifying PASS here and no such recovery is
+        // credited. If that ever changes, the exit-7 cases below need a
+        // qualifying control.
+        if qualifying_subruns(&exit7_pass.mode, &exit7_pass.attempts) {
+            return Err(format!(
+                "the exit-7 PASS fixture became a qualifying PASS; add its recovery control: {exit7_pass:?}"
+            ));
+        }
         let mut product = first_row.clone();
         product.attempt = 1;
         // The recovery reading needs a history the runner itself validates,
@@ -15531,6 +15745,120 @@ fn self_test(root: &Path) -> Result<(), String> {
                 vec![skid.clone(), forged_path_pass.clone()],
                 false,
             ),
+            (
+                "skid then dispatched pass",
+                "pass",
+                vec![skid.clone(), dispatched_pass.clone()],
+                true,
+            ),
+            (
+                "skid then forged-dispatch pass",
+                "pass",
+                vec![skid.clone(), forged_dispatch_pass.clone()],
+                false,
+            ),
+            (
+                "stripped skid then canonical pass",
+                "pass",
+                vec![stripped_skid.clone(), canonical_under_stripped_pass.clone()],
+                false,
+            ),
+            (
+                "declared skid then pass",
+                "pass",
+                vec![declared_skid.clone(), retry_pass.clone()],
+                true,
+            ),
+            (
+                "skid then unexpected-stdout pass",
+                "pass",
+                vec![skid.clone(), unexpected_stdout_pass.clone()],
+                true,
+            ),
+            (
+                "declared skid then unexpected-stdout pass",
+                "pass",
+                vec![declared_skid.clone(), unexpected_stdout_pass.clone()],
+                false,
+            ),
+            (
+                "skid then pass recording its declaration",
+                "pass",
+                vec![skid.clone(), recorded_pass.clone()],
+                true,
+            ),
+            (
+                "skid then pass recording another declaration",
+                "pass",
+                vec![skid.clone(), misrecorded_pass.clone()],
+                false,
+            ),
+            (
+                "exit-7 skid then exit-7 pass",
+                "pass",
+                vec![exit7_skid.clone(), exit7_pass.clone()],
+                false,
+            ),
+            (
+                "exit-7 skid then exit-0 pass",
+                "pass",
+                vec![exit7_skid.clone(), exit0_pass.clone()],
+                false,
+            ),
+            (
+                "exit-7 skid then hermit-status-0 pass",
+                "pass",
+                vec![exit7_skid.clone(), status0_pass.clone()],
+                false,
+            ),
+            (
+                "undeclared skid then exit-7 pass",
+                "pass",
+                vec![skid.clone(), exit7_pass.clone()],
+                false,
+            ),
+            (
+                "skid then classified pass",
+                "pass",
+                vec![skid.clone(), classified_pass.clone()],
+                false,
+            ),
+            (
+                "skid then later-line pass",
+                "pass",
+                vec![skid.clone(), later_line_pass.clone()],
+                true,
+            ),
+            (
+                "skid then reasoned pass",
+                "pass",
+                vec![skid.clone(), reasoned_pass.clone()],
+                false,
+            ),
+            (
+                "skid then kinded pass",
+                "pass",
+                vec![skid.clone(), kinded_pass.clone()],
+                false,
+            ),
+            (
+                "other-backend skid then pass",
+                "pass",
+                vec![other_backend_skid.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "other-test skid then pass",
+                "pass",
+                vec![other_test_skid.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "other-category skid then pass",
+                "pass",
+                vec![other_category_skid.clone(), retry_pass.clone()],
+                false,
+            ),
         ] {
             if passed_after_skid_retries_only(result, &rows) != recovered {
                 return Err(format!(
@@ -15539,11 +15867,16 @@ fn self_test(root: &Path) -> Result<(), String> {
             }
         }
         // Skid-recovery credit needs the skid predicate, a selected PASS of
-        // qualifying subruns, and an intact inner history whose categories
-        // are all infrastructure failures; each history refused by any of
-        // them keeps base's FLAKY reading, with no credit. A PASS retaining a
+        // qualifying subruns that the runner's PASS checks re-decide from
+        // what it retains, and an intact inner history whose categories are
+        // all infrastructure failures; each history refused by any of them
+        // keeps base's FLAKY reading, with no credit. A PASS retaining a
         // canonical divergence or a skid refusal is an intact history, so it
-        // is refused with no unknown history and no evidence error.
+        // is refused with no unknown history and no evidence error, and so is
+        // a qualifying PASS the re-decision refuses (another backend's
+        // dispatch record, a canonical report under stripped relaxations,
+        // stdout the skid row's declaration forbids, or a guest exit the rows
+        // do not expect); each has a control that earns credit.
         for (name, earlier, later, verdict, recovered, history_intact) in [
             (
                 "verdicts-skid-recovered",
@@ -15645,6 +15978,62 @@ fn self_test(root: &Path) -> Result<(), String> {
                 "verdicts-vacuous-skid-recovered",
                 &vacuous,
                 &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-skid-then-dispatched-pass",
+                &skid,
+                &dispatched_pass,
+                "INCOMPLETE",
+                1,
+                true,
+            ),
+            (
+                "verdicts-skid-then-forged-dispatch-pass",
+                &skid,
+                &forged_dispatch_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-stripped-skid-then-canonical-pass",
+                &stripped_skid,
+                &canonical_under_stripped_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-declared-skid-then-pass",
+                &declared_skid,
+                &retry_pass,
+                "INCOMPLETE",
+                1,
+                true,
+            ),
+            (
+                "verdicts-skid-then-unexpected-stdout-pass",
+                &skid,
+                &unexpected_stdout_pass,
+                "INCOMPLETE",
+                1,
+                true,
+            ),
+            (
+                "verdicts-declared-skid-then-unexpected-stdout-pass",
+                &declared_skid,
+                &unexpected_stdout_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-exit7-skid-then-exit0-pass",
+                &exit7_skid,
+                &exit0_pass,
                 "FLAKY",
                 0,
                 true,

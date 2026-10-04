@@ -546,7 +546,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validation_dag::tests::no_dag_text_names_a_user_home_path retains all
     // 838 prior identities (`cargo nextest list --profile ci` over this
     // node's selection measured 839).
-    ("test.regular_crates", 839),
+    // runner::tests::a_retained_verify_pass_is_redecided_from_its_own_evidence,
+    // added when a pressure-test history's skid-recovered PASS became
+    // re-decided from its retained evidence (the same issue), retains all 839.
+    ("test.regular_crates", 840),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -999,8 +1002,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.regular_crates retain all 828 prior identities, and the four
     // SKID-RETRY tests of https://github.com/rrnewton/hermit/issues/1845 listed
     // there retain all 834. The home-path DAG text test listed there retains
-    // all 838.
-    ("test.regular_crates_on_host", 839),
+    // all 838, and the retained-PASS re-decision test listed there retains
+    // all 839.
+    ("test.regular_crates_on_host", 840),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
