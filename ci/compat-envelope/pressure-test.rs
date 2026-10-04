@@ -645,6 +645,122 @@ struct PressureCells {
     eligible_cells: usize,
     preparation_by_test: BTreeMap<String, CellId>,
     cells_file_sha256: Option<String>,
+    /// The manifest facts of every selected cell and every preparation cell,
+    /// keyed by (test, mode, backend).
+    manifest_facts: BTreeMap<(String, String, String), ManifestCellFacts>,
+}
+
+/// What the manifest says about one cell that a generated `test-harness`
+/// command must reproduce to select it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ManifestCellFacts {
+    /// The cell's run types, exactly as the harness's selection computes them
+    /// (`runner::cell_labels`): the test's labels and the mode's labels for
+    /// this backend, or the default run type when there are none. A harness
+    /// selection without `--label` selects only cells of the default run type.
+    run_types: BTreeSet<String>,
+    /// The manifest lists this backend in the mode's `backends_enabled`. The
+    /// harness selects an enabled cell with `--include-manual`, whatever its
+    /// `ci` flag says, and a disabled one only with `--probe-disabled`.
+    enabled: bool,
+}
+
+/// Every manifest cell's [`ManifestCellFacts`], from the same manifest set and
+/// selection code `test-harness` uses: both populations, every run type,
+/// occasional and manual cells included.
+fn manifest_cell_facts(
+    manifests: &ManifestSet,
+) -> Result<BTreeMap<(String, String, String), ManifestCellFacts>, String> {
+    use hermit_manifest_plan::runner::Population;
+    use hermit_manifest_plan::runner::Selection;
+    let mut facts = BTreeMap::new();
+    for population in [Population::Enabled, Population::Disabled] {
+        let cells = manifests.select(&Selection {
+            population: Some(population),
+            include_occasional: true,
+            include_manual: true,
+            all_run_types: true,
+            ..Selection::default()
+        })?;
+        for cell in cells {
+            let recipe = cell.test.modes.get(&cell.id.mode).ok_or_else(|| {
+                format!(
+                    "manifest cell {}/{} has no mode recipe",
+                    cell.id.test, cell.id.mode
+                )
+            })?;
+            let run_types = hermit_manifest_plan::runner::cell_labels(
+                &cell.test,
+                recipe,
+                cell.id.backend.as_deref(),
+            )
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+            let key = (
+                cell.id.test.clone(),
+                cell.id.mode.clone(),
+                cell.id.backend.clone().unwrap_or_else(|| "native".into()),
+            );
+            if facts
+                .insert(
+                    key.clone(),
+                    ManifestCellFacts {
+                        run_types,
+                        enabled: cell.enabled,
+                    },
+                )
+                .is_some()
+            {
+                return Err(format!(
+                    "manifest selection lists {}/{}/{} twice",
+                    key.0, key.1, key.2
+                ));
+            }
+        }
+    }
+    Ok(facts)
+}
+
+/// The facts for `cell`, refusing a cell the manifest lacks or whose
+/// applicability the tracked scorecard records differently: the generated
+/// harness selector depends on it, and a mismatch would select nothing.
+fn tracked_cell_facts(
+    facts: &BTreeMap<(String, String, String), ManifestCellFacts>,
+    cell: &CellId,
+    applicable: bool,
+) -> Result<ManifestCellFacts, String> {
+    let found = facts
+        .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+        .ok_or_else(|| format!("the manifests have no cell {}", display_id(cell)))?;
+    if found.enabled != applicable {
+        return Err(format!(
+            "the tracked scorecard records {} as {}, but the manifest {} its backend; update the scorecard before generating a pressure run",
+            display_id(cell),
+            if applicable {
+                "applicable"
+            } else {
+                "not applicable"
+            },
+            if found.enabled { "enables" } else { "disables" },
+        ));
+    }
+    Ok(found.clone())
+}
+
+/// The `test-harness` selection words that admit a cell of `run_types`: none
+/// for a cell of the default run type, else `--label` naming its run types.
+fn run_type_filter(run_types: &BTreeSet<String>) -> Result<String, String> {
+    if run_types.is_empty() {
+        return Err("a manifest cell has no run type".into());
+    }
+    if run_types.contains(hermit_manifest_plan::runner::DEFAULT_RUN_TYPE) {
+        return Ok(String::new());
+    }
+    Ok(format!(
+        " --label {}",
+        shell_quote(&run_types.iter().cloned().collect::<Vec<_>>().join(","))
+    ))
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -3969,12 +4085,28 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             .entry(cell.id.test.clone())
             .or_insert_with(|| prepared_with.clone());
     }
+    // The harness selects a cell only through its run types and its enabled
+    // state, so every generated command takes them from the manifest. The
+    // preparation cell is applicable by construction.
+    let all_facts = manifest_cell_facts(&ManifestSet::load(root)?)?;
+    let mut manifest_facts = BTreeMap::new();
+    for (id, applicable) in selected_cells
+        .iter()
+        .map(|cell| (&cell.id, cell.is_applicable()))
+        .chain(preparation_by_test.values().map(|id| (id, true)))
+    {
+        manifest_facts.insert(
+            (id.test.clone(), id.mode.clone(), id.backend.clone()),
+            tracked_cell_facts(&all_facts, id, applicable)?,
+        );
+    }
     Ok(PressureCells {
         selected: selected_cells,
         unavailable,
         eligible_cells,
         preparation_by_test,
         cells_file_sha256,
+        manifest_facts,
     })
 }
 
@@ -4894,7 +5026,14 @@ fn write_plan_after_scorecard_check(
         eligible_cells,
         preparation_by_test: all_preparations,
         cells_file_sha256,
+        manifest_facts,
     } = pressure_cells(root, selection)?;
+    let run_types_of = |cell: &CellId| -> Result<String, String> {
+        let facts = manifest_facts
+            .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+            .ok_or_else(|| format!("no manifest facts for {}", display_id(cell)))?;
+        run_type_filter(&facts.run_types)
+    };
     validate_guest_caps_against_selected_demand(&cells, selection)?;
     if checked_scorecard.enforce_host_capabilities {
         require_selected_kvm_capability(&cells, &strict_kvm_capability())?;
@@ -5029,13 +5168,14 @@ fn write_plan_after_scorecard_check(
             format!(" --backend {}", shell_quote(&cell.backend))
         };
         let pressure_seconds = preparation_timeout(budget)?;
+        let run_types = run_types_of(&cell)?;
         let cmd = format!(
             "mkdir -p {status_dir}; if test -f {status}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status}; status=0; \
              timeout --kill-after=10s {pressure_seconds}s env \
              E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} \
              target/debug/test-harness build --include-manual --include-occasional \
-             --test {test} --mode {mode}{backend} || status=$?; \
+             --test {test} --mode {mode}{backend}{run_types} || status=$?; \
              printf '%s\\n' \"$status\" > {status}; exit 0",
             status_dir = shell_quote(&status_path.parent().unwrap().to_string_lossy()),
             results = shell_quote(&results.to_string_lossy()),
@@ -5043,6 +5183,7 @@ fn write_plan_after_scorecard_check(
             test = shell_quote(&test),
             mode = shell_quote(&cell.mode),
             backend = backend,
+            run_types = run_types,
             status = shell_quote(&status_path.to_string_lossy()),
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
         );
@@ -5151,6 +5292,7 @@ fn write_plan_after_scorecard_check(
                 ""
             };
             let namespaces = dbt_namespace_prefix(&cell.backend);
+            let run_types = run_types_of(cell)?;
             let harness = if selection.is_exact() {
                 let prebuilt = if selection.uses_shared_preparation() {
                     " --prebuilt"
@@ -5158,7 +5300,7 @@ fn write_plan_after_scorecard_check(
                     ""
                 };
                 format!(
-                    "{hermit_bin} {namespaces}target/debug/test-harness run {selector} --include-occasional{prebuilt}{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "{hermit_bin} {namespaces}target/debug/test-harness run {selector} --include-occasional{prebuilt}{no_retry} --test {test} --mode {mode}{backend}{run_types} --results {result_file} --junit {junit}",
                     hermit_bin = EXACT_CELL_HERMIT_BIN,
                     selector = selector,
                     prebuilt = prebuilt,
@@ -5166,17 +5308,19 @@ fn write_plan_after_scorecard_check(
                     test = shell_quote(&cell.test),
                     mode = shell_quote(&cell.mode),
                     backend = backend,
+                    run_types = run_types,
                     result_file = shell_quote(&result_in_progress.to_string_lossy()),
                     junit = shell_quote(&junit_in_progress.to_string_lossy()),
                 )
             } else {
                 format!(
-                    "{namespaces}./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt{no_retry} --test {test} --mode {mode}{backend} --results {result_file} --junit {junit}",
+                    "{namespaces}./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run {selector} --include-occasional --prebuilt{no_retry} --test {test} --mode {mode}{backend}{run_types} --results {result_file} --junit {junit}",
                     selector = selector,
                     no_retry = no_retry,
                     test = shell_quote(&cell.test),
                     mode = shell_quote(&cell.mode),
                     backend = backend,
+                    run_types = run_types,
                     result_file = shell_quote(&result_in_progress.to_string_lossy()),
                     junit = shell_quote(&junit_in_progress.to_string_lossy()),
                 )
@@ -11511,6 +11655,183 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 /// read that followed an inherited location back to the source would see
 /// another HEAD or a dirty tree. The self-test process runs no other thread,
 /// so it may set and clear the variables here.
+/// Red cells the default run type does not select: a test-level label
+/// (compat/java, compat/strict-du), a per-backend label (compat/comm on
+/// SaBRe), and an rr-compat replay cell, beside a red default-run-type cell.
+const FOCUSED_RED_CELLS: [(&str, &str, &str); 5] = [
+    ("c-programs/prctl-identity", "verify", "dbt"),
+    ("compat/comm", "verify", "sabre"),
+    ("compat/java", "verify", "ptrace"),
+    ("compat/rr-awk", "replay", "ptrace"),
+    ("compat/strict-du", "verify", "ptrace"),
+];
+/// Disabled SaBRe cells: one of a labelled test, one of a default-run-type test.
+const FOCUSED_DISABLED_SABRE_CELLS: [(&str, &str, &str); 2] = [
+    ("compat/comm", "replay", "sabre"),
+    ("compat/strict-du", "verify", "sabre"),
+];
+
+/// The `test-harness` subcommand of a generated command and the selection it
+/// applies, parsed as `test-harness` parses them: `--include-manual` selects
+/// the enabled population, `--probe-disabled` the disabled one, `--label` the
+/// named run types, and no `--label` the default run type.
+fn harness_command_selection(
+    cmd: &str,
+) -> Result<(String, hermit_manifest_plan::runner::Selection), String> {
+    use hermit_manifest_plan::runner::Population;
+    let marker = "target/debug/test-harness ";
+    let start = cmd
+        .find(marker)
+        .ok_or_else(|| format!("no harness invocation in {cmd}"))?
+        + marker.len();
+    let rest = &cmd[start..];
+    let end = rest
+        .find(" --results")
+        .or_else(|| rest.find(" ||"))
+        .ok_or_else(|| format!("unterminated harness invocation {rest}"))?;
+    let mut words = rest[..end]
+        .split_whitespace()
+        .map(|word| word.trim_matches('\'').to_string());
+    let command = words.next().ok_or("empty harness invocation")?;
+    let mut selection = hermit_manifest_plan::runner::Selection::default();
+    while let Some(word) = words.next() {
+        let mut value = || {
+            words
+                .next()
+                .ok_or_else(|| format!("{word} has no value in {cmd}"))
+        };
+        match word.as_str() {
+            "--include-manual" => selection.include_manual = true,
+            "--include-occasional" => selection.include_occasional = true,
+            "--probe-disabled" => selection.population = Some(Population::Disabled),
+            "--prebuilt" | "--no-retry" => {}
+            "--test" => selection.test = Some(value()?),
+            "--mode" => selection.mode = Some(value()?),
+            "--backend" => selection.backend = Some(value()?),
+            "--label" => selection
+                .labels
+                .extend(value()?.split(',').map(str::to_string)),
+            other => return Err(format!("unexpected harness word {other} in {cmd}")),
+        }
+    }
+    if selection.population.is_none() {
+        selection.population = Some(if selection.include_manual {
+            Population::Enabled
+        } else {
+            Population::Required
+        });
+    }
+    Ok((command, selection))
+}
+
+/// Plan `cells` from a cells file under `scratch` and require every
+/// preparation and cell node to select exactly its own cell through the
+/// harness's selection. A node that selects nothing would exit "filters
+/// selected no cells", and the run would record an infrastructure error in
+/// place of evidence.
+fn focused_run_type_plan_selects_each_cell(
+    root: &Path,
+    scratch: &Path,
+    label: &str,
+    cells: &[(&str, &str, &str)],
+    probe_backend: Option<&str>,
+) -> Result<(), String> {
+    let cells: Vec<CellId> = cells
+        .iter()
+        .map(|(test, mode, backend)| CellId {
+            lane: "portable".into(),
+            category: test
+                .split_once('/')
+                .map_or("", |(category, _)| category)
+                .into(),
+            test: (*test).into(),
+            mode: (*mode).into(),
+            backend: (*backend).into(),
+        })
+        .collect();
+    let checked = CheckedScorecard {
+        root,
+        enforce_host_capabilities: false,
+        memory_budget_override: Some(i64::MAX),
+    };
+    let cells_file = scratch.join(format!("focused-run-type-{label}.jsonl"));
+    fs::write(&cells_file, canonical_cells_jsonl(&cells)?)
+        .map_err(|error| format!("cannot write {}: {error}", cells_file.display()))?;
+    let plan = scratch.join(format!("focused-run-type-{label}-plan"));
+    let selection = CellSelection {
+        cells_file: Some(cells_file),
+        repetitions: Some(1),
+        probe_disabled: probe_backend.is_some(),
+        backend: probe_backend.map(str::to_string),
+        run_timeout_seconds: Some(1_000_000),
+        ..CellSelection::default()
+    };
+    let (_, dag) =
+        write_plan_after_scorecard_check(&checked, &plan, &plan.join("dag.json"), &selection)?;
+    let manifests = ManifestSet::load(root)?;
+    let mut prepared = BTreeSet::new();
+    let mut ran = BTreeSet::new();
+    for step in dag
+        .steps
+        .iter()
+        .filter(|step| matches!(step.group.as_str(), "prepare" | "cell"))
+    {
+        let (command, harness_selection) = harness_command_selection(&step.cmd)?;
+        let selected = manifests.select(&harness_selection)?;
+        let [selected] = selected.as_slice() else {
+            return Err(format!(
+                "{label}: {} selects {} cell(s) through the harness: {}",
+                step.tag(),
+                selected.len(),
+                step.cmd
+            ));
+        };
+        let backend = selected
+            .id
+            .backend
+            .clone()
+            .unwrap_or_else(|| "native".into());
+        match (step.group.as_str(), command.as_str()) {
+            ("prepare", "build") => {
+                prepared.insert(selected.id.test.clone());
+            }
+            ("cell", "run") => {
+                ran.insert((selected.id.test.clone(), selected.id.mode.clone(), backend));
+            }
+            _ => {
+                return Err(format!(
+                    "{label}: {} runs test-harness {command}",
+                    step.tag()
+                ));
+            }
+        }
+    }
+    let expected_tests: BTreeSet<_> = cells.iter().map(|cell| cell.test.clone()).collect();
+    let expected_cells: BTreeSet<_> = cells
+        .iter()
+        .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+        .collect();
+    if prepared != expected_tests || ran != expected_cells {
+        return Err(format!(
+            "{label}: the plan prepared {prepared:?} and ran {ran:?}; expected {expected_tests:?} and {expected_cells:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Cells of a non-default run type, red and disabled, are prepared and run by
+/// commands that the harness's own selection resolves to exactly them.
+fn focused_run_type_selection_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
+    focused_run_type_plan_selects_each_cell(root, scratch, "red", &FOCUSED_RED_CELLS, None)?;
+    focused_run_type_plan_selects_each_cell(
+        root,
+        scratch,
+        "disabled",
+        &FOCUSED_DISABLED_SABRE_CELLS,
+        Some("sabre"),
+    )
+}
+
 fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Result<(), String> {
     let git_dir = source.join(".git");
     let git_dir_text = git_dir.to_string_lossy().into_owned();
@@ -13480,6 +13801,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     }
 
     disabled_cells_file_self_test(root, &scratch)?;
+    focused_run_type_selection_self_test(root, &scratch)?;
 
     let cells_file_results = scratch.join("cells-file-plan");
     let cells_file_budget_keys = cells_file_ids
@@ -18775,7 +19097,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, run-type harness selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
     );
     Ok(())
 }
@@ -23877,5 +24199,85 @@ print("fixture " + args[0] + " accepted")
             "the writer's child {} outlived it",
             sleeper.trim()
         );
+    }
+}
+
+#[cfg(test)]
+mod harness_selection_tests {
+    //! Every generated preparation and cell command must select, through the
+    //! harness's own selection rules, exactly the cell it was generated for.
+    use super::*;
+
+    fn scratch(label: &str) -> (PathBuf, SelfTestDirectory) {
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-harness-selection-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let cleanup = SelfTestDirectory::new(path.clone());
+        (path, cleanup)
+    }
+
+    fn checkout_root() -> PathBuf {
+        Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf()
+    }
+
+    /// Red cells whose run type is not the default one (a test-level label, a
+    /// per-backend label, and an rr-compat replay cell), beside a red cell of
+    /// the default run type. compat/java prepares through its ptrace cell,
+    /// whose test-level label also excludes it from the default selection.
+    #[test]
+    fn red_cells_of_focused_run_types_select_their_cells() {
+        let (path, cleanup) = scratch("red");
+        focused_run_type_plan_selects_each_cell(
+            &checkout_root(),
+            &path,
+            "red",
+            &FOCUSED_RED_CELLS,
+            None,
+        )
+        .unwrap();
+        cleanup.remove().unwrap();
+    }
+
+    /// A disabled-backend probe of a labelled test, beside one of a test of
+    /// the default run type.
+    #[test]
+    fn disabled_probes_of_focused_run_types_select_their_cells() {
+        let (path, cleanup) = scratch("disabled");
+        focused_run_type_plan_selects_each_cell(
+            &checkout_root(),
+            &path,
+            "disabled",
+            &FOCUSED_DISABLED_SABRE_CELLS,
+            Some("sabre"),
+        )
+        .unwrap();
+        cleanup.remove().unwrap();
+    }
+
+    /// The check itself refuses a command whose run-type filter is lost.
+    #[test]
+    fn a_command_without_its_run_type_filter_selects_nothing() {
+        let manifests = ManifestSet::load(&checkout_root()).unwrap();
+        let labelled = "env X=1 target/debug/test-harness run --include-manual \
+             --include-occasional --prebuilt --test 'compat/java' --mode 'verify' \
+             --backend 'ptrace' --label 'sabre-compat-only' --results 'r' --junit 'j' || status=$?";
+        let (command, selection) = harness_command_selection(labelled).unwrap();
+        assert_eq!(command, "run");
+        assert_eq!(manifests.select(&selection).unwrap().len(), 1);
+        let unlabelled = labelled.replace(" --label 'sabre-compat-only'", "");
+        let (_, selection) = harness_command_selection(&unlabelled).unwrap();
+        assert!(manifests.select(&selection).unwrap().is_empty());
     }
 }
