@@ -5330,6 +5330,19 @@ fn execute_process_with_cpu_poll_interval(
             started,
             &mut observation,
             Some(cgroup),
+            |pid, leader_unreaped| match cgroup.kernel_path() {
+                Some(invocation) => check_cgroup_membership(
+                    pid,
+                    leader_unreaped,
+                    &invocation,
+                    process_group_members,
+                    process_cgroup,
+                ),
+                None => Err(format!(
+                    "invocation cgroup {} is not under /sys/fs/cgroup, so its members cannot be checked",
+                    cgroup.path().display()
+                )),
+            },
             |_| Ok(()),
             monotonic_cpu_sampler(|| cgroup.cpu_usage_usec()),
         ),
@@ -5383,6 +5396,122 @@ fn monotonic_cpu_sampler(
         highest = Some(usage);
         Ok(usage)
     }
+}
+
+/// Whether `path`, a cgroup path as the `0::` line of `/proc/<pid>/cgroup`
+/// gives it, is `invocation` or a cgroup below it.
+fn within_cgroup(path: &str, invocation: &str) -> bool {
+    path == invocation
+        || path
+            .strip_prefix(invocation)
+            .is_some_and(|below| below.starts_with('/'))
+}
+
+/// The cgroup v2 path of `pid` from the `0::` line of `/proc/<pid>/cgroup`,
+/// or `None` when the process no longer exists.
+fn process_cgroup(pid: u32) -> Result<Option<String>, String> {
+    let text = match fs::read_to_string(format!("/proc/{pid}/cgroup")) {
+        Ok(text) => text,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(format!("/proc/{pid}/cgroup: {error}")),
+    };
+    let path = text
+        .lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .ok_or_else(|| format!("/proc/{pid}/cgroup has no cgroup v2 line"))?;
+    // An exited process in a removed cgroup still names it, so marked.
+    Ok(Some(
+        path.strip_suffix(" (deleted)").unwrap_or(path).to_owned(),
+    ))
+}
+
+/// The live members of process group `pgid`, found as the agent-utils
+/// process-group scan finds them: every numeric `/proc` entry whose `stat`
+/// names `pgid` as its process group. A process that exits during the scan
+/// is skipped.
+fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
+    let mut members = Vec::new();
+    for entry in fs::read_dir("/proc").map_err(|error| format!("/proc: {error}"))? {
+        let entry = entry.map_err(|error| format!("/proc: {error}"))?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .filter(|name| !name.is_empty() && name.bytes().all(|b| b.is_ascii_digit()))
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+            Ok(stat) => stat,
+            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+                continue;
+            }
+            Err(error) => return Err(format!("/proc/{pid}/stat: {error}")),
+        };
+        // The command name may hold spaces and parentheses; after its last
+        // ')' come the state, the parent PID and the process group.
+        let group = stat
+            .rsplit_once(')')
+            .and_then(|(_, fields)| fields.split_whitespace().nth(2))
+            .and_then(|group| group.parse::<u32>().ok())
+            .ok_or_else(|| format!("/proc/{pid}/stat is malformed"))?;
+        if group == pgid {
+            members.push(pid);
+        }
+    }
+    Ok(members)
+}
+
+/// Check that every process the process-group scan could see for this
+/// invocation is in its cgroup `invocation` or a cgroup below it: the leader
+/// `pid` while it is unreaped (`leader_unreaped`), wherever its process group
+/// went, and the live members of its process group `pid`. Returns why the
+/// invocation must be refused: a process outside, or a failed check.
+///
+/// What this cannot see: a process other than the leader that leaves both
+/// the process group and the invocation cgroup, and one that leaves the
+/// cgroup and exits between two checks. The process-group scan this cgroup
+/// replaced could not charge either of them. One evasion is weaker than that
+/// scan and is not refused here: a command that empties its invocation
+/// cgroup, makes it threaded through `cgroup.type` and moves back only its
+/// thread-group leader through `cgroup.threads` passes this check while its
+/// other threads are charged to the parent cgroup. The scan read the whole
+/// thread group's CPU from `/proc/<pid>/stat`.
+fn check_cgroup_membership(
+    pid: u32,
+    leader_unreaped: bool,
+    invocation: &str,
+    group_members: impl FnOnce(u32) -> Result<Vec<u32>, String>,
+    mut cgroup_of: impl FnMut(u32) -> Result<Option<String>, String>,
+) -> Result<(), String> {
+    let unchecked = |error: String| {
+        format!(
+            "cannot check that process group {pid} stays inside its invocation cgroup {invocation}: {error}"
+        )
+    };
+    let members = group_members(pid).map_err(unchecked)?;
+    let leader = leader_unreaped.then_some(pid);
+    for member in leader
+        .into_iter()
+        .chain(members.into_iter().filter(|member| Some(*member) != leader))
+    {
+        match cgroup_of(member).map_err(unchecked)? {
+            Some(cgroup) if !within_cgroup(&cgroup, invocation) => {
+                let role = if Some(member) == leader {
+                    "the leader"
+                } else {
+                    "a member of the leader's process group"
+                };
+                return Err(format!(
+                    "process {member} ({role}) is in cgroup {cgroup}, outside its invocation cgroup {invocation}, so that cgroup's CPU counter does not hold its CPU"
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn spawn_process(
@@ -5511,16 +5640,34 @@ fn monitor_live_cpu<R>(
     register: impl FnOnce(u32) -> Result<R, String>,
     sample: impl FnMut(u32, &R) -> Result<u64, CpuError>,
 ) -> Result<ProcessOutput, String> {
-    monitor_live_cpu_in(child, limits, started, observation, None, register, sample)
+    monitor_live_cpu_in(
+        child,
+        limits,
+        started,
+        observation,
+        None,
+        |_, _| Ok(()),
+        register,
+        sample,
+    )
 }
 
 /// `monitor_live_cpu` for an invocation that runs in `cgroup`, when it has one.
+///
+/// `membership(pid, leader_unreaped)` refuses the invocation when a process
+/// that should be charged to the cgroup is outside it. It runs before every
+/// live CPU sample, before a wall-clock stop, and once the leader has been
+/// waited for. A CPU-budget stop is preceded by the check at its triggering
+/// poll, which runs before that poll's sample so that a refusal never follows
+/// a recorded trigger.
+#[allow(clippy::too_many_arguments)]
 fn monitor_live_cpu_in<R>(
     child: Child,
     limits: ProcessLimits,
     started: Instant,
     observation: &mut InvocationCpuObservation,
     cgroup: Option<&InvocationCgroup>,
+    mut membership: impl FnMut(u32, bool) -> Result<(), String>,
     register: impl FnOnce(u32) -> Result<R, String>,
     mut sample: impl FnMut(u32, &R) -> Result<u64, CpuError>,
 ) -> Result<ProcessOutput, String> {
@@ -5554,6 +5701,37 @@ fn monitor_live_cpu_in<R>(
             started,
             &mut observation.final_wait,
         )? {
+            let leader_unreaped =
+                !matches!(observation.final_wait, FinalWaitObservation::Reaped { .. });
+            if let Err(reason) = membership(pid, leader_unreaped) {
+                observation.termination = TerminationPath::CgroupMembershipStop;
+                if leader_unreaped {
+                    return match stop_process_group(
+                        pid,
+                        &leader,
+                        cgroup,
+                        started,
+                        &mut observation.final_wait,
+                    ) {
+                        Ok(_) => Err(format!(
+                            "{reason}; stopped and reaped its leader rather than charge an incomplete CPU measurement"
+                        )),
+                        Err(error) => Err(format!(
+                            "{reason}; could not confirm leader stop/reap: {error}"
+                        )),
+                    };
+                }
+                // The leader is gone, so no grace can be waited out for it.
+                // Its PID stays reserved while it names a live process group,
+                // so this kill reaches only that group; what remains in the
+                // invocation cgroup is killed when the cgroup is finished.
+                unsafe {
+                    libc::kill(-(pid as i32), libc::SIGKILL);
+                }
+                return Err(format!(
+                    "{reason}; killed its process group after the leader exited rather than charge an incomplete CPU measurement"
+                ));
+            }
             let timeout = cpu_budget_usec
                 .filter(|limit| cpu_usage_usec >= *limit)
                 .map(|_| ProcessTimeout::Cpu);
@@ -5575,9 +5753,30 @@ fn monitor_live_cpu_in<R>(
             });
         }
         let now = Instant::now();
-        let (timeout, observed_cpu_usec) = if now >= deadline {
+        let wall_due = now >= deadline;
+        let poll_due = cpu_budget_usec.is_some() && now >= next_cpu_poll;
+        if wall_due || poll_due {
+            if let Err(reason) = membership(pid, true) {
+                observation.termination = TerminationPath::CgroupMembershipStop;
+                return match stop_process_group(
+                    pid,
+                    &leader,
+                    cgroup,
+                    started,
+                    &mut observation.final_wait,
+                ) {
+                    Ok(_) => Err(format!(
+                        "{reason}; stopped and reaped its leader rather than charge an incomplete CPU measurement"
+                    )),
+                    Err(error) => Err(format!(
+                        "{reason}; could not confirm leader stop/reap: {error}"
+                    )),
+                };
+            }
+        }
+        let (timeout, observed_cpu_usec) = if wall_due {
             (Some(ProcessTimeout::Wall), None)
-        } else if let Some(limit) = cpu_budget_usec.filter(|_| now >= next_cpu_poll) {
+        } else if let Some(limit) = cpu_budget_usec.filter(|_| poll_due) {
             next_cpu_poll = now + cpu_poll_interval;
             let sample_result = match &cpu_reader {
                 Some(Ok(reader)) => sample(pid, reader),
@@ -11640,6 +11839,7 @@ mod tests {
             started,
             &mut observation,
             Some(&cgroup),
+            |_, _| Ok(()),
             |_| Ok(()),
             |_, _| Ok(if moved.exists() { 200_000 } else { 0 }),
         )
@@ -11806,6 +12006,410 @@ mod tests {
             }
         }
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_cgroup_membership_check_refuses_every_process_it_sees_outside_the_cgroup() {
+        let invocation = "/runner/hermit-e2e-invocation-1";
+        let check = |leader_unreaped: bool,
+                     members: Result<Vec<u32>, String>,
+                     cgroups: &[(u32, Result<Option<&str>, &str>)]| {
+            check_cgroup_membership(
+                7,
+                leader_unreaped,
+                invocation,
+                |pgid| {
+                    assert_eq!(pgid, 7, "the leader's PID names its process group");
+                    members
+                },
+                |pid| match cgroups.iter().find(|(member, _)| *member == pid) {
+                    Some((_, Ok(cgroup))) => Ok(cgroup.map(str::to_owned)),
+                    Some((_, Err(error))) => Err((*error).to_owned()),
+                    None => panic!("process {pid} was not expected to be checked"),
+                },
+            )
+        };
+        let inside = Ok(Some(invocation));
+        let nested = Ok(Some("/runner/hermit-e2e-invocation-1/nested"));
+        let parent = Ok(Some("/runner"));
+        // Shares the invocation's name as a prefix but is a sibling cgroup.
+        let sibling = Ok(Some("/runner/hermit-e2e-invocation-10"));
+        let gone = Ok(None);
+
+        assert_eq!(
+            check(
+                true,
+                Ok(vec![7, 8, 9]),
+                &[(7, inside), (8, nested), (9, inside)]
+            ),
+            Ok(())
+        );
+        // A member that exited between the scan and its cgroup read is gone,
+        // not outside.
+        assert_eq!(
+            check(true, Ok(vec![7, 8]), &[(7, inside), (8, gone)]),
+            Ok(())
+        );
+        // A reaped leader is not checked; only its group's members remain.
+        assert_eq!(check(false, Ok(vec![8]), &[(8, nested)]), Ok(()));
+
+        for (label, leader_unreaped, members, cgroups, offender) in [
+            (
+                "member in the parent",
+                true,
+                vec![7, 8],
+                vec![(7, inside), (8, parent)],
+                "process 8 (a member",
+            ),
+            (
+                "member in a sibling",
+                true,
+                vec![7, 8],
+                vec![(7, inside), (8, sibling)],
+                "process 8 (a member",
+            ),
+            (
+                "member after the leader exited",
+                false,
+                vec![8],
+                vec![(8, parent)],
+                "process 8 (a member",
+            ),
+            // The leader left its process group as well as its cgroup; the
+            // pidfd-named leader is still checked.
+            (
+                "leader in another group",
+                true,
+                vec![],
+                vec![(7, parent)],
+                "process 7 (the leader)",
+            ),
+            (
+                "leader in its group",
+                true,
+                vec![7],
+                vec![(7, sibling)],
+                "process 7 (the leader)",
+            ),
+        ] {
+            let refusal = check(leader_unreaped, Ok(members), &cgroups)
+                .expect_err(&format!("{label}: a process outside must be refused"));
+            assert!(refusal.contains(offender), "{label}: {refusal}");
+            assert!(
+                refusal.contains("outside its invocation cgroup /runner/hermit-e2e-invocation-1"),
+                "{label}: {refusal}"
+            );
+        }
+
+        // A check that cannot be made refuses rather than passes.
+        let unreadable = check(true, Ok(vec![7, 8]), &[(7, inside), (8, Err("EACCES"))])
+            .expect_err("an unreadable member must be refused");
+        assert!(
+            unreadable.contains("cannot check") && unreadable.contains("EACCES"),
+            "{unreadable}"
+        );
+        let unscanned = check(true, Err("/proc: EMFILE".into()), &[])
+            .expect_err("a failed process-group scan must be refused");
+        assert!(
+            unscanned.contains("cannot check") && unscanned.contains("EMFILE"),
+            "{unscanned}"
+        );
+
+        assert!(within_cgroup(invocation, invocation));
+        assert!(within_cgroup(
+            "/runner/hermit-e2e-invocation-1/a/b",
+            invocation
+        ));
+        assert!(!within_cgroup(
+            "/runner/hermit-e2e-invocation-10",
+            invocation
+        ));
+        assert!(!within_cgroup("/runner", invocation));
+        assert!(!within_cgroup("/", invocation));
+    }
+
+    #[test]
+    fn the_real_membership_readers_find_this_process_and_its_group() {
+        // The production readers, on this test process: it is in its own
+        // process group's member list and in the cgroup its `0::` line names.
+        let pid = std::process::id();
+        let pgid = unsafe { libc::getpgid(0) } as u32;
+        let members = process_group_members(pgid).unwrap();
+        assert!(members.contains(&pid), "{pid} not among {members:?}");
+        let own = fs::read_to_string("/proc/self/cgroup").unwrap();
+        let expected = own
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .expect("a cgroup v2 line");
+        assert_eq!(process_cgroup(pid).unwrap().as_deref(), Some(expected));
+        // Other processes share this test's process group, and other tests
+        // move their children between cgroups, so only this process is fed
+        // to the check, through the real cgroup reader.
+        assert_eq!(
+            check_cgroup_membership(pid, true, expected, |_| Ok(vec![pid]), process_cgroup),
+            Ok(())
+        );
+        let elsewhere = check_cgroup_membership(
+            pid,
+            true,
+            "/not-this-cgroup",
+            |_| Ok(vec![pid]),
+            process_cgroup,
+        )
+        .expect_err("this process is not in /not-this-cgroup");
+        assert!(
+            elsewhere.contains(&format!("is in cgroup {expected},")),
+            "{elsewhere}"
+        );
+        // A reaped process reads as gone, not as an error.
+        let mut child = std::process::Command::new("/bin/true").spawn().unwrap();
+        let reaped = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_cgroup(reaped), Ok(None));
+    }
+
+    #[test]
+    fn a_membership_refusal_stops_the_invocation_and_charges_nothing() {
+        use std::cell::Cell;
+
+        // Each place the monitor checks membership must turn a refusal into a
+        // stopped, reaped, uncharged invocation: at a live poll, before a wall
+        // stop, and after the leader returned.
+        for (case, script, poll, wall) in [
+            ("poll", "exec sleep 30", Duration::from_millis(50), 20),
+            ("wall", "exec sleep 30", Duration::from_secs(600), 1),
+            ("return", "exit 0", Duration::from_secs(600), 20),
+        ] {
+            let root = cpu_reader_test_root(&format!("membership-refusal-{case}"));
+            let (child, started, mut observation) = spawn_fixture_with_source(
+                &root,
+                case,
+                script,
+                Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+            );
+            let pid = child.id();
+            let checks = Cell::new(Vec::new());
+            let result = monitor_live_cpu_in(
+                child,
+                ProcessLimits {
+                    deadline: started + Duration::from_secs(wall),
+                    cpu_budget_usec: Some(60_000_000),
+                    cpu_poll_interval: poll,
+                },
+                started,
+                &mut observation,
+                None,
+                |checked, leader_unreaped| {
+                    let mut seen = checks.take();
+                    seen.push((checked, leader_unreaped));
+                    let refuse = case != "poll" || seen.len() >= 2;
+                    checks.set(seen);
+                    if refuse {
+                        Err("process 1 (fixture) is outside its invocation cgroup".into())
+                    } else {
+                        Ok(())
+                    }
+                },
+                |_| Ok(()),
+                |_, _| Ok(10),
+            );
+            let error = result.map(|_| ()).expect_err(&format!(
+                "{case}: a membership refusal must fail the invocation"
+            ));
+            assert!(
+                error.contains("outside its invocation cgroup"),
+                "{case}: {error}"
+            );
+            assert_eq!(
+                observation.termination,
+                TerminationPath::CgroupMembershipStop,
+                "{case}"
+            );
+            assert_eq!(
+                observation.returned_cpu_charge,
+                ReturnedCpuCharge::Unavailable,
+                "{case}"
+            );
+            assert!(owned_child_is_reaped(pid), "{case}");
+            let seen = checks.take();
+            assert!(
+                seen.iter().all(|(checked, _)| *checked == pid),
+                "{case}: {seen:?}"
+            );
+            let live = enabled_cpu(&observation);
+            match case {
+                // The refused poll took no sample, so no trigger can be
+                // recorded beside the refusal.
+                "poll" => {
+                    assert_eq!(seen, vec![(pid, true), (pid, true)]);
+                    assert_eq!(live.polls, 1);
+                }
+                "wall" => {
+                    assert_eq!(seen, vec![(pid, true)]);
+                    assert_eq!(live.polls, 0);
+                }
+                _ => {
+                    assert_eq!(seen, vec![(pid, false)]);
+                    assert!(matches!(
+                        observation.final_wait,
+                        FinalWaitObservation::Reaped { raw_status: 0, .. }
+                    ));
+                }
+            }
+            validate_native_observation(&observation);
+            fs::remove_dir_all(root).unwrap();
+        }
+    }
+
+    /// A process moves itself out of its invocation cgroup into the runner's
+    /// own cgroup above it, keeping the command's process group. The cgroup
+    /// counter no longer sees its CPU, which the process-group scan the
+    /// cgroup replaced would have charged, so the invocation must be stopped
+    /// and refused rather than charged or passed. The four cases put the
+    /// escape where each check must catch it: at a live poll (the leader
+    /// itself, and a member found by the process-group scan), after the
+    /// leader exits with status 0, and before a wall stop, the last two with
+    /// no live poll at all.
+    #[test]
+    fn a_process_that_moves_out_of_its_invocation_cgroup_is_stopped_and_refused() {
+        use crate::invocation_cgroup::tests::KillPidFile;
+        use crate::invocation_cgroup::tests::OWN_CGROUP_SH;
+        use crate::invocation_cgroup::tests::RemoveLeftoverCgroup;
+        let test = "a_process_that_moves_out_of_its_invocation_cgroup_is_stopped_and_refused";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let mut failures = Vec::new();
+        // (case, CPU poll interval, wall budget, latest acceptable refusal)
+        for (case, poll, wall, refused_within) in [
+            ("leader", CELL_CPU_POLL_INTERVAL, 8, 6),
+            ("member", CELL_CPU_POLL_INTERVAL, 8, 6),
+            ("member-then-leader-exits", Duration::from_secs(600), 8, 6),
+            ("member-until-wall", Duration::from_secs(600), 2, 6),
+        ] {
+            let root = cpu_reader_test_root(&format!("cgroup-escape-{case}"));
+            let saved = root.join("leader.cgroup");
+            let pid_file = root.join("escaped.pid");
+            let _leftovers = RemoveLeftoverCgroup(saved.clone());
+            let _escaped = KillPidFile(pid_file.clone());
+            // `$cg` is the invocation cgroup; `${cg%/*}` is the runner's own
+            // cgroup above it. A background job of a noninteractive shell
+            // stays in the leader's process group.
+            let member = format!(
+                r#"/bin/sh -c 'echo $$ > "$1/cgroup.procs" && echo $$ > "$2.tmp" && mv "$2.tmp" "$2" && exec sleep 30' sh "${{cg%/*}}" '{pid}' & while [ ! -s '{pid}' ]; do sleep 0.05; done; "#,
+                pid = pid_file.display()
+            );
+            let body = match case {
+                "leader" => format!(
+                    r#"echo $$ > "${{cg%/*}}/cgroup.procs" && echo $$ > '{pid}' && exec sleep 30"#,
+                    pid = pid_file.display()
+                ),
+                "member-then-leader-exits" => format!("{member}exit 0"),
+                _ => format!("{member}exec sleep 30"),
+            };
+            let script = format!(
+                "cat /proc/self/cgroup > '{saved}'; {OWN_CGROUP_SH}{body}",
+                saved = saved.display()
+            );
+            let request = ProcessRequest::new(
+                InvocationRole::Execution {
+                    attempt_index: "1".into(),
+                    backend: RequiredNullable::Null,
+                },
+                &root,
+                "/bin/sh",
+                &["-c".into(), script],
+                &BTreeMap::new(),
+                &root.join("leader.stdout"),
+                &root.join("leader.stderr"),
+            );
+            let mut observations = Vec::new();
+            let started = Instant::now();
+            let result = execute_process_with_cpu_poll_interval(
+                request,
+                ProcessLimits {
+                    deadline: started + Duration::from_secs(wall),
+                    cpu_budget_usec: Some(60_000_000),
+                    cpu_poll_interval: poll,
+                },
+                &mut observations,
+            );
+            let elapsed = started.elapsed();
+            let shown = match &result {
+                Ok(output) => format!(
+                    "Ok(status {:?}, timeout {:?}, cpu {} usec)",
+                    output.status, output.timeout, output.cpu_usage_usec
+                ),
+                Err(reason) => format!("Err({reason})"),
+            };
+            let observation = &observations[0];
+            let termination = serde_json::to_value(&observation.termination).unwrap();
+            let mut problems = Vec::new();
+            match &result {
+                Err(reason) if reason.contains("outside its invocation cgroup") => {}
+                _ => problems.push("the result is not a cgroup refusal".to_string()),
+            }
+            if termination != serde_json::json!("cgroup_membership_stop") {
+                problems.push(format!("termination {termination}"));
+            }
+            if observation.returned_cpu_charge != ReturnedCpuCharge::Unavailable {
+                problems.push(format!("charge {:?}", observation.returned_cpu_charge));
+            }
+            if enabled_cpu(observation).source != LiveCpuSource::CgroupV2InvocationCpuStatV1 {
+                problems.push("not the cgroup source".into());
+            }
+            if elapsed >= Duration::from_secs(refused_within) {
+                problems.push(format!("refused only after {elapsed:?}"));
+            }
+            if case == "member-then-leader-exits"
+                && !matches!(
+                    observation.final_wait,
+                    FinalWaitObservation::Reaped { raw_status: 0, .. }
+                )
+            {
+                problems.push(format!("final wait {:?}", observation.final_wait));
+            }
+            let directory = saved_cgroup_directory(&saved);
+            if directory.exists() {
+                problems.push(format!("{} is left behind", directory.display()));
+            }
+            // The escaped process kept the leader's process group, so the
+            // stop's group signals reach it outside the cgroup.
+            let LaunchObservation::Spawned { pid: leader } = observation.launch else {
+                panic!("{case}: not launched: {observation:?}");
+            };
+            let escaped = fs::read_to_string(&pid_file).unwrap_or_default();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                let state = fs::read_to_string(format!("/proc/{}/stat", escaped.trim()))
+                    .ok()
+                    .and_then(|stat| {
+                        let rest = stat.rsplit_once(") ")?.1.to_owned();
+                        let mut fields = rest.split_whitespace();
+                        Some((fields.next()?.to_owned(), fields.nth(1)?.to_owned()))
+                    });
+                match state {
+                    Some((state, group)) if state != "Z" && group == leader.to_string() => {
+                        if Instant::now() >= deadline {
+                            problems.push(format!("escaped process {} survived", escaped.trim()));
+                            break;
+                        }
+                        thread::sleep(Duration::from_millis(20));
+                    }
+                    _ => break,
+                }
+            }
+            if problems.is_empty() {
+                validate_native_observation(observation);
+            } else {
+                failures.push(format!("{case}: {problems:?} after {elapsed:?}: {shown}"));
+            }
+            fs::remove_dir_all(root).unwrap();
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[test]

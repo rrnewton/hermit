@@ -563,6 +563,14 @@ impl InvocationCgroup {
         &self.path
     }
 
+    /// This cgroup as the unified (`0::`) line of `/proc/<pid>/cgroup` names
+    /// it for a process inside it, or `None` when its directory is not under
+    /// `/sys/fs/cgroup`.
+    pub fn kernel_path(&self) -> Option<String> {
+        let relative = self.path.strip_prefix(CGROUP_ROOT).ok()?.to_str()?;
+        Some(format!("/{relative}"))
+    }
+
     /// The `cgroup.procs` descriptor a child writes `0` to before exec. It is
     /// close-on-exec, so the program never inherits it.
     pub fn enrollment_fd(&self) -> RawFd {
