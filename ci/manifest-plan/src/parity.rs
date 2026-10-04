@@ -3079,23 +3079,22 @@ struct ImportedLogDir {
 /// Where an imported cell's execution ran, from its `result.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ImportedRoute {
-    /// One of [`IMPORTED_ROUTES`].
+    /// With `container`, one of [`IMPORTED_ROUTES`].
     route: String,
-    /// One of [`IMPORTED_CONTAINERS`].
+    /// The root the cell ran in: empty for the host's own.
     container: String,
     /// The execution platform; `local` when not remote. Never empty.
     re_platform: String,
 }
 
-/// The routes `ci/buck-e2e/defs.bzl` gives a generated cell: local execution
-/// and remote execution. `cell.sh` records whatever `HERMIT_E2E_ROUTE` it was
-/// given, so a cell run by hand can record any other label, which says
+/// The (route, container) pairs `ci/buck-e2e/defs.bzl` gives a generated
+/// cell: local execution on the host's own root (empty) or in the pinned
+/// root, and remote execution on the host's own root only (`_container`;
+/// `cell.sh` refuses the pinned root on any route but `local`). `cell.sh`
+/// records whatever `HERMIT_E2E_ROUTE` and `HERMIT_E2E_CONTAINER` it was
+/// given, so a cell run by hand can record any other pair, which says
 /// nothing about where it ran.
-const IMPORTED_ROUTES: [&str; 2] = ["local", "re"];
-
-/// The roots `ci/buck-e2e/cell.sh` runs a cell in: the host's own (empty)
-/// and the pinned root.
-const IMPORTED_CONTAINERS: [&str; 2] = ["", "pinned-root"];
+const IMPORTED_ROUTES: [(&str, &str); 3] = [("local", ""), ("local", "pinned-root"), ("re", "")];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3202,12 +3201,12 @@ impl ImportedLogs {
                 }
             };
             // A route the generated Buck targets never give (an empty or
-            // hand-set label, another container, no platform) is a cell run
-            // outside them, which says nothing about where it ran.
+            // hand-set label, another container, the pinned root off the
+            // local route, no platform) is a cell run outside them, which
+            // says nothing about where it ran.
             let route = match (entry.route, entry.container, entry.re_platform) {
                 (Some(route), Some(container), Some(re_platform))
-                    if IMPORTED_ROUTES.contains(&route.as_str())
-                        && IMPORTED_CONTAINERS.contains(&container.as_str())
+                    if IMPORTED_ROUTES.contains(&(route.as_str(), container.as_str()))
                         && !re_platform.is_empty() =>
                 {
                     Some(ImportedRoute {
@@ -9090,19 +9089,24 @@ mod tests {
         // What cell.sh records when run by hand with a label of its own.
         let by_hand = route(Some("unknown"), Some(""), Some("local"));
         let other_root = route(Some("local"), Some("chroot"), Some("local"));
+        let pinned_root = route(Some("local"), Some("pinned-root"), Some("local"));
+        // Each part is one the targets give, but never together: a remote
+        // cell runs on the host's own root.
+        let remote_root = route(Some("re"), Some("pinned-root"), Some("linux-re"));
         let no_platform = route(Some("re"), Some(""), Some(""));
         // (test, where its ptrace reference ran, where its kvm candidate ran,
         // whether those are known to be alike)
         let cases = [
             ("fx/local", local.clone(), local.clone(), true),
             ("fx/remote", remote.clone(), remote.clone(), true),
-            ("fx/split", local.clone(), remote.clone(), false),
             (
-                "fx/container",
-                local.clone(),
-                route(Some("local"), Some("pinned-root"), Some("local")),
-                false,
+                "fx/pinned-root",
+                pinned_root.clone(),
+                pinned_root.clone(),
+                true,
             ),
+            ("fx/split", local.clone(), remote.clone(), false),
+            ("fx/container", local.clone(), pinned_root.clone(), false),
             (
                 "fx/platform",
                 remote.clone(),
@@ -9123,6 +9127,12 @@ mod tests {
                 "fx/other-root",
                 other_root.clone(),
                 other_root.clone(),
+                false,
+            ),
+            (
+                "fx/remote-root",
+                remote_root.clone(),
+                remote_root.clone(),
                 false,
             ),
             (
