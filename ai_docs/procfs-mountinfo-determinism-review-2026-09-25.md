@@ -89,11 +89,17 @@ seed-named row of another filesystem type survive).
   which fails if either capture in `initialize_procfs_snapshot` stops calling
   the filter.
 - Unit (hermit-cli): `identity_capture_excludes_host_seed_mounts_and_keeps_order`.
-- E2E: guest `cat` view 101→86 rows, 0 xarfuse, `/test` + edenfs retained.
+- E2E, 2026-09-25, under the original `/mnt/xarfuse/` prefix rule (not
+  re-measured under the seed-name rule): guest `cat` view 101→86 rows, 0
+  xarfuse, `/test` + edenfs retained. Under the seed-name rule a non-seed
+  SquashFUSE row stays visible, so "0 xarfuse" holds only while every such
+  row is seed-named.
 - Cell: `system-utils/procfs-sanitized-paths` canonical verify, ptrace,
   under its manifest profile: **60/60 with the harness retry, first-attempt
   60/60** at ab7f0dd15120aeecea647940feca712741ec214d (2026-10-04 09:38:46Z
-  to 09:41:42Z); the cell stays required in CI with pinned evidence
+  to 09:41:42Z). The 60-repetition window contained no guest-visible host
+  mount churn, so it measured neither the named-seed widening nor the
+  residual `/run/user` failure rate. The cell stays required in CI with pinned evidence
   (`PROCFS_MOUNTINFO_2026_09_25_*`). A mountinfo monitor running alongside
   saw one row change, an excluded per-process seed mount added at 09:41:31Z
   during repetition 56, which matched. The earlier 180 repetitions at
@@ -113,8 +119,9 @@ seed-named row of another filesystem type survive).
   carry that.
 
 ## Mounts view
-`/proc/<pid>/mounts` is not covered. It stays raw host passthrough, as on
-main, so it still lists seed rows and the two guest views disagree. Giving it
+`/proc/<pid>/mounts` and `/proc/<pid>/mountstats` are not covered. Both stay
+raw host passthrough, as on main (Detcore has no snapshot kind for either),
+so both still list seed rows and disagree with the guest mountinfo view. Giving it
 the same exclusion and mountinfo's mount-point prefix rewrites is
 <https://github.com/rrnewton/hermit/issues/3719>. KVM reverie-kvm proc_mounts
 capture is pre-existing and unmeasured.
@@ -129,5 +136,4 @@ A retained row whose parent is an excluded seed still snapshots: the constructor
 Residual: a guest program that itself drives host squashfuse seeds would
 not see its own post-launch seed mounts (they were never deterministic —
 host-assigned hashes/PIDs); disclosed in the PR. Churn outside the class,
-such as `/run/user/<uid>` tmpfs mounts, stays visible to the guest. The one `not_run` from the
-retained 18/20 is infrastructure (canonical NotRun stamp), not product.
+such as `/run/user/<uid>` tmpfs mounts, stays visible to the guest.

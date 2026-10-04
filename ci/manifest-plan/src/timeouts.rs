@@ -87,7 +87,8 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// (`compare_io_buffers: true, rcb_time: false`), 2026-10-04 09:38:46Z to
 /// 09:41:42Z. A mountinfo monitor running alongside saw one row change, an
 /// excluded per-process seed mount added at 09:41:31Z during repetition 56,
-/// which matched. Guest-visible host mount churn outside the excluded class,
+/// which matched. The 60-repetition window contained no guest-visible host
+/// mount churn. Guest-visible host mount churn outside the excluded class,
 /// such as `/run/user/<uid>` tmpfs mounts
 /// (<https://github.com/rrnewton/hermit/issues/1820>), can still fail a first
 /// attempt: 180 repetitions at the previous grammar
@@ -96,7 +97,11 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// divergences, one of them coinciding with a `/run/user/0` unmount, and one
 /// unrelated host-directory `newfstatat` size change. The real fix is one
 /// shared mount snapshot (<https://github.com/rrnewton/hermit/issues/3627>).
-/// Evidence SHA is the tree the measurement binary was built from.
+/// Evidence SHA is the tree the measurement binary was built from. The
+/// result rows record `source_tree_dirty: true` only because the slot's
+/// `reverie` submodule checkout (51186070) differed from the pinned gitlink;
+/// Cargo builds Reverie from the pinned git rev in `Cargo.lock`
+/// (d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918), not from that checkout.
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
     "ab7f0dd15120aeecea647940feca712741ec214d";
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-04T09:41:42Z";
