@@ -26,7 +26,9 @@ use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use tracing::debug;
 use tracing::trace;
@@ -1962,7 +1964,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Reverie revision has no typed variant, so it arrives as a raw
     /// `Syscall::Other` and is dispatched here by Sysno. Detcore treats it
     /// exactly like epoll_pwait: a scheduler yield point followed by
-    /// record/replay-aware forwarding of the raw call.
+    /// record/replay-aware forwarding of the raw call. An epoll that watches
+    /// a virtual timerfd at the turn takes `handle_timer_epoll_pwait2`
+    /// instead; as for a masked epoll_pwait, that is decided after the turn,
+    /// since a peer may add or remove one while this thread waits for it.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#773)
     pub async fn handle_epoll_pwait2<G: Guest<Self>>(
@@ -1970,17 +1975,169 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
-        // The raw call cannot be re-issued with a zero timeout, so it has no
-        // deterministic merge path, and the host wait would never observe a
-        // virtual timerfd. Refuse rather than silently miss its readiness.
-        let (_, args) = call.into_parts();
-        if self.epoll_has_timerfds(guest, args.arg0 as i32) {
-            tracing::warn!("epoll_pwait2 on an epoll watching a virtual timerfd; unsupported");
-            return Err(Errno::ENOSYS.into());
-        }
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
+        let (_, args) = call.into_parts();
+        if self.epoll_has_timerfds(guest, args.arg0 as i32) {
+            return self.handle_timer_epoll_pwait2(guest, call, args).await;
+        }
         Ok(self.record_or_replay(guest, call).await?)
+    }
+
+    /// epoll_pwait2 on an epoll watching a virtual timerfd, after its turn.
+    ///
+    /// The host never reports a virtual timerfd, so the call runs through
+    /// the epoll_pwait timer machinery. Its host probe is an epoll_pwait with
+    /// timeout 0 and the guest's epoll, output array, maxevents, signal mask
+    /// and mask size. Once Linux has read the timeout, it judges both calls
+    /// by the same `do_epoll_pwait`, so the probe reports Linux's errors in
+    /// Linux's order; the timeout's own errors come first (see
+    /// `read_epoll_pwait2_timeout`).
+    ///
+    /// A zero timeout is one non-blocking round, which does not check for
+    /// signals. A NULL timeout waits forever, and any other is a deadline
+    /// that far past the virtual time of the call, in nanoseconds. Without a
+    /// mask a wait that blocks is the epoll_pwait polling loop
+    /// (`wait_with_timerfds`). With one, a wait that need not block is one
+    /// timeout-0 probe under the mask, and a wait that must block is refused
+    /// with ENOSYS, both exactly as for a masked epoll_pwait.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): epoll_pwait2 on a virtual timerfd reuses
+    // the epoll_pwait timer machinery with a nanosecond deadline.
+    async fn handle_timer_epoll_pwait2<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        args: SyscallArgs,
+    ) -> Result<i64, Error> {
+        let timeout = self.read_epoll_pwait2_timeout(guest, args).await?;
+        let Syscall::EpollPwait(probe) = Syscall::from_raw(
+            Sysno::epoll_pwait,
+            SyscallArgs::new(args.arg0, args.arg1, args.arg2, 0, args.arg4, args.arg5),
+        ) else {
+            unreachable!("epoll_pwait is a typed syscall")
+        };
+        let may_block = timeout != Some(Duration::ZERO);
+        if probe.sigmask().is_some() {
+            let probed = self
+                .masked_epoll_timer_probe(guest, probe, may_block)
+                .await?;
+            return match probed {
+                Some(total) => Ok(total),
+                // No timerfd interest is live: forward the plain masked wait.
+                None => Ok(self.record_or_replay(guest, call).await?),
+            };
+        }
+        if !may_block {
+            return self.epoll_wait_once(guest, probe).await;
+        }
+        let deadline = match timeout {
+            Some(timeout) => Some(thread_observe_time(guest).await + timeout),
+            None => None,
+        };
+        self.wait_with_timerfds(guest, probe, probe.into(), deadline, "epoll_pwait2")
+            .await
+    }
+
+    /// The timeout of an epoll_pwait2, judged as Linux judges it before
+    /// anything else: EFAULT when the kernel cannot copy it, then EINVAL when
+    /// it is not a valid timespec (negative seconds, or nanoseconds outside
+    /// [0, 1e9)). None is a NULL timeout.
+    ///
+    /// `read_exact_with_user_access` refuses a page the guest cannot read, as
+    /// the kernel's copy does, but on ptrace (`process_vm_readv`) it also
+    /// refuses some pages the guest can read, such as a write-only mapping.
+    /// When it refuses, the kernel decides: with no mask and maxevents 0,
+    /// epoll_pwait2 copies and checks the timeout, then fails with EINVAL
+    /// before it looks at the epoll, so only a failed copy reports EFAULT.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): epoll_pwait2 timeout validation order.
+    async fn read_epoll_pwait2_timeout<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        args: SyscallArgs,
+    ) -> Result<Option<Duration>, Error> {
+        let Some(address) = Addr::<Timespec>::from_raw(args.arg3) else {
+            return Ok(None);
+        };
+        let mut bytes = [0_u8; std::mem::size_of::<Timespec>()];
+        if guest
+            .memory()
+            .read_exact_with_user_access(address.cast::<u8>(), &mut bytes)
+            .is_err()
+        {
+            let check = Syscall::from_raw(
+                Sysno::epoll_pwait2,
+                SyscallArgs::new(args.arg0, 0, 0, args.arg3, 0, 0),
+            );
+            match guest.inject(check).await {
+                Err(Errno::EINVAL) => {}
+                Err(errno) => return Err(errno.into()),
+                // Linux always rejects maxevents 0.
+                Ok(_) => return Err(Errno::EIO.into()),
+            }
+            // The kernel copied it, so read it a word at a time, which a
+            // ptrace peek can do.
+            for (index, word) in bytes.as_chunks_mut::<8>().0.iter_mut().enumerate() {
+                let raw = args.arg3.checked_add(index * 8).ok_or(Errno::EFAULT)?;
+                let address = Addr::<u64>::from_raw(raw).ok_or(Errno::EFAULT)?;
+                *word = guest.memory().read_value(address)?.to_ne_bytes();
+            }
+        }
+        let (tv_sec, tv_nsec) = bytes.split_at(8);
+        let timeout = Timespec {
+            tv_sec: libc::time_t::from_ne_bytes(tv_sec.try_into().unwrap()),
+            tv_nsec: libc::c_long::from_ne_bytes(tv_nsec.try_into().unwrap()),
+        };
+        Ok(Some(ppoll_timeout_duration(timeout)?))
+    }
+
+    /// One masked timeout-0 epoll_pwait probe on an epoll watching a virtual
+    /// timerfd, after the caller's turn: the timer half of
+    /// `handle_masked_epoll_pwait`, for epoll_pwait2, whose blocking is
+    /// decided by its timespec rather than the probe's timeout. None when no
+    /// timerfd interest is live at the turn, so the caller forwards its own
+    /// call.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): masked epoll_pwait2 decides on the timer
+    // state of its own turn.
+    async fn masked_epoll_timer_probe<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        probe: syscalls::EpollPwait,
+        may_block: bool,
+    ) -> Result<Option<i64>, Error> {
+        let set = TimerWaitSet::from(probe);
+        let round = self.timer_wait_round(guest, set).await?;
+        if let TimerWaitRound::Epoll(EpollTimerRound { watched: false, .. }) = round {
+            return Ok(None);
+        }
+        let host = match round.host_limit() {
+            Some(0) => {
+                // As in `handle_masked_epoll_pwait`: no host probe, so only
+                // the mask's own checks remain.
+                if probe.sigsetsize() != KERNEL_SIGSET_SIZE {
+                    return Err(Errno::EINVAL.into());
+                }
+                if let Some(mask) = probe.sigmask() {
+                    read_kernel_sigset(guest, mask).await?;
+                }
+                0
+            }
+            limit => {
+                guest
+                    .inject(limit.map_or(probe, |limit| probe.with_host_limit(limit)))
+                    .await?
+            }
+        };
+        let total = self.merge_timer_wait_set(guest, set, round, host).await?;
+        if total > 0 || !may_block {
+            return Ok(Some(total));
+        }
+        tracing::warn!(
+            "epoll_pwait2 with a signal mask must block on a virtual timerfd; unsupported"
+        );
+        Err(Errno::ENOSYS.into())
     }
 
     /// epoll_wait syscall (MAYHANG)

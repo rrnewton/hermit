@@ -1372,6 +1372,178 @@ static void check_fine_periodic_sleep(int close_first) {
     else ok(name);
 }
 
+/*
+ * Wait forms beyond epoll_wait, epoll_pwait and a select within FD_SETSIZE.
+ *   wait_form_epoll_pwait2_zero / wait_form_epoll_pwait2_finite
+ *       epoll_pwait2 without a mask reports an expired timerfd with a zero
+ *       and with a finite timespec.
+ *   wait_form_epoll_pwait2_infinite_block / wait_form_epoll_pwait2_finite_block /
+ *   wait_form_epoll_pwait2_timeout
+ *       It blocks until a timerfd armed for later fires, with a NULL timespec
+ *       and with one longer than the timer, and returns 0 when a timespec
+ *       shorter than the timer runs out.
+ *   wait_form_epoll_pwait2_masked_ready
+ *       With a signal mask it returns a ready pipe beside a distant timerfd,
+ *       and an expired timerfd, without blocking.
+ *   wait_form_epoll_pwait2_errors
+ *       Linux's argument-checking order: the timespec pointer, then its
+ *       value, then the mask size and pointer, then maxevents; a NULL mask
+ *       ignores its size; a timespec in a write-only page, which Linux can
+ *       read, is accepted.
+ */
+#include <sys/mman.h>
+
+static long wait_form_pwait2(int ep, struct epoll_event *out, int maxevents, const void *ts,
+                             const void *mask, size_t sigsetsize) {
+    return syscall(SYS_epoll_pwait2, ep, out, maxevents, ts, mask, sigsetsize);
+}
+
+static void wait_form_epoll_pwait2_ready(int finite) {
+    const char *name = finite ? "wait_form_epoll_pwait2_finite" : "wait_form_epoll_pwait2_zero";
+    int tfd = expired_tfd();
+    int ep = epoll_with(tfd, EPOLLIN, 11);
+    struct timespec ts = {finite ? 1 : 0, 0};
+    struct epoll_event out[4];
+    memset(out, 0, sizeof out);
+    errno = 0;
+    long n = wait_form_pwait2(ep, out, 4, &ts, NULL, 0);
+    long err = errno;
+    close(ep);
+    close(tfd);
+    if (n != 1 || out[0].data.u64 != 11 || out[0].events != EPOLLIN)
+        fail(name, "n=%ld errno=%ld", n, err);
+    else ok(name);
+}
+
+static void wait_form_epoll_pwait2_block(int finite) {
+    const char *name =
+        finite ? "wait_form_epoll_pwait2_finite_block" : "wait_form_epoll_pwait2_infinite_block";
+    int64_t start = now_ns(CLOCK_MONOTONIC);
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 30 * MS, 0, 0);
+    int ep = epoll_with(tfd, EPOLLIN, 12);
+    struct timespec ts = {5, 0};
+    struct epoll_event out[4];
+    memset(out, 0, sizeof out);
+    errno = 0;
+    long n = wait_form_pwait2(ep, out, 4, finite ? &ts : NULL, NULL, 0);
+    long err = errno;
+    int64_t elapsed = now_ns(CLOCK_MONOTONIC) - start;
+    close(ep);
+    close(tfd);
+    if (n != 1 || out[0].data.u64 != 12) fail(name, "n=%ld errno=%ld", n, err);
+    else if (elapsed < 30 * MS || elapsed > 4000 * MS)
+        fail(name, "elapsed_ms=%ld%ld", (long)(elapsed / MS), 0);
+    else ok(name);
+}
+
+static void wait_form_epoll_pwait2_timeout(void) {
+    const char *name = "wait_form_epoll_pwait2_timeout";
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 100000 * MS, 0, 0);
+    int ep = epoll_with(tfd, EPOLLIN, 13);
+    struct timespec ts = {0, 20 * MS};
+    struct epoll_event out[4];
+    int64_t start = now_ns(CLOCK_MONOTONIC);
+    errno = 0;
+    long n = wait_form_pwait2(ep, out, 4, &ts, NULL, 0);
+    long err = errno;
+    int64_t elapsed = now_ns(CLOCK_MONOTONIC) - start;
+    close(ep);
+    close(tfd);
+    if (n != 0) fail(name, "n=%ld errno=%ld", n, err);
+    else if (elapsed < 20 * MS || elapsed > 4000 * MS)
+        fail(name, "elapsed_ms=%ld%ld", (long)(elapsed / MS), 0);
+    else ok(name);
+}
+
+static void wait_form_epoll_pwait2_masked_ready(void) {
+    const char *name = "wait_form_epoll_pwait2_masked_ready";
+    int p[2];
+    ready_pipe(p);
+    int far = armed_tfd(CLOCK_MONOTONIC, 0, 100000 * MS, 0, 0);
+    int ep = epoll_with(far, EPOLLIN, 1);
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN;
+    ev.data.u64 = 2;
+    epoll_ctl(ep, EPOLL_CTL_ADD, p[0], &ev);
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR2);
+    struct timespec ts = {1, 0};
+    struct epoll_event out[4];
+    memset(out, 0, sizeof out);
+    long host = wait_form_pwait2(ep, out, 4, &ts, &mask, 8);
+    long host_data = host > 0 ? (long)out[0].data.u64 : 0;
+    close(ep);
+    close(far);
+    close(p[0]);
+    close(p[1]);
+    int tfd = expired_tfd();
+    ep = epoll_with(tfd, EPOLLIN, 3);
+    memset(out, 0, sizeof out);
+    long timer = wait_form_pwait2(ep, out, 4, &ts, &mask, 8);
+    long timer_data = timer > 0 ? (long)out[0].data.u64 : 0;
+    close(ep);
+    close(tfd);
+    if (host != 1 || host_data != 2) fail(name, "pipe n=%ld data=%ld", host, host_data);
+    else if (timer != 1 || timer_data != 3) fail(name, "timer n=%ld data=%ld", timer, timer_data);
+    else ok(name);
+}
+
+static void wait_form_epoll_pwait2_errors(void) {
+    const char *name = "wait_form_epoll_pwait2_errors";
+    int tfd = expired_tfd();
+    int ep = epoll_with(tfd, EPOLLIN, 14);
+    struct timespec *write_only =
+        mmap(NULL, 4096, PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (write_only == MAP_FAILED) {
+        fail(name, "mmap errno=%ld%ld", errno, 0);
+        return;
+    }
+    write_only->tv_sec = 0;
+    write_only->tv_nsec = 0;
+    void *bad = (void *)1;
+    sigset_t mask;
+    sigemptyset(&mask);
+    struct timespec zero = {0, 0};
+    struct timespec big_nsec = {0, 1000000000L};
+    struct timespec neg_nsec = {0, -1};
+    struct timespec neg_sec = {-1, 0};
+    /* want is the errno, or 0 for the one expired timer. */
+    struct { const void *ts; const void *mask; size_t size; int maxevents; long want; } cases[] = {
+        {bad, &mask, 1, 0, EFAULT},
+        {&big_nsec, bad, 8, 0, EINVAL},
+        {&neg_nsec, bad, 8, 4, EINVAL},
+        {&neg_sec, bad, 8, 4, EINVAL},
+        {&zero, bad, 8, 0, EFAULT},
+        {&zero, bad, 8, 1, EFAULT},
+        {&zero, &mask, 4, 1, EINVAL},
+        {&zero, &mask, 4, 4, EINVAL},
+        {&zero, NULL, 0, 0, EINVAL},
+        {&zero, NULL, 0, -1, EINVAL},
+        {&zero, NULL, 1, 4, 0},
+        {write_only, NULL, 0, 4, 0},
+    };
+    long bad_case = -1, got = 0;
+    for (int i = 0; i < (int)(sizeof cases / sizeof cases[0]); i++) {
+        struct epoll_event out[4];
+        memset(out, 0, sizeof out);
+        errno = 0;
+        long n = wait_form_pwait2(ep, out, cases[i].maxevents, cases[i].ts, cases[i].mask,
+                                  cases[i].size);
+        got = n < 0 ? errno : (n == 1 && out[0].data.u64 == 14 ? 0 : 1000 + n);
+        if (got != cases[i].want) {
+            bad_case = i;
+            break;
+        }
+    }
+    munmap(write_only, 4096);
+    close(ep);
+    close(tfd);
+    if (bad_case >= 0) fail(name, "case=%ld got=%ld", bad_case, got);
+    else ok(name);
+}
+
 /* The fork and ppoll cases that check sharing and readiness only, never the
  * guest's clock; the `sharing` argument runs only these. */
 static void check_sharing_cases(void) {
@@ -1439,6 +1611,13 @@ int main(int argc, char **argv) {
     check_huge_relative("huge_relative", 17000000000L, 0);
     check_huge_relative("near_max_relative", 9223372035L, 999999999L);
     check_epoll_pwait_masked_ready();
+    wait_form_epoll_pwait2_ready(0);
+    wait_form_epoll_pwait2_ready(1);
+    wait_form_epoll_pwait2_block(0);
+    wait_form_epoll_pwait2_block(1);
+    wait_form_epoll_pwait2_timeout();
+    wait_form_epoll_pwait2_masked_ready();
+    wait_form_epoll_pwait2_errors();
     check_sharing_cases();
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
