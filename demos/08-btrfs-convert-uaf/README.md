@@ -7,10 +7,13 @@ two threads interleave at shutdown, and an ordinary run cannot choose that
 interleaving. On the reference host, 29 of 40 native runs of the buggy build
 showed no sign of the bug, and the other 11 printed the first lines of an
 AddressSanitizer report and then exited with status 0 before the report was
-complete. This demo runs AddressSanitizer builds of the tool from before and
-after the upstream fix. Hermit's chaos mode finds a thread schedule that crashed
-the old build every time it was run on the reference host, the fixed build
-survives that same schedule, and running the schedule again reproduced the
+complete. This demo runs two AddressSanitizer builds of btrfs-progs v7.1: a
+buggy build that brings the race back, with the progress thread detached and
+never joined as before the upstream fix but with the demo's own shutdown code
+(see [How it works](#how-it-works)), and a fixed build that joins the thread
+as the fix does. Hermit's chaos mode finds a seed whose thread schedule crashed
+the buggy build every time it was run on the reference host, the fixed build
+run with that seed does not crash, and running the seed again reproduced the
 crash report byte for byte. On a shared or heavily loaded machine the crash may
 not reproduce reliably. Chaos mode places each thread switch by counting the
 CPU's retired branches: Hermit arms the counter's interrupt a safety margin of
@@ -422,8 +425,18 @@ The files are in [`fixtures/`](fixtures/): `buggy/common/` and `fixed/common/`
 hold each variant's `task-utils.c` and `task-utils.h`, both with the pipe, and
 [`convert-main-v7.1.patch`](fixtures/convert-main-v7.1.patch) makes the
 `convert/main.c` changes, the same for both variants. None of these changes
-decides which shutdown order is safe; the racing read of freed
-memory is the original bug.
+decides which shutdown order is safe. The race is the same kind as the
+original bug, a detached thread that can read `task_info` after the main
+thread has freed it, but the buggy build reaches it through the demo's own
+shutdown code rather than the 2015 code. Before upstream commit 73e211a7,
+`task_stop()` asked the thread to stop with `pthread_cancel()`, which takes
+effect only when the thread reaches a cancellation point, and returned
+without waiting, after which the caller freed `task_info` with
+`task_deinit()`. The buggy build's `task_stop()` sets a stop flag and writes
+the one byte to the pipe instead, and it too returns without waiting. The
+fixed build joins the thread before the free, as 73e211a7 does, but without
+73e211a7's `pthread_cancel()`: its thread leaves its loop when it sees the
+flag.
 
 Each run gets a fresh copy of the image, because btrfs-convert converts it in
 place. Step 4 reuses the image path of step 2: the path is part of the

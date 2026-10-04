@@ -39,10 +39,11 @@ data. The symptom reported upstream was an assertion failure in
 `btrfs_cow_block`, far from the real cause, which is typical of use-after-free
 bugs.
 
-Hermit did not find a new bug here. The demo puts the pre-2015 shutdown code
-back into btrfs-progs v7.1 and asks a simple question: can a tool reliably
-expose a real race that ordinary runs hit only by chance, and then reproduce it
-exactly?
+Hermit did not find a new bug here. The demo brings the race back into
+btrfs-progs v7.1, with the progress thread detached and never joined as before
+2015 but with its own shutdown code in place of the 2015 code (see the setup
+below), and asks a simple question: can a tool reliably expose a real race
+that ordinary runs hit only by chance, and then reproduce it exactly?
 
 ## The setup
 
@@ -53,6 +54,16 @@ of freed memory into an immediate abort with a detailed report:
   73e211a7).
 - **fixed**: the progress thread is joined before its data is freed
   (73e211a7).
+
+Neither build's shutdown code is the 2015 code. Back then, shutdown asked the
+progress thread to stop with `pthread_cancel`, which takes effect only when
+the thread reaches a cancellation point, and `task_info` was freed without
+waiting for the thread. The buggy build instead sets a stop flag and writes
+one byte to a pipe to wake the thread (the harness below explains the pipe),
+and likewise does not wait, so it has the same kind of race through different
+code. The fixed build joins the thread before the free, as 73e211a7 does, but
+without 73e211a7's `pthread_cancel`: its thread leaves its loop when it sees
+the flag.
 
 The input is a 256 MiB ext4 image holding about 100 small files. Every run
 converts a fresh copy.
@@ -73,11 +84,17 @@ between them is the fix:
   unmodified timer might work today; that has not been measured.
 - btrfs-convert normally starts by checking that its target is not mounted,
   which reads the whole mount table. Under Hermit that table comes from the
-  host's current mounts, and Hermit passes it through unchanged
-  (<https://github.com/rrnewton/hermit/issues/1820>), so on a host where other
-  software mounts and unmounts file systems, that check made the schedule
-  differ from run to run. The harness skips it; the image is a plain file that
-  is never mounted.
+  host's current mounts, and Hermit passes it through unchanged, so on a host
+  where other software mounts and unmounts file systems, that check made the
+  schedule differ from run to run. Giving the program a mount table that does
+  not depend on the host's mounts is tracked in
+  <https://github.com/rrnewton/hermit/issues/3627>;
+  <https://github.com/rrnewton/hermit/issues/1820> is a narrower, related
+  issue. The harness skips the check to work around this gap in Hermit; it is
+  not part of the bug. As a result the demo does not exercise btrfs-convert's
+  refusal to convert a mounted file system, and the patched builds would go on
+  to convert a mounted target, so use them only on the demo's image, a plain
+  file that is never mounted.
 - The demo runs the program with `hermit run --base-env=minimal`, so
   AddressSanitizer options from your environment do not reach it. Both builds
   compile in their options instead: abort on the first error, no leak
@@ -159,9 +176,11 @@ SUMMARY: AddressSanitizer: heap-use-after-free common/task-utils.c:154 in task_p
 
 Elided: the C library frames (`start_thread`, `clone3`,
 `__libc_start_call_main`), the `main` frames at the bottom of the last two
-stacks, and the shadow-memory map. The complete report, shadow-memory map
-included, was byte-identical in all 13 copies kept from seed-7 runs at the
-demo's path. `==3==` is the process ID the program saw, which under Hermit is a
+stacks, and the shadow-memory map. Five outputs of seed-7 runs at the demo's
+path, from 2026-09-30 and 2026-10-01, are still on the reference host, and all
+five contain the same complete report, shadow-memory map included; the
+[README](README.md#run-it) says which runs they came from.
+`==3==` is the process ID the program saw, which under Hermit is a
 virtual, repeatable number.
 
 The report reads exactly like the bug: thread T1, the progress thread, read 8
@@ -177,8 +196,9 @@ bytes inside the 56-byte `task_info` that `task_init` allocated, after
 - **Chaos scheduling finds it.** Hermit still runs one thread at a time, but in
   chaos mode it chooses where to switch threads pseudo-randomly from a seed. 5
   of 32 seeds gave a complete report.
-- **The fix holds on the same schedules.** The fixed build ran every seed
-  without a use-after-free.
+- **The fix holds on the same seeds.** The fixed build ran every seed without
+  a use-after-free. A seed names a schedule for one binary, so this is the
+  same seeds, not the same interleavings.
 - **A crash becomes a repeatable test case.** On the 316-thread host used for
   the demo, the same seed on the same build and command line gave the same
   interleaving and the same report; the last limit below gives the host's load.
