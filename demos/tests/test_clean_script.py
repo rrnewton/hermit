@@ -32,6 +32,7 @@ TRANSIENT_FILES = (
     "run-metadata.json.tmp.456",
     "hermit-boot.qcow2.tmp.789",
     "hermit-boot.qcow2.producer.json.tmp.321",
+    "hermit-snapshot.qcow2.producer.json.tmp.654",
     ".bzImage.123",
     ".initramfs.cpio.gz.1",
     ".initramfs-version.2",
