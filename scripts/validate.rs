@@ -15323,9 +15323,10 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|bucket| bucket.lane == "privileged" && bucket.category == "c-programs")
         .ok_or("node vacuity: required plan lost the privileged c-programs bucket")?;
-    // The checked-in bucket selects cpuid-probe for KVM, LiteInst, ptrace and
-    // DBT.
-    if privileged.selected != 4
+    // The checked-in bucket selects cpuid-probe for KVM, ptrace and DBT. The
+    // LiteInst cell left when every LiteInst cell was switched off for the
+    // in-guest reset (https://github.com/rrnewton/hermit/issues/3520).
+    if privileged.selected != 3
         || !bucket_runs_nothing(privileged)
         || privileged.capabilities != vec!["cpuid-faulting".to_string()]
     {
