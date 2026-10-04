@@ -145,45 +145,35 @@ hermit --backend=ptrace run -- /bin/echo hello
 ```
 
 Backend selection fails closed. Hermit never substitutes ptrace after an
-explicit backend request. LiteInst is an experimental ptrace-hosted hybrid for
-dynamically linked Linux x86-64 guests. It needs the optional `liteinst` CLI
-feature, which `third-party-backends` includes; a build without it refuses
-`--backend=liteinst`:
+explicit backend request. LiteInst is experimental and runs Detcore inside the
+guest for dynamically linked Linux x86-64 programs. It needs the optional
+`liteinst` CLI feature, which `third-party-backends` includes; a build without
+it refuses `--backend=liteinst`. Build the in-guest runtime beside the Hermit
+executable, or name it with `HERMIT_LITEINST_TOOL_RUNTIME`:
 
 ```bash
-./scripts/stage-liteinst-runtime.sh dev \
-  "$PWD/target/debug/libreverie_liteinst.so" \
-  "$PWD/target/liteinst-runtime-build"
 cargo build --locked -p hermit --features liteinst --bin hermit
-./target/debug/hermit --backend=liteinst run --strict --verify -- /bin/echo hello
+cargo build --locked -p detcore-liteinst
+./target/debug/hermit --backend=liteinst run --max-timeslice=disabled -- /bin/echo hello
 ```
 
-The ptrace host owns the sole generic Reverie `Detcore` Tool and GlobalTool.
-The standalone manifest enables and statically verifies the preload constructor;
-Hermit rejects non-runtime or constructor-free overrides before activation.
-The resulting Reverie preload DSO initializes only the LiteInst patch/helper
-side; it never installs another Tool in the guest. The host observes the first
-invocation of each eligible syscall site and installs an instruction-punning
-hook. Later invocations enter the LiteInst trampoline and return to the same
-ptrace-owned Detcore lifecycle.
+Hermit preloads `libdetcore_liteinst.so` into the guest. Its constructor
+installs Detcore's `Tool` in the guest process before the program's `main`;
+Detcore's global state stays in Hermit and is reached over a socket. No ptrace
+tracer sits on the system-call path. Hermit refuses a runtime library that does
+not register its constructor, rather than run the guest unmonitored. The dynamic
+loader, the C library's initialization and the constructors of the program's
+own shared libraries run before the constructor and are not monitored.
 
-`--verify` compares captured status and output and applies the `Stripped`
-comparison to selected Detcore scheduler messages. A successful result is a
-useful diagnostic, but it is not strict determinism. Strict verification requires
-`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts.
-Guests may create threads and child processes: `clone`, `clone3` and `fork` run
-under the ordinary ptrace lifecycle. Installation of new hooks stops at the
-first task-creating syscall, while existing hooks and tasks keep running.
-An activated process leader may `exec` a new dynamically linked program; the
-new image must retain the inherited runtime environment and activate the
-LiteInst runtime again. `vfork` and `exec` from a thread other than the process
-leader remain unsupported and are refused. RCB preemption and CPUID/RDTSC
-interception use the ptrace host and retain its PMU and CPU capability
-requirements.
-The default Hermit namespace path is supported; `--no-namespace` remains an
-explicit option for trusted guests. The in-guest patch runtime is experimental
-and continues to receive compatibility and lifecycle improvements.
+The in-guest runtime cannot deliver Detcore's preemption timer yet, so Hermit
+refuses the run unless `--max-timeslice=disabled` is given. It also refuses
+`--verify`, `--run-evidence-dir`, `--timeout`, `--skid-margin` and
+`--gdbserver`, and guest programs it cannot monitor: statically linked,
+set-user-ID or non-x86-64 programs, programs with a `DT_PREINIT_ARRAY`, and
+anything other than a regular file. A guest may `fork`, and `vfork` runs as a copying fork; creating
+a thread and `exec` are not supported yet. The default Hermit namespace path is
+supported; `--no-namespace` remains an explicit option for trusted guests.
+
 The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
 well as runtime resources. Build both with:
 
