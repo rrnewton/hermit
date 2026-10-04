@@ -31,6 +31,7 @@ use reverie::SignalRecipient;
 use reverie::SignalTaskIdentity;
 
 use super::parked::*;
+use super::real_timer::TimerFailure;
 use super::*;
 
 #[derive(Default)]
@@ -2889,7 +2890,7 @@ fn parent_death_committed_failure_is_retained_and_forwarded_after_unlock() {
     let result = s.consume_signal_boundary(boundary);
     assert!(matches!(result, Err(reverie::Error::Errno(reverie::Errno::EBADF))));
     assert!(s.backend_failed());
-    assert_eq!(s.parked.parent_death_failures.as_slice(), &[receipt.clone()]);
+    assert_eq!(s.parked.parent_death_failures.as_slice(), std::slice::from_ref(&receipt));
     assert!(backend.parent_death_failures.lock().unwrap().is_empty());
     let scheduler = Arc::new(Mutex::new(s));
     let weak = Arc::downgrade(&scheduler);

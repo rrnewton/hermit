@@ -5324,14 +5324,6 @@ impl RunOpts {
         Ok((container, identity_sources))
     }
 
-    pub fn run_verify(
-        &self,
-        log_file: fs::File,
-        global: &GlobalOpts,
-    ) -> Result<(Output, u64), Error> {
-        self.run_verify_with_native_exit_owner(log_file, global, None)
-    }
-
     fn run_verify_with_native_exit_owner(
         &self,
         log_file: fs::File,
