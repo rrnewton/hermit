@@ -419,7 +419,18 @@ fn main() {
     fs::create_dir_all(&build_root)
         .unwrap_or_else(|error| panic!("failed to create {}: {error}", build_root.display()));
 
-    for library in ["libdetcore_dbt.so", "libdetcore_sabre.so"] {
+    // The Detcore runtimes Hermit loads into a guest or a DBT client: the DBT
+    // client library, the SaBRe plugin, and the in-guest LiteInst preload that
+    // `--backend=liteinst` resolves as `rsrcs/libdetcore_liteinst.so`. Each is
+    // the cdylib this same Cargo invocation builds into the profile directory
+    // (the workspace build includes detcore-dbt, detcore-sabre and
+    // detcore-liteinst); a standalone copy made with symlink dereferencing
+    // carries the file itself.
+    for library in [
+        "libdetcore_dbt.so",
+        "libdetcore_sabre.so",
+        "libdetcore_liteinst.so",
+    ] {
         replace_symlink(
             &resources.join(library),
             &Path::new("../..").join(&profile_dir_name).join(library),

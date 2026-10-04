@@ -284,7 +284,6 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.cli",
     "test.isolated_dbt_workdir",
     "test.isolated_detcore_workdir",
-    "test.liteinst_strict",
     "test.sabre_examples",
     "test.hermit_modes",
     "test.app_strict_verify",
@@ -293,9 +292,6 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.rr_suite_contract",
     "test.envelope_levels",
     "test.applications_e2e",
-    "liteinst.strict",
-    "liteinst.hermit_release",
-    "liteinst.runtime",
     "quick.build",
     "quick.detcore_unit",
     "quick.run_smoke",
@@ -392,15 +388,20 @@ struct Profile {
 // full-buck-e2e is only the Buck E2E nodes; a Buck full run selects it with a
 // pruned full (buck_e2e_selection), which assert_buck_e2e_selection counts.
 const PROFILES: [Profile; 12] = [
+    // full and portable each lost test.liteinst_strict, hosted-portable lost
+    // its twin test.liteinst_strict_on_host, and super lost
+    // super.liteinst_python3_verify_diagnostics when the LiteInst host hybrid
+    // was retired (https://github.com/rrnewton/hermit/issues/3520): 88/89,
+    // 74/75, 68/68 and 56/57 before.
     Profile {
         label: "full",
-        direct_steps: 88,
-        selected_steps: 89,
+        direct_steps: 87,
+        selected_steps: 88,
     },
     Profile {
         label: "portable",
-        direct_steps: 74,
-        selected_steps: 75,
+        direct_steps: 73,
+        selected_steps: 74,
     },
     Profile {
         label: "quick",
@@ -411,8 +412,8 @@ const PROFILES: [Profile; 12] = [
     // probe (5), each running its 20 repetitions: 151/152 before.
     Profile {
         label: "super",
-        direct_steps: 56,
-        selected_steps: 57,
+        direct_steps: 55,
+        selected_steps: 56,
     },
     Profile {
         label: "privileged",
@@ -421,8 +422,8 @@ const PROFILES: [Profile; 12] = [
     },
     Profile {
         label: HOSTED_PORTABLE_LABEL,
-        direct_steps: 68,
-        selected_steps: 68,
+        direct_steps: 67,
+        selected_steps: 67,
     },
     Profile {
         label: HOSTED_PRIVILEGED_LABEL,
@@ -1144,9 +1145,12 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // which were already in this split's dependency closure and became its
     // roots; 20 until check.backend_parity_suites was retired with
     // tests/backend-parity (also slice S13). 20 since test.detcore_time and its hosted twin were enrolled.
-    if split.len() != 20 {
+    // 19 since test.liteinst_strict, whose hosted twin was
+    // test.liteinst_strict_on_host, was retired with the LiteInst host hybrid
+    // (https://github.com/rrnewton/hermit/issues/3520).
+    if split.len() != 19 {
         return Err(format!(
-            "hosted test split has {} roots, expected 20",
+            "hosted test split has {} roots, expected 19",
             split.len()
         ));
     }
@@ -1186,9 +1190,11 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
     // e2e.manifest_compat bucket (2026-10-01), whose hosted twin is authored.
     // 23 until check.backend_parity_suites was retired with
     // tests/backend-parity (also slice S13). 23 since test.detcore_time and its hosted twin were enrolled.
-    if split.len() != 23 {
+    // 22 since test.liteinst_strict, one of the split's roots, was retired
+    // with the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520).
+    if split.len() != 22 {
         return Err(format!(
-            "hosted test dependency closure has {} nodes, expected 23",
+            "hosted test dependency closure has {} nodes, expected 22",
             split.len()
         ));
     }
@@ -2072,10 +2078,13 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // test.detcore_time and its hosted twin were enrolled; 121 since
     // privileged-test.pmu_detcore_time_cases took the 29 tests_time cases that
     // need a PMU (https://github.com/rrnewton/hermit/issues/3663). 137 with
-    // the 16 Buck import twins.
-    if expected.len() != 137 {
+    // the 16 Buck import twins. 133 since test.liteinst_strict, its hosted
+    // twin, liteinst.strict and super.liteinst_python3_verify_diagnostics
+    // were retired with the LiteInst host hybrid
+    // (https://github.com/rrnewton/hermit/issues/3520).
+    if expected.len() != 133 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 137",
+            "structured result producer registry has {} entries, expected 133",
             expected.len()
         ));
     }
@@ -2085,10 +2094,12 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         .copied()
         .collect::<BTreeMap<_, _>>();
     // 43 since privileged-test.pmu_detcore_time_cases joined it
-    // (https://github.com/rrnewton/hermit/issues/3663).
-    if expected_counts.len() != 43 {
+    // (https://github.com/rrnewton/hermit/issues/3663). 41 since
+    // test.liteinst_strict and test.liteinst_strict_on_host were retired with
+    // the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520).
+    if expected_counts.len() != 41 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 43",
+            "Nextest expected-count registry has {} entries, expected 41",
             expected_counts.len()
         ));
     }
@@ -2220,8 +2231,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // probe nodes. Nextest 69 -> 71 when test.detcore_time and its hosted twin
     // were enrolled, and 72 with privileged-test.pmu_detcore_time_cases
     // (https://github.com/rrnewton/hermit/issues/3663). TestHarness 56 with
-    // the 16 Buck import twins.
-    if actual_group_counts != [72, 56, 7, 2] {
+    // the 16 Buck import twins. Nextest 68 since test.liteinst_strict, its
+    // hosted twin, liteinst.strict and super.liteinst_python3_verify_diagnostics
+    // were retired with the LiteInst host hybrid
+    // (https://github.com/rrnewton/hermit/issues/3520).
+    if actual_group_counts != [68, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -2993,9 +3007,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // https://github.com/rrnewton/hermit/issues/3663).
     // 436 with the 18 full-buck-e2e nodes: e2e.buck_cells, the 16 bucket
     // import twins and the scorecard twin (418 + 18).
-    if cfg.steps.len() != 436 {
+    // 430 since the LiteInst host hybrid was retired
+    // (https://github.com/rrnewton/hermit/issues/3520): test.liteinst_strict,
+    // test.liteinst_strict_on_host, liteinst.strict, liteinst.hermit_release,
+    // liteinst.runtime and super.liteinst_python3_verify_diagnostics (436 - 6).
+    if cfg.steps.len() != 430 {
         return Err(format!(
-            "superset has {} steps, expected 436",
+            "superset has {} steps, expected 430",
             cfg.steps.len()
         ));
     }
@@ -4801,6 +4819,8 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let selected =
             select_steps_by_labels(&committed, &[HOSTED_PORTABLE_LABEL.to_string()]).unwrap();
+        // 67 since test.liteinst_strict_on_host was retired with the LiteInst
+        // host hybrid (https://github.com/rrnewton/hermit/issues/3520);
         // 68 since test.detcore_time_on_host was enrolled;
         // 67 since check.backend_parity_suites_on_host was retired with
         // tests/backend-parity (slice S13 of
@@ -4818,7 +4838,7 @@ sys.exit(37)
         // 255 since the five selftest.<name> nodes left gate.manifest
         // (https://github.com/rrnewton/hermit/issues/3381); 250 since
         // test.dbt_parity_on_host was retired (slice S13); 251 before.
-        assert_eq!(selected.steps.len(), 68);
+        assert_eq!(selected.steps.len(), 67);
         let legacy_variants = [
             "test.cli_on_host",
             "test.hermit_modes_on_host",
@@ -4850,7 +4870,6 @@ sys.exit(37)
             "hermit_integration",
             "hermit_unit",
             "ignored_syscall_regressions",
-            "liteinst_strict",
             "regular_crates",
             "rr_suite_contract",
             "sabre_examples",
@@ -4875,6 +4894,8 @@ sys.exit(37)
             "doc.rustdoc_on_host".into(),
             "lint.clippy_on_host".into(),
         ]);
+        // 22 since test.liteinst_strict_on_host was retired with the LiteInst
+        // host hybrid (https://github.com/rrnewton/hermit/issues/3520);
         // 23 since test.detcore_time_on_host was enrolled;
         // 22 since check.backend_parity_suites_on_host was retired with
         // tests/backend-parity (slice S13 of
@@ -4888,7 +4909,7 @@ sys.exit(37)
         // change of 2026-09-30 retired build.liteinst_runtime_release_on_host
         // and moved check.dbt_runtime_abi into the pinned root, which gave it
         // the hosted twin check.dbt_runtime_abi_on_host.
-        assert_eq!(new_variants.len(), 23);
+        assert_eq!(new_variants.len(), 22);
         let mut expected = legacy_variants
             .map(str::to_string)
             .into_iter()
@@ -5021,6 +5042,10 @@ sys.exit(37)
             .retain(|label| label != HOSTED_PORTABLE_LABEL);
         let error = assert_invariants(&planted_coverage_loss, &cells).unwrap_err();
         assert!(
+            // 66 = the 67 hosted-portable direct steps since
+            // test.liteinst_strict_on_host was retired with the LiteInst host
+            // hybrid (https://github.com/rrnewton/hermit/issues/3520), minus
+            // the one planted loss;
             // 67 = the 68 hosted-portable direct steps since
             // test.detcore_time_on_host was enrolled, minus the one planted loss;
             // 66 = the 67 hosted-portable direct steps since
@@ -5040,7 +5065,7 @@ sys.exit(37)
             // selftest.scorecard_commands split from selftest.scorecard,
             // https://github.com/rrnewton/hermit/issues/3381), minus the one
             // planted loss.
-            error.contains("hosted-portable label has 67 direct steps"),
+            error.contains("hosted-portable label has 66 direct steps"),
             "{error}"
         );
     }
@@ -5131,7 +5156,6 @@ sys.exit(37)
                     "test.hermit_modes",
                     "test.hermit_unit",
                     "test.ignored_syscall_regressions",
-                    "test.liteinst_strict",
                     "test.regular_crates",
                     "test.rr_suite_contract",
                     "test.sabre_examples",
@@ -5162,10 +5186,12 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         assert_buck_e2e_selection(&committed, &cells).unwrap();
-        // 89 full nodes (87 before test.detcore_time joined full, 88 before
+        // 88 full nodes (89 before test.liteinst_strict was retired with the
+        // LiteInst host hybrid, https://github.com/rrnewton/hermit/issues/3520;
+        // 87 before test.detcore_time joined full, 88 before
         // privileged-test.pmu_detcore_time_cases did) - 22 replaced + 18
         // full-buck-e2e nodes.
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 85);
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 84);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

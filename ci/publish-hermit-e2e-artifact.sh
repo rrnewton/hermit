@@ -102,7 +102,7 @@ function require_portable_sabre_plugin {
 function require_complete_resources {
     local install=$1 require_runtime=$2 path
     [[ -d $install/rsrcs ]] || fail "resource bundle has no rsrcs directory: $install"
-    for path in libdetcore_dbt.so libdetcore_sabre.so libreverie_dbt_client.so libreverie_liteinst.so; do
+    for path in libdetcore_dbt.so libdetcore_sabre.so libdetcore_liteinst.so libreverie_dbt_client.so libreverie_liteinst.so; do
         [[ -f $install/rsrcs/$path && -s $install/rsrcs/$path ]] ||
             fail "resource bundle is missing or empty: $install/rsrcs/$path"
     done

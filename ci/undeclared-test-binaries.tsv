@@ -40,7 +40,6 @@ kvm_info_log_determinism	host-dependency-unsatisfied	Measured 2026-08-26 on herm
 kvm_lifecycle_timing_log_level	measured-green-pending-registration	Measured 2026-08-26 on hermit@a787a547ea: 1 test, 1 pass, 0.3s. Green; belongs in the DAG pending a memory sample for its hint block.
 language_runtime_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 leveldb	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-liteinst_host_activation	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 madvise	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 meminfo_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 mmap_stress_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
