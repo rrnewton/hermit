@@ -652,6 +652,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // runner::tests::a_retained_command_line_must_be_the_executor_invocation_its_row_records
     // retains all 889 (`cargo nextest list --profile ci -p hermit-manifest-plan`
     // measured 692 at 9af999677494 and 693 with it; the whole selection lists 890).
+    // Composed owning LIST at f89aedbaa67a measured 890: all 889 prior IDs
+    // plus the one retained-command-line control; no ignore/filter change.
+    // Evidence: https://github.com/rrnewton/reverie/issues/916
     ("test.regular_crates", 890),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
@@ -1180,6 +1183,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Count evidence: https://github.com/rrnewton/reverie/issues/916
     // The three parity import tests listed there retain all 886, and the
     // retained-command-line test listed there retains all 889.
+    // Composed owning LIST at f89aedbaa67a measured 890: all 889 prior IDs
+    // plus the one retained-command-line control; no ignore/filter change.
+    // Evidence: https://github.com/rrnewton/reverie/issues/916
     ("test.regular_crates_on_host", 890),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
