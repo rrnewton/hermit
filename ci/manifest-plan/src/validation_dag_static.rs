@@ -761,7 +761,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3219) retains all 817 prior
     // identities (`cargo nextest list --profile ci` lists 823 = 818 plus the
     // five real_random_ PMU cases this node skips).
-    ("test.hermit_unit", 818),
+    // tests::backend_blocked_wait_signal_contract_is_explicit
+    // (https://github.com/rrnewton/hermit/issues/3146) retains all 818 prior
+    // identities: 818 + 1 = 819 (`cargo nextest list --profile ci` lists 824 =
+    // 819 plus the five real_random_ PMU cases this node skips).
+    ("test.hermit_unit", 819),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -839,7 +843,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_fault_of_the_whole_copy_copies_nothing;
     // https://github.com/rrnewton/hermit/pull/3226) retain all 881 prior
     // identities: 881 + 23 = 904 (`cargo nextest list --profile ci` measured 904).
-    ("test.detcore_unit", 904),
+    // The 38 blocked-wait signal tests (22 scheduler::test, 12
+    // syscalls::helpers::kernel_signal_wait_failures, one
+    // syscalls::helpers::tests and three syscalls::threads::tests;
+    // https://github.com/rrnewton/hermit/issues/3146) retain all 904 prior
+    // identities: 904 + 38 = 942 (`cargo nextest list --profile ci` measured 942).
+    ("test.detcore_unit", 942),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -988,14 +997,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities.
     // liteinst_dispatch_record_reports_patched_sites retains all 27 prior
     // identities.
-    // external_signal_interrupt adds its 48 tests plus its copy of the shared
+    // external_signal_interrupt adds its 61 tests plus its copy of the shared
     // liteinst_runtime::tests::staged_ci_artifact_never_becomes_a_cargo_profile
     // unit test; all 28 liteinst_advanced identities are retained
-    // (`cargo nextest list --profile ci` measured 28 + 49 = 77 at the rebased
+    // (`cargo nextest list --profile ci` measured 28 + 62 = 90 at the rebased
     // head of https://github.com/rrnewton/hermit/pull/3361;
     // https://github.com/rrnewton/hermit/issues/3146). Its tests are split per
     // backend so each stays inside the per-test wall and CPU bounds.
-    ("test.liteinst_strict", 77),
+    ("test.liteinst_strict", 90),
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops retains all 6
     // prior identities.
     ("test.sabre_examples", 7),
@@ -1069,7 +1078,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 878 prior identities: 878 + 3 = 881.
     // The host twin selects the same 23 directory-stream tests
     // (https://github.com/rrnewton/hermit/pull/3226): 881 + 23 = 904.
-    ("test.detcore_unit_on_host", 904),
+    // The host twin selects the same 38 blocked-wait signal tests
+    // (https://github.com/rrnewton/hermit/issues/3146): 904 + 38 = 942.
+    ("test.detcore_unit_on_host", 942),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1104,7 +1115,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/issues/1845 test.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3219 test.
-    ("test.hermit_unit_on_host", 818),
+    // The host twin selects the same
+    // https://github.com/rrnewton/hermit/issues/3146 test: 818 + 1 = 819.
+    ("test.hermit_unit_on_host", 819),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
@@ -1112,8 +1125,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities. The host twin also selects
     // liteinst_dispatch_record_reports_patched_sites.
     // The host twin selects the same external_signal_interrupt binary
-    // (https://github.com/rrnewton/hermit/issues/3146).
-    ("test.liteinst_strict_on_host", 77),
+    // (https://github.com/rrnewton/hermit/issues/3146): 28 + 62 = 90.
+    ("test.liteinst_strict_on_host", 90),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // The fold-2 resolver test retains all 764 prior identities.
