@@ -13,7 +13,8 @@
 # its `ci: false` becomes true. That manifest edit is the only hand edit. This
 # script then rewrites, in dependency order,
 #
-#   test-harness sync-cells      ci/expected-e2e-plan.json, tests/e2e/parity-selection.yaml
+#   test-harness sync-cells      ci/expected-e2e-plan.json, ci/optional-e2e-cells.txt,
+#                                tests/e2e/parity-selection.yaml
 #   generate-parity-cells        ci/compat-envelope/parity-cells.json
 #   scorecard.rs update          SCORECARD.md, ci/compat-envelope/cells.json
 #   generate-validation-dag      ci/dag/validate.json
@@ -30,7 +31,7 @@ usage() {
 Usage: ci/sync-cell-config.sh [--check]
 
 Regenerate every file derived from the E2E manifests after a cell flip: the
-expected plan, the parity selection, parity-cells.json, the scorecard and cell
+expected plan, the optional-cell inventory, the parity selection, parity-cells.json, the scorecard and cell
 table, and the validation DAG. Edit the manifest, run this,
 and commit the manifest with the files it rewrites.
 
@@ -66,6 +67,11 @@ root=$(git -C "$(dirname "$0")" rev-parse --show-toplevel) || {
     exit 1
 }
 target=${CARGO_TARGET_DIR:-$root/target}
+# Every step runs from the checkout root and scorecard.rs wants an absolute
+# helper path, so resolve a relative target directory as cargo would, against
+# the caller's directory, and hand cargo the same absolute path.
+[[ $target == /* ]] || target=$PWD/$target
+export CARGO_TARGET_DIR=$target
 bin=$target/debug
 
 # step SECONDS LABEL COMMAND... — run one step from the checkout root under a

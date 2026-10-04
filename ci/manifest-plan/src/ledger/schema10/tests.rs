@@ -1144,8 +1144,13 @@ fn generated_plan_populations_preserve_command_policy() {
                 .map(BackendParityRelation::ptrace)
                 .collect::<Vec<_>>();
             // How many relations a parity reference plans follows from the
-            // committed plan; this catches a reference that plans none.
+            // committed plan, so it is not pinned; the plan must plan exactly
+            // these, and some only when its parity reference is active.
             assert_eq!(expected_relations.is_empty(), !active);
+            assert_eq!(
+                plan.planned_backend_parity_relations().unwrap(),
+                expected_relations
+            );
             if let Some(destination) = std::env::var_os("HERMIT_SCHEMA10_PLAN_FIXTURE_OUTPUT") {
                 use std::io::Write;
                 let destination = std::path::PathBuf::from(destination);

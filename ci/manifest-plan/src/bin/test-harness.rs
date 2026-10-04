@@ -64,6 +64,7 @@ use serde_yaml::Value as YamlValue;
 
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
 const EXPECTED_PLAN_PATH: &str = "ci/expected-e2e-plan.json";
+const OPTIONAL_CELLS_PATH: &str = "ci/optional-e2e-cells.txt";
 const DEFAULT_BUILD_JOBS: usize = 16;
 const DEFAULT_VALIDATE_AUDIT_JOBS: usize = 2;
 const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
@@ -155,17 +156,18 @@ const RUN_ENVIRONMENT: &str =
 const SYNC_CELLS_HELP: &str = "\
 Usage: test-harness sync-cells <--check|--write> [--repo-root <DIR>]
 
-Regenerate the two manifest-derived files that the scorecard and parity census
-are generated from:
+Regenerate the manifest-derived files that the scorecard and parity census
+are generated from, and the inventory of optional cells:
 
   ci/expected-e2e-plan.json        the required plan, rows in their committed order
+  ci/optional-e2e-cells.txt        enabled cells that are not required (ci: false)
   tests/e2e/parity-selection.yaml  the cells its written rule selects
 
 A cell flip makes one existing manifest cell required: its backend joins the
 mode's `backends_enabled` and `ci`, or its `ci: false` becomes true. The diff of
 ci/expected-e2e-plan.json is the record of every change to the required cells.
-`test-harness validate` refuses a tree where either file differs from this
-output.
+`test-harness validate` refuses a tree where any of these files differs from
+this output.
 
 ci/sync-cell-config.sh runs this and then every generator downstream of it;
 run that rather than this alone.
@@ -1411,6 +1413,40 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
     cell_count
 }
 
+/// Every enabled cell that is not required (a `ci: false` cell), one
+/// `<test> <mode> <backend>` line each, sorted. No other derived file names
+/// these cells, so this inventory is what makes disabling one show up as a
+/// diff (https://github.com/rrnewton/hermit/issues/3606).
+fn optional_cells_document(manifests: &ManifestSet) -> Result<String, String> {
+    let select = |population| {
+        manifests.select(&Selection {
+            population: Some(population),
+            ..Selection::default()
+        })
+    };
+    let required = select(Population::Required)?
+        .into_iter()
+        .map(|cell| cell.id)
+        .collect::<BTreeSet<_>>();
+    let lines = select(Population::Enabled)?
+        .into_iter()
+        .filter(|cell| !required.contains(&cell.id))
+        .map(|cell| {
+            format!(
+                "{} {} {}\n",
+                cell.id.test,
+                cell.id.mode,
+                cell.id.backend.as_deref().unwrap_or("-")
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    Ok(format!(
+        "# Enabled E2E cells that are not required (ci: false): <test> <mode> <backend>.\n\
+         # Generated from tests/e2e/manifests by ci/sync-cell-config.sh; do not edit.\n{}",
+        lines.into_iter().collect::<String>()
+    ))
+}
+
 /// The files `sync-cells` derives, each with the text the manifests now give
 /// it, in the order it reports them.
 fn synced_cell_files(root: &Path) -> Result<Vec<(&'static str, String)>, String> {
@@ -1429,6 +1465,7 @@ fn synced_cell_files(root: &Path) -> Result<Vec<(&'static str, String)>, String>
     let plan = serde_json::to_string_pretty(&generated).map_err(|error| error.to_string())? + "\n";
     Ok(vec![
         (EXPECTED_PLAN_PATH, plan),
+        (OPTIONAL_CELLS_PATH, optional_cells_document(&manifests)?),
         (parity::PARITY_SELECTION_PATH, selection),
     ])
 }
@@ -1477,7 +1514,9 @@ fn sync_cells(values: &[String]) -> ExitCode {
         }
     }
     match (stale.is_empty(), write) {
-        (true, _) => println!("sync-cells: the expected plan and parity selection are current"),
+        (true, _) => println!(
+            "sync-cells: the expected plan, optional cells and parity selection are current"
+        ),
         (false, true) => println!("sync-cells: wrote {}", stale.join(", ")),
         (false, false) => {
             eprintln!(
@@ -9095,8 +9134,8 @@ sys.exit(1 if failed else 0)
         }
     }
 
-    /// A fresh temporary root holding a copy of tests/e2e and the expected
-    /// plan, the files `sync-cells` reads and writes, with every other entry of
+    /// A fresh temporary root holding a copy of tests/e2e, the expected plan
+    /// and the optional-cell inventory, the files `sync-cells` reads and writes, with every other entry of
     /// the checkout, tests and ci linked in for the programs the manifests name.
     fn sync_cells_fixture(label: &str) -> std::path::PathBuf {
         fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
@@ -9134,14 +9173,15 @@ sys.exit(1 if failed else 0)
         // Not .git: the fixture is no checkout.
         link_except("", &["tests", ".git"]);
         fs::remove_file(fixture.join("ci")).unwrap();
-        link_except("ci", &["expected-e2e-plan.json"]);
+        link_except("ci", &["expected-e2e-plan.json", "optional-e2e-cells.txt"]);
         link_except("tests", &["e2e"]);
         copy_tree(&checkout.join("tests/e2e"), &fixture.join("tests/e2e"));
-        fs::copy(
-            checkout.join(super::EXPECTED_PLAN_PATH),
-            fixture.join(super::EXPECTED_PLAN_PATH),
-        )
-        .unwrap();
+        for relative in [super::EXPECTED_PLAN_PATH, super::OPTIONAL_CELLS_PATH] {
+            // A missing inventory is copied as missing, and `sync` reports it stale.
+            if checkout.join(relative).exists() {
+                fs::copy(checkout.join(relative), fixture.join(relative)).unwrap();
+            }
+        }
         fixture
     }
 
@@ -9237,6 +9277,45 @@ sys.exit(1 if failed else 0)
         assert_eq!(
             fs::read(root.join(parity::PARITY_SELECTION_PATH)).unwrap(),
             committed_selection
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Disabling an optional (`ci: false`) cell changes no required plan row,
+    /// parity cell or scorecard row, so only the optional-cell inventory
+    /// records it; re-enabling it gives the inventory back byte for byte.
+    #[test]
+    fn sync_cells_records_disabling_an_optional_cell() {
+        let root = sync_cells_fixture("optional");
+        let committed = fs::read_to_string(root.join(super::OPTIONAL_CELLS_PATH)).unwrap();
+        let line = "c-programs/writev-determinism custom ptrace";
+        assert!(
+            committed.lines().any(|entry| entry == line),
+            "{line} is not optional"
+        );
+        let manifest = root.join("tests/e2e/manifests/c-programs.yaml");
+        let original = fs::read_to_string(&manifest).unwrap();
+
+        fs::write(
+            &manifest,
+            unflip(
+                &original,
+                "c-programs/writev-determinism",
+                "custom",
+                "ptrace",
+            ),
+        )
+        .unwrap();
+        assert_eq!(sync(&root), [super::OPTIONAL_CELLS_PATH]);
+        let disabled = fs::read_to_string(root.join(super::OPTIONAL_CELLS_PATH)).unwrap();
+        assert_eq!(disabled.lines().count() + 1, committed.lines().count());
+        assert!(!disabled.lines().any(|entry| entry == line));
+
+        fs::write(&manifest, &original).unwrap();
+        assert_eq!(sync(&root), [super::OPTIONAL_CELLS_PATH]);
+        assert_eq!(
+            fs::read_to_string(root.join(super::OPTIONAL_CELLS_PATH)).unwrap(),
+            committed
         );
         fs::remove_dir_all(&root).unwrap();
     }
