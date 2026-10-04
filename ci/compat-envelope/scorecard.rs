@@ -38069,6 +38069,21 @@ mod post_verdict_transaction_tests {
         verify_candidate_set(&BTreeSet::from([id.clone()]), candidates)
             .expect("control: a canonical pass that retries a canonical failure is a pass");
 
+        // The same comparator throughout, but the earlier attempt is a
+        // canonical match the readers refuse: the terminal pass cannot carry
+        // the run past it.
+        let mut retried_pass = canonical_match(true);
+        retried_pass["attempt"] = 2.into();
+        fixture.publish_rows(&[refused.clone(), retried_pass]);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        let error = verify_candidate_set(&BTreeSet::from([id.clone()]), candidates)
+            .map(|_| ())
+            .expect_err("a canonical pass hid an earlier refused canonical match");
+        assert!(
+            error.contains(INCONSISTENT_MATCH) && error.contains("outer attempt 1"),
+            "{error}"
+        );
+
         for (label, earlier, expected) in [
             ("canonical failure", failed, "switches comparator"),
             ("refused canonical match", refused, "switches comparator"),
