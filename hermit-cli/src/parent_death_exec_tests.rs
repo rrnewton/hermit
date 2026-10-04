@@ -51,8 +51,12 @@ impl Drop for NoStackGuard {
 impl reverie::Stack for NoStack {
     type StackGuard = NoStackGuard;
 
-    fn size(&self) -> usize { panic!("unexpected stack size") }
-    fn capacity(&self) -> usize { panic!("unexpected stack capacity") }
+    fn size(&self) -> usize {
+        panic!("unexpected stack size")
+    }
+    fn capacity(&self) -> usize {
+        panic!("unexpected stack capacity")
+    }
     fn push<'stack, T>(&mut self, _: T) -> Addr<'stack, T> {
         panic!("unexpected stack push")
     }
@@ -94,7 +98,9 @@ impl<T: Tool<GlobalState = GlobalState>> GlobalRPC<GlobalState> for BoundaryGues
         self.unexpected(4)
     }
 
-    fn config(&self) -> &Config { &self.config }
+    fn config(&self) -> &Config {
+        &self.config
+    }
 }
 
 #[reverie::tool]
@@ -115,19 +121,35 @@ impl<T: Tool<GlobalState = GlobalState>> Guest<T> for BoundaryGuest<T> {
         })
     }
 
-    fn tid(&self) -> Pid { Pid::from_raw(i32::MAX) }
-    fn pid(&self) -> Pid { self.tid() }
-    fn ppid(&self) -> Option<Pid> { None }
-    fn memory(&self) -> Self::Memory { self.unexpected(3) }
-    fn thread_state_mut(&mut self) -> &mut T::ThreadState { self.unexpected(2) }
+    fn tid(&self) -> Pid {
+        Pid::from_raw(i32::MAX)
+    }
+    fn pid(&self) -> Pid {
+        self.tid()
+    }
+    fn ppid(&self) -> Option<Pid> {
+        None
+    }
+    fn memory(&self) -> Self::Memory {
+        self.unexpected(3)
+    }
+    fn thread_state_mut(&mut self) -> &mut T::ThreadState {
+        self.unexpected(2)
+    }
     fn thread_state(&self) -> &T::ThreadState {
         self.effects[1].fetch_add(1, Ordering::SeqCst);
         assert!(self.allow_prehook_witness, "refused exec entered prehook");
         std::panic::panic_any(PrehookReached)
     }
-    async fn regs(&mut self) -> libc::user_regs_struct { self.unexpected(6) }
-    async fn stack(&mut self) -> Self::Stack { self.unexpected(6) }
-    async fn daemonize(&mut self) { self.unexpected(6) }
+    async fn regs(&mut self) -> libc::user_regs_struct {
+        self.unexpected(6)
+    }
+    async fn stack(&mut self) -> Self::Stack {
+        self.unexpected(6)
+    }
+    async fn daemonize(&mut self) {
+        self.unexpected(6)
+    }
     async fn inject<S: SyscallInfo>(&mut self, _: S) -> Result<i64, Errno> {
         self.unexpected(5)
     }
@@ -140,7 +162,9 @@ impl<T: Tool<GlobalState = GlobalState>> Guest<T> for BoundaryGuest<T> {
     fn set_timer_precise(&mut self, _: reverie::TimerSchedule) -> Result<(), Error> {
         self.unexpected(6)
     }
-    fn read_clock(&mut self) -> Result<u64, Error> { self.unexpected(6) }
+    fn read_clock(&mut self) -> Result<u64, Error> {
+        self.unexpected(6)
+    }
 }
 
 fn check_boundary<T: Tool<GlobalState = GlobalState>>(
@@ -184,17 +208,26 @@ fn check_boundary<T: Tool<GlobalState = GlobalState>>(
         let Ok(Poll::Ready(Err(Error::Tool(error)))) = outcome else {
             panic!("enrolled wrapper exec did not fail at first admission");
         };
-        assert_eq!(error.to_string(), format!(
-            "KVM parent-death signal unsupported enrolled exec under record/replay or unknown subtool before {number}"
-        ));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "KVM parent-death signal unsupported enrolled exec under record/replay or unknown subtool before {number}"
+            )
+        );
     } else {
         let Err(witness) = outcome else {
             panic!("supported or unenrolled call did not reach the existing prehook");
         };
-        assert!(witness.is::<PrehookReached>(), "unexpected downstream failure");
+        assert!(
+            witness.is::<PrehookReached>(),
+            "unexpected downstream failure"
+        );
     }
     assert_eq!(
-        guest.effects.each_ref().map(|value| value.load(Ordering::SeqCst)),
+        guest
+            .effects
+            .each_ref()
+            .map(|value| value.load(Ordering::SeqCst)),
         [usize::from(kvm), usize::from(!refuse), 0, 0, 0, 0, 0]
     );
 }

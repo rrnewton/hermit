@@ -65,7 +65,10 @@ impl std::fmt::Debug for Backend {
 }
 impl ProcessSignalControl for Backend {
     fn enable_parent_death_control(&self) -> Result<(), reverie::Errno> {
-        if self.parent_death_enabled.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .parent_death_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             Ok(())
         } else {
             Err(reverie::Errno::ENOSYS)
@@ -75,23 +78,40 @@ impl ProcessSignalControl for Backend {
         if let Some(error) = *self.parent_death_query_error.lock().unwrap() {
             return Err(error);
         }
-        Ok(self.parent_death_enrolled.lock().unwrap().contains(&(process.tgid.as_raw(), process.generation)))
+        Ok(self
+            .parent_death_enrolled
+            .lock()
+            .unwrap()
+            .contains(&(process.tgid.as_raw(), process.generation)))
     }
-    fn publish_parent_death(&self, boundary: SignalBoundaryReceipt) -> reverie::ParentDeathPublicationResult {
+    fn publish_parent_death(
+        &self,
+        boundary: SignalBoundaryReceipt,
+    ) -> reverie::ParentDeathPublicationResult {
         self.parent_death_boundaries.lock().unwrap().push(boundary);
-        self.parent_death_result.lock().unwrap().clone().unwrap_or_else(|| {
-            reverie::ParentDeathPublicationResult::Committed(reverie::ParentDeathPublication {
-                boundary,
-                batches: Vec::new(),
-                signals: Vec::new(),
+        self.parent_death_result
+            .lock()
+            .unwrap()
+            .clone()
+            .unwrap_or_else(|| {
+                reverie::ParentDeathPublicationResult::Committed(reverie::ParentDeathPublication {
+                    boundary,
+                    batches: Vec::new(),
+                    signals: Vec::new(),
+                })
             })
-        })
     }
-    fn finish_parent_death_failure(&self, receipt: &reverie::ParentDeathPublication) -> Result<(), reverie::Errno> {
+    fn finish_parent_death_failure(
+        &self,
+        receipt: &reverie::ParentDeathPublication,
+    ) -> Result<(), reverie::Errno> {
         if let Some(probe) = self.failure_probe.lock().unwrap().as_ref() {
             probe();
         }
-        self.parent_death_failures.lock().unwrap().push(receipt.clone());
+        self.parent_death_failures
+            .lock()
+            .unwrap()
+            .push(receipt.clone());
         Ok(())
     }
     fn publish_alarm(
@@ -155,7 +175,12 @@ impl ProcessSignalControl for Backend {
         process: SignalProcessId,
         signal: i32,
     ) -> Result<Vec<SignalRecipient>, reverie::Errno> {
-        if self.parent_death_recipient_signal.lock().unwrap().is_some_and(|expected| expected != signal) {
+        if self
+            .parent_death_recipient_signal
+            .lock()
+            .unwrap()
+            .is_some_and(|expected| expected != signal)
+        {
             return Ok(Vec::new());
         }
         if *self.fail_recipients.lock().unwrap() == Some(process) {
@@ -2662,10 +2687,19 @@ fn parent_death_fixture() -> (Scheduler, Arc<Backend>) {
         ..Config::default()
     });
     let backend = Arc::new(Backend::default());
-    backend.parent_death_enabled.store(true, std::sync::atomic::Ordering::Relaxed);
+    backend
+        .parent_death_enabled
+        .store(true, std::sync::atomic::Ordering::Relaxed);
     *backend.parent_death_recipient_signal.lock().unwrap() = Some(libc::SIGUSR1);
-    s.install_signal_control(Some(BackendSignalControl { process: backend.clone() })).unwrap();
-    backend.parent_death_enrolled.lock().unwrap().insert((100, 1));
+    s.install_signal_control(Some(BackendSignalControl {
+        process: backend.clone(),
+    }))
+    .unwrap();
+    backend
+        .parent_death_enrolled
+        .lock()
+        .unwrap()
+        .insert((100, 1));
     (s, backend)
 }
 
@@ -2678,7 +2712,10 @@ fn parent_death_absent_feature_keeps_old_control_and_never_queries_enrollment() 
     assert_eq!(s.parent_death_enrolled(tid), Ok(false));
     let mut resources = Resources::new(tid);
     resources.insert(ResourceID::FutexWait, Permission::RW);
-    assert_eq!(s.validate_parent_death_resource(tid, &resources, ControlCapability::None), Ok(()));
+    assert_eq!(
+        s.validate_parent_death_resource(tid, &resources, ControlCapability::None),
+        Ok(())
+    );
 }
 
 #[test]
@@ -2686,7 +2723,10 @@ fn parent_death_query_failure_is_not_an_unenrolled_answer() {
     let (mut s, backend) = parent_death_fixture();
     let (tid, _, _) = add(&mut s, 100, 100);
     *backend.parent_death_query_error.lock().unwrap() = Some(reverie::Errno::EBADF);
-    assert_eq!(s.parent_death_enrolled(tid), Err(ProtocolFailure::ParentDeathQuery(libc::EBADF)));
+    assert_eq!(
+        s.parent_death_enrolled(tid),
+        Err(ProtocolFailure::ParentDeathQuery(libc::EBADF))
+    );
     assert!(s.next_turns[&tid].req.try_read().is_none());
     assert!(s.next_turns[&tid].resp.try_read().is_none());
 }
@@ -2698,20 +2738,42 @@ fn parent_death_wait_guard_accepts_only_matching_authenticated_sleep() {
     let mut resources = Resources::new(tid);
     resources.insert(ResourceID::SleepUntil(at(100)), Permission::RW);
     let capability = ControlCapability::ParkedWait {
-        policy: ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline: at(100) },
+        policy: ParkedWaitPolicy::NanosleepNoHandlerRestart {
+            absolute_deadline: at(100),
+        },
         site,
     };
-    assert_eq!(s.validate_parent_death_resource(tid, &resources, capability), Ok(()));
-    assert_eq!(s.validate_parent_death_resource(tid, &resources, ControlCapability::None), Err(ProtocolFailure::ParentDeathUnsupportedWait));
+    assert_eq!(
+        s.validate_parent_death_resource(tid, &resources, capability),
+        Ok(())
+    );
+    assert_eq!(
+        s.validate_parent_death_resource(tid, &resources, ControlCapability::None),
+        Err(ProtocolFailure::ParentDeathUnsupportedWait)
+    );
     let wrong = ControlCapability::ParkedWait {
-        policy: ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline: at(101) },
+        policy: ParkedWaitPolicy::NanosleepNoHandlerRestart {
+            absolute_deadline: at(101),
+        },
         site,
     };
-    assert_eq!(s.validate_parent_death_resource(tid, &resources, wrong), Err(ProtocolFailure::ParentDeathUnsupportedWait));
+    assert_eq!(
+        s.validate_parent_death_resource(tid, &resources, wrong),
+        Err(ProtocolFailure::ParentDeathUnsupportedWait)
+    );
     resources.resources.clear();
-    resources.insert(ResourceID::SleepUntil(LogicalTime::INDEFINITE), Permission::RW);
-    let pause = ControlCapability::ParkedWait { policy: ParkedWaitPolicy::PauseNoHandlerRestart, site };
-    assert_eq!(s.validate_parent_death_resource(tid, &resources, pause), Ok(()));
+    resources.insert(
+        ResourceID::SleepUntil(LogicalTime::INDEFINITE),
+        Permission::RW,
+    );
+    let pause = ControlCapability::ParkedWait {
+        policy: ParkedWaitPolicy::PauseNoHandlerRestart,
+        site,
+    };
+    assert_eq!(
+        s.validate_parent_death_resource(tid, &resources, pause),
+        Ok(())
+    );
     assert!(s.next_turns[&tid].req.try_read().is_none());
     assert!(s.next_turns[&tid].resp.try_read().is_none());
     assert!(s.blocked.timed_waiters.is_empty());
@@ -2732,7 +2794,14 @@ fn parent_death_wait_guard_refuses_polled_io_futex_and_external_before_effects()
     ] {
         let mut resources = Resources::new(tid);
         resources.insert(resource, Permission::RW);
-        assert_eq!(s.validate_parent_death_resource(tid, &resources, ControlCapability::PolledRead { site }), Err(ProtocolFailure::ParentDeathUnsupportedWait));
+        assert_eq!(
+            s.validate_parent_death_resource(
+                tid,
+                &resources,
+                ControlCapability::PolledRead { site }
+            ),
+            Err(ProtocolFailure::ParentDeathUnsupportedWait)
+        );
         assert!(s.next_turns[&tid].req.try_read().is_none());
         assert!(s.next_turns[&tid].resp.try_read().is_none());
         assert!(s.blocked.timed_waiters.is_empty());
@@ -2745,8 +2814,14 @@ fn parent_death_receipt_is_bound_to_the_owned_boundary_and_not_republished() {
     let (mut s, backend) = parent_death_fixture();
     let (tid, _, _) = add(&mut s, 100, 100);
     s.parked.running = Some(tid);
-    let permit = s.authorize_signal_boundary(task(100, 100)).unwrap().unwrap();
-    let boundary = SignalBoundaryReceipt { permit, outcome: SignalBoundaryOutcome::ImageReplaced };
+    let permit = s
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .unwrap();
+    let boundary = SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::ImageReplaced,
+    };
     let mut forged = boundary;
     forged.permit.sequence += 1;
     assert!(s.consume_signal_boundary(forged).is_err());
@@ -2754,11 +2829,20 @@ fn parent_death_receipt_is_bound_to_the_owned_boundary_and_not_republished() {
     assert_eq!(s.parked.permits[&tid], permit);
     s.consume_signal_boundary(boundary).unwrap();
     s.consume_signal_boundary(boundary).unwrap();
-    assert_eq!(backend.parent_death_boundaries.lock().unwrap().as_slice(), &[boundary]);
+    assert_eq!(
+        backend.parent_death_boundaries.lock().unwrap().as_slice(),
+        &[boundary]
+    );
     assert!(s.parked.permits.is_empty());
-    let changed = SignalBoundaryReceipt { permit, outcome: SignalBoundaryOutcome::Cancelled };
+    let changed = SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Cancelled,
+    };
     assert!(s.consume_signal_boundary(changed).is_err());
-    assert_eq!(backend.parent_death_boundaries.lock().unwrap().as_slice(), &[boundary]);
+    assert_eq!(
+        backend.parent_death_boundaries.lock().unwrap().as_slice(),
+        &[boundary]
+    );
 }
 
 #[test]
@@ -2766,8 +2850,15 @@ fn parent_death_cancellation_does_not_publish_a_guest_death() {
     let (mut s, backend) = parent_death_fixture();
     let (tid, _, _) = add(&mut s, 100, 100);
     s.parked.running = Some(tid);
-    let permit = s.authorize_signal_boundary(task(100, 100)).unwrap().unwrap();
-    s.consume_signal_boundary(SignalBoundaryReceipt { permit, outcome: SignalBoundaryOutcome::Cancelled }).unwrap();
+    let permit = s
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .unwrap();
+    s.consume_signal_boundary(SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::Cancelled,
+    })
+    .unwrap();
     assert!(backend.parent_death_boundaries.lock().unwrap().is_empty());
     assert!(s.parked.parent_death_pending.is_empty());
 }
@@ -2881,16 +2972,40 @@ fn parent_death_committed_failure_is_retained_and_forwarded_after_unlock() {
     let (mut s, backend) = parent_death_fixture();
     let (tid, _, _) = add(&mut s, 100, 100);
     s.parked.running = Some(tid);
-    let permit = s.authorize_signal_boundary(task(100, 100)).unwrap().unwrap();
-    let boundary = SignalBoundaryReceipt { permit, outcome: SignalBoundaryOutcome::ImageReplaced };
-    let receipt = reverie::ParentDeathPublication { boundary, batches: vec![7], signals: vec![reverie::ParentDeathSignalPublication {
-        process: task(100, 100).process, signal: libc::SIGUSR1, pending_generation: 19, coalesced: false, discarded: false,
-    }] };
-    *backend.parent_death_result.lock().unwrap() = Some(reverie::ParentDeathPublicationResult::FailedAfterCommit { receipt: receipt.clone(), errno: reverie::Errno::EBADF });
+    let permit = s
+        .authorize_signal_boundary(task(100, 100))
+        .unwrap()
+        .unwrap();
+    let boundary = SignalBoundaryReceipt {
+        permit,
+        outcome: SignalBoundaryOutcome::ImageReplaced,
+    };
+    let receipt = reverie::ParentDeathPublication {
+        boundary,
+        batches: vec![7],
+        signals: vec![reverie::ParentDeathSignalPublication {
+            process: task(100, 100).process,
+            signal: libc::SIGUSR1,
+            pending_generation: 19,
+            coalesced: false,
+            discarded: false,
+        }],
+    };
+    *backend.parent_death_result.lock().unwrap() =
+        Some(reverie::ParentDeathPublicationResult::FailedAfterCommit {
+            receipt: receipt.clone(),
+            errno: reverie::Errno::EBADF,
+        });
     let result = s.consume_signal_boundary(boundary);
-    assert!(matches!(result, Err(reverie::Error::Errno(reverie::Errno::EBADF))));
+    assert!(matches!(
+        result,
+        Err(reverie::Error::Errno(reverie::Errno::EBADF))
+    ));
     assert!(s.backend_failed());
-    assert_eq!(s.parked.parent_death_failures.as_slice(), std::slice::from_ref(&receipt));
+    assert_eq!(
+        s.parked.parent_death_failures.as_slice(),
+        std::slice::from_ref(&receipt)
+    );
     assert!(backend.parent_death_failures.lock().unwrap().is_empty());
     let scheduler = Arc::new(Mutex::new(s));
     let weak = Arc::downgrade(&scheduler);
@@ -2898,8 +3013,18 @@ fn parent_death_committed_failure_is_retained_and_forwarded_after_unlock() {
         assert!(weak.upgrade().unwrap().try_lock().is_ok());
     }));
     super::signal_control::flush_signal_failures(&scheduler);
-    assert_eq!(backend.parent_death_failures.lock().unwrap().as_slice(), &[receipt]);
-    assert!(scheduler.lock().unwrap().parked.parent_death_failures.is_empty());
+    assert_eq!(
+        backend.parent_death_failures.lock().unwrap().as_slice(),
+        &[receipt]
+    );
+    assert!(
+        scheduler
+            .lock()
+            .unwrap()
+            .parked
+            .parent_death_failures
+            .is_empty()
+    );
 }
 
 #[test]
@@ -2907,23 +3032,40 @@ fn parent_death_quiescent_selection_uses_real_pending_without_a_timer_event() {
     let (mut s, backend) = parent_death_fixture();
     let (tid, mm, site) = add(&mut s, 100, 100);
     let response = sleep(&mut s, tid, mm, site, 100);
-    s.parked.parent_death_pending.insert((ProcessGeneration::from_backend(task(100, 100).process), libc::SIGUSR1), 19);
+    s.parked.parent_death_pending.insert(
+        (
+            ProcessGeneration::from_backend(task(100, 100).process),
+            libc::SIGUSR1,
+        ),
+        19,
+    );
     s.committed_time = at(10);
     // A masked/absent eligible recipient leaves the original wait untouched.
     s.select_parked_alarm().unwrap();
     assert!(response.try_read().is_none());
     assert_eq!(s.blocked.timed_waiters.thread_deadline(tid), Some(at(100)));
-    backend.recipients.lock().unwrap().push(SignalRecipient { task: task(100, 100) });
+    backend.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 100),
+    });
     s.select_parked_alarm().unwrap();
     let control = selected(&response);
     assert_eq!(control.permit.task, task(100, 100));
     assert_eq!(s.committed_time, at(10));
     assert_eq!(s.host_signal_attempts, 0);
     assert!(backend.publications.lock().unwrap().is_empty());
-    assert_eq!(s.real_timers.snapshot(tid, at(10)).unwrap().remaining, at(0));
-    assert_eq!(backend.permits.lock().unwrap().as_slice(), &[control.permit]);
+    assert_eq!(
+        s.real_timers.snapshot(tid, at(10)).unwrap().remaining,
+        at(0)
+    );
+    assert_eq!(
+        backend.permits.lock().unwrap().as_slice(),
+        &[control.permit]
+    );
     s.select_parked_alarm().unwrap();
-    assert_eq!(backend.permits.lock().unwrap().as_slice(), &[control.permit]);
+    assert_eq!(
+        backend.permits.lock().unwrap().as_slice(),
+        &[control.permit]
+    );
 }
 
 #[test]
@@ -2933,27 +3075,43 @@ fn parent_death_only_live_nonleader_remains_a_process_recipient() {
     let (worker, _, site) = add(&mut s, 100, 101);
     s.logically_kill_thread(&leader, &leader, mm);
     let response = sleep(&mut s, worker, mm, site, 100);
-    s.parked.parent_death_pending.insert((ProcessGeneration::from_backend(task(100, 101).process), libc::SIGUSR1), 19);
-    backend.recipients.lock().unwrap().push(SignalRecipient { task: task(100, 101) });
+    s.parked.parent_death_pending.insert(
+        (
+            ProcessGeneration::from_backend(task(100, 101).process),
+            libc::SIGUSR1,
+        ),
+        19,
+    );
+    backend.recipients.lock().unwrap().push(SignalRecipient {
+        task: task(100, 101),
+    });
     s.committed_time = at(10);
     s.select_parked_alarm().unwrap();
     assert_eq!(selected(&response).permit.task, task(100, 101));
     assert!(backend.publications.lock().unwrap().is_empty());
 }
 
-
 #[test]
 fn parent_death_retired_recipient_hint_is_removed_without_timer_failure() {
     let (mut s, backend) = parent_death_fixture();
     let (recipient, mm, _) = add(&mut s, 100, 100);
     let (other, _, _) = add(&mut s, 900, 900);
-    let key = (ProcessGeneration::from_backend(task(100, 100).process), libc::SIGUSR1);
+    let key = (
+        ProcessGeneration::from_backend(task(100, 100).process),
+        libc::SIGUSR1,
+    );
     s.parked.parent_death_pending.insert(key, 19);
     s.committed_time = at(10);
     s.logically_kill_thread(&recipient, &recipient, mm);
     // Real logical retirement keeps ancestry but retires the timer identity.
-    assert_eq!(s.thread_tree.thread_to_leader.get(&recipient), Some(&recipient));
-    assert_eq!(s.real_timers.process_identity(recipient), Err(TimerFailure::Identity));
+    assert_eq!(
+        s.thread_tree.thread_to_leader.get(&recipient),
+        Some(&recipient)
+    );
+    assert_eq!(
+        s.real_timers.process_identity(recipient),
+        Err(TimerFailure::Identity)
+    );
     assert!(s.next_turns.contains_key(&other));
     assert_eq!(s.select_parked_alarm(), Ok(()));
     assert!(!s.parked.parent_death_pending.contains_key(&key));
@@ -2995,9 +3153,17 @@ fn parent_death_stale_generation_does_not_select_reused_process() {
     // Nearby positive: a current-generation hint plus authoritative pending
     // membership still produces exactly one site-bound observation.
     *backend.fail_recipients.lock().unwrap() = None;
-    backend.recipients.lock().unwrap().push(SignalRecipient { task: current });
+    backend
+        .recipients
+        .lock()
+        .unwrap()
+        .push(SignalRecipient { task: current });
     s.parked.parent_death_pending.insert(
-        (ProcessGeneration::from_backend(current.process), libc::SIGUSR1), 20,
+        (
+            ProcessGeneration::from_backend(current.process),
+            libc::SIGUSR1,
+        ),
+        20,
     );
     assert_eq!(s.select_parked_parent_death(), Ok(()));
     assert_eq!(selected(&response).permit.task, current);
