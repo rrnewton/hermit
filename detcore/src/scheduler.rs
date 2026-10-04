@@ -935,6 +935,13 @@ pub struct ThreadTree {
     /// the exact creating task for __WNOTHREAD, clone exit-signal class, and
     /// mutable process-group/session membership.
     process_wait: HashMap<DetPid, ProcessWaitMetadata>,
+
+    /// Every process that created a child process, or that a `CLONE_PARENT`
+    /// child names as its wait parent: the processes the kernel can send a
+    /// `SIGCHLD` for a child. A process is added when the child is registered,
+    /// before that child can run, and is never removed
+    /// (`Scheduler::sigchld_eligible`).
+    processes_with_children: HashSet<DetPid>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1126,7 +1133,9 @@ impl ThreadTree {
                 };
                 if let Some(wait_parent) = wait_parent {
                     self.process_parent.insert(child_dettid, wait_parent);
+                    self.processes_with_children.insert(wait_parent);
                 }
+                self.processes_with_children.insert(parent_process);
                 self.process_wait.insert(
                     child_dettid,
                     ProcessWaitMetadata {
@@ -1157,6 +1166,12 @@ impl ThreadTree {
     /// signal to a `Gone` target.
     pub fn parent_process(&self, pid: &DetPid) -> Option<DetPid> {
         self.process_parent.get(pid).copied()
+    }
+
+    /// Whether `pid` ever created a child process or became the wait parent of
+    /// one (`processes_with_children`).
+    pub fn process_had_child(&self, pid: &DetPid) -> bool {
+        self.processes_with_children.contains(pid)
     }
 
     /// Preserve a surviving exec task's children when Linux replaces its TID
@@ -3850,11 +3865,17 @@ impl Scheduler {
     //     (`note_child_exit_sigchld`). The scheduler sends nothing for it; the
     //     kernel's own `SIGCHLD` becomes eligible at the point where the
     //     scheduler admits the child's `wait4` and `waitid` waiters.
-    // Any other pending `SIGCHLD` is left out of the pending set: the kernel's
-    // second, coalescing copy of a `ChildExit` send that arrives after the first
-    // was taken, one for a child's stop or continue, and one sent from outside
-    // the container. It stays pending in the kernel and is delivered when the
-    // wait ends.
+    // A process that never created a child, and that no `CLONE_PARENT` child
+    // names as its wait parent, is never sent a `SIGCHLD` by the kernel for a
+    // child, so every pending `SIGCHLD` of such a process counts
+    // (`sigchld_eligible`); this is how a `SIGCHLD` sent from outside the
+    // container reaches a process without children. For a process with
+    // children, any other pending `SIGCHLD` is left out of the pending set:
+    // the kernel's second, coalescing copy of a `ChildExit` send that arrives
+    // after the first was taken, one for a child's stop or continue, and one
+    // sent from outside the container, which `/proc` cannot tell apart from the
+    // kernel's. It stays pending in the kernel and is delivered when the wait
+    // ends.
     //
     // Why the answer is deterministic:
     //   * Marks are set only at the scheduler's ordering points: in the sender's
@@ -3877,6 +3898,15 @@ impl Scheduler {
     //     So whether a take succeeds depends on the marks alone.
     //   * The host-timed copy of a `ChildExit` send can only coalesce into the
     //     marked one, which changes nothing a reader can see.
+    //   * A process joins `processes_with_children` when its child is
+    //     registered (`ThreadTree::add_child_with_wait_metadata`): by the
+    //     creating thread in its turn, or by a vfork child before its first
+    //     turn. The child cannot exit, stop or continue before that, so the
+    //     kernel's `SIGCHLD` for it is pending only for a process already in
+    //     the set, whose `SIGCHLD` still needs a mark. A `SIGCHLD` counted for
+    //     a process outside the set was sent from outside the container, at a
+    //     host-timed moment like any external signal, and is observed at the
+    //     same boundary as every other: the reader's gated read in its turn.
     //
     // The argument needs the guest to be traced, and it is on every backend that
     // turns this on: `backend_supports_blocked_wait_signal_interruption` is set
@@ -4059,12 +4089,22 @@ impl Scheduler {
     /// then returns its restart errno and the kernel delivers the signal as the
     /// call returns. A `false` answer with nothing pending also releases a
     /// reservation this thread held, since the signal it named is gone.
+    ///
+    /// A `SIGCHLD` pending for a process that never had a child counts without
+    /// a mark: the kernel sends `SIGCHLD` for a child only to the child's
+    /// parent, so it came from a sender, either a guest one, which marked it,
+    /// or one outside the container. No reservation is taken for it: every
+    /// `SIGCHLD` of such a process counts, so a mark that its delivery clears
+    /// changes no answer.
     pub(crate) fn sigchld_eligible(&mut self, thread: DetTid, pending: bool) -> bool {
         if !pending {
             self.sigchld_taken.remove(&thread);
             return false;
         }
         self.take_sigchld_eligibility(thread)
+            || !self
+                .thread_tree
+                .process_had_child(&self.sigchld_process(thread))
     }
 
     /// Take one mark for a `SIGCHLD` that `thread` is about to be interrupted by,
@@ -8964,6 +9004,11 @@ mod test {
         let mut scheduler = sigchld_gated_scheduler();
         let thread = DetTid::from_raw(100);
         let process = DetPid::from_raw(100);
+        // A process with a child, for which the kernel can post a `SIGCHLD`.
+        scheduler.thread_tree.add_child(thread, thread, true);
+        scheduler
+            .thread_tree
+            .add_child(thread, DetTid::from_raw(101), true);
 
         assert!(
             !scheduler.sigchld_eligible(thread, true),
@@ -8998,6 +9043,68 @@ mod test {
         assert!(scheduler.sigchld_eligible(thread, true));
         assert!(!scheduler.sigchld_eligible(thread, false));
         assert!(scheduler.sigchld_taken.is_empty());
+        assert!(scheduler.sigchld_eligible_processes.is_empty());
+    }
+
+    /// The kernel sends `SIGCHLD` for a child only to the child's parent, so a
+    /// gated wait of a process that never had a child counts its pending
+    /// `SIGCHLD` without a mark: a caught `SIGCHLD` sent from outside the
+    /// container interrupts it (review finding Codex 3 on
+    /// https://github.com/rrnewton/hermit/pull/3361). Once the process creates a
+    /// child process, from any of its threads, an unmarked `SIGCHLD` may be the
+    /// kernel's host-timed report for that child and needs a mark again.
+    #[test]
+    fn a_process_that_never_had_a_child_counts_an_unmarked_sigchld() {
+        let mut scheduler = sigchld_gated_scheduler();
+        let root = DetTid::from_raw(100);
+        let worker = DetTid::from_raw(101);
+        let child = DetTid::from_raw(102);
+        let grandchild = DetTid::from_raw(103);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, worker, false);
+
+        assert!(
+            scheduler.sigchld_eligible(worker, true),
+            "no child can have sent this SIGCHLD"
+        );
+        assert!(
+            scheduler.sigchld_taken.is_empty(),
+            "nothing is reserved for it"
+        );
+        assert!(!scheduler.sigchld_eligible(worker, false));
+
+        // A thread that is not the leader creates a child process.
+        scheduler.thread_tree.add_child(worker, child, true);
+        assert!(scheduler.thread_tree.process_had_child(&root));
+        assert!(
+            !scheduler.sigchld_eligible(root, true),
+            "an unmarked SIGCHLD of a process with a child may be the kernel's"
+        );
+        assert!(!scheduler.sigchld_eligible(worker, true));
+        assert!(
+            scheduler.sigchld_eligible(child, true),
+            "the new child has no child of its own"
+        );
+
+        // A `CLONE_PARENT` child names `root` as its wait parent; its creator
+        // `child` counts as having a child too.
+        scheduler.thread_tree.add_child_with_wait_metadata(
+            child,
+            grandchild,
+            true,
+            true,
+            libc::SIGCHLD,
+        );
+        assert_eq!(
+            scheduler.thread_tree.parent_process(&grandchild),
+            Some(root)
+        );
+        assert!(!scheduler.sigchld_eligible(child, true));
+        assert!(scheduler.sigchld_eligible(grandchild, true));
+
+        // A mark still counts for a process with a child.
+        scheduler.mark_sigchld_eligible(root, Some(root));
+        assert!(scheduler.sigchld_eligible(root, true));
         assert!(scheduler.sigchld_eligible_processes.is_empty());
     }
 
