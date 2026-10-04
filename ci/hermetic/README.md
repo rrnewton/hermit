@@ -58,22 +58,30 @@ checker is read-only and does not build, load, inspect, or silently repair an
 image. Both `-h` and `--help` describe this interface; its unit tests run with
 `rust-script --test ci/hermetic/check-image-provenance.rs`.
 
-The current d809 pin supersedes c607 because c607 was produced from a reused,
-mixed Nix store. Three same-path inputs in that store had NAR contents different
-from fresh realizations. A separately reviewed eight-combination fresh/shared
-matrix reported that its all-fresh cell produced the same 717144 archive as two
-new builds from commit
-`c549ee2642cd2bb670247453d8f69b7502346bf4`. Those builds used
-independent source snapshots, physical Nix stores, and Podman stores and loaded
-the same d809 image. The matrix did not match the recorded c607 archive SHA-256
-`e3655bf4a4e82753e39a74c838e03fbdb2e22dae7fc7568c2c4664d7639374db`;
-the original archive bytes were not retained and are unavailable, so the
-comparison is against PR #3172's recorded SHA-256 rather than present bytes.
+The current d4e5 pin supersedes d809, whose root put only libunwind,
+elfutils, zlib and openssl on `LIBRARY_PATH`. Reverie `b8ef6a829634`
+(https://github.com/rrnewton/reverie/pull/942) made reverie-ptrace's build
+script request libunwind-ptrace's `--static` pkg-config closure, and Nixpkgs'
+`libunwind.pc` names `-llzma` in `Libs.private`, so
+`build.workspace_in_pinned_root` failed with `rust-lld: error: unable to find
+library -llzma` although liblzma was already in the image closure. The
+replacement adds xz to `nativeLibs`. Two builds from commit
+`ad99c6fa21f7332ee399dfe0ce47149a78d29c34` used independent source snapshots,
+physical Nix stores that did not exist before the build, and Podman stores;
+both produced archive
+`085b605dd6d17c59795ccc92b5cbd761424810ab156520a10474dc9e4a3c57d0`
+and loaded the same d4e5 image. d809
+(https://github.com/rrnewton/hermit/pull/3171) itself replaced c607
+(https://github.com/rrnewton/hermit/pull/3172), an image built from a reused,
+mixed Nix store.
 
 This proves same-host reproducibility for the recorded method only; it makes no
-cross-host reproducibility claim. The evidence also states what the experiment
-did not preserve: its exact launch command/environment, elapsed wall time,
-build-time Nix version, and a pre-build empty-store listing. `build-image.sh`
+cross-host reproducibility claim. Each build ran as a systemd user service
+bounded to 2 CPUs (`CPUQuota=200%`), 8 GiB of memory with no swap and 1200
+seconds of wall time, running `nix --store <build-root>/nix-root build .#image`.
+The receipt records the build-time Nix version; its evidence limitations name
+what it does not preserve: the service environment's values, the build logs
+and path-info records, and the superseded d809 archive bytes. `build-image.sh`
 remains useful for a local one-off build, but one such build is not sufficient
 evidence for another reviewed repin. A future repin must replace the digest and
 provenance together with two new agreeing isolated builds.

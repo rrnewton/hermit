@@ -36,21 +36,25 @@ use sha2::Sha256;
 const PROVENANCE: &str = "ci/hermetic/image.provenance.json";
 const PIN: &str = "ci/hermetic/image.digest";
 const METHOD: &str = "two-clean-isolated-nix-stores-v1";
-const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:c607ad3875925bd7fc5378efdd850d306a0c2a5c1fbc8f0bc0f3bb5ca8879852";
+const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:d809dc6e74ce56238e1110e0c323ba617bea759198ef72bc23f56ea966c1c90a";
 const SUPERSEDED_ARCHIVE_SHA256: &str =
-    "e3655bf4a4e82753e39a74c838e03fbdb2e22dae7fc7568c2c4664d7639374db";
+    "717144d1e2d19c5efa7296c7db00bdf0d95a6478323d79e8ebcc07e150c05470";
+/// The replaced d809 root lacked liblzma on LIBRARY_PATH; the rationale must
+/// name the library whose absence this repin repairs.
+const RATIONALE_MARKER: &str = "liblzma";
+/// Both isolated builds recorded `nix --version` before building.
+const RECORDED_NIX_VERSION: &str = "nix (Nix) 2.35.2";
 const INPUT_PATHS: [&str; 4] = [
     "ci/hermetic/build-image.sh",
     "ci/hermetic/flake.lock",
     "ci/hermetic/flake.nix",
     "ci/hermetic/guest-paths.txt",
 ];
-const EVIDENCE_LIMITATIONS: [&str; 6] = [
-    "The build-time Nix version was not recorded.",
-    "The exact systemd-run command, sanitized environment, and wall elapsed time were not recorded.",
-    "Separate physical roots, source archives, and full build logs demonstrate isolation, but no pre-build empty-store listing was preserved.",
-    "The Docker-v2 descriptor was recovered from the content-addressed d809 image in local containers storage after the verified archive import.",
-    "The original c607/e365 archive bytes were not retained and are unavailable; the earlier eight-cell matrix comparison is against PR #3172's recorded SHA-256, not present bytes.",
+const EVIDENCE_LIMITATIONS: [&str; 5] = [
+    "Each service ran with the systemd user manager's environment plus PATH, HOME, NIX_SSL_CERT_FILE and CURL_CA_BUNDLE; only those variable names were recorded, not their values.",
+    "Both builds fetched the locked flake inputs and binary substitutes from cache.nixos.org through the host forward proxy; substituted paths are trusted by Nix signature and NAR hash, not rebuilt.",
+    "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
+    "The superseded d809 archive was not rebuilt for this receipt; its 717144 SHA-256 is carried from the d809 receipt.",
     "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive.",
 ];
 
@@ -65,20 +69,20 @@ struct ExpectedRun {
 
 const EXPECTED_RUNS: [ExpectedRun; 2] = [
     ExpectedRun {
-        run_id: "hermetic-c549-a-mkt20DAo.service",
-        source_snapshot_identity: "source-a.git-archive.tar@48:1166781911",
-        nix_store_identity: "build-a/nix-root/nix@48:1166785122",
+        run_id: "hermetic-ad99-a-lzma.service",
+        source_snapshot_identity: "source-a.git-archive.tar@50:1247760177",
+        nix_store_identity: "build-a/nix-root/nix@50:1247977273",
         podman_store_identity: "build-a/podman-data",
-        memory_peak_bytes: 8_590_426_112,
-        cpu_nanoseconds: 1_278_088_018_000,
+        memory_peak_bytes: 7_086_940_160,
+        cpu_nanoseconds: 1_351_620_598_000,
     },
     ExpectedRun {
-        run_id: "hermetic-c549-b-mkt20DAo.service",
-        source_snapshot_identity: "source-b.git-archive.tar@48:1166781925",
-        nix_store_identity: "build-b/nix-root/nix@48:1166785137",
+        run_id: "hermetic-ad99-b-lzma.service",
+        source_snapshot_identity: "source-b.git-archive.tar@50:1247764715",
+        nix_store_identity: "build-b/nix-root/nix@50:1247977542",
         podman_store_identity: "build-b/podman-data",
-        memory_peak_bytes: 8_590_032_896,
-        cpu_nanoseconds: 1_277_824_562_000,
+        memory_peak_bytes: 7_098_404_864,
+        cpu_nanoseconds: 1_343_578_125_000,
     },
 ];
 
@@ -502,17 +506,19 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     let new = string(repin, "replacement_reference", "repin")?;
     if old != SUPERSEDED_REFERENCE {
         return Err(format!(
-            "repin.superseded_reference must retain the historical c607 reference {SUPERSEDED_REFERENCE:?}"
+            "repin.superseded_reference must retain the replaced d809 reference {SUPERSEDED_REFERENCE:?}"
         ));
     }
     let old_archive = string(repin, "superseded_archive_sha256", "repin")?;
     if old_archive != SUPERSEDED_ARCHIVE_SHA256 {
         return Err(format!(
-            "repin.superseded_archive_sha256 must retain PR #3172's recorded e365 SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
+            "repin.superseded_archive_sha256 must retain the d809 receipt's 717144 archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
         ));
     }
-    if old == new || !string(repin, "rationale", "repin")?.contains("impure reused Nix store") {
-        return Err("repin must explain a real change from the impure reused store".into());
+    if old == new || !string(repin, "rationale", "repin")?.contains(RATIONALE_MARKER) {
+        return Err(format!(
+            "repin must explain the real change: its rationale must name {RATIONALE_MARKER}, the library the d809 root left off LIBRARY_PATH"
+        ));
     }
     for (reference, context) in [
         (old, "repin.superseded_reference"),
@@ -625,14 +631,10 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     if actual_limitations != EVIDENCE_LIMITATIONS {
         return Err("evidence_limitations must retain every known evidence gap".into());
     }
-    if nix_version != "not-recorded" {
-        return Err("nix.version must retain the exact unrecorded build-time status".into());
-    }
-    if !limitations.iter().any(|item| {
-        item.as_str()
-            .is_some_and(|text| text.contains("build-time Nix version was not recorded"))
-    }) {
-        return Err("an unrecorded Nix version must remain an explicit evidence limitation".into());
+    if nix_version != RECORDED_NIX_VERSION {
+        return Err(format!(
+            "nix.version must retain the build-time Nix version both runs recorded, {RECORDED_NIX_VERSION:?}"
+        ));
     }
 
     let runs = array(field(root, "runs", "provenance")?, "runs")?;
@@ -892,8 +894,9 @@ mod tests {
             );
         }
 
-        // The historical c549 object is deliberately absent from this repository.
-        // Current input equivalence, not rewritten ancestry, is the live check.
+        // The recorded build-source commit is deliberately absent from this
+        // fixture repository. Current input equivalence, not rewritten
+        // ancestry, is the live check.
         verify(fixture.path()).unwrap();
     }
 
@@ -951,7 +954,7 @@ mod tests {
         assert!(
             validate_semantics(&reference)
                 .unwrap_err()
-                .contains("must retain the historical c607 reference")
+                .contains("must retain the replaced d809 reference")
         );
 
         let mut archive = record();
@@ -959,7 +962,7 @@ mod tests {
         assert!(
             validate_semantics(&archive)
                 .unwrap_err()
-                .contains("must retain PR #3172's recorded e365 SHA-256")
+                .contains("must retain the d809 receipt's 717144 archive SHA-256")
         );
     }
 
@@ -988,6 +991,26 @@ mod tests {
             "localhost/hermit-hermetic-validate@{different_manifest}"
         ));
         assert!(validate_semantics(&manifest).is_err());
+    }
+
+    #[test]
+    fn rejects_unrecorded_nix_version_or_unexplained_repin() {
+        let mut version = record();
+        *mutate(&mut version, "/nix/version") = Value::String("not-recorded".into());
+        assert!(
+            validate_semantics(&version)
+                .unwrap_err()
+                .contains("build-time Nix version both runs recorded")
+        );
+
+        let mut rationale = record();
+        *mutate(&mut rationale, "/repin/rationale") =
+            Value::String("A newer image was built.".into());
+        assert!(
+            validate_semantics(&rationale)
+                .unwrap_err()
+                .contains("rationale must name liblzma")
+        );
     }
 
     #[test]
