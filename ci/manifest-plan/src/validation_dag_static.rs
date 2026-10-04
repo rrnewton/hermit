@@ -584,10 +584,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test-harness's sync_cells_records_disabling_an_optional_cell, added in
     // 6166181d8f (the same issue) without a pin change, retains all 847 prior
     // identities (`cargo nextest list --profile ci` measured 848).
+    // hermit-manifest-plan's validation_dag::tests::result_owner_index_answers_exactly_what_result_manifest_owner_answers,
+    // added in 76521affca5b without a pin change, retains all 848 prior
+    // identities (`cargo nextest list --profile ci` over this node's selection
+    // measured 849 on eb12bc206386).
     // One DBT signal-capability configuration control
     // (every_config_source_clears_the_ptrace_only_signal_capabilities;
-    // https://github.com/rrnewton/hermit/pull/3224) retains all 848 prior identities.
-    ("test.regular_crates", 849),
+    // https://github.com/rrnewton/hermit/pull/3224) retains all 849 prior
+    // identities (measured 850).
+    ("test.regular_crates", 850),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1088,8 +1093,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The three sync-cells tests of 32053b6d listed for test.regular_crates
     // bring the measured count to 847, and the optional-cell sync test of
     // 6166181d8f listed there to 848.
+    // The result-owner index test of 76521affca5b listed for
+    // test.regular_crates retains all 848 prior identities.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3224 test.
-    ("test.regular_crates_on_host", 849),
+    ("test.regular_crates_on_host", 850),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
