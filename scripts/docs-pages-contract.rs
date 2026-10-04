@@ -29,6 +29,8 @@ const BUILDER_CHECKOUT_STEP: &str = "Check out reviewed website builder";
 const SERVED_REGISTRY_QUERY: &str = "if jq -e 'any(.[]; .name == \"releases.json\" and .type == \"file\")' \"$scratch/served.json\" >/dev/null; then";
 const BOOTSTRAP_INVENTORY_QUERY: &str = "jq -e --slurpfile pins \"$pins\" \\\n    '([.[] | .name] | sort) == ([$pins[0].releases[].identity, \"latest\"] | sort)' \\\n    \"$scratch/served.json\" >/dev/null";
 const LANDING_ALIAS: &str = "href=\"compatibility/latest/\"";
+const REBUILD_COMMAND: &str = "rebuild-compatibility-site.py rebuild";
+const PHASE_TIMING: &str = "COMPATIBILITY_WEBSITE_PHASE_TIMING";
 
 fn repository_root() -> PathBuf {
     let script = Path::new(file!());
@@ -178,19 +180,16 @@ fn checkout_steps(workflow: &str) -> Result<Vec<String>, String> {
         .collect()
 }
 
-fn require_checkout_input(
-    errors: &mut Vec<String>,
-    scope: &str,
-    step: &str,
-    key: &str,
-    value: &str,
-) {
+/// Does `step` declare `key: value` exactly once, directly inside its single
+/// `mapping:` block (for example `with:` or `env:`)?
+fn step_mapping_declares(step: &str, mapping: &str, key: &str, value: &str) -> bool {
     let lines = step.lines().collect::<Vec<_>>();
     let expected_indent = indentation(lines[0]) + 4;
+    let header = format!("{mapping}:");
     let mappings = lines
         .iter()
         .enumerate()
-        .filter(|(_, line)| indentation(line) + 2 == expected_indent && line.trim() == "with:")
+        .filter(|(_, line)| indentation(line) + 2 == expected_indent && line.trim() == header)
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
     let input_range = mappings.first().map(|start| {
@@ -206,15 +205,78 @@ fn require_checkout_input(
         .enumerate()
         .filter(|(_, line)| line.trim_start().starts_with(&prefix))
         .collect::<Vec<_>>();
-    if fields.len() != 1
-        || mappings.len() != 1
-        || !input_range.is_some_and(|range| range.contains(&fields[0].0))
-        || indentation(fields[0].1) != expected_indent
-        || fields[0].1.trim() != format!("{key}: {value}")
-    {
+    fields.len() == 1
+        && mappings.len() == 1
+        && input_range.is_some_and(|range| range.contains(&fields[0].0))
+        && indentation(fields[0].1) == expected_indent
+        && fields[0].1.trim() == format!("{key}: {value}")
+}
+
+fn require_checkout_input(
+    errors: &mut Vec<String>,
+    scope: &str,
+    step: &str,
+    key: &str,
+    value: &str,
+) {
+    if !step_mapping_declares(step, "with", key, value) {
         errors.push(format!(
             "{scope} must declare exactly one `{key}: {value}` checkout input"
         ));
+    }
+}
+
+/// The one workflow step whose shell runs `command`, located by the command
+/// rather than by the step's display name.
+fn step_running(workflow: &str, command: &str) -> Result<String, String> {
+    let lines = workflow.lines().collect::<Vec<_>>();
+    let uses = lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(command))
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    if uses.len() != 1 {
+        return Err(format!(
+            "workflow must run `{command}` on exactly one line, found {}",
+            uses.len()
+        ));
+    }
+    let name = lines[..uses[0]]
+        .iter()
+        .rev()
+        .find(|line| {
+            indentation(line) < indentation(lines[uses[0]])
+                && line.trim_start().starts_with("- name: ")
+        })
+        .map(|line| line.trim_start().trim_start_matches("- name: "))
+        .ok_or_else(|| format!("`{command}` is not inside a named workflow step"))?;
+    named_step(workflow, name)
+}
+
+/// Below the builder's 12 GiB warning line, the hosted rebuild logs its peak
+/// memory only because this step turns phase timing on
+/// (https://github.com/rrnewton/dev-hermit/issues/515). Dropping or overriding
+/// the variable would silently remove that log line.
+fn require_phase_timing(errors: &mut Vec<String>, workflow: &str) {
+    let step = match step_running(workflow, REBUILD_COMMAND) {
+        Ok(step) => step,
+        Err(error) => {
+            errors.push(error);
+            return;
+        }
+    };
+    if !step_mapping_declares(&step, "env", PHASE_TIMING, "\"1\"") {
+        errors.push(format!(
+            "compatibility rebuild step must declare exactly one `{PHASE_TIMING}: \"1\"` in its env"
+        ));
+    }
+    match literal_block(&step, "run") {
+        Ok(shell) if shell.contains(PHASE_TIMING) => errors.push(format!(
+            "compatibility rebuild shell must not reassign `{PHASE_TIMING}`"
+        )),
+        Ok(_) => {}
+        Err(error) => errors.push(error),
     }
 }
 
@@ -283,6 +345,7 @@ fn validate_contract(workflow: &str, landing: &str) -> Result<(), Vec<String>> {
         }
         (Err(error), _) | (_, Err(error)) => errors.push(error),
     }
+    require_phase_timing(&mut errors, workflow);
     let step = match named_step(workflow, PUBLICATION_STEP) {
         Ok(step) => step,
         Err(error) => return Err(vec![error]),
@@ -1184,12 +1247,13 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
         let (workflow, landing) = actual();
         let step = named_step(&workflow, PUBLICATION_STEP).unwrap();
         let retain = "        python3 .github/scripts/publish-compatibility-site.py retain \\\n          \"$pins\" \"$releases\" .github/compatibility-site-builder.json > \"$retained\"\n";
-        let finalize = "        python3 .github/scripts/publish-compatibility-site.py \\\n          finalize";
+        let finalize =
+            "        python3 .github/scripts/publish-compatibility-site.py \\\n          finalize";
         assert_eq!(step.matches(retain).count(), 1);
         assert_eq!(step.matches(finalize).count(), 1);
-        let late_retain = step
-            .replacen(retain, "", 1)
-            .replacen(finalize, &format!("{retain}{finalize}"), 1);
+        let late_retain =
+            step.replacen(retain, "", 1)
+                .replacen(finalize, &format!("{retain}{finalize}"), 1);
         for (changed_step, diagnostic) in [
             (
                 step.replacen(
@@ -1237,6 +1301,63 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
                 &landing,
                 diagnostic,
             );
+        }
+    }
+
+    #[test]
+    fn rebuild_step_must_turn_phase_timing_on() {
+        let (workflow, landing) = actual();
+        let rebuild = step_running(&workflow, REBUILD_COMMAND).unwrap();
+        let declared = format!("{PHASE_TIMING}: \"1\"");
+        assert_eq!(rebuild.matches(&declared).count(), 1);
+        let mutate = |changed: &str| workflow.replacen(&rebuild, changed, 1);
+        let env_diagnostic = "must declare exactly one `COMPATIBILITY_WEBSITE_PHASE_TIMING: \"1\"`";
+        for (changed, diagnostic) in [
+            // Dropped, turned off, unquoted, or declared twice.
+            (
+                rebuild.replacen(&format!("{declared}\n"), "", 1),
+                env_diagnostic,
+            ),
+            (
+                rebuild.replacen(&declared, &format!("{PHASE_TIMING}: \"0\""), 1),
+                env_diagnostic,
+            ),
+            (
+                rebuild.replacen(&declared, &format!("{PHASE_TIMING}: 1"), 1),
+                env_diagnostic,
+            ),
+            (
+                rebuild.replacen(&declared, &format!("{declared}\n        {declared}"), 1),
+                env_diagnostic,
+            ),
+            // Moved out of the step's env mapping.
+            (
+                rebuild.replacen("      env:\n", "      with:\n", 1),
+                env_diagnostic,
+            ),
+            // Overridden in the shell after the env sets it.
+            (
+                rebuild.replacen(
+                    "set -euo pipefail\n",
+                    &format!("set -euo pipefail\n        export {PHASE_TIMING}=0\n"),
+                    1,
+                ),
+                "must not reassign",
+            ),
+            // The rebuild no longer runs, or runs from a second step.
+            (
+                rebuild.replacen(REBUILD_COMMAND, "rebuild-compatibility-site.py build", 1),
+                "on exactly one line, found 0",
+            ),
+            (
+                format!(
+                    "{rebuild}\n    - name: Second rebuild\n      run: python3 .github/scripts/{REBUILD_COMMAND}"
+                ),
+                "on exactly one line, found 2",
+            ),
+        ] {
+            assert_ne!(changed, rebuild, "mutation did not apply: {diagnostic}");
+            assert_rejected(&mutate(&changed), &landing, diagnostic);
         }
     }
 
