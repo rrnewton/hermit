@@ -24,7 +24,9 @@ use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::Displayable;
+use reverie::syscalls::MapFlags;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::ProtFlags;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
@@ -398,6 +400,85 @@ where
     Ok(())
 }
 
+/// One select or pselect6 probe whose fd sets are wider than the `fd_set`
+/// slots the retry loop reserves on the guest stack (nfds above FD_SETSIZE).
+/// The guest-stack scratch cannot grow to nfds, so the probe's sets live in
+/// an anonymous mapping injected around this single probe: the original sets
+/// are written in, the probe runs, the kernel's result sets are read back,
+/// and the mapping is removed, all inside the caller's scheduler turn, so no
+/// other guest thread runs while it exists. The guest's own sets are left
+/// for the caller to write at completion, as with the stack scratch. Returns
+/// the probe's result and, when it succeeded, the result sets in
+/// `[read, write, except]` order.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3229): select and pselect6 above FD_SETSIZE probe through a per-probe mapping.
+async fn inject_wide_select_probe<T, G, C>(
+    guest: &mut G,
+    originals: [&Option<Vec<u8>>; 3],
+    len: usize,
+    probe: impl FnOnce([Option<AddrMut<'static, libc::fd_set>>; 3]) -> C,
+) -> Result<(Result<i64, Errno>, [Option<Vec<u8>>; 3]), Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+    C: SyscallInfo,
+{
+    let present = originals.iter().filter(|set| set.is_some()).count();
+    let mapping_len = present.checked_mul(len).ok_or(Errno::ENOMEM)?;
+    if mapping_len == 0 {
+        return Ok((guest.inject(probe([None; 3])).await, [None, None, None]));
+    }
+    let mapped = guest
+        .inject_with_retry(Syscall::Mmap(
+            syscalls::Mmap::new()
+                .with_addr(None)
+                .with_len(mapping_len)
+                .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                .with_fd(-1)
+                .with_offset(0),
+        ))
+        .await?;
+    let base = usize::try_from(mapped).map_err(|_| Errno::EFAULT)?;
+    let mut slots = [None; 3];
+    let mut next = base;
+    for (slot, original) in slots.iter_mut().zip(originals) {
+        if original.is_some() {
+            *slot = AddrMut::<libc::fd_set>::from_raw(next);
+            next += len;
+        }
+    }
+    // The slots are held by value across the probe: `AddrMut` is Send but
+    // not Sync, so a borrow of them would make this future non-Send.
+    let [readfds, writefds, exceptfds] = slots;
+    let written = write_pselect6_fd_set(guest, readfds, originals[0])
+        .and_then(|()| write_pselect6_fd_set(guest, writefds, originals[1]))
+        .and_then(|()| write_pselect6_fd_set(guest, exceptfds, originals[2]));
+    let outcome = match written {
+        Ok(()) => {
+            let result = guest.inject(probe(slots)).await;
+            if result.is_ok() {
+                read_pselect6_fd_set(guest, readfds, len).and_then(|read| {
+                    let write = read_pselect6_fd_set(guest, writefds, len)?;
+                    let except = read_pselect6_fd_set(guest, exceptfds, len)?;
+                    Ok((result, [read, write, except]))
+                })
+            } else {
+                Ok((result, [None, None, None]))
+            }
+        }
+        Err(error) => Err(error),
+    };
+    guest
+        .inject_with_retry(Syscall::Munmap(
+            syscalls::Munmap::new()
+                .with_addr(Addr::from_raw(base))
+                .with_len(mapping_len),
+        ))
+        .await?;
+    outcome
+}
+
 fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errno> {
     let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
     let nanoseconds = u32::try_from(timeout.tv_nsec).map_err(|_| Errno::EINVAL)?;
@@ -754,8 +835,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest,
                 call.nfds(),
                 call.readfds().map(|addr| addr.as_raw()),
-                "pselect6",
-            )?
+            )
         {
             return self
                 .record_or_replay_blocking(guest, Syscall::Pselect6(call))
@@ -828,10 +908,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
 
+        // Sets wider than an fd_set do not fit the stack scratch; each probe
+        // then maps its own (`inject_wide_select_probe`).
+        let wide = len > std::mem::size_of::<libc::fd_set>();
         let mut stack = guest.stack().await;
-        let readfds = call.readfds().map(|_| stack.reserve::<libc::fd_set>());
-        let writefds = call.writefds().map(|_| stack.reserve::<libc::fd_set>());
-        let exceptfds = call.exceptfds().map(|_| stack.reserve::<libc::fd_set>());
+        let readfds = call
+            .readfds()
+            .filter(|_| !wide)
+            .map(|_| stack.reserve::<libc::fd_set>());
+        let writefds = call
+            .writefds()
+            .filter(|_| !wide)
+            .map(|_| stack.reserve::<libc::fd_set>());
+        let exceptfds = call
+            .exceptfds()
+            .filter(|_| !wide)
+            .map(|_| stack.reserve::<libc::fd_set>());
         // pselect6's timeout is a writable in-out kernel timespec, so the probe
         // needs a mutable scratch cell (re-zeroed each iteration below to keep
         // every probe a non-blocking poll).
@@ -880,11 +972,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                     tv_nsec: 0,
                 },
             )?;
-            write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
-            write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
-            write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
-
-            let result = pselect6_probe_result(guest.inject(probe).await);
+            let (result, wide_sets) = if wide {
+                match inject_wide_select_probe(
+                    guest,
+                    [&original_readfds, &original_writefds, &original_exceptfds],
+                    len,
+                    move |[readfds, writefds, exceptfds]| {
+                        probe
+                            .with_readfds(readfds)
+                            .with_writefds(writefds)
+                            .with_exceptfds(exceptfds)
+                    },
+                )
+                .await
+                {
+                    Ok((result, sets)) => (pselect6_probe_result(result), Some(sets)),
+                    Err(error) => {
+                        self.write_pselect6_remaining(guest, call, deadline).await?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
+                write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
+                write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
+                (pselect6_probe_result(guest.inject(probe).await), None)
+            };
             // Virtual timerfds are never readable on the host; add the ready
             // ones to a successful probe's read set and count.
             let timer_ready = match result {
@@ -897,7 +1010,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if result != Ok(0) || !timer_ready.is_empty() {
                 let copy_result = match result {
                     Ok(host) => self
-                        .copy_pselect6_results(guest, probe, call, len)
+                        .copy_pselect6_results(guest, probe, call, len, &wide_sets)
                         .and_then(|()| {
                             set_select_read_bits(
                                 guest,
@@ -916,7 +1029,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(deadline) = deadline
                 && thread_observe_time(guest).await >= deadline
             {
-                let copy_result = self.copy_pselect6_results(guest, probe, call, len);
+                let copy_result = self.copy_pselect6_results(guest, probe, call, len, &wide_sets);
                 self.write_pselect6_remaining(guest, call, Some(deadline))
                     .await?;
                 copy_result?;
@@ -931,13 +1044,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Copy a probe's result sets to the guest's: from the stack scratch, or
+    /// from the sets a wide probe read back before unmapping its own.
     fn copy_pselect6_results<G: Guest<Self>>(
         &self,
         guest: &mut G,
         probe: syscalls::Pselect6,
         call: syscalls::Pselect6,
         len: usize,
+        wide_sets: &Option<[Option<Vec<u8>>; 3]>,
     ) -> Result<(), Error> {
+        if let Some([readfds, writefds, exceptfds]) = wide_sets {
+            write_pselect6_fd_set(guest, call.readfds(), readfds)?;
+            write_pselect6_fd_set(guest, call.writefds(), writefds)?;
+            return write_pselect6_fd_set(guest, call.exceptfds(), exceptfds);
+        }
         copy_pselect6_fd_set(guest, probe.readfds(), call.readfds(), len)?;
         copy_pselect6_fd_set(guest, probe.writefds(), call.writefds(), len)?;
         copy_pselect6_fd_set(guest, probe.exceptfds(), call.exceptfds(), len)
@@ -1021,8 +1142,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest,
                 call.nfds(),
                 call.readfds().map(|addr| addr.as_raw()),
-                "select",
-            )?
+            )
         {
             return self
                 .record_or_replay_blocking(guest, Syscall::Select(call))
@@ -1066,10 +1186,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         };
 
+        // Sets wider than an fd_set do not fit the stack scratch; each probe
+        // then maps its own (`inject_wide_select_probe`).
+        let wide = len > std::mem::size_of::<libc::fd_set>();
         let mut stack = guest.stack().await;
-        let readfds = call.readfds().map(|_| stack.reserve::<libc::fd_set>());
-        let writefds = call.writefds().map(|_| stack.reserve::<libc::fd_set>());
-        let exceptfds = call.exceptfds().map(|_| stack.reserve::<libc::fd_set>());
+        let readfds = call
+            .readfds()
+            .filter(|_| !wide)
+            .map(|_| stack.reserve::<libc::fd_set>());
+        let writefds = call
+            .writefds()
+            .filter(|_| !wide)
+            .map(|_| stack.reserve::<libc::fd_set>());
+        let exceptfds = call
+            .exceptfds()
+            .filter(|_| !wide)
+            .map(|_| stack.reserve::<libc::fd_set>());
         // select modifies its timeout in place, so the probe timeout must be a
         // writable scratch cell. It is re-zeroed each iteration to keep every
         // probe a non-blocking poll (a NULL timeout would block indefinitely).
@@ -1104,11 +1236,32 @@ impl<T: RecordOrReplay> Detcore<T> {
                     tv_usec: 0,
                 },
             )?;
-            write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
-            write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
-            write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
-
-            let result = guest.inject(probe).await;
+            let (result, wide_sets) = if wide {
+                match inject_wide_select_probe(
+                    guest,
+                    [&original_readfds, &original_writefds, &original_exceptfds],
+                    len,
+                    move |[readfds, writefds, exceptfds]| {
+                        probe
+                            .with_readfds(readfds)
+                            .with_writefds(writefds)
+                            .with_exceptfds(exceptfds)
+                    },
+                )
+                .await
+                {
+                    Ok((result, sets)) => (result, Some(sets)),
+                    Err(error) => {
+                        self.write_select_remaining(guest, call, deadline).await?;
+                        return Err(error);
+                    }
+                }
+            } else {
+                write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
+                write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
+                write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
+                (guest.inject(probe).await, None)
+            };
             // Virtual timerfds are never readable on the host; add the ready
             // ones to a successful probe's read set and count.
             let timer_ready = match result {
@@ -1121,7 +1274,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if result != Ok(0) || !timer_ready.is_empty() {
                 let copy_result = match result {
                     Ok(host) => self
-                        .copy_select_results(guest, probe, call, len)
+                        .copy_select_results(guest, probe, call, len, &wide_sets)
                         .and_then(|()| {
                             set_select_read_bits(
                                 guest,
@@ -1140,7 +1293,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(deadline) = deadline
                 && thread_observe_time(guest).await >= deadline
             {
-                let copy_result = self.copy_select_results(guest, probe, call, len);
+                let copy_result = self.copy_select_results(guest, probe, call, len, &wide_sets);
                 self.write_select_remaining(guest, call, Some(deadline))
                     .await?;
                 copy_result?;
@@ -1155,13 +1308,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Copy a probe's result sets to the guest's: from the stack scratch, or
+    /// from the sets a wide probe read back before unmapping its own.
     fn copy_select_results<G: Guest<Self>>(
         &self,
         guest: &mut G,
         probe: syscalls::Select,
         call: syscalls::Select,
         len: usize,
+        wide_sets: &Option<[Option<Vec<u8>>; 3]>,
     ) -> Result<(), Error> {
+        if let Some([readfds, writefds, exceptfds]) = wide_sets {
+            write_pselect6_fd_set(guest, call.readfds(), readfds)?;
+            write_pselect6_fd_set(guest, call.writefds(), writefds)?;
+            return write_pselect6_fd_set(guest, call.exceptfds(), exceptfds);
+        }
         copy_pselect6_fd_set(guest, probe.readfds(), call.readfds(), len)?;
         copy_pselect6_fd_set(guest, probe.writefds(), call.writefds(), len)?;
         copy_pselect6_fd_set(guest, probe.exceptfds(), call.exceptfds(), len)
@@ -2330,28 +2491,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Whether a blocking select or pselect6 wider than one word must stay
     /// with Detcore: its read set names a virtual timerfd, whose never-armed
-    /// host vessel the kernel would never report ready. Up to FD_SETSIZE the
-    /// scratch sets used by the retry loop hold it; beyond that the call is
-    /// refused rather than left to block on the vessel.
+    /// host vessel the kernel would never report ready. The retry loop's
+    /// probe sets hold any nfds: stack scratch up to FD_SETSIZE, and beyond
+    /// it a mapping that lives for one probe (`inject_wide_select_probe`).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): select and pselect6 above FD_SETSIZE no longer refuse with ENOSYS.
     fn wide_select_needs_detcore<G: Guest<Self>>(
         &self,
         guest: &mut G,
         nfds: i32,
         readfds: Option<usize>,
-        name: &str,
-    ) -> Result<bool, Error> {
-        if self.select_read_timerfds(guest, nfds, readfds).is_empty() {
-            return Ok(false);
-        }
-        if nfds > libc::FD_SETSIZE as i32 {
-            tracing::warn!(
-                "{} with nfds {} > FD_SETSIZE and a virtual timerfd in its read set is not supported",
-                name,
-                nfds
-            );
-            return Err(Errno::ENOSYS.into());
-        }
-        Ok(true)
+    ) -> bool {
+        !self.select_read_timerfds(guest, nfds, readfds).is_empty()
     }
 
     /// A zero-timeout select or pselect6: one host poll, plus ready virtual
