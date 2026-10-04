@@ -304,7 +304,7 @@ fn check_sigtimedwait_boundary<T: Tool<GlobalState = GlobalState>>(
         };
         assert_eq!(
             error.to_string(),
-            "KVM parent-death signal unsupported enrolled rt_sigtimedwait before rt_sigtimedwait"
+            "KVM parent-death signal unsupported enrolled rt_sigtimedwait before rt_sigtimedwait; use --backend ptrace for this operation"
         );
     } else {
         let Err(witness) = outcome else {

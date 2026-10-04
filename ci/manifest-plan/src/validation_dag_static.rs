@@ -641,6 +641,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and runner::tests::a_process_named_with_bytes_that_are_not_utf8_does_not_fail_the_scan
     // retain all 884 (`cargo nextest list --profile ci -p hermit-manifest-plan`
     // measured 687 at 7e2fc5cfd65d and 689 with them).
+    // Owning LIST for the b8ef6a82 composition measured 889 selected cases.
+    // Current identities/flags are recorded; no full historical LIST is claimed.
+    // Count evidence: https://github.com/rrnewton/reverie/issues/916
     // The three parity import tests of 9af999677494,
     // parity::tests::an_imported_pair_earns_clean_credit_only_when_both_cells_ran_alike,
     // parity::tests::an_imported_reference_never_reuses_an_earlier_golden and
@@ -764,7 +767,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Candidate 1e4519e707a9 inventories measured 836 selected cases; the
     // existing identities and selection flags are retained. Count evidence:
     // https://github.com/rrnewton/reverie/issues/916
-    ("test.hermit_unit", 836),
+    // Owning LIST for the b8ef6a82 composition measured 844 selected cases.
+    // Prior identities/flags and the declared FIX1/FIX2 additions are preserved.
+    // Count evidence: https://github.com/rrnewton/reverie/issues/916
+    ("test.hermit_unit", 844),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -909,7 +915,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Candidate 1e4519e707a9 inventories measured 199 selected cases; the
     // existing identities and selection flags are retained. Count evidence:
     // https://github.com/rrnewton/reverie/issues/916
-    ("test.hermit_integration", 199),
+    // Owning LIST for the b8ef6a82 composition measured 203 selected cases.
+    // Prior identities/flags and the declared FIX1/FIX2 additions are preserved.
+    // Count evidence: https://github.com/rrnewton/reverie/issues/916
+    ("test.hermit_integration", 203),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -1090,7 +1099,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Candidate 1e4519e707a9 inventories measured 199 selected cases; the
     // existing identities and selection flags are retained. Count evidence:
     // https://github.com/rrnewton/reverie/issues/916
-    ("test.hermit_integration_on_host", 199),
+    // Owning LIST for the b8ef6a82 composition measured 203 selected cases.
+    // Prior identities/flags and the declared FIX1/FIX2 additions are preserved.
+    // Count evidence: https://github.com/rrnewton/reverie/issues/916
+    ("test.hermit_integration_on_host", 203),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -1115,7 +1127,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Candidate 1e4519e707a9 inventories measured 836 selected cases; the
     // existing identities and selection flags are retained. Count evidence:
     // https://github.com/rrnewton/reverie/issues/916
-    ("test.hermit_unit_on_host", 836),
+    // Owning LIST for the b8ef6a82 composition measured 844 selected cases.
+    // Prior identities/flags and the declared FIX1/FIX2 additions are preserved.
+    // Count evidence: https://github.com/rrnewton/reverie/issues/916
+    ("test.hermit_unit_on_host", 844),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
@@ -1160,6 +1175,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities and remove one, so 850 of the 851 prior identities are
     // retained (+32). The spawn-failure test listed there retains all 883.
     // The two process-group scan tests listed there retain all 884.
+    // Owning LIST for the b8ef6a82 composition measured 889 selected cases.
+    // Current identities/flags are recorded; no full historical LIST is claimed.
+    // Count evidence: https://github.com/rrnewton/reverie/issues/916
     // The three parity import tests listed there retain all 886, and the
     // retained-command-line test listed there retains all 889.
     ("test.regular_crates_on_host", 890),

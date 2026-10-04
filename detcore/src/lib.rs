@@ -2005,7 +2005,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // logical time before its later parent-death refusal.
                     // Reject this unsupported consumer operation before either.
                     return Err(Error::Tool(anyhow::anyhow!(
-                        "KVM parent-death signal unsupported enrolled rt_sigtimedwait before {}",
+                        "KVM parent-death signal unsupported enrolled rt_sigtimedwait before {}; use --backend ptrace for this operation",
                         call.number()
                     )));
                 }
