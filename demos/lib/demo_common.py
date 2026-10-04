@@ -2104,6 +2104,10 @@ def _stop_unreaped(process: subprocess.Popen) -> None:
     Sends nothing if ``process`` had already exited when this was called, and
     nothing more once it turns out to have been reaped elsewhere (its numbers
     may then belong to another process already).
+
+    The SIGKILL is sent even if the SIGTERM or the wait after it raises (a
+    KeyboardInterrupt during the wait, for example): that exception is raised
+    again once the SIGKILL has been sent and waited for.
     """
     if _exit_status_without_reaping(process) is not None:
         return
@@ -2113,14 +2117,19 @@ def _stop_unreaped(process: subprocess.Popen) -> None:
             group = process.pid
     except OSError:
         group = None
-    _signal_unreaped(process, group, signal.SIGTERM)
-    _wait_without_reaping(process, 10)
-    if process.returncode is not None:
-        return
-    # Sent even if the child has exited meanwhile: the rest of its group may
-    # still be running. The child is still unreaped, so the group ID is its own.
-    _signal_unreaped(process, group, signal.SIGKILL)
-    _wait_without_reaping(process, 10)
+    try:
+        _signal_unreaped(process, group, signal.SIGTERM)
+        _wait_without_reaping(process, 10)
+    finally:
+        # Asks again first: the wait may have stopped before it learned that
+        # the child was reaped elsewhere, after which nothing more is sent.
+        _exit_status_without_reaping(process)
+        if process.returncode is None:
+            # Sent even if the child has exited meanwhile: the rest of its group
+            # may still be running. The child is still unreaped, so the group ID
+            # is its own.
+            _signal_unreaped(process, group, signal.SIGKILL)
+            _wait_without_reaping(process, 10)
 
 
 def stop_process(process: Optional[subprocess.Popen]) -> None:
@@ -2137,12 +2146,16 @@ def stop_process(process: Optional[subprocess.Popen]) -> None:
     more. The child is reaped only after the SIGKILL has been sent: until then
     Linux gives its PID, and the group ID it leads, to no other process, so
     neither signal can reach a process that reused them. Nothing is sent to a
-    child that has already exited; it is only reaped.
+    child that has already exited; it is only reaped. If a wait raises (a
+    KeyboardInterrupt, for example), the SIGKILL is still sent and the child
+    still reaped after it, and then the exception is raised again.
     """
     if process is None or process.returncode is not None:
         return
-    _stop_unreaped(process)
-    process.poll()
+    try:
+        _stop_unreaped(process)
+    finally:
+        process.poll()
 
 
 def _other_group_members(group: int, leader: int) -> bool:
@@ -2153,14 +2166,26 @@ def _other_group_members(group: int, leader: int) -> bool:
     not signal does not count: nothing more can be done about it from here.
     Permission is asked through a pidfd with signal 0, which delivers nothing.
     A process whose stat cannot be read counts, unless the read failed because
-    the process no longer exists: a failed observation is not an absence.
+    the process no longer exists: a failed observation is not an absence. For
+    the same reason, if /proc itself cannot be opened or listed to the end (too
+    many open files, for example), the answer is that a member may remain.
 
     The answer is a sample of a moment: it only bounds a wait, and never decides
     whether a signal is sent (see stop_process_group).
     """
     gone = (errno.ENOENT, errno.ESRCH)
     wanted = str(group).encode()
-    for entry in os.scandir("/proc"):
+    try:
+        entries = os.scandir("/proc")
+    except OSError:
+        return True  # /proc could not be opened: cannot tell; count it.
+    while True:
+        try:
+            entry = next(entries, None)
+        except OSError:
+            return True  # The listing failed part-way: cannot tell; count it.
+        if entry is None:
+            return False
         name = entry.name
         if not name.isdigit() or int(name) == leader:
             continue
@@ -2198,7 +2223,6 @@ def _other_group_members(group: int, leader: int) -> bool:
         finally:
             os.close(pidfd)
         return True
-    return False
 
 
 def _group_empty(process: subprocess.Popen, group: int, timeout: float) -> bool:
@@ -2240,26 +2264,49 @@ def stop_process_group(process: Optional[subprocess.Popen]) -> None:
     A child that was reaped before this call may have had its PID and group ID
     given to another process since, so nothing is sent then. The caller's own
     group is never signalled.
+
+    No exception from the steps before it can skip the group's SIGKILL or the
+    reap after it: if stopping the child, the SIGTERM or the wait after it
+    raises (a KeyboardInterrupt, for example), the SIGKILL is still sent while
+    the child is unreaped, the child is still reaped after it, and then the
+    exception is raised again. An exception in the wait after the SIGKILL
+    does not skip the reap either.
     """
     if process is None or process.returncode is not None:
         return
-    _stop_unreaped(process)
     group = process.pid
-    if group != os.getpgrp():
-        for sig in (signal.SIGTERM, signal.SIGKILL):
-            # Learns whether the child was reaped elsewhere meanwhile, after
-            # which its group ID may be another process's: nothing more is sent.
-            _exit_status_without_reaping(process)
-            if process.returncode is not None:
-                break
-            try:
-                os.killpg(group, sig)
-            except ProcessLookupError:
-                pass  # ESRCH: nothing is left in the group.
-            except PermissionError:
-                pass  # No member may be signalled from here.
-            _group_empty(process, group, 10)
-    process.poll()
+    # Never the caller's own group.
+    own_group = group == os.getpgrp()
+    try:
+        try:
+            _stop_unreaped(process)
+            if not own_group:
+                _signal_group_while_unreaped(process, group, signal.SIGTERM)
+        finally:
+            if not own_group:
+                _signal_group_while_unreaped(process, group, signal.SIGKILL)
+    finally:
+        process.poll()
+
+
+def _signal_group_while_unreaped(process: subprocess.Popen, group: int, sig: int) -> None:
+    """Send ``sig`` to ``process``'s group ``group``, then wait up to 10 seconds for it to empty.
+
+    One step of stop_process_group. Nothing is sent once ``process`` turns out
+    to have been reaped elsewhere.
+    """
+    # Learns whether the child was reaped elsewhere meanwhile, after which its
+    # group ID may be another process's: nothing more is sent.
+    _exit_status_without_reaping(process)
+    if process.returncode is not None:
+        return
+    try:
+        os.killpg(group, sig)
+    except ProcessLookupError:
+        pass  # ESRCH: nothing is left in the group.
+    except PermissionError:
+        pass  # No member may be signalled from here.
+    _group_empty(process, group, 10)
 
 
 def drain_output(

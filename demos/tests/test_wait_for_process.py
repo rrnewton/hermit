@@ -527,6 +527,36 @@ FAKE_PID = 4242
 FAKE_OWN_GROUP = 1000
 
 
+class ObservationFailed(Exception):
+    """Raised by a faked observation (a scan of /proc, a waitid) that fails."""
+
+
+def _raise_on_call(function, call: int):
+    """``function``, except that its ``call``-th call raises ObservationFailed instead."""
+    calls = [0]
+
+    def wrapper(*arguments):
+        calls[0] += 1
+        if calls[0] == call:
+            raise ObservationFailed("call {} of {} failed".format(call, function.__name__))
+        return function(*arguments)
+
+    return wrapper
+
+
+def _interrupt_once(sleep):
+    """``sleep``, except that its first call raises KeyboardInterrupt, as a SIGINT would."""
+    interrupted = [False]
+
+    def wrapper(seconds: float) -> None:
+        if not interrupted[0]:
+            interrupted[0] = True
+            raise KeyboardInterrupt
+        sleep(seconds)
+
+    return wrapper
+
+
 class _FakeGroup:
     """A child leading its own process group, with Linux and Popen replaced by fakes.
 
@@ -829,6 +859,122 @@ class StopOrderTest(unittest.TestCase):
                 if failing == "read":
                     self.assertTrue(closed, "the stat descriptor was not closed")
                     self.assertEqual(set(closed), {descriptor})
+
+    def assert_killed_then_reaped(self, fake: _FakeGroup, status: int, expected=None) -> None:
+        """The group's SIGKILL was sent before the child was reaped, and the child was reaped."""
+        self.assert_nothing_sent_after_the_reap(fake)
+        self.assertEqual(
+            fake.events,
+            expected
+            or [
+                ("killpg", FAKE_PID, signal.SIGTERM),
+                ("killpg", FAKE_PID, signal.SIGKILL),
+                ("reap", FAKE_PID),
+            ],
+        )
+        self.assertEqual(fake.others, [], "the member that ignores SIGTERM was not stopped")
+        self.assertEqual(fake.process.returncode, status, "the child was not reaped")
+
+    def no_stat_opened(self, path, flags, *rest):
+        raise AssertionError("opened {}, which /proc did not list".format(path))
+
+    def test_a_proc_that_cannot_be_opened_is_not_taken_as_an_empty_group(self):
+        # The descriptor table is full, so /proc cannot be opened, while another
+        # member of the exited child's group ignores SIGTERM.
+        fake = _FakeGroup(exited=True, status=7, others=[{signal.SIGKILL}])
+        listings: List[str] = []
+
+        def scandir(path):
+            listings.append(path)
+            raise OSError(errno.EMFILE, "Too many open files", path)
+
+        fake.os.scandir = scandir
+        with mock.patch.object(dc, "os", fake.os), mock.patch.object(dc, "time", fake.time):
+            self.assertTrue(
+                dc._other_group_members(FAKE_PID, FAKE_PID),
+                "a /proc that could not be opened was taken as a group with no other member",
+            )
+            dc.stop_process_group(fake.process)
+        self.assertTrue(listings, "/proc was never read")
+        self.assert_killed_then_reaped(fake, 7)
+
+    def test_a_proc_listing_that_fails_part_way_is_not_taken_as_an_empty_group(self):
+        # The listing of /proc fails after two entries, before it reaches the
+        # other member of the exited child's group, which ignores SIGTERM.
+        fake = _FakeGroup(exited=True, status=7, others=[{signal.SIGKILL}])
+        listed: List[str] = []
+
+        def scandir(path):
+            self.assertEqual(path, "/proc")
+
+            def entries():
+                for name in ("self", str(FAKE_PID)):
+                    listed.append(name)
+                    yield SimpleNamespace(name=name)
+                raise OSError(errno.ENOMEM, "Cannot allocate memory")
+
+            return entries()
+
+        fake.os.scandir = scandir
+        fake.os.open = self.no_stat_opened
+        with mock.patch.object(dc, "os", fake.os), mock.patch.object(dc, "time", fake.time):
+            self.assertTrue(
+                dc._other_group_members(FAKE_PID, FAKE_PID),
+                "a /proc listing that failed part-way was taken as a group with no other member",
+            )
+            dc.stop_process_group(fake.process)
+        self.assertEqual(listed[:2], ["self", str(FAKE_PID)])
+        self.assert_killed_then_reaped(fake, 7)
+
+    def test_an_observation_that_raises_in_the_group_wait_skips_neither_the_sigkill_nor_the_reap(self):
+        # The child has exited (as wait_for_process leaves it); another member of
+        # its group ignores SIGTERM. The wait after the group's SIGTERM raises.
+        def failed_scan(group, leader):
+            raise ObservationFailed("the scan of /proc failed")
+
+        for failing in ("scan raises every time", "sleep interrupted once"):
+            with self.subTest(failing=failing):
+                fake = _FakeGroup(exited=True, status=7, others=[{signal.SIGKILL}])
+                if failing == "scan raises every time":
+                    expected_error = ObservationFailed
+                    members = failed_scan
+                else:
+                    expected_error = KeyboardInterrupt
+                    members = fake.other_group_members
+                    fake.time.sleep = _interrupt_once(fake.sleep)
+                with mock.patch.object(dc, "os", fake.os), mock.patch.object(
+                    dc, "time", fake.time
+                ), mock.patch.object(dc, "_other_group_members", members):
+                    with self.assertRaises(expected_error):
+                        dc.stop_process_group(fake.process)
+                self.assert_killed_then_reaped(fake, 7)
+
+    def test_a_wait_that_raises_while_the_child_runs_skips_neither_the_sigkill_nor_the_reap(self):
+        # The child ignores SIGTERM, and so does another member of its group.
+        # The wait after the SIGTERM to the child raises.
+        for stop in (dc.stop_process, dc.stop_process_group):
+            for failing in ("waitid raises once", "sleep interrupted once"):
+                with self.subTest(stop=stop.__name__, failing=failing):
+                    fake = _FakeGroup(leader_dies_on={signal.SIGKILL}, others=[{signal.SIGKILL}])
+                    if failing == "waitid raises once":
+                        expected_error = ObservationFailed
+                        # Call 1 is the check before the SIGTERM; call 2 is the
+                        # first one in the wait after it.
+                        fake.os.waitid = _raise_on_call(fake.os.waitid, 2)
+                    else:
+                        expected_error = KeyboardInterrupt
+                        fake.time.sleep = _interrupt_once(fake.sleep)
+                    with self.assertRaises(expected_error):
+                        self.run_faked(fake, stop)
+                    expected = [
+                        ("killpg", FAKE_PID, signal.SIGTERM),
+                        ("killpg", FAKE_PID, signal.SIGKILL),
+                    ]
+                    if stop is dc.stop_process_group:
+                        # The group's own SIGKILL, sent while the child is unreaped.
+                        expected.append(("killpg", FAKE_PID, signal.SIGKILL))
+                    expected.append(("reap", FAKE_PID))
+                    self.assert_killed_then_reaped(fake, -signal.SIGKILL, expected)
 
     def test_nothing_is_sent_for_a_child_that_was_already_reaped(self):
         for stop in (dc.stop_process, dc.stop_process_group):
