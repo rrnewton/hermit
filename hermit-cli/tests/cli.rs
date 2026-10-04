@@ -30,6 +30,9 @@ mod kvm_signal_retirement;
 #[path = "common/kvm_synchronous_fault.rs"]
 mod kvm_synchronous_fault;
 
+#[path = "common/kvm_waitid_copyout.rs"]
+mod kvm_waitid_copyout;
+
 // Its runtime-staging helpers are used only by the LiteInst run tests, which
 // a build without the `liteinst` feature leaves out.
 #[cfg_attr(not(feature = "liteinst"), allow(dead_code))]
@@ -12689,4 +12692,64 @@ fn run_kvm_synchronous_root_segv_preserves_guest_exit() {
 #[test]
 fn run_kvm_synchronous_orphan_segv_preserves_root_success() {
     kvm_synchronous_fault::run_orphan();
+}
+
+#[test]
+fn run_kvm_waitid_terminal_copyout_preserves_arenas_and_child_lifecycle() {
+    kvm_waitid_copyout::run("terminal");
+}
+
+#[test]
+fn run_kvm_waitid_error_copyout_preserves_arenas_and_interrupt_precedence() {
+    kvm_waitid_copyout::run("errors");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_leader_child_pid_success() {
+    kvm_waitid_copyout::run_sibling("leader-child", "pid", "success");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_leader_child_pid_efault() {
+    kvm_waitid_copyout::run_sibling("leader-child", "pid", "efault");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_leader_child_all_success() {
+    kvm_waitid_copyout::run_sibling("leader-child", "all", "success");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_leader_child_all_efault() {
+    kvm_waitid_copyout::run_sibling("leader-child", "all", "efault");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_worker_child_pid_success() {
+    kvm_waitid_copyout::run_sibling("worker-child", "pid", "success");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_worker_child_pid_efault() {
+    kvm_waitid_copyout::run_sibling("worker-child", "pid", "efault");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_worker_child_all_success() {
+    kvm_waitid_copyout::run_sibling("worker-child", "all", "success");
+}
+
+#[test]
+fn run_kvm_waitid_sibling_worker_child_all_efault() {
+    kvm_waitid_copyout::run_sibling("worker-child", "all", "efault");
+}
+
+#[test]
+fn run_kvm_wait4_fault_consumption_preserves_waitid_and_children_cpu() {
+    kvm_waitid_copyout::run_wait4_fault();
+}
+
+#[test]
+fn run_kvm_wait4_int_min_preserves_errno_and_arenas() {
+    kvm_waitid_copyout::run_wait4_int_min();
 }
