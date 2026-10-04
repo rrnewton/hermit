@@ -130,8 +130,8 @@ def guest_environment_args() -> list:
 
 # Seconds to wait, after Hermit exits, for its last output to reach the log.
 # Processes Hermit left running can hold its output open meanwhile;
-# drain_output keeps QEMU_MAX_LOG_BYTES in force and stops them when this
-# runs out.
+# drain_output keeps QEMU_MAX_LOG_BYTES in force and, when this runs out,
+# signals Hermit's process group, which reaches those still in it.
 OUTPUT_DRAIN_TIMEOUT = 60
 
 
@@ -227,11 +227,12 @@ def failed_run_message(return_code: int, serial_log: Path) -> str:
 def guest_command_progress(serial_log: Path, hermit_exited: bool = False) -> str:
     """Say how far the guest's command had got, from the serial log.
 
-    ``hermit_exited`` says Hermit had exited (processes it left running were
-    stopped later), so a finished command is not reported as one whose Hermit
-    had not exited. A BEGIN line without an END line shows only that the
-    command was not seen to finish: a command still running and one whose END
-    line a kernel message hid leave the same serial log. In the same way, no
+    ``hermit_exited`` says Hermit had exited (the demo signalled Hermit's
+    process group later, for processes it left running), so a finished
+    command is not reported as one whose Hermit had not exited. A BEGIN line
+    without an END line shows only that the command was not seen to finish: a
+    command still running and one whose END line a kernel message hid leave
+    the same serial log. In the same way, no
     BEGIN line shows only that the command was not seen to start: a BEGIN line
     that a kernel message split does not start the frame (see
     STALE_BEGIN_PREFIX_RE in qemu_controller).
@@ -265,31 +266,38 @@ def guest_command_progress(serial_log: Path, hermit_exited: bool = False) -> str
 
 
 def stopped_run_message(error: Exception, serial_log: Path) -> str:
-    """Name what stopped an unfinished resume, and how far the guest had got.
+    """Name the bound an unfinished resume reached and how far the guest got.
 
     A command that never exits, or one whose END line a kernel message hid,
-    keeps the run going until a bound stops it. With the default settings the
+    keeps the run going until it reaches a bound. With the default settings the
     INFO log cap is reached first: on 2026-10-03 Hermit wrote 18.5 to 19.2 MB
-    of INFO log per second of resume, so the 512 MiB cap stopped a
-    `sleep 1000000` after about 29 seconds, well before the 120-second
-    QEMU_TIMEOUT. Neither bound can end in SUCCESS. The cap also holds after
-    Hermit exits, while processes it left running still write to its output
-    (see drain_output); LogCapExceeded then carries Hermit's exit status. It
+    of INFO log per second of resume, so a `sleep 1000000` reached the 512 MiB
+    cap after about 29 seconds, well before the 120-second QEMU_TIMEOUT.
+    Neither bound can end in SUCCESS. The cap also holds after Hermit exits,
+    while processes it left running still write to its output (see
+    drain_output); LogCapExceeded then carries Hermit's exit status. It
     carries it too when the log was found past the cap by the check made once
     Hermit had exited, or once the copy of its output had ended
     (``final_check``); nothing was then seen still writing.
 
     The time a cap message gives is when the size was found past the cap, read
-    before anything was stopped. The message names QEMU_TIMEOUT without saying
+    before anything was signalled. The message names QEMU_TIMEOUT without saying
     whether it had passed by then: the size is checked before the deadline, so
     a log past the cap is what is reported even when both bounds were passed.
+
+    By the time this runs, wait_for_process or drain_output has signalled
+    Hermit's process group, the one the demo started Hermit in (see
+    stop_process_group), and that is all a cap message says about it: nothing
+    reports whether the group emptied, and a process outside it is not
+    signalled. Under a wrapper such as bin/safehermit, Hermit, its tracer and
+    QEMU can run outside that group.
     """
     if isinstance(error, LogCapExceeded) and error.final_check:
         cause = (
             "Hermit's INFO log {} was {} bytes, past the {}-byte cap "
             "(QEMU_MAX_LOG_BYTES), when checked {:.1f}s into the resume, after "
-            "Hermit had exited with status {}, and anything Hermit left running "
-            "was stopped".format(
+            "Hermit had exited with status {}, and the demo then signalled "
+            "Hermit's process group".format(
                 error.log_path,
                 error.log_size,
                 error.max_log_bytes,
@@ -303,7 +311,7 @@ def stopped_run_message(error: Exception, serial_log: Path) -> str:
             "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
             "(QEMU_MAX_LOG_BYTES), {:.1f}s into the resume, after Hermit had "
             "exited with status {}: processes it left running still wrote to its "
-            "output, and were stopped".format(
+            "output, and the demo then signalled Hermit's process group".format(
                 error.log_path,
                 error.log_size,
                 error.max_log_bytes,
@@ -316,7 +324,8 @@ def stopped_run_message(error: Exception, serial_log: Path) -> str:
         cause = (
             "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
             "(QEMU_MAX_LOG_BYTES), when checked {:.1f}s into the resume "
-            "(QEMU_TIMEOUT is {}s), so the run was stopped".format(
+            "(QEMU_TIMEOUT is {}s), so the demo signalled Hermit's process "
+            "group".format(
                 error.log_path,
                 error.log_size,
                 error.max_log_bytes,
@@ -541,8 +550,8 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
                 stderr=subprocess.STDOUT,
                 env=environment,
                 cwd=str(ROOT),
-                # Own process group, so stop_process can stop Hermit and every
-                # process it started, not only the first one.
+                # Own process group, so stop_process_group can signal every
+                # process in it, not only the first one.
                 start_new_session=True,
             )
             launched = time.monotonic()

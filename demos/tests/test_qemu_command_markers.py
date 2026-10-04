@@ -963,14 +963,16 @@ class Demo6ResumeTest(unittest.TestCase):
                 log_cap,
                 "Hermit's INFO log hermit-info.log grew to 538072392 bytes, past "
                 "the 536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked 29.2s "
-                "into the resume (QEMU_TIMEOUT is 120s), so the run was stopped",
+                "into the resume (QEMU_TIMEOUT is 120s), so the demo signalled "
+                "Hermit's process group",
             ),
             (
                 "log cap checked after QEMU_TIMEOUT",
                 late_log_cap,
                 "Hermit's INFO log hermit-info.log grew to 538072392 bytes, past "
                 "the 536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked 120.2s "
-                "into the resume (QEMU_TIMEOUT is 120s), so the run was stopped",
+                "into the resume (QEMU_TIMEOUT is 120s), so the demo signalled "
+                "Hermit's process group",
             ),
             (
                 "timeout",
@@ -1002,8 +1004,8 @@ class Demo6ResumeTest(unittest.TestCase):
             str(caught.exception),
             "Hermit's INFO log hermit-info.log was 536871936 bytes, past the "
             "536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked 16.2s into the "
-            "resume, after Hermit had exited with status 0, and anything Hermit left "
-            "running was stopped; the guest command had finished with exit status 0",
+            "resume, after Hermit had exited with status 0, and the demo then signalled "
+            "Hermit's process group; the guest command had finished with exit status 0",
         )
         self.assertIs(caught.exception.__cause__, log_cap)
 
