@@ -80,7 +80,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -126,7 +125,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -172,7 +170,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -205,7 +202,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -267,7 +263,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -332,7 +327,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -394,7 +388,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
       ],
@@ -436,7 +429,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
-        "test.liteinst_strict",
         "test.regular_crates_on_host",
         "test.rr_suite_contract",
         "test.sabre_examples"
@@ -479,7 +471,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -605,18 +596,6 @@
         "tests/standalone/**",
         "tests/stress/**",
         "tests/util/**"
-      ]
-    },
-    {
-      "_why": "LiteInst runtime staging is outside Cargo's workspace graph.",
-      "e2e_backends": [
-        "liteinst"
-      ],
-      "nodes": [
-        "test.liteinst_strict"
-      ],
-      "paths": [
-        "scripts/stage-liteinst-runtime.sh"
       ]
     },
     {

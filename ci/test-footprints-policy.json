@@ -103,7 +103,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
-        "test.liteinst_strict",
         "test.rr_suite_contract",
         "test.sabre_examples"
       ],
@@ -219,12 +218,6 @@
         "test.rr_suite_contract"
       ],
       "e2e_all": true
-    },
-    {
-      "_why": "LiteInst runtime staging is outside Cargo's workspace graph.",
-      "paths": ["scripts/stage-liteinst-runtime.sh"],
-      "nodes": ["test.liteinst_strict"],
-      "e2e_backends": ["liteinst"]
     },
     {
       "_why": "Standalone checks map to their own portable DAG node.",

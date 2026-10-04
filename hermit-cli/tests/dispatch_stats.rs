@@ -9,10 +9,9 @@
 //! The ptrace and e9patch dispatch records, and the DEBUG-only rule.
 //!
 //! The harness in `common/dispatch_stats.rs` checks what every backend's
-//! record must satisfy; the SaBRe and LiteInst cases live in
-//! `sabre_examples.rs` and `liteinst_advanced.rs`, whose validation nodes
-//! stage those backends' artifacts. The record must stay out of the INFO log
-//! that `--verify` compares.
+//! record must satisfy; the SaBRe case lives in `sabre_examples.rs`, whose
+//! validation node stages that backend's artifacts. The record must stay out
+//! of the INFO log that `--verify` compares.
 
 #[path = "common/dispatch_stats.rs"]
 mod dispatch_stats;

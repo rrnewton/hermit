@@ -43,7 +43,7 @@ HERMIT_DEBUG_BIN ?= target/debug/hermit
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
 	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-script-tests \
-	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
+	validate-kvm validate-dbt validate-sabre validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
 	@echo 'make: building the hermit binary (dev profile, third-party-backends) -- expect ~45s warm, longer cold'
@@ -199,7 +199,6 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	python3 ./scripts/test_pr_status.py
 	./scripts/bisect-probe.rs --self-test
 	./ci/lint-checks-node.sh --self-test
-	./ci/liteinst-strict-node.sh --self-test
 	./ci/hermetic/assert-build-dependencies.sh --self-test
 	./ci/hermetic/check-image-provenance.rs
 	./ci/hermetic/tests/test-retry-fetch.sh
@@ -254,7 +253,6 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-kvm       KVM manifest cells    (needs /dev/kvm)            not yet timed\n'
 	@printf '  validate-dbt       DBT manifest cells    (third-party-backends)      not yet timed\n'
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
-	@printf '  validate-liteinst  LiteInst strict corpus                            ~5-15 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
 	@printf '\nThe full multi-backend suite is ./scripts/validate.rs (see ./scripts/validate.rs --help).\n'
 
@@ -373,9 +371,6 @@ validate-dbt: check-submodules ## Run ONLY the DBT cells of the E2E manifests (t
 
 validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
 	./scripts/validate.rs --sabre-compat-only
-
-validate-liteinst: check-submodules ## Run ONLY the LiteInst strict compatibility corpus
-	./scripts/validate.rs --liteinst-compat-only
 
 validate-e9patch: check-submodules ## Run ONLY the e9patch (ptrace-preprocessing) compat corpus (needs HERMIT_E9PATCH_BACKEND)
 	./scripts/validate.rs --e9patch-compat-only
