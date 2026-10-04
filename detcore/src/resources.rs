@@ -379,6 +379,19 @@ pub struct Resources {
     /// requests that do not go through `resource_request`.
     #[serde(default)]
     pub(crate) backend_runtime_bootstrap: bool,
+    /// The signal mask a thread sleeps under in the blocking call this request
+    /// begins (`BlockingExternalIO`, `BlockingRtSigsuspend`), when the call
+    /// installs its own: the mask argument of `rt_sigsuspend`, `ppoll` or
+    /// `pselect6`, read in the thread's turn, without `SIGKILL` and `SIGSTOP`,
+    /// which Linux never blocks. `None` for a call that sleeps under the
+    /// thread's own mask; the scheduler then reads that mask when it commits
+    /// the request, while the thread is still stopped at it. The scheduler
+    /// records the mask either way, because once the thread runs the call its
+    /// live mask is no longer ordered by the schedule, and a `SIGCHLD` target
+    /// must be chosen from masks that are
+    /// (<https://github.com/rrnewton/hermit/issues/3146>).
+    #[serde(default)]
+    pub(crate) blocked_signal_mask: Option<u64>,
 }
 
 impl fmt::Debug for Resources {
@@ -395,6 +408,9 @@ impl fmt::Debug for Resources {
         if self.backend_runtime_bootstrap {
             debug.field("backend_runtime_bootstrap", &true);
         }
+        if let Some(mask) = self.blocked_signal_mask {
+            debug.field("blocked_signal_mask", &mask);
+        }
         debug.finish()
     }
 }
@@ -409,6 +425,7 @@ impl Resources {
             fyi: String::new(),
             signal_interrupt_errno: None,
             backend_runtime_bootstrap: false,
+            blocked_signal_mask: None,
         }
     }
 
@@ -434,6 +451,11 @@ impl Resources {
             (Some(_), None) => {}
         }
         self.backend_runtime_bootstrap |= other.backend_runtime_bootstrap;
+        match (self.blocked_signal_mask, other.blocked_signal_mask) {
+            (None, mask) => self.blocked_signal_mask = mask,
+            (Some(left), Some(right)) => assert_eq!(left, right),
+            (Some(_), None) => {}
+        }
     }
 
     pub fn set_signal_interrupt_errno(&mut self, errno: Errno) {

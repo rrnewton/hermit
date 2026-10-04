@@ -836,7 +836,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // syscalls::helpers::tests and three syscalls::threads::tests;
     // https://github.com/rrnewton/hermit/issues/3146) retain all 904 prior
     // identities: 904 + 38 = 942 (`cargo nextest list --profile ci` measured 942).
-    ("test.detcore_unit", 942),
+    // scheduler::test::a_sigchld_target_sleeping_outside_the_scheduler_uses_the_mask_recorded_at_its_commit
+    // (https://github.com/rrnewton/hermit/issues/3146) retains all 942 prior
+    // identities: 942 + 1 = 943 (the filtered nextest run measured 943).
+    ("test.detcore_unit", 943),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1068,7 +1071,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3226): 881 + 23 = 904.
     // The host twin selects the same 38 blocked-wait signal tests
     // (https://github.com/rrnewton/hermit/issues/3146): 904 + 38 = 942.
-    ("test.detcore_unit_on_host", 942),
+    // The host twin selects the same recorded-mask SIGCHLD target test: 942 + 1 = 943.
+    ("test.detcore_unit_on_host", 943),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

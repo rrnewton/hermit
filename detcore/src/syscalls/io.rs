@@ -44,6 +44,7 @@ use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
+use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
 use crate::syscalls::threads::KernelSigset;
 use crate::tool_global::*;
@@ -534,8 +535,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         // require fewer bytes than a userspace calculation predicts. Keep those calls
         // under kernel ownership rather than over-reading the guest bitmap.
         if call.nfds() > PSELECT6_INTERNAL_MAX_NFDS {
+            // The kernel sleeps under the inner mask, so record it for the
+            // scheduler's SIGCHLD target choice (`Resources::blocked_signal_mask`).
+            // A mask the kernel would reject (wrong size, or a pointer it cannot
+            // read) fails the real call before it sleeps or installs anything, so
+            // the thread's own mask is the right record there (`None`).
+            let blocked_signal_mask = match sigmask_argument {
+                Some(argument)
+                    if argument.sigmask != 0 && argument.sigsetsize == KERNEL_SIGSET_SIZE =>
+                {
+                    match Addr::<libc::sigset_t>::from_raw(argument.sigmask) {
+                        Some(mask_addr) => read_kernel_sigset(guest, mask_addr)
+                            .await
+                            .ok()
+                            .map(kernel_installed_signal_mask),
+                        None => None,
+                    }
+                }
+                _ => None,
+            };
             return self
-                .record_or_replay_blocking(guest, Syscall::Pselect6(call))
+                .record_or_replay_blocking_with_mask(
+                    guest,
+                    Syscall::Pselect6(call),
+                    blocked_signal_mask,
+                )
                 .await;
         }
 
@@ -1107,20 +1131,29 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Use scratch memory only for the signal mask so raw ppoll can still update the
             // guest timeout.
             let mut signal_mask_guard = None;
+            // The mask the real call sleeps under, recorded for the scheduler's
+            // SIGCHLD target choice (`Resources::blocked_signal_mask`).
+            let mut blocked_signal_mask = None;
             let call = if let Some(signal_mask) = call.sigmask() {
                 if call.sigsetsize() != KERNEL_SIGSET_SIZE {
                     return Err(Errno::EINVAL.into());
                 }
                 let signal_mask = read_kernel_sigset(guest, signal_mask).await?;
+                let signal_mask = sanitize_ppoll_signal_mask(signal_mask);
+                blocked_signal_mask = Some(kernel_installed_signal_mask(signal_mask));
                 let mut stack = guest.stack().await;
-                let signal_mask = stack.push(sanitize_ppoll_signal_mask(signal_mask)).cast();
+                let signal_mask = stack.push(signal_mask).cast();
                 signal_mask_guard = Some(stack.commit()?);
                 call.with_sigmask(Some(signal_mask))
             } else {
                 call
             };
             let result = Ok(self
-                .record_or_replay_blocking(guest, Syscall::Ppoll(call))
+                .record_or_replay_blocking_with_mask(
+                    guest,
+                    Syscall::Ppoll(call),
+                    blocked_signal_mask,
+                )
                 .await?);
             drop(signal_mask_guard);
             result
@@ -1359,7 +1392,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // to swap the signal mask atomically for the duration of the wait, and
         // a timeout-0 polling loop cannot reproduce that atomicity. Such calls
         // remain able to block the scheduler; that is a known remaining gap
-        // rather than something this change silently pretends to fix.
+        // rather than something this change silently pretends to fix. Because
+        // such a call keeps its turn, it never sleeps outside the runnable set,
+        // so the scheduler needs no record of its temporary mask
+        // (`Resources::blocked_signal_mask`).
         if call.sigmask().is_some() {
             let dettid = guest.thread_state().dettid;
             resource_request(guest, Resources::new(dettid)).await; // empty request
