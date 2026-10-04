@@ -306,6 +306,39 @@ static void count_signal(int signal_number) {
   handled++;
 }
 
+/* Returns once Linux reports the parent asleep in do_wait, where wait4 sleeps
+ * after it has looked for a ready child and then for a pending signal. Linux
+ * names a task's wait channel in /proc only while the task is off the run
+ * queue, and a wait4 still between those two looks is on it. Fails after
+ * 10,000 reads about 1 ms apart. */
+static void wait_for_parent_asleep(void) {
+  char path[64];
+  snprintf(path, sizeof(path), "/proc/%d/wchan", (int)getppid());
+  char seen[64] = "";
+  for (int reads = 0; reads < 10000; reads++) {
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+    if (fd < 0)
+      fail("open the parent's wchan");
+    ssize_t length = read(fd, seen, sizeof(seen) - 1);
+    if (length < 0)
+      fail("read the parent's wchan");
+    close(fd);
+    seen[length] = '\0';
+    if (strcmp(seen, "do_wait") == 0)
+      return;
+    struct timespec pause = {0, 1000 * 1000};
+    if (nanosleep(&pause, NULL) != 0)
+      fail("nanosleep");
+  }
+  char line[160];
+  int length = snprintf(line, sizeof(line),
+                        "FAIL the parent's wchan is still \"%s\", not do_wait\n",
+                        seen);
+  if (length > 0)
+    (void)!write(STDERR_FILENO, line, (size_t)length);
+  _exit(1);
+}
+
 /* (b) A signal that is pending when the reap succeeds, and has a handler.
  * Linux sends SIGCHLD in the same step that makes the child ready to be
  * reaped. A wait4 asleep at that point wakes and looks for a ready child
@@ -313,12 +346,16 @@ static void count_signal(int signal_number) {
  * handler runs once on the way back to the guest. A wait4 caught between those
  * two looks returns EINTR instead: 26 of 100,000 native runs on Linux 7.1.3
  * did, when the child exited as soon as it read the go byte. So the child
- * sleeps for 50 ms first, which leaves the parent asleep in wait4 when the
- * child exits; under Hermit that sleep is virtual time. Detcore keeps the
- * signal blocked across its wait, so the handler can run only when Detcore
- * restores the guest's mask. The handler is installed without SA_RESTART, so
- * a runtime that turned the pending signal into an EINTR fails the wait4. */
-static int handler_after_reap(void) {
+ * exits only once the parent is asleep in wait4. It first sleeps for 50 ms,
+ * which under Hermit is virtual time; Detcore parks the parent before that
+ * sleep ends, and the test checks that order in the ptrace run's scheduler
+ * log. Natively a sleep promises nothing, so the native run passes
+ * wait-for-parent-asleep, and the child then also waits until Linux reports
+ * the parent asleep in do_wait. Detcore keeps the signal blocked across its
+ * wait, so the handler can run only when Detcore restores the guest's mask.
+ * The handler is installed without SA_RESTART, so a runtime that turned the
+ * pending signal into an EINTR fails the wait4. */
+static int handler_after_reap(int wait_for_parent) {
   set_disposition(SIGCHLD, count_signal);
   int go[2];
   if (pipe(go) != 0)
@@ -332,6 +369,8 @@ static int handler_after_reap(void) {
     struct timespec pause = {0, 50 * 1000 * 1000};
     if (nanosleep(&pause, NULL) != 0)
       fail("nanosleep");
+    if (wait_for_parent)
+      wait_for_parent_asleep();
     _exit(5);
   }
   close(go[0]);
@@ -440,9 +479,13 @@ static int write_only_set(void) {
 int main(int argc, char** argv) {
   const char* mode = argc > 1 ? argv[1] : "";
   int arguments = strcmp(mode, "terminate-then-exit") == 0 ? 3 : 2;
-  if (argc != arguments) {
-    fprintf(stderr, "usage: %s MODE, or %s terminate-then-exit STATUS-FILE\n",
-            argv[0], argv[0]);
+  int wait_for_parent = strcmp(mode, "handler-after-reap") == 0 && argc == 3 &&
+                        strcmp(argv[2], "wait-for-parent-asleep") == 0;
+  if (argc != arguments + wait_for_parent) {
+    fprintf(stderr,
+            "usage: %s MODE, %s terminate-then-exit STATUS-FILE, or %s "
+            "handler-after-reap wait-for-parent-asleep\n",
+            argv[0], argv[0], argv[0]);
     return 64;
   }
   if (strcmp(mode, "sigchld-during-wait") == 0)
@@ -456,7 +499,7 @@ int main(int argc, char** argv) {
   if (strcmp(mode, "terminate-then-exit") == 0)
     return terminate_then_exit(argv[2]);
   if (strcmp(mode, "handler-after-reap") == 0)
-    return handler_after_reap();
+    return handler_after_reap(wait_for_parent);
   if (strcmp(mode, "guest-blocked") == 0)
     return guest_blocked();
   if (strcmp(mode, "block-all") == 0)
