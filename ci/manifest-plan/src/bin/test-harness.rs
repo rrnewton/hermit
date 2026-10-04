@@ -199,7 +199,9 @@ It writes only below DIR/parity-compare: parity.jsonl, parity.status.json
 the goldens and log-diff reports under DIR/parity-compare/parity/. The run's
 results.jsonl, JUnit, summary.json, parity.jsonl, parity.status.json and
 parity/ are only read. A golden the run wrote is reused once the reference's
-retained log is gone.
+retained log is gone, except in an imported run, whose summary.json names its
+import ROOT: each log is read only from the directory the ingest restored it
+into below ROOT/retained-verify-logs/, and no golden is reused.
 
 Options:
   --artifacts <DIR>                The directory holding the run's results.jsonl
@@ -3384,7 +3386,9 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     });
     if let (Some(import_root), Some(imported)) = (&import_root, &imported) {
         summary["imported"] = serde_json::json!({
-            "root": import_root,
+            // Absolute, so `parity compare` finds the restored logs from any
+            // directory (`recorded_import_root`).
+            "root": std::path::absolute(import_root).unwrap_or_else(|_| import_root.clone()),
             "source_run_ids": imported.source_run_ids,
             "missing_cells": imported.missing,
             "dropped_retries": imported.dropped_retries,
@@ -3839,6 +3843,9 @@ fn parity_compare(
     }
     config.jobs = request.jobs;
     config.outer_deadline = parity::dagrun_step_deadline();
+    config.imported_logs = recorded_import_root(&request.artifacts)
+        .unwrap_or_else(|error| fail(error))
+        .map(|root| parity::ImportedLogs::load(&root));
     let report = parity::post_pass(&config, &scope, &rows).unwrap_or_else(|error| fail(error));
     for record in &report.records {
         println!(
@@ -3848,6 +3855,35 @@ fn parity_compare(
     }
     eprintln!("test-harness: {}", report.summary_line());
     ExitCode::SUCCESS
+}
+
+/// The import root the finished run in `artifacts` recorded in its
+/// summary.json, or None when it imported nothing. Its rows record verify-log
+/// directories on the machines that ran the cells, so `parity compare` must
+/// read an imported run's logs from where the ingest restored them, as the
+/// run's own post-pass does (`report_parity`); without its summary, whether
+/// the run imported is unknown, so the comparison is refused.
+fn recorded_import_root(artifacts: &Path) -> Result<Option<PathBuf>, String> {
+    let path = artifacts.join("summary.json");
+    let text = fs::read_to_string(&path).map_err(|error| {
+        format!(
+            "cannot read {}, so whether the run imported its rows is unknown: {error}",
+            path.display()
+        )
+    })?;
+    let summary: serde_json::Value =
+        serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let Some(imported) = summary.get("imported") else {
+        return Ok(None);
+    };
+    match imported.get("root").and_then(serde_json::Value::as_str) {
+        Some(root) if Path::new(root).is_absolute() => Ok(Some(PathBuf::from(root))),
+        _ => Err(format!(
+            "{} records an import with no absolute \"root\", so the verify logs it restored \
+             cannot be found",
+            path.display()
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -6773,6 +6809,53 @@ sys.exit(1 if failed else 0)
         let mut written = Vec::new();
         print_best_effort(&mut written, "test-harness: parity: 1 cell(s)");
         assert_eq!(written, b"test-harness: parity: 1 cell(s)\n");
+    }
+
+    /// `parity compare` reads an imported run's logs from the import root its
+    /// summary.json records (<https://github.com/rrnewton/hermit/issues/3687>).
+    /// A run that imported nothing has none; a summary that cannot be read, or
+    /// records an import without an absolute root, is refused rather than
+    /// read as a run that imported nothing.
+    #[test]
+    fn parity_compare_finds_an_imported_runs_logs_through_its_summary() {
+        let artifacts = std::env::temp_dir().join(format!(
+            "hermit-harness-import-root-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        fs::create_dir(&artifacts).unwrap();
+        let recorded = |summary: Option<serde_json::Value>| {
+            let path = artifacts.join("summary.json");
+            match summary {
+                Some(summary) => fs::write(&path, summary.to_string()).unwrap(),
+                None => fs::remove_file(&path).unwrap(),
+            }
+            super::recorded_import_root(&artifacts)
+        };
+
+        assert_eq!(recorded(Some(serde_json::json!({"cells": 1}))), Ok(None));
+        assert_eq!(
+            recorded(Some(
+                serde_json::json!({"imported": {"root": "/srv/import", "missing_cells": []}})
+            )),
+            Ok(Some(std::path::PathBuf::from("/srv/import")))
+        );
+        for summary in [
+            serde_json::json!({"imported": {"root": "relative/import"}}),
+            serde_json::json!({"imported": {"missing_cells": []}}),
+            serde_json::json!({"imported": null}),
+        ] {
+            let error = recorded(Some(summary.clone())).unwrap_err();
+            assert!(error.contains("no absolute \"root\""), "{summary}: {error}");
+        }
+        let error = recorded(None).unwrap_err();
+        assert!(
+            error.contains("whether the run imported its rows is unknown"),
+            "{error}"
+        );
+        fs::write(artifacts.join("summary.json"), "{").unwrap();
+        assert!(super::recorded_import_root(&artifacts).is_err());
+        fs::remove_dir_all(&artifacts).unwrap();
     }
 
     /// The `test-harness run` arguments of a committed DAG step up to its

@@ -48,7 +48,11 @@ IMPORT_DIR/retained-verify-logs/index.jsonl maps each recorded directory to the
 directory below IMPORT_DIR its logs were restored to, or to why none were (no such log
 among the artifacts, a failed fetch, no recorded or a different sha256). A directory is
 restored whole or not at all. A log that is not restored leaves only its parity cell
-unmeasured: it never fails the ingest.
+unmeasured: it never fails the ingest. Each entry also records where the execution that
+recorded the directory ran, as its result.json recorded it: route (local or re),
+container (pinned-root or empty) and re_platform, each null when it recorded none or
+several executions recorded the directory. The post-pass gives a pair clean credit only
+when both cells ran on the same route.
 
 --local-artifacts: Buck materializes each test's artifact directory locally
 (buck-out/v2/test/execution/<cell>/<target hash>/<config hash>/default/artifacts_directory),
@@ -65,7 +69,8 @@ VERIFY_LOG_DIR = "--verify-log-dir"  # the harness's flag naming where hermit --
 RUN1_LOG = "run1_log_"  # hermit's first-run log; parity.rs RETAINED_LOG_PREFIX
 LOGS_DIR = "retained-verify-logs"  # parity.rs IMPORTED_LOGS_DIR
 LOGS_INDEX = "index.jsonl"  # parity.rs IMPORTED_LOGS_INDEX
-LOGS_SCHEMA = 1  # parity.rs IMPORTED_LOGS_SCHEMA
+LOGS_SCHEMA = 2  # parity.rs IMPORTED_LOGS_SCHEMA
+ROUTE_KEYS = ("route", "container", "re_platform")  # cell.sh's result.json: where the execution ran
 SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # a path component, never . or ..
 
 def try_testx(*args, tries=4):
@@ -131,6 +136,12 @@ def verify_logs(rows, names):
         prefix = "cell__" + "__".join(parts) + "__"
         found[recorded] = ("/".join(parts), prefix, sorted(n for n in names if run1_log_name(n, prefix)))
     return found
+
+def route_of(result):
+    """{key: the string the execution's RESULT records for it, else None} for each of
+    ROUTE_KEYS."""
+    result = result if isinstance(result, dict) else {}
+    return {k: result[k] if isinstance(result.get(k), str) else None for k in ROUTE_KEYS}
 
 def restore(out, run_id, result, logs, log_dir, fetch_error):
     """Copy each first-run log LOGS (see verify_logs) names out of LOG_DIR into
@@ -355,14 +366,16 @@ def main():
     os.makedirs(logs_root)  # fails if a previous ingest's logs could not all be removed
     recorded = collections.Counter(r for _, _, (logs, _, _) in log_sources for r in logs)
     index = {}  # recorded verify-log directory -> (restored directory, None) or (None, why none)
+    routes = {}  # recorded verify-log directory -> route_of the execution that recorded it
     for run_id, result, (logs, log_dir, fetch_error) in log_sources:
         shared = {r for r in logs if recorded[r] > 1}
         index.update((r, (None, f"{recorded[r]} executions recorded it, so their logs cannot be told apart")) for r in shared)
         index.update(restore(a.out, run_id, result, {r: v for r, v in logs.items() if r not in shared}, log_dir, fetch_error))
+        routes.update((r, route_of(None if r in shared else result)) for r in logs)
     with open(os.path.join(logs_root, LOGS_INDEX), "w") as f:
         for r, (restored, reason) in sorted(index.items()):
-            f.write(json.dumps({"schema": LOGS_SCHEMA, "verify_log_dir": r, "restored": restored, "reason": reason},
-                               sort_keys=True) + "\n")
+            f.write(json.dumps({"schema": LOGS_SCHEMA, "verify_log_dir": r, "restored": restored, "reason": reason,
+                                **routes[r]}, sort_keys=True) + "\n")
     unrestored = sorted(f"{r}: {reason}" for r, (_, reason) in index.items() if reason is not None)
     print(json.dumps({"sources": dict(sources), "cells": len(per_cell), "buckets": len(set(buckets) | set(summaries)), "rows": sum(attempts.values()),
                       "attempts": dict(attempts), "final_outcomes": dict(final),
