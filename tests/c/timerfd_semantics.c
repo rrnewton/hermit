@@ -1390,8 +1390,21 @@ static void check_fine_periodic_sleep(int close_first) {
  *       value, then the mask size and pointer, then maxevents; a NULL mask
  *       ignores its size; a timespec in a write-only page, which Linux can
  *       read, is accepted.
+ *   wait_form_select_wide_ready / wait_form_pselect6_wide_ready
+ *       select and pselect6 with nfds above FD_SETSIZE, whose read set names
+ *       an expired and a distant timerfd above fd 1100, report only the
+ *       expired one without blocking. select's write set also reports a
+ *       writable pipe and its empty except set stays empty; pselect6 passes
+ *       only a read set and a signal mask. A word past nfds is untouched.
+ *   wait_form_select_wide_block / wait_form_pselect6_wide_block
+ *       They block until a timerfd armed for later fires, select with a NULL
+ *       timeout and pselect6 with one longer than the timer.
+ *   wait_form_select_wide_timeout / wait_form_pselect6_wide_timeout
+ *       They return 0, with the read set cleared and no time left, when a
+ *       timeout shorter than the timer runs out.
  */
 #include <sys/mman.h>
+#include <sys/resource.h>
 
 static long wait_form_pwait2(int ep, struct epoll_event *out, int maxevents, const void *ts,
                              const void *mask, size_t sigsetsize) {
@@ -1544,6 +1557,170 @@ static void wait_form_epoll_pwait2_errors(void) {
     else ok(name);
 }
 
+#define WAIT_FORM_WORDS 32 /* bitmap words: descriptors 0..2047 */
+#define WAIT_FORM_HIGH_FD 1100
+#define WAIT_FORM_SENTINEL 0xa5a5a5a5a5a5a5a5UL
+
+/* Raise RLIMIT_NOFILE so descriptors above WAIT_FORM_HIGH_FD can exist. */
+static int wait_form_nofile(void) {
+    struct rlimit rl;
+    if (getrlimit(RLIMIT_NOFILE, &rl) != 0) return -1;
+    if (rl.rlim_cur >= WAIT_FORM_WORDS * 64) return 0;
+    rl.rlim_cur = WAIT_FORM_WORDS * 64;
+    return setrlimit(RLIMIT_NOFILE, &rl);
+}
+
+/* Move a descriptor above FD_SETSIZE. */
+static int wait_form_high_fd(int fd) {
+    if (fd < 0) return -1;
+    int high = fcntl(fd, F_DUPFD, WAIT_FORM_HIGH_FD);
+    close(fd);
+    return high;
+}
+
+static void wait_form_set(unsigned long *set, int fd) { set[fd / 64] |= 1UL << (fd % 64); }
+
+static long wait_form_isset(const unsigned long *set, int fd) {
+    return (long)((set[fd / 64] >> (fd % 64)) & 1);
+}
+
+/* Every set bit counts, so a stray bit fails as well as a missing one. */
+static long wait_form_count(const unsigned long *set) {
+    long count = 0;
+    for (int i = 0; i < WAIT_FORM_WORDS; i++) count += __builtin_popcountl(set[i]);
+    return count;
+}
+
+/* Raw select or pselect6; pselect6 also blocks SIGUSR2 for the wait. A
+ * negative timeout passes NULL. *left_ns receives the time not slept. */
+static long wait_form_select(int use_pselect, int nfds, unsigned long *rd, unsigned long *wr,
+                             unsigned long *ex, int64_t timeout_ns, int64_t *left_ns) {
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR2);
+    struct { const sigset_t *set; size_t size; } wrapper = {&mask, 8};
+    struct timespec ts = ns_ts(timeout_ns < 0 ? 0 : timeout_ns);
+    struct timeval tv = {ts.tv_sec, ts.tv_nsec / 1000};
+    long n;
+    if (use_pselect)
+        n = syscall(SYS_pselect6, nfds, rd, wr, ex, timeout_ns < 0 ? NULL : &ts, &wrapper);
+    else
+        n = syscall(SYS_select, nfds, rd, wr, ex, timeout_ns < 0 ? NULL : &tv);
+    *left_ns = use_pselect ? (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec
+                           : (int64_t)tv.tv_sec * 1000000000LL + tv.tv_usec * 1000LL;
+    return n;
+}
+
+static void wait_form_wide_ready(int use_pselect) {
+    const char *name =
+        use_pselect ? "wait_form_pselect6_wide_ready" : "wait_form_select_wide_ready";
+    if (wait_form_nofile() != 0) { fail(name, "rlimit errno=%ld%ld", errno, 0); return; }
+    int ready = wait_form_high_fd(expired_tfd());
+    int far = wait_form_high_fd(armed_tfd(CLOCK_MONOTONIC, 0, 100000 * MS, 0, 0));
+    /* select also watches a pipe's write end, which has room to write. */
+    int p[2] = {-1, -1};
+    int out = -1;
+    if (!use_pselect && pipe(p) == 0) out = wait_form_high_fd(p[1]);
+    int low = ready < far ? ready : far;
+    if (!use_pselect && out < low) low = out;
+    if (low < WAIT_FORM_HIGH_FD) {
+        fail(name, "low_fd=%ld errno=%ld", (long)low, errno);
+        return;
+    }
+    unsigned long rd[WAIT_FORM_WORDS], wr[WAIT_FORM_WORDS], ex[WAIT_FORM_WORDS];
+    memset(rd, 0, sizeof rd);
+    memset(wr, 0, sizeof wr);
+    memset(ex, 0, sizeof ex);
+    wait_form_set(rd, ready);
+    wait_form_set(rd, far);
+    int nfds = (ready > far ? ready : far) + 1;
+    if (!use_pselect) {
+        wait_form_set(wr, out);
+        if (out + 1 > nfds) nfds = out + 1;
+    }
+    /* Linux copies only the words that hold descriptors below nfds. */
+    rd[WAIT_FORM_WORDS - 1] = WAIT_FORM_SENTINEL;
+    int64_t left = 0;
+    errno = 0;
+    long n = use_pselect ? wait_form_select(1, nfds, rd, NULL, NULL, 1000 * MS, &left)
+                         : wait_form_select(0, nfds, rd, wr, ex, 1000 * MS, &left);
+    long err = errno;
+    long sentinel_kept = rd[WAIT_FORM_WORDS - 1] == WAIT_FORM_SENTINEL;
+    rd[WAIT_FORM_WORDS - 1] = 0;
+    close(ready);
+    close(far);
+    if (!use_pselect) {
+        close(p[0]);
+        close(out);
+    }
+    if (n != (use_pselect ? 1 : 2)) fail(name, "n=%ld errno=%ld", n, err);
+    else if (!wait_form_isset(rd, ready) || wait_form_count(rd) != 1)
+        fail(name, "ready_bit=%ld read_bits=%ld", wait_form_isset(rd, ready), wait_form_count(rd));
+    else if (!use_pselect && (!wait_form_isset(wr, out) || wait_form_count(wr) != 1))
+        fail(name, "out_bit=%ld write_bits=%ld", wait_form_isset(wr, out), wait_form_count(wr));
+    else if (wait_form_count(ex) != 0) fail(name, "except_bits=%ld%ld", wait_form_count(ex), 0);
+    else if (!sentinel_kept) fail(name, "sentinel_kept=%ld%ld", sentinel_kept, 0);
+    else if (left < 500 * MS || left > 1000 * MS)
+        fail(name, "left_ms=%ld%ld", (long)(left / MS), 0);
+    else ok(name);
+}
+
+static void wait_form_wide_block(int use_pselect) {
+    const char *name =
+        use_pselect ? "wait_form_pselect6_wide_block" : "wait_form_select_wide_block";
+    if (wait_form_nofile() != 0) { fail(name, "rlimit errno=%ld%ld", errno, 0); return; }
+    int64_t start = now_ns(CLOCK_MONOTONIC);
+    int soon = wait_form_high_fd(armed_tfd(CLOCK_MONOTONIC, 0, 30 * MS, 0, 0));
+    int far = wait_form_high_fd(armed_tfd(CLOCK_MONOTONIC, 0, 100000 * MS, 0, 0));
+    if (soon < WAIT_FORM_HIGH_FD || far < WAIT_FORM_HIGH_FD) {
+        fail(name, "low_fd=%ld errno=%ld", (long)(soon < far ? soon : far), errno);
+        return;
+    }
+    unsigned long rd[WAIT_FORM_WORDS];
+    memset(rd, 0, sizeof rd);
+    wait_form_set(rd, soon);
+    wait_form_set(rd, far);
+    int nfds = (soon > far ? soon : far) + 1;
+    int64_t left = 0;
+    errno = 0;
+    long n = wait_form_select(use_pselect, nfds, rd, NULL, NULL, use_pselect ? 5000 * MS : -1,
+                              &left);
+    long err = errno;
+    int64_t elapsed = now_ns(CLOCK_MONOTONIC) - start;
+    close(soon);
+    close(far);
+    if (n != 1) fail(name, "n=%ld errno=%ld", n, err);
+    else if (!wait_form_isset(rd, soon) || wait_form_count(rd) != 1)
+        fail(name, "soon_bit=%ld read_bits=%ld", wait_form_isset(rd, soon), wait_form_count(rd));
+    else if (elapsed < 30 * MS || elapsed > 4000 * MS)
+        fail(name, "elapsed_ms=%ld%ld", (long)(elapsed / MS), 0);
+    else ok(name);
+}
+
+static void wait_form_wide_timeout(int use_pselect) {
+    const char *name =
+        use_pselect ? "wait_form_pselect6_wide_timeout" : "wait_form_select_wide_timeout";
+    if (wait_form_nofile() != 0) { fail(name, "rlimit errno=%ld%ld", errno, 0); return; }
+    int far = wait_form_high_fd(armed_tfd(CLOCK_MONOTONIC, 0, 100000 * MS, 0, 0));
+    if (far < WAIT_FORM_HIGH_FD) { fail(name, "fd=%ld errno=%ld", (long)far, errno); return; }
+    unsigned long rd[WAIT_FORM_WORDS];
+    memset(rd, 0, sizeof rd);
+    wait_form_set(rd, far);
+    int64_t left = -1;
+    int64_t start = now_ns(CLOCK_MONOTONIC);
+    errno = 0;
+    long n = wait_form_select(use_pselect, far + 1, rd, NULL, NULL, 20 * MS, &left);
+    long err = errno;
+    int64_t elapsed = now_ns(CLOCK_MONOTONIC) - start;
+    close(far);
+    if (n != 0) fail(name, "n=%ld errno=%ld", n, err);
+    else if (wait_form_count(rd) != 0) fail(name, "read_bits=%ld%ld", wait_form_count(rd), 0);
+    else if (left != 0) fail(name, "left_us=%ld%ld", (long)(left / 1000), 0);
+    else if (elapsed < 20 * MS || elapsed > 4000 * MS)
+        fail(name, "elapsed_ms=%ld%ld", (long)(elapsed / MS), 0);
+    else ok(name);
+}
+
 /* The fork and ppoll cases that check sharing and readiness only, never the
  * guest's clock; the `sharing` argument runs only these. */
 static void check_sharing_cases(void) {
@@ -1618,6 +1795,12 @@ int main(int argc, char **argv) {
     wait_form_epoll_pwait2_timeout();
     wait_form_epoll_pwait2_masked_ready();
     wait_form_epoll_pwait2_errors();
+    wait_form_wide_ready(0);
+    wait_form_wide_ready(1);
+    wait_form_wide_block(0);
+    wait_form_wide_block(1);
+    wait_form_wide_timeout(0);
+    wait_form_wide_timeout(1);
     check_sharing_cases();
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
