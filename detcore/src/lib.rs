@@ -214,13 +214,15 @@ pub fn is_kernel_keyring_syscall(sysno: Sysno) -> bool {
 /// Returns whether Detcore deterministically refuses `sysno` with a fixed
 /// errno when the fail-closed policy is active, without consulting the host.
 ///
-/// This is the boundary backends that execute guest syscalls outside Detcore's
-/// `handle_syscall_event` dispatcher (the DBT copied-child fast path and the
-/// KVM executor) consult to enforce the same fixed refusal the ptrace path
-/// enforces. It deliberately excludes emulated / no-op / host-forwarding
-/// families (credential no-ops, `timer_create`, AF_UNIX autobind, `openat2`,
-/// `copy_file_range`), because fail-closing a copied child for those would
-/// diverge from the ptrace path rather than match it.
+/// A backend that lets a guest execute a syscall outside Detcore's
+/// `handle_syscall_event` dispatcher consults this to enforce the same fixed
+/// refusal the ptrace path enforces. The only production consumer is the DBT
+/// copied pre-exec child policy in `detcore-dbt`, which runs without a Detcore
+/// tool; the KVM backend, like ptrace, delivers these syscalls to
+/// `handle_syscall_event`. It deliberately excludes emulated / no-op /
+/// host-forwarding families (credential no-ops, `timer_create`, AF_UNIX
+/// autobind), because fail-closing a copied child for those would diverge from
+/// the ptrace path rather than match it.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-978): Review the copied-DBT-child deterministic-refusal surface.
 pub fn is_deterministically_refused_syscall(sysno: Sysno) -> bool {
@@ -2236,7 +2238,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // TODO-HUMAN-REVIEW(PR-855): Fail-closed runs cannot expose
             // unmodeled pipe-buffer ownership or vmsplice page pinning, but
             // preserve host pass-through under the explicit compatibility
-            // opt-out used by the existing rr splice test. splice and tee
+            // opt-out, `hermit run --allow-unsupported-syscalls`. splice and tee
             // refuse with EINVAL, the errno Linux returns when a descriptor
             // pair cannot be spliced and the one callers fall back to
             // read/write on: GNU grep 3.12 drains a pipe into /dev/null with

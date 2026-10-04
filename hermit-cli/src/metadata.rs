@@ -170,7 +170,14 @@ impl RecordVersion {
 // record a Bytes event (Return for a zero-size query), and zero-count read and
 // pread64 calls are recorded instead of running live. An older reader would
 // desynchronize on these events.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x120);
+// 0x120 -> 0x121: splice and tee refuse with EINVAL instead of ENOSYS; vmsplice
+// keeps ENOSYS. Record and replay always fail closed, and Detcore computes this
+// refusal itself rather than recording it, so replay recomputes the errno. The
+// guest can branch on it: GNU grep falls back to read/write on EINVAL but
+// reports a read error and exits 2 on ENOSYS. Replaying an older stream under
+// the new errno could change guest control flow and event consumption, although
+// no event shape changed.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x121);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -195,7 +202,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x120);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x120;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x121;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
