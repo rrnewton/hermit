@@ -10868,6 +10868,9 @@ fn import_results(
         .len();
     let current = read_current_pressure_evidence(root, current_summaries, &before)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
+    // The removal below runs before the fold, so it must not remove a
+    // canonical comparison that this input cannot replace.
+    refuse_stripped_only_replacement(&tracked, &retained_cells)?;
     // This command is a projection, not an append-only history store. Remove
     // only ordinary projections: canonical comparisons and the exact
     // invocations of stripped passes. Parity receipts measure another relation
@@ -18015,6 +18018,61 @@ fn remove_imported_validate_projection(cell: &mut TrackedCell) {
     }) {
         cell.last_tested = None;
     }
+}
+
+/// Refuse a retained import whose input supplies a cell's below-L2 stripped
+/// pass but no canonical comparison, while the tracked projection holds a
+/// canonical comparison for that cell.
+///
+/// `import-results` removes every imported ordinary projection, canonical
+/// comparisons included, before it folds the input. For such a cell the
+/// removal would delete the canonical comparison and leave the stripped pass
+/// as its only ordinary result, so a below-L2 pass would retire an active
+/// canonical failure. A stripped pass cannot supersede a canonical comparison,
+/// so the input cannot replace that projection, and the whole import is
+/// refused before anything is written. An input that supplies a canonical
+/// comparison for the cell replaces its canonical projection as before. A
+/// cell that the input does not supply at all keeps the projection rule: its
+/// imported rows are removed and nothing replaces them, which records no pass.
+fn refuse_stripped_only_replacement(
+    tracked: &TrackedCells,
+    retained: &[RetainedCellResults],
+) -> Result<(), String> {
+    let mut supplied = BTreeMap::<&CellId, BTreeSet<RetainedComparisonDomain>>::new();
+    for cell in retained {
+        supplied.entry(&cell.id).or_default().insert(cell.domain);
+    }
+    for cell in &tracked.cells {
+        let Some(domains) = supplied.get(&cell.id) else {
+            continue;
+        };
+        if !domains.contains(&RetainedComparisonDomain::Stripped)
+            || domains.contains(&RetainedComparisonDomain::Canonical)
+        {
+            continue;
+        }
+        let held = cell
+            .observations
+            .iter()
+            .filter(|observation| observation.provenance == ObservationProvenance::Validate)
+            .flat_map(|observation| &observation.canonical_comparisons)
+            .collect::<Vec<_>>();
+        if let Some(first) = held.first() {
+            return Err(format!(
+                "import-results refuses a replacement for {}: the input supplies a below-L2 \
+                 stripped pass but no canonical comparison, so it cannot replace the {} \
+                 canonical comparison(s) the tracked projection holds (first: run {} at {}, \
+                 {:?}); a stripped pass cannot retire a canonical result, and nothing was \
+                 written",
+                display_id(&cell.id),
+                held.len(),
+                first.run_id,
+                first.hermit_sha,
+                first.result,
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Rank commits in the current Hermit history for retained-result import.
