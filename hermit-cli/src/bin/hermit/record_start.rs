@@ -366,6 +366,8 @@ impl StartOpts {
             return Ok(None);
         }
 
+        #[cfg(not(feature = "e9patch"))]
+        Backend::E9patch.ensure_available()?;
         Backend::Ptrace.ensure_available()?;
         let target = self.resolve_e9patch_record_target()?;
         if !is_elf_file(&target)? {

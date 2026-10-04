@@ -61,11 +61,12 @@ impl Version {
 /// Formats a Cargo or OSS Buck build's version. A release build names its
 /// revision, for example `0.4.0 (2026-10-02, gabc123def456)`. A regular build
 /// embeds no revision (`unknown`, see `build_support::UNSTAMPED_GIT_SHA`) and
-/// says so: `0.4.0 (2026-10-02, dev build)`.
+/// says so: `0.4.0 (2026-10-02, source revision not embedded)`. A registry build
+/// has the published package version even though it carries no Git stamp.
 #[cfg(any(not(fbcode_build), test))]
 fn cargo_version(crate_version: &str, build_date: &str, git_sha: &str) -> String {
     if git_sha == "unknown" {
-        format!("{crate_version} ({build_date}, dev build)")
+        format!("{crate_version} ({build_date}, source revision not embedded)")
     } else {
         format!("{crate_version} ({build_date}, g{git_sha})")
     }
@@ -126,10 +127,10 @@ mod tests {
     }
 
     #[test]
-    fn cargo_version_of_an_unstamped_build_says_dev_build() {
+    fn cargo_version_of_an_unstamped_build_discloses_missing_revision() {
         assert_eq!(
             cargo_version("0.4.0", "2026-10-02", "unknown"),
-            "0.4.0 (2026-10-02, dev build)"
+            "0.4.0 (2026-10-02, source revision not embedded)"
         );
     }
 

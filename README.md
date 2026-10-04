@@ -35,7 +35,7 @@ On Debian or Ubuntu:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libunwind-dev liblzma-dev
+sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev
 ```
 
 On Fedora or CentOS:
@@ -77,7 +77,7 @@ cargo build --release --workspace
 ```
 
 A regular build does not embed the Git revision, so `hermit --version` reports
-`hermit 0.4.0 (2026-10-02, dev build)` and `hermit version --json` reports
+`hermit 0.4.0 (2026-10-02, source revision not embedded)` and `hermit version --json` reports
 `"git_sha": "unknown"`. This keeps a commit that does not change Hermit's
 source from rebuilding it. To stamp the revision, as a release build does, set
 `HERMIT_STAMP_GIT_SHA=1` when building; the version then reads

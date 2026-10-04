@@ -3,8 +3,13 @@
 [package]
 name = "hermit"
 description = "Hermit: a deterministic Linux execution engine for reproducible runs, record and replay, and concurrency-race search."
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/hermit-run"
+keywords = ["linux", "hermit", "determinism", "debugging"]
+categories = ["development-tools::debugging", "development-tools::testing"]
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
@@ -12,21 +17,21 @@ license = "BSD-3-Clause"
 crate-type = ["rlib", "cdylib"]
 
 # Third-party-dependency and experimental execution backends are OFF by default
-# so the shipped `hermit` binary is a single static binary with the ptrace and
-# kvm backends and no DynamoRIO/e9patch/SaBRe/LiteInst dependencies. CI builds
+# so the shipped `hermit` binary includes the ptrace and KVM backends
+# without DynamoRIO/e9patch/SaBRe/LiteInst dependencies. CI builds
 # with `--features third-party-backends` to compile and test them. `dbt` adds
 # detcore-dbt + reverie-dbt and `liteinst` adds reverie-liteinst (and through it
 # liteinst2); `sabre` and `e9patch` shell out to external artifacts at runtime
-# and only gate their in-crate dispatch code. LiteInst is left out of the
-# default build because its architecture is not settled (see the 2026-10-02
+# with SaBRe's Rust RPC/statistics support selected only by `sabre`. LiteInst is
+# left out of the default build because its architecture is not settled (see the 2026-10-02
 # patching-backends architecture audit); every validation still builds it
 # through `third-party-backends`.
 [features]
 default = []
 # Native controls exercise real KVM ownership/RPC helpers without a VM.
 kvm-native-test-support = ["reverie-kvm/native-test-support"]
-dbt = ["dep:detcore-dbt", "dep:reverie-dbt"]
-sabre = []
+dbt = ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"]
+sabre = ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"]
 e9patch = []
 liteinst = ["dep:reverie-liteinst"]
 third-party-backends = ["dbt", "sabre", "e9patch", "liteinst"]
@@ -39,15 +44,15 @@ bincode = { version = "2", features = ["serde"] }
 addr2line = "0.26.1"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
-detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
+detcore = { package = "hermit-detcore", version = "0.4.1", path = "../detcore" }
 detcore-dbt = { version = "0.4.0", path = "../detcore-dbt", optional = true }
-detcore-model = { version = "0.4.0", path = "../detcore-model" }
+detcore-model = { version = "0.4.1", path = "../detcore-model" }
 diff = "0.1.13"
 dirs = "6.0"
 fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
-hermit-resources = { version = "0.4.0", path = "../hermit-resources" }
-hermit-test-workdir = { version = "0.4.0", path = "../common/test-workdir" }
+hermit-resources = { version = "0.4.1", path = "../hermit-resources" }
+hermit-test-workdir = { version = "0.4.1", path = "../common/test-workdir", optional = true }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
@@ -59,13 +64,13 @@ rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
 # Reverie is pinned to a specific commit for reproducibility. Keep this rev in
 # sync across all crates and bump it via docs/updating-reverie.md.
-reverie = { package = "reverie-core", version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "034ebf294e3e863805d2971d85499a0041f67e8b" }
-reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "034ebf294e3e863805d2971d85499a0041f67e8b", default-features = false, optional = true }
-reverie-kvm = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "034ebf294e3e863805d2971d85499a0041f67e8b" }
-reverie-ptrace = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "034ebf294e3e863805d2971d85499a0041f67e8b" }
-reverie-liteinst = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "034ebf294e3e863805d2971d85499a0041f67e8b", default-features = false, optional = true }
-reverie-rpc-transport = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "034ebf294e3e863805d2971d85499a0041f67e8b" }
-reverie-sabre-stats = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "034ebf294e3e863805d2971d85499a0041f67e8b" }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "b8ef6a829634d51e79ebc4c24e11c5dd5fac205c" }
+reverie-dbt = { version = "0.4.0", git = "https://github.com/rrnewton/reverie.git", rev = "b8ef6a829634d51e79ebc4c24e11c5dd5fac205c", default-features = false, optional = true }
+reverie-kvm = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "b8ef6a829634d51e79ebc4c24e11c5dd5fac205c" }
+reverie-ptrace = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "b8ef6a829634d51e79ebc4c24e11c5dd5fac205c" }
+reverie-liteinst = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "b8ef6a829634d51e79ebc4c24e11c5dd5fac205c", default-features = false, optional = true }
+reverie-rpc-transport = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "b8ef6a829634d51e79ebc4c24e11c5dd5fac205c", optional = true }
+reverie-sabre-stats = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "b8ef6a829634d51e79ebc4c24e11c5dd5fac205c", optional = true }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"

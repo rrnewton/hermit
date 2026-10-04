@@ -21,6 +21,22 @@ rust_library(
     srcs = glob(["src/**/*.rs"]),
     autocargo = {
         "cargo_toml_config": {
+            "package": {
+                "version": "0.4.1",
+                "readme": "README.md",
+                "homepage": "https://hermetic-infra.org",
+                "documentation": "https://docs.rs/hermit-detcore",
+                "keywords": [
+                    "linux",
+                    "hermit",
+                    "determinism",
+                    "debugging"
+                ],
+                "categories": [
+                    "development-tools::debugging",
+                    "development-tools::testing"
+                ]
+            },
             "dependencies_override": {
                 "dependencies": {
                     "bitflags": {

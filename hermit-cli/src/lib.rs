@@ -7,6 +7,7 @@
  */
 
 // Treat all Clippy warnings as errors.
+#![doc = include_str!("../README.md")]
 #![deny(clippy::all)]
 #![allow(clippy::uninlined_format_args)]
 
@@ -324,7 +325,9 @@ mod record_replay_path;
 mod recorder;
 mod replay;
 mod replayer;
+#[cfg(feature = "sabre")]
 mod sabre_bootstrap;
+#[cfg(feature = "sabre")]
 mod sabre_ptrace;
 mod script;
 
@@ -336,13 +339,18 @@ use std::io::SeekFrom;
 use std::io::Write;
 use std::os::fd::AsRawFd;
 use std::os::fd::FromRawFd;
+#[cfg(any(feature = "sabre", feature = "liteinst"))]
 use std::os::unix::ffi::OsStrExt;
+#[cfg(feature = "sabre")]
 use std::os::unix::fs::OpenOptionsExt;
+#[cfg(any(feature = "sabre", feature = "liteinst"))]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::path::PathBuf;
+#[cfg(feature = "sabre")]
 use std::sync::Arc;
 use std::sync::Mutex;
+#[cfg(feature = "sabre")]
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 use std::time::Instant;
@@ -390,6 +398,7 @@ pub use ptrace_completion::RecoveryRefusal;
 use record::Record;
 use replay::Replay;
 pub use reverie::ExitStatus;
+#[cfg(feature = "sabre")]
 use reverie::GlobalTool;
 pub use reverie::process;
 pub use reverie::process::Command;
@@ -1679,13 +1688,9 @@ impl SkidOvershootReport {
     }
 }
 
-// SaBRe and e9patch add no third-party Rust dependencies to `hermit-cli` (SaBRe
-// shells out to an external loader plus `libdetcore_sabre.so`, and e9patch shells
-// out to `e9tool`/`e9patch`). They are still gated behind the `sabre` and
-// `e9patch` cargo features so the default `hermit` binary reports them as absent
-// and only the `third-party-backends` build offers them. The reverie-sabre Rust
-// dependency lives in the `detcore-sabre` crate, which is excluded from the
-// workspace's `default-members`.
+// SaBRe's statistics and RPC support are selected only by `sabre`; the external
+// loader and Detcore plugin must also be supplied. e9patch preprocessing requires
+// external `e9tool`/`e9patch` artifacts. Neither path is enabled by default.
 #[cfg(feature = "sabre")]
 fn sabre_unavailable_reason() -> Option<String> {
     sabre_runtime_unavailable_reason()
@@ -1723,17 +1728,31 @@ fn dbt_unavailable_reason() -> Option<String> {
 #[cfg(not(feature = "dbt"))]
 // TODO-HUMAN-REVIEW(PR-1150): Review the default-on DBT compile-time feature boundary.
 fn dbt_unavailable_reason() -> Option<String> {
-    Some("the `dbt` feature is not enabled in this build; rebuild with `--features dbt` (or `--features third-party-backends`). This says nothing about whether DynamoRIO works on this machine -- it has not been checked".to_owned())
+    Some(dbt_disabled_build_reason(
+        option_env!("CARGO_PKG_NAME").unwrap_or("hermit"),
+    ))
 }
 
+#[cfg(not(feature = "dbt"))]
+fn dbt_disabled_build_reason(package_name: &str) -> String {
+    if package_name == "hermit-run" {
+        "the dbt backend is not included in this registry release; use a source build from https://github.com/rrnewton/hermit with `--features dbt`. The registry's `third-party-backends` feature does not include DBT. DynamoRIO availability on this machine has not been checked".to_owned()
+    } else {
+        "the `dbt` feature is not enabled in this source build; rebuild with `--features dbt` (or `--features third-party-backends`). DynamoRIO availability on this machine has not been checked".to_owned()
+    }
+}
+
+#[cfg(feature = "sabre")]
 const SABRE_BINARY_ENV: &str = "HERMIT_SABRE_BINARY";
 
+#[cfg(feature = "sabre")]
 fn is_executable_file(path: &Path) -> bool {
     fs::metadata(path)
         .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
 }
 
 // TODO-HUMAN-REVIEW(PR-739): Review SaBRe loader discovery and executable validation.
+#[cfg(feature = "sabre")]
 fn resolve_sabre_binary_from(
     override_path: Option<&OsStr>,
     packaged_path: Option<&Path>,
@@ -1790,6 +1809,7 @@ fn resolve_sabre_binary_from(
     ))
 }
 
+#[cfg(feature = "sabre")]
 fn resolve_sabre_binary() -> Result<PathBuf, Error> {
     let executable =
         std::env::current_exe().context("failed to locate running Hermit executable")?;
@@ -1804,21 +1824,28 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
     )
 }
 
+#[cfg(feature = "sabre")]
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
+#[cfg(feature = "sabre")]
 const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
+#[cfg(feature = "sabre")]
 const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
+#[cfg(feature = "sabre")]
 const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
 
+#[cfg(feature = "sabre")]
 struct StagedSabreProgram {
     path: PathBuf,
 }
 
+#[cfg(feature = "sabre")]
 impl Drop for StagedSabreProgram {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
 }
 
+#[cfg(feature = "sabre")]
 fn sabre_program_needs_neutral_name(program: &Path) -> bool {
     program
         .file_name()
@@ -1827,6 +1854,7 @@ fn sabre_program_needs_neutral_name(program: &Path) -> bool {
 
 // TODO-HUMAN-REVIEW(PR-845): Review the neutral-name workaround for SaBRe's
 // dynamic-loader prefix collision.
+#[cfg(feature = "sabre")]
 fn stage_sabre_program_in(
     program: &Path,
     staging_directory: &Path,
@@ -1868,6 +1896,7 @@ fn stage_sabre_program_in(
 }
 
 // TODO-HUMAN-REVIEW(PR-738): Review controller/plugin artifact separation.
+#[cfg(feature = "sabre")]
 fn sabre_runtime_library_path() -> io::Result<PathBuf> {
     if let Some(path) = hermit_resources::resource("libdetcore_sabre.so")?
         && path.is_file()
@@ -1913,8 +1942,10 @@ fn sabre_runtime_unavailable_reason() -> Option<String> {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-774): Review the bounded SaBRe RPC disconnect drain.
+#[cfg(feature = "sabre")]
 const SABRE_RPC_DISCONNECT_TIMEOUT: Duration = Duration::from_secs(1);
 
+#[cfg(feature = "sabre")]
 async fn wait_for_sabre_rpc_disconnects<T>(
     global: &Arc<T>,
     timeout: Duration,
@@ -1940,6 +1971,7 @@ async fn wait_for_sabre_rpc_disconnects<T>(
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-782): Review SaBRe RPC server shutdown errors.
+#[cfg(feature = "sabre")]
 async fn stop_sabre_rpc_server<E>(
     server_task: tokio::task::JoinHandle<Result<(), E>>,
 ) -> Result<(), Error>
@@ -1957,6 +1989,7 @@ where
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-789): Review complete SaBRe RPC shutdown ordering.
+#[cfg(feature = "sabre")]
 async fn shutdown_sabre_rpc<T, E>(
     server_task: tokio::task::JoinHandle<Result<(), E>>,
     global: &Arc<T>,
@@ -1999,6 +2032,7 @@ fn ensure_backend_dispatch(backend: Backend) -> Result<(), Error> {
 /// the single GlobalState held by this Hermit coordinator process.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-738): Review SaBRe coordinator lifetime and artifact loading.
+#[cfg(feature = "sabre")]
 async fn run_sabre(
     mut command: Command,
     config: DetConfig,
@@ -2227,8 +2261,21 @@ async fn run_sabre(
     Ok(output)
 }
 
+#[cfg(not(feature = "sabre"))]
+async fn run_sabre(
+    _command: Command,
+    _config: DetConfig,
+    _print_summary: bool,
+    _print_summary_to_json_file: &Option<PathBuf>,
+    _capture_output: bool,
+) -> Result<Output, Error> {
+    Backend::Sabre.ensure_available()?;
+    unreachable!("SaBRe availability must fail when the feature is disabled");
+}
+
 /// Classify the existing SaBRe reach evidence without collapsing "never
 /// engaged" into the same zero-valued state as a fully exercised run.
+#[cfg(feature = "sabre")]
 fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> &'static str {
     match (guest_rpc_observed, ptrace_fallback_sites) {
         (false, _) => "no-detcore-reached",
@@ -2249,6 +2296,7 @@ fn sabre_reach_state(guest_rpc_observed: bool, ptrace_fallback_sites: usize) -> 
 /// 14 under ptrace; the 11 absent records were the loader's libc.so.6 path
 /// resolution. The launch-order fact, not that host-specific count, is the
 /// runtime contract.
+#[cfg(feature = "sabre")]
 fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String {
     format!(
         ":: Backend: sabre static rewriting + ptrace runtime; run_mode=run; \
@@ -2276,6 +2324,7 @@ fn sabre_backend_evidence_line(evidence: &sabre_ptrace::PathEvidence) -> String 
 /// statically linked ELF is the sharp edge: it has no dynamic loader and no
 /// shared library through which SaBRe could regain control, so an unrewritten
 /// static client runs entirely on bare Linux with no second chance.
+#[cfg(feature = "sabre")]
 fn sabre_uninstrumented_guest_message(status: &ExitStatus) -> String {
     format!(
         "the SaBRe backend finished ({status:?}) without the guest ever reaching the Detcore \
@@ -4858,6 +4907,56 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "dbt"))]
+    #[test]
+    fn dbt_registry_diagnostic_redirects_to_a_source_build() {
+        let reason = super::dbt_disabled_build_reason("hermit-run");
+        assert!(reason.contains("not included in this registry release"));
+        assert!(reason.contains("source build from https://github.com/rrnewton/hermit"));
+        assert!(reason.contains("`third-party-backends` feature does not include DBT"));
+        assert!(reason.contains("has not been checked"));
+
+        let source_reason = super::dbt_disabled_build_reason("hermit");
+        assert!(source_reason.contains("rebuild with `--features dbt`"));
+        assert!(!source_reason.contains("not included in this registry release"));
+    }
+
+    #[cfg(not(feature = "sabre"))]
+    #[tokio::test]
+    async fn disabled_sabre_dispatch_refuses_before_resolving_the_program() {
+        let program = "/hermit-missing-disabled-sabre-program";
+        let error = super::dispatch_backend(
+            super::Command::new(program),
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::Sabre,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the `sabre` feature is not enabled")
+        );
+        let error = super::dispatch_output_backend(
+            super::Command::new(program),
+            super::DetConfig::default(),
+            false,
+            &None,
+            Backend::Sabre,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the `sabre` feature is not enabled")
+        );
+    }
+
     #[test]
     #[cfg(feature = "dbt")]
     fn a_cold_dbt_runtime_diagnostic_is_not_feature_absence() {
@@ -4872,19 +4971,25 @@ mod tests {
         assert!(!reason.contains("not enabled in this build"));
         assert!(!reason.contains("has not been checked"));
     }
+    #[cfg(feature = "sabre")]
     use std::ffi::OsStr;
     use std::fs;
+    #[cfg(any(feature = "sabre", feature = "dbt"))]
     use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
+    #[cfg(feature = "sabre")]
     use std::sync::Arc;
+    #[cfg(feature = "sabre")]
     use std::time::Duration;
 
     use super::Backend;
+    #[cfg(any(feature = "sabre", feature = "liteinst"))]
     use super::ExitStatus;
     use super::HermitData;
     use super::Id;
     use super::LITEINST_IN_GUEST_ENV;
     use super::LiteinstRuntime;
+    #[cfg(feature = "sabre")]
     use super::SABRE_RPC_SOCKET_ENV;
     use super::collect_recording_ids;
     #[cfg(feature = "dbt")]
@@ -4906,14 +5011,23 @@ mod tests {
     use super::prepare_backend_config_for_liteinst_runtime;
     use super::reserve_output_stdin_snapshot;
     use super::resolve_kvm_shebang;
+    #[cfg(feature = "sabre")]
     use super::resolve_sabre_binary_from;
+    #[cfg(feature = "sabre")]
     use super::sabre_backend_evidence_line;
+    #[cfg(feature = "sabre")]
     use super::sabre_program_needs_neutral_name;
+    #[cfg(feature = "sabre")]
     use super::sabre_reach_state;
+    #[cfg(feature = "sabre")]
     use super::sabre_uninstrumented_guest_message;
+    #[cfg(feature = "sabre")]
     use super::shutdown_sabre_rpc;
+    #[cfg(feature = "sabre")]
     use super::stage_sabre_program_in;
+    #[cfg(feature = "sabre")]
     use super::stop_sabre_rpc_server;
+    #[cfg(feature = "sabre")]
     use super::wait_for_sabre_rpc_disconnects;
 
     #[test]
@@ -5072,6 +5186,7 @@ mod tests {
     /// reaches this path in practice because a static client has no dynamic
     /// loader through which SaBRe could regain control.
     #[test]
+    #[cfg(feature = "sabre")]
     fn uninstrumented_sabre_guest_is_reported_as_no_determinization() {
         let message = sabre_uninstrumented_guest_message(&ExitStatus::Exited(0));
         assert!(
@@ -5102,6 +5217,7 @@ mod tests {
     /// engaged zero-fallback run as `sabre-exercised`. Assert the three states
     /// together so no pair can collapse back onto one value.
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_reach_states_are_pairwise_distinct() {
         let no_detcore = sabre_reach_state(false, 0);
         let degraded = sabre_reach_state(true, 1);
@@ -5121,6 +5237,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_backend_fact_is_versioned_and_names_preplugin_coverage() {
         let exercised = super::sabre_ptrace::PathEvidence {
             schema: 1,
@@ -5420,6 +5537,7 @@ mod tests {
         assert!(reason.contains("read-write"));
     }
 
+    #[cfg(any(feature = "sabre", feature = "dbt"))]
     fn write_test_executable(path: &std::path::Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();
         fs::write(path, b"test loader").unwrap();
@@ -5429,11 +5547,13 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_rpc_socket_uses_private_exec_environment() {
         assert!(SABRE_RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_stages_program_names_that_collide_with_loader_prefix() {
         assert!(sabre_program_needs_neutral_name(
             PathBuf::from("/usr/bin/ld").as_path()
@@ -5447,6 +5567,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_neutral_name_staging_preserves_program_bytes_and_cleans_up() {
         let temp = tempfile::tempdir().unwrap();
         let program = temp.path().join("ld.test");
@@ -5470,6 +5591,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_disconnect_wait_observes_delayed_release() {
         let global = Arc::new(());
         let connection = global.clone();
@@ -5485,6 +5607,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_disconnect_wait_reports_stuck_connection() {
         let global = Arc::new(());
         let _connection = global.clone();
@@ -5496,6 +5619,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_server_intentional_abort_is_clean() {
         let server_task = tokio::spawn(std::future::pending::<Result<(), &'static str>>());
 
@@ -5503,6 +5627,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_server_failure_is_reported() {
         let server_task = tokio::spawn(async { Err::<(), _>("accept failed") });
         while !server_task.is_finished() {
@@ -5514,6 +5639,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[cfg(feature = "sabre")]
     async fn sabre_rpc_shutdown_drains_connections_after_server_failure() {
         let global = Arc::new(());
         let connection = global.clone();
@@ -5534,6 +5660,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_binary_resolver_finds_cargo_target_build() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("target/release/hermit");
@@ -5547,6 +5674,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_binary_resolver_uses_packaged_loader() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("target/release/hermit");
@@ -5560,6 +5688,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_binary_resolver_prefers_and_validates_override() {
         let temp = tempfile::tempdir().unwrap();
         let executable = temp.path().join("target/release/hermit");

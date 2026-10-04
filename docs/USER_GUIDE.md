@@ -29,8 +29,36 @@ On Debian or Ubuntu:
 
 ```bash
 sudo apt-get update
-sudo apt-get install -y libunwind-dev liblzma-dev
+sudo apt-get install -y build-essential pkg-config libunwind-dev liblzma-dev
 ```
+
+For the registry release, install stable Rust with rustup, then use
+`cargo +stable install hermit-run --version 0.4.1 --locked`. The package's
+executable is named `hermit`. The 0.4.1 ptrace release is qualified on Ubuntu
+24.04's stock Linux 6.8 kernel. Source builds continue to use the toolchain
+selected by `rust-toolchain.toml`.
+
+Ubuntu 24.04 may deny unprivileged user namespaces through AppArmor even when
+`kernel.unprivileged_userns_clone=1`. Errors include `MapUid: EPERM` and
+`Setting UID map failed`. An administrator can allow the installed Hermit
+executable through a scoped profile while keeping
+`kernel.apparmor_restrict_unprivileged_userns=1`. Find its absolute path with
+`readlink -f "$(command -v hermit)"`; create `/etc/apparmor.d/hermit-local`,
+substituting that path for the example attachment below:
+
+```text
+abi <abi/4.0>,
+include <tunables/global>
+
+profile hermit /home/YOUR_USER/.cargo/bin/hermit flags=(unconfined) {
+  userns,
+}
+```
+
+Load it with `sudo apparmor_parser -r /etc/apparmor.d/hermit-local`, then retry
+`hermit run -- /bin/echo hello`. This grants user-namespace access to the named
+executable; review that path and local security policy before applying the
+profile, and update it if the installation path changes.
 
 On Fedora or CentOS:
 
@@ -74,7 +102,7 @@ cargo build --release --workspace
 ```
 
 A regular build does not embed the Git revision, so `hermit --version` reports
-`hermit 0.4.0 (2026-10-02, dev build)` and `hermit version --json` reports
+`hermit 0.4.0 (2026-10-02, source revision not embedded)` and `hermit version --json` reports
 `"git_sha": "unknown"`. This keeps a commit that does not change Hermit's
 source from rebuilding it. To stamp the revision, as a release build does, set
 `HERMIT_STAMP_GIT_SHA=1` when building; the version then reads
