@@ -5937,8 +5937,10 @@ mod tests {
             .find("write_verification_json(path, &outcome)")
             .expect("verification report publication");
         let announce = verification
-            .find("announce_verification_outcome(&outcome")
+            .find("announce_verification_outcome(")
             .expect("verification announcement");
+        let arguments = &verification[announce + "announce_verification_outcome(".len()..];
+        assert!(arguments.trim_start().starts_with("&outcome,"), "{arguments}");
         assert!(publish < announce);
         // Run mode compares two independent runs, never a replay, so its match
         // line must not use the replay wording for the time note.
