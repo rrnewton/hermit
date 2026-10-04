@@ -1309,27 +1309,72 @@ fn clock_trajectory(backend: &str) -> Vec<ClockSample> {
 /// across runs in one environment, but they depend on the fixture binary that
 /// the host's cc produces, on the runtime's library set and on the environment
 /// (likely the lengths of the mapped paths), so the test bounds them instead of
-/// asserting them. 200 ms per image leaves about 49 to 64 ms of headroom and
+/// asserting them. On GitHub's hosted runners it is 194,525,000 ns in both
+/// images, the same in all three runs of
+/// https://github.com/rrnewton/hermit/pull/3508 (for example job 110966808998
+/// of https://github.com/rrnewton/hermit/actions/runs/37041622670). 200 ms per
+/// image leaves about 49 to 64 ms of headroom here and 5.475 ms there, and
 /// fails if even a tenth of the runtime constructor is charged again. This residual is
 /// not parity: it grows with every exec, and after enough execs sysinfo uptime
-/// differs between the backends again. The follow-up is tracked from
-/// https://github.com/rrnewton/hermit/issues/3338.
+/// differs between the backends again. The follow-up is tracked in
+/// https://github.com/rrnewton/hermit/issues/3352.
 const LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS: u128 = 200_000_000;
+
+/// `VIRTUAL_TIME_EPOCH` in nanoseconds since the Unix epoch. The guest's
+/// CLOCK_MONOTONIC counts from it, like its CLOCK_REALTIME.
+const VIRTUAL_TIME_EPOCH_NS: u128 = 1_767_225_600_000_000_000;
+
+/// Detcore's default `--sysinfo-uptime-offset`, which these runs keep.
+const SYSINFO_UPTIME_OFFSET_SECONDS: i64 = 120;
+
+/// The `sysinfo(2)` uptime Detcore reports at virtual instant `ns`: the offset
+/// plus the time since the epoch, rounded up to a whole second as Linux does
+/// (`sysinfo_uptime_seconds` in detcore/src/syscalls/sysinfo.rs).
+fn sysinfo_uptime_at(ns: u128) -> i64 {
+    let elapsed = ns
+        .checked_sub(VIRTUAL_TIME_EPOCH_NS)
+        .unwrap_or_else(|| panic!("virtual instant {ns} ns precedes the epoch"));
+    SYSINFO_UPTIME_OFFSET_SECONDS
+        + i64::try_from(elapsed.div_ceil(1_000_000_000)).expect("uptime fits i64")
+}
+
+/// The virtual instants between which sample `index`'s sysinfo call ran.
+///
+/// The fixture calls sysinfo after clock_gettime and before the next sample's
+/// clock_gettime. The last sample of an image has no next read in that image;
+/// every iteration runs the same code, so its sysinfo call is no further from
+/// its clock_gettime than one whole iteration, the previous sample's interval.
+fn sysinfo_window(samples: &[ClockSample], index: usize) -> (u128, u128) {
+    let start = samples[index].monotonic_ns;
+    let last_in_image =
+        index + 1 == CLOCK_TRAJECTORY_FIRST_AFTER_EXEC || index + 1 == CLOCK_TRAJECTORY_SAMPLES;
+    let end = if last_in_image {
+        start + (start - samples[index - 1].monotonic_ns)
+    } else {
+        samples[index + 1].monotonic_ns
+    };
+    (start, end)
+}
 
 #[test]
 fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
     let liteinst = clock_trajectory("liteinst");
     let ptrace = clock_trajectory("ptrace");
 
-    // The fixture's last read is about 0.91 to 0.92 s past the epoch under LiteInst,
-    // below the next uptime boundary, so both backends read the same uptime.
-    // This is not a general guarantee; see LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS.
-    let liteinst_uptime = liteinst.iter().map(|s| s.uptime).collect::<Vec<_>>();
-    let ptrace_uptime = ptrace.iter().map(|s| s.uptime).collect::<Vec<_>>();
-    assert_eq!(
-        liteinst_uptime, ptrace_uptime,
-        "LiteInst and ptrace must agree on sysinfo uptime\nliteinst={liteinst:?}\nptrace={ptrace:?}"
-    );
+    // Under each backend, every sysinfo uptime is the one Detcore derives from
+    // the same virtual clock that CLOCK_MONOTONIC reads. The window allows two
+    // adjacent values only when a whole second falls inside it.
+    for (backend, samples) in [("LiteInst", &liteinst), ("ptrace", &ptrace)] {
+        for index in 0..CLOCK_TRAJECTORY_SAMPLES {
+            let (start, end) = sysinfo_window(samples, index);
+            let expected = sysinfo_uptime_at(start)..=sysinfo_uptime_at(end);
+            assert!(
+                expected.contains(&samples[index].uptime),
+                "{backend} sample {index} reads uptime {} but its sysinfo call ran between {start} and {end} ns, where Detcore reports {expected:?}\nliteinst={liteinst:?}\nptrace={ptrace:?}",
+                samples[index].uptime
+            );
+        }
+    }
 
     // Inside one image, after main starts, the guest runs identical code under
     // both backends, so the time between consecutive samples must be identical
@@ -1381,6 +1426,29 @@ fn liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image() {
         exec_growth < LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS,
         "the exec adds {exec_growth} ns to the LiteInst gap\nliteinst={liteinst:?}\nptrace={ptrace:?}"
     );
+
+    // With the checks above, each LiteInst sysinfo call ran in the ptrace
+    // sample's window shifted later by less than one residual bound per image
+    // so far. Where that whole range lies inside one uptime second, the
+    // backends must read the same uptime. Past a second boundary the bound
+    // cannot say which side LiteInst is on: on GitHub's hosted runners the
+    // last LiteInst sample reads 122 and the ptrace one 121
+    // (https://github.com/rrnewton/hermit/issues/3517).
+    for index in 0..CLOCK_TRAJECTORY_SAMPLES {
+        let images = if index < CLOCK_TRAJECTORY_FIRST_AFTER_EXEC {
+            1
+        } else {
+            2
+        };
+        let (start, end) = sysinfo_window(&ptrace, index);
+        let latest = end + images * LITEINST_PER_IMAGE_RESIDUAL_BOUND_NS;
+        if sysinfo_uptime_at(start) == sysinfo_uptime_at(latest) {
+            assert_eq!(
+                liteinst[index].uptime, ptrace[index].uptime,
+                "sample {index}: LiteInst and ptrace must agree on sysinfo uptime\nliteinst={liteinst:?}\nptrace={ptrace:?}"
+            );
+        }
+    }
 }
 
 // getdents keys each entry's deterministic inode on the directory's device as
