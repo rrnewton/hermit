@@ -10427,13 +10427,13 @@ fn apply_validate_results_from(
             }) {
                 observation.results.insert(result);
             }
+            let mut canonical_receipt = None;
             if let Some((left_info_messages, right_info_messages)) = comparison {
                 let hermit_depth = depth.get("hermit").ok_or_else(|| {
                     format!("{} observation has no Hermit source depth", display_id(id))
                 })?;
-                observation
-                    .canonical_comparisons
-                    .insert(CanonicalComparison {
+                canonical_receipt = Some(observation.canonical_comparisons.insert(
+                    CanonicalComparison {
                         hermit_sha: row.hermit_sha.clone(),
                         hermit_commits: hermit_depth.commits,
                         hermit_first_parent: hermit_depth.first_parent,
@@ -10442,7 +10442,8 @@ fn apply_validate_results_from(
                         result: result.expect("canonical evidence has a result"),
                         left_info_messages,
                         right_info_messages,
-                    });
+                    },
+                ));
             }
             let mut inserted_parity = true;
             if let Some(report) = backend_parity {
@@ -10504,24 +10505,39 @@ fn apply_validate_results_from(
             // retry at outer attempt 2 publishes with its event and an event
             // from another attempt cannot cover it. The next retained import
             // finds the same record and replaces it as its own projection.
+            //
+            // A canonical match stores no invocation. The receipt inserted
+            // above already records the same hermit_sha, run_id and Pass, plus
+            // the evidence digest the invocation lacks; direct evidence keys
+            // skip a plain invocation that a receipt covers, and a pass has no
+            // divergence position to sample. The plain copy cost about 8 MB of
+            // cells.json per full run and nothing read it
+            // (https://github.com/rrnewton/dev-hermit/issues/540). Its argv,
+            // environment and attempt records stay in the retained run named by
+            // run_id. Divergences, parity rows, stripped passes and no-verdict
+            // rows keep their invocations.
             let exact = unavailable_reason.is_some() || stripped_pass;
-            let inserted = if store_invocation || exact {
-                observation.invocations.insert(ObservedInvocation {
-                    hermit_sha: row.hermit_sha.clone(),
-                    run_id: row.run_id.clone(),
-                    attempt: exact.then_some(row.attempt),
-                    evidence_sha256: exact.then(|| candidate.evidence_identity.clone()),
-                    result,
-                    argv: row.argv.clone(),
-                    guest_argv: row.guest_argv.clone(),
-                    env: row.env.clone(),
-                    cwd: row.cwd.clone(),
-                    shell_command: row.shell_command.clone(),
-                    attempts: attempt_invocations,
-                })
-            } else {
-                true
-            };
+            let receipt_covers_pass = result == Some(ObservedResult::Pass) && !exact;
+            let inserted =
+                if let (true, Some(receipt_inserted)) = (receipt_covers_pass, canonical_receipt) {
+                    receipt_inserted
+                } else if store_invocation || exact {
+                    observation.invocations.insert(ObservedInvocation {
+                        hermit_sha: row.hermit_sha.clone(),
+                        run_id: row.run_id.clone(),
+                        attempt: exact.then_some(row.attempt),
+                        evidence_sha256: exact.then(|| candidate.evidence_identity.clone()),
+                        result,
+                        argv: row.argv.clone(),
+                        guest_argv: row.guest_argv.clone(),
+                        env: row.env.clone(),
+                        cwd: row.cwd.clone(),
+                        shell_command: row.shell_command.clone(),
+                        attempts: attempt_invocations,
+                    })
+                } else {
+                    true
+                };
             // Re-importing the same retained evidence must be byte-idempotent.
             // Positions are vectors, so appending them when the invocation set
             // rejected a duplicate would silently inflate the sample count.
@@ -24098,10 +24114,20 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 .filter(|invocation| invocation.run_id == replay_row.run_id)
                 .collect::<Vec<_>>();
             let no_result_digest = different_attempt_no_result.evidence_identity()?;
-            if invocations.len() != 2
+            // The no-result attempt keeps its exact invocation. The pass is
+            // recorded once, as its canonical receipt, not again as a plain
+            // invocation.
+            if invocations.len() != 1
                 || invocations
                     .iter()
-                    .filter(|invocation| invocation.result == Some(ObservedResult::Pass))
+                    .any(|invocation| invocation.result == Some(ObservedResult::Pass))
+                || observations
+                    .iter()
+                    .flat_map(|observation| &observation.canonical_comparisons)
+                    .filter(|receipt| {
+                        receipt.run_id == replay_row.run_id
+                            && receipt.result == ObservedResult::Pass
+                    })
                     .count()
                     != 1
                 || invocations
@@ -27056,6 +27082,106 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         };
     let fold_fixture_row = |row: ResultRow| fold_fixture_rows(vec![row]);
 
+    // A canonical PASS is stored once, as its receipt, with no plain
+    // invocation beside it (https://github.com/rrnewton/dev-hermit/issues/540).
+    // Its readers still get the run's result, pass count, measurement and
+    // direct evidence key, through the stored form and a repeated import. A
+    // canonical divergence keeps its plain invocation.
+    let mut canonical_pass = recovered_pass_row.clone();
+    canonical_pass.run_id = "fixture-canonical-pass-stored-once".into();
+    let (pass_tracked, pass_fold) = fold_fixture_row(canonical_pass.clone())?;
+    let pass_encoded = encoded_cells(&pass_tracked)?;
+    let pass_reloaded: TrackedCells =
+        serde_json::from_str(&pass_encoded).map_err(|e| e.to_string())?;
+    let (pass_keys, pass_opaque) = direct_evidence_keys(&pass_reloaded)?;
+    let pass_observation = &pass_reloaded.cells[0].observations[0];
+    if pass_reloaded.cells != pass_tracked.cells
+        || pass_fold.passed != 1
+        || !pass_fold.errored.is_empty()
+        || pass_reloaded.cells[0].measurement != MeasurementState::MeasuredAndPassed
+        || pass_reloaded.cells[0].observations.len() != 1
+        || pass_observation.results != BTreeSet::from([ObservedResult::Pass])
+        || !pass_observation.invocations.is_empty()
+        || pass_observation
+            .canonical_comparisons
+            .iter()
+            .map(|receipt| {
+                (
+                    receipt.hermit_sha.as_str(),
+                    receipt.run_id.as_str(),
+                    receipt.result,
+                    receipt.evidence_sha256.as_str(),
+                )
+            })
+            .collect::<Vec<_>>()
+            != vec![(
+                "sha-1",
+                canonical_pass.run_id.as_str(),
+                ObservedResult::Pass,
+                canonical_pass.evidence_identity()?.as_str(),
+            )]
+        || pass_opaque
+        || pass_keys
+            .iter()
+            .map(|(key, count)| (key.base.run_id.as_str(), key.kind.clone(), *count))
+            .collect::<Vec<_>>()
+            != vec![(
+                canonical_pass.run_id.as_str(),
+                DirectEvidenceKind::Result(ObservedResult::Pass),
+                1,
+            )]
+    {
+        return Err(format!(
+            "a canonical PASS was not stored exactly once, as its receipt: {pass_fold:?}"
+        ));
+    }
+    let mut pass_repeated = pass_tracked.clone();
+    apply_validate_results(
+        &mut pass_repeated,
+        &BTreeMap::from([(
+            unlocated_id.clone(),
+            vec![ResultCandidate {
+                parity_history: false,
+                evidence_identity: canonical_pass.evidence_identity()?,
+                path: PathBuf::from("fixture/results.jsonl"),
+                row: canonical_pass.clone(),
+            }],
+        )]),
+        "sha-1",
+        "tree-1",
+        &depth_fixture,
+        true,
+        true,
+    )?;
+    refresh_measurement(&mut pass_repeated);
+    if encoded_cells(&pass_repeated)? != pass_encoded {
+        return Err("re-importing a canonical PASS changed its stored evidence".into());
+    }
+    let (divergent_tracked, _) = fold_fixture_row(validate_row.clone())?;
+    let divergent_observation = &divergent_tracked.cells[0].observations[0];
+    if divergent_observation.canonical_comparisons.len() != 1
+        || divergent_observation
+            .invocations
+            .iter()
+            .map(|invocation| {
+                (
+                    invocation.run_id.as_str(),
+                    invocation.attempt,
+                    invocation.result,
+                    invocation.shell_command.as_str(),
+                )
+            })
+            .collect::<Vec<_>>()
+            != vec![(
+                validate_row.run_id.as_str(),
+                None,
+                Some(ObservedResult::DeterminismFailure),
+                validate_row.shell_command.as_str(),
+            )]
+    {
+        return Err("a canonical divergence lost its plain invocation".into());
+    }
+
     // Current producer ERROR diagnoses survive the real fold and stored reader,
     // without entering the canonical comparison or pass populations.
     for (diagnosis, class, timed_out, status, signal) in [
@@ -27270,13 +27396,21 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             || tracked.cells[0].observations.len() != 1
             || tracked.cells[0].observations[0].results
                 != BTreeSet::from([ObservedResult::Pass, ObservedResult::Timeout])
-            || tracked.cells[0].observations[0].invocations.len() != 2
+            // The timeout keeps its exact invocation; the canonical PASS is
+            // its receipt, and stores no second, plain invocation.
+            || tracked.cells[0].observations[0].invocations.len() != 1
             || tracked.cells[0].observations[0]
                 .invocations
                 .iter()
                 .filter_map(|invocation| invocation.attempt)
                 .collect::<BTreeSet<_>>()
                 != BTreeSet::from([1])
+            || tracked.cells[0].observations[0]
+                .canonical_comparisons
+                .iter()
+                .map(|receipt| (receipt.run_id.as_str(), receipt.result))
+                .collect::<Vec<_>>()
+                != vec![(not_run_row.run_id.as_str(), ObservedResult::Pass)]
         {
             return Err(format!(
                 "recovered NotRun {label} did not retain the timeout and later canonical PASS: {fold:?}"
@@ -27306,7 +27440,13 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         || tracked.cells[0].observations.len() != 1
         || tracked.cells[0].observations[0].results
             != BTreeSet::from([ObservedResult::Pass, ObservedResult::Timeout])
-        || tracked.cells[0].observations[0].invocations.len() != 2
+        || tracked.cells[0].observations[0].invocations.len() != 1
+        || tracked.cells[0].observations[0]
+            .canonical_comparisons
+            .iter()
+            .map(|receipt| (receipt.run_id.as_str(), receipt.result))
+            .collect::<Vec<_>>()
+            != vec![(prelaunch_not_run.run_id.as_str(), ObservedResult::Pass)]
     {
         return Err(format!(
             "a recovered pre-launch NotRun did not retain its timeout and later canonical PASS: {fold:?}"
@@ -27329,7 +27469,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         }
     }
 
-    for (label, rows, expected_measurement, expected_results, expected_runs) in [
+    for (label, rows, expected_measurement, expected_results, expected_receipts) in [
         ("terminal", vec![not_run_row.clone()]),
         (
             "after-match",
@@ -27367,13 +27507,15 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         } else {
             BTreeSet::from([ObservedResult::Pass, ObservedResult::Timeout])
         };
-        let expected_runs = if label == "terminal" { 1 } else { 2 };
+        // Every case keeps the NotRun's exact invocation. A canonical PASS
+        // is recorded once, as its receipt.
+        let expected_receipts = if label == "terminal" { 0 } else { 1 };
         (
             label,
             rows,
             expected_measurement,
             expected_results,
-            expected_runs,
+            expected_receipts,
         )
     }) {
         let (tracked, fold) = fold_fixture_rows(rows)
@@ -27407,7 +27549,12 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
             || tracked.cells[0].last_tested.is_none()
             || tracked.cells[0].observations.len() != 1
             || tracked.cells[0].observations[0].results != expected_results
-            || tracked.cells[0].observations[0].invocations.len() != expected_runs
+            || tracked.cells[0].observations[0].invocations.len() != 1
+            || tracked.cells[0].observations[0]
+                .invocations
+                .iter()
+                .any(|invocation| invocation.result == Some(ObservedResult::Pass))
+            || tracked.cells[0].observations[0].canonical_comparisons.len() != expected_receipts
         {
             return Err(format!(
                 "{label} NotRun evidence was not retained as measured no-verdict: {fold:?}"
@@ -29324,19 +29471,44 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         // keys come from two DISTINCT legacy invocations inside ONE observation.
         // Their omitted outer-attempt and evidence identities collapse to the same
         // compact run/result key even though the invocation payloads differ.
-        let mut legacy_invocation = fixture
+        //
+        // Cells written before https://github.com/rrnewton/dev-hermit/issues/540
+        // hold that plain invocation beside each canonical receipt. The
+        // fixture's replay row is a canonical pass, so the current writer
+        // stores only its receipt; the legacy invocation is rebuilt from the
+        // same row exactly as the earlier writer stored it.
+        let replay = &fixture.replay_row;
+        if !fixture
             .before_publication
             .cells
             .iter()
-            .find(|cell| cell.id == fixture.replay_id)
-            .and_then(|cell| {
-                cell.observations
-                    .iter()
-                    .flat_map(|observation| &observation.invocations)
-                    .find(|invocation| invocation.run_id == fixture.replay_row.run_id)
+            .filter(|cell| cell.id == fixture.replay_id)
+            .flat_map(|cell| &cell.observations)
+            .flat_map(|observation| &observation.canonical_comparisons)
+            .any(|receipt| {
+                receipt.run_id == replay.run_id && receipt.result == ObservedResult::Pass
             })
-            .cloned()
-            .ok_or("combined result fixture retained no direct invocation")?;
+        {
+            return Err("combined result fixture retained no canonical pass receipt".into());
+        }
+        let mut legacy_invocation = ObservedInvocation {
+            hermit_sha: replay.hermit_sha.clone(),
+            run_id: replay.run_id.clone(),
+            attempt: None,
+            evidence_sha256: None,
+            result: Some(ObservedResult::Pass),
+            argv: replay.argv.clone(),
+            guest_argv: replay.guest_argv.clone(),
+            env: replay.env.clone(),
+            cwd: replay.cwd.clone(),
+            shell_command: replay.shell_command.clone(),
+            attempts: replay
+                .attempts
+                .iter()
+                .map(|attempt| serde_json::from_value::<ObservedAttemptInvocation>(attempt.clone()))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|error| format!("combined result fixture attempt unreadable: {error}"))?,
+        };
         let legacy_run_id = "fixture-legacy-duplicate-invocation";
         legacy_invocation.hermit_sha = fixture_hermit_tree.clone();
         legacy_invocation.run_id = legacy_run_id.into();
@@ -30706,13 +30878,18 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     // attempt and complete result row that produced the measured no-verdict.
     // Otherwise making `result` optional would also make a damaged historical
     // invocation silently indistinguishable from intentional no-verdict data.
-    let mut missing_no_verdict_identity = passed.clone();
+    // A canonical PASS stores no plain invocation, so the plain invocation
+    // under test is the unlocated divergence's.
+    let mut missing_no_verdict_identity = unlocated.clone();
     let invocation = missing_no_verdict_identity.cells[0].observations[0]
         .invocations
         .iter()
         .next()
         .cloned()
-        .ok_or("PASS fixture has no invocation")?;
+        .ok_or("divergence fixture has no invocation")?;
+    if invocation.attempt.is_some() || invocation.evidence_sha256.is_some() {
+        return Err("divergence fixture invocation is not a plain invocation".into());
+    }
     missing_no_verdict_identity.cells[0].observations[0]
         .invocations
         .clear();
@@ -35562,7 +35739,28 @@ mod post_verdict_transaction_tests {
                 BTreeSet::from([ObservedResult::Pass]),
                 "{label}"
             );
-            assert_eq!(stored_failures(&green), vec![None], "{label}");
+            // A canonical pass stores its receipt and no invocation
+            // (https://github.com/rrnewton/dev-hermit/issues/540), so the green
+            // sibling holds no attempt that could carry a failure record, and
+            // its one receipt is the pass.
+            assert_eq!(
+                stored_failures(&green),
+                Vec::<Option<ExpectedOutputFailure>>::new(),
+                "{label}"
+            );
+            assert_eq!(
+                green
+                    .observations
+                    .iter()
+                    .flat_map(|observation| &observation.canonical_comparisons)
+                    .map(|receipt| (receipt.run_id.clone(), receipt.result))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    sibling["run_id"].as_str().unwrap().to_string(),
+                    ObservedResult::Pass
+                )],
+                "{label}"
+            );
             assert_eq!(
                 results(&red),
                 BTreeSet::from([ObservedResult::CrashError]),
@@ -35628,6 +35826,10 @@ mod post_verdict_transaction_tests {
     /// row's claim: a record forged onto a passing attempt is not carried into
     /// the scorecard, and `encoded_cells` refuses a record on an attempt the
     /// runner could not have failed that way.
+    ///
+    /// A canonical pass stores only its receipt
+    /// (https://github.com/rrnewton/dev-hermit/issues/540), so the record is
+    /// also forged onto a stripped pass, which still stores its attempts.
     #[test]
     fn an_expected_output_failure_the_runner_could_not_have_found_is_not_published() {
         let _fixture_lock = history_fixture_lock();
@@ -35635,6 +35837,7 @@ mod post_verdict_transaction_tests {
         let measured = fixture.options.results_head.clone().unwrap();
         let (id, declared) = declared_exit_row(&measured);
         let sibling_id = fixture.id.clone();
+        let (stripped_id, stripped) = stripped_row(&measured);
         let mut undeclared = with_matched_exit(&declared, 0);
         undeclared
             .as_object_mut()
@@ -35676,9 +35879,12 @@ mod post_verdict_transaction_tests {
             ("malformed", JsonValue::String("not a record".into())),
         ] {
             let mut forged = fixture.row.clone();
-            forged["attempts"][0]["expected_output_failure"] = forged_record;
+            forged["attempts"][0]["expected_output_failure"] = forged_record.clone();
+            let mut forged_stripped = stripped.clone();
+            forged_stripped["attempts"][0]["expected_output_failure"] = forged_record;
             fixture.publish_rows(&[
                 forged,
+                forged_stripped,
                 expected_output_failure(
                     &undeclared,
                     &expected_stdout_reason("first", observed, expected),
@@ -35696,12 +35902,43 @@ mod post_verdict_transaction_tests {
                 true,
             )
             .unwrap_or_else(|error| panic!("{label}: the fold was aborted: {error}"));
-            assert_eq!(fold.passed, 1, "{label}: {fold:?}");
+            assert_eq!(fold.passed, 2, "{label}: {fold:?}");
             assert_eq!(fold.failed_expectations.len(), 1, "{label}: {fold:?}");
             assert_eq!(
-                stored(&tracked, &sibling_id),
+                stored(&tracked, &stripped_id),
                 vec![None],
-                "{label}: the forged record was stored"
+                "{label}: the forged record was stored on the stripped pass"
+            );
+            // The canonical pass stores no attempt at all, and nothing
+            // published for it names a failure record.
+            let sibling_cell = tracked
+                .cells
+                .iter()
+                .find(|cell| cell.id == sibling_id)
+                .unwrap();
+            assert_eq!(
+                stored(&tracked, &sibling_id),
+                Vec::<Option<ExpectedOutputFailure>>::new(),
+                "{label}: the canonical pass stored an attempt"
+            );
+            assert_eq!(
+                sibling_cell
+                    .observations
+                    .iter()
+                    .flat_map(|observation| &observation.canonical_comparisons)
+                    .map(|receipt| (receipt.run_id.clone(), receipt.result))
+                    .collect::<Vec<_>>(),
+                vec![(
+                    fixture.row["run_id"].as_str().unwrap().to_string(),
+                    ObservedResult::Pass
+                )],
+                "{label}: the canonical pass lost its receipt"
+            );
+            assert!(
+                !serde_json::to_string(sibling_cell)
+                    .unwrap()
+                    .contains("expected_output_failure"),
+                "{label}: the forged record was stored on the canonical pass"
             );
             assert_eq!(
                 stored(&tracked, &id),
@@ -35744,7 +35981,7 @@ mod post_verdict_transaction_tests {
         };
         refuses(
             "record on a passing attempt",
-            &sibling_id,
+            &stripped_id,
             &|_, _, attempt| {
                 attempt.expected_output_failure = Some(failure.clone());
             },
