@@ -3185,6 +3185,12 @@ pub fn skid_overshoot_reason(count: u64) -> String {
 ///   the row's recorded `execution_path`, eligible). Both are checked only on
 ///   a `PASS` elsewhere, so an `ERROR` attempt would otherwise reach a retry
 ///   without them.
+/// - every inner attempt's retained runtime and divergence coordinates are
+///   the ones the runner copies onto it from its report, and the row's are
+///   the ones the runner gives a row from its attempts
+///   (`attempt_copies_its_report`, `row_copies_its_attempts`), so no retained
+///   copy carries evidence, such as another backend's dispatch record, that
+///   the report the checks above read does not;
 ///
 /// - the row records the stdout assertions its cell declares
 ///   ([`CellResult::declared_stdout`]), and every attempt's own evidence
@@ -3244,6 +3250,7 @@ pub fn skid_overshoot_only_reports(result: &CellResult) -> Option<u64> {
         || result.failure_class != Some(FailureClass::UnderstoodInfrastructureFailure)
         || result.error_kind.as_deref() != Some("infrastructure")
         || retained_execution_path_error(result).is_some()
+        || !row_copies_its_attempts(result)
     {
         return None;
     }
@@ -3333,7 +3340,10 @@ fn attempt_skid_overshoot_reports(
         return None;
     }
     let report = current_verification_report(raw.as_bytes()).ok()?;
-    if report.verdict != Verdict::InfrastructureError || report.no_result_reason.is_some() {
+    if report.verdict != Verdict::InfrastructureError
+        || report.no_result_reason.is_some()
+        || !attempt_copies_its_report(attempt, &report)
+    {
         return None;
     }
     // The backend evidence a passing attempt must carry.
@@ -3431,6 +3441,10 @@ const HERMIT_INTERNAL_FAILURE_CLASS_PREFIX: &str = "HERMIT_INTERNAL_FAILURE clas
 ///   canonical match; for `stripped`, the stripped comparison
 ///   ([`require_stripped_comparison`]), a verified `matched` verdict and
 ///   matching exact outputs;
+/// - every inner attempt's retained runtime and divergence coordinates are
+///   its report's, which the runner copies onto it, and the row's are the
+///   first runtime and the divergence position its attempts give, so no
+///   retained copy carries evidence that only a copy, not the report, holds;
 /// - the report satisfies the stdout assertions `declared` (the exact bytes
 ///   against both compared runs' digests, and the contained text in the
 ///   attempt's captured stdout, which must be both runs' stdout);
@@ -3516,6 +3530,15 @@ pub fn retained_verify_pass_error(
                 ));
             }
         };
+        // The runner copies a passing attempt's runtime and divergence
+        // coordinates from its report, so a retained copy that differs is not
+        // one the runner wrote, and the checks below, which read the report,
+        // would never decide what the copy carries.
+        if !attempt_copies_its_report(attempt, &report) {
+            return Some(format!(
+                "inner attempt {index}'s retained runtime or divergence coordinates differ from its verification report's"
+            ));
+        }
         let comparison = match comparator {
             Comparator::Strict => report
                 .require_canonical_comparison()
@@ -3590,7 +3613,55 @@ pub fn retained_verify_pass_error(
             ));
         }
     }
+    // The runner gives the row the first runtime its attempts carry and the
+    // divergence position its attempts give (`cell_divergence_position`).
+    if !row_copies_its_attempts(result) {
+        return Some(
+            "the row's runtime or divergence coordinates are not the ones its inner attempts retain"
+                .into(),
+        );
+    }
     None
+}
+
+/// Whether `attempt`'s retained runtime and divergence coordinates are the
+/// ones the executor copies onto it from `report`, the attempt's own parsed
+/// verification report.
+///
+/// The executor copies the runtime from every report it parses, and the
+/// divergence coordinates from every one except a refused guest launch's or
+/// an unavailable backend's. Those two attempts are an `ERROR` whose first
+/// stderr line is a Hermit internal-failure class, which neither a verify
+/// `PASS` ([`retained_verify_pass_error`]) nor a skid attempt
+/// ([`skid_overshoot_only_reports`]) may carry, so for those readers a copy
+/// that differs from the report is one the executor did not write.
+fn attempt_copies_its_report(attempt: &AttemptResult, report: &VerificationReport) -> bool {
+    attempt.runtime == report.runtime
+        && attempt.first_divergent_scheduler_turn == report.first_divergent_scheduler_turn
+        && attempt.first_divergent_virtual_nanoseconds == report.first_divergent_virtual_nanoseconds
+        && attempt.first_divergent_record == report.first_divergent_record
+        && attempt.first_divergent_syscall == report.first_divergent_syscall
+        && attempt.first_divergent_left_message == report.first_divergent_left_message
+        && attempt.first_divergent_right_message == report.first_divergent_right_message
+}
+
+/// Whether `result`'s runtime and divergence coordinates are the ones the
+/// executor gives a row from its inner attempts: the first runtime an
+/// attempt carries, and the divergence position the attempts give
+/// (`cell_divergence_position`).
+fn row_copies_its_attempts(result: &CellResult) -> bool {
+    let position = cell_divergence_position(&result.attempts);
+    result.runtime
+        == result
+            .attempts
+            .iter()
+            .find_map(|attempt| attempt.runtime.clone())
+        && result.first_divergent_scheduler_turn == position.scheduler_turn
+        && result.first_divergent_virtual_nanoseconds == position.virtual_nanoseconds
+        && result.first_divergent_record == position.record
+        && result.first_divergent_syscall == position.syscall
+        && result.first_divergent_left_message == position.left_message
+        && result.first_divergent_right_message == position.right_message
 }
 
 fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
@@ -13769,8 +13840,9 @@ exit "$(cat "$PWD/exit-status")"
 
     /// The verify row `run_cell_inner` publishes for `attempts`: the same
     /// outcome, reason and error-kind fold, then the same typed result and
-    /// failure class, and the same declared-stdout record for a cell that
-    /// declares no stdout assertion.
+    /// failure class, the same declared-stdout record for a cell that
+    /// declares no stdout assertion, and the same runtime and divergence
+    /// position copied from the attempts.
     fn verify_row_from_attempts(attempts: Vec<AttemptResult>) -> CellResult {
         let outcome = if attempts.iter().all(|attempt| attempt.outcome == "PASS") {
             "PASS"
@@ -13790,12 +13862,21 @@ exit "$(cat "$PWD/exit-status")"
             .iter()
             .any(attempt_has_infrastructure_report)
             .then(DeclaredStdout::default);
+        let runtime = attempts.iter().find_map(|attempt| attempt.runtime.clone());
+        let position = cell_divergence_position(&attempts);
         CellResult {
             outcome,
             result,
             failure_class,
             error_kind,
             reason,
+            runtime,
+            first_divergent_scheduler_turn: position.scheduler_turn,
+            first_divergent_virtual_nanoseconds: position.virtual_nanoseconds,
+            first_divergent_record: position.record,
+            first_divergent_syscall: position.syscall,
+            first_divergent_left_message: position.left_message,
+            first_divergent_right_message: position.right_message,
             attempts,
             declared_stdout,
             ..cell_result_that_located_nothing()
@@ -14006,6 +14087,58 @@ exit "$(cat "$PWD/exit-status")"
         let with_dispatch = skid_with_report(&dispatched);
         classified_as_skid("a skid report with ptrace dispatch records", &with_dispatch);
         assert_eq!(skid_overshoot_only_reports(&with_dispatch), Some(2));
+        // The runner copies the skid report's runtime and divergence
+        // coordinates onto the attempt, and onto the row the first runtime and
+        // the divergence position its attempts give, so a copy that differs is
+        // not one the runner wrote. With only the report's runtime removed,
+        // its digest recomputed, the attempt's and the row's copies keep a
+        // dispatch record no check of the report sees.
+        assert_eq!(with_dispatch.attempts[0].runtime, dispatched.runtime);
+        assert_eq!(with_dispatch.runtime, dispatched.runtime);
+        let mut unruntimed = dispatched.clone();
+        unruntimed.runtime = None;
+        let unruntimed = serde_json::to_string(&unruntimed).unwrap();
+        let mut stale_copies = with_dispatch.clone();
+        stale_copies.attempts[0].verification_report_sha256 =
+            Some(hex_digest(unruntimed.as_bytes()));
+        stale_copies.attempts[0].verification_report = Some(unruntimed);
+        classified_as_skid("a skid attempt with runtime copies", &stale_copies);
+        not_skid_only(
+            "a skid attempt whose runtime copy its report does not carry",
+            &stale_copies,
+        );
+        // The same report with both copies cleared, as the runner writes it,
+        // is skid-only, so only the copies separate the two.
+        let mut uncopied = stale_copies.clone();
+        uncopied.attempts[0].runtime = None;
+        uncopied.runtime = None;
+        assert_eq!(skid_overshoot_only_reports(&uncopied), Some(2));
+        let mut stale_row = uncopied.clone();
+        stale_row.runtime = dispatched.runtime.clone();
+        not_skid_only(
+            "a skid row whose runtime copy no attempt carries",
+            &stale_row,
+        );
+        // A divergence coordinate only the copies carry, and a divergence
+        // message only the row carries.
+        let mut copied_coordinate = qualifying.clone();
+        copied_coordinate.attempts[0].first_divergent_record = Some(9);
+        copied_coordinate.first_divergent_record = Some(9);
+        classified_as_skid(
+            "a skid attempt with a divergence coordinate copy",
+            &copied_coordinate,
+        );
+        not_skid_only(
+            "a skid attempt whose divergence coordinate its report does not carry",
+            &copied_coordinate,
+        );
+        let mut row_message = qualifying.clone();
+        row_message.first_divergent_left_message = Some("left".into());
+        classified_as_skid("a skid row with a divergence message", &row_message);
+        not_skid_only(
+            "a skid row whose divergence message no attempt carries",
+            &row_message,
+        );
         let mut relabeled = dispatched.clone();
         relabeled
             .runtime
@@ -15243,10 +15376,38 @@ cp "{}" "$verdict"
                 "{label} was refused by another check: {error}"
             );
         };
-        let with_raw_report = |row: &CellResult, raw: String| {
+        // Replace the attempt's report bytes and digest only, as a rewritten
+        // history would.
+        let with_bare_raw_report = |row: &CellResult, raw: String| {
             let mut row = row.clone();
             row.attempts[0].verification_report_sha256 = Some(hex_digest(raw.as_bytes()));
             row.attempts[0].verification_report = Some(raw);
+            row
+        };
+        // Replace the report and, when it is a current report, the copies of
+        // it the runner writes onto the attempt and the row.
+        let with_raw_report = |row: &CellResult, raw: String| {
+            let mut row = with_bare_raw_report(row, raw.clone());
+            if let Ok(report) = current_verification_report(raw.as_bytes()) {
+                let attempt = &mut row.attempts[0];
+                attempt.runtime = report.runtime.clone();
+                attempt.first_divergent_scheduler_turn = report.first_divergent_scheduler_turn;
+                attempt.first_divergent_virtual_nanoseconds =
+                    report.first_divergent_virtual_nanoseconds;
+                attempt.first_divergent_record = report.first_divergent_record;
+                attempt.first_divergent_syscall = report.first_divergent_syscall;
+                attempt.first_divergent_left_message = report.first_divergent_left_message.clone();
+                attempt.first_divergent_right_message =
+                    report.first_divergent_right_message.clone();
+                let position = cell_divergence_position(&row.attempts);
+                row.runtime = row.attempts.iter().find_map(|a| a.runtime.clone());
+                row.first_divergent_scheduler_turn = position.scheduler_turn;
+                row.first_divergent_virtual_nanoseconds = position.virtual_nanoseconds;
+                row.first_divergent_record = position.record;
+                row.first_divergent_syscall = position.syscall;
+                row.first_divergent_left_message = position.left_message;
+                row.first_divergent_right_message = position.right_message;
+            }
             row
         };
         let with_report = |row: &CellResult, report: &VerificationReport| {
@@ -15513,11 +15674,78 @@ cp "{}" "$verdict"
         assert_eq!(retained_verify_pass_error(&dispatched, &none), None);
         let mut forged: serde_json::Value = serde_json::to_value(&dispatched_report).unwrap();
         forged["runtime"]["run1"]["dispatch"]["backend"] = serde_json::json!("liteinst");
+        let forged_pass = with_raw_report(&pass, serde_json::to_string(&forged).unwrap());
         refused(
             "another backend's dispatch record",
-            &with_raw_report(&pass, serde_json::to_string(&forged).unwrap()),
+            &forged_pass,
             &none,
             "dispatch evidence",
+        );
+
+        // The runner copies a passing attempt's runtime and divergence
+        // coordinates from its report onto the attempt, and onto the row the
+        // first runtime and the divergence position its attempts give. A row
+        // the runner wrote from a report carrying a runtime agrees with every
+        // copy.
+        let (executed_dispatched, _) = expected_exit_row(
+            Some(expected_exit(Some(7), None)),
+            dispatched_report.clone(),
+            "exit 7",
+        );
+        assert_eq!(
+            executed_dispatched.outcome, "PASS",
+            "{:?}",
+            executed_dispatched.reason
+        );
+        assert!(executed_dispatched.runtime.is_some());
+        assert_eq!(
+            executed_dispatched.attempts[0].runtime,
+            dispatched_report.runtime
+        );
+        assert_eq!(
+            retained_verify_pass_error(&executed_dispatched, &none),
+            None
+        );
+        // The forged history with only the report's runtime removed: the
+        // attempt's and the row's copies still carry the other backend's
+        // record, which no check of the report would see.
+        let mut unruntimed = forged.clone();
+        unruntimed.as_object_mut().unwrap().remove("runtime");
+        let stale_copies =
+            with_bare_raw_report(&forged_pass, serde_json::to_string(&unruntimed).unwrap());
+        assert!(stale_copies.attempts[0].runtime.is_some() && stale_copies.runtime.is_some());
+        refused(
+            "an attempt runtime copy the report does not carry",
+            &stale_copies,
+            &none,
+            "retained runtime or divergence coordinates differ",
+        );
+        // The attempt's copy removed too: only the row still carries it.
+        let mut stale_row = stale_copies.clone();
+        stale_row.attempts[0].runtime = None;
+        refused(
+            "a row runtime copy no attempt carries",
+            &stale_row,
+            &none,
+            "the row's runtime or divergence coordinates",
+        );
+        // A divergence coordinate only a copy carries.
+        let mut attempt_coordinate = pass.clone();
+        attempt_coordinate.attempts[0].first_divergent_record = Some(9);
+        attempt_coordinate.first_divergent_record = Some(9);
+        refused(
+            "an attempt divergence coordinate the report does not carry",
+            &attempt_coordinate,
+            &none,
+            "retained runtime or divergence coordinates differ",
+        );
+        let mut row_message = pass.clone();
+        row_message.first_divergent_left_message = Some("left".into());
+        refused(
+            "a row divergence message no attempt carries",
+            &row_message,
+            &none,
+            "the row's runtime or divergence coordinates",
         );
     }
 

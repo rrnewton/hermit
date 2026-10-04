@@ -15503,12 +15503,94 @@ fn self_test(root: &Path) -> Result<(), String> {
             });
             json!({"run1": run.clone(), "run2": run})
         };
-        let dispatched_pass = rewrite_report(&retry_pass, &|report| {
+        // The runner copies a passing attempt's report runtime onto the
+        // attempt and onto the row, so each of these fixtures carries its
+        // runtime in all three places, as a row the runner wrote does.
+        let with_runtime_copies = |mut row: CellResult| -> Result<CellResult, String> {
+            let raw = row.attempts[0]
+                .verification_report
+                .clone()
+                .ok_or("report fixture lost its report")?;
+            let report = VerificationReport::from_current_json_slice(raw.as_bytes())
+                .map_err(|e| format!("invalid report fixture: {e}"))?;
+            row.attempts[0].runtime = report.runtime.clone();
+            row.runtime = report.runtime;
+            Ok(row)
+        };
+        let dispatched_pass = with_runtime_copies(rewrite_report(&retry_pass, &|report| {
             report["runtime"] = runtime("ptrace");
-        })?;
-        let forged_dispatch_pass = rewrite_report(&retry_pass, &|report| {
+        })?)?;
+        let forged_dispatch_pass = with_runtime_copies(rewrite_report(&retry_pass, &|report| {
             report["runtime"] = runtime("liteinst");
+        })?)?;
+        // The forged PASS with only its report's runtime removed, the digest
+        // recomputed: the attempt's and the row's copies still carry the
+        // other backend's dispatch record, which no check of the report sees.
+        // Then the same with the attempt's copy removed too, so that only the
+        // row still carries it. The runner writes neither.
+        let stale_runtime_copies_pass = rewrite_report(&forged_dispatch_pass, &|report| {
+            report
+                .as_object_mut()
+                .map(|fields| fields.remove("runtime"));
         })?;
+        let mut stale_row_runtime_pass = stale_runtime_copies_pass.clone();
+        stale_row_runtime_pass.attempts[0].runtime = None;
+        if stale_runtime_copies_pass.attempts[0].runtime.is_none()
+            || stale_row_runtime_pass.runtime.is_none()
+            || VerificationReport::from_current_json_slice(
+                stale_row_runtime_pass.attempts[0]
+                    .verification_report
+                    .as_deref()
+                    .unwrap_or_default()
+                    .as_bytes(),
+            )
+            .map(|report| report.runtime.is_some())
+                != Ok(false)
+        {
+            return Err(format!(
+                "the stale runtime-copy fixtures do not isolate the copies: {stale_runtime_copies_pass:?}"
+            ));
+        }
+        // The same copies on the skid row: the runner copies a skid attempt's
+        // report runtime onto the attempt and the row as it does a PASS's. A
+        // skid row carrying a ptrace dispatch record in all three places is
+        // skid-only; one naming another backend is not, and neither is that
+        // row with only its report's runtime removed (the attempt's and the
+        // row's copies keep the other backend's record), or with the
+        // attempt's copy removed too.
+        let dispatched_skid = with_runtime_copies(rewrite_report(&skid, &|report| {
+            report["runtime"] = runtime("ptrace");
+        })?)?;
+        let forged_dispatch_skid = with_runtime_copies(rewrite_report(&skid, &|report| {
+            report["runtime"] = runtime("liteinst");
+        })?)?;
+        let stale_runtime_copies_skid = rewrite_report(&forged_dispatch_skid, &|report| {
+            report
+                .as_object_mut()
+                .map(|fields| fields.remove("runtime"));
+        })?;
+        let mut stale_row_runtime_skid = stale_runtime_copies_skid.clone();
+        stale_row_runtime_skid.attempts[0].runtime = None;
+        let mut uncopied_skid = stale_row_runtime_skid.clone();
+        uncopied_skid.runtime = None;
+        if skid_overshoot_only_reports(&dispatched_skid) != Some(2)
+            || skid_overshoot_only_reports(&uncopied_skid) != Some(2)
+            || stale_runtime_copies_skid.attempts[0].runtime.is_none()
+            || stale_row_runtime_skid.runtime.is_none()
+        {
+            return Err(format!(
+                "the skid runtime-copy fixtures do not isolate the copies: {stale_runtime_copies_skid:?}"
+            ));
+        }
+        for (case, row) in [
+            ("another backend's dispatch record", &forged_dispatch_skid),
+            ("stale runtime copies", &stale_runtime_copies_skid),
+            ("a stale row runtime", &stale_row_runtime_skid),
+        ] {
+            if skid_overshoot_only_reports(row).is_some() {
+                return Err(format!("a skid row with {case} read as skid-only: {row:?}"));
+            }
+        }
         // A stripped skid row, and a canonical PASS recorded under the same
         // stripped relaxation: the comparator the rows record is the stripped
         // one, which a canonical report does not hold.
@@ -15637,6 +15719,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         for (case, row) in [
             ("dispatched", &dispatched_pass),
             ("forged-dispatch", &forged_dispatch_pass),
+            ("stale-runtime-copies", &stale_runtime_copies_pass),
+            ("stale-row-runtime", &stale_row_runtime_pass),
             ("canonical-under-stripped", &canonical_under_stripped_pass),
             ("unexpected-stdout", &unexpected_stdout_pass),
             ("marker", &marker_pass),
@@ -15783,6 +15867,18 @@ fn self_test(root: &Path) -> Result<(), String> {
                 false,
             ),
             (
+                "skid then pass with stale runtime copies",
+                "pass",
+                vec![skid.clone(), stale_runtime_copies_pass.clone()],
+                false,
+            ),
+            (
+                "skid then pass with a stale row runtime",
+                "pass",
+                vec![skid.clone(), stale_row_runtime_pass.clone()],
+                false,
+            ),
+            (
                 "stripped skid then canonical pass",
                 "pass",
                 vec![stripped_skid.clone(), canonical_under_stripped_pass.clone()],
@@ -15913,7 +16009,9 @@ fn self_test(root: &Path) -> Result<(), String> {
         // a qualifying PASS the re-decision refuses (another backend's
         // dispatch record, a canonical report under stripped relaxations,
         // stdout the skid row's declaration forbids, or a guest exit the rows
-        // do not expect); each has a control that earns credit.
+        // do not expect); each has a control that earns credit. A skid row or
+        // a selected PASS whose retained runtime copies are not its report's
+        // is refused the same way, beside a control whose copies agree.
         for (name, earlier, later, verdict, recovered, history_intact) in [
             (
                 "verdicts-skid-recovered",
@@ -16031,6 +16129,54 @@ fn self_test(root: &Path) -> Result<(), String> {
                 "verdicts-skid-then-forged-dispatch-pass",
                 &skid,
                 &forged_dispatch_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-skid-then-stale-runtime-copies-pass",
+                &skid,
+                &stale_runtime_copies_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-skid-then-stale-row-runtime-pass",
+                &skid,
+                &stale_row_runtime_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-dispatched-skid-then-dispatched-pass",
+                &dispatched_skid,
+                &dispatched_pass,
+                "INCOMPLETE",
+                1,
+                true,
+            ),
+            (
+                "verdicts-forged-dispatch-skid-recovered",
+                &forged_dispatch_skid,
+                &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-stale-runtime-copies-skid-recovered",
+                &stale_runtime_copies_skid,
+                &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-stale-row-runtime-skid-recovered",
+                &stale_row_runtime_skid,
+                &retry_pass,
                 "FLAKY",
                 0,
                 true,
