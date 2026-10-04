@@ -36,13 +36,17 @@ use crate::resources::Resources;
 use crate::syscalls::threads::BlockedWaitSignalError;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
+use crate::syscalls::threads::KernelSignalState;
 use crate::syscalls::threads::KernelSigset;
+use crate::syscalls::threads::SignalQueue;
 use crate::syscalls::threads::WaitSignalDisposition;
 use crate::syscalls::threads::block_signals_for_disposition;
 use crate::syscalls::threads::blocked_signal_mask;
 use crate::syscalls::threads::eligible_pending_signals;
+use crate::syscalls::threads::kernel_sigset_bit;
 use crate::syscalls::threads::read_wait_signal_state;
 use crate::syscalls::threads::restore_signals_after_disposition;
+use crate::syscalls::threads::sigchld_eligibility_is_tracked;
 use crate::syscalls::threads::wait_signal_disposition;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::resource_request;
@@ -1642,11 +1646,13 @@ where
 ///
 /// A wait ends early only for a signal that would end it natively: one the guest
 /// does not block and that is caught, or whose default action terminates or stops
-/// the process. Ignored, blocked, and default-ignored signals leave the wait
-/// running to its original deadline
-/// (https://github.com/rrnewton/hermit/issues/3146). So does a default job-control
-/// stop when the call's restart would start a relative timeout again
-/// (`NonblockableSyscall::restart_rearms_timeout`).
+/// the process (https://github.com/rrnewton/hermit/issues/3146). Blocked,
+/// ignored, and default-ignored signals do not end it, and neither does a default
+/// job-control stop when the call's restart would start a relative timeout again
+/// (`NonblockableSyscall::restart_rearms_timeout`). Such a signal that stops one
+/// of the wait's injections is absorbed, and the wait runs on; the stops that
+/// `KernelSignalWait::inject_absorbing` cannot absorb safely end the wait with a
+/// restart instead, after which the call runs again from the start.
 ///
 /// The first probe runs under the guest's own mask. If it would block, every
 /// blockable signal is blocked for the rest of the wait, so later probes cannot be
@@ -1670,6 +1676,7 @@ where
         guest,
         call0.signals_consumed_by_wait(&guest.memory()),
         call0.restart_rearms_timeout(),
+        call0.kernel_restart_errno(),
     );
     let mut rsrc = rsrc.clone();
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
@@ -1691,18 +1698,18 @@ where
             }
             Err(error) => break Err(error),
         }
-        // A plain `inject`, never `inject_with_retry`: see `KernelSignalWait`.
-        let syscall_result = guest.inject(call).await;
-        if let Err(errno) = syscall_result
-            && probe_was_interrupted_by_signal(errno)
-        {
-            tracing::trace!(
-                "retry_nonblocking_syscall: signal stopped the probe of {}: {:?}",
-                call.display(&guest.memory()),
-                errno
-            );
-            break Err(Errno::ERESTARTNOINTR.into());
-        }
+        // Never `inject_with_retry`: see `KernelSignalWait`.
+        let syscall_result = match signals.inject_absorbing(guest, call).await {
+            Ok(result) => result,
+            Err(error) => {
+                tracing::trace!(
+                    "retry_nonblocking_syscall: a signal stop ends the wait in {}: {:?}",
+                    call.display(&guest.memory()),
+                    error
+                );
+                break Err(error);
+            }
+        };
         if !call.syscall_would_have_blocked(syscall_result) {
             let res = call
                 .normalize_nonblocking_result(syscall_result, rsrc.poll_attempt > 0)
@@ -1763,10 +1770,11 @@ where
 ///
 /// A wait ends early only for a signal that would end it natively: one the guest
 /// does not block and that is caught, or whose default action terminates or stops
-/// the process. Ignored, blocked, and default-ignored signals leave the wait
-/// running to its original deadline
-/// (https://github.com/rrnewton/hermit/issues/3146). So does a default job-control
-/// stop when `defers_default_stops` is set (`KernelSignalState::interrupting_wait`).
+/// the process (https://github.com/rrnewton/hermit/issues/3146). Blocked,
+/// ignored, and default-ignored signals do not end it, and neither does a default
+/// job-control stop when `defers_default_stops` is set
+/// (`KernelSignalState::interrupting_wait`), apart from the stops that
+/// `inject_absorbing` cannot absorb safely, which end it with a restart.
 ///
 /// The first probe runs under the guest's own mask. If it would block, `block`
 /// blocks every blockable signal for the rest of the wait, so later probes cannot
@@ -1776,16 +1784,19 @@ where
 /// back before the call returns, so a pending interrupting signal is delivered as
 /// the call returns its restart errno.
 ///
-/// Probes use a plain `inject`, never `inject_with_retry`: a signal that stops the
-/// guest around a probe is dequeued from the kernel and held by the backend, and a
-/// retry that is stopped again would replace it. Before the mask is set only a
-/// signal that arrived after the turn's `/proc` read can do that; afterwards only
-/// an unblockable one can. Either way the caller restarts the call
-/// (`ERESTARTNOINTR`) after the backend delivers it. Injecting the mask change
-/// itself is stopped the same way, which is why a signal found pending before the
-/// mask is set ends the wait without another probe. A stop after the probe ran
-/// replaces its result, so a probe that consumed something (an edge-triggered
-/// event, a dequeued signal) loses it; that remains a known gap.
+/// Probes and the mask change go through `inject_absorbing`, never
+/// `inject_with_retry`. A signal that stops the guest around an injection is
+/// dequeued from the kernel and held by the backend in a single slot, so a blind
+/// retry that is stopped again would replace it. `inject_absorbing` works out
+/// from `/proc` which signal the backend holds and injects again only when that
+/// signal would not end the wait natively. Before the mask is set, a signal
+/// pending at the turn's `/proc` read that would end the wait is reported by
+/// `interrupted`, and any other unblocked one stops the next injection and is
+/// absorbed; a signal that arrives after the read can stop an injection in a way
+/// that cannot be identified, which ends the wait. Afterwards only a signal that
+/// cannot be blocked can stop an injection. A stop after a probe ran replaces its
+/// result, so a probe that consumed something (an edge-triggered event, a
+/// dequeued signal) loses it; that remains a known gap.
 ///
 /// No failure of this machinery reaches the guest as an errno the wait call
 /// cannot return. A `/proc` read that fails for a thread that still exists, or a
@@ -1806,14 +1817,59 @@ pub(crate) struct KernelSignalWait {
     /// call's restart would start a relative timeout again
     /// (`NonblockableSyscall::restart_rearms_timeout`).
     defers_default_stops: bool,
+    /// The errno that ends the wait for an interrupting signal: the restart code
+    /// Linux uses for the call (`NonblockableSyscall::kernel_restart_errno`).
+    restart_errno: Errno,
     /// The guest's own mask while the wait runs with every signal blocked.
     saved_mask: Option<KernelSigset>,
     /// `block` could not change the mask, so probes run under the guest's own.
     unblockable: bool,
+    /// The signal the backend holds since `inject_absorbing` absorbed a stop.
+    held: Option<HeldSignal>,
 }
 
+/// A signal that stopped one of a wait's injections and that the backend holds
+/// for delivery when the guest resumes (`KernelSignalWait::inject_absorbing`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct HeldSignal {
+    signal: i32,
+    queue: SignalQueue,
+    kind: HeldKind,
+}
+
+/// Whether losing a held signal, which a later stop would replace, changes what
+/// the guest or the scheduler observes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
+enum HeldKind {
+    /// Its delivery does nothing: it is ignored, or default-ignored and not
+    /// `SIGCHLD`.
+    Harmless,
+    /// Its delivery matters: a `SIGCHLD`, whose report the scheduler's
+    /// eligibility accounting relies on and which may run a handler, or a
+    /// default job-control stop that the wait defers.
+    Precious,
+}
+
+/// What a signal that stopped one of a wait's injections means for the wait.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StopVerdict {
+    /// The wait goes on; the backend holds the signal.
+    Absorb(HeldKind),
+    /// The wait ends with this errno.
+    End(Errno),
+}
+
+/// The first real-time signal number in the kernel. A standard signal below it
+/// is pending at most once; a second one sent while it is pending is merged.
+const KERNEL_SIGRTMIN: i32 = 32;
+
 impl KernelSignalWait {
-    pub(crate) fn new<T, G>(guest: &G, consumed: KernelSigset, defers_default_stops: bool) -> Self
+    pub(crate) fn new<T, G>(
+        guest: &G,
+        consumed: KernelSigset,
+        defers_default_stops: bool,
+        restart_errno: Errno,
+    ) -> Self
     where
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
@@ -1823,8 +1879,10 @@ impl KernelSignalWait {
             tid: guest.tid(),
             consumed,
             defers_default_stops,
+            restart_errno,
             saved_mask: None,
             unblockable: false,
+            held: None,
         }
     }
 
@@ -1834,6 +1892,23 @@ impl KernelSignalWait {
         self.saved_mask.is_none() && !self.unblockable
     }
 
+    /// The signals that would end the wait natively under the guest's mask, given
+    /// the kernel's `state`.
+    fn could_interrupt(&self, state: &KernelSignalState) -> KernelSigset {
+        let guest_mask = self.saved_mask.unwrap_or(state.blocked);
+        state.interrupting_wait(guest_mask, self.defers_default_stops) & !self.consumed
+    }
+
+    /// Whether a pending `SIGCHLD` counts only once the scheduler made it eligible
+    /// (`eligible_pending_signals`).
+    fn gates_sigchld<T, G>(&self, guest: &G) -> bool
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        sigchld_eligibility_is_tracked(guest)
+    }
+
     /// Whether a signal that would end the wait natively is pending, in which case
     /// the caller returns the call's restart errno. The guest thread has been
     /// stopped inside the call since it was intercepted, so such a signal arrived
@@ -1841,19 +1916,19 @@ impl KernelSignalWait {
     /// Linux would still report sources that were ready when the call began, which
     /// this check puts behind the signal, as the scheduler's `Signaled` path did.
     /// A `SIGCHLD` counts only once the scheduler made it eligible
-    /// (`eligible_pending_signals`). A failed read is never returned as the
-    /// call's errno (`read_wait_signal_state`).
+    /// (`eligible_pending_signals`), and a `SIGCHLD` that the backend holds since
+    /// `inject_absorbing` absorbed it counts as pending. A failed read is never
+    /// returned as the call's errno (`read_wait_signal_state`).
     pub(crate) async fn interrupted<T, G>(&self, guest: &mut G) -> Result<bool, Error>
     where
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
         let state = read_wait_signal_state(self.pid, self.tid)?;
-        let guest_mask = self.saved_mask.unwrap_or(state.blocked);
-        let could_interrupt =
-            state.interrupting_wait(guest_mask, self.defers_default_stops) & !self.consumed;
-        let interrupting =
-            eligible_pending_signals(guest, state.pending & could_interrupt, could_interrupt).await;
+        let could_interrupt = self.could_interrupt(&state);
+        let held = self.held.map_or(0, |held| kernel_sigset_bit(held.signal));
+        let pending = (state.pending | held) & could_interrupt;
+        let interrupting = eligible_pending_signals(guest, pending, could_interrupt).await;
         if interrupting != 0 {
             tracing::trace!(
                 "[tid {}] pending signals {:#x} interrupt a blocking wait",
@@ -1864,11 +1939,162 @@ impl KernelSignalWait {
         Ok(interrupting != 0)
     }
 
-    /// Block every blockable signal for the rest of the wait. `scratch` is a guest
-    /// cell for the mask when the caller holds the only scratch-stack guard;
-    /// otherwise a fresh guard is taken. A signal that stops the guest around this
-    /// call arrived before the wait blocked, so the mask is put back if it took
-    /// effect and the call restarts.
+    /// Inject `call`, a probe or a mask change, absorbing the signal stops that do
+    /// not end the wait. `Ok` carries the call's own result; `Err` ends the wait.
+    ///
+    /// A signal that stops the guest around an injection is dequeued from the
+    /// kernel and held by the backend, which delivers it when the guest resumes,
+    /// and the injection returns a restart errno instead of the call's result.
+    /// The backend does not say which signal it holds, so the kernel's state is
+    /// read just before each injection, which names the signal the kernel
+    /// dequeues next (`KernelSignalState::next_dequeued`), and again after a
+    /// stop. The stop is identified only if exactly that signal left its queue
+    /// and the mask and dispositions did not change; it then decides:
+    ///
+    /// - A signal the wait consumes (`consumed`) ends it with `ERESTARTNOINTR`:
+    ///   it is delivered rather than consumed, and the call runs again.
+    /// - A signal that would end the wait natively ends it with the restart
+    ///   errno, except a `SIGCHLD` the scheduler has not made eligible, which is
+    ///   held and counts in `interrupted` once it is.
+    /// - Any other `SIGCHLD`, and a default job-control stop that the wait
+    ///   defers, are held, and so are an ignored signal and a default-ignored
+    ///   one. The injection runs again.
+    /// - Anything else, which is the backend's own preemption signal, ends the
+    ///   wait with `ERESTARTNOINTR`.
+    ///
+    /// A pending signal that would end the wait ends it before the injection,
+    /// with the restart errno, so it is never held. The backend has one slot for
+    /// a held signal, and a stop replaces what it holds. So while it holds a
+    /// `SIGCHLD` or a deferred stop, an injection that another pending signal
+    /// would stop is not made, and the wait ends with `ERESTARTNOINTR`; the same
+    /// standard signal on the same queue is the exception, because Linux merges
+    /// the two. A stop that cannot be identified, a signal that arrived after
+    /// the first read, ends the wait with the restart errno when that is a kernel
+    /// restart code, which becomes `EINTR` only if a handler runs, and with
+    /// `ERESTARTNOHAND`, which does the same, for a call whose restart errno is
+    /// `EINTR`. After `MAX_ABSORBED_STOPS` absorbed stops the wait ends with
+    /// `ERESTARTNOINTR`.
+    pub(crate) async fn inject_absorbing<T, G, S>(
+        &mut self,
+        guest: &mut G,
+        call: S,
+    ) -> Result<Result<i64, Errno>, Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+        S: SyscallInfo,
+    {
+        // Each absorbed stop takes one signal off a kernel queue, so only signals
+        // sent faster than the injections run can reach this.
+        const MAX_ABSORBED_STOPS: usize = 64;
+        let mut absorbed = 0;
+        loop {
+            let before = read_wait_signal_state(self.pid, self.tid)?;
+            let mut ends_wait = self.could_interrupt(&before);
+            if self.gates_sigchld(guest) {
+                ends_wait &= !kernel_sigset_bit(libc::SIGCHLD);
+            }
+            if before.pending & ends_wait != 0 {
+                return Err(self.restart_errno.into());
+            }
+            let next = before.next_dequeued(before.blocked);
+            if let (Some(held), Some((signal, queue))) = (self.held, next)
+                && held.kind == HeldKind::Precious
+                && !(signal == held.signal && queue == held.queue && signal < KERNEL_SIGRTMIN)
+            {
+                tracing::trace!(
+                    "[tid {}] signal {} would replace the held signal {}; the wait ends",
+                    self.tid,
+                    signal,
+                    held.signal
+                );
+                return Err(Errno::ERESTARTNOINTR.into());
+            }
+            let result = guest.inject(call).await;
+            let Err(errno) = result else {
+                return Ok(result);
+            };
+            if !probe_was_interrupted_by_signal(errno) {
+                return Ok(result);
+            }
+            let after = read_wait_signal_state(self.pid, self.tid)?;
+            let identified =
+                next.filter(|&(signal, queue)| stop_took_only(&before, &after, signal, queue));
+            let Some((signal, queue)) = identified else {
+                let errno = match self.restart_errno {
+                    Errno::ERESTARTSYS | Errno::ERESTARTNOHAND | Errno::ERESTARTNOINTR => {
+                        self.restart_errno
+                    }
+                    _ => Errno::ERESTARTNOHAND,
+                };
+                tracing::trace!(
+                    "[tid {}] a signal stop that cannot be identified ends the wait: {}",
+                    self.tid,
+                    errno
+                );
+                return Err(errno.into());
+            };
+            match self.stop_verdict(guest, &before, signal) {
+                StopVerdict::Absorb(kind) if absorbed < MAX_ABSORBED_STOPS => {
+                    absorbed += 1;
+                    let kind = self.held.map_or(kind, |held| held.kind.max(kind));
+                    tracing::trace!(
+                        "[tid {}] signal {} stopped an injection and is held ({:?})",
+                        self.tid,
+                        signal,
+                        kind
+                    );
+                    self.held = Some(HeldSignal {
+                        signal,
+                        queue,
+                        kind,
+                    });
+                }
+                StopVerdict::Absorb(_) => return Err(Errno::ERESTARTNOINTR.into()),
+                StopVerdict::End(errno) => return Err(errno.into()),
+            }
+        }
+    }
+
+    /// What a stop by `signal` means for the wait, given the kernel's state
+    /// `before` the injection (see `inject_absorbing`).
+    fn stop_verdict<T, G>(&self, guest: &G, before: &KernelSignalState, signal: i32) -> StopVerdict
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let bit = kernel_sigset_bit(signal);
+        if self.consumed & bit != 0 {
+            return StopVerdict::End(Errno::ERESTARTNOINTR);
+        }
+        let sigchld = signal == libc::SIGCHLD;
+        if self.could_interrupt(before) & bit != 0 {
+            return if sigchld && self.gates_sigchld(guest) {
+                StopVerdict::Absorb(HeldKind::Precious)
+            } else {
+                StopVerdict::End(self.restart_errno)
+            };
+        }
+        if sigchld || (self.defers_default_stops && before.default_job_control_stops() & bit != 0) {
+            return StopVerdict::Absorb(HeldKind::Precious);
+        }
+        let default_ignored = [libc::SIGCONT, libc::SIGURG, libc::SIGWINCH]
+            .into_iter()
+            .fold(0, |set, signal| set | kernel_sigset_bit(signal));
+        if (before.ignored | (default_ignored & !before.caught)) & bit != 0 {
+            return StopVerdict::Absorb(HeldKind::Harmless);
+        }
+        StopVerdict::End(Errno::ERESTARTNOINTR)
+    }
+
+    /// Block every blockable signal for the rest of the wait, and keep blocked the
+    /// signals the guest blocks itself, which the blockable set leaves out (the C
+    /// library's reserved signals). `scratch` is a guest cell for the mask when
+    /// the caller holds the only scratch-stack guard; otherwise a fresh guard is
+    /// taken. The change goes through `inject_absorbing`, so a signal that stops
+    /// it is handled as one that stops a probe. If that ends the wait, the guest's
+    /// mask is still recorded, and the caller's final `restore` reads the
+    /// kernel's mask and puts the guest's back if the change took effect.
     ///
     /// If the mask cannot be changed for another reason, the guest's mask is
     /// unchanged and no wait call can return that error, so the wait continues
@@ -1888,17 +2114,33 @@ impl KernelSignalWait {
         G: Guest<Detcore<T>>,
     {
         let guest_mask = read_wait_signal_state(self.pid, self.tid)?.blocked;
-        match inject_signal_mask(guest, blocked_signal_mask(), scratch).await {
-            Ok(()) => {
+        let mask = blocked_signal_mask() | guest_mask;
+        let result = match scratch {
+            Some(cell) => match guest.memory().write_value(cell, &mask) {
+                Ok(()) => {
+                    self.inject_absorbing(guest, set_signal_mask_call(cell.into()))
+                        .await
+                }
+                Err(errno) => Ok(Err(errno)),
+            },
+            None => {
+                let mut stack = guest.stack().await;
+                let cell = stack.push(mask);
+                match stack.commit() {
+                    Ok(_guard) => {
+                        self.inject_absorbing(guest, set_signal_mask_call(cell))
+                            .await
+                    }
+                    Err(_) => Ok(Err(Errno::EFAULT)),
+                }
+            }
+        };
+        match result {
+            Ok(Ok(_)) => {
                 self.saved_mask = Some(guest_mask);
                 Ok(())
             }
-            Err(errno) if probe_was_interrupted_by_signal(errno) => {
-                self.saved_mask = Some(guest_mask);
-                self.restore(guest, scratch).await?;
-                Err(Errno::ERESTARTNOINTR.into())
-            }
-            Err(errno) => {
+            Ok(Err(errno)) => {
                 tracing::debug!(
                     "[tid {}] cannot block signals for a wait ({}); its probes run under the \
                      guest's mask",
@@ -1907,6 +2149,10 @@ impl KernelSignalWait {
                 );
                 self.unblockable = true;
                 Ok(())
+            }
+            Err(error) => {
+                self.saved_mask = Some(guest_mask);
+                Err(error)
             }
         }
     }
@@ -1979,25 +2225,53 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
-    fn setmask(cell: Addr<'_, KernelSigset>) -> syscalls::RtSigprocmask {
-        syscalls::RtSigprocmask::new()
-            .with_how(libc::SIG_SETMASK)
-            .with_set(Some(cell.cast()))
-            .with_oldset(None)
-            .with_sigsetsize(KERNEL_SIGSET_SIZE)
-    }
     match scratch {
         Some(cell) => {
             guest.memory().write_value(cell, &mask)?;
-            guest.inject(setmask(cell.into())).await.map(drop)
+            guest
+                .inject(set_signal_mask_call(cell.into()))
+                .await
+                .map(drop)
         }
         None => {
             let mut stack = guest.stack().await;
             let cell = stack.push(mask);
             let _guard = stack.commit().map_err(|_| Errno::EFAULT)?;
-            guest.inject(setmask(cell)).await.map(drop)
+            guest.inject(set_signal_mask_call(cell)).await.map(drop)
         }
     }
+}
+
+/// `rt_sigprocmask(SIG_SETMASK, cell, NULL)`.
+fn set_signal_mask_call(cell: Addr<'_, KernelSigset>) -> syscalls::RtSigprocmask {
+    syscalls::RtSigprocmask::new()
+        .with_how(libc::SIG_SETMASK)
+        .with_set(Some(cell.cast()))
+        .with_oldset(None)
+        .with_sigsetsize(KERNEL_SIGSET_SIZE)
+}
+
+/// Whether a signal stop between the kernel states `before` and `after` took
+/// exactly `signal` off `queue`: it is no longer there, no other signal left
+/// either queue, and the mask and dispositions did not change. Signals may have
+/// arrived in between.
+fn stop_took_only(
+    before: &KernelSignalState,
+    after: &KernelSignalState,
+    signal: i32,
+    queue: SignalQueue,
+) -> bool {
+    let bit = kernel_sigset_bit(signal);
+    let other = match queue {
+        SignalQueue::Thread => SignalQueue::Shared,
+        SignalQueue::Shared => SignalQueue::Thread,
+    };
+    before.blocked == after.blocked
+        && before.ignored == after.ignored
+        && before.caught == after.caught
+        && after.queued(queue) & bit == 0
+        && before.queued(queue) & !bit & !after.queued(queue) == 0
+        && before.queued(other) & !after.queued(other) == 0
 }
 
 /// Whether an injected call's error means a signal stopped the guest around it
@@ -2304,6 +2578,15 @@ mod kernel_signal_wait_failures {
         pending: KernelSigset,
         /// Signals with a handler (`SigCgt`).
         caught: KernelSigset,
+        /// Signals whose disposition is `SIG_IGN` (`SigIgn`).
+        ignored: KernelSigset,
+        /// Whether a pending signal outside the mask stops each injection before
+        /// the call runs, as on ptrace, where an ignored signal still queues for
+        /// a traced task: it leaves the queue for the backend to hold
+        /// (`taken`), and the injection reports a restart errno.
+        stops_for_pending: bool,
+        /// The signals that stopped an injection, in order.
+        taken: Vec<i32>,
         /// Errors for the next reads, one per read.
         read_failures: VecDeque<Errno>,
         /// Outcomes for the next `rt_sigprocmask` calls; `Apply` once empty.
@@ -2410,6 +2693,7 @@ mod kernel_signal_wait_failures {
                     thread_pending: kernel.pending,
                     blocked: kernel.blocked,
                     caught: kernel.caught,
+                    ignored: kernel.ignored,
                     ..KernelSignalState::default()
                 }),
             })
@@ -2475,6 +2759,13 @@ mod kernel_signal_wait_failures {
             let mask: KernelSigset = LocalMemory::new().read_value(set.cast::<KernelSigset>())?;
             let mut kernel = self.kernel.lock().unwrap();
             kernel.requested.push(mask);
+            let deliverable = kernel.pending & !kernel.blocked;
+            if kernel.stops_for_pending && deliverable != 0 {
+                let signal = deliverable.trailing_zeros() as i32 + 1;
+                kernel.pending &= !kernel_sigset_bit(signal);
+                kernel.taken.push(signal);
+                return Err(Errno::ERESTARTSYS);
+            }
             match kernel.outcomes.pop_front().unwrap_or(MaskOutcome::Apply) {
                 MaskOutcome::Apply => {
                     kernel.blocked = mask;
@@ -2515,7 +2806,7 @@ mod kernel_signal_wait_failures {
 
     /// A wait whose guest mask `block` replaced with the all-blocked mask.
     async fn blocked_wait(guest: &mut WaitGuest, kernel: &Kernel) -> KernelSignalWait {
-        let mut wait = KernelSignalWait::new(guest, 0, false);
+        let mut wait = KernelSignalWait::new(guest, 0, false, Errno::ERESTARTSYS);
         wait.block(guest, None).await.unwrap();
         assert!(!wait.needs_block());
         assert_eq!(kernel.lock().unwrap().blocked, blocked_signal_mask());
@@ -2614,7 +2905,7 @@ mod kernel_signal_wait_failures {
         let expected = |errno| BlockedWaitSignalError::StateUnreadable { pid, tid, errno };
 
         // The turn's check, before the mask is set.
-        let mut wait = KernelSignalWait::new(&guest, 0, false);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
         kernel.lock().unwrap().read_failures.push_back(Errno::EIO);
         assert_eq!(
             diagnostic(wait.interrupted(&mut guest).await),
@@ -2652,7 +2943,7 @@ mod kernel_signal_wait_failures {
         let (mut guest, _kernel) = WaitGuest::new(Pid::from_raw(exited), guest_mask());
         // No script: the read goes to the real `/proc`, where the thread is gone.
 
-        let wait = KernelSignalWait::new(&guest, 0, false);
+        let wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
         assert!(matches!(
             wait.interrupted(&mut guest).await,
             Err(Error::Errno(Errno::ERESTARTNOINTR))
@@ -2668,7 +2959,7 @@ mod kernel_signal_wait_failures {
         let (mut guest, kernel) = WaitGuest::live(guest_mask());
         guest.commit_fails = true;
         let _proc = scripted_proc(&kernel);
-        let mut wait = KernelSignalWait::new(&guest, 0, false);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
 
         wait.block(&mut guest, None).await.unwrap();
 
@@ -2698,5 +2989,213 @@ mod kernel_signal_wait_failures {
             "nothing to put back"
         );
         assert_eq!(kernel.lock().unwrap().blocked, guest_mask());
+    }
+
+    /// A guest whose injections a pending signal outside the mask stops, as on
+    /// ptrace, with `pending` queued and `ignored` set to `SIG_IGN`.
+    fn stopping_guest(pending: KernelSigset, ignored: KernelSigset) -> (WaitGuest, Kernel) {
+        let (guest, kernel) = WaitGuest::live(guest_mask());
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.stops_for_pending = true;
+            kernel.pending = pending;
+            kernel.ignored = ignored;
+        }
+        (guest, kernel)
+    }
+
+    /// Inject a mask change to `mask` through `wait.inject_absorbing`.
+    async fn inject_mask_absorbing(
+        wait: &mut KernelSignalWait,
+        guest: &mut WaitGuest,
+        mask: KernelSigset,
+    ) -> Result<Result<i64, Errno>, Error> {
+        let mut stack = guest.stack().await;
+        let cell = stack.push(mask);
+        let _guard = stack.commit().unwrap();
+        wait.inject_absorbing(guest, set_signal_mask_call(cell))
+            .await
+    }
+
+    /// An ignored signal that was already pending stops the mask change of
+    /// `block`, which used to end the wait with a restart (review finding F2 on
+    /// https://github.com/rrnewton/hermit/pull/3361). Linux would not end the
+    /// wait for it, so the stop is absorbed: the backend holds the signal, the
+    /// change runs again, and the held signal does not interrupt the wait.
+    #[tokio::test]
+    async fn an_ignored_signal_that_stops_the_mask_change_does_not_end_the_wait() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let (mut guest, kernel) = stopping_guest(usr1, usr1);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
+
+        wait.block(&mut guest, None).await.unwrap();
+
+        assert!(!wait.needs_block());
+        let all_blocked = blocked_signal_mask() | guest_mask();
+        {
+            let kernel = kernel.lock().unwrap();
+            assert_eq!(kernel.taken, vec![libc::SIGUSR1]);
+            assert_eq!(kernel.requested, vec![all_blocked, all_blocked]);
+            assert_eq!(kernel.blocked, all_blocked);
+        }
+        assert_eq!(
+            wait.held,
+            Some(HeldSignal {
+                signal: libc::SIGUSR1,
+                queue: SignalQueue::Thread,
+                kind: HeldKind::Harmless,
+            })
+        );
+        assert!(
+            !wait.interrupted(&mut guest).await.unwrap(),
+            "an ignored signal does not end the wait"
+        );
+        wait.restore(&mut guest, None).await.unwrap();
+        assert_eq!(kernel.lock().unwrap().blocked, guest_mask());
+    }
+
+    /// A default-ignored signal that stops an injection is held the same way,
+    /// and the injection then returns its own result (review finding F2 on
+    /// https://github.com/rrnewton/hermit/pull/3361).
+    #[tokio::test]
+    async fn a_default_ignored_signal_that_stops_an_injection_is_held() {
+        let (mut guest, kernel) = stopping_guest(kernel_sigset_bit(libc::SIGWINCH), 0);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
+
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+        assert!(matches!(result, Ok(Ok(0))), "{result:?}");
+        assert_eq!(kernel.lock().unwrap().taken, vec![libc::SIGWINCH]);
+        assert_eq!(kernel.lock().unwrap().requested.len(), 2);
+        assert_eq!(wait.held.map(|held| held.kind), Some(HeldKind::Harmless));
+        assert!(!wait.interrupted(&mut guest).await.unwrap());
+    }
+
+    /// A pending signal that would end the wait natively ends it before any
+    /// injection, with the restart errno, and stays queued for the guest.
+    #[tokio::test]
+    async fn a_pending_caught_signal_ends_the_wait_before_the_injection() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let (mut guest, kernel) = stopping_guest(usr1, 0);
+        kernel.lock().unwrap().caught = usr1;
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
+
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTSYS))),
+            "{result:?}"
+        );
+        let kernel = kernel.lock().unwrap();
+        assert!(kernel.requested.is_empty(), "nothing is injected");
+        assert_eq!(kernel.pending, usr1);
+        assert_eq!(wait.held, None);
+    }
+
+    /// The backend holds one signal. Once it holds one whose loss would matter,
+    /// a `SIGCHLD` here, an injection that a different pending signal would stop
+    /// is not made and the wait ends with `ERESTARTNOINTR`, so the held signal
+    /// is delivered rather than replaced.
+    #[tokio::test]
+    async fn a_held_sigchld_is_never_replaced_by_another_stop() {
+        let (mut guest, kernel) = stopping_guest(
+            kernel_sigset_bit(libc::SIGCHLD) | kernel_sigset_bit(libc::SIGWINCH),
+            0,
+        );
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
+
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))),
+            "{result:?}"
+        );
+        let kernel = kernel.lock().unwrap();
+        assert_eq!(kernel.taken, vec![libc::SIGCHLD]);
+        assert_eq!(
+            kernel.requested.len(),
+            1,
+            "the second injection is not made"
+        );
+        assert_eq!(kernel.pending, kernel_sigset_bit(libc::SIGWINCH));
+        assert_eq!(wait.held.map(|held| held.kind), Some(HeldKind::Precious));
+    }
+
+    /// The kernel's next dequeue: the private queue before the shared one, a
+    /// synchronous signal first, then the lowest number, outside the mask.
+    #[test]
+    fn next_dequeued_follows_the_kernel_order() {
+        let bit = kernel_sigset_bit;
+        let state = KernelSignalState {
+            thread_pending: bit(libc::SIGUSR2) | bit(libc::SIGSEGV),
+            shared_pending: bit(libc::SIGHUP),
+            ..KernelSignalState::default()
+        };
+        assert_eq!(
+            state.next_dequeued(0),
+            Some((libc::SIGSEGV, SignalQueue::Thread))
+        );
+        assert_eq!(
+            state.next_dequeued(bit(libc::SIGSEGV)),
+            Some((libc::SIGUSR2, SignalQueue::Thread))
+        );
+        assert_eq!(
+            state.next_dequeued(bit(libc::SIGSEGV) | bit(libc::SIGUSR2)),
+            Some((libc::SIGHUP, SignalQueue::Shared))
+        );
+        assert_eq!(state.next_dequeued(!0), None);
+    }
+
+    /// A stop is identified only when exactly the predicted signal left its
+    /// queue and the mask and dispositions are unchanged; arrivals do not matter.
+    #[test]
+    fn a_stop_is_identified_only_by_exactly_its_signal() {
+        let bit = kernel_sigset_bit;
+        let before = KernelSignalState {
+            thread_pending: bit(libc::SIGUSR1) | bit(libc::SIGWINCH),
+            shared_pending: bit(libc::SIGHUP),
+            ..KernelSignalState::default()
+        };
+        let took = |after: KernelSignalState, signal, queue| {
+            stop_took_only(&before, &after, signal, queue)
+        };
+        let after = KernelSignalState {
+            thread_pending: bit(libc::SIGWINCH) | bit(libc::SIGUSR2),
+            ..before
+        };
+        assert!(took(after, libc::SIGUSR1, SignalQueue::Thread));
+        assert!(
+            !took(after, libc::SIGWINCH, SignalQueue::Thread),
+            "SIGWINCH is still queued"
+        );
+        let two_left = KernelSignalState {
+            thread_pending: 0,
+            ..before
+        };
+        assert!(!took(two_left, libc::SIGUSR1, SignalQueue::Thread));
+        let shared_left = KernelSignalState {
+            thread_pending: bit(libc::SIGWINCH),
+            shared_pending: 0,
+            ..before
+        };
+        assert!(!took(shared_left, libc::SIGUSR1, SignalQueue::Thread));
+        let mask_changed = KernelSignalState {
+            blocked: bit(libc::SIGUSR2),
+            ..after
+        };
+        assert!(!took(mask_changed, libc::SIGUSR1, SignalQueue::Thread));
+        let disposition_changed = KernelSignalState {
+            ignored: bit(libc::SIGWINCH),
+            ..after
+        };
+        assert!(!took(
+            disposition_changed,
+            libc::SIGUSR1,
+            SignalQueue::Thread
+        ));
     }
 }
