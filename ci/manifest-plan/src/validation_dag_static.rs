@@ -655,7 +655,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Seven runner::tests for the process-group scan's stat re-read (one per arm
     // of member_process_group, plus the real existence reader) retain all 891
     // (`cargo nextest list --profile ci -p hermit-manifest-plan` lists 701).
-    ("test.regular_crates", 898),
+    // stress_series::tests::pressure_history_admits_a_nonzero_match_only_as_declared
+    // retains all 898 (the same listing gives 702 with it).
+    ("test.regular_crates", 899),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1151,8 +1153,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The three parity import tests listed there retain all 886, and the
     // retained-command-line test listed there retains all 889. The
     // main-ancestor floor admission test listed there retains all 890. The
-    // seven stat re-read tests listed there retain all 891.
-    ("test.regular_crates_on_host", 898),
+    // seven stat re-read tests listed there retain all 891, and the
+    // declared-exit pressure history test listed there retains all 898.
+    ("test.regular_crates_on_host", 899),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
