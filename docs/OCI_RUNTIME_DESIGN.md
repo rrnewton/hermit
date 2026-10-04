@@ -310,7 +310,7 @@ assumption:
 | --- | --- | --- |
 | ptrace | Host mount namespace, overlay, `pivot_root`, then normal Reverie attach | Compatibility baseline |
 | DBT/SaBRe | Same host namespace view, but instrumentation/runtime files must be opened before `pivot_root` or deliberately staged inside the image | Performance follow-up |
-| LiteInst hybrid | Same host namespace view; preload DSO and post-exec bootstrap must be qualified inside the image | After its exec/lifecycle support |
+| LiteInst | Same host namespace view; the in-guest Detcore preload DSO must be qualified inside the image | After its exec/lifecycle support |
 | KVM | Export the prepared root through a block image, virtio-fs, or equivalent guest-kernel filesystem channel | Separate performance/isolation phase |
 
 Define a backend rootfs capability such as `HostPivotRoot`, `GuestExport`, or
