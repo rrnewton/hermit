@@ -1865,7 +1865,7 @@ pub(crate) const BITWISE_PARITY_CLAIM: &str = "bitwise parity established";
 /// printed for the lossy `Stripped` comparison of a plain `--verify` as well as
 /// for the canonical comparison of `--verify-strict`, so on its own it cannot
 /// tell a reader which one ran.
-fn write_verification_announcement(
+pub(super) fn write_verification_announcement(
     out: &mut impl io::Write,
     outcome: &VerificationOutcome,
     second_run: SecondRun,

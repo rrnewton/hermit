@@ -117,7 +117,11 @@ fn channel_ready(fd: RawFd) -> bool {
     rc > 0 && event.revents & libc::POLLIN != 0
 }
 
-fn buffer_real_comparison(directory: &Path, destination: &Path) -> Result<(), Error> {
+fn buffer_real_comparison(
+    directory: &Path,
+    destination: &Path,
+    announce: bool,
+) -> Result<(), Error> {
     // Real comparator and typed report, with explicitly host-fixture operands.
     // These bytes are never evidence of a guest run or of the parent-death cell.
     let suffix = detcore::detlog::record_suffix(detcore::detlog::DetLogEvent::Syscall);
@@ -164,10 +168,41 @@ fn buffer_real_comparison(directory: &Path, destination: &Path) -> Result<(), Er
         format!("{}\n", serde_json::to_string(&report)?),
     )?;
     verify::write_report_json(destination, &report)?;
+    if announce {
+        const SUCCESS: &str = "Success: deterministic. Determinism verified.";
+        let mut expected = Vec::new();
+        verify::write_verification_announcement(
+            &mut expected,
+            &outcome,
+            verify::SecondRun::Rerun,
+            SUCCESS,
+            "Failure: nondeterministic.",
+        )?;
+        fs::write(directory.join("expected-announcement"), &expected)?;
+        fs::write(
+            directory.join("stderr-before-announcement"),
+            fs::read(directory.join("stderr"))?,
+        )?;
+        // Exercise the actual existing entrypoint, also on the old test-only
+        // target where this API returns (). The assertion is made on real
+        // captured bytes after the existing owned cleanup, never on timeout.
+        let _ = verify::announce_verification_outcome(
+            &outcome,
+            verify::SecondRun::Rerun,
+            SUCCESS,
+            "Failure: nondeterministic.",
+        );
+        fs::write(
+            directory.join("stderr-before-settlement"),
+            fs::read(directory.join("stderr"))?,
+        )?;
+    }
     Ok(())
 }
 
 fn invocation(mode: &str, deadline: Instant, directory: &Path) -> i32 {
+    let announce = mode.ends_with("-announcement");
+    let mode = mode.strip_suffix("-announcement").unwrap_or(mode);
     let settled = mode == "native-exit-child-settled";
     let panic_reporter = mode == "native-exit-child-fatal-panic";
     let successful_work = mode == "native-exit-child-fatal-success";
@@ -224,7 +259,7 @@ fn invocation(mode: &str, deadline: Instant, directory: &Path) -> i32 {
                     serde_json::to_vec(&stopped)?,
                 )?;
             }
-            buffer_real_comparison(directory, &destination)?;
+            buffer_real_comparison(directory, &destination, announce)?;
             anyhow::ensure!(
                 fs::read(&destination)? == pending,
                 "pending comparison leaked before native settlement"
@@ -353,6 +388,9 @@ fn invocation(mode: &str, deadline: Instant, directory: &Path) -> i32 {
 }
 
 fn supervisor(mode: &str, deadline: Instant, end: u64) -> i32 {
+    let requested_mode = mode;
+    let announce = mode.ends_with("-announcement");
+    let mode = mode.strip_suffix("-announcement").unwrap_or(mode);
     let settled = mode == "native-exit-settled";
     assert!(
         settled
@@ -369,7 +407,7 @@ fn supervisor(mode: &str, deadline: Instant, end: u64) -> i32 {
     let path = directory.path();
     let (channel, sender) = std::os::unix::net::UnixDatagram::pair().unwrap();
     let parent = unsafe { libc::getpid() };
-    let child_mode = mode.replacen("native-exit-", "native-exit-child-", 1);
+    let child_mode = requested_mode.replacen("native-exit-", "native-exit-child-", 1);
     let mut command = Command::new(std::env::current_exe().unwrap());
     command
         .env("HERMIT_INTERNAL_CLI_LIFECYCLE", "1")
@@ -565,6 +603,43 @@ fn supervisor(mode: &str, deadline: Instant, end: u64) -> i32 {
             .unwrap(),
             b"fixture occupied destination\n"
         );
+    }
+    if announce {
+        let expected = fs::read(path.join("expected-announcement")).unwrap();
+        let before = fs::read(path.join("stderr-before-announcement")).unwrap();
+        let unsettled = fs::read(path.join("stderr-before-settlement")).unwrap();
+        // Keep the observations explicit and assert only after actual child and
+        // broker cleanup above. An outer timeout or rescue cannot satisfy this.
+        println!(
+            "{}",
+            serde_json::json!({
+                "phase": "verification announcement ordering after actual cleanup",
+                "mode": requested_mode, "before_bytes": before.len(),
+                "unsettled_bytes": unsettled.len(), "expected_bytes": expected.len(),
+                "cleanup_complete": cleanup_complete,
+            })
+        );
+        assert_eq!(
+            unsettled, before,
+            "console verdict escaped before native settlement"
+        );
+        if settled {
+            let mut exact = before;
+            exact.extend_from_slice(&expected);
+            assert_eq!(
+                stderr.as_bytes(),
+                exact,
+                "settled announcement bytes changed"
+            );
+        } else {
+            assert!(
+                !stderr
+                    .as_bytes()
+                    .windows(expected.len())
+                    .any(|bytes| bytes == expected),
+                "fatal invocation printed the buffered success verdict"
+            );
+        }
     }
     0
 }
