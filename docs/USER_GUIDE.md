@@ -211,48 +211,44 @@ hermit --backend=ptrace run -- /bin/echo hello
 
 Hermit detects whether the requested backend is integrated and available on
 the current host. It does not silently fall back to a different backend.
-LiteInst requires `libreverie_liteinst.so` beside the Hermit executable. That
-DSO initializes only the in-guest patch/helper runtime. The ptrace host owns the
-sole `Detcore` Tool and GlobalTool from the initial exec; it observes the first
-syscall at each site and installs a LiteInst trampoline for later invocations.
-There is no second in-guest Detcore instance or coordinator RPC Tool.
+LiteInst runs Detcore inside the guest. Hermit preloads
+`libdetcore_liteinst.so`: the one `HERMIT_LITEINST_TOOL_RUNTIME` names, else
+the installation's `rsrcs/libdetcore_liteinst.so` (which `hermit-install`
+stages), else the one built beside the Hermit executable. Its constructor installs Detcore's `Tool` in
+the guest process before the program's `main`, and Detcore's global state stays
+in Hermit, reached over a socket. No ptrace tracer sits on the system-call path.
 
-Build and stage the constructor-enabled runtime with its locked standalone
-manifest before building Hermit with the optional `liteinst` feature, which
-`third-party-backends` includes; a build without it refuses `--backend=liteinst`:
+Build the runtime beside a Hermit built with the optional `liteinst` feature,
+which `third-party-backends` includes; a build without it refuses
+`--backend=liteinst`:
 
 ```bash
-./scripts/stage-liteinst-runtime.sh dev \
-  "$PWD/target/debug/libreverie_liteinst.so" \
-  "$PWD/target/liteinst-runtime-build"
 cargo build --locked -p hermit --features liteinst --bin hermit
+cargo build --locked -p detcore-liteinst
+./target/debug/hermit --backend=liteinst run --max-timeslice=disabled -- /bin/echo hello
 ```
 
-Hermit verifies the DSO architecture, required exports, and preload constructor
-before activation; an arbitrary shared object or constructor-free runtime is
-rejected rather than silently falling back.
+Hermit verifies the library's architecture and that it registers
+`detcore_liteinst_initialize` as a preload constructor before it starts the
+guest; an arbitrary shared object or a constructor-free library is rejected
+rather than letting the guest run unmonitored. The dynamic loader, the C
+library's initialization and the constructors of the program's own shared
+libraries run before that constructor and are not monitored.
 
-LiteInst uses the normal Hermit run and verification paths. A successful
-`--strict --verify` run compares status/stdout/stderr exactly and applies the
-`Stripped` comparison to selected Detcore scheduler messages; it is useful
-diagnostic evidence, but it is not strict determinism. Strict verification requires
-`--verify-strict --verify-json REPORT.json`, `bitwise_parity: true`, and nonzero
-compared-message counts. Verification snapshots guest stdin once and supplies
-the identical bytes to both runs. LiteInst supports dynamically linked Linux
-x86-64 guests, including threads and child processes created with `clone`,
-`clone3`, and `fork`. Installation of new hooks stops at the first task-creating
-syscall, while existing hooks and tasks keep running. An activated process
-leader may `exec` a new dynamically linked program; the new image must retain
-the inherited runtime environment and activate the LiteInst runtime again.
-`vfork` and `exec` from a thread other than the process leader remain unsupported
-and are refused. PMU/RCB timer delivery, CPUID, RDTSC, and RDTSCP use the ptrace
-host path and therefore have the same host capability requirements as the
-normal ptrace backend.
+The in-guest runtime cannot deliver Detcore's preemption timer yet, so Hermit
+refuses a LiteInst run unless `--max-timeslice=disabled` is given. It also
+refuses `--verify`, because the in-guest Tool does not forward its records to
+Hermit yet, and `--run-evidence-dir`, `--timeout`, `--skid-margin` and
+`--gdbserver`. It refuses guest programs it cannot monitor: statically linked,
+set-user-ID or non-x86-64 programs, programs with a `DT_PREINIT_ARRAY`, and
+anything other than a regular file. A guest may `fork`, and `vfork` runs as a
+copying fork; creating a thread and `exec` are not supported yet.
 
 The default namespace, mount, and network setup is shared with Hermit's other
-backends; `--no-namespace` remains available for trusted guests. The preload
-runtime reserves `SIGSYS` in kernel-visible signal masks. This experimental
-patch-helper path is not a security boundary for intentionally hostile code.
+backends; `--no-namespace` remains available for trusted guests. The in-guest
+runtime reserves `SIGSYS` for itself. This experimental path is not a security
+boundary for intentionally hostile code.
+
 The `dbt`, `sabre`, and `e9patch` selections require optional CLI features as
 well as their runtime resources. Build and stage both with:
 
