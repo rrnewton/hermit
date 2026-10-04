@@ -22,7 +22,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from demo_common import hermit_tmp_args, make_socket_path
 from qemu_controller import KERNEL_COMMAND_LINE
@@ -498,27 +498,30 @@ class _NoSignalSent(Exception):
     """A process that needed SIGKILL could not be signalled through a pidfd, so got no signal."""
 
 
-def _kill_if_running(pid: int, start_time: int) -> None:
+def _kill_if_running(pid: int, start_time: int, pidfd: Optional[int] = None) -> None:
     """Send SIGKILL to ``pid`` only if it is still the process that started at ``start_time``.
 
-    The signal goes only through a pidfd. A process that has exited, even if
-    not yet reaped, or whose pid now belongs to a process with a different
-    start time, is not signalled. Any other failure to open or use the pidfd
-    raises _NoSignalSent, and no signal is sent by pid instead: these processes
-    are not this process's children, so nothing keeps their pids from being
-    given to another process between a check and a signal by pid.
+    The signal goes only through a pidfd: ``pidfd`` when the caller holds one
+    for this process (see _HeldTracer), else one opened here. A process that has
+    exited, even if not yet reaped, or whose pid now belongs to a process with a
+    different start time, is not signalled. Any other failure to open or use
+    the pidfd raises _NoSignalSent, and no signal is sent by pid instead: these
+    processes are not this process's children, so nothing keeps their pids from
+    being given to another process between a check and a signal by pid.
     """
     if not _is_running(pid, start_time):
         return
-    try:
-        # A pidfd refers to the process that had the pid when it was opened, so
-        # a start time that still matches after opening it identifies the
-        # process the signal reaches, even if the pid is reused meanwhile.
-        pidfd = os.pidfd_open(pid)
-    except ProcessLookupError:
-        return  # ESRCH: it has exited.
-    except (AttributeError, OSError) as error:
-        raise _NoSignalSent("pidfd_open failed: {}".format(error)) from error
+    held = pidfd is not None
+    if pidfd is None:
+        try:
+            # A pidfd refers to the process that had the pid when it was opened, so
+            # a start time that still matches after opening it identifies the
+            # process the signal reaches, even if the pid is reused meanwhile.
+            pidfd = os.pidfd_open(pid)
+        except ProcessLookupError:
+            return  # ESRCH: it has exited.
+        except (AttributeError, OSError) as error:
+            raise _NoSignalSent("pidfd_open failed: {}".format(error)) from error
     try:
         if not _is_running(pid, start_time):
             return
@@ -529,7 +532,8 @@ def _kill_if_running(pid: int, start_time: int) -> None:
         except (AttributeError, OSError) as error:
             raise _NoSignalSent("pidfd_send_signal failed: {}".format(error)) from error
     finally:
-        os.close(pidfd)
+        if not held:
+            os.close(pidfd)
 
 
 def _tracer_of(pid: int, start_time: int) -> Optional[int]:
@@ -550,7 +554,9 @@ def _tracer_of(pid: int, start_time: int) -> Optional[int]:
 
 
 def _kill_and_wait(
-    processes: List[Tuple[str, int, int]], timeout: float
+    processes: List[Tuple[str, int, int]],
+    timeout: float,
+    pidfds: Optional[Dict[Tuple[str, int], int]] = None,
 ) -> Tuple[List[Tuple[str, int, int]], List[Tuple[str, int, int, str]]]:
     """SIGKILL each (name, pid, start time) and wait up to ``timeout`` seconds for all to exit.
 
@@ -558,13 +564,19 @@ def _kill_and_wait(
     reason, those that could not be signalled through a pidfd and so were sent
     no signal; the wait is not spent on these. A process that has exited, even
     if not yet reaped, or whose pid now belongs to a process with a different
-    start time, counts as gone and is not signalled.
+    start time, counts as gone and is not signalled. ``pidfds`` maps (name,
+    pid) to a pidfd already held for that process, which is used instead of a
+    new one.
     """
     signalled = []  # type: List[Tuple[str, int, int]]
     not_signalled = []  # type: List[Tuple[str, int, int, str]]
     for name, pid, start_time in processes:
+        held = (pidfds or {}).get((name, pid))
         try:
-            _kill_if_running(pid, start_time)
+            if held is None:
+                _kill_if_running(pid, start_time)
+            else:
+                _kill_if_running(pid, start_time, held)
         except _NoSignalSent as error:
             not_signalled.append((name, pid, start_time, str(error)))
         else:
@@ -646,24 +658,113 @@ def _open_serial_pipe(
             time.sleep(0.05)
 
 
-def _freeze_exact_tracer(qemu_pid: int, timeout: float = 20.0) -> Tuple[int, int]:
+def _qemu_tracer_tgid(qemu_pid: int) -> int:
+    """The thread-group id of the process that ptrace-traces QEMU."""
     tracer_tid = int(_proc_status_value(qemu_pid, "TracerPid"))
     if tracer_tid == 0:
         raise RuntimeError("QEMU is not ptrace-traced by Hermit")
-    tracer_tgid = int(_proc_status_value(tracer_tid, "Tgid"))
+    return int(_proc_status_value(tracer_tid, "Tgid"))
+
+
+class _HeldTracer:
+    """Hermit's tracer, found as QEMU's tracer, held through a pidfd opened once.
+
+    The demo did not start the tracer, so nothing keeps its pid from being given
+    to another process once it exits. Every signal the demo sends it, SIGSTOP,
+    SIGCONT and SIGKILL, goes through this pidfd, which names the process that
+    had the pid when it was opened; none is ever sent by pid.
+    """
+
+    def __init__(self, tgid: int, start_time: int, pidfd: int) -> None:
+        self.tgid = tgid
+        self.start_time = start_time
+        self.pidfd = pidfd  # type: Optional[int]
+
+    def send(self, sig: int) -> bool:
+        """Send ``sig`` through the pidfd; False if the tracer has exited (ESRCH).
+
+        Any other failure raises, and no signal is sent by pid instead.
+        """
+        if self.pidfd is None:
+            raise RuntimeError("Hermit's tracer (pid {}) is no longer held".format(self.tgid))
+        try:
+            signal.pidfd_send_signal(self.pidfd, sig)
+        except ProcessLookupError:
+            return False
+        except (AttributeError, OSError) as error:
+            raise RuntimeError(
+                "could not send {} to Hermit's tracer (pid {}) through its pidfd: {}; "
+                "no signal was sent by pid".format(signal.Signals(sig).name, self.tgid, error)
+            ) from error
+        return True
+
+    def close(self) -> None:
+        if self.pidfd is not None:
+            os.close(self.pidfd)
+            self.pidfd = None
+
+
+def _hold_exact_tracer(qemu_pid: int) -> _HeldTracer:
+    """Open a pidfd for QEMU's tracer and check that it names the tracer found.
+
+    The start time is read before the pidfd is opened, and checked again after,
+    with the tracer still QEMU's: a pid given to another process meanwhile has
+    a different start time, so the pidfd is then closed unused.
+    """
+    tracer_tgid = _qemu_tracer_tgid(qemu_pid)
+    identity = _proc_identity(tracer_tgid)
+    if identity is None:
+        raise RuntimeError("Hermit's tracer (pid {}) exited before it was held".format(tracer_tgid))
+    try:
+        pidfd = os.pidfd_open(tracer_tgid)
+    except ProcessLookupError as error:
+        raise RuntimeError(
+            "Hermit's tracer (pid {}) exited before it was held".format(tracer_tgid)
+        ) from error
+    except (AttributeError, OSError) as error:
+        raise RuntimeError(
+            "could not open a pidfd for Hermit's tracer (pid {}): {}; it is not signalled "
+            "by pid".format(tracer_tgid, error)
+        ) from error
+    tracer = _HeldTracer(tracer_tgid, identity[1], pidfd)
+    try:
+        current = _qemu_tracer_tgid(qemu_pid)
+        held = _is_running(tracer_tgid, identity[1])
+    except BaseException:
+        tracer.close()
+        raise
+    if current != tracer_tgid or not held:
+        tracer.close()
+        raise RuntimeError(
+            "Hermit's tracer changed while it was being held: pid {} started at {}, and QEMU's "
+            "tracer is now pid {}".format(tracer_tgid, identity[1], current)
+        )
+    return tracer
+
+
+def _freeze_exact_tracer(qemu_pid: int, tracer: _HeldTracer, timeout: float = 20.0) -> None:
+    """Stop ``tracer``, QEMU's tracer, while QEMU is in a trace-stop."""
+    current = _qemu_tracer_tgid(qemu_pid)
+    if current != tracer.tgid:
+        raise RuntimeError(
+            "QEMU's tracer is now pid {}, not Hermit's tracer pid {} that the demo "
+            "holds".format(current, tracer.tgid)
+        )
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         if _proc_state(qemu_pid) != "t":
             time.sleep(0.002)
             continue
-        os.kill(tracer_tgid, signal.SIGSTOP)
+        if not tracer.send(signal.SIGSTOP):
+            raise RuntimeError("Hermit's tracer (pid {}) exited".format(tracer.tgid))
         for _ in range(1000):
-            if _proc_state(tracer_tgid) == "T":
+            if _proc_state(tracer.tgid) == "T":
                 break
             time.sleep(0.001)
-        if _proc_state(qemu_pid) == "t" and _proc_state(tracer_tgid) == "T":
-            return tracer_tid, tracer_tgid
-        os.kill(tracer_tgid, signal.SIGCONT)
+        if _proc_state(qemu_pid) == "t" and _proc_state(tracer.tgid) == "T":
+            return
+        if not tracer.send(signal.SIGCONT):
+            raise RuntimeError("Hermit's tracer (pid {}) exited".format(tracer.tgid))
     raise TimeoutError("could not freeze Hermit's exact tracer at a QEMU trace-stop")
 
 
@@ -728,6 +829,7 @@ class HermitGuestProgram:
         self._process_group = None  # type: Optional[int]
         self._qemu_pid = None  # type: Optional[int]
         self._tracer_tgid = None  # type: Optional[int]
+        self._tracer = None  # type: Optional[_HeldTracer]
         # (name, pid, start time) of each process close() must kill through a pidfd.
         self._owned_processes = []  # type: List[Tuple[str, int, int]]
         self._memory = None  # type: Optional[int]
@@ -883,8 +985,12 @@ class HermitGuestProgram:
 
         self._qemu_pid = _wait_for_qemu(self._process, qmp_socket, self.config.timeout)
         self._own_process("QEMU", self._qemu_pid)
-        _, self._tracer_tgid = _freeze_exact_tracer(self._qemu_pid)
-        self._own_process("Hermit's tracer", self._tracer_tgid)
+        self._tracer = _hold_exact_tracer(self._qemu_pid)
+        self._tracer_tgid = self._tracer.tgid
+        self._owned_processes.append(
+            ("Hermit's tracer", self._tracer.tgid, self._tracer.start_time)
+        )
+        _freeze_exact_tracer(self._qemu_pid, self._tracer)
         self._frozen = True
         first, last = _ram_region(self._qemu_pid, self.config.ram_bytes)
         self._ram_first = first
@@ -1035,7 +1141,7 @@ class HermitGuestProgram:
         """Run the preloaded guest command, then freeze the guest at its completion marker."""
         if not self._frozen or self._qmp is None:
             raise RuntimeError("guest is not ready for deterministic advance")
-        if self._tracer_tgid is None or self._qemu_pid is None:
+        if self._tracer is None or self._qemu_pid is None:
             raise RuntimeError("traced processes are unavailable")
         if b"\n" in marker or "\n" in command or "\r" in command:
             raise ValueError("advance command and marker must each be one line")
@@ -1045,14 +1151,17 @@ class HermitGuestProgram:
         # The deterministic input was preloaded on the command disk before QEMU
         # restored the snapshot. Resume the frozen tracee, then wait on serial only
         # for the guest's completion marker.
-        os.kill(self._tracer_tgid, signal.SIGCONT)
+        if not self._tracer.send(signal.SIGCONT):
+            raise RuntimeError(
+                "Hermit's tracer (pid {}) exited before the advance".format(self._tracer.tgid)
+            )
         self._frozen = False
         self._qmp.execute("cont")
         self._wait_for_serial(marker)
         self._qmp.execute("stop")
         if self._qmp.status() != "paused":
             raise RuntimeError("QEMU did not pause after deterministic advance")
-        _, self._tracer_tgid = _freeze_exact_tracer(self._qemu_pid)
+        _freeze_exact_tracer(self._qemu_pid, self._tracer)
         self._frozen = True
 
     def close(self, failed: bool = False) -> None:
@@ -1101,8 +1210,11 @@ class HermitGuestProgram:
                 for name, pid, start_time in self._owned_processes
                 if _is_running(pid, start_time)
             ]
+            held = {}  # type: Dict[Tuple[str, int], int]
+            if self._tracer is not None and self._tracer.pidfd is not None:
+                held[("Hermit's tracer", self._tracer.tgid)] = self._tracer.pidfd
             survivors, not_signalled = _kill_and_wait(
-                self._owned_processes, OWNED_PROCESS_EXIT_SECONDS
+                self._owned_processes, OWNED_PROCESS_EXIT_SECONDS, held
             )
             reasons = {(name, pid): reason for name, pid, _, reason in not_signalled}
             stopped = [name for name, pid in running if (name, pid) not in reasons]
@@ -1138,6 +1250,8 @@ class HermitGuestProgram:
                         ),
                         file=sys.stderr,
                     )
+        if self._tracer is not None:
+            self._tracer.close()
         # Hermit runs in its own process group (start_new_session); this stops
         # whatever is still running in it, Hermit included.
         if (
