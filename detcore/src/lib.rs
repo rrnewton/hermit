@@ -2390,7 +2390,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 Ok(0)
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            // TODO-HUMAN-REVIEW(#1851): The file-ownership mutation family
+            // OWNER-APPROVED (2026-10-04, https://github.com/rrnewton/hermit/pull/1851;
+            // ownership-model audit: https://github.com/rrnewton/hermit/issues/3750):
+            // The file-ownership mutation family
             // (chown/fchown/fchownat/lchown) completes the fixed virtual-root
             // identity that the credential query (#1549) and credential set
             // (#787) families already implement. A real root process's chown
