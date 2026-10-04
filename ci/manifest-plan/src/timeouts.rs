@@ -81,17 +81,25 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// ephemeral host FUSE seed mounts (`fuse.squashfuse_ll` mounts whose last
 /// path component is a host seed name, `<hex>-seed-<seed>-ns-<digits>`, with
 /// `<seed>` a per-process `nspid<digits>_cgpid<digits>` or a named host tool):
-/// `system-utils/procfs-sanitized-paths` passed twenty
-/// consecutive `test-harness run` repetitions, each one first-attempt PASS, at
+/// `system-utils/procfs-sanitized-paths` passed 60 of 60 `test-harness run`
+/// repetitions with the harness retry, and 60 of 60 at the first attempt, at
 /// the evidence head under its manifest comparison profile
-/// (`compare_io_buffers: true, rcb_time: false`), with 14 `fuse.squashfuse_ll`
-/// rows in the host mountinfo. The first qualification, 20 of 20 on
-/// 2026-09-25 at 9721082f52fec889af9100c39a7d581d2eb1e044 with
-/// `compare_io_buffers: false`, predates the rebase onto the stricter I/O
-/// comparison. Evidence SHA is the tree the qualification binary was built from.
+/// (`compare_io_buffers: true, rcb_time: false`), 2026-10-04 09:38:46Z to
+/// 09:41:42Z. A mountinfo monitor running alongside saw one row change, an
+/// excluded per-process seed mount added at 09:41:31Z during repetition 56,
+/// which matched. Guest-visible host mount churn outside the excluded class,
+/// such as `/run/user/<uid>` tmpfs mounts
+/// (<https://github.com/rrnewton/hermit/issues/1820>), can still fail a first
+/// attempt: 180 repetitions at the previous grammar
+/// (d547b64d3b9f9976232aa1bb71ea7773b7f73d1a) passed 180 of 180 with the
+/// retry and 177 of 180 at the first attempt, with two mountinfo-read
+/// divergences, one of them coinciding with a `/run/user/0` unmount, and one
+/// unrelated host-directory `newfstatat` size change. The real fix is one
+/// shared mount snapshot (<https://github.com/rrnewton/hermit/issues/3627>).
+/// Evidence SHA is the tree the measurement binary was built from.
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
-    "88bcd6efcd0fa95208efbf6116687a9ed66fc986";
-pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-04T07:20:11Z";
+    "ab7f0dd15120aeecea647940feca712741ec214d";
+pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-04T09:41:42Z";
 pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
@@ -1986,11 +1994,11 @@ mod tests {
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
         assert_eq!(
             PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA,
-            "88bcd6efcd0fa95208efbf6116687a9ed66fc986"
+            "ab7f0dd15120aeecea647940feca712741ec214d"
         );
         assert_eq!(
             PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-10-04T07:20:11Z"
+            "2026-10-04T09:41:42Z"
         );
         assert_eq!(PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(
