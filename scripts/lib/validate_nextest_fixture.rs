@@ -14,6 +14,7 @@ use super::super::Plan;
 use super::super::dag_to_json;
 use super::super::env_u64;
 use super::super::finish_committed_selection;
+use super::super::ledger_gate_attempts;
 use super::super::libtest_counts;
 use super::super::monotonic_now_ns;
 use super::super::nextest_test_observations;
@@ -825,10 +826,11 @@ fn actual_nextest_results_and_publication_failures() {
             assert!(row["executed_tests"].is_null() && row["passed_tests"].is_null());
             assert!(row.get("test_results").is_none());
             assert_eq!(row["gates"][0]["test_results_error_kind"], "read_io");
-            assert_eq!(
-                row["gates"][0]["attempts"][0]["test_results_error_kind"],
-                "read_io"
-            );
+            // The written gate may omit an attempt list it states itself;
+            // the history read back is the same either way.
+            let attempts = ledger_gate_attempts(&row["gates"][0]).unwrap();
+            assert_eq!(attempts.len(), 1, "{attempts:?}");
+            assert_eq!(attempts[0]["test_results_error_kind"], "read_io");
         }
         fs::write(
             case.join("checked.json"),

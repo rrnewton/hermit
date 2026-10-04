@@ -4165,6 +4165,7 @@ fn self_test() -> Result<(), String> {
     test_node_coverage_bracket()?;
     typed_libtest_count_bracket()?;
     ledger_gate_origin_bracket()?;
+    ledger_gate_compaction_bracket()?;
     requalification_plan_bracket(&root)?;
     tool_root_split_bracket()?;
     validate_series_writer_bracket()?;
@@ -21573,6 +21574,257 @@ fn ledger_gate_with_attempts(outcome: &StepOutcome, attempts: &[NodeAttempt]) ->
     gate
 }
 
+/// The attempt record a ledger gate already states by itself: the first and
+/// only attempt, not retried, with no environmental hypothesis and no
+/// understood infrastructure class, whose observation is the one
+/// [`ledger_gate_with_attempts`] copied onto the gate (`raw_result`,
+/// `raw_aborted`, `raw_failure_class`, `raw_failure_detail`, and the latest
+/// attempt's `reported`, `execution`, exit, budget, reason and timing fields).
+///
+/// `None` when the gate carries no `raw_result`. Every gate written with
+/// attempts since `raw_result` was introduced carries both, and a gate built
+/// by [`ledger_gate`] alone carries neither, so an absent list on a gate
+/// without `raw_result` is never read as one implied attempt.
+fn implied_single_ledger_attempt(gate: &serde_json::Value) -> Option<serde_json::Value> {
+    let gate = gate.as_object()?;
+    let mut attempt = serde_json::Map::new();
+    attempt.insert("attempt".into(), serde_json::json!(1));
+    attempt.insert("result".into(), gate.get("raw_result")?.clone());
+    for field in [
+        "reported",
+        "execution",
+        "exit_code",
+        "oomed",
+        "oom_kills",
+        "timed_out",
+        "cpu_timed_out",
+        "reason",
+        "real_seconds",
+    ] {
+        attempt.insert(field.into(), gate.get(field)?.clone());
+    }
+    attempt.insert("aborted".into(), gate.get("raw_aborted")?.clone());
+    for field in [
+        "understood_infrastructure_class",
+        "retry_class",
+        "retry_detail",
+        "environmental_class",
+        "environmental_verdict",
+        "environmental_refuted_shape",
+    ] {
+        attempt.insert(field.into(), serde_json::Value::Null);
+    }
+    attempt.insert(
+        "environmental_detail_observed".into(),
+        serde_json::json!(false),
+    );
+    for (field, source) in [
+        ("test_results_error", "test_results_error"),
+        ("test_results_error_kind", "test_results_error_kind"),
+        ("failure_class", "raw_failure_class"),
+        ("failure_detail", "raw_failure_detail"),
+    ] {
+        if let Some(value) = gate.get(source) {
+            attempt.insert(field.into(), value.clone());
+        }
+    }
+    Some(serde_json::Value::Object(attempt))
+}
+
+/// Write a ledger gate without its `attempts` list when that list is exactly
+/// the one attempt [`implied_single_ledger_attempt`] rebuilds from the gate.
+///
+/// Most gates run once, so the list repeated the gate's own fields in about
+/// 36 KB of every validate ledger event
+/// (https://github.com/rrnewton/dev-hermit/issues/540). A retried gate, an
+/// environmental or infrastructure attempt, or any attempt that differs from
+/// the rebuild in one field keeps its list unchanged.
+/// [`ledger_gate_attempts`] reads either form.
+fn compact_ledger_gate(mut gate: serde_json::Value) -> serde_json::Value {
+    let implied = match gate.get("attempts").and_then(serde_json::Value::as_array) {
+        Some(attempts) if attempts.len() == 1 => {
+            implied_single_ledger_attempt(&gate).is_some_and(|implied| implied == attempts[0])
+        }
+        _ => false,
+    };
+    if implied {
+        gate.as_object_mut()
+            .expect("ledger gate must remain a JSON object")
+            .remove("attempts");
+    }
+    gate
+}
+
+/// A ledger gate's attempt history: its stored list, or the single attempt the
+/// gate implies when [`compact_ledger_gate`] omitted the list. `None` for a
+/// gate with neither, such as one built by [`ledger_gate`] alone.
+fn ledger_gate_attempts(gate: &serde_json::Value) -> Option<Vec<serde_json::Value>> {
+    match gate.get("attempts") {
+        Some(attempts) => attempts.as_array().cloned(),
+        None => implied_single_ledger_attempt(gate).map(|attempt| vec![attempt]),
+    }
+}
+
+/// Every gate shape the scheduler writes must survive compaction: the attempt
+/// history read back from the written gate equals the full history, a list
+/// is omitted only for one implied attempt, and a gate that differs from its
+/// rebuild in any attempt field keeps its list.
+fn ledger_gate_compaction_bracket() -> Result<(), String> {
+    let mut gates = typed_gate_round_trip_bracket()?
+        .into_iter()
+        .map(|gate| (format!("typed {}", gate["name"]), gate))
+        .collect::<Vec<_>>();
+    let failed = StepOutcome {
+        tag: "test.fixture".into(),
+        ok: false,
+        duration_s: 2.5,
+        summary: String::new(),
+        executed_tests: Some(1),
+        filtered_tests: Some(0),
+        test_results: None,
+        test_results_error: None,
+        test_results_error_kind: None,
+        returncode: Some(1),
+        oomed: false,
+        oom_kills: 0,
+        timed_out: false,
+        cpu_timed_out: false,
+        reason: "fixture failure".into(),
+        aborted: false,
+    };
+    let mut passed = failed.clone();
+    passed.ok = true;
+    passed.returncode = Some(0);
+    passed.reason.clear();
+    let mut no_result = failed.clone();
+    no_result.returncode = Some(NO_RESULT_EXIT_CODE);
+    let mut retried = reported_attempt(&failed, 1);
+    retried.retry_class = Some(RetryClass::AlwaysEligible);
+    retried.retry_detail = Some("fixture retry".into());
+    let mut environmental = reported_attempt(&failed, 1);
+    environmental.environmental_class = Some("fixture-environment".into());
+    let mut infrastructure = reported_attempt(&failed, 1);
+    infrastructure.understood_infrastructure_class = Some("fixture-infrastructure".into());
+    for (label, outcome, attempts, omitted) in [
+        (
+            "one pass",
+            &passed,
+            vec![reported_attempt(&passed, 1)],
+            true,
+        ),
+        (
+            "one failure",
+            &failed,
+            vec![reported_attempt(&failed, 1)],
+            true,
+        ),
+        (
+            "one no-result with its class and detail",
+            &no_result,
+            vec![reported_attempt(&no_result, 1)],
+            true,
+        ),
+        (
+            "one unreported attempt",
+            &failed,
+            vec![unreported_attempt("test.fixture".into(), 1)],
+            true,
+        ),
+        (
+            "retried then passed",
+            &passed,
+            vec![retried, reported_attempt(&passed, 2)],
+            false,
+        ),
+        (
+            "environmental hypothesis",
+            &failed,
+            vec![environmental],
+            false,
+        ),
+        ("infrastructure class", &failed, vec![infrastructure], false),
+        (
+            "second attempt only",
+            &passed,
+            vec![reported_attempt(&passed, 2)],
+            false,
+        ),
+    ] {
+        let gate = ledger_gate_with_attempts(outcome, &attempts);
+        let written = compact_ledger_gate(gate.clone());
+        if written.get("attempts").is_none() != omitted {
+            return Err(format!(
+                "ledger gate compaction {label}: omitted={} wanted {omitted}: {written}",
+                written.get("attempts").is_none()
+            ));
+        }
+        gates.push((label.to_string(), gate));
+    }
+    // An attempt that differs from the gate in one field keeps its list.
+    let mut drifted = ledger_gate_with_attempts(&passed, &[reported_attempt(&passed, 1)]);
+    drifted["attempts"][0]["real_seconds"] = serde_json::json!(9.0);
+    if compact_ledger_gate(drifted.clone())
+        .get("attempts")
+        .is_none()
+    {
+        return Err(format!(
+            "ledger gate compaction dropped a drifted attempt: {drifted}"
+        ));
+    }
+    gates.push(("drifted".into(), drifted));
+    for (label, gate) in &gates {
+        let written = compact_ledger_gate(gate.clone());
+        let mut rebuilt = written.clone();
+        if let Some(attempts) = ledger_gate_attempts(&written) {
+            rebuilt["attempts"] = serde_json::Value::Array(attempts);
+        }
+        if &rebuilt != gate || ledger_gate_attempts(&written) != ledger_gate_attempts(gate) {
+            return Err(format!(
+                "ledger gate compaction {label} lost a fact: full={gate} written={written} rebuilt={rebuilt}"
+            ));
+        }
+        // The shared typed reader reads the written gate as the full gate:
+        // every typed and extra field is equal, the only difference is the
+        // omitted list, and restoring that list from the written gate gives
+        // back exactly what the reader read from the full gate.
+        let read = |row: &serde_json::Value| {
+            serde_json::from_value::<hermit_manifest_plan::ledger::GateHistoryRow>(row.clone())
+                .map_err(|error| format!("{label}: typed reader refused a gate: {error}: {row}"))
+        };
+        let read_full = read(gate)?;
+        let mut read_written = read(&written)?;
+        if written.get("attempts").is_none() {
+            if read_written.extra.contains_key("attempts") {
+                return Err(format!(
+                    "{label}: typed reader invented an attempt list: {written}"
+                ));
+            }
+            let mut read_full_without_list = read_full.clone();
+            read_full_without_list.extra.remove("attempts");
+            if read_written != read_full_without_list {
+                return Err(format!(
+                    "{label}: typed reader read the written gate differently: full={gate} written={written}"
+                ));
+            }
+            if let Some(attempts) = ledger_gate_attempts(&written) {
+                read_written
+                    .extra
+                    .insert("attempts".into(), serde_json::Value::Array(attempts));
+            }
+        }
+        if read_written != read_full {
+            return Err(format!(
+                "{label}: typed reader lost a fact from the written gate: full={gate} written={written}"
+            ));
+        }
+    }
+    // A gate built without attempts has no implied attempt.
+    if ledger_gate_attempts(&ledger_gate(&passed)).is_some() {
+        return Err("a gate without raw_result read as one implied attempt".into());
+    }
+    Ok(())
+}
+
 fn typed_gate_round_trip_bracket() -> Result<Vec<serde_json::Value>, String> {
     let fields = ["oomed", "oom_kills", "timed_out", "cpu_timed_out"];
     let mut fixtures = Vec::new();
@@ -23047,9 +23299,11 @@ fn write_ledger_with_snapshot(
             })
         })
         .collect();
+    // A gate's attempt list is omitted only when the gate itself states its
+    // one attempt; `ledger_gate_attempts` reads either form.
     let gates: Vec<serde_json::Value> = outcomes
         .iter()
-        .map(|outcome| ledger_gate_with_attempts(outcome, attempts))
+        .map(|outcome| compact_ledger_gate(ledger_gate_with_attempts(outcome, attempts)))
         .collect();
     // Nodes that were re-run, and nodes for which no completion payload ever
     // arrived. The second list is the verdict-capture population: a node that
@@ -29888,6 +30142,11 @@ mod typed_termination_tests {
     #[test]
     fn gate_and_attempt_termination_fields_preserve_latest_unknown() {
         ledger_gate_origin_bracket().unwrap();
+    }
+
+    #[test]
+    fn a_written_gate_omits_only_an_attempt_it_states_itself() {
+        ledger_gate_compaction_bracket().unwrap();
     }
 
     #[test]
