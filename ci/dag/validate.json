@@ -1060,6 +1060,13 @@
           "backend": "sabre"
         },
         {
+          "lane": "portable",
+          "category": "bin-c",
+          "test": "bin-c/robust-futex-test",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
           "kind": "structured-test-results",
           "schema": 2,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
@@ -13229,6 +13236,13 @@
         {
           "lane": "portable",
           "category": "language-runtimes",
+          "test": "language-runtimes/python-hashseed",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
           "test": "language-runtimes/python-io-subprocess-time",
           "mode": "verify",
           "backend": "kvm"
@@ -16127,6 +16141,13 @@
         },
         {
           "lane": "portable",
+          "category": "bin-c",
+          "test": "bin-c/robust-futex-test",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/acct-refusal-probe",
           "mode": "verify",
@@ -18285,6 +18306,13 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/python-hash-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-hashseed",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -21351,6 +21379,13 @@
           "test": "bin-c/posix-timer-test",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "bin-c",
+          "test": "bin-c/robust-futex-test",
+          "mode": "verify",
+          "backend": "ptrace"
         },
         {
           "kind": "structured-test-results",
@@ -28028,6 +28063,13 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/python-hash-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-hashseed",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -36976,6 +37018,13 @@
           "backend": "sabre"
         },
         {
+          "lane": "portable",
+          "category": "bin-c",
+          "test": "bin-c/robust-futex-test",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
           "kind": "structured-test-results",
           "schema": 2,
           "path_env": "DAGRUN_TEST_COUNTS_PATH",
@@ -45209,6 +45258,13 @@
           "lane": "portable",
           "category": "language-runtimes",
           "test": "language-runtimes/python-hash-determinism",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
+          "test": "language-runtimes/python-hashseed",
           "mode": "verify",
           "backend": "ptrace"
         },

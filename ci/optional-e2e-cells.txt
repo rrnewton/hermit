@@ -5,7 +5,6 @@ applications/example-timed-progress-bar verify kvm
 applications/example-timed-progress-bar verify liteinst
 applications/example-timed-progress-bar verify ptrace
 applications/kvm-python-examples verify kvm
-bin-c/robust-futex-test verify ptrace
 c-programs/acct-refusal-probe verify dbt
 c-programs/add-key-enosys verify dbt
 c-programs/adjtimex-deterministic verify dbt
@@ -114,7 +113,6 @@ language-runtimes/perl-hash-order naked -
 language-runtimes/perl-random naked -
 language-runtimes/python-hash-determinism naked -
 language-runtimes/python-hashseed naked -
-language-runtimes/python-hashseed verify ptrace
 language-runtimes/python-random naked -
 language-runtimes/ruby-random naked -
 language-runtimes/ruby-random verify kvm
