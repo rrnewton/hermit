@@ -93,7 +93,7 @@ impl GlobalState {
         {
             return Ok(false);
         }
-        self.with_foreground_close(tid, state, |engine, grant, metadata| {
+        let result = self.with_foreground_close(tid, state, |engine, grant, metadata| {
             engine.validate_fd_read_grant(owner, read).map_err(failed)?;
             let observed = metadata.observe_fd_read(read).map_err(failed)?;
             if observed.binding != read.binding
@@ -111,7 +111,17 @@ impl GlobalState {
                 .validate_foreground_close_birth_root(owner, read, grant.root())
                 .map_err(failed)?;
             Ok(true)
-        })
+        });
+        crate::network_runtime::socket_birth_policy::decline_diagnostic(format_args!(
+            "phase=close-census fd={} outcome={}",
+            read.fd,
+            match &result {
+                Ok(true) => "initial-singleton",
+                Ok(false) => "other-topology",
+                Err(_) => "error",
+            }
+        ));
+        result
     }
     pub(crate) async fn begin_foreground_original_close<T>(
         &self,

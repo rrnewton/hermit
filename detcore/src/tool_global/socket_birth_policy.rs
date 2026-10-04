@@ -14,6 +14,16 @@ impl GlobalState {
         _target: &OwnedFd,
     ) -> Result<Option<SocketBirthAuthority>, NetworkRpcError> {
         let a = &admission.arguments;
+        let diagnostic_scope =
+            a.kind == Kind::Socket && a.fd == libc::AF_INET && self.uses_shared_network_attempts();
+        let diagnostic = |reason: &str| {
+            if diagnostic_scope {
+                crate::network_runtime::socket_birth_policy::decline_diagnostic(format_args!(
+                    "phase=birth-authority call={} reason={reason}",
+                    admission.call.native_command_call()
+                ));
+            }
+        };
         if !self.cfg.sequentialize_threads
             || a.kind != Kind::Socket
             || a.fd != libc::AF_INET
@@ -21,15 +31,19 @@ impl GlobalState {
                 != libc::SOCK_STREAM
             || !matches!(a.length, 0 | libc::IPPROTO_TCP)
         {
+            diagnostic("shape-or-nonsequential");
             return Ok(None);
         }
         let Some(runtime) = &self.network_runtime else {
+            diagnostic("no-runtime");
             return Ok(None);
         };
         let Ok(root) = runtime.foreground_root(owner) else {
+            diagnostic("no-root");
             return Ok(None);
         };
         if !root.is_sole_initial_root(owner) {
+            diagnostic("not-sole-initial");
             return Ok(None);
         }
         let actual = root
@@ -66,6 +80,7 @@ impl GlobalState {
                 "Socket birth was canceled before capture",
             ));
         }
+        diagnostic("issuer-reached");
         SocketBirthAuthority::from_original(root.clone(), &grant, admission)
             .map(Some)
             .map_err(|e| NetworkRpcError::internal(e.to_string()))

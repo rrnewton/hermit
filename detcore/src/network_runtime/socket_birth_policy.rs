@@ -26,6 +26,54 @@ const BPF_F_QUERY_EFFECTIVE: u32 = 1;
 const GETSOCKOPT: u32 = 21;
 const SETSOCKOPT: u32 = 22;
 
+/// Temporary finite-Close investigation on the existing supervisor channel.
+/// No tracing record, guest output, query or authority is produced here.
+/// Only fixed labels/numeric fields are passed; cap each process at 64 rows.
+/// Missing/limited diagnostic evidence never proves admission or success.
+pub(crate) fn decline_diagnostic(fields: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    static ROWS: AtomicUsize = AtomicUsize::new(0);
+    let row = ROWS
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            Some(n.saturating_add(1).min(65))
+        })
+        .unwrap();
+    if row > 64 {
+        return;
+    }
+    let line = if row == 64 {
+        "hermit: finite-close-diagnostic row-limit=64\n".to_owned()
+    } else {
+        format!("hermit: finite-close-diagnostic row={row} {fields}\n")
+    };
+    let bytes = if line.len() <= 1024 {
+        line.as_bytes()
+    } else {
+        b"hermit: finite-close-diagnostic row-too-long\n"
+    };
+    let _ = crate::util::RetryingStderr.write_all(bytes);
+}
+
+// Emit only the numeric prefix, never the existing private error's host paths.
+fn diagnostic_failure(snapshot: &Snapshot) -> (u8, Option<i32>) {
+    let Some(error) = snapshot.error.as_deref() else {
+        return (0, None);
+    };
+    let Some(fields) = error.strip_prefix("finite-close-stage=") else {
+        return (255, None);
+    };
+    let mut fields = fields.splitn(3, ';');
+    let stage = fields.next().and_then(|s| s.parse().ok()).unwrap_or(255);
+    let errno = fields
+        .next()
+        .and_then(|s| s.strip_prefix("errno="))
+        .and_then(|s| s.parse().ok())
+        .filter(|n| *n != 0);
+    (stage, errno)
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct Node {
     device: u64,
@@ -270,8 +318,22 @@ impl Plan {
             .as_ref()
             .is_some_and(|c| c.pid != authority.root.thread() as u32)
         {
-            before.error = Some("Socket birth PIDFD differs from original root".into());
+            before.error = Some(
+                "finite-close-stage=16;errno=0; Socket birth PIDFD differs from original root"
+                    .into(),
+            );
         }
+        decline_diagnostic(format_args!(
+            "phase=birth-before call={} domain={} stage={} errno={:?} identity={} opened={} closed={} released={}",
+            authority.admission.call.native_command_call(),
+            authority.admission.arguments.fd,
+            diagnostic_failure(&before).0,
+            diagnostic_failure(&before).1,
+            before.identity_complete(),
+            before.opened,
+            before.releases.len(),
+            before.released()
+        ));
         Self { authority, before }
     }
     pub(super) fn released(&self) -> bool {
@@ -291,11 +353,50 @@ impl Plan {
             ));
         }
         if !self.before.released() || !after.released() {
+            decline_diagnostic(format_args!(
+                "phase=birth-release-refused call={} before_opened={} before_closed={} after_opened={} after_closed={} before_errno={:?} after_errno={:?}",
+                admission.call.native_command_call(),
+                self.before.opened,
+                self.before.releases.len(),
+                after.opened,
+                after.releases.len(),
+                self.before.releases.iter().find_map(|r| r.errno),
+                after.releases.iter().find_map(|r| r.errno)
+            ));
             return Err(io::Error::other(
                 "Socket birth directory release remains unresolved",
             ));
         }
         let linger = observation.disabled_linger();
+        decline_diagnostic(format_args!(
+            "phase=birth-complete call={} before_stage={} before_errno={:?} after_stage={} after_errno={:?} same_birth={} policy_same={} linger_rc={:?} linger_errno={:?} linger_len={} linger_on={} eligible={}",
+            admission.call.native_command_call(),
+            diagnostic_failure(&self.before).0,
+            diagnostic_failure(&self.before).1,
+            diagnostic_failure(after).0,
+            diagnostic_failure(after).1,
+            self.before.same_birth(after),
+            after == &observation.policy,
+            observation.returned,
+            observation.errno,
+            observation.length,
+            observation.value[0],
+            after == &observation.policy && self.before.same_birth(after) && linger.is_some()
+        ));
+        if let Some(queries) = &after.queries {
+            for q in queries {
+                decline_diagnostic(format_args!(
+                    "phase=birth-query call={} attach={} rc={} errno={:?} count={} flags={} revision={}",
+                    admission.call.native_command_call(),
+                    q.attach,
+                    q.returned,
+                    q.errno,
+                    q.count,
+                    q.attach_flags,
+                    q.revision
+                ));
+            }
+        }
         if after != &observation.policy || !self.before.same_birth(after) || linger.is_none() {
             return Ok(None);
         }
@@ -544,14 +645,17 @@ pub(super) fn snapshot(target: BorrowedFd<'_>, effective: bool) -> Snapshot {
     use std::os::unix::fs::MetadataExt;
     let mut receipt = Snapshot::new();
     let mut opened: Vec<OwnedFd> = Vec::new();
+    let mut diagnostic_stage = 1;
     let observed = (|| -> io::Result<()> {
         let before = creator(target)?;
+        diagnostic_stage = 2;
         let local_ns = std::fs::metadata("/proc/thread-self/ns/cgroup")?;
         if local_ns.ino() != CGROUP_NS_INIT_INO {
             return Err(io::Error::other(
                 "observer is not in initial cgroup namespace",
             ));
         }
+        diagnostic_stage = 3;
         const PIDFD_GET_CGROUP_NAMESPACE: libc::c_ulong = 0xff01;
         let raw = unsafe { libc::ioctl(target.as_raw_fd(), PIDFD_GET_CGROUP_NAMESPACE, 0) };
         if raw < 0 {
@@ -559,6 +663,7 @@ pub(super) fn snapshot(target: BorrowedFd<'_>, effective: bool) -> Snapshot {
         }
         opened.push(unsafe { OwnedFd::from_raw_fd(raw) });
         receipt.opened += 1;
+        diagnostic_stage = 4;
         let ns = stat_node(opened.last().unwrap().as_fd(), None)?;
         if ns.inode != CGROUP_NS_INIT_INO || ns.device != local_ns.dev() {
             return Err(io::Error::other(
@@ -566,19 +671,25 @@ pub(super) fn snapshot(target: BorrowedFd<'_>, effective: bool) -> Snapshot {
             ));
         }
         receipt.namespace = Some(ns);
+        diagnostic_stage = 5;
         let member = membership(&read_bounded(
             &format!("/proc/{}/cgroup", before.pid),
             4096,
         )?)?;
+        diagnostic_stage = 6;
         let (expected_mount, mountpoint) =
             mount(&read_bounded("/proc/thread-self/mountinfo", 1024 * 1024)?)?;
+        diagnostic_stage = 7;
         opened.push(open_directory(libc::AT_FDCWD, &mountpoint, false)?);
         receipt.opened += 1;
         let root = opened.last().unwrap();
+        diagnostic_stage = 8;
         stat_node(root.as_fd(), Some(CGROUP2_MAGIC))?;
+        diagnostic_stage = 9;
         if mount_id(root.as_fd())? != expected_mount {
             return Err(io::Error::other("cgroup2 mount changed during resolution"));
         }
+        diagnostic_stage = 10;
         let relative = member.strip_prefix('/').unwrap();
         opened.push(open_directory(
             root.as_raw_fd(),
@@ -587,7 +698,9 @@ pub(super) fn snapshot(target: BorrowedFd<'_>, effective: bool) -> Snapshot {
         )?);
         receipt.opened += 1;
         let directory = opened.last().unwrap();
+        diagnostic_stage = 11;
         let node = stat_node(directory.as_fd(), Some(CGROUP2_MAGIC))?;
+        diagnostic_stage = 12;
         let actual_mount = mount_id(directory.as_fd())?;
         if actual_mount != expected_mount || node.inode != before.cgroup {
             return Err(io::Error::other(
@@ -606,6 +719,7 @@ pub(super) fn snapshot(target: BorrowedFd<'_>, effective: bool) -> Snapshot {
                 query(directory.as_fd(), SETSOCKOPT),
             ]);
         }
+        diagnostic_stage = 14;
         if creator(target)? != before
             || membership(&read_bounded(
                 &format!("/proc/{}/cgroup", before.pid),
@@ -619,7 +733,10 @@ pub(super) fn snapshot(target: BorrowedFd<'_>, effective: bool) -> Snapshot {
         Ok(())
     })();
     if let Err(error) = observed {
-        receipt.error = Some(error.to_string());
+        receipt.error = Some(format!(
+            "finite-close-stage={diagnostic_stage};errno={}; {error}",
+            error.raw_os_error().unwrap_or(0)
+        ));
     }
     for fd in opened.into_iter().rev() {
         let returned = unsafe { libc::close(fd.into_raw_fd()) };

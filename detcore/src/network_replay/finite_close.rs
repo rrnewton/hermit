@@ -7,6 +7,7 @@ use crate::network_runtime::original_installation::FileIdentity;
 use crate::network_runtime::original_installation::Installation;
 use crate::network_runtime::original_installation::Source;
 use crate::network_runtime::socket_birth_policy::Completed;
+use crate::network_runtime::socket_birth_policy::decline_diagnostic;
 
 #[derive(Debug)]
 pub(in crate::network_replay) struct FiniteCloseBirth {
@@ -39,6 +40,10 @@ impl NetworkReplayEngine {
     ) -> Result<Option<Arc<FiniteCloseBirth>>, NetworkReplayError> {
         self.validate_fd_read(owner, read)?;
         let Some(binding) = read.binding else {
+            decline_diagnostic(format_args!(
+                "phase=close-birth fd={} reason=no-binding",
+                read.fd
+            ));
             return Ok(None);
         };
         let Some(socket) = self
@@ -46,15 +51,35 @@ impl NetworkReplayEngine {
             .as_ref()
             .and_then(|s| s.sockets.get(&binding.open_file))
         else {
+            decline_diagnostic(format_args!(
+                "phase=close-birth fd={} ofd={:?} reason=no-socket",
+                read.fd, binding.open_file
+            ));
             return Ok(None);
         };
         let Some(provenance) = &socket.finite_close else {
+            decline_diagnostic(format_args!(
+                "phase=close-birth fd={} ofd={:?} reason=no-birth",
+                read.fd, binding.open_file
+            ));
             return Ok(None);
         };
         if provenance.revoked {
+            decline_diagnostic(format_args!(
+                "phase=close-birth fd={} ofd={:?} birth_call={} reason=revoked",
+                read.fd,
+                binding.open_file,
+                provenance.birth.call.native_command_call()
+            ));
             return Ok(None);
         }
         self.validate_finite_close_birth(binding.open_file, &provenance.birth)?;
+        decline_diagnostic(format_args!(
+            "phase=close-birth fd={} ofd={:?} birth_call={} reason=present",
+            read.fd,
+            binding.open_file,
+            provenance.birth.call.native_command_call()
+        ));
         Ok(Some(provenance.birth.clone()))
     }
     pub(in crate::network_replay) fn validate_finite_close_birth(
@@ -107,6 +132,13 @@ impl NetworkReplayEngine {
                 .and_then(|s| s.finite_close.as_mut())
         {
             provenance.revoked = true;
+            decline_diagnostic(format_args!(
+                "phase=birth-revoked ofd={:?} birth_call={} level={} option={}",
+                file,
+                provenance.birth.call.native_command_call(),
+                level,
+                option
+            ));
         }
         Ok(())
     }
@@ -151,6 +183,17 @@ impl NetworkReplayEngine {
         binding: crate::types::FdSlotBinding,
         receipt: &Installation,
     ) {
+        if self.uses_shared_mm_attempts()
+            && let Source::Socket(call) = receipt.source()
+        {
+            decline_diagnostic(format_args!(
+                "phase=birth-enroll call={} fd={} ofd={:?} proof={}",
+                call.native_command_call(),
+                binding.slot.fd,
+                binding.open_file,
+                receipt.finite_close_birth().is_some()
+            ));
+        }
         let Some(policy) = receipt.finite_close_birth() else {
             return;
         };
