@@ -569,7 +569,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validation_dag::tests::committed_buck_e2e_selection_replaces_22_nodes_with_18,
     // added with the full-buck-e2e label (Buck as the E2E runner), retains all
     // 840 prior identities.
-    ("test.regular_crates", 841),
+    // detcore-model's procfs::tests::ephemeral_host_seed_mount_class_is_the_seed_name
+    // and seed_filter_drops_only_seed_rows_and_keeps_order
+    // (https://github.com/rrnewton/hermit/pull/3219) retain all 841 prior
+    // identities (`cargo nextest list --profile ci` measured 843).
+    ("test.regular_crates", 843),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -677,7 +681,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (a skid overshoot no longer erases a refused comparison's reason, so the
     // SKID-RETRY of https://github.com/rrnewton/hermit/issues/1845 cannot
     // retry it) retains all 816 prior identities.
-    ("test.hermit_unit", 817),
+    // tests::identity_capture_excludes_host_seed_mounts_and_keeps_order
+    // (https://github.com/rrnewton/hermit/pull/3219) retains all 817 prior
+    // identities (`cargo nextest list --profile ci` lists 823 = 818 plus the
+    // five real_random_ PMU cases this node skips).
+    ("test.hermit_unit", 818),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -742,13 +750,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // bootstrap_syscall_marks_its_resource_requests_only_while_it_is_uncharged,
     // https://github.com/rrnewton/hermit/issues/3517) retain all 876 prior
     // identities: 876 + 2 = 878.
-    // Four ephemeral host seed mount tests (procfs::tests::
-    // ephemeral_host_seed_mount_class_is_precise,
-    // seed_churn_does_not_change_guest_mountinfo_membership,
-    // mounts_format_seed_rows_are_excluded_legitimate_rows_kept and
-    // retained_row_with_seed_parent_still_snapshots) retain all 878 prior
-    // identities: 878 + 4 = 882.
-    ("test.detcore_unit", 882),
+    // Three ephemeral host seed mount tests (procfs::tests::
+    // seed_churn_does_not_change_guest_mountinfo_membership and
+    // retained_row_with_seed_parent_still_snapshots, and the source guard
+    // syscalls::files::procfs_wiring_guard::
+    // snapshot_initializer_excludes_host_seed_mounts_at_both_captures,
+    // https://github.com/rrnewton/hermit/pull/3219) retain all 878 prior
+    // identities: 878 + 3 = 881 (`cargo nextest list --profile ci` measured 881).
+    ("test.detcore_unit", 881),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -964,9 +973,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two bootstrap-turn scheduler-time tests listed for test.detcore_unit
     // (https://github.com/rrnewton/hermit/issues/3517) retain all 876 prior
     // identities.
-    // The four ephemeral host seed mount tests listed for test.detcore_unit
-    // retain all 878 prior identities: 878 + 4 = 882.
-    ("test.detcore_unit_on_host", 882),
+    // The three ephemeral host seed mount tests listed for test.detcore_unit
+    // retain all 878 prior identities: 878 + 3 = 881.
+    ("test.detcore_unit_on_host", 881),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1000,7 +1009,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same 562b7dd7a635 test.
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/issues/1845 test.
-    ("test.hermit_unit_on_host", 817),
+    // The host twin selects the same https://github.com/rrnewton/hermit/pull/3219 test.
+    ("test.hermit_unit_on_host", 818),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
@@ -1033,7 +1043,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 838, and the retained-PASS re-decision test listed there retains
     // all 839.
     // committed_buck_e2e_selection_replaces_22_nodes_with_18 retains all 840.
-    ("test.regular_crates_on_host", 841),
+    // The two detcore-model seed mount tests listed for test.regular_crates
+    // retain all 841 prior identities.
+    ("test.regular_crates_on_host", 843),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
