@@ -761,7 +761,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3219) retains all 817 prior
     // identities (`cargo nextest list --profile ci` lists 823 = 818 plus the
     // five real_random_ PMU cases this node skips).
-    ("test.hermit_unit", 818),
+    // Candidate 1e4519e707a9 inventories measured 836 selected cases; the
+    // existing identities and selection flags are retained. Count evidence:
+    // https://github.com/rrnewton/reverie/issues/916
+    ("test.hermit_unit", 836),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -839,6 +842,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_fault_of_the_whole_copy_copies_nothing;
     // https://github.com/rrnewton/hermit/pull/3226) retain all 881 prior
     // identities: 881 + 23 = 904 (`cargo nextest list --profile ci` measured 904).
+    // Candidate 1e4519e707a9 inventories measured 897 selected cases; the
+    // existing identities and selection flags are retained. Count evidence:
+    // https://github.com/rrnewton/reverie/issues/916
+    // Parent-death composition keeps the upstream count temporarily.
+    // The composed Detcore inventory is pending; this is not its measured count.
     ("test.detcore_unit", 904),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
@@ -900,7 +908,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_renamed_over_target_does_not_get_the_explicit_mtime
     // (https://github.com/rrnewton/hermit/issues/3565); they retain all 193
     // prior identities.
-    ("test.hermit_integration", 195),
+    // Candidate 1e4519e707a9 inventories measured 199 selected cases; the
+    // existing identities and selection flags are retained. Count evidence:
+    // https://github.com/rrnewton/reverie/issues/916
+    ("test.hermit_integration", 199),
     ("test.arbitrary_binaries", 4),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
@@ -1062,6 +1073,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 878 prior identities: 878 + 3 = 881.
     // The host twin selects the same 23 directory-stream tests
     // (https://github.com/rrnewton/hermit/pull/3226): 881 + 23 = 904.
+    // Candidate 1e4519e707a9 inventories measured 897 selected cases; the
+    // existing identities and selection flags are retained. Count evidence:
+    // https://github.com/rrnewton/reverie/issues/916
+    // Parent-death composition keeps the upstream count temporarily.
+    // The composed Detcore inventory is pending; this is not its measured count.
     ("test.detcore_unit_on_host", 904),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
@@ -1075,7 +1091,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3639).
     // The host twin also selects the two utimensat_mtime tests
     // (https://github.com/rrnewton/hermit/issues/3565).
-    ("test.hermit_integration_on_host", 195),
+    // Candidate 1e4519e707a9 inventories measured 199 selected cases; the
+    // existing identities and selection flags are retained. Count evidence:
+    // https://github.com/rrnewton/reverie/issues/916
+    ("test.hermit_integration_on_host", 199),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -1097,7 +1116,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/issues/1845 test.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3219 test.
-    ("test.hermit_unit_on_host", 818),
+    // Candidate 1e4519e707a9 inventories measured 836 selected cases; the
+    // existing identities and selection flags are retained. Count evidence:
+    // https://github.com/rrnewton/reverie/issues/916
+    ("test.hermit_unit_on_host", 836),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
