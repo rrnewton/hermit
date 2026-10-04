@@ -652,7 +652,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // ledger::admission::tests::main_ancestor_floor_is_canonical_only_as_the_targets_own_floor
     // of 6bc5540bb6a7 retains all 890 (the validate node at b3037b11fa56 executed
     // 694 hermit-manifest-plan tests and 891 in the whole selection, all passing).
-    ("test.regular_crates", 891),
+    // stress_series::tests::pressure_history_admits_a_nonzero_match_only_as_declared
+    // retains all 891 (`cargo nextest list --profile ci -p hermit-manifest-plan`
+    // measured 694 at 4565b01b66c2 and 695 with it).
+    ("test.regular_crates", 892),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1147,8 +1150,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two process-group scan tests listed there retain all 884.
     // The three parity import tests listed there retain all 886, and the
     // retained-command-line test listed there retains all 889. The
-    // main-ancestor floor admission test listed there retains all 890.
-    ("test.regular_crates_on_host", 891),
+    // main-ancestor floor admission test listed there retains all 890, and the
+    // declared-exit pressure history test listed there retains all 891.
+    ("test.regular_crates_on_host", 892),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
