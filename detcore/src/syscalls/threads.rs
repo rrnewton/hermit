@@ -554,11 +554,14 @@ fn validate_wait4_arguments(pid: libc::pid_t, options: WaitPidFlag) -> Result<()
 }
 
 // Serial KVM represents terminal events only, including the terminal subset
-// of WUNTRACED. Keep unsupported and unknown low-int bits on the backend's
-// prevalidation path; they must not select or consume a logical child.
+// of WUNTRACED. `__WNOTHREAD` is enforced by the logical owner filter in
+// `terminal_child_wait_spec`, and exact-child completion strips it before
+// the backend call. Keep unsupported and unknown low-int bits on the
+// backend's prevalidation path; they must not select or consume a logical
+// child.
 pub(super) fn wait4_uses_terminal_selector(options: WaitPidFlag, serial_kvm: bool) -> bool {
     if serial_kvm {
-        options.bits() & !(libc::WNOHANG | libc::WUNTRACED) == 0
+        options.bits() & !(libc::WNOHANG | libc::WUNTRACED | libc::__WNOTHREAD) == 0
     } else {
         !options.intersects(
             WaitPidFlag::WUNTRACED
@@ -590,7 +593,15 @@ where
             "serial KVM wait4 selected child has no owned final CPU publication"
         )));
     }
-    let result = guest.inject(call.with_pid(child.as_raw())).await;
+    // Selection already applied `__WNOTHREAD` through the logical owner
+    // filter; the backend's raw wait4 accepts only WNOHANG and WUNTRACED.
+    // Keep exactly those, as the waitid exact-child completion does.
+    let exact = call
+        .with_pid(child.as_raw())
+        .with_options(WaitPidFlag::from_bits_retain(
+            call.options().bits() & (libc::WNOHANG | libc::WUNTRACED),
+        ));
+    let result = guest.inject(exact).await;
     match result {
         Ok(pid) if pid == i64::from(child.as_raw()) => {}
         // The supported KVM wait4 selects/consumes before either status or

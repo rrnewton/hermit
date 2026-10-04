@@ -9,6 +9,7 @@
 //! Immediate logical-child and CPU accounting invariants have component tests;
 //! eventual guest ECHILD by itself would not establish their ordering.
 
+use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
@@ -1014,4 +1015,506 @@ fn assert_wait4_int_min_observations(stdout: &[u8]) {
             "type": "summary", "cases": 64, "calls": 64, "children": 0, "passed": true
         })
     );
+}
+
+// Serial-KVM wait4 with `__WNOTHREAD`: the logical owner filter admits only
+// the calling thread's own children. The guest checks every result and both
+// whole output pages itself. This table independently fixes the complete
+// call sequence, so a guest that skipped, added or reordered a call fails.
+pub(super) fn run_wait4_nothread() {
+    run_fixture(
+        "wait4-nothread",
+        "kvm_wait4_nothread.c",
+        &[],
+        assert_wait4_nothread_observations,
+        |_, _| {},
+    );
+}
+
+#[derive(Clone, Copy)]
+enum NothreadTarget {
+    Child(&'static str),
+    /// wait4 pid -1.
+    Any,
+    /// waitid P_ALL.
+    All,
+}
+
+#[derive(Clone, Copy)]
+enum NothreadOutcome {
+    Reaped(&'static str),
+    Zero,
+    Error(i32),
+}
+
+#[derive(Clone, Copy)]
+enum NothreadCpu {
+    Start,
+    Equal,
+    Added,
+}
+
+enum NothreadStep {
+    Spawn {
+        name: &'static str,
+        status: i32,
+        held: bool,
+    },
+    Wait4 {
+        name: &'static str,
+        target: NothreadTarget,
+        options: i32,
+        fault: i32,
+        usage: bool,
+        outcome: NothreadOutcome,
+        status: i32,
+    },
+    Waitid {
+        name: &'static str,
+        target: NothreadTarget,
+        options: i32,
+        event: Option<(&'static str, i32)>,
+        error: i32,
+    },
+    Cpu {
+        name: &'static str,
+        relation: NothreadCpu,
+    },
+    Case {
+        name: &'static str,
+        worker: bool,
+    },
+}
+
+/// The complete expected sequence: (case, made by a worker thread, step).
+fn wait4_nothread_script() -> Vec<(u32, bool, NothreadStep)> {
+    use NothreadCpu::*;
+    use NothreadOutcome::*;
+    use NothreadStep::*;
+    use NothreadTarget::*;
+    const N: i32 = libc::WNOHANG;
+    const U: i32 = libc::WUNTRACED;
+    const T: i32 = libc::__WNOTHREAD;
+    let wait4 = |name, target, options, usage, outcome, status| Wait4 {
+        name,
+        target,
+        options,
+        fault: 0,
+        usage,
+        outcome,
+        status,
+    };
+    let echild = |name, target, options| wait4(name, target, options, true, Error(libc::ECHILD), 0);
+    let peek = |name, child, status| Waitid {
+        name,
+        target: Child(child),
+        options: libc::WEXITED | libc::WNOWAIT,
+        event: Some((child, status)),
+        error: 0,
+    };
+    let waitid_echild = |name, target| Waitid {
+        name,
+        target,
+        options: libc::WEXITED | libc::WNOHANG,
+        event: None,
+        error: libc::ECHILD,
+    };
+    let cpu = |name, relation| Cpu { name, relation };
+    let mut script = Vec::new();
+    let deny = |script: &mut Vec<_>, case, worker, child| {
+        for (name, target, options) in [
+            ("deny-exact-nohang", Child(child), N | T),
+            ("deny-any-nohang", Any, N | T),
+            ("deny-exact-blocking", Child(child), T),
+            ("deny-any-blocking", Any, T),
+            ("deny-any-untraced", Any, U | T),
+        ] {
+            script.push((case, worker, echild(name, target, options)));
+        }
+    };
+    let main = |script: &mut Vec<_>, case, steps: Vec<NothreadStep>| {
+        script.extend(steps.into_iter().map(|step| (case, false, step)));
+    };
+    main(
+        &mut script,
+        0,
+        vec![
+            Spawn {
+                name: "c1",
+                status: 41,
+                held: true,
+            },
+            wait4("own-exact-live", Child("c1"), N | T, true, Zero, 0),
+            wait4("own-any-live", Any, N | T, true, Zero, 0),
+            wait4(
+                "own-exact-live-untraced",
+                Child("c1"),
+                N | U | T,
+                true,
+                Zero,
+                0,
+            ),
+            wait4("own-any-live-untraced", Any, N | U | T, true, Zero, 0),
+            cpu("baseline", Start),
+            Case {
+                name: "owned-live",
+                worker: false,
+            },
+        ],
+    );
+    deny(&mut script, 1, true, "c1");
+    main(
+        &mut script,
+        1,
+        vec![
+            cpu("after-live-denial", Equal),
+            Case {
+                name: "sibling-denial-live",
+                worker: true,
+            },
+        ],
+    );
+    main(&mut script, 2, vec![peek("c1-peek", "c1", 41)]);
+    deny(&mut script, 2, true, "c1");
+    main(
+        &mut script,
+        2,
+        vec![
+            peek("c1-peek-again", "c1", 41),
+            cpu("after-ready-denial", Equal),
+            Case {
+                name: "sibling-denial-ready",
+                worker: true,
+            },
+        ],
+    );
+    main(
+        &mut script,
+        3,
+        vec![
+            wait4("own-exact-consume", Child("c1"), T, false, Reaped("c1"), 41),
+            cpu("after-consume", Added),
+            echild("own-exact-echild", Child("c1"), N | T),
+            echild("own-any-echild", Any, N | T),
+            waitid_echild("c1-echild", Child("c1")),
+            cpu("after-echild", Equal),
+            Case {
+                name: "owned-ready-completion",
+                worker: false,
+            },
+        ],
+    );
+    main(
+        &mut script,
+        4,
+        vec![
+            Spawn {
+                name: "c2",
+                status: 42,
+                held: true,
+            },
+            wait4(
+                "own-any-blocking-consume",
+                Any,
+                U | T,
+                false,
+                Reaped("c2"),
+                42,
+            ),
+            cpu("after-consume", Added),
+            echild("own-any-echild", Any, N | T),
+            cpu("after-echild", Equal),
+            Case {
+                name: "owned-blocking-completion",
+                worker: true,
+            },
+        ],
+    );
+    main(
+        &mut script,
+        5,
+        vec![
+            Spawn {
+                name: "c3",
+                status: 43,
+                held: false,
+            },
+            peek("c3-peek", "c3", 43),
+            wait4(
+                "own-any-nohang-consume",
+                Any,
+                N | T,
+                false,
+                Reaped("c3"),
+                43,
+            ),
+            cpu("after-consume", Added),
+            echild("own-exact-echild", Child("c3"), N | T),
+            cpu("after-echild", Equal),
+            Case {
+                name: "owned-nohang-completion",
+                worker: false,
+            },
+        ],
+    );
+    // (fault, any-child selector, options, readiness peek first)
+    let faults = [
+        (1, false, T, false),
+        (1, true, N | T, true),
+        (2, false, U | T, false),
+        (2, true, N | U | T, true),
+    ];
+    for (k, (fault, any, options, ready)) in faults.into_iter().enumerate() {
+        let child = ["fault0", "fault1", "fault2", "fault3"][k];
+        let status = 50 + k as i32;
+        let mut steps = vec![Spawn {
+            name: child,
+            status,
+            held: false,
+        }];
+        if ready {
+            steps.push(peek("fault-peek", child, status));
+        }
+        steps.extend([
+            cpu("before-fault", Equal),
+            Wait4 {
+                name: "own-consuming-fault",
+                target: if any { Any } else { Child(child) },
+                options,
+                fault,
+                usage: true,
+                outcome: Error(libc::EFAULT),
+                status,
+            },
+            cpu("after-fault", Added),
+            echild("own-exact-echild", Child(child), N | T),
+            waitid_echild("fault-echild", Child(child)),
+            cpu("after-echild", Equal),
+            Case {
+                name: "owned-fault",
+                worker: false,
+            },
+        ]);
+        main(&mut script, 6 + k as u32, steps);
+    }
+    script.push((
+        10,
+        true,
+        Spawn {
+            name: "c5",
+            status: 45,
+            held: true,
+        },
+    ));
+    deny(&mut script, 10, false, "c5");
+    main(
+        &mut script,
+        10,
+        vec![cpu("before-release", Equal), peek("c5-peek", "c5", 45)],
+    );
+    deny(&mut script, 10, false, "c5");
+    main(
+        &mut script,
+        10,
+        vec![peek("c5-peek-again", "c5", 45), cpu("after-denials", Equal)],
+    );
+    script.push((
+        10,
+        true,
+        wait4(
+            "creator-exact-consume",
+            Child("c5"),
+            T,
+            false,
+            Reaped("c5"),
+            45,
+        ),
+    ));
+    script.push((10, true, echild("creator-exact-echild", Child("c5"), N | T)));
+    main(
+        &mut script,
+        10,
+        vec![
+            cpu("after-creator-consume", Added),
+            echild("final-any-echild", Any, N),
+            waitid_echild("final-all-echild", All),
+            cpu("after-final-echild", Equal),
+            Case {
+                name: "reverse-sibling-denial",
+                worker: true,
+            },
+        ],
+    );
+    script
+}
+
+fn assert_wait4_nothread_observations(stdout: &[u8]) {
+    let rows: Vec<serde_json::Value> = std::str::from_utf8(stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("complete __WNOTHREAD observation"))
+        .collect();
+    let script = wait4_nothread_script();
+    assert_eq!(rows.len(), script.len() + 1);
+    let summary = rows.last().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["cases"], 11);
+    assert_eq!(summary["children"], 8);
+    assert_eq!(summary["calls"], 55);
+    assert_eq!(summary["assertions"], 440);
+    assert_eq!(summary["passed"], true);
+    let leader = summary["leader"].as_i64().unwrap();
+    assert!(leader > 0);
+    let workers: BTreeMap<u64, i64> = rows
+        .iter()
+        .filter(|row| row["type"] == "case")
+        .map(|row| {
+            (
+                row["case"].as_u64().unwrap(),
+                row["worker"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(workers.len(), 11);
+    let encode = |bytes: &[u8]| {
+        bytes
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+    let untouched = "a5".repeat(128);
+    let mut children: BTreeMap<&str, i64> = BTreeMap::new();
+    let mut worker_tids = BTreeSet::new();
+    let mut cpu: Option<(i64, i64)> = None;
+    let mut calls = 0;
+    for (row, (case, worker, step)) in rows.iter().zip(&script) {
+        assert_eq!(row["case"], *case, "{row}");
+        let pid = |target: NothreadTarget| match target {
+            NothreadTarget::Child(name) => children[name],
+            NothreadTarget::Any => -1,
+            NothreadTarget::All => 0,
+        };
+        if !matches!(step, NothreadStep::Case { .. }) {
+            assert_eq!(
+                row["actor"],
+                if *worker { "worker" } else { "main" },
+                "{row}"
+            );
+            if let Some(tid) = row.get("tid") {
+                let expected = if *worker {
+                    workers[&u64::from(*case)]
+                } else {
+                    leader
+                };
+                assert_eq!(tid.as_i64(), Some(expected), "{row}");
+            }
+        }
+        match *step {
+            NothreadStep::Spawn { name, status, held } => {
+                assert_eq!(row["type"], "spawn");
+                assert_eq!(row["name"], name);
+                assert_eq!(row["status"], status);
+                assert_eq!(row["held"], i32::from(held));
+                let child = row["child"].as_i64().unwrap();
+                assert!(child > 0 && child != leader);
+                assert!(!children.values().any(|known| *known == child));
+                assert!(children.insert(name, child).is_none());
+            }
+            NothreadStep::Wait4 {
+                name,
+                target,
+                options,
+                fault,
+                usage,
+                outcome,
+                status,
+            } => {
+                calls += 1;
+                assert_eq!(row["type"], "wait4");
+                assert_eq!(row["name"], name);
+                assert_eq!(row["selector"], pid(target), "{row}");
+                assert_eq!(row["options"], options, "{row}");
+                assert_eq!(row["fault"], fault);
+                assert_eq!(row["usage"], i32::from(usage));
+                let (rc, errno) = match outcome {
+                    NothreadOutcome::Reaped(child) => (children[child], 0),
+                    NothreadOutcome::Zero => (0, 0),
+                    NothreadOutcome::Error(errno) => (-1, errno),
+                };
+                assert_eq!(row["rc"], rc, "{row}");
+                assert_eq!(row["errno"], errno, "{row}");
+                let mut window = [0xa5_u8; 128];
+                if matches!(outcome, NothreadOutcome::Reaped(_)) || fault == 2 {
+                    window[64..68].copy_from_slice(&(status << 8).to_le_bytes());
+                }
+                assert_eq!(row["status_window"], encode(&window), "{row}");
+                assert_eq!(row["usage_window"], untouched, "{row}");
+            }
+            NothreadStep::Waitid {
+                name,
+                target,
+                options,
+                event,
+                error,
+            } => {
+                calls += 1;
+                assert_eq!(row["type"], "waitid");
+                assert_eq!(row["name"], name);
+                let which = if matches!(target, NothreadTarget::All) {
+                    libc::P_ALL
+                } else {
+                    libc::P_PID
+                };
+                assert_eq!(row["which"], which);
+                assert_eq!(row["id"], pid(target));
+                assert_eq!(row["options"], options);
+                assert_eq!(row["rc"], if error == 0 { 0 } else { -1 }, "{row}");
+                assert_eq!(row["errno"], error, "{row}");
+                let (signo, code, child, status) = match event {
+                    Some((child, status)) => {
+                        (libc::SIGCHLD, libc::CLD_EXITED, children[child], status)
+                    }
+                    None => (0, 0, 0, 0),
+                };
+                assert_eq!(row["si_signo"], signo, "{row}");
+                assert_eq!(row["si_code"], code, "{row}");
+                assert_eq!(row["si_pid"], child, "{row}");
+                assert_eq!(row["si_status"], status, "{row}");
+            }
+            NothreadStep::Cpu { name, relation } => {
+                assert_eq!(row["type"], "cpu");
+                assert_eq!(row["name"], name);
+                let now = (
+                    row["user_us"].as_i64().unwrap(),
+                    row["system_us"].as_i64().unwrap(),
+                );
+                assert!(now.0 >= 0 && now.1 >= 0);
+                match (relation, cpu) {
+                    (NothreadCpu::Start, None) => {}
+                    (NothreadCpu::Equal, Some(before)) => assert_eq!(now, before, "{row}"),
+                    (NothreadCpu::Added, Some(before)) => assert!(
+                        now.0 >= before.0 && now.1 >= before.1 && now != before,
+                        "consuming wait adds child CPU once: {row}"
+                    ),
+                    _ => panic!("CPU relation out of order: {row}"),
+                }
+                cpu = Some(now);
+            }
+            NothreadStep::Case { name, worker } => {
+                assert_eq!(row["type"], "case");
+                assert_eq!(row["name"], name);
+                assert_eq!(row["passed"], true);
+                let tid = row["worker"].as_i64().unwrap();
+                if worker {
+                    assert!(tid > 0 && tid != leader, "{row}");
+                    assert!(worker_tids.insert(tid), "one fresh worker per case: {row}");
+                } else {
+                    assert_eq!(tid, 0, "{row}");
+                }
+            }
+        }
+    }
+    assert_eq!(calls, 55);
+    assert_eq!(children.len(), 8);
+    assert_eq!(worker_tids.len(), 4);
 }
