@@ -136,11 +136,15 @@ demo_banner() {
 # Succeeds when the host can virtualize CPUID (the CPU supports CPUID
 # faulting). Without it CPUID is a host input; direct `hermit` invocations
 # such as demo 4's analyze use this to decide whether to pass
-# --no-virtualize-cpuid.
+# --no-virtualize-cpuid. Every error Reverie prints when it cannot turn on
+# CPUID interception ends with "continuing without CPUID interception"
+# (reverie-ptrace/src/task.rs); older builds printed "Underlying hardware does
+# not support CPUID faulting" instead.
 hermit_supports_cpuid_faulting() {
   local out
   out="$(hermit --log=error run --base-env=minimal -- /bin/true 2>&1 || true)"
-  [[ "$out" != *"does not support CPUID faulting"* ]]
+  [[ "$out" != *"continuing without CPUID interception"* &&
+    "$out" != *"does not support CPUID faulting"* ]]
 }
 
 # Pass/fail verdict. The demo sets DEMO_LABEL before sourcing this file; the
