@@ -30,9 +30,6 @@ PUBLIC_FILES = (
     "assets/site.js",
     "data/site-manifest.json.gz",
     "data/site-summary.json.gz",
-    "data/cells.json.gz",
-    "data/runs.json.gz",
-    "data/tests.json.gz",
 )
 ROOT = Path(__file__).resolve().parents[2]
 HELPER = ROOT / ".github/scripts/publish-compatibility-site.py"

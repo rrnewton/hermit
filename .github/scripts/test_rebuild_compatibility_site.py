@@ -434,7 +434,22 @@ class HostedAdapterTests(unittest.TestCase):
 
         with patch.object(ADAPTER.urllib.request, "urlopen", side_effect=read):
             self.assertTrue(ADAPTER.verify_public(receipt)["deployed"])
-        self.assertEqual(len(calls), 9)
+        # build.json records the digest of every other published file, so
+        # these six identify which build Pages serves.
+        self.assertEqual(
+            calls,
+            [
+                ADAPTER.PUBLIC + name
+                for name in (
+                    "build.json",
+                    "index.html",
+                    "assets/site.css",
+                    "assets/site.js",
+                    "data/site-manifest.json.gz",
+                    "data/site-summary.json.gz",
+                )
+            ],
+        )
         self.assertTrue(all("?" not in url for url in calls))
         receipt.write_text(json.dumps({"website": str(tree), "deployed": False}))
         with (
