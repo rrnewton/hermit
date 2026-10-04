@@ -8,6 +8,7 @@
 
 //! Single guest-memory adapter for engine-owned network syscalls.
 
+mod foreground_close;
 mod native_poll;
 mod shared_poll;
 mod shared_receive;
@@ -2147,6 +2148,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Close,
     ) -> Result<i64, Error> {
         let result = async {
+            if let Some(result) = self.try_network_foreground_close(guest, call).await? {
+                return Ok(result);
+            }
             let (admission, outcome, result, _) = self
                 .network_original_invoke(
                     guest,
@@ -5963,6 +5967,24 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         };
         let work = async {
+            match network_request(
+                guest,
+                NetworkRequest::ObserveFiniteCloseOptionAttempt {
+                    lease: control.lease,
+                    level: call.level(),
+                    option: call.optname(),
+                },
+            )
+            .await
+            .map_err(engine_rpc_error)?
+            {
+                NetworkReply::Unit => {}
+                other => {
+                    return Err(engine_error(format!(
+                        "unexpected socket-attempt observation {other:?}"
+                    )));
+                }
+            }
             let Some(argument) = snapshot_shadow_socket_option(&guest.memory(), call)? else {
                 // Other options retain the existing guest-context operation
                 // under the same exclusion. Other receive-affecting options still need

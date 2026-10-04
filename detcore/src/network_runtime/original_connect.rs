@@ -993,6 +993,31 @@ impl NetworkRuntimeResources {
         task: OwnedFd,
         publication: NativeCaptureRecovery,
     ) -> std::io::Result<()> {
+        self.prepare_original_with_birth(owner, admission, task, publication, None)
+            .await
+    }
+
+    pub(crate) async fn prepare_original_socket_with_birth(
+        &self,
+        owner: NetworkStreamOwner,
+        admission: Admission,
+        task: OwnedFd,
+        publication: NativeCaptureRecovery,
+        authority: super::socket_birth_policy::SocketBirthAuthority,
+    ) -> std::io::Result<()> {
+        self.prepare_original_with_birth(owner, admission, task, publication, Some(authority))
+            .await
+    }
+
+    async fn prepare_original_with_birth(
+        &self,
+        owner: NetworkStreamOwner,
+        admission: Admission,
+        task: OwnedFd,
+        publication: NativeCaptureRecovery,
+        birth_authority: Option<super::socket_birth_policy::SocketBirthAuthority>,
+    ) -> std::io::Result<()> {
+        let birth_requested = birth_authority.is_some();
         let target = std::sync::Arc::new(task);
         let setup = (|| {
             let userns = if admission.arguments.kind == Kind::Openat {
@@ -1071,12 +1096,29 @@ impl NetworkRuntimeResources {
                 executor,
                 authority.clone(),
             )?;
+            // All directory/namespace observations execute inside this exact
+            // retained native worker before provider submission; no guest code
+            // or second task can mutate the admitted sole-root birth interval.
+            let birth = birth_authority.map(|authority| {
+                super::socket_birth_policy::Plan::capture(authority, capture_target.as_fd())
+            });
+            let birth_released = birth.as_ref().is_none_or(|plan| plan.released());
             if admitted.arguments.kind.allocator() {
                 let mut calls = shared.native_streams.lock().unwrap();
                 let state = calls.original(owner, admitted.call)?;
                 state.allocation_task = Some(retained_target);
                 state.allocation_userns = userns;
                 state.allocation_netns = netns;
+                state.socket_birth = birth;
+            }
+            if !birth_released {
+                // The raw failed close remains on the retained Original. Its
+                // auxiliary-debt guard prevents final removal, and no provider
+                // command or original Socket invocation has been admitted.
+                shared.retire_original_before_submission(owner, &admitted, &authority)?;
+                return Err(std::io::Error::other(
+                    "Socket birth pre-entry release is unresolved",
+                ));
             }
             let held = shared
                 .native_streams
@@ -1169,10 +1211,43 @@ impl NetworkRuntimeResources {
         let result = receive.await;
         self.shared.join_native_worker(&worker).await?;
         result.map_err(std::io::Error::other)??;
+        if birth_requested {
+            let mut calls = self.shared.native_streams.lock().unwrap();
+            let state = calls.original(owner, admission.call)?;
+            if state.socket_birth.is_some() {
+                state.socket_birth_preparation_joined = true;
+            }
+        }
         self.wait_original(owner, &admission, &publication, false)
             .await
             .map(|_| ())
     }
+    pub(crate) fn original_socket_birth_authority(
+        &self,
+        owner: NetworkStreamOwner,
+        admission: &Admission,
+    ) -> std::io::Result<Option<super::socket_birth_policy::SocketBirthAuthority>> {
+        if admission.arguments.kind != Kind::Socket {
+            return Ok(None);
+        }
+        let mut calls = self.shared.native_streams.lock().unwrap();
+        let state = calls.original(owner, admission.call)?;
+        if state.admission != *admission {
+            return Err(std::io::Error::other(
+                "Socket birth lookup changed original Call",
+            ));
+        }
+        if state.socket_birth.is_some() && !state.socket_birth_preparation_joined {
+            return Err(std::io::Error::other(
+                "Socket birth preparation worker has not joined",
+            ));
+        }
+        Ok(state
+            .socket_birth
+            .as_ref()
+            .map(|plan| plan.authority.clone()))
+    }
+
     pub(super) async fn wait_original(
         &self,
         owner: NetworkStreamOwner,

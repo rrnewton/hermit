@@ -357,6 +357,7 @@ pub(crate) struct Installation {
     reconciled: Option<Vec<super::accepted_provider::FdEvent>>,
     allocated: Option<AllocatedProfile>,
     epoll: Option<EpollProfile>,
+    finite_close: Option<Arc<super::socket_birth_policy::Completed>>,
 }
 
 impl Installation {
@@ -464,6 +465,7 @@ impl Installation {
             reconciled: None,
             allocated: None,
             epoll: None,
+            finite_close: None,
         })
     }
 
@@ -591,6 +593,10 @@ impl Installation {
         Ok(self)
     }
 
+    pub(crate) fn finite_close_birth(&self) -> Option<&Arc<super::socket_birth_policy::Completed>> {
+        self.finite_close.as_ref()
+    }
+
     pub(crate) fn original_owner(&self) -> NetworkStreamOwner {
         self.owner.owner
     }
@@ -666,6 +672,7 @@ impl Installation {
             && self.through >= prior.through
             && self.allocated == prior.allocated
             && self.epoll == prior.epoll
+            && self.same_finite_close_birth(prior)
             && self.reconciled.as_ref().is_some_and(|rows| {
                 prior
                     .reconciled
@@ -688,8 +695,17 @@ impl Installation {
             && self.removed == prior.removed
             && self.allocated == prior.allocated
             && self.epoll == prior.epoll
+            && self.same_finite_close_birth(prior)
             && self.reconciled == prior.reconciled
             && (self.interference.is_empty() || self.reconciled.is_some())
+    }
+
+    fn same_finite_close_birth(&self, prior: &Self) -> bool {
+        match (&self.finite_close, &prior.finite_close) {
+            (None, None) => true,
+            (Some(current), Some(old)) => current.same(old),
+            _ => false,
+        }
     }
 
     pub(crate) fn epoll_profile(&self) -> io::Result<EpollProfile> {
@@ -925,7 +941,28 @@ impl super::NetworkRuntimeResources {
                 journal.history(),
             )
             .and_then(|mut receipt| {
-                if admission.arguments.kind == crate::network_replay::original_connect::Kind::Openat
+                if admission.arguments.kind == crate::network_replay::original_connect::Kind::Socket
+                {
+                    if let Some(plan) = &state.socket_birth {
+                        if !state.socket_birth_preparation_joined {
+                            return Err(io::Error::other(
+                                "Socket birth precedes actual preparation worker join",
+                            ));
+                        }
+                        if let Some(observed) = effect
+                            .socket
+                            .as_ref()
+                            .map(|c| c.checked(&effect))
+                            .transpose()?
+                            .flatten()
+                            && let Some(observation) = observed.finite_close.as_ref()
+                        {
+                            receipt.finite_close =
+                                plan.complete(owner, admission, &observation.policy, observation)?;
+                        }
+                    }
+                } else if admission.arguments.kind
+                    == crate::network_replay::original_connect::Kind::Openat
                 {
                     receipt.allocated = Some(allocated_profile(&effect.original)?);
                 } else if matches!(
@@ -1401,7 +1438,27 @@ impl super::RuntimeShared {
                         (begin, end, through),
                         journal.history(),
                     )?;
-                    if admission.arguments.kind == Kind::Openat {
+                    if admission.arguments.kind == Kind::Socket && effect.socket.is_some() {
+                        // Only the original retained capture can preserve birth.
+                        // A later publisher's terminal getter is not its issuer.
+                        if let Some(plan) = &state.socket_birth {
+                            if !state.socket_birth_preparation_joined {
+                                return Err(io::Error::other(
+                                    "Socket birth precedes actual preparation worker join",
+                                ));
+                            }
+                            if let Some(observation) =
+                                socket.as_ref().and_then(|s| s.finite_close.as_ref())
+                            {
+                                receipt.finite_close = plan.complete(
+                                    owner,
+                                    admission,
+                                    &observation.policy,
+                                    observation,
+                                )?;
+                            }
+                        }
+                    } else if admission.arguments.kind == Kind::Openat {
                         receipt.allocated = Some(allocated_profile(&effect.original)?);
                     } else if matches!(admission.arguments.kind, Kind::EpollCreate { .. }) {
                         receipt.epoll = Some(epoll_profile(&effect.original)?);
@@ -1604,6 +1661,7 @@ impl super::RuntimeShared {
                 };
                 refreshed.allocated = receipt.allocated;
                 refreshed.epoll = receipt.epoll;
+                refreshed.finite_close = receipt.finite_close.clone();
                 // A newly removed file needs only its authenticated historical
                 // profile; it must not enroll a now-absent live TCP stream.
                 let profile = if refreshed.removed_before_publication() {
@@ -2601,3 +2659,25 @@ mod recovery_tests {
 #[cfg(test)]
 #[path = "original_installation/native_publication.rs"]
 mod native_publication;
+
+/// Adds only a controlled host-policy premise to an existing authenticated
+/// Socket fixture; the real installation publisher still issues OFD history.
+#[cfg(test)]
+pub(crate) fn installation_with_controlled_birth(
+    mut installation: Installation,
+    birth: Arc<super::socket_birth_policy::Completed>,
+) -> io::Result<Installation> {
+    let Source::Socket(call) = installation.source else {
+        return Err(io::Error::other(
+            "controlled birth requires original Socket",
+        ));
+    };
+    if installation.finite_close.is_some() || !birth.validates(installation.original_owner(), call)
+    {
+        return Err(io::Error::other(
+            "controlled birth changed installation owner/call",
+        ));
+    }
+    installation.finite_close = Some(birth);
+    Ok(installation)
+}

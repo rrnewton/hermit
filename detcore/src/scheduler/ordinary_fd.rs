@@ -352,6 +352,13 @@ impl SharedMmForegroundObservation<'_> {
     pub(crate) fn owner(&self) -> NetworkStreamOwner { self.grant.owner() }
     pub(crate) fn epoch(&self) -> u64 { self.grant.epoch() }
     pub(crate) fn root(&self) -> &std::sync::Arc<crate::network_runtime::ForegroundRoot> { self.lineage.root() }
+    /// All historical children were authenticated and finally joined by the
+    /// full shared observer. The only live member must be the initial owner.
+    pub(crate) fn admits_initial_singleton(&self) -> bool {
+        self.lineage.members().count() == 1
+            && std::ptr::eq(self.root().as_ref(), self.root().initial_ancestor())
+            && self.owner() == self.root().initial_ancestor().owner()
+    }
     pub(crate) fn contains_root(
         &self,
         root: &std::sync::Arc<crate::network_runtime::ForegroundRoot>,
@@ -896,5 +903,28 @@ impl Scheduler {
         assert_eq!(grant.resume(), OrdinaryFdResume::Normal);
         assert_eq!(grant.epoch(), original_epoch + 1);
         (parked, grant.epoch())
+    }
+}
+
+#[cfg(test)]
+impl Scheduler {
+    /// Exercise the actual idle-queue maintenance at a controlled caller
+    /// barrier. This issues no turn, timer suppression, or completion fact.
+    pub(crate) fn controlled_original_close_clock_probe(
+        &mut self,
+        owner: NetworkStreamOwner,
+        operation: crate::resources::ExternalOpId,
+        time: &std::sync::Arc<std::sync::Mutex<crate::types::GlobalTime>>,
+    ) -> (bool, bool, u64) {
+        let maintained = self.step2d_handle_empty_queue(time).is_ok();
+        (
+            maintained,
+            self.original_transfer_grant_matches(
+                owner,
+                operation,
+                crate::network_replay::original_connect::Kind::Close,
+            ),
+            self.host_signal_attempts,
+        )
     }
 }

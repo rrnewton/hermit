@@ -21,12 +21,18 @@ fn invalid(message: &str) -> NetworkReplayError {
 pub(super) struct Socket {
     pub(super) profile: NetworkStreamSocketState,
     native: Option<NativeReceive>,
+    pub(super) finite_close: Option<super::finite_close::Provenance>,
 }
 impl Socket {
+    #[cfg(test)]
+    pub(super) fn has_native_receive(&self) -> bool {
+        self.native.is_some()
+    }
     pub(super) fn new(profile: NetworkStreamSocketState) -> Self {
         Self {
             profile,
             native: None,
+            finite_close: None,
         }
     }
 }

@@ -26,6 +26,7 @@ mod initial_record;
 pub(crate) use initial_record::initial_record_call_supported;
 pub(crate) use initial_record::original_sendto_shape;
 mod fd_read_metadata;
+pub(in crate::network_replay) mod finite_close;
 mod helper_copy;
 pub(crate) mod lifetime;
 mod native_receive;

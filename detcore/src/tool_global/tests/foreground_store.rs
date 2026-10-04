@@ -3,6 +3,7 @@
 //! The writer performs real process_vm_writev; safeptrace separately tests its
 //! production Stopped implementation and target-PKRU check. No BPF/E2E claim.
 mod fd_identity;
+mod foreground_close;
 mod scalar_recvfrom;
 mod send_timeout;
 mod shared_send_staging;

@@ -12,6 +12,7 @@
 mod foreground_epoll;
 mod foreground_poll;
 pub(crate) use foreground_poll::{SharedPollInvocation, SharedPollStoreAttempt};
+mod foreground_close;
 mod foreground_store;
 mod guard_probe;
 mod native_source_read;
@@ -20,6 +21,7 @@ mod original_source_ioctl;
 mod replay_connect;
 mod shared_origin;
 mod shared_send;
+mod socket_birth_policy;
 pub(crate) use foreground_store::CheckedBlockingReadRetry;
 pub(crate) use foreground_store::CheckedReadInvocation;
 pub(crate) use foreground_store::CheckedReadRange;
@@ -3085,6 +3087,7 @@ impl GlobalTool for GlobalState {
                 | NetworkRequest::BeginFdRead { .. }
                 | NetworkRequest::BeginOrdinaryFdRead { .. }
                 | NetworkRequest::FinishFdRead { .. }
+                | NetworkRequest::ObserveFiniteCloseOptionAttempt { .. }
                 | NetworkRequest::FinishSocketControl { .. }
                 | NetworkRequest::BeginStreamCall { .. }
                 | NetworkRequest::ConfirmStreamCallPin { .. }
@@ -5967,6 +5970,9 @@ impl GlobalState {
                                 .collect()
                         })
                         .map(NetworkReply::SocketControls),
+                    NetworkRequest::ObserveFiniteCloseOptionAttempt { lease, level, option } => engine
+                        .observe_finite_close_option_attempt(owner, *lease, *level, *option)
+                        .map(|()| NetworkReply::Unit),
                     NetworkRequest::FinishSocketControl { lease, disposition } => engine
                         .finish_socket_control(owner, *lease, *disposition)
                         .map(|()| NetworkReply::Unit),
@@ -6429,6 +6435,7 @@ impl GlobalState {
             | NetworkRequest::BeginFdRead { .. }
             | NetworkRequest::BeginOrdinaryFdRead { .. }
             | NetworkRequest::FinishFdRead { .. }
+            | NetworkRequest::ObserveFiniteCloseOptionAttempt { .. }
             | NetworkRequest::FinishSocketControl { .. }
             | NetworkRequest::BeginStreamCall { .. }
             | NetworkRequest::NativeBeginStreamCall { .. }
@@ -6848,6 +6855,15 @@ pub enum NetworkRequest {
     BeginSocketControls {
         /// Stable OFD identities acquired as one sorted set.
         open_files: Vec<OpenFileId>,
+    },
+    /// Record an option attempt under the already held exact socket control.
+    ObserveFiniteCloseOptionAttempt {
+        /// Actual owned control; this request never acquires another lease.
+        lease: NetworkStreamLeaseId,
+        /// Original Linux option level, before memory or delegate processing.
+        level: i32,
+        /// Original option selector, including unmodeled or failing attempts.
+        option: i32,
     },
     /// Finish one short control after physical/lifetime reconciliation.
     FinishSocketControl {

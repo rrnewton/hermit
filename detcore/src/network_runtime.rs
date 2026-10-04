@@ -57,6 +57,7 @@ pub(crate) mod original_read_copy;
 pub(crate) mod original_send;
 mod physical;
 pub(crate) mod shared_waits;
+pub(crate) mod socket_birth_policy;
 pub(crate) mod socket_profile;
 mod terminal_socket_observation;
 // Both host C bridges use one supervisor module, including its unchanged

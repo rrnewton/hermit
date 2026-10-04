@@ -10,6 +10,7 @@ use crate::types::FdSlotBinding;
 
 #[path = "original_connect/epoll_ctl.rs"]
 mod epoll_ctl;
+pub(crate) mod foreground_close;
 
 /// The original syscall owned by the same admission, early observation and
 /// final-result state machine. Close never acquires a duplicate guest FD.
@@ -242,6 +243,7 @@ pub(crate) enum Pin {
 pub(super) struct OriginalCallState {
     arguments: Arguments,
     source: OriginalResultSource,
+    foreground_close: Option<std::sync::Arc<foreground_close::ForegroundCloseOrigin>>,
     external_grant: Option<ExternalOpId>,
     // Original allocator admission survives mutation publication until Call ACK.
     socket_mutation: Option<NetworkFdMutationAdmission>,
@@ -737,6 +739,7 @@ impl NetworkReplayEngine {
                 original: Some(OriginalCallState {
                     arguments: arguments.clone(),
                     source,
+                    foreground_close: None,
                     external_grant,
                     socket_mutation: mutation,
                     allocation_published: false,

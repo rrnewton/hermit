@@ -775,7 +775,9 @@ impl NetworkReplayEngine {
         }
         match plan.kind {
             EnrollmentKind::Socket(Some(fresh)) => {
+                self.validate_finite_close_installation(plan.binding, &plan.receipt)?;
                 self.register_original_receive_socket(plan.binding, &plan.receipt, fresh)?;
+                self.retain_finite_close_installation(plan.binding, &plan.receipt);
             }
             EnrollmentKind::Socket(None)
             | EnrollmentKind::Openat(_)

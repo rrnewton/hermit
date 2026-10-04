@@ -449,11 +449,27 @@ impl GlobalState {
             // The first poll starts the same retained NativeWorker before it
             // awaits anything; worker/Driver custody survives a lost RPC reply.
             if !recorded && !emulated {
-                runtime
-                    .expect("native task already required runtime")
-                    .prepare_original_connect(owner, admission.clone(), task.unwrap(), publication)
-                    .await
-                    .map_err(physical)?;
+                let task = task.unwrap();
+                let birth = self.original_socket_birth_authority(owner, &admission, &task)?;
+                let runtime = runtime.expect("native task already required runtime");
+                if let Some(authority) = birth {
+                    runtime
+                        .prepare_original_socket_with_birth(
+                            owner,
+                            admission.clone(),
+                            task,
+                            publication,
+                            authority,
+                        )
+                        .await
+                        .map_err(physical)?;
+                    self.check_original_socket_birth(owner, &admission)?;
+                } else {
+                    runtime
+                        .prepare_original_connect(owner, admission.clone(), task, publication)
+                        .await
+                        .map_err(physical)?;
+                }
             }
             return Ok(NetworkReply::OriginalConnectAdmission(admission));
         }
@@ -490,6 +506,15 @@ impl GlobalState {
         })?;
         match request {
             NetworkRequest::NativeSubmitOriginalConnect { .. } => {
+                if admission.arguments.kind == crate::network_replay::original_connect::Kind::Socket
+                {
+                    self.check_original_socket_birth(owner, admission)?;
+                }
+                if admission.arguments.kind == crate::network_replay::original_connect::Kind::Close
+                    && self.submit_foreground_original_close(owner, admission)?
+                {
+                    return Ok(NetworkReply::Unit);
+                }
                 if matches!(admission.arguments.kind, crate::network_replay::original_connect::Kind::BlockingSendto { .. }) {
                     self.validate_shared_send_submission(owner, admission)?;
                     return Ok(NetworkReply::Unit);
@@ -666,6 +691,14 @@ impl GlobalState {
                 return Err("original Connect local admission changed");
             }
             if event == reverie::InjectedSyscallEvent::Prepared {
+                if local.arguments.kind == crate::network_replay::original_connect::Kind::Socket {
+                    self.check_original_socket_birth(owner, admission)
+                        .map_err(|_| "Socket birth Prepared lost original Normal/call")?;
+                }
+                if local.arguments.kind == crate::network_replay::original_connect::Kind::Close {
+                    self.validate_foreground_close_callback(tid, state, admission, raw)
+                        .map_err(|_| "finite Close Prepared lost exact original custody")?;
+                }
                 if matches!(local.arguments.kind, crate::network_replay::original_connect::Kind::BlockingSendto { .. }) {
                     self.validate_shared_send_callback(tid, state, admission, raw)
                         .map_err(|_| "shared Sendto Prepared lost exact original grant/tuple/peer custody")?;
