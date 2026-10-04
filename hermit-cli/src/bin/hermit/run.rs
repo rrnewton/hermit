@@ -40,8 +40,6 @@ use hermit::Backend;
 use hermit::Context;
 use hermit::DetConfig;
 use hermit::Error;
-use hermit::LITEINST_IN_GUEST_ENV;
-use hermit::LiteinstRuntime;
 use hermit::Shebang;
 use hermit::SkidOvershootError;
 use hermit::happens_before::DebugInfoResolver;
@@ -2441,40 +2439,19 @@ fn skid_margin_override_rejects_non_ptrace_backed_backends() {
     }
 }
 
-#[test]
-fn skid_margin_override_is_available_to_liteinst_host_hybrid() {
-    let mut opts = run_opts_for(&[
-        "hermit",
-        "--backend=liteinst",
-        "run",
-        "--skid-margin=500",
-        "fakeprog",
-    ]);
-    opts.validate_args_with_perf_support(true).unwrap();
-    assert_eq!(opts.skid_margin, Some(500));
-    assert_eq!(opts.global_backend_arg(), " --backend=liteinst");
-    assert_eq!(
-        format!("{opts}"),
-        " --skid-margin=500 --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
-    );
-}
-
 #[cfg(test)]
-fn liteinst_in_guest_refusal(
-    runtime: LiteinstRuntime,
-    options: &[&str],
-) -> Result<(), anyhow::Error> {
+fn liteinst_in_guest_refusal(options: &[&str]) -> Result<(), anyhow::Error> {
     let mut argv = vec!["hermit", "--backend=liteinst", "run"];
     argv.extend_from_slice(options);
     argv.push("fakeprog");
-    run_opts_for(&argv).refuse_unqualified_liteinst_in_guest_options(runtime)
+    run_opts_for(&argv).refuse_unqualified_liteinst_in_guest_options()
 }
 
 #[test]
 fn liteinst_in_guest_refuses_options_it_cannot_honour() {
     // The default maximum timeslice is on, and the in-guest Tool host cannot
     // deliver its timer.
-    let error = liteinst_in_guest_refusal(LiteinstRuntime::InGuest, &[]).unwrap_err();
+    let error = liteinst_in_guest_refusal(&[]).unwrap_err();
     assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
     assert!(
         error.to_string().contains("pass --max-timeslice=disabled"),
@@ -2490,32 +2467,14 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
         ("--skid-margin=500", "--skid-margin configures"),
         ("--gdbserver", "--gdbserver needs the ptrace tracer"),
     ] {
-        let error = liteinst_in_guest_refusal(
-            LiteinstRuntime::InGuest,
-            &["--max-timeslice=disabled", option],
-        )
-        .unwrap_err();
+        let error = liteinst_in_guest_refusal(&["--max-timeslice=disabled", option]).unwrap_err();
         assert!(
             error.downcast_ref::<PolicyRefusal>().is_some(),
             "{option}: {error:#}"
         );
         assert!(error.to_string().contains(reason), "{option}: {error:#}");
     }
-    liteinst_in_guest_refusal(LiteinstRuntime::InGuest, &["--max-timeslice=disabled"]).unwrap();
-}
-
-#[test]
-fn liteinst_host_hybrid_is_not_subject_to_the_in_guest_refusals() {
-    liteinst_in_guest_refusal(
-        LiteinstRuntime::HostHybrid,
-        &[
-            "--verify",
-            "--timeout=3",
-            "--skid-margin=500",
-            "--gdbserver",
-        ],
-    )
-    .unwrap();
+    liteinst_in_guest_refusal(&["--max-timeslice=disabled"]).unwrap();
 }
 
 #[test]
@@ -2961,6 +2920,8 @@ fn only_instrumented_ptrace_family_runs_depend_on_host_perf() {
     assert!(!namespace_only.arms_reverie_ptrace_pmu_timer());
     let kvm = run_opts_for(&["hermit", "--backend=kvm", "run", "fakeprog"]);
     assert!(!kvm.arms_reverie_ptrace_pmu_timer());
+    let liteinst = run_opts_for(&["hermit", "--backend=liteinst", "run", "fakeprog"]);
+    assert!(!liteinst.arms_reverie_ptrace_pmu_timer());
 }
 
 #[test]
@@ -3547,25 +3508,18 @@ impl RunOpts {
         }
     }
 
-    /// Where this run hosts Detcore when it uses LiteInst. Every other backend,
-    /// and `--namespace-only` (which runs no backend), reports the hybrid so the
-    /// selector variable is read only when it can matter.
-    fn liteinst_runtime(&self) -> Result<LiteinstRuntime, Error> {
-        if self.namespace_only || self.selected_backend() != Backend::Liteinst {
-            return Ok(LiteinstRuntime::HostHybrid);
-        }
-        LiteinstRuntime::from_env()
+    /// Whether this run hosts Detcore inside the guest through LiteInst.
+    /// `--namespace-only` runs no backend, so it never does.
+    fn uses_in_guest_liteinst(&self) -> bool {
+        !self.namespace_only && self.selected_backend() == Backend::Liteinst
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3635): Review the in-guest LiteInst option refusals.
     /// Refuses options that in-guest LiteInst cannot honour yet, so a run never
     /// silently drops one of them.
-    fn refuse_unqualified_liteinst_in_guest_options(
-        &self,
-        runtime: LiteinstRuntime,
-    ) -> Result<(), Error> {
-        if runtime != LiteinstRuntime::InGuest {
+    fn refuse_unqualified_liteinst_in_guest_options(&self) -> Result<(), Error> {
+        if !self.uses_in_guest_liteinst() {
             return Ok(());
         }
         let config = &self.det_opts.det_config;
@@ -3590,7 +3544,7 @@ impl RunOpts {
             return Ok(());
         };
         Err(Error::new(PolicyRefusal).context(format!(
-            "{LITEINST_IN_GUEST_ENV}=1 (in-guest LiteInst) refuses this run: {reason}"
+            "--backend=liteinst (in-guest LiteInst) refuses this run: {reason}"
         )))
     }
 
@@ -3653,31 +3607,6 @@ impl RunOpts {
         }
     }
 
-    fn verify_liteinst_activation(&self) -> Result<(), Error> {
-        let executable = std::env::current_exe().context("locate Hermit LiteInst probe")?;
-        let mut command = Command::new(executable);
-        command
-            .env_clear()
-            .env(super::LITEINST_ACTIVATION_PROBE_ENV, "1");
-        let output = hermit::run_with_output_backend(
-            command,
-            self.effective_det_config(),
-            false,
-            &None,
-            Backend::Liteinst,
-        )?;
-        let expected = b"hermit-liteinst-activation calls=32 traps=1 hooks=31\n";
-        if output.status != ExitStatus::Exited(0) || output.stdout != expected {
-            anyhow::bail!(
-                "LiteInst activation probe failed closed: status={:?}, stdout={:?}, stderr={:?}",
-                output.status,
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            );
-        }
-        Ok(())
-    }
-
     /// The `--verify-json` path this invocation will publish a verdict to, if
     /// any. Exposed so the top-level dispatcher can stamp the invocation-bound
     /// NO-RESULT record before ANY fallible preflight runs — several of this
@@ -3735,7 +3664,7 @@ impl RunOpts {
         // Before `--verify` reads stdin to its end below: a run that in-guest
         // LiteInst refuses must not wait for its input. `validate_args` repeats
         // the check for its other callers.
-        self.refuse_unqualified_liteinst_in_guest_options(self.liteinst_runtime()?)?;
+        self.refuse_unqualified_liteinst_in_guest_options()?;
         if self.verify {
             validate_log_level(global)?;
         }
@@ -3907,21 +3836,12 @@ impl RunOpts {
             }
         }
 
-        if backend == Backend::Liteinst {
-            match self.liteinst_runtime()? {
-                LiteinstRuntime::HostHybrid => {
-                    self.verify_liteinst_activation()?;
-                    eprintln!(
-                        "hermit: [liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
-                    );
-                }
-                // The probe above asserts the hybrid's trap/hook split, which
-                // does not describe an in-guest Tool. Nothing has started the
-                // guest yet, so this names the configuration, not an outcome.
-                LiteinstRuntime::InGuest => eprintln!(
-                    "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool; the host-hybrid activation probe does not apply"
-                ),
-            }
+        if backend == Backend::Liteinst && self.uses_in_guest_liteinst() {
+            // Nothing has started the guest yet, so this names the
+            // configuration, not an outcome.
+            eprintln!(
+                "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool"
+            );
         }
 
         if self.no_namespace {
@@ -3962,15 +3882,10 @@ impl RunOpts {
     /// Some arguments imply others. This is the place where that validation occurs.
     /// Also this performs side effects like accessing system randomness to implement --seed-from=SystemArgs
     pub fn validate_args(&mut self) -> Result<(), Error> {
-        let liteinst_runtime = self.liteinst_runtime()?;
-        // In-guest LiteInst arms no ptrace PMU timer. Reporting perf as present
-        // keeps `--max-timeslice` from being downgraded with a warning, so the
-        // refusal below sees it and stops the run instead.
-        let perf_supported = !self.arms_reverie_ptrace_pmu_timer()
-            || liteinst_runtime == LiteinstRuntime::InGuest
-            || reverie_ptrace::is_perf_supported();
+        let perf_supported =
+            !self.arms_reverie_ptrace_pmu_timer() || reverie_ptrace::is_perf_supported();
         self.validate_args_with_perf_support(perf_supported)?;
-        self.refuse_unqualified_liteinst_in_guest_options(liteinst_runtime)
+        self.refuse_unqualified_liteinst_in_guest_options()
     }
 
     /// Whether this run would arm Reverie ptrace's PMU timer for
@@ -3981,11 +3896,15 @@ impl RunOpts {
     /// though `selected_backend()` still reports the ptrace default. Probing perf
     /// for it would print a `--max-timeslice` downgrade warning about a timer the
     /// run never uses.
+    ///
+    /// In-guest LiteInst arms no ptrace PMU timer either. Reporting perf as
+    /// present for it keeps `--max-timeslice` from being downgraded with a
+    /// warning, so the in-guest refusal sees the timeslice and stops the run.
     fn arms_reverie_ptrace_pmu_timer(&self) -> bool {
         !self.namespace_only
             && match self.selected_backend() {
-                Backend::Ptrace | Backend::Liteinst | Backend::E9patch => true,
-                Backend::Dbt | Backend::Sabre | Backend::Kvm => false,
+                Backend::Ptrace | Backend::E9patch => true,
+                Backend::Liteinst | Backend::Dbt | Backend::Sabre | Backend::Kvm => false,
             }
     }
 
@@ -4014,6 +3933,8 @@ impl RunOpts {
                 )));
             }
         }
+        // LiteInst passes here so that the in-guest refusal, which names why
+        // it cannot honour `--skid-margin`, is the one that stops the run.
         if self.skid_margin.is_some()
             && (self.namespace_only
                 || !matches!(
@@ -5555,10 +5476,12 @@ impl RunOpts {
 
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
-            Backend::Liteinst => {
-                Some("LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)")
-            }
-            Backend::Ptrace | Backend::Dbt | Backend::Sabre | Backend::E9patch => None,
+            // In-guest LiteInst refuses `--verify` before it starts a guest.
+            Backend::Liteinst
+            | Backend::Ptrace
+            | Backend::Dbt
+            | Backend::Sabre
+            | Backend::E9patch => None,
         };
         if let Some(backend_banner) = backend_banner {
             eprintln!(":: Backend: {backend_banner}");
@@ -5855,6 +5778,11 @@ impl RunOpts {
     /// | `kvm`      | 13s     | `HERMIT_RUN_TIMEOUT_FALLBACK` |
     /// | `sabre`    | 40s     | none -- killed by the harness |
     /// | `dbt`      | 20s     | none -- killed by the harness |
+    ///
+    /// The `liteinst` row measured the ptrace-hosted hybrid, which no longer
+    /// exists. In-guest LiteInst refuses `--timeout` earlier, in
+    /// `refuse_unqualified_liteinst_in_guest_options`, so it never reaches this
+    /// check.
     ///
     /// ⚠️ `sabre` AND `dbt` ARE NOT MERELY UNTESTED -- THEY STRUCTURALLY CANNOT
     /// HONOUR THE FLAG TODAY, and the difference decides what fixing them means.

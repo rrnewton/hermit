@@ -6,16 +6,9 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-#include <stdint.h>
-
-void reverie_liteinst_initialize(void) {}
-
-uint64_t reverie_liteinst_site_trap_count(uint64_t address) {
-  (void)address;
-  return 0;
-}
-
-uint64_t reverie_liteinst_site_hook_count(uint64_t address) {
-  (void)address;
-  return 0;
-}
+/*
+ * Exports the in-guest Detcore runtime's initializer but registers no
+ * constructor, so preloading it would run the guest without installing
+ * Detcore. Hermit must refuse it before dispatch.
+ */
+void detcore_liteinst_initialize(void) {}

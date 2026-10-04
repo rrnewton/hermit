@@ -24253,8 +24253,12 @@ mod pressure_sample_tests {
         // https://github.com/rrnewton/hermit/issues/3448), which left 72.
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 deleted
         // check.backend_parity_suites, one of those 72, which leaves 71.
+        // Retiring the LiteInst host hybrid
+        // (https://github.com/rrnewton/hermit/issues/3520) deleted four more:
+        // test.liteinst_strict, liteinst.strict, liteinst.hermit_release and
+        // liteinst.runtime, which took the measured count from 73 to 69.
         assert!(
-            headers.len() >= 71,
+            headers.len() >= 69,
             "{} pinned-root commands",
             headers.len()
         );

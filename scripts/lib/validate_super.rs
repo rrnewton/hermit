@@ -602,9 +602,12 @@ pub fn stress_verdict(rates: &[ProbeRate], reps: i64, jobs: i64, host_cpus: usiz
 /// committed DAG became the sole source of super-plan construction.
 pub fn self_test(root: &Path) -> Result<String, String> {
     let gates = load_gates(root)?;
-    if gates.len() != 32 {
+    // 31 since the liteinst_python3_verify_diagnostics row left with the
+    // ptrace-hosted LiteInst hybrid (https://github.com/rrnewton/hermit/issues/3520);
+    // it had already stopped selecting any test.
+    if gates.len() != 31 {
         return Err(format!(
-            "super source table has {} rows; the mechanical extraction requires exactly 32",
+            "super source table has {} rows; the mechanical extraction requires exactly 31",
             gates.len()
         ));
     }
@@ -750,7 +753,7 @@ pub fn self_test(root: &Path) -> Result<String, String> {
     let standin = stress_standin_bracket(root)?;
 
     Ok(format!(
-        "super source: 32 rows, 3 synthetic expansions, {nextest_rows} nextest rows, {refused} malformed tables refused; stress verdict bracketed; {standin}"
+        "super source: 31 rows, 3 synthetic expansions, {nextest_rows} nextest rows, {refused} malformed tables refused; stress verdict bracketed; {standin}"
     ))
 }
 

@@ -43,7 +43,7 @@ HERMIT_DEBUG_BIN ?= target/debug/hermit
 .PHONY: build install-deps install-hooks release-core prune-stale-release help checkout-all check-build-tools \
 	install-build-tools check-submodules verify-submodules check-skill-discovery validate validate-plan \
 	validate-self-test validate-timeout-layers-test lint lint-parent-checks lint-script-tests \
-	validate-kvm validate-dbt validate-sabre validate-liteinst validate-e9patch
+	validate-kvm validate-dbt validate-sabre validate-e9patch
 
 build: prune-stale-release install-deps ## Build the development Hermit binary with every backend
 	@echo 'make: building the hermit binary (dev profile, third-party-backends) -- expect ~45s warm, longer cold'
@@ -68,8 +68,8 @@ install-deps: install-hooks check-submodules ## Build and stage all third-party 
 	@echo 'make: building the third-party backend runtimes (release profile) -- expect ~60s cold'
 	@echo "make: cargo jobs=$(THIRD_PARTY_BUILD_JOBS) (host has $$(nproc) logical cores)"
 	CARGO_BUILD_JOBS=$(THIRD_PARTY_BUILD_JOBS) $(CARGO) build --release --locked \
-		-p detcore-dbt -p detcore-sabre -p hermit-install
-	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-sabre, hermit-install)'
+		-p detcore-dbt -p detcore-sabre -p detcore-liteinst -p hermit-install
+	@echo 'make: backend runtimes OK (release profile: detcore-dbt, detcore-sabre, detcore-liteinst, hermit-install)'
 
 # Install this clone's git pre-commit hooks (core.hooksPath -> .githooks) so a
 # fresh clone/worktree gets the BLOCKING local pin-consistency check plus the
@@ -217,7 +217,6 @@ LINT_CHECK_TARGETS := \
     lint-check-pr-status \
     lint-check-bisect-probe \
     lint-check-lint-checks-node \
-    lint-check-liteinst-strict-node \
     lint-check-assert-build-dependencies \
     lint-check-image-provenance \
     lint-check-retry-fetch \
@@ -303,9 +302,6 @@ lint-check-bisect-probe:
 
 lint-check-lint-checks-node:
 	./ci/lint-checks-node.sh --self-test
-
-lint-check-liteinst-strict-node:
-	./ci/liteinst-strict-node.sh --self-test
 
 lint-check-assert-build-dependencies:
 	./ci/hermetic/assert-build-dependencies.sh --self-test
@@ -406,7 +402,6 @@ help: ## Show this help (the list of make targets)
 	@printf '  validate-kvm       KVM manifest cells    (needs /dev/kvm)            not yet timed\n'
 	@printf '  validate-dbt       DBT manifest cells    (third-party-backends)      not yet timed\n'
 	@printf '  validate-sabre     SaBRe corpus          (needs HERMIT_SABRE_BINARY) ~10-20 min\n'
-	@printf '  validate-liteinst  LiteInst strict corpus                            ~5-15 min\n'
 	@printf '  validate-e9patch   e9patch corpus        (needs HERMIT_E9PATCH_BACKEND) ~5-20 min\n'
 	@printf '\nThe full multi-backend suite is ./scripts/validate.rs (see ./scripts/validate.rs --help).\n'
 
@@ -525,9 +520,6 @@ validate-dbt: check-submodules ## Run ONLY the DBT cells of the E2E manifests (t
 
 validate-sabre: check-submodules ## Run ONLY the SaBRe compatibility corpus (needs HERMIT_SABRE_BINARY)
 	./scripts/validate.rs --sabre-compat-only
-
-validate-liteinst: check-submodules ## Run ONLY the LiteInst strict compatibility corpus
-	./scripts/validate.rs --liteinst-compat-only
 
 validate-e9patch: check-submodules ## Run ONLY the e9patch (ptrace-preprocessing) compat corpus (needs HERMIT_E9PATCH_BACKEND)
 	./scripts/validate.rs --e9patch-compat-only

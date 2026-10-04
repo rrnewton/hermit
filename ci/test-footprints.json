@@ -80,7 +80,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -126,7 +125,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -172,7 +170,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -205,7 +202,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -217,12 +213,16 @@
     },
     {
       "_why": "@generated: Cargo package `detcore-liteinst`; reverse-dependent closure: detcore-liteinst.",
+      "e2e_backends": [
+        "liteinst"
+      ],
       "nodes": [
         "build.workspace_on_host",
         "doc.doctests_on_host",
         "doc.rustdoc_on_host",
         "lint.clippy_on_host",
         "lint.rustfmt",
+        "test.cli_on_host",
         "test.regular_crates_on_host"
       ],
       "paths": [
@@ -267,7 +267,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -332,7 +331,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -394,7 +392,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
       ],
@@ -436,7 +433,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit",
         "test.ignored_syscall_regressions",
-        "test.liteinst_strict",
         "test.regular_crates_on_host",
         "test.rr_suite_contract",
         "test.sabre_examples"
@@ -479,7 +475,6 @@
         "test.hermit_modes_on_host",
         "test.hermit_unit_on_host",
         "test.ignored_syscall_regressions_on_host",
-        "test.liteinst_strict_on_host",
         "test.regular_crates_on_host",
         "test.rr_suite_contract_on_host",
         "test.sabre_examples_on_host"
@@ -605,18 +600,6 @@
         "tests/standalone/**",
         "tests/stress/**",
         "tests/util/**"
-      ]
-    },
-    {
-      "_why": "LiteInst runtime staging is outside Cargo's workspace graph.",
-      "e2e_backends": [
-        "liteinst"
-      ],
-      "nodes": [
-        "test.liteinst_strict"
-      ],
-      "paths": [
-        "scripts/stage-liteinst-runtime.sh"
       ]
     },
     {

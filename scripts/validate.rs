@@ -202,7 +202,7 @@ const INTEGRATION_ARTIFACT_WRAPPER: &str =
     "./ci/run-with-hermit-e2e-artifact.sh --require-install ";
 // The FULL plan's workspace producer prepares the FULL profile. Each build
 // producer prepares the profile of the plan it serves -- full/full,
-// privileged/privileged, liteinst/liteinst, quick/quick, super/super -- and
+// privileged/privileged, quick/quick, super/super -- and
 // ci/manifest-plan/src/validation_dag_static.rs, which generates the graph,
 // emits "prepare portable" for no step at all. The earlier spelling here named
 // a profile this producer had stopped preparing, so the bracket refused a graph
@@ -509,8 +509,6 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
     for tag in [
         "test.cli",
         "test.cli_on_host",
-        "test.liteinst_strict",
-        "test.liteinst_strict_on_host",
         "test.sabre_examples",
         "test.sabre_examples_on_host",
     ] {
@@ -528,11 +526,13 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             ));
         }
     }
-    // The full plan carries exactly 3 of these (test.cli,
-    // test.liteinst_strict, test.sabre_examples); the _on_host twins are
-    // hosted-portable only. It carried 4 until slice S13 of
-    // https://github.com/rrnewton/hermit/issues/3301 retired test.dbt_parity.
-    if direct_consumers < 3 {
+    // The full plan carries exactly 2 of these (test.cli,
+    // test.sabre_examples); the _on_host twins are hosted-portable only. It
+    // carried 3 until test.liteinst_strict was retired with the LiteInst host
+    // hybrid (https://github.com/rrnewton/hermit/issues/3520), and 4 until
+    // slice S13 of https://github.com/rrnewton/hermit/issues/3301 retired
+    // test.dbt_parity.
+    if direct_consumers < 2 {
         return Err(format!(
             "release-artifact bracket: inspected only {direct_consumers} direct consumers"
         ));
@@ -782,7 +782,6 @@ enum Focused {
     RrCompat,
     SabreCompat,
     E9patchCompat,
-    LiteinstCompat,
     QemuL2,
     PrivilegedOnly,
     HostedPortable,
@@ -816,7 +815,6 @@ impl Focused {
             Focused::RrCompat => "rr-compat-only".into(),
             Focused::SabreCompat => "sabre-compat-only".into(),
             Focused::E9patchCompat => "e9patch-compat-only".into(),
-            Focused::LiteinstCompat => "liteinst-compat-only".into(),
             Focused::QemuL2 => "qemu-l2-only".into(),
             Focused::PrivilegedOnly => "privileged-only".into(),
             Focused::HostedPortable => "hosted-portable".into(),
@@ -839,7 +837,6 @@ impl Focused {
             Focused::RrCompat => "rr-compat-only",
             Focused::SabreCompat => "sabre-compat-only",
             Focused::E9patchCompat => "e9patch-compat-only",
-            Focused::LiteinstCompat => "liteinst-compat-only",
             Focused::QemuL2 => "qemu-l2-only",
             Focused::PrivilegedOnly => "privileged-only",
             Focused::HostedPortable => "hosted-portable-only",
@@ -1216,7 +1213,6 @@ fn usage() -> &'static str {
      \x20 --rr-compat-only              Only the compat bucket's record/replay cells (label rr-compat-only).\n\
      \x20 --sabre-compat-only           Only the compat bucket's SaBRe cells (label sabre-compat-only).\n\
      \x20 --e9patch-compat-only         Gate core + installed e9patch legacy stripped apps.\n\
-     \x20 --liteinst-compat-only        Run the portable CI liteinst_strict test.\n\
      \x20 --qemu-l2-only                Run the heavyweight QEMU L2 boot.\n\
      \x20 --portable-only               No PMU/CPUID hardware required.\n\
      \x20 --privileged-only             PMU/CPUID-dependent tests only.\n\
@@ -1433,7 +1429,6 @@ fn parse_argv(argv: &[String]) -> Result<Args, u8> {
             "--rr-compat-only" => focused.push(Focused::RrCompat),
             "--sabre-compat-only" => focused.push(Focused::SabreCompat),
             "--e9patch-compat-only" => focused.push(Focused::E9patchCompat),
-            "--liteinst-compat-only" => focused.push(Focused::LiteinstCompat),
             "--qemu-l2-only" => focused.push(Focused::QemuL2),
             "--privileged-only" => focused.push(Focused::PrivilegedOnly),
             "--hosted-portable-only" => focused.push(Focused::HostedPortable),
@@ -2354,7 +2349,6 @@ const SUBMODULE_SERVICE_FIXTURE_SOURCES: &[&str] = &[
     "detcore/src/tool_global.rs",
     "docs/BUCK2_OSS.md",
     "hermit-cli/BUCK",
-    "hermit-cli/tests/liteinst_advanced.rs",
     "scripts/build-buck-release.rs",
     "scripts/validate.rs",
     "scripts/lib/validate_history.rs",
@@ -4239,7 +4233,6 @@ fn self_test() -> Result<(), String> {
         "rr-compat-only",
         "sabre-compat-only",
         "e9patch-compat-only",
-        "liteinst-compat-only",
         "qemu-l2-only",
         "privileged-only",
         "only",
@@ -7205,6 +7198,7 @@ mod ordinary_artifact_pointer_tests {
         for name in [
             "libdetcore_dbt.so",
             "libdetcore_sabre.so",
+            "libdetcore_liteinst.so",
             "libreverie_dbt_client.so",
             "libreverie_liteinst.so",
             "dynamorio/bin64/drrun",
@@ -12166,7 +12160,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
         (Some(Focused::RrCompat), _) => Some("rr-compat-only"),
         (Some(Focused::SabreCompat), _) => Some("sabre-compat-only"),
         (Some(Focused::E9patchCompat), _) => Some("e9patch-compat-only"),
-        (Some(Focused::LiteinstCompat), _) => Some("liteinst-compat-only"),
         (Some(Focused::QemuL2), _) => Some("qemu-l2-only"),
         (Some(Focused::Envelope { .. }), _) => Some("envelope-only"),
         (None, Level::Quick) => Some("quick"),
@@ -29625,6 +29618,10 @@ mod committed_selection_preservation_tests {
                     "the fixture must accompany the strict compatibility bucket: {stdout}"
                 );
             } else {
+                // 67 since test.liteinst_strict_on_host was retired with the
+                // LiteInst host hybrid
+                // (https://github.com/rrnewton/hermit/issues/3520); 68 since
+                // test.detcore_time_on_host was enrolled.
                 // 67 since the 189 compat.<label>_on_host nodes were folded
                 // into e2e.manifest_compat_on_host (fold 1 of
                 // https://github.com/rrnewton/hermit/issues/3448).
@@ -29648,7 +29645,7 @@ mod committed_selection_preservation_tests {
                 // ci/portable-shards.json.
                 assert!(
                     stdout.contains(
-                        "68 committed hosted-portable steps each assigned to exactly one hosted job"
+                        "67 committed hosted-portable steps each assigned to exactly one hosted job"
                     ),
                     "{stdout}"
                 );
@@ -29782,7 +29779,6 @@ mod committed_selection_preservation_tests {
             "test.hermit_integration",
             "test.hermit_unit",
             "test.ignored_syscall_regressions",
-            "test.liteinst_strict",
             "test.regular_crates",
             "test.rr_suite_contract",
             "test.sabre_examples",
@@ -29803,8 +29799,10 @@ mod committed_selection_preservation_tests {
         // https://github.com/rrnewton/hermit/issues/3448); 206 until
         // test.dbt_parity_on_host was retired (slice S13 of
         // https://github.com/rrnewton/hermit/issues/3301). 17 since
-        // test.detcore_time_on_host was enrolled.
-        assert_eq!(expected.len(), 17);
+        // test.detcore_time_on_host was enrolled. 16 since
+        // test.liteinst_strict_on_host was retired
+        // (https://github.com/rrnewton/hermit/issues/3520).
+        assert_eq!(expected.len(), 16);
         let requested = [public.join(","), "e2e.manifest_compat".into()].join(",");
         for only in [false, true] {
             let mut argv = if only {

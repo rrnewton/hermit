@@ -2012,7 +2012,7 @@ mod tests {
         }
         // The dev-profile producers build far less than the workspace, so
         // each of their selections keeps a listing of its own.
-        for profile in ["privileged", "super", "quick", "liteinst-compat-only"] {
+        for profile in ["privileged", "super", "quick"] {
             let plan = listings(profile, &several).unwrap();
             assert_eq!(plan.len(), 2, "{profile}");
             for (listing, keys) in plan {

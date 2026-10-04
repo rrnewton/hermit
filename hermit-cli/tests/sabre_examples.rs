@@ -819,6 +819,7 @@ fn sabre_dispatch_record_reports_its_routes_and_tracer_stops() {
     let record = dispatch_stats::dispatch_record(
         "sabre",
         &hermit_binary(),
+        &[],
         &[("HERMIT_SABRE_BINARY", &loader)],
         &guest,
     );

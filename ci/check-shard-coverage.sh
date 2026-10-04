@@ -351,8 +351,9 @@ debug_artifact_contract() {
 # No release-profile producer exists since d44bbbb79ac
 # (https://github.com/rrnewton/hermit/issues/3458), so the debug tree is the
 # only carrier of the install resources that build.e2e_artifact publishes and
-# the release shards read, and of the profile-staged LiteInst runtime that
-# test.liteinst_strict stages. hermit-install links three of those resources
+# the release shards read, and of the profile-staged Reverie LiteInst runtime
+# that hermit-install writes beside the validate-profile Hermit. hermit-install
+# links three of those resources
 # into target/validate, which the tree does not carry whole, so the pack step
 # must replace every link with a regular copy and refuse a leftover one. The
 # replacement loop is pinned whole and must precede the tar: its dangling-link
