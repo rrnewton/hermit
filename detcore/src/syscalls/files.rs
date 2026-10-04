@@ -2932,13 +2932,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         // preadv2 at offset -1 is readv (fs/read_write.c do_preadv2). A
-        // virtual timerfd is never armed on the host, so route the flag-free
-        // form through the virtual read; other flags keep the host path.
+        // virtual timerfd is never armed on the host, so the flag-free form
+        // goes through the virtual read, and so does RWF_HIPRI: every kernel
+        // accepts that flag on a timerfd and ignores it. What the other flags
+        // do depends on the kernel. Where timerfd reads through read_iter,
+        // RWF_NOWAIT acts as O_NONBLOCK and the other supported flags are
+        // ignored; on older kernels every flag but RWF_HIPRI is EOPNOTSUPP.
+        // A read with any other flag therefore hands the timer to the kernel
+        // and lets the kernel answer, as on base main, unless it asks for zero
+        // bytes: vfs_readv returns 0 for that before it looks at the flags.
         // AUTONOMOUS-BOT-IMPLEMENTED
-        if vectored_offset(call.pos_l(), call.pos_h()) == -1
-            && call.flags() == 0
-            && self.virtual_timerfds()
-            && !self.timerfd_kernel_backed(guest, call.fd())
+        // TODO-HUMAN-REVIEW(PR-3229): preadv2 flags on a virtual timerfd.
+        if offset == -1 && self.virtual_timerfds() && !self.timerfd_kernel_backed(guest, call.fd())
         {
             let timer = guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (detfd.ty() == FdType::Timerfd).then(|| detfd.clone())
@@ -2946,9 +2951,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(timer) = timer {
                 let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
                 let iovecs = read_iovecs(&guest.memory(), call.iov(), count)?;
-                return self
-                    .read_timerfd(guest, &timer, &iovecs, TimerfdReadForm::Vectored)
-                    .await;
+                if call.flags() & !libc::RWF_HIPRI == 0 {
+                    return self
+                        .read_timerfd(guest, &timer, &iovecs, TimerfdReadForm::Vectored)
+                        .await;
+                }
+                if iovecs.iter().all(|iovec| iovec.len == 0) {
+                    return Ok(0);
+                }
+                self.hand_timerfd_to_kernel(guest, call.fd()).await?;
             }
         }
 

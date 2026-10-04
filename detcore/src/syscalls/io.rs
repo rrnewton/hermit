@@ -1784,7 +1784,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// is polled until it fires, so it is readable when the guest next
     /// looks; the kernel then counts one expiration, however many were
     /// pending. If the vessel cannot be armed, the timer stays virtual.
-    async fn hand_timerfd_to_kernel<G: Guest<Self>>(
+    pub(crate) async fn hand_timerfd_to_kernel<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: i32,
