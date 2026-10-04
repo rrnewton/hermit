@@ -81,6 +81,11 @@
  *       thread closes the descriptor, and when a new timerfd then takes the
  *       freed number: it returns the old timer's count, not EBADF, and leaves
  *       the new timer's expiration unread.
+ *   readv_empty / readv_zero_lengths / preadv2_zero_length /
+ *   readv_zero_blocking / read_zero_einval
+ *       A readv or preadv2 whose iovecs hold no bytes returns 0 without
+ *       consuming the expiration, and without waiting on a blocking timer;
+ *       a read of 0 bytes is EINVAL and leaves the expiration in place.
  *   create_errors / gettime_errors / settime_errors
  *       Linux's argument-checking order: bad flags or clock are EINVAL (even
  *       for an alarm clock); gettime checks the descriptor before the output
@@ -842,6 +847,56 @@ static void check_read_across_close(const char *name, int vectored, int reuse) {
     else ok(name);
 }
 
+/* vfs_readv returns 0 for a zero total before it reaches the timer, so a
+ * vector read of no bytes neither fails, nor consumes, nor waits. A scalar
+ * read of 0 bytes does reach timerfd_read_iter, which refuses it. */
+static void check_zero_length_reads(void) {
+    unsigned char byte = 0;
+    struct iovec zeros[2] = {{&byte, 0}, {&byte, 0}};
+    const char *names[3] = {"readv_empty", "readv_zero_lengths", "preadv2_zero_length"};
+    for (int i = 0; i < 3; i++) {
+        int tfd = expired_tfd();
+        errno = 0;
+        ssize_t r = i == 0   ? readv(tfd, zeros, 0)
+                    : i == 1 ? readv(tfd, zeros, 2)
+                             : preadv2(tfd, zeros, 1, -1, 0);
+        int err = errno;
+        uint64_t left = 0;
+        ssize_t again = read(tfd, &left, sizeof left);
+        close(tfd);
+        if (r != 0) fail(names[i], "r=%ld errno=%ld", (long)r, err);
+        else if (again != 8 || left != 1)
+            fail(names[i], "again=%ld left=%ld", (long)again, (long)left);
+        else ok(names[i]);
+    }
+
+    /* A blocking timer due in 200 ms is still pending after the empty read. */
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 200 * MS, 0, 0);
+    errno = 0;
+    ssize_t r = readv(tfd, zeros, 2);
+    int err = errno;
+    struct itimerspec cur;
+    memset(&cur, 0, sizeof cur);
+    long got = timerfd_gettime(tfd, &cur);
+    close(tfd);
+    if (r != 0) fail("readv_zero_blocking", "r=%ld errno=%ld", (long)r, err);
+    else if (got != 0 || (cur.it_value.tv_sec == 0 && cur.it_value.tv_nsec == 0))
+        fail("readv_zero_blocking", "gettime=%ld pending=%ld", got, 0);
+    else ok("readv_zero_blocking");
+
+    tfd = expired_tfd();
+    errno = 0;
+    r = read(tfd, &byte, 0);
+    err = errno;
+    uint64_t left = 0;
+    ssize_t again = read(tfd, &left, sizeof left);
+    close(tfd);
+    if (r != -1 || err != EINVAL) fail("read_zero_einval", "r=%ld errno=%ld", (long)r, err);
+    else if (again != 8 || left != 1)
+        fail("read_zero_einval", "again=%ld left=%ld", (long)again, (long)left);
+    else ok("read_zero_einval");
+}
+
 static void check_create_errors(void) {
     const char *name = "create_errors";
     struct { int clock; int flags; } cases[] = {
@@ -1042,6 +1097,7 @@ int main(void) {
     check_read_across_close("read_across_reuse", 0, 1);
     check_read_across_close("readv_across_close", 1, 0);
     check_read_across_close("readv_across_reuse", 1, 1);
+    check_zero_length_reads();
     check_create_errors();
     check_gettime_errors();
     check_settime_errors();
