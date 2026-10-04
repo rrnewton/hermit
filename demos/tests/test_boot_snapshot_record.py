@@ -1453,5 +1453,50 @@ class Demo7ChecksTheSnapshotFirstTest(unittest.TestCase):
         self.assertTrue(run.call_args.kwargs["check"])
 
 
+class FailedRebuildDocumentationTest(unittest.TestCase):
+    """The demo 6 and demo 7 READMEs describe the failed-rebuild rule as coded.
+
+    Both demos call accept_snapshot_after_failed_rebuild, which judges demo 5's
+    rebuild by its record instead of its exit status, only when a snapshot was
+    there and did not match. When the snapshot was missing, demo 5's failure is
+    raised again and ends the demo, even if demo 5 saved a snapshot first
+    (test_a_missing_snapshot_whose_demo5_fails_still_fails, for each demo).
+    """
+
+    MISSING = (
+        "If the snapshot was missing and demo 5 exits non-zero, this demo stops "
+        "with demo 5's failure, even if demo 5 saved a snapshot first."
+    )
+    STALE_ONLY = (
+        "In that case only, this demo checks demo 5's record instead of its exit "
+        "status"
+    )
+
+    @staticmethod
+    def _words(text):
+        return " ".join(text.split())
+
+    def _prerequisites(self, demo):
+        readme = (DEMOS_DIR / demo / "README.md").read_text()
+        section = readme.split("\n## Prerequisites\n", 1)[1].split("\n## ", 1)[0]
+        return self._words(section)
+
+    def test_each_readme_limits_the_record_check_to_a_snapshot_that_was_there(self):
+        for demo in ("06-qemu-resume", "07-drgn-kernel"):
+            with self.subTest(demo=demo):
+                prerequisites = self._prerequisites(demo)
+                self.assertIn(self.MISSING, prerequisites)
+                self.assertIn(self.STALE_ONLY, prerequisites)
+
+    def test_demo_6s_summary_of_the_record_limits_it_too(self):
+        readme = self._words((DEMOS_DIR / "06-qemu-resume" / "README.md").read_text())
+        self.assertIn(
+            "That allowance is only for a snapshot that was there and did not "
+            "match: when the snapshot is missing and demo 5 exits non-zero, the "
+            "demo stops with demo 5's failure (see Prerequisites).",
+            readme,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

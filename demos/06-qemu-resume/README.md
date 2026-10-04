@@ -18,13 +18,16 @@ post-command snapshot.
 
 - Everything [demo 5](../05-qemu-boot/README.md#prerequisites) needs.
 - The boot snapshot from demo 5, booted from the initramfs that
-  `demos/lib/qemu-assets.sh` builds now. If it is missing, or demo 5 saved it
-  from another initramfs, this demo runs demo 5 first to rebuild it. After an
-  initramfs change, demo 5's own reference run no longer applies either, so
-  demo 5 may end `PARTIAL` and exit non-zero after it has saved a current
-  snapshot. This demo then checks demo 5's record instead of its exit status:
-  it uses the snapshot, with a note, when the record matches, and otherwise
-  stops and asks you to run `demos/clean.sh` and then this demo again.
+  `demos/lib/qemu-assets.sh` builds now. If it is missing, or demo 5's record
+  of it does not show that, this demo runs demo 5 first to rebuild it. If the
+  snapshot was missing and demo 5 exits non-zero, this demo stops with demo 5's
+  failure, even if demo 5 saved a snapshot first. If a snapshot was there but
+  its record did not show that, demo 5 may end `PARTIAL` and exit non-zero
+  after it has saved a current snapshot, because after an initramfs change its
+  own reference run no longer applies either. In that case only, this demo
+  checks demo 5's record instead of its exit status: it uses the rebuilt
+  snapshot, with a note, when the record matches, and otherwise stops and asks
+  you to run `demos/clean.sh` and then this demo again.
 
 The resume itself does not use the hardware performance counters (see "How it
 works"), but demo 5 does if it has to run first.
@@ -327,9 +330,11 @@ The framing has these consequences and limits:
   This demo restores the default snapshot only when that record matches the
   snapshot and the current initramfs, and otherwise runs demo 5 again to
   rebuild it; if demo 5 then exits non-zero, the rebuilt snapshot is used only
-  when its record matches (see Prerequisites). A snapshot named by
-  `QEMU_BOOT_SNAPSHOT_DISK` without such a record is refused, with the reason
-  and how to rebuild it. Because demo 5 does not take this demo's lock, the
+  when its record matches. That allowance is only for a snapshot that was
+  there and did not match: when the snapshot is missing and demo 5 exits
+  non-zero, the demo stops with demo 5's failure (see Prerequisites). A
+  snapshot named by `QEMU_BOOT_SNAPSHOT_DISK` without such a record is refused,
+  with the reason and how to rebuild it. Because demo 5 does not take this demo's lock, the
   copy that QEMU restores is checked against the record too. As a second line
   of defence, the controller stops as soon as it sees the BEGIN line of
   another `/init`, a bare `__HERMIT_COMMAND_BEGIN__` line or one ending in
