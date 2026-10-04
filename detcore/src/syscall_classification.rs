@@ -675,7 +675,9 @@ pub(crate) const fn classify_syscall(sysno: Sysno) -> SyscallClassification {
         | Sysno::getresuid
         | Sysno::getresgid
         // AUTONOMOUS-BOT-IMPLEMENTED
-        // TODO-HUMAN-REVIEW(#1851): Complete the fixed virtual-root identity by
+        // OWNER-APPROVED (2026-10-04, https://github.com/rrnewton/hermit/pull/1851;
+        // ownership-model audit: https://github.com/rrnewton/hermit/issues/3750):
+        // Complete the fixed virtual-root identity by
         // emulating file-ownership MUTATION too. The query family above and the
         // credential-setting family are already virtualized to root; leaving the
         // chown family as pass-through contradicted that model, because the host
@@ -989,7 +991,9 @@ pub(crate) const fn is_credential_identity_noop_syscall(sysno: Sysno) -> bool {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(#1851): File-ownership mutation completed to match the
+// OWNER-APPROVED (2026-10-04, https://github.com/rrnewton/hermit/pull/1851;
+// ownership-model audit: https://github.com/rrnewton/hermit/issues/3750):
+// File-ownership mutation completed to match the
 // fixed virtual-root identity.
 /// The `chown` family: `chown`, `fchown`, `fchownat`, `lchown`.
 ///
@@ -2786,7 +2790,7 @@ mod tests {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(#1851)
+    // OWNER-APPROVED (2026-10-04, https://github.com/rrnewton/hermit/pull/1851)
     #[test]
     fn ownership_change_family_is_determinized_not_passthrough() {
         // POSITIVE: exactly the four ownership-mutation syscalls are in the
