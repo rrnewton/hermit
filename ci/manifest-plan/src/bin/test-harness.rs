@@ -3833,19 +3833,8 @@ fn parity_compare(
         rows.iter().map(|row| row.hermit_sha.as_str()).collect(),
         "hermit_sha",
     );
-    let hermit_bin =
-        hermit_manifest_plan::runner::resolve_hermit_bin(root, std::env::var_os("HERMIT_BIN"));
-    let mut config =
-        parity::PostPassConfig::new(&request.artifacts, &hermit_bin, &run_id, &hermit_sha)
-            .writing_below(&request.artifacts.join(PARITY_COMPARE_DIR));
-    if let Some(output) = &request.output {
-        config.output = output.clone();
-    }
-    config.jobs = request.jobs;
-    config.outer_deadline = parity::dagrun_step_deadline();
-    config.imported_logs = recorded_import_root(&request.artifacts)
-        .unwrap_or_else(|error| fail(error))
-        .map(|root| parity::ImportedLogs::load(&root));
+    let config = parity_compare_config(root, request, &run_id, &hermit_sha)
+        .unwrap_or_else(|error| fail(error));
     let report = parity::post_pass(&config, &scope, &rows).unwrap_or_else(|error| fail(error));
     for record in &report.records {
         println!(
@@ -3855,6 +3844,31 @@ fn parity_compare(
     }
     eprintln!("test-harness: {}", report.summary_line());
     ExitCode::SUCCESS
+}
+
+/// The post-pass configuration `parity compare` measures the finished run in
+/// `request.artifacts` with: its outputs below that run's
+/// `PARITY_COMPARE_DIR`, and an imported run's logs read from where its
+/// ingest restored them (`recorded_import_root`).
+fn parity_compare_config(
+    root: &Path,
+    request: &ParityCompareRequest,
+    run_id: &str,
+    hermit_sha: &str,
+) -> Result<parity::PostPassConfig, String> {
+    let hermit_bin =
+        hermit_manifest_plan::runner::resolve_hermit_bin(root, std::env::var_os("HERMIT_BIN"));
+    let mut config =
+        parity::PostPassConfig::new(&request.artifacts, &hermit_bin, run_id, hermit_sha)
+            .writing_below(&request.artifacts.join(PARITY_COMPARE_DIR));
+    if let Some(output) = &request.output {
+        config.output = output.clone();
+    }
+    config.jobs = request.jobs;
+    config.outer_deadline = parity::dagrun_step_deadline();
+    config.imported_logs =
+        recorded_import_root(&request.artifacts)?.map(|root| parity::ImportedLogs::load(&root));
+    Ok(config)
 }
 
 /// The import root the finished run in `artifacts` recorded in its
@@ -3873,6 +3887,12 @@ fn recorded_import_root(artifacts: &Path) -> Result<Option<PathBuf>, String> {
     })?;
     let summary: serde_json::Value =
         serde_json::from_str(&text).map_err(|error| format!("{}: {error}", path.display()))?;
+    let Some(summary) = summary.as_object() else {
+        return Err(format!(
+            "{} is not a JSON object, so whether the run imported its rows is unknown",
+            path.display()
+        ));
+    };
     let Some(imported) = summary.get("imported") else {
         return Ok(None);
     };
@@ -6844,10 +6864,11 @@ sys.exit(1 if failed else 0)
     }
 
     /// `parity compare` reads an imported run's logs from the import root its
-    /// summary.json records (<https://github.com/rrnewton/hermit/issues/3687>).
-    /// A run that imported nothing has none; a summary that cannot be read, or
-    /// records an import without an absolute root, is refused rather than
-    /// read as a run that imported nothing.
+    /// summary.json records (<https://github.com/rrnewton/hermit/issues/3687>):
+    /// the configuration it measures with loads that root's log index. A run
+    /// that imported nothing has none; a summary that cannot be read, is not a
+    /// JSON object, or records an import without an absolute root, is refused
+    /// rather than read as a run that imported nothing.
     #[test]
     fn parity_compare_finds_an_imported_runs_logs_through_its_summary() {
         let artifacts = std::env::temp_dir().join(format!(
@@ -6880,6 +6901,15 @@ sys.exit(1 if failed else 0)
             let error = recorded(Some(summary.clone())).unwrap_err();
             assert!(error.contains("no absolute \"root\""), "{summary}: {error}");
         }
+        for summary in [
+            serde_json::json!(null),
+            serde_json::json!([]),
+            serde_json::json!(3),
+            serde_json::json!("imported"),
+        ] {
+            let error = recorded(Some(summary.clone())).unwrap_err();
+            assert!(error.contains("is not a JSON object"), "{summary}: {error}");
+        }
         let error = recorded(None).unwrap_err();
         assert!(
             error.contains("whether the run imported its rows is unknown"),
@@ -6887,6 +6917,49 @@ sys.exit(1 if failed else 0)
         );
         fs::write(artifacts.join("summary.json"), "{").unwrap();
         assert!(super::recorded_import_root(&artifacts).is_err());
+
+        // The configuration reads each recorded verify-log directory from
+        // where the index below the recorded root restored it.
+        let import_root = artifacts.join("import");
+        let index_dir = import_root.join(parity::IMPORTED_LOGS_DIR);
+        fs::create_dir_all(&index_dir).unwrap();
+        let entry = serde_json::json!({
+            "schema": parity::IMPORTED_LOGS_SCHEMA,
+            "verify_log_dir": "/tmp/cell/verify-logs",
+            "restored": format!("{}/r1", parity::IMPORTED_LOGS_DIR),
+            "reason": null,
+            "route": "local",
+            "container": "",
+            "re_platform": "local",
+        });
+        fs::write(
+            index_dir.join(parity::IMPORTED_LOGS_INDEX),
+            format!("{entry}\n"),
+        )
+        .unwrap();
+        let request = super::ParityCompareRequest {
+            artifacts: artifacts.clone(),
+            cells: Vec::new(),
+            output: None,
+            jobs: 1,
+        };
+        let configured = |summary: serde_json::Value| {
+            fs::write(artifacts.join("summary.json"), summary.to_string()).unwrap();
+            super::parity_compare_config(&artifacts, &request, "run", "sha")
+        };
+        let config = configured(serde_json::json!({
+            "imported": {"root": import_root.to_str().unwrap()}
+        }))
+        .unwrap();
+        let imported = config.imported_logs.as_ref().expect("the import's logs");
+        assert_eq!(
+            imported.restored("/tmp/cell/verify-logs"),
+            Ok(index_dir.join("r1").as_path())
+        );
+        assert!(imported.restored("/tmp/other/verify-logs").is_err());
+        let config = configured(serde_json::json!({"cells": 1})).unwrap();
+        assert!(config.imported_logs.is_none());
+        assert!(configured(serde_json::json!({"imported": {"root": "import"}})).is_err());
         fs::remove_dir_all(&artifacts).unwrap();
     }
 
