@@ -2301,6 +2301,7 @@ impl GlobalState {
                     poll_attempt: 0,
                     fyi: String::new(),
                     signal_interrupt_errno: None,
+                    backend_runtime_bootstrap: false,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {
@@ -3409,11 +3410,17 @@ enum SchedulerRpcResult<T> {
 /// Global method RPC to request to control a resource.
 ///
 /// Blocking: future returns only when resources are fully acquired.
-pub async fn resource_request<G, T>(guest: &mut G, r: Resources) -> ResumeStatus
+pub async fn resource_request<G, T>(guest: &mut G, mut r: Resources) -> ResumeStatus
 where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
+    // A request made while handling a syscall whose cost the bootstrap window
+    // withholds carries that fact to the scheduler, which then withholds the
+    // turn's scheduler time too (see `Scheduler::bump_global_time`). Only a
+    // backend whose `is_backend_runtime_bootstrap` can return true ever sets it.
+    r.backend_runtime_bootstrap |=
+        guest.thread_state().in_uncharged_bootstrap_syscall && guest.is_backend_runtime_bootstrap();
     if guest.config().sequentialize_threads {
         if let Some(lease) = guest.signal_observation_lease() {
             if let Some(site) = guest.parked_signal_site() {

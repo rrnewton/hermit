@@ -1849,6 +1849,19 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) uncharged_bootstrap_syscalls: u32,
 
+    /// True from the moment [`ThreadState::charge_syscall_time`] leaves the
+    /// syscall this thread is handling uncharged until that syscall's handler
+    /// finishes. Resource requests made meanwhile through
+    /// `tool_global::resource_request` are marked
+    /// [`Resources::backend_runtime_bootstrap`], so the scheduler withholds
+    /// their turn time as well, except for an IO-polling retry, which still
+    /// advances it. Requests that bypass `resource_request` (direct futex and
+    /// thread-lifecycle requests) are not marked and advance it as usual.
+    /// Cleared at the start of every handler and before the syscall handler's
+    /// post-hook.
+    #[serde(default)]
+    pub(crate) in_uncharged_bootstrap_syscall: bool,
+
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
 
@@ -2262,6 +2275,7 @@ impl<T> ThreadState<T> {
             thread_logical_time,
             committed_clock_value: 0,
             uncharged_bootstrap_syscalls: 0,
+            in_uncharged_bootstrap_syscall: false,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED
@@ -2502,6 +2516,7 @@ impl<T> ThreadState<T> {
             poll_attempt: 0,
             fyi: String::new(),
             signal_interrupt_errno: None,
+            backend_runtime_bootstrap: false,
         }
     }
 

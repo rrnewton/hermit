@@ -573,6 +573,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A common hook called at the start of *every* handler, just after we receive
     /// control from the guest.
     async fn pre_handler_hook<G: Guest<Self>>(&self, guest: &mut G, precise_branch: bool) {
+        // A handler that left early (an error return) may not have cleared
+        // this; no request made by this new handler belongs to that syscall.
+        guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
         let dettid = guest.thread_state().dettid;
         let evs = self.update_logical_time_rcbs(guest, precise_branch).await;
 
@@ -1701,6 +1704,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // A new thread or process is never the backend runtime's
                     // bootstrapping thread, so it starts outside any window.
                     uncharged_bootstrap_syscalls: 0,
+                    in_uncharged_bootstrap_syscall: false,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
@@ -2056,6 +2060,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // never reset: the first syscall after the window continues from the
         // value the window left. See https://github.com/rrnewton/hermit/issues/3338
         // and https://github.com/rrnewton/hermit/pull/3430#issuecomment-5928691696.
+        //
+        // The scheduler turns such a syscall needs are withheld the same way.
+        // Handling an uncharged syscall can still commit scheduler turns (for
+        // example the file resources of a read of /proc/self/maps), and each
+        // committed turn normally advances global time by the per-turn
+        // scheduler cost. While the syscall is being handled the thread is
+        // marked `in_uncharged_bootstrap_syscall`, `tool_global::resource_request`
+        // copies that mark into the request, and the scheduler does not
+        // advance global time for a marked turn unless it is an IO-polling
+        // retry, whose time enforces timeouts. Without this, a LiteInst run of
+        // the clock-trajectory fixture reached its first clock read 11.5 ms of
+        // virtual time later than with it, and each exec added 12.0 ms more
+        // (measured locally), which was enough for its sysinfo uptime to
+        // differ from the ptrace backend's on the hosted runner
+        // (https://github.com/rrnewton/hermit/issues/3517). A charged syscall
+        // (one that observes virtual time, or any past the cap) is not marked,
+        // so its turns advance the clock as everywhere else.
         let in_backend_runtime_bootstrap = guest.is_backend_runtime_bootstrap();
         let new_count = {
             // which results from not being able to borrow guest twice.
@@ -2067,11 +2088,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // The one exception is the bootstrap window described above: on the bootstrapping
             // thread, up to MAX_UNCHARGED_BOOTSTRAP_SYSCALLS syscalls per window that do not
             // observe virtual time are left uncharged.
-            if thread_state.charge_syscall_time(in_backend_runtime_bootstrap, call.number()) {
+            let charged =
+                thread_state.charge_syscall_time(in_backend_runtime_bootstrap, call.number());
+            if charged {
                 thread_state
                     .thread_logical_time
                     .add_syscall_with_cost(syscall_cost_ns);
             }
+            thread_state.in_uncharged_bootstrap_syscall = !charged;
             // This only folds the thread's new user and system time into the process total.
             // An uncharged syscall added none, so it needs no guard.
             thread_state.account_process_cpu_time();
@@ -2996,6 +3020,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .await;
         }
 
+        // The syscall is finished; a turn the post-hook takes (a timeslice
+        // end) is the thread's own and advances global time as usual.
+        guest.thread_state_mut().in_uncharged_bootstrap_syscall = false;
         self.post_handler_hook(guest).await;
 
         // Defense-in-depth: unless the backend already owns this guarantee,
