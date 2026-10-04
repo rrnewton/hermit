@@ -1401,6 +1401,15 @@ const VERIFY_LOG_DIR_FLAG: &str = "--verify-log-dir";
 /// The first verification run's retained log: after a match, the only log
 /// `hermit run --keep-logs` keeps.
 const RETAINED_LOG_PREFIX: &str = "run1_log_";
+/// Below an imported run's root (`E2E_IMPORT_RESULTS`): the first-run logs
+/// that `ci/buck-e2e/ingest.py` restored from the cells' artifacts, and
+/// [`IMPORTED_LOGS_INDEX`] naming where each was restored ([`ImportedLogs`]).
+pub const IMPORTED_LOGS_DIR: &str = "retained-verify-logs";
+/// In [`IMPORTED_LOGS_DIR`]: one line per verify-log directory an imported
+/// row records, with the directory its logs were restored into or why none
+/// were.
+pub const IMPORTED_LOGS_INDEX: &str = "index.jsonl";
+pub const IMPORTED_LOGS_SCHEMA: u64 = 1;
 const STDERR_LIMIT_BYTES: usize = 16 * 1024;
 
 /// Parse one `<test-id>@<backend>` cell against the matrix. Refuses an unknown
@@ -1694,6 +1703,12 @@ pub struct PostPassConfig {
     /// history records a mismatch ([`records_mismatch`]). Empty for the
     /// harness.
     pub nondeterministic: BTreeMap<(String, String), String>,
+    /// Where the logs of rows another process ran were restored, for an
+    /// imported run ([`ImportedLogs`]). With it, an operand's log is read
+    /// only from the directory its recorded `--verify-log-dir` was restored
+    /// into, never from the recorded path. `None` for a run that executed
+    /// its own cells.
+    pub imported_logs: Option<ImportedLogs>,
 }
 
 /// Why a caller refused to hand over a verify cell's result row
@@ -1767,6 +1782,7 @@ impl PostPassConfig {
             jobs: 1,
             rejected: BTreeMap::new(),
             nondeterministic: BTreeMap::new(),
+            imported_logs: None,
         }
     }
 
@@ -2539,6 +2555,7 @@ fn measure(
                 &candidate_role,
                 row,
                 ParityVerdict::CandidateMissing,
+                config.imported_logs.as_ref(),
             )
             .and_then(|log| {
                 hashed(&log, ParityGuestInputs::from_result(row)).map_err(|error| Unusable {
@@ -3014,18 +3031,139 @@ fn evaluate_history(
     }
 }
 
+/// The first-run logs of an imported run's rows, restored below the import
+/// root by `ci/buck-e2e/ingest.py`
+/// (<https://github.com/rrnewton/hermit/issues/3687>). An imported row keeps
+/// the `--verify-log-dir` it was run with, in another process's scratch
+/// directory that is gone; [`IMPORTED_LOGS_INDEX`] maps each such directory
+/// to the one below the root that its logs were restored into, or to why
+/// none were. The recorded path itself is never read, so a log is only ever
+/// the one its row's own cell retained.
+#[derive(Clone, Debug)]
+pub struct ImportedLogs {
+    /// Recorded verify-log directory to restored directory, or why none.
+    dirs: BTreeMap<String, Result<PathBuf, String>>,
+    /// Why the index cannot be used at all; every operand is then unrestored
+    /// for this reason.
+    unusable: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ImportedLogEntry {
+    schema: u64,
+    verify_log_dir: String,
+    /// Relative to the import root.
+    restored: Option<String>,
+    reason: Option<String>,
+}
+
+impl ImportedLogs {
+    /// Read `<import_root>/`[`IMPORTED_LOGS_DIR`]`/`[`IMPORTED_LOGS_INDEX`].
+    /// This never fails: an index that is missing or cannot be trusted as a
+    /// whole leaves every operand unrestored, with the reason, so its cells
+    /// are unmeasured rather than the run refused.
+    pub fn load(import_root: &Path) -> Self {
+        let index = import_root
+            .join(IMPORTED_LOGS_DIR)
+            .join(IMPORTED_LOGS_INDEX);
+        match Self::parse(import_root, &index) {
+            Ok(dirs) => Self {
+                dirs,
+                unusable: None,
+            },
+            Err(reason) => Self {
+                dirs: BTreeMap::new(),
+                unusable: Some(reason),
+            },
+        }
+    }
+
+    fn parse(
+        import_root: &Path,
+        index: &Path,
+    ) -> Result<BTreeMap<String, Result<PathBuf, String>>, String> {
+        let text = fs::read_to_string(index).map_err(|error| {
+            format!(
+                "the import's log index {} cannot be read: {error}",
+                index.display()
+            )
+        })?;
+        let mut dirs = BTreeMap::new();
+        for (number, line) in text.lines().enumerate() {
+            let at = format!(
+                "the import's log index {} line {}",
+                index.display(),
+                number + 1
+            );
+            let entry: ImportedLogEntry = serde_json::from_str(line)
+                .map_err(|error| format!("{at} is not an index entry: {error}"))?;
+            if entry.schema != IMPORTED_LOGS_SCHEMA {
+                return Err(format!(
+                    "{at} has schema {}, not {IMPORTED_LOGS_SCHEMA}",
+                    entry.schema
+                ));
+            }
+            let restored = match (entry.restored, entry.reason) {
+                (Some(restored), None) => {
+                    let relative = Path::new(&restored);
+                    if restored.is_empty()
+                        || !relative
+                            .components()
+                            .all(|component| matches!(component, Component::Normal(_)))
+                    {
+                        return Err(format!(
+                            "{at} restores into {restored:?}, which is not a plain relative path"
+                        ));
+                    }
+                    Ok(import_root.join(relative))
+                }
+                (None, Some(reason)) => Err(reason),
+                _ => {
+                    return Err(format!(
+                        "{at} must name exactly one of a restored directory and a reason"
+                    ));
+                }
+            };
+            if dirs
+                .insert(entry.verify_log_dir.clone(), restored)
+                .is_some()
+            {
+                return Err(format!("{at} names {:?} again", entry.verify_log_dir));
+            }
+        }
+        Ok(dirs)
+    }
+
+    /// The directory the logs of the recorded verify-log directory
+    /// `recorded` were restored into, or why there is none.
+    fn restored(&self, recorded: &str) -> Result<&Path, String> {
+        if let Some(reason) = &self.unusable {
+            return Err(reason.clone());
+        }
+        match self.dirs.get(recorded) {
+            Some(Ok(directory)) => Ok(directory),
+            Some(Err(reason)) => Err(reason.clone()),
+            None => Err("the import's log index does not name it".to_string()),
+        }
+    }
+}
+
 /// The single retained first-run log of the verify cell `row` that
 /// [`evaluate_history`] returned, or why there is none:
 /// [`UnavailableClass::LogNotRetained`] when the cell did not retain exactly
 /// one nonempty first-run log, and [`UnavailableClass::LogUnreadable`] when
 /// its one log exists but cannot be read. Only first-run logs are considered;
-/// a second-run log kept for determinism debugging is never read.
+/// a second-run log kept for determinism debugging is never read. A row
+/// another process ran (`imported`) is read only from the directory its
+/// recorded one was restored into ([`ImportedLogs`]).
 fn retained_log(
     test: &str,
     operand: ParityOperand,
     role: &str,
     row: &CellResult,
     missing: ParityVerdict,
+    imported: Option<&ImportedLogs>,
 ) -> Result<PathBuf, Unusable> {
     let unusable = |class, reason: String| Unusable {
         verdict: missing,
@@ -3034,17 +3172,26 @@ fn retained_log(
         reason,
     };
     let not_retained = |reason: String| unusable(UnavailableClass::LogNotRetained, reason);
-    let Some(directory) = row
+    let Some(recorded) = row
         .argv
         .iter()
         .position(|arg| arg == VERIFY_LOG_DIR_FLAG)
         .and_then(|flag| row.argv.get(flag + 1))
-        .map(PathBuf::from)
     else {
         return Err(not_retained(format!(
             "the {role} verify cell of {test} retained no logs (its argv has no \
              {VERIFY_LOG_DIR_FLAG})"
         )));
+    };
+    let directory = match imported.map(|imported| imported.restored(recorded)) {
+        None => PathBuf::from(recorded),
+        Some(Ok(directory)) => directory.to_path_buf(),
+        Some(Err(reason)) => {
+            return Err(not_retained(format!(
+                "the {role} verify cell of {test} ran in another process, and the import \
+                 restored no log of its {recorded}: {reason}"
+            )));
+        }
     };
     let mut logs = match fs::read_dir(&directory) {
         Ok(entries) => entries
@@ -3114,6 +3261,7 @@ fn reference_golden(
         role,
         row,
         ParityVerdict::ReferenceMissing,
+        config.imported_logs.as_ref(),
     ) {
         Ok(source) => source,
         Err(unusable) => {
@@ -8542,6 +8690,226 @@ mod tests {
                 .0
                 .exists()
         );
+    }
+
+    /// The rows of an imported run record the `--verify-log-dir` each cell
+    /// had in the process that ran it. Each operand is read only from the
+    /// directory the ingest restored that recorded directory into
+    /// (<https://github.com/rrnewton/hermit/issues/3687>): a restored pair is
+    /// measured from its restored logs while the recorded directories hold
+    /// other logs, and an operand whose recorded directory the index restored
+    /// no log of, or does not name, leaves its cell unmeasured with why.
+    #[test]
+    fn an_imported_row_is_measured_only_from_its_restored_logs() {
+        const RECORDED: &str = "INFO detcore: open\nINFO detcore: read 5\nINFO detcore: exit 0\n";
+        let fixture = Fixture::new("imported");
+        // Reading either recorded log of fx/restored would diverge.
+        let rows = vec![
+            fixture.row("fx/restored", "ptrace", 1, "PASS", Some(DIVERGENT)),
+            fixture.row("fx/restored", "kvm", 1, "PASS", Some(RECORDED)),
+            fixture.row("fx/unrestored", "ptrace", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/unrestored", "kvm", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/unindexed", "ptrace", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/unindexed", "kvm", 1, "PASS", Some(REFERENCE)),
+        ];
+        let import = fixture.dir.join("import");
+        let recorded = |row: &CellResult| log_dir(row).display().to_string();
+        let restored_dir = |row: &CellResult| {
+            format!(
+                "{IMPORTED_LOGS_DIR}/buck-fixture/{}-{}/verify-logs/verify-1",
+                row.test.replace('/', "-"),
+                row.backend.as_deref().unwrap()
+            )
+        };
+        // Restores `log` for `row` as the ingest does and returns its index
+        // line.
+        let restore = |row: &CellResult, log: &str| {
+            let restored = restored_dir(row);
+            fs::create_dir_all(import.join(&restored)).unwrap();
+            fs::write(import.join(&restored).join("run1_log_abcde"), log).unwrap();
+            serde_json::json!({
+                "schema": IMPORTED_LOGS_SCHEMA,
+                "verify_log_dir": recorded(row),
+                "restored": restored,
+                "reason": null,
+            })
+            .to_string()
+        };
+        let index = [
+            restore(&rows[0], REFERENCE),
+            restore(&rows[1], REFERENCE),
+            restore(&rows[2], REFERENCE),
+            serde_json::json!({
+                "schema": IMPORTED_LOGS_SCHEMA,
+                "verify_log_dir": recorded(&rows[3]),
+                "restored": null,
+                "reason": "its logs could not be fetched: fixture",
+            })
+            .to_string(),
+            restore(&rows[5], REFERENCE),
+        ];
+        fs::write(
+            import.join(IMPORTED_LOGS_DIR).join(IMPORTED_LOGS_INDEX),
+            index.join("\n") + "\n",
+        )
+        .unwrap();
+        let scope = BTreeSet::from([
+            parity_cell("fx/restored", ParityBackend::Kvm),
+            parity_cell("fx/unrestored", ParityBackend::Kvm),
+            parity_cell("fx/unindexed", ParityBackend::Kvm),
+        ]);
+        let mut config = fixture.config();
+        config.imported_logs = Some(ImportedLogs::load(&import));
+        let report = post_pass(&config, &scope, &rows).unwrap();
+        assert_eq!(
+            report.log_diff_runs, 1,
+            "only the restored pair is compared"
+        );
+        assert_eq!(fixture.log_diff_calls(), 1);
+        let by_cell = |test: &str| {
+            report
+                .records
+                .iter()
+                .find(|record| record.test_id == test)
+                .unwrap()
+        };
+
+        let restored = by_cell("fx/restored");
+        assert_eq!(restored.verdict, ParityVerdict::Matched, "{restored:?}");
+        assert_eq!(restored.unequalized_credit, Some(1.0));
+        let restored_log = import.join(restored_dir(&rows[1])).join("run1_log_abcde");
+        assert_eq!(
+            restored.candidate_log.as_deref(),
+            Some(path_text(&restored_log).as_str())
+        );
+        let golden = fixture
+            .artifacts()
+            .join(PARITY_GOLDEN_DIR)
+            .join("fx/restored.detlog");
+        assert_eq!(fs::read_to_string(&golden).unwrap(), REFERENCE);
+
+        let unrestored = by_cell("fx/unrestored");
+        assert_eq!(
+            (
+                unrestored.verdict,
+                unrestored.unavailable_class,
+                unrestored.operand
+            ),
+            (
+                ParityVerdict::CandidateMissing,
+                Some(UnavailableClass::LogNotRetained),
+                Some(ParityOperand::Candidate)
+            ),
+            "{unrestored:?}"
+        );
+        assert_eq!(
+            unrestored.reason.clone().unwrap(),
+            format!(
+                "the kvm candidate verify cell of fx/unrestored ran in another process, and the \
+                 import restored no log of its {}: its logs could not be fetched: fixture",
+                recorded(&rows[3])
+            )
+        );
+        assert_eq!(unrestored.candidate_log, None);
+
+        let unindexed = by_cell("fx/unindexed");
+        assert_eq!(
+            (
+                unindexed.verdict,
+                unindexed.unavailable_class,
+                unindexed.operand
+            ),
+            (
+                ParityVerdict::ReferenceMissing,
+                Some(UnavailableClass::LogNotRetained),
+                Some(ParityOperand::Reference)
+            ),
+            "{unindexed:?}"
+        );
+        assert_eq!(
+            unindexed.reason.clone().unwrap(),
+            format!(
+                "the ptrace reference verify cell of fx/unindexed ran in another process, and \
+                 the import restored no log of its {}: the import's log index does not name it",
+                recorded(&rows[4])
+            )
+        );
+        assert_eq!(unindexed.reference_log, None);
+    }
+
+    /// An imported run's log index is trusted whole or not at all. An index
+    /// that is missing or unparsable, has another schema, restores outside
+    /// the import root, names a recorded directory twice, or gives both or
+    /// neither of a restored directory and a reason leaves every operand
+    /// unrestored with that reason, so no cell is measured from a log that
+    /// might not be its own.
+    #[test]
+    fn an_imported_log_index_is_trusted_whole_or_not_at_all() {
+        let fixture = Fixture::new("imported-index");
+        let import = fixture.dir.join("import");
+        let index = import.join(IMPORTED_LOGS_DIR).join(IMPORTED_LOGS_INDEX);
+        let recorded = "/w/one/verify-logs/verify-1";
+        let line = |restored: serde_json::Value, reason: serde_json::Value| {
+            serde_json::json!({
+                "schema": IMPORTED_LOGS_SCHEMA,
+                "verify_log_dir": recorded,
+                "restored": restored,
+                "reason": reason,
+            })
+            .to_string()
+        };
+        let restoring = |path: &str| line(path.into(), serde_json::Value::Null);
+
+        let missing = ImportedLogs::load(&import);
+        let error = missing.restored(recorded).unwrap_err();
+        assert!(error.contains("cannot be read"), "{error}");
+
+        fs::create_dir_all(index.parent().unwrap()).unwrap();
+        let good = restoring("retained-verify-logs/run/one/verify-logs/verify-1");
+        fs::write(&index, format!("{good}\n")).unwrap();
+        let loaded = ImportedLogs::load(&import);
+        assert_eq!(
+            loaded.restored(recorded).unwrap(),
+            import
+                .join("retained-verify-logs/run/one/verify-logs/verify-1")
+                .as_path()
+        );
+        assert_eq!(
+            loaded.restored("/w/two/verify-logs/verify-1").unwrap_err(),
+            "the import's log index does not name it"
+        );
+
+        for (text, expected) in [
+            ("not json".to_string(), "is not an index entry"),
+            (
+                good.replace("\"schema\":1", "\"schema\":2"),
+                "has schema 2, not 1",
+            ),
+            (
+                good.replace("\"reason\"", "\"extra\":1,\"reason\""),
+                "is not an index entry",
+            ),
+            (restoring("/abs/verify-1"), "not a plain relative path"),
+            (restoring("../escape"), "not a plain relative path"),
+            (restoring("a/../b"), "not a plain relative path"),
+            (restoring("./dot"), "not a plain relative path"),
+            (restoring(""), "not a plain relative path"),
+            (line("x".into(), "why".into()), "exactly one of"),
+            (
+                line(serde_json::Value::Null, serde_json::Value::Null),
+                "exactly one of",
+            ),
+            (
+                format!("{good}\n{good}"),
+                "names \"/w/one/verify-logs/verify-1\" again",
+            ),
+        ] {
+            fs::write(&index, format!("{text}\n")).unwrap();
+            let logs = ImportedLogs::load(&import);
+            assert!(logs.dirs.is_empty(), "{text}");
+            let error = logs.restored(recorded).unwrap_err();
+            assert!(error.contains(expected), "{text}: {error}");
+        }
     }
 
     /// A verify cell whose row the caller rejected is never compared. As the
