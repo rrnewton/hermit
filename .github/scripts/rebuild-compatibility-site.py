@@ -136,8 +136,14 @@ def configuration(path=CONFIG):
     if (
         not isinstance(value, dict)
         or set(value)
-        != {"schema", "parent_repository", "parent_commit", "hermit_commit"}
-        or value["schema"] != 1
+        != {
+            "schema",
+            "parent_repository",
+            "parent_commit",
+            "hermit_commit",
+            "retention",
+        }
+        or value["schema"] != 2
         or value["parent_repository"] != "rrnewton/dev-hermit"
         or any(
             not isinstance(value[key], str)
@@ -148,6 +154,27 @@ def configuration(path=CONFIG):
         raise ValueError(
             "website builder requires exact reviewed parent and Hermit source commits"
         )
+    # The publisher applies the retention rule and checks its wording; refuse a
+    # malformed block here too, before an expensive rebuild reaches publication.
+    retention = value["retention"]
+    if (
+        not isinstance(retention, dict)
+        or set(retention) != {"rule", "budget_bytes", "max_builds", "not_before"}
+        or not isinstance(retention["rule"], str)
+        or not retention["rule"]
+        or any(
+            not isinstance(retention[key], int)
+            or isinstance(retention[key], bool)
+            or retention[key] <= 0
+            for key in ("budget_bytes", "max_builds")
+        )
+        or not isinstance(retention["not_before"], str)
+        or not re.fullmatch(
+            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
+            retention["not_before"],
+        )
+    ):
+        raise ValueError("website builder retention settings are malformed")
     return value
 
 

@@ -39,12 +39,37 @@ class HostedAdapterTests(unittest.TestCase):
             ("hermit_commit", "abc"),
             ("parent_repository", "foreign/source"),
             ("extra", True),
-            ("schema", 2),
+            ("schema", 1),
+            ("schema", 3),
+            ("retention", None),
         ):
             wrong = dict(self.config)
             wrong[key] = value
             path.write_text(json.dumps(wrong))
-            with self.subTest(key=key), self.assertRaises(ValueError):
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                ADAPTER.configuration(path)
+        missing = dict(self.config)
+        del missing["retention"]
+        path.write_text(json.dumps(missing))
+        with self.subTest(key="retention", value="missing"), self.assertRaises(
+            ValueError
+        ):
+            ADAPTER.configuration(path)
+        for key, value in (
+            ("budget_bytes", 0),
+            ("budget_bytes", "1000000000"),
+            ("max_builds", True),
+            ("max_builds", -1),
+            ("not_before", "2026-10-04"),
+            ("rule", ""),
+            ("extra", 1),
+        ):
+            wrong = copy.deepcopy(self.config)
+            wrong["retention"][key] = value
+            path.write_text(json.dumps(wrong))
+            with self.subTest(retention=key, value=value), self.assertRaises(
+                ValueError
+            ):
                 ADAPTER.configuration(path)
 
     def source_git(self, root, *args):

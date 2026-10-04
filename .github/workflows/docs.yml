@@ -254,7 +254,8 @@ jobs:
         pins=.github/compatibility-site-releases.json
         archives="$scratch/archives"
         pin_rows="$scratch/pins"
-        mkdir "$archives" "$pin_rows"
+        releases="$scratch/releases"
+        mkdir "$archives" "$pin_rows" "$releases"
 
         python3 .github/scripts/publish-compatibility-site.py validate "$pins" .
 
@@ -307,8 +308,7 @@ jobs:
           asset=$(jq -er '.asset' "$pin")
           archive_sha256=$(jq -er '.archive_sha256' "$pin")
           archive_bytes=$(jq -er '.archive_bytes' "$pin")
-          release_json="$scratch/release-$identity.json"
-          archive="$archives/$asset"
+          release_json="$releases/$identity.json"
 
           gh api "repos/$release_repository/releases/tags/$tag" > "$release_json"
           asset_id=$(
@@ -334,6 +334,20 @@ jobs:
                   else error("release asset metadata disagrees with the pin") end
               ' "$release_json"
           )
+          printf '%s\n' "$asset_id" > "$pin_rows/$index.asset"
+          ((index += 1))
+        done
+
+        # Every release above is checked, but only the newest builds allowed by
+        # the builder config's retention rule are downloaded and served. The
+        # others stay published as release assets and listed in releases.json.
+        retained="$scratch/retained.txt"
+        python3 .github/scripts/publish-compatibility-site.py retain \
+          "$pins" "$releases" .github/compatibility-site-builder.json > "$retained"
+        while read -r index identity <&3; do
+          asset=$(jq -er '.asset' "$pin_rows/$index.json")
+          asset_id=$(< "$pin_rows/$index.asset")
+          archive="$archives/$asset"
           gh api \
             -H 'Accept: application/octet-stream' \
             "repos/$release_repository/releases/assets/$asset_id" \
@@ -341,11 +355,11 @@ jobs:
 
           python3 .github/scripts/publish-compatibility-site.py extract "$archive" \
             "target/doc/compatibility/$identity" "$pins" "$index"
-          ((index += 1))
-        done
+        done 3< "$retained"
 
         python3 .github/scripts/publish-compatibility-site.py \
-          finalize "$pins" target/doc/compatibility
+          finalize "$pins" target/doc/compatibility "$releases" \
+          .github/compatibility-site-builder.json
     - name: Deploy to GitHub Pages
       # Only publish from the canonical branch, not from manual dispatch on a
       # feature branch.
