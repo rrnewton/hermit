@@ -4799,7 +4799,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The one exception is a vector of zero total length, which vfs_readv
     /// answers with 0 before the timer is reached: nothing is consumed and a
     /// blocking timer is not waited on. A scalar read of 0 bytes does reach
-    /// the timer and stays EINVAL.
+    /// the timer and stays EINVAL. The count is copied with the caller's
+    /// access rights, as copy_to_iter does: a read-only buffer faults, and a
+    /// buffer that runs into one keeps the bytes copied before the fault.
     ///
     /// `timer` is the open file the caller resolved when the syscall began.
     /// Like the file reference Linux's read holds (fdget), it is never looked
@@ -4808,7 +4810,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd read counts, EAGAIN, and
     // blocking restart; the read holds its open file across the wait; a
-    // zero-length vector read returns 0.
+    // zero-length vector read returns 0; the count is copied out with the
+    // caller's access rights.
     async fn read_timerfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -4832,10 +4835,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .map(|s| s.pending(now))
                 .ok_or(Errno::EINVAL)?;
             if pending > 0 {
-                timer.with_timerfd_mut(|s| {
-                    s.consumed += pending;
-                    s.generation += 1;
-                });
+                // fs/timerfd.c consumes the count and then copies it out with
+                // copy_to_iter, which checks the caller's access to each
+                // buffer. Here the copy goes first, so an error that is not a
+                // fault (the tracee is gone, or the backend cannot check
+                // access) leaves the timer as it was. Nothing is awaited
+                // between the copy and the consumption, so no other guest
+                // thread can observe the order.
                 let mut bytes: &[u8] = &pending.to_ne_bytes();
                 for iovec in iovecs {
                     if bytes.is_empty() {
@@ -4845,15 +4851,27 @@ impl<T: RecordOrReplay> Detcore<T> {
                         continue;
                     }
                     let chunk = iovec.len.min(bytes.len());
-                    let copied = AddrMut::from_raw(iovec.base)
-                        .ok_or(Errno::EFAULT)
-                        .and_then(|addr| guest.memory().write(addr, &bytes[..chunk]))
-                        .unwrap_or(0);
+                    // A plain write of exactly 8 bytes is PTRACE_POKEDATA on
+                    // the ptrace backend, which writes through a read-only
+                    // mapping; Linux faults there instead.
+                    let written = match AddrMut::from_raw(iovec.base) {
+                        Some(addr) => guest.memory().write_with_user_access(addr, &bytes[..chunk]),
+                        None => Err(Errno::EFAULT),
+                    };
+                    let copied = match written {
+                        Ok(copied) => copied,
+                        Err(Errno::EFAULT) => 0,
+                        Err(errno) => return Err(crate::random::copy_error(errno)),
+                    };
                     bytes = &bytes[copied..];
                     if copied < chunk {
                         break;
                     }
                 }
+                timer.with_timerfd_mut(|s| {
+                    s.consumed += pending;
+                    s.generation += 1;
+                });
                 // fs/timerfd.c returns what copy_to_iter transferred and
                 // reports EFAULT only when nothing was copied.
                 let copied = 8 - bytes.len();
