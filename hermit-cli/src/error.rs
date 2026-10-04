@@ -303,8 +303,8 @@ mod tests {
         assert_eq!(refusal.kind(), FailureKind::PolicyRefusal);
         assert_eq!(
             refusal.error,
-            "HERMIT_LITEINST_IN_GUEST=1 (in-guest LiteInst) refuses this run: guest program \
-             /static is statically linked"
+            "--backend=liteinst (in-guest LiteInst) refuses this run: guest program /static is \
+             statically linked"
         );
     }
 }
