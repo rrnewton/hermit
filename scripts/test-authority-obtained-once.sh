@@ -88,8 +88,35 @@ GUARDED="test-required-check-outcomes.sh test-check-status-outcome.sh check-merg
 # unreachable ones, that this property does not apply to. Exempting them is
 # stated here rather than achieved by leaving them off the list silently.
 EXEMPT="test-authority-obtained-once.sh test_check_outcome_adapter_authority.py"
-consumers=$(sed -n '/^lint-checks:/,/^$/p' "$ROOT_DIR/Makefile" \
-    | grep -oE 'scripts/[A-Za-z0-9_.-]+' | sort -u)
+# ⚠️ ASK MAKE FOR THE RECIPE; DO NOT PARSE THE MAKEFILE HERE. lint-checks runs
+# one target per checker (so `make -j` can run them concurrently) and its own
+# recipe is empty. The sed range this used to read would then have found no
+# consumer at all, and this check would have passed without checking anything.
+# `make -n` prints every command lint-checks would run, through its
+# prerequisites, without running any of them. Clear the parent make's flags so
+# it neither joins the parent's jobserver nor inherits -k or -O.
+recipe="$work/lint-checks-recipe"
+env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL \
+    make --no-print-directory -n -C "$ROOT_DIR" lint-checks SUBMODULE_PROXY= \
+    >"$recipe" 2>"$work/lint-checks-recipe.err"
+recipe_rc=$?
+if [ "$recipe_rc" -ne 0 ]; then
+    cat "$work/lint-checks-recipe.err" >&2
+    echo "FAIL: make -n lint-checks exited $recipe_rc; cannot list the authority consumers" >&2
+    exit 1
+fi
+consumers=$(grep -oE 'scripts/[A-Za-z0-9_.-]+' "$recipe" | sort -u)
+# Every guarded checker is in lint-checks, so an empty or short list means the
+# recipe was not read, not that there is nothing to check.
+for checker in $GUARDED; do
+    case $'\n'"$consumers"$'\n' in
+        *$'\n'"scripts/$checker"$'\n'*) ;;
+        *)
+            echo "FAIL: scripts/$checker is guarded here but not found in make -n lint-checks; the recipe was not read" >&2
+            exit 1
+            ;;
+    esac
+done
 missing=0
 for consumer in $consumers; do
     file="$ROOT_DIR/$consumer"
@@ -313,10 +340,14 @@ exit 2
 STUB
 cat > "$response_bin/make" <<'STUB'
 #!/usr/bin/env bash
-if [ "${1:-}" = lint-checks ]; then
-    echo 'NO-RESULT-CASE: planted lint-checks marker'
-    exit 0
-fi
+# The node runs `make -jN -k -Otarget lint-checks ...`, so the target is not
+# the first argument; accept it anywhere.
+for arg in "$@"; do
+    if [ "$arg" = lint-checks ]; then
+        echo 'NO-RESULT-CASE: planted lint-checks marker'
+        exit 0
+    fi
+done
 echo "unexpected make invocation: $*" >&2
 exit 2
 STUB

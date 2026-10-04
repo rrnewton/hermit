@@ -178,40 +178,162 @@ lint-parent-checks: ## The lint checker that needs the dev-hermit parent (CI nod
 # child enters the stop-test seam before admission or the DAG. The full run also
 # exercises the final-status contract, so it replaces the narrower self-test here.
 #
-# ⚠️ Comments INSIDE the recipe below must be TAB-indented. A comment at column 0 ends
-# the recipe, silently dropping every line after it.
-lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
+# ONE TARGET PER CHECKER, so `make -j` runs them concurrently. check.lint_checks
+# runs `make -j8 -k -Otarget lint-checks` (ci/lint-checks-node.sh): measured
+# 2026-10-04, the 47 lines took about 366 s serially, their CPU sum. A plain
+# `make lint-checks` still runs them one at a time in the order listed. To add a
+# checker, write a `lint-check-<name>:` target below and list it in
+# LINT_CHECK_TARGETS. A target that is not listed is not run, and
+# scripts/check-checker-scheduling.rs does not count it as scheduled. A target
+# holds more than one line only when the lines must run in order: a self-test
+# and then the real check of the same tool.
+#
+# ⚠️ Every checker must be safe to run concurrently with the others: no writes
+# inside the checkout, no fixed /tmp paths or ports. lint-check-whitespace,
+# lint-check-verify-submodules and check-checker-scheduling read the tree while
+# the others run.
+#
+# ⚠️ Comments INSIDE these recipes must be TAB-indented. A comment at column 0 ends
+# the recipe for scripts/check-checker-scheduling.rs, so every line after it would
+# stop counting as scheduled.
+LINT_CHECK_TARGETS := \
+    lint-check-skill-discovery \
+    lint-check-github-actions-triggers \
+    lint-check-docs-pages-contract \
+    lint-check-pre-push-submodule-diagnosis \
+    lint-check-doc-bare-urls \
+    lint-check-pre-push-doc-bare-urls \
+    lint-check-required-check-outcomes \
+    lint-check-check-status-outcome \
+    lint-check-check-outcome-adapter-authority \
+    lint-check-authority-obtained-once \
+    lint-check-compat-localhost-port \
+    lint-check-compat-git-location \
+    lint-check-run-pinned-tool \
+    lint-check-git-dep-mirrors \
+    lint-check-validate-stop-paths \
+    lint-check-merge-gate-policy \
+    lint-check-configure-merge-gate-ruleset \
+    lint-check-pr-status \
+    lint-check-bisect-probe \
+    lint-check-lint-checks-node \
+    lint-check-liteinst-strict-node \
+    lint-check-assert-build-dependencies \
+    lint-check-image-provenance \
+    lint-check-retry-fetch \
+    lint-check-apt-install-cached \
+    lint-check-pinned-root-cache \
+    lint-check-checker-scheduling \
+    lint-check-validate-refusal-predicate \
+    lint-check-audit-test-binary-registration \
+    lint-check-shellcheck \
+    lint-check-whitespace \
+    lint-check-verify-submodules \
+    lint-check-reverie-pin \
+    lint-check-nested-lockfiles \
+    lint-check-record-version-floor \
+    lint-check-buck-reindeer-features \
+    lint-check-reverie-dbt-buck-inventory \
+    lint-check-core-review-protocol \
+    lint-check-audit-test-binary-registration-test \
+    lint-check-buck-e2e-ingest \
+    lint-check-buck-e2e-verdict \
+    lint-check-buck-e2e-cell \
+    lint-check-buck-e2e-stage \
+    lint-check-reverie-dbt-budget
+.PHONY: lint-checks $(LINT_CHECK_TARGETS)
+lint-checks: $(LINT_CHECK_TARGETS) ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
+
+lint-check-skill-discovery:
 	./scripts/check-skill-discovery.rs
+
+lint-check-github-actions-triggers:
 	./scripts/check-github-actions-triggers.rs
+
+lint-check-docs-pages-contract:
 	./scripts/docs-pages-contract.rs
+
+lint-check-pre-push-submodule-diagnosis:
 	./scripts/test-pre-push-submodule-diagnosis.sh
+
+lint-check-doc-bare-urls:
 	./scripts/check-doc-bare-urls.rs
+
+lint-check-pre-push-doc-bare-urls:
 	./scripts/test-pre-push-doc-bare-urls.sh
+
+lint-check-required-check-outcomes:
 	./scripts/test-required-check-outcomes.sh
+
+lint-check-check-status-outcome:
 	./scripts/test-check-status-outcome.sh
+
+lint-check-check-outcome-adapter-authority:
 	python3 ./scripts/test_check_outcome_adapter_authority.py
+
+lint-check-authority-obtained-once:
 	./scripts/test-authority-obtained-once.sh
+
+lint-check-compat-localhost-port:
 	bash ./tests/compat/real_compat_workload.sh --self-test-localhost-port
+
+lint-check-compat-git-location:
 	bash ./tests/compat/real_compat_workload.sh --self-test-git-location
+
+lint-check-run-pinned-tool:
 	./bootstrap/test-run-pinned-tool.sh
+
+lint-check-git-dep-mirrors:
 	./bootstrap/test-git-dep-mirrors.sh
+
+lint-check-validate-stop-paths:
 	python3 ./scripts/test_validate_stop_paths.py --exclude-canonical-adapter-accept-arm
+
+lint-check-merge-gate-policy:
 	./scripts/check-merge-gate-policy.sh
+
+lint-check-configure-merge-gate-ruleset:
 	./scripts/test-configure-merge-gate-ruleset.sh
+
+lint-check-pr-status:
 	python3 ./scripts/test_pr_status.py
+
+lint-check-bisect-probe:
 	./scripts/bisect-probe.rs --self-test
+
+lint-check-lint-checks-node:
 	./ci/lint-checks-node.sh --self-test
+
+lint-check-liteinst-strict-node:
 	./ci/liteinst-strict-node.sh --self-test
+
+lint-check-assert-build-dependencies:
 	./ci/hermetic/assert-build-dependencies.sh --self-test
+
+lint-check-image-provenance:
 	./ci/hermetic/check-image-provenance.rs
+
+lint-check-retry-fetch:
 	./ci/hermetic/tests/test-retry-fetch.sh
+
+lint-check-apt-install-cached:
 	./ci/apt-install-cached-test.sh
+
+lint-check-pinned-root-cache:
 	python3 ./ci/hermetic/run-in-pinned-root-cache-test.py
+
+lint-check-checker-scheduling:
 	./scripts/check-checker-scheduling.rs --self-test
 	./scripts/check-checker-scheduling.rs
+
+lint-check-validate-refusal-predicate:
 	python3 ./scripts/check-validate-refusal-predicate.py --self-test
 	python3 ./scripts/check-validate-refusal-predicate.py
+
+lint-check-audit-test-binary-registration:
 	python3 ./ci/audit-test-binary-registration.py
+
+lint-check-shellcheck:
 	@sh_files="$$(git ls-files '*.sh' ':!:third-party/**')"; \
 		if [ -z "$$sh_files" ]; then \
 			echo 'lint: no tracked shell scripts to check'; \
@@ -221,20 +343,48 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 			echo 'error: shellcheck is not installed (see https://www.shellcheck.net)' >&2; \
 			exit 1; \
 		fi
+
+lint-check-whitespace:
 	@git diff --check
+
+lint-check-verify-submodules:
 	./ci/verify-submodules.sh --self-test
 	./ci/verify-submodules.sh
+
+lint-check-reverie-pin:
 	$(SUBMODULE_PROXY) ./ci/run-reverie-pin-check.sh $(_VALIDATE_PIN_ARG)
+
+lint-check-nested-lockfiles:
 	$(SUBMODULE_PROXY) ./scripts/check-nested-lockfiles.rs
+
+lint-check-record-version-floor:
 	./scripts/check-record-version-floor.rs
+
+lint-check-buck-reindeer-features:
 	./scripts/check-buck-reindeer-features.rs
+
+lint-check-reverie-dbt-buck-inventory:
 	./scripts/patch-reverie-dbt-buck.rs --check-inventory
+
+lint-check-core-review-protocol:
 	./scripts/core-review-protocol-lint-test.sh
+
+lint-check-audit-test-binary-registration-test:
 	python3 ./ci/test_audit_test_binary_registration.py
+
+lint-check-buck-e2e-ingest:
 	python3 ./ci/test_buck_e2e_ingest.py
+
+lint-check-buck-e2e-verdict:
 	python3 ./ci/test_buck_e2e_verdict.py
+
+lint-check-buck-e2e-cell:
 	python3 ./ci/test_buck_e2e_cell.py
+
+lint-check-buck-e2e-stage:
 	python3 ./ci/test_buck_e2e_stage.py
+
+lint-check-reverie-dbt-budget:
 	./ci/run-with-reverie-dbt-budget-test.sh
 
 # The unit tests carried by rust-script entrypoints are their own CI node,
