@@ -79,6 +79,7 @@ use hermit_manifest_plan::runner::ObservedResult;
 use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::retained_execution_path_error;
+use hermit_manifest_plan::runner::retained_verify_invocation_error;
 use hermit_manifest_plan::runner::retained_verify_pass_error;
 use hermit_manifest_plan::runner::run_epoch_from_env;
 use hermit_manifest_plan::runner::skid_overshoot_only_reports;
@@ -7179,14 +7180,18 @@ struct RepeatedCellTally {
 /// records any.
 ///
 /// The PASS row is then re-decided from what it retains, as the runner
-/// decides a fresh verify PASS ([`retained_verify_pass_error`]): every inner
-/// report passes the comparator the row's relaxations record, satisfies the
-/// declared stdout assertions the skid rows recorded, ends with the guest
-/// disposition and Hermit status the row's expected guest exit names (or
-/// Hermit exit status 0), and carries the dispatch record of the row's
-/// backend. A forged dispatch record, a canonical report under stripped
-/// relaxations, stdout the declaration forbids, or an exit the row does not
-/// expect keeps the ordinary reading.
+/// decides a fresh verify PASS ([`retained_verify_pass_error`]): its command
+/// lines are the verify invocation the runner's executor writes for the row's
+/// backend, relaxations and expected guest exit
+/// ([`retained_verify_invocation_error`], which the skid predicate applies to
+/// each skid row as well), every inner report passes the comparator the row's
+/// relaxations record, satisfies the declared stdout assertions the skid rows
+/// recorded, ends with the guest disposition and Hermit status the row's
+/// expected guest exit names (or Hermit exit status 0), and carries the
+/// dispatch record of the row's backend. A command line that selects another
+/// backend or carries an unrecorded run flag, a forged dispatch record, a
+/// canonical report under stripped relaxations, stdout the declaration
+/// forbids, or an exit the row does not expect keeps the ordinary reading.
 ///
 /// That refusal is the one infrastructure failure the runner retries
 /// (<https://github.com/rrnewton/hermit/issues/1845>). It measured the host's
@@ -10261,6 +10266,82 @@ fn matched_pass_row(
     attempt.verification_report = Some(raw);
     row.attempts = vec![attempt];
     Ok(row)
+}
+
+/// `row` with the command fields the runner's executor writes for a verify
+/// cell on the row's backend (`native` when it records none) that records the
+/// row's relaxations and expected guest exit (`verified_invocation_argv`,
+/// `run_cell_inner`). Each attempt runs `hermit --log info --backend <backend>
+/// run --base-env=minimal --strict`, then `--verify-strict` unless the row
+/// records the stripped comparator, the run flags its relaxations record (the
+/// manifest's Hermit arguments before `--no-detlog-io-buffers` and
+/// `--no-rcb-time`), `--verify` with `--verify-allow=failure` when the row
+/// declares an exit, the report path, and `--` before the attempt's guest argv.
+/// Each attempt's shell command is rendered from its argv, and the row carries
+/// the first attempt's copies, with the argv after the Hermit path as its
+/// effective args and log level `info`. The runner re-decides a retained row
+/// only from such a command line (`retained_verify_invocation_error`), so a
+/// fixture that must be judged on anything else carries it.
+fn with_executor_invocation(mut row: CellResult) -> CellResult {
+    let backend = row.backend.clone().unwrap_or_else(|| "native".into());
+    let flags: Vec<String> = row
+        .relaxations
+        .iter()
+        .filter_map(|relaxation| relaxation.split_once(": "))
+        .map(|(flag, _)| flag.to_owned())
+        .filter(|flag| flag.starts_with("--"))
+        .collect();
+    let late = ["--no-detlog-io-buffers", "--no-rcb-time"];
+    let mut options: Vec<String> = [
+        "--log",
+        "info",
+        "--backend",
+        &backend,
+        "run",
+        "--base-env=minimal",
+        "--strict",
+    ]
+    .map(String::from)
+    .to_vec();
+    if !row.relaxations.iter().any(|relaxation| {
+        relaxation.starts_with(hermit_manifest_plan::runner::STRIPPED_COMPARATOR_RELAXATION_PREFIX)
+    }) {
+        options.push("--verify-strict".into());
+    }
+    options.extend(
+        flags
+            .iter()
+            .filter(|flag| !late.contains(&flag.as_str()))
+            .cloned(),
+    );
+    options.extend(
+        late.iter()
+            .filter(|flag| flags.iter().any(|recorded| recorded == *flag))
+            .map(|flag| (*flag).to_owned()),
+    );
+    options.push("--verify".into());
+    if row.expected_guest_exit.is_some() {
+        options.push("--verify-allow=failure".into());
+    }
+    options.extend(["--verify-json".into(), "/fixture/verification.json".into()]);
+    for attempt in &mut row.attempts {
+        let mut argv = vec!["hermit".to_owned()];
+        argv.extend(options.iter().cloned());
+        argv.push("--".into());
+        argv.extend(attempt.guest_argv.iter().cloned());
+        attempt.shell_command = literal_shell_command(&attempt.cwd, &attempt.env, &argv);
+        attempt.argv = argv;
+    }
+    if let Some(first) = row.attempts.first() {
+        row.argv = first.argv.clone();
+        row.guest_argv = first.guest_argv.clone();
+        row.env = first.env.clone();
+        row.cwd = first.cwd.clone();
+        row.shell_command = first.shell_command.clone();
+    }
+    row.effective_args = row.argv.iter().skip(1).cloned().collect();
+    row.log_level = Some("info".into());
+    row
 }
 
 fn pressure_timeout_self_test() -> Result<(), String> {
@@ -15136,7 +15217,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             row.artifact_dir = format!("/retained/runs/{run}/cell");
             row
         };
-        let pass = matched_pass_row(&result_row, &argv, 0, (0, 0), None)?;
+        let pass = with_executor_invocation(matched_pass_row(&result_row, &argv, 0, (0, 0), None)?);
         let mut error = first_row.clone();
         error.outcome = "ERROR".into();
         error.result = None;
@@ -15380,6 +15461,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         relaxed
             .relaxations
             .push("--no-rcb-time: fixture reason".into());
+        let relaxed = with_executor_invocation(relaxed);
         if skid_overshoot_only_reports(&relaxed) != Some(2) {
             return Err(format!(
                 "the relaxed skid fixture is not otherwise skid-only: {relaxed:?}"
@@ -15621,10 +15703,12 @@ fn self_test(root: &Path) -> Result<(), String> {
             });
         })?;
         stripped_skid.relaxations.push(stripped_relaxation.clone());
+        let stripped_skid = with_executor_invocation(stripped_skid);
         let mut canonical_under_stripped_pass = retry_pass.clone();
         canonical_under_stripped_pass
             .relaxations
             .push(stripped_relaxation);
+        let canonical_under_stripped_pass = with_executor_invocation(canonical_under_stripped_pass);
         // A skid row declaring empty stdout, which its compared runs printed,
         // and a PASS whose compared runs agree on other bytes.
         let mut declared_skid = skid.clone();
@@ -15678,9 +15762,18 @@ fn self_test(root: &Path) -> Result<(), String> {
         // whose guest exited 0 instead, and a PASS whose guest exited 7 while
         // Hermit exited 0.
         let retried = |row: CellResult| CellResult { attempt: 2, ..row };
-        let exit7_pass = retried(matched_pass_row(&result_row, &argv, 7, (7, 7), Some(7))?);
-        let exit0_pass = retried(matched_pass_row(&result_row, &argv, 0, (0, 0), Some(7))?);
-        let status0_pass = retried(matched_pass_row(&result_row, &argv, 0, (7, 7), Some(7))?);
+        let declared_pass = |status: i32, outputs: (i32, i32)| -> Result<CellResult, String> {
+            Ok(retried(with_executor_invocation(matched_pass_row(
+                &result_row,
+                &argv,
+                status,
+                outputs,
+                Some(7),
+            )?)))
+        };
+        let exit7_pass = declared_pass(7, (7, 7))?;
+        let exit0_pass = declared_pass(0, (0, 0))?;
+        let status0_pass = declared_pass(0, (7, 7))?;
         let mut exit7_skid = rewrite_report(&skid, &|report| {
             report["guest_exit_code"] = json!(7);
             for side in ["left", "right"] {
@@ -15688,6 +15781,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             }
         })?;
         exit7_skid.expected_guest_exit = exit7_pass.expected_guest_exit.clone();
+        let exit7_skid = with_executor_invocation(exit7_skid);
         // Hermit's internal-failure class on the PASS attempt's first stderr
         // line; on a later line it is guest output.
         let mut classified_pass = retry_pass.clone();
@@ -15704,10 +15798,57 @@ fn self_test(root: &Path) -> Result<(), String> {
         // Rows that are not the same cell's.
         let mut other_backend_skid = skid.clone();
         other_backend_skid.backend = Some("liteinst".into());
+        let other_backend_skid = with_executor_invocation(other_backend_skid);
         let mut other_test_skid = skid.clone();
         other_test_skid.test = "sample/elsewhere".into();
         let mut other_category_skid = skid.clone();
         other_category_skid.category = "elsewhere".into();
+        // Rows whose command lines are not the ones the executor writes for
+        // what they record: a PASS and a skid row recorded as ptrace whose
+        // every copy of the command line selects liteinst (each copy agrees
+        // with the others and its shell command is rendered from it, and the
+        // report carries no runtime that names a backend), and a PASS whose
+        // command line carries `--no-rcb-time`, which its relaxations do not
+        // record. The runner refuses each when it re-decides the row
+        // (`retained_verify_invocation_error`).
+        let invoked_as = |row: &CellResult, backend: &str| {
+            let mut invoked = row.clone();
+            invoked.backend = Some(backend.into());
+            let mut invoked = with_executor_invocation(invoked);
+            invoked.backend = row.backend.clone();
+            invoked
+        };
+        let liteinst_invocation_pass = invoked_as(&retry_pass, "liteinst");
+        let liteinst_invocation_skid = invoked_as(&skid, "liteinst");
+        let mut unrecorded_flag_pass = retry_pass.clone();
+        unrecorded_flag_pass
+            .relaxations
+            .push("--no-rcb-time: fixture reason".into());
+        let mut unrecorded_flag_pass = with_executor_invocation(unrecorded_flag_pass);
+        unrecorded_flag_pass.relaxations = retry_pass.relaxations.clone();
+        if retained_verify_invocation_error(&retry_pass).is_some()
+            || retained_verify_invocation_error(&skid).is_some()
+            || [
+                &liteinst_invocation_pass,
+                &liteinst_invocation_skid,
+                &unrecorded_flag_pass,
+            ]
+            .iter()
+            .any(|row| {
+                retained_verify_invocation_error(row).is_none()
+                    || row.runtime.is_some()
+                    || row.attempts.iter().any(|attempt| attempt.runtime.is_some())
+            })
+        {
+            return Err(format!(
+                "the invocation fixtures do not isolate the command line: {liteinst_invocation_pass:?} {liteinst_invocation_skid:?} {unrecorded_flag_pass:?}"
+            ));
+        }
+        if skid_overshoot_only_reports(&liteinst_invocation_skid).is_some() {
+            return Err(format!(
+                "a ptrace skid row whose command line selects liteinst read as skid-only: {liteinst_invocation_skid:?}"
+            ));
+        }
         for (case, row) in [
             ("stripped skid", &stripped_skid),
             ("declared skid", &declared_skid),
@@ -15737,6 +15878,8 @@ fn self_test(root: &Path) -> Result<(), String> {
             ("later-line", &later_line_pass),
             ("reasoned", &reasoned_pass),
             ("kinded", &kinded_pass),
+            ("liteinst-invocation", &liteinst_invocation_pass),
+            ("unrecorded-flag", &unrecorded_flag_pass),
         ] {
             if !qualifying_subruns(&row.mode, &row.attempts)
                 || retained_execution_path_error(row).is_some()
@@ -15999,6 +16142,24 @@ fn self_test(root: &Path) -> Result<(), String> {
                 vec![other_category_skid.clone(), retry_pass.clone()],
                 false,
             ),
+            (
+                "skid then liteinst-invocation pass",
+                "pass",
+                vec![skid.clone(), liteinst_invocation_pass.clone()],
+                false,
+            ),
+            (
+                "liteinst-invocation skid then pass",
+                "pass",
+                vec![liteinst_invocation_skid.clone(), retry_pass.clone()],
+                false,
+            ),
+            (
+                "skid then unrecorded-flag pass",
+                "pass",
+                vec![skid.clone(), unrecorded_flag_pass.clone()],
+                false,
+            ),
         ] {
             if passed_after_skid_retries_only(result, &rows) != recovered {
                 return Err(format!(
@@ -16018,7 +16179,11 @@ fn self_test(root: &Path) -> Result<(), String> {
         // stdout the skid row's declaration forbids, or a guest exit the rows
         // do not expect); each has a control that earns credit. A skid row or
         // a selected PASS whose retained runtime copies are not its report's
-        // is refused the same way, beside a control whose copies agree.
+        // is refused the same way, beside a control whose copies agree. So is
+        // a PASS or a skid row whose command lines select another backend
+        // than the one the row records, or carry a run flag its relaxations
+        // do not record, beside verdicts-skid-recovered, whose rows also
+        // carry no runtime.
         for (name, earlier, later, verdict, recovered, history_intact) in [
             (
                 "verdicts-skid-recovered",
@@ -16240,6 +16405,30 @@ fn self_test(root: &Path) -> Result<(), String> {
                 "verdicts-exit7-skid-then-exit0-pass",
                 &exit7_skid,
                 &exit0_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-skid-then-liteinst-invocation-pass",
+                &skid,
+                &liteinst_invocation_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-liteinst-invocation-skid-recovered",
+                &liteinst_invocation_skid,
+                &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
+                "verdicts-skid-then-unrecorded-flag-pass",
+                &skid,
+                &unrecorded_flag_pass,
                 "FLAKY",
                 0,
                 true,

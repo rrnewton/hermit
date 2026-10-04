@@ -4652,6 +4652,38 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
                         format!("{:x}", sha2::Sha256::digest(sevens.as_bytes()))
                     });
                     redeclared.attempts[0].verification_report = Some(sevens);
+                    // The executor writes `--verify-allow=failure` after
+                    // `--verify` for a cell that declares an expected exit,
+                    // and records the shell command and the row's copies from
+                    // that argv; without it the command line is not one a
+                    // declaring cell runs.
+                    assert_eq!(
+                        super::skid_overshoot_only_reports(&redeclared),
+                        None,
+                        "{redeclared:#?}"
+                    );
+                    for attempt in &mut redeclared.attempts {
+                        let verify = attempt
+                            .argv
+                            .iter()
+                            .position(|arg| arg == "--verify")
+                            .unwrap();
+                        attempt
+                            .argv
+                            .insert(verify + 1, "--verify-allow=failure".into());
+                        attempt.shell_command = hermit_manifest_plan::runner::shell_command(
+                            &attempt.cwd,
+                            &attempt.env,
+                            &attempt.argv,
+                        );
+                    }
+                    redeclared.argv = redeclared.attempts[0].argv.clone();
+                    redeclared.shell_command = redeclared.attempts[0].shell_command.clone();
+                    redeclared.effective_args = redeclared.argv[1..].to_vec();
+                    assert_eq!(
+                        hermit_manifest_plan::runner::retained_verify_invocation_error(&redeclared),
+                        None
+                    );
                     assert_eq!(
                         super::skid_overshoot_only_reports(&redeclared),
                         Some(2),

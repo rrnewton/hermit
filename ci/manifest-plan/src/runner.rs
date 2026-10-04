@@ -3201,6 +3201,13 @@ pub fn skid_overshoot_reason(count: u64) -> String {
 ///   (`attempt_copies_its_report`, `row_copies_its_attempts`), so no retained
 ///   copy carries evidence, such as another backend's dispatch record, that
 ///   the report the checks above read does not;
+/// - every inner attempt's command line, and the row's copies of the first
+///   attempt's, are the verify invocation the executor writes for the row's
+///   backend, relaxations, expected guest exit and comparator
+///   ([`retained_verify_invocation_error`] finds nothing), so a row whose
+///   command line selects another backend, carries a run flag its
+///   relaxations do not record, or ran another guest is not judged by labels
+///   that do not describe it;
 ///
 /// - the row records the stdout assertions its cell declares
 ///   ([`CellResult::declared_stdout`]), and every attempt's own evidence
@@ -3261,6 +3268,7 @@ pub fn skid_overshoot_only_reports(result: &CellResult) -> Option<u64> {
         || result.error_kind.as_deref() != Some("infrastructure")
         || retained_execution_path_error(result).is_some()
         || !row_copies_its_attempts(result)
+        || retained_verify_invocation_error(result).is_some()
     {
         return None;
     }
@@ -3438,6 +3446,10 @@ const HERMIT_INTERNAL_FAILURE_CLASS_PREFIX: &str = "HERMIT_INTERNAL_FAILURE clas
 ///   result `pass`, and no failure class, error kind or reason), and its
 ///   execution path is the eligible one its own retained attempts decide
 ///   ([`retained_execution_path_error`]);
+/// - every inner attempt's command line, and the row's copies of the first
+///   attempt's, are the verify invocation the executor writes for the row's
+///   backend, relaxations, expected guest exit and comparator
+///   ([`retained_verify_invocation_error`]);
 /// - it has at least one inner attempt, and every inner attempt has a
 ///   nonblank index no other attempt shares and is a `PASS` with no error
 ///   kind, reason or timeout, whose first stderr line carries no Hermit
@@ -3495,6 +3507,11 @@ pub fn retained_verify_pass_error(
     }
     if result.attempts.is_empty() {
         return Some("the row retains no inner attempt".into());
+    }
+    if let Some(error) = retained_verify_invocation_error(result) {
+        return Some(format!(
+            "the row's command lines are not a verify invocation the executor writes: {error}"
+        ));
     }
     let comparator = row_comparator(result);
     let mut indices = BTreeSet::new();
@@ -3672,6 +3689,269 @@ fn row_copies_its_attempts(result: &CellResult) -> bool {
         && result.first_divergent_syscall == position.syscall
         && result.first_divergent_left_message == position.left_message
         && result.first_divergent_right_message == position.right_message
+}
+
+/// Why `result`'s retained command lines are not the verify invocation the
+/// executor writes for a row with its recorded backend, relaxations, expected
+/// guest exit and comparator, or `None` when they are.
+///
+/// The executor builds every verify attempt's argv in one place
+/// (`verified_invocation_argv`) from the cell the row records: `<hermit> --log
+/// info --backend <backend> run`, the runner's own flags, the run flags the
+/// row's relaxations record, `--verify` with the expected-exit allowance
+/// exactly when the row records an expected guest exit, the report path, the
+/// optional retained-log directory, the guest's execution root and
+/// environment, and `--` before the attempt's guest argv. It records that argv
+/// on the attempt beside the shell command rendered from it
+/// ([`shell_command`]), and copies the first attempt's command fields onto the
+/// row, with the argv after the Hermit path as `effective_args` and log level
+/// `info`. A reader re-deciding a retained row from what it retains
+/// ([`skid_overshoot_only_reports`], [`retained_verify_pass_error`]) judges it
+/// by its recorded backend, relaxations and expected exit, so those must
+/// describe the command that ran
+/// (<https://github.com/rrnewton/hermit/issues/1845>):
+///
+/// - each attempt's argv selects the row's backend (`native` when the row
+///   records none, as the executor does) once, before `run`, and no token
+///   before `--` selects a backend again;
+/// - every token between `run` and `--` is one the executor writes, in the
+///   order it writes them, and every valued flag carries a value that does
+///   not start with `-` (a token Hermit's parser would not take as the value);
+/// - the run flags in the argv are exactly the ones the row's relaxations
+///   record, `--verify-allow=failure` is present exactly when the row records
+///   an expected guest exit, and `--verify-strict` is absent under the
+///   stripped comparator ([`row_comparator`]);
+/// - the tokens after `--` are the attempt's guest argv, and its shell command
+///   is the one rendered from its cwd, env and argv;
+/// - the row's argv, guest argv, env, cwd and shell command are its first
+///   attempt's, its effective args are that argv after the Hermit path, and
+///   its log level is `info`.
+pub fn retained_verify_invocation_error(result: &CellResult) -> Option<String> {
+    let Some(first) = result.attempts.first() else {
+        return Some("the row retains no inner attempt".into());
+    };
+    if result.argv != first.argv
+        || result.guest_argv != first.guest_argv
+        || result.env != first.env
+        || result.cwd != first.cwd
+        || result.shell_command != first.shell_command
+    {
+        return Some(
+            "the row's argv, guest argv, env, cwd or shell command is not its first inner attempt's"
+                .into(),
+        );
+    }
+    if result.effective_args.as_slice() != result.argv.get(1..).unwrap_or_default()
+        || result.log_level.as_deref() != Some("info")
+    {
+        return Some(
+            "the row's effective args or log level are not the ones the executor records with its argv"
+                .into(),
+        );
+    }
+    let backend = result.backend.as_deref().unwrap_or("native");
+    let mut relaxation_flags: Vec<&str> = result
+        .relaxations
+        .iter()
+        .filter_map(|relaxation| relaxation.split_once(": "))
+        .map(|(flag, _)| flag)
+        .filter(|flag| flag.starts_with("--"))
+        .collect();
+    relaxation_flags.sort_unstable();
+    let expects_exit = result.expected_guest_exit.is_some();
+    let comparator = row_comparator(result);
+    for attempt in &result.attempts {
+        let index = attempt.index.as_str();
+        if let Err(error) = verify_attempt_invocation_error(
+            attempt,
+            backend,
+            &relaxation_flags,
+            expects_exit,
+            comparator,
+        ) {
+            return Some(format!("inner attempt {index}'s command line {error}"));
+        }
+        if attempt.shell_command != shell_command(&attempt.cwd, &attempt.env, &attempt.argv) {
+            return Some(format!(
+                "inner attempt {index}'s shell command is not the one rendered from its cwd, env and argv"
+            ));
+        }
+    }
+    None
+}
+
+/// Why `attempt`'s argv is not one `verified_invocation_argv` writes for a
+/// verify attempt on `backend` whose row's relaxations record the run flags
+/// `relaxation_flags` (sorted), that expects a guest exit when `expects_exit`
+/// and that is judged by `comparator`, as [`retained_verify_invocation_error`]
+/// defines it.
+fn verify_attempt_invocation_error(
+    attempt: &AttemptResult,
+    backend: &str,
+    relaxation_flags: &[&str],
+    expects_exit: bool,
+    comparator: Comparator,
+) -> Result<(), String> {
+    let argv = &attempt.argv;
+    let head = ["--log", "info", "--backend", backend, "run"];
+    if argv
+        .get(1..=head.len())
+        .is_none_or(|words| words.iter().map(String::as_str).ne(head))
+    {
+        return Err(format!(
+            "does not start `<hermit> --log info --backend {backend} run`"
+        ));
+    }
+    let options_start = 1 + head.len();
+    let separator = argv[options_start..]
+        .iter()
+        .position(|arg| arg == "--")
+        .map(|offset| options_start + offset)
+        .ok_or("has no `--` before the guest command")?;
+    if argv[separator + 1..] != attempt.guest_argv[..] {
+        return Err("does not end with the attempt's guest argv".into());
+    }
+    let options = &argv[options_start..separator];
+    if let Some(selector) = options
+        .iter()
+        .find(|arg| *arg == "--backend" || arg.starts_with("--backend="))
+    {
+        return Err(format!("selects a backend again after `run` ({selector})"));
+    }
+    let mut tokens = InvocationTokens(options);
+    tokens.require("--base-env=minimal")?;
+    tokens.require("--strict")?;
+    if tokens.flag("--verify-strict") && comparator == Comparator::Stripped {
+        return Err(
+            "asks for the canonical comparison (`--verify-strict`) under the stripped comparator"
+                .into(),
+        );
+    }
+    let mut run_flags = Vec::new();
+    while let Some(arg) = tokens.next_if(allowed_hermit_arg) {
+        run_flags.push(arg);
+    }
+    for flag in ["--no-detlog-io-buffers", "--no-rcb-time"] {
+        if tokens.flag(flag) {
+            run_flags.push(flag);
+        }
+    }
+    run_flags.sort_unstable();
+    if run_flags != relaxation_flags {
+        return Err(format!(
+            "carries the run flags {run_flags:?}, not the ones the row's relaxations record ({relaxation_flags:?})"
+        ));
+    }
+    tokens.require("--verify")?;
+    if tokens.flag("--verify-allow=failure") != expects_exit {
+        return Err(format!(
+            "{} `--verify-allow=failure`, but the row {} an expected guest exit",
+            if expects_exit { "lacks" } else { "carries" },
+            if expects_exit {
+                "records"
+            } else {
+                "records no"
+            },
+        ));
+    }
+    tokens
+        .value("--verify-json")?
+        .ok_or("lacks `--verify-json <path>` where the executor writes it")?;
+    if tokens.flag("--keep-logs") {
+        tokens
+            .value("--verify-log-dir")?
+            .ok_or("keeps logs without `--verify-log-dir <path>`")?;
+    }
+    // The execution root (`append_execution_root_args`): a tmpfs mounted at
+    // the workdir, a workdir alone, a per-attempt directory bound at the fixed
+    // guest workdir, or none.
+    let mount = tokens.prefixed("--mount=type=tmpfs,target=");
+    let fixed_bind = format!(":{FIXED_GUEST_WORKDIR}");
+    let fixed = mount.is_none()
+        && matches!(tokens.0, [bind, workdir, ..]
+            if bind.starts_with("--bind=") && bind.ends_with(&fixed_bind) && workdir == "--workdir");
+    if fixed {
+        tokens.0 = &tokens.0[1..];
+    }
+    let workdir = tokens.value("--workdir")?;
+    if mount.is_some_and(|target| workdir != Some(target))
+        || (fixed && workdir != Some(FIXED_GUEST_WORKDIR))
+    {
+        return Err("mounts or binds an execution root that is not its workdir".into());
+    }
+    // The equalized inputs' binds, then the guest environment.
+    while tokens.prefixed("--bind=").is_some() {}
+    while let Some(assignment) = tokens.value("--env")? {
+        if !assignment.contains('=') {
+            return Err(format!(
+                "gives `--env` the value {assignment:?}, which assigns nothing"
+            ));
+        }
+    }
+    match tokens.0.first() {
+        Some(token) => Err(format!(
+            "carries `{token}` where the executor writes nothing of the kind"
+        )),
+        None => Ok(()),
+    }
+}
+
+/// The Hermit options of a retained command line, read front to back by
+/// [`verify_attempt_invocation_error`]. Each method consumes the next token
+/// only when it is the one asked for.
+struct InvocationTokens<'a>(&'a [String]);
+
+impl<'a> InvocationTokens<'a> {
+    /// Consume the next token if `accept` takes it.
+    fn next_if(&mut self, accept: impl FnOnce(&str) -> bool) -> Option<&'a str> {
+        let (first, rest) = self.0.split_first()?;
+        accept(first).then(|| {
+            self.0 = rest;
+            first.as_str()
+        })
+    }
+
+    /// Consume `flag` if it is next.
+    fn flag(&mut self, flag: &str) -> bool {
+        self.next_if(|token| token == flag).is_some()
+    }
+
+    /// Consume `flag`, which the executor always writes next.
+    fn require(&mut self, flag: &str) -> Result<(), String> {
+        self.flag(flag)
+            .then_some(())
+            .ok_or_else(|| format!("lacks `{flag}` where the executor writes it"))
+    }
+
+    /// Consume the next token if it is `prefix` followed by a nonempty value,
+    /// and return the value.
+    fn prefixed(&mut self, prefix: &str) -> Option<&'a str> {
+        let value = self
+            .0
+            .first()?
+            .strip_prefix(prefix)
+            .filter(|value| !value.is_empty())?;
+        self.0 = &self.0[1..];
+        Some(value)
+    }
+
+    /// Consume `flag` and its value if `flag` is next: `Ok(None)` when it is
+    /// not, and an error when its value is missing, empty or starts with `-`.
+    fn value(&mut self, flag: &str) -> Result<Option<&'a str>, String> {
+        let [first, rest @ ..] = self.0 else {
+            return Ok(None);
+        };
+        if first != flag {
+            return Ok(None);
+        }
+        match rest {
+            [value, rest @ ..] if !value.is_empty() && !value.starts_with('-') => {
+                self.0 = rest;
+                Ok(Some(value.as_str()))
+            }
+            _ => Err(format!("gives `{flag}` no value Hermit would take")),
+        }
+    }
 }
 
 fn command_text(program: &str, args: &[&str]) -> Result<String, String> {
@@ -7411,6 +7691,19 @@ const RUNNER_GUEST_ENV: [&str; 7] = [
 /// takes a value.
 const ALLOWED_HERMIT_ARGS: &[&str] = &["--no-virtualize-cpuid", "--max-timeslice="];
 
+/// Whether `arg` is one of [`ALLOWED_HERMIT_ARGS`]: one of its exact flags,
+/// or one of its valued flags with a nonempty value.
+fn allowed_hermit_arg(arg: &str) -> bool {
+    ALLOWED_HERMIT_ARGS
+        .iter()
+        .any(|flag| match flag.strip_suffix('=') {
+            Some(_) => arg
+                .strip_prefix(flag)
+                .is_some_and(|value| !value.is_empty()),
+            None => arg == *flag,
+        })
+}
+
 /// Validate a mode's `hermit_args`, `env` and `comparator`.
 fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String> {
     let extends = !recipe.hermit_args.is_empty()
@@ -7453,15 +7746,7 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
         }
     }
     for arg in recipe.hermit_args.values().flatten() {
-        let allowed = ALLOWED_HERMIT_ARGS
-            .iter()
-            .any(|flag| match flag.strip_suffix('=') {
-                Some(_) => arg
-                    .strip_prefix(flag)
-                    .is_some_and(|value| !value.is_empty()),
-                None => arg == flag,
-            });
-        if !allowed {
+        if !allowed_hermit_arg(arg) {
             return Err(format!(
                 "{id}: hermit_args entry `{arg}` is not one of {ALLOWED_HERMIT_ARGS:?}"
             ));
@@ -16055,11 +16340,643 @@ exit "$(cat "$PWD/exit-status")"
         );
     }
 
+    /// The verify cell a row records: the fixture cell on the row's backend,
+    /// whose recipe selects exactly the row's relaxations and expected guest
+    /// exit.
+    fn cell_recorded_by(row: &CellResult) -> SelectedCell {
+        let mut cell = ptrace_cell("verify");
+        cell.id.backend = row.backend.clone();
+        let backend = row.backend.clone().unwrap_or_else(|| "native".into());
+        let recipe = cell.test.modes.get_mut("verify").unwrap();
+        for relaxation in &row.relaxations {
+            if let Some(reason) = relaxation.strip_prefix(DIAGNOSTIC_RELAXATION_PREFIX) {
+                recipe.diagnostic.insert(backend.clone(), reason.into());
+                continue;
+            }
+            let (flag, reason) = relaxation.split_once(": ").unwrap();
+            match flag {
+                "--no-detlog-io-buffers" => {
+                    recipe.compare_io_buffers = Some(false);
+                    recipe.compare_io_buffers_disabled_reason = Some(reason.into());
+                }
+                "--no-rcb-time" => {
+                    recipe.rcb_time = Some(false);
+                    recipe.rcb_time_disabled_reason = Some(reason.into());
+                }
+                "comparator=stripped" => {
+                    recipe.comparator = Some(Comparator::Stripped);
+                    recipe.comparator_reason = Some(reason.into());
+                }
+                flag if allowed_hermit_arg(flag) => {
+                    recipe
+                        .hermit_args
+                        .entry(backend.clone())
+                        .or_default()
+                        .push(flag.into());
+                    recipe.hermit_args_reason = Some(reason.into());
+                }
+                other => panic!("a fixture row records the relaxation {other:?}"),
+            }
+        }
+        recipe.expected_guest_exit = row.expected_guest_exit.clone();
+        assert_eq!(cell_relaxations(&cell), row.relaxations);
+        assert_eq!(cell_expected_guest_exit(&cell), row.expected_guest_exit);
+        cell
+    }
+
+    /// `row` with the command fields the executor writes for the cell it
+    /// records ([`cell_recorded_by`]) under `context`: each attempt's argv,
+    /// guest argv, env, cwd and shell command as `build_spec` renders them,
+    /// and the row's copies of the first attempt's (`run_cell_inner`). The
+    /// fixture attempts execute a shell script in place of Hermit, so the
+    /// command they record is the script's, which no retained row may carry
+    /// ([`retained_verify_invocation_error`]).
+    fn with_executor_invocation_in(row: CellResult, context: &RunContext) -> CellResult {
+        let cell = cell_recorded_by(&row);
+        with_executor_invocation_for(row, context, &cell)
+    }
+
+    /// `row` with the command fields the executor writes for `cell` under
+    /// `context`, as [`with_executor_invocation_in`] writes them for the cell
+    /// the row records. A caller passes a cell whose recipe adds what a row
+    /// does not record (a workdir, a guest environment) or a context with
+    /// another execution root or log retention.
+    fn with_executor_invocation_for(
+        mut row: CellResult,
+        context: &RunContext,
+        cell: &SelectedCell,
+    ) -> CellResult {
+        let dir = context.root.join("results/cell");
+        for (position, attempt) in row.attempts.iter_mut().enumerate() {
+            let spec = build_spec(
+                context,
+                cell,
+                dir.clone(),
+                attempt.guest_argv.clone(),
+                &(position + 1).to_string(),
+                None,
+                3,
+            )
+            .unwrap();
+            attempt.cwd = spec.cwd.to_string_lossy().into_owned();
+            attempt.shell_command = shell_command(&attempt.cwd, &spec.env, &spec.argv);
+            attempt.argv = spec.argv;
+            attempt.guest_argv = spec.guest_argv;
+            attempt.env = spec.env;
+        }
+        if let Some(first) = row.attempts.first() {
+            row.argv = first.argv.clone();
+            row.guest_argv = first.guest_argv.clone();
+            row.env = first.env.clone();
+            row.cwd = first.cwd.clone();
+            row.shell_command = first.shell_command.clone();
+        }
+        row.effective_args = row.argv.iter().skip(1).cloned().collect();
+        row.log_level = Some("info".into());
+        row
+    }
+
+    /// [`with_executor_invocation_in`] under the fixture context, with the
+    /// canonical comparison flag Hermit's probe enables.
+    fn with_executor_invocation(row: CellResult) -> CellResult {
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-executor-invocation-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let mut context = run_context(&root);
+        context.run_verify_strict = true;
+        let row = with_executor_invocation_in(row, &context);
+        let _ = fs::remove_dir_all(&root);
+        row
+    }
+
+    /// A retained verify row is re-decided by what it records: its backend,
+    /// relaxations, expected guest exit and comparator. Its command lines must
+    /// therefore be the invocation the executor writes for exactly those
+    /// ([`retained_verify_invocation_error`],
+    /// <https://github.com/rrnewton/hermit/issues/1845>). Every shape the
+    /// executor writes is accepted, whatever execution root, log retention,
+    /// workdir, guest environment, relaxations or declared exit produced it.
+    /// Each row below that differs from an accepted one in one respect is
+    /// refused by the named check, and so by the skid predicate and the
+    /// retained-pass check.
+    #[test]
+    fn a_retained_command_line_must_be_the_executor_invocation_its_row_records() {
+        fn at(argv: &[String], token: &str) -> usize {
+            argv.iter()
+                .position(|arg| arg == token)
+                .unwrap_or_else(|| panic!("{token} is not in {argv:?}"))
+        }
+        // `row` with each attempt's argv edited by `edit`, its shell command
+        // rendered again and the row's copies taken again, so that the
+        // command line is the row's only defect.
+        fn with_argv(row: &CellResult, edit: impl Fn(&mut Vec<String>)) -> CellResult {
+            let mut row = row.clone();
+            for attempt in &mut row.attempts {
+                edit(&mut attempt.argv);
+                attempt.shell_command = shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+            }
+            row.argv = row.attempts[0].argv.clone();
+            row.shell_command = row.attempts[0].shell_command.clone();
+            row.effective_args = row.argv[1..].to_vec();
+            row
+        }
+        fn insert_before(token: &str, inserted: &[&str]) -> impl Fn(&mut Vec<String>) {
+            let token = token.to_owned();
+            let inserted: Vec<String> = inserted.iter().map(|arg| (*arg).to_owned()).collect();
+            move |argv| {
+                let index = at(argv, &token);
+                argv.splice(index..index, inserted.iter().cloned());
+            }
+        }
+        fn replace_after(flag: &str, value: &str) -> impl Fn(&mut Vec<String>) {
+            let (flag, value) = (flag.to_owned(), value.to_owned());
+            move |argv| {
+                let index = at(argv, &flag);
+                argv[index + 1] = value.clone();
+            }
+        }
+        fn without(token: &str, values: usize) -> impl Fn(&mut Vec<String>) {
+            let token = token.to_owned();
+            move |argv| {
+                let index = at(argv, &token);
+                argv.drain(index..=index + values);
+            }
+        }
+        fn accepted(label: &str, row: &CellResult) {
+            assert_eq!(
+                retained_verify_invocation_error(row),
+                None,
+                "{label} is a command line the executor writes: {:?}",
+                row.argv
+            );
+        }
+        fn accepted_skid(label: &str, row: &CellResult, count: u64) {
+            accepted(label, row);
+            assert_eq!(
+                skid_overshoot_only_reports(row),
+                Some(count),
+                "{label} is a skid-only row: {:?}",
+                row.argv
+            );
+        }
+        fn refused(label: &str, row: &CellResult, check: &str) {
+            let error = retained_verify_invocation_error(row)
+                .unwrap_or_else(|| panic!("{label} was accepted: {:?}", row.argv));
+            assert!(
+                error.contains(check),
+                "{label} was refused by another check: {error}"
+            );
+            assert_eq!(
+                skid_overshoot_only_reports(row),
+                None,
+                "{label} still reads as a skid-only row"
+            );
+        }
+
+        let root = std::env::temp_dir().join(format!(
+            "hermit-runner-invocation-shapes-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let context = |edit: &dyn Fn(&mut RunContext)| {
+            let mut context = run_context(&root);
+            context.run_verify_strict = true;
+            edit(&mut context);
+            context
+        };
+        // The cell a row records, with recipe additions the row does not
+        // record, rendered under `context`.
+        let rendered = |row: &CellResult, context: &RunContext, edit: &dyn Fn(&mut ModeRecipe)| {
+            let mut cell = cell_recorded_by(row);
+            edit(cell.test.modes.get_mut("verify").unwrap());
+            with_executor_invocation_for(row.clone(), context, &cell)
+        };
+        let skid = |index: &str| {
+            let mut attempt = attempt_from_script(
+                "ptrace",
+                &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+                Some(&skid_report(2)),
+            );
+            attempt.index = index.into();
+            attempt
+        };
+        let has = |row: &CellResult, token: &str| row.argv.iter().any(|arg| arg == token);
+        let has_pair = |row: &CellResult, flag: &str, value: &str| {
+            row.argv
+                .windows(2)
+                .any(|pair| pair[0] == flag && pair[1] == value)
+        };
+
+        // Every shape the executor writes.
+        let base = verify_row_from_attempts(vec![skid("1")]);
+        assert!(has(&base, "--verify-strict") && base.argv[4] == "ptrace");
+        accepted_skid("the fixture row", &base, 2);
+        let unprobed = rendered(
+            &base,
+            &context(&|context| context.run_verify_strict = false),
+            &|_| {},
+        );
+        assert!(!has(&unprobed, "--verify-strict"));
+        accepted_skid(
+            "a row from a Hermit without the canonical comparison flag",
+            &unprobed,
+            2,
+        );
+        let kept = rendered(
+            &base,
+            &context(&|context| context.keep_logs = true),
+            &|_| {},
+        );
+        assert!(has(&kept, "--keep-logs") && has(&kept, "--verify-log-dir"));
+        accepted_skid("a row whose verify logs were kept", &kept, 2);
+        let test = cell_recorded_by(&base).id.test;
+        let parity = rendered(
+            &base,
+            &context(&|context| {
+                context
+                    .parity_retained
+                    .insert((test.clone(), "ptrace".into()));
+            }),
+            &|_| {},
+        );
+        assert!(has(&parity, "--keep-logs"));
+        accepted_skid("a row whose logs the parity post-pass kept", &parity, 2);
+        let isolated = rendered(
+            &base,
+            &context(&|context| context.isolated_workdir = Some(PathBuf::from("/test"))),
+            &|_| {},
+        );
+        assert!(has(&isolated, "--mount=type=tmpfs,target=/test"));
+        assert!(has_pair(&isolated, "--workdir", "/test"));
+        accepted_skid("a row from the hermetic /test root", &isolated, 2);
+        let requested = rendered(&base, &context(&|_| {}), &|recipe| {
+            recipe.workdir = Some("/srv/work".into())
+        });
+        assert!(has_pair(&requested, "--workdir", "/srv/work"));
+        assert!(!requested.argv.iter().any(|arg| arg.ends_with(":/tmp/test")));
+        accepted_skid("a row whose manifest names its workdir", &requested, 2);
+        let mode_env = rendered(&base, &context(&|_| {}), &|recipe| {
+            recipe.env.insert("FIXTURE_MODE".into(), "on".into());
+        });
+        assert!(has_pair(&mode_env, "--env", "FIXTURE_MODE=on"));
+        accepted_skid("a row whose manifest adds a guest variable", &mode_env, 2);
+        let two = verify_row_from_attempts(vec![skid("1"), skid("2")]);
+        assert_ne!(two.attempts[0].argv, two.attempts[1].argv);
+        accepted_skid("a row with two inner attempts", &two, 4);
+        let mut relaxed = base.clone();
+        relaxed.relaxations = vec![
+            "--no-detlog-io-buffers: fixture".into(),
+            "--no-rcb-time: fixture".into(),
+            "--no-virtualize-cpuid: fixture".into(),
+            "--max-timeslice=1000: fixture".into(),
+        ];
+        let relaxed = with_executor_invocation(relaxed);
+        assert!(has(&relaxed, "--max-timeslice=1000") && has(&relaxed, "--no-rcb-time"));
+        accepted("a row recording every run-flag relaxation", &relaxed);
+        let mut declared = base.clone();
+        declared.expected_guest_exit = Some(expected_exit(Some(7), None));
+        let declared = with_executor_invocation(declared);
+        assert!(has(&declared, "--verify-allow=failure"));
+        accepted("a row declaring a guest exit", &declared);
+        let mut stripped = base.clone();
+        stripped.relaxations = vec![format!("{STRIPPED_COMPARATOR_RELAXATION_PREFIX}fixture")];
+        let stripped = with_executor_invocation(stripped);
+        assert!(!has(&stripped, "--verify-strict"));
+        accepted("a stripped-comparator row", &stripped);
+        let mut native = base.clone();
+        native.backend = None;
+        let native = with_executor_invocation(native);
+        assert_eq!(native.argv[4], "native");
+        accepted("a row recording no backend", &native);
+        let mut dbt = base.clone();
+        dbt.backend = Some("dbt".into());
+        let dbt_fixed = with_executor_invocation(dbt.clone());
+        assert!(!dbt_fixed.argv.iter().any(|arg| arg.starts_with("--bind=")));
+        accepted("a DBT row", &dbt_fixed);
+        let dbt_isolated = rendered(
+            &dbt,
+            &context(&|context| context.isolated_workdir = Some(PathBuf::from("/test"))),
+            &|_| {},
+        );
+        assert!(has_pair(&dbt_isolated, "--workdir", "/test"));
+        assert!(
+            !dbt_isolated
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("--mount="))
+        );
+        accepted("a DBT row from the hermetic /test root", &dbt_isolated);
+
+        // The backend.
+        refused(
+            "a ptrace row whose command line selects liteinst",
+            &with_argv(&base, |argv| argv[4] = "liteinst".into()),
+            "does not start `<hermit> --log info --backend ptrace run`",
+        );
+        refused(
+            "a row recording no backend whose command line selects ptrace",
+            &{
+                let mut row = base.clone();
+                row.backend = None;
+                row
+            },
+            "does not start `<hermit> --log info --backend native run`",
+        );
+        refused(
+            "a command line that selects a second backend after `run`",
+            &with_argv(
+                &base,
+                insert_before("--base-env=minimal", &["--backend=liteinst"]),
+            ),
+            "selects a backend again after `run` (--backend=liteinst)",
+        );
+        refused(
+            "a command line that selects a backend in front of the guest",
+            &with_argv(&base, insert_before("--", &["--backend", "liteinst"])),
+            "selects a backend again after `run` (--backend)",
+        );
+        let mut second = two.clone();
+        second.attempts[1].argv[4] = "liteinst".into();
+        second.attempts[1].shell_command = shell_command(
+            &second.attempts[1].cwd,
+            &second.attempts[1].env,
+            &second.attempts[1].argv,
+        );
+        refused(
+            "a second attempt that selects another backend",
+            &second,
+            "inner attempt 2's command line does not start",
+        );
+        // The runner's own flags, in the executor's order.
+        refused(
+            "a command line without the minimal base environment",
+            &with_argv(&base, without("--base-env=minimal", 0)),
+            "lacks `--base-env=minimal`",
+        );
+        refused(
+            "the runner's flags out of order",
+            &with_argv(&base, |argv| {
+                let (env, strict) = (at(argv, "--base-env=minimal"), at(argv, "--strict"));
+                argv.swap(env, strict);
+            }),
+            "lacks `--base-env=minimal`",
+        );
+        refused(
+            "a command line without `--verify`",
+            &with_argv(&base, without("--verify", 0)),
+            "lacks `--verify` where",
+        );
+        refused(
+            "the canonical comparison flag after the run flags",
+            &with_argv(&relaxed, |argv| {
+                let flag = argv.remove(at(argv, "--verify-strict"));
+                let index = at(argv, "--verify");
+                argv.insert(index, flag);
+            }),
+            "lacks `--verify` where",
+        );
+        refused(
+            "the canonical comparison flag on a stripped row",
+            &with_argv(&stripped, insert_before("--verify", &["--verify-strict"])),
+            "under the stripped comparator",
+        );
+        // The run flags the relaxations record.
+        refused(
+            "a run flag the executor never writes",
+            &with_argv(
+                &base,
+                insert_before("--verify", &["--no-sequentialize-threads"]),
+            ),
+            "lacks `--verify` where",
+        );
+        refused(
+            "a run flag the row does not record",
+            &with_argv(&base, insert_before("--verify", &["--no-rcb-time"])),
+            "carries the run flags [\"--no-rcb-time\"]",
+        );
+        refused(
+            "a Hermit argument the row does not record",
+            &with_argv(&base, insert_before("--verify", &["--max-timeslice=1000"])),
+            "carries the run flags [\"--max-timeslice=1000\"]",
+        );
+        refused(
+            "a recorded run flag the command line lacks",
+            &with_argv(&relaxed, without("--no-rcb-time", 0)),
+            "carries the run flags",
+        );
+        refused(
+            "a recorded Hermit argument with another value",
+            &with_argv(&relaxed, |argv| {
+                let index = at(argv, "--max-timeslice=1000");
+                argv[index] = "--max-timeslice=2000".into();
+            }),
+            "carries the run flags",
+        );
+        refused(
+            "run flags out of the executor's order",
+            &with_argv(&relaxed, |argv| {
+                let (io, rcb) = (
+                    at(argv, "--no-detlog-io-buffers"),
+                    at(argv, "--no-rcb-time"),
+                );
+                argv.swap(io, rcb);
+            }),
+            "carries the run flags",
+        );
+        // The expected-exit allowance and the valued flags.
+        refused(
+            "an expected-exit allowance the row does not declare",
+            &with_argv(
+                &base,
+                insert_before("--verify-json", &["--verify-allow=failure"]),
+            ),
+            "carries `--verify-allow=failure`",
+        );
+        refused(
+            "a declared exit without its allowance",
+            &with_argv(&declared, without("--verify-allow=failure", 0)),
+            "lacks `--verify-allow=failure`",
+        );
+        refused(
+            "a command line without its report path",
+            &with_argv(&base, without("--verify-json", 1)),
+            "lacks `--verify-json <path>`",
+        );
+        refused(
+            "a report path Hermit would read as a flag",
+            &with_argv(&base, replace_after("--verify-json", "-x")),
+            "gives `--verify-json` no value",
+        );
+        refused(
+            "an empty report path",
+            &with_argv(&base, replace_after("--verify-json", "")),
+            "gives `--verify-json` no value",
+        );
+        refused(
+            "kept logs without their directory",
+            &with_argv(&kept, without("--verify-log-dir", 1)),
+            "keeps logs without `--verify-log-dir <path>`",
+        );
+        refused(
+            "a workdir Hermit would read as a flag",
+            &with_argv(&requested, replace_after("--workdir", "-w")),
+            "gives `--workdir` no value",
+        );
+        // The execution root and the guest environment.
+        refused(
+            "a tmpfs mounted somewhere other than the workdir",
+            &with_argv(&isolated, replace_after("--workdir", "/elsewhere")),
+            "not its workdir",
+        );
+        refused(
+            "the fixed bind with another workdir",
+            &with_argv(&base, replace_after("--workdir", "/tmp/other")),
+            "not its workdir",
+        );
+        refused(
+            "a guest variable that assigns nothing",
+            &with_argv(&base, |argv| {
+                let index = at(argv, "--env");
+                argv[index + 1] = "FIXTURE".into();
+            }),
+            "which assigns nothing",
+        );
+        refused(
+            "a token after the guest environment",
+            &with_argv(&base, insert_before("--", &["--no-sequentialize-threads"])),
+            "carries `--no-sequentialize-threads` where the executor writes nothing",
+        );
+        // The guest and the rendered shell command.
+        refused(
+            "a command line without the guest separator",
+            &with_argv(&base, without("--", 0)),
+            "has no `--` before the guest command",
+        );
+        refused(
+            "a command line that runs another guest",
+            &with_argv(&base, |argv| argv.push("--extra".into())),
+            "does not end with the attempt's guest argv",
+        );
+        let edited = |edit: &dyn Fn(&mut CellResult)| {
+            let mut row = base.clone();
+            edit(&mut row);
+            row
+        };
+        refused(
+            "a guest argv the command line does not run",
+            &edited(&|row| {
+                row.attempts[0].guest_argv.push("--extra".into());
+                row.guest_argv = row.attempts[0].guest_argv.clone();
+            }),
+            "does not end with the attempt's guest argv",
+        );
+        refused(
+            "a stale shell command",
+            &edited(&|row| {
+                row.attempts[0].shell_command.push_str(" --extra");
+                row.shell_command = row.attempts[0].shell_command.clone();
+            }),
+            "shell command is not the one rendered",
+        );
+        refused(
+            "an attempt environment its shell command does not render",
+            &edited(&|row| {
+                row.attempts[0].env.insert("FIXTURE".into(), "1".into());
+                row.env = row.attempts[0].env.clone();
+            }),
+            "shell command is not the one rendered",
+        );
+        // The row's copies of its first attempt.
+        let copies = "is not its first inner attempt's";
+        refused(
+            "a row argv of its own",
+            &edited(&|row| row.argv.push("--extra".into())),
+            copies,
+        );
+        refused(
+            "a row guest argv of its own",
+            &edited(&|row| row.guest_argv.push("--extra".into())),
+            copies,
+        );
+        refused(
+            "a row environment of its own",
+            &edited(&|row| {
+                row.env.insert("FIXTURE".into(), "1".into());
+            }),
+            copies,
+        );
+        refused(
+            "a row cwd of its own",
+            &edited(&|row| row.cwd.push_str("/elsewhere")),
+            copies,
+        );
+        refused(
+            "a row shell command of its own",
+            &edited(&|row| row.shell_command.push_str(" --extra")),
+            copies,
+        );
+        let recorded = "effective args or log level";
+        refused(
+            "effective args that are not the argv",
+            &edited(&|row| {
+                row.effective_args.pop();
+            }),
+            recorded,
+        );
+        refused(
+            "a debug log level",
+            &edited(&|row| row.log_level = Some("debug".into())),
+            recorded,
+        );
+        refused(
+            "no log level",
+            &edited(&|row| row.log_level = None),
+            recorded,
+        );
+        refused(
+            "a row without inner attempts",
+            &edited(&|row| row.attempts.clear()),
+            "retains no inner attempt",
+        );
+
+        // A retained PASS is refused by the same check.
+        let none = DeclaredStdout::default();
+        let (plain, _) = expected_exit_row(None, canonical_verification_report(), "exit 0");
+        assert_eq!(plain.argv[4], "ptrace");
+        accepted("a verify PASS the executor wrote", &plain);
+        assert_eq!(retained_verify_pass_error(&plain, &none), None);
+        for (label, row) in [
+            (
+                "a ptrace PASS whose command line selects liteinst",
+                with_argv(&plain, |argv| argv[4] = "liteinst".into()),
+            ),
+            (
+                "a PASS that selects a second backend",
+                with_argv(&plain, insert_before("--", &["--backend=liteinst"])),
+            ),
+            (
+                "a PASS with a run flag its row does not record",
+                with_argv(&plain, insert_before("--verify", &["--no-rcb-time"])),
+            ),
+        ] {
+            let error = retained_verify_pass_error(&row, &none)
+                .unwrap_or_else(|| panic!("{label} was re-decided as a verify PASS"));
+            assert!(
+                error.contains("not a verify invocation the executor writes"),
+                "{label} was refused by another check: {error}"
+            );
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// The verify row `run_cell_inner` publishes for `attempts`: the same
     /// outcome, reason and error-kind fold, then the same typed result and
     /// failure class, the same declared-stdout record for a cell that
-    /// declares no stdout assertion, and the same runtime and divergence
-    /// position copied from the attempts.
+    /// declares no stdout assertion, the same runtime and divergence
+    /// position copied from the attempts, and the command fields the executor
+    /// writes ([`with_executor_invocation`]).
     fn verify_row_from_attempts(attempts: Vec<AttemptResult>) -> CellResult {
         let outcome = if attempts.iter().all(|attempt| attempt.outcome == "PASS") {
             "PASS"
@@ -16081,7 +16998,7 @@ exit "$(cat "$PWD/exit-status")"
             .then(DeclaredStdout::default);
         let runtime = attempts.iter().find_map(|attempt| attempt.runtime.clone());
         let position = cell_divergence_position(&attempts);
-        CellResult {
+        with_executor_invocation(CellResult {
             outcome,
             result,
             failure_class,
@@ -16097,7 +17014,7 @@ exit "$(cat "$PWD/exit-status")"
             attempts,
             declared_stdout,
             ..cell_result_that_located_nothing()
-        }
+        })
     }
 
     /// The stderr Hermit writes when it refuses a verify comparison after two
@@ -16428,9 +17345,8 @@ exit "$(cat "$PWD/exit-status")"
             Some(&sabre_report),
         )]);
         genuine_sabre.backend = Some("sabre".into());
-        genuine_sabre.attempts[0].argv = ["hermit", "--backend", "sabre", "run", "--verify"]
-            .map(String::from)
-            .to_vec();
+        let mut genuine_sabre = with_executor_invocation(genuine_sabre);
+        assert_eq!(retained_verify_invocation_error(&genuine_sabre), None);
         with_sabre_evidence(&mut genuine_sabre, Some(&clean_evidence));
         recompute_path(&mut genuine_sabre);
         assert_eq!(
@@ -16471,11 +17387,14 @@ exit "$(cat "$PWD/exit-status")"
         assert_eq!(fallback.execution_path.as_ref().unwrap()["eligible"], false);
         not_skid_only("a SaBRe skid row that used a fallback site", &fallback);
         // A SaBRe row whose command line does not select SaBRe writes no
-        // evidence the summary reads, so it cannot stand for a SaBRe run.
+        // evidence the summary reads, so it cannot stand for a SaBRe run. The
+        // path check refuses it on its own, as the invocation check does.
         let mut unselected = genuine_sabre.clone();
         unselected.attempts[0].argv = ["hermit", "run", "--verify"].map(String::from).to_vec();
         recompute_path(&mut unselected);
         assert_eq!(unselected.execution_path, None);
+        assert!(retained_execution_path_error(&unselected).is_some());
+        assert!(retained_verify_invocation_error(&unselected).is_some());
         not_skid_only(
             "a SaBRe skid row whose command line does not select SaBRe",
             &unselected,
@@ -16494,13 +17413,17 @@ exit "$(cat "$PWD/exit-status")"
             "a ptrace skid row that records an eligible SaBRe path",
             &labelled_path,
         );
+        // The command line is the one the executor writes for a SaBRe row,
+        // recorded on a ptrace row; the path check and the invocation check
+        // each refuse it.
         let mut ptrace_selecting_sabre = with_dispatch.clone();
-        ptrace_selecting_sabre.attempts[0].argv =
-            ["hermit", "--backend", "sabre", "run", "--verify"]
-                .map(String::from)
-                .to_vec();
+        ptrace_selecting_sabre.backend = Some("sabre".into());
+        let mut ptrace_selecting_sabre = with_executor_invocation(ptrace_selecting_sabre);
+        ptrace_selecting_sabre.backend = with_dispatch.backend.clone();
         with_sabre_evidence(&mut ptrace_selecting_sabre, Some(&clean_evidence));
         recompute_path(&mut ptrace_selecting_sabre);
+        assert!(retained_execution_path_error(&ptrace_selecting_sabre).is_some());
+        assert!(retained_verify_invocation_error(&ptrace_selecting_sabre).is_some());
         not_skid_only(
             "a ptrace skid row whose command line selects SaBRe",
             &ptrace_selecting_sabre,
@@ -16539,9 +17462,16 @@ exit "$(cat "$PWD/exit-status")"
         let stripped_relaxation = vec![format!(
             "{STRIPPED_COMPARATOR_RELAXATION_PREFIX}fixture reason"
         )];
+        // Each row is re-rendered with the command line the executor writes
+        // for its relaxations, so only the comparison can refuse it.
         let mut canonical_as_stripped = qualifying.clone();
         canonical_as_stripped.relaxations = stripped_relaxation.clone();
+        let canonical_as_stripped = with_executor_invocation(canonical_as_stripped);
         assert_eq!(row_comparator(&canonical_as_stripped), Comparator::Stripped);
+        assert_eq!(
+            retained_verify_invocation_error(&canonical_as_stripped),
+            None
+        );
         not_skid_only(
             "a stripped row carrying a canonical skid report",
             &canonical_as_stripped,
@@ -16571,11 +17501,14 @@ exit "$(cat "$PWD/exit-status")"
             5,
         )]);
         stripped_row.relaxations = stripped_relaxation;
+        let stripped_row = with_executor_invocation(stripped_row);
         classified_as_skid("a stripped skid row", &stripped_row);
         assert_eq!(skid_overshoot_only_reports(&stripped_row), Some(2));
         let mut stripped_as_strict = stripped_row.clone();
         stripped_as_strict.relaxations.clear();
+        let stripped_as_strict = with_executor_invocation(stripped_as_strict);
         assert_eq!(row_comparator(&stripped_as_strict), Comparator::Strict);
+        assert_eq!(retained_verify_invocation_error(&stripped_as_strict), None);
         not_skid_only(
             "a strict row carrying a stripped skid report",
             &stripped_as_strict,
@@ -16823,9 +17756,12 @@ exit "$(cat "$PWD/exit-status")"
         classified_as_skid("a compared exit 7 the cell does not declare", &undeclared);
         not_skid_only("a compared exit 7 the cell does not declare", &undeclared);
         // The same report in a cell that declares exit 7 is skid-only, and
-        // the clean-exit report is not.
+        // the clean-exit report is not. Each row carries the command line the
+        // executor writes for its declaration, so only the disposition can
+        // refuse it.
         let mut declared = marked(&sevens);
         declared.expected_guest_exit = Some(expected_exit(Some(7), None));
+        let declared = with_executor_invocation(declared);
         classified_as_skid("a compared exit 7 the cell declares", &declared);
         assert_eq!(
             skid_overshoot_only_reports(&declared),
@@ -16834,6 +17770,8 @@ exit "$(cat "$PWD/exit-status")"
         );
         let mut clean_in_declared = qualifying.clone();
         clean_in_declared.expected_guest_exit = Some(expected_exit(Some(7), None));
+        let clean_in_declared = with_executor_invocation(clean_in_declared);
+        assert_eq!(retained_verify_invocation_error(&clean_in_declared), None);
         not_skid_only(
             "a compared exit 0 in a cell that declares exit 7",
             &clean_in_declared,
@@ -17758,10 +18696,13 @@ cp "{}" "$verdict"
         // are refused; a stripped report under the stripped relaxation
         // passes only when it matched and its exact outputs agree.
         let stripped_relaxation = format!("{STRIPPED_COMPARATOR_RELAXATION_PREFIX}fixture reason");
+        // Each row carries the command line the executor writes for its
+        // relaxations, so only the comparison can refuse it.
         let mut canonical_under_stripped = pass.clone();
         canonical_under_stripped
             .relaxations
             .push(stripped_relaxation.clone());
+        let canonical_under_stripped = with_executor_invocation(canonical_under_stripped);
         refused(
             "a canonical report under the stripped relaxation",
             &canonical_under_stripped,
@@ -17779,6 +18720,7 @@ cp "{}" "$verdict"
         );
         let mut stripped = stripped_under_strict.clone();
         stripped.relaxations.push(stripped_relaxation);
+        let stripped = with_executor_invocation(stripped);
         assert_eq!(retained_verify_pass_error(&stripped, &none), None);
         let mut stripped_outputs_differ = stripped_report.clone();
         stripped_outputs_differ
@@ -17863,6 +18805,7 @@ cp "{}" "$verdict"
         // when the row names none.
         let mut undeclared = pass.clone();
         undeclared.expected_guest_exit = None;
+        let undeclared = with_executor_invocation(undeclared);
         refused(
             "exit status 7 without a declaration",
             &undeclared,
