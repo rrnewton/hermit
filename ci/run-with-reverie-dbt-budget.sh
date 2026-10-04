@@ -738,7 +738,22 @@ fi
 # rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
 # CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
 # 1050 effective-job-seconds budget are unchanged.
-expected_pin=dbb8e5b6962312f4ee0e6046098ddae18574f818
+# CARRY TO 51186070ef15bb4471b4d8801ff77ee385c793f2 (2026-10-04): from
+# dbb8e5b6962312f4ee0e6046098ddae18574f818; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The 1-commit range (the reverie-kvm host metadata
+# timestamp commit of https://github.com/rrnewton/hermit/issues/3695) touches
+# no reverie-dbt input.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+expected_pin=51186070ef15bb4471b4d8801ff77ee385c793f2
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
