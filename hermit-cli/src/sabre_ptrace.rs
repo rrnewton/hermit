@@ -1640,8 +1640,17 @@ mod tests {
         assert_ne!(mapping, libc::MAP_FAILED, "mmap of the fixture failed");
         let address = mapping as usize;
 
-        let maps = fs::read_to_string("/proc/self/maps").expect("read own maps");
-        let entry = mapping_entry(&maps, address).expect("our own mapping must have a row");
+        // Other tests can map non-UTF-8 Linux filenames in this same mm.
+        // Read bytes and select our exact mmap base before decoding its row;
+        // the tempfile path and the kernel's numeric columns are UTF-8.
+        let maps = fs::read("/proc/self/maps").expect("read own maps");
+        let prefix = format!("{address:08x}-");
+        let row = maps
+            .split(|byte| *byte == b'\n')
+            .find(|row| row.starts_with(prefix.as_bytes()))
+            .expect("our own mapping must have a row");
+        let row = std::str::from_utf8(row).expect("our fixture's mapping row must be UTF-8");
+        let entry = mapping_entry(row, address).expect("our own mapping must contain its base");
         let from_maps = entry
             .file_id()
             .expect("a file-backed mapping has an identity");
