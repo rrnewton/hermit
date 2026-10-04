@@ -107,7 +107,21 @@ group and waits up to 10 s for the leader to exit; it then sends `SIGKILL` to
 the process group,
 kills the whole cgroup through `cgroup.kill`, and sends `SIGKILL` to the leader
 through a pidfd before it waits for the leader, so a leader that moved to
-another process group cannot hold the stop open. A sample that cannot be read,
+another process group cannot hold the stop open. A process can move itself out
+of that cgroup into the harness's own, where the counter no longer sees its
+CPU, so before every live sample, before a wall stop, and once the leader has
+been waited for, the harness reads the cgroup v2 line of `/proc/<pid>/cgroup`
+for the leader and for every live member of its process group. Any of them
+outside the execution's cgroup, or a check that cannot be made, stops the
+execution through the same sequence (only `SIGKILL` to the process group when
+the leader has already exited), charges no CPU, records the termination
+`cgroup_membership_stop`, and makes the cell an `ERROR`. A process that leaves
+both the process group and the cgroup, or leaves the cgroup and exits between
+two checks, is not seen; the process-group scan the cgroup replaced could not
+charge it either. A command that empties the cgroup, makes it threaded through
+`cgroup.type` and moves only its main thread back is not refused either, and
+its other threads' CPU then goes to the harness's cgroup; the process-group
+scan did count those threads. A sample that cannot be read,
 or that is lower than one already read, is a failed sample. CPU that stays
 unmeasurable for 1 s, timed from when
 the first failed sample returned, stops the execution rather than letting it run

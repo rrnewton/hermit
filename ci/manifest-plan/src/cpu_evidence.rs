@@ -329,6 +329,13 @@ pub enum TerminationPath {
     CpuBudgetStop,
     WallBudgetStop,
     AccountingUnavailableStop,
+    /// A process the process-group scan could see for this invocation, the
+    /// leader or a live member of its process group, was outside the
+    /// invocation cgroup, or that could not be checked. The cgroup counter
+    /// then cannot be shown to hold all of the invocation's CPU, so the
+    /// invocation was stopped (its process group killed, when the leader had
+    /// already exited) and charges no CPU.
+    CgroupMembershipStop,
     WaitError,
 }
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -653,6 +660,7 @@ impl InvocationCpuObservation {
                             TerminationPath::CpuBudgetStop
                                 | TerminationPath::WallBudgetStop
                                 | TerminationPath::AccountingUnavailableStop
+                                | TerminationPath::CgroupMembershipStop
                         ),
                     },
                     "wait operation differs from initiating branch",
@@ -761,6 +769,13 @@ impl InvocationCpuObservation {
                 matches!(self.final_wait, FinalWaitObservation::Reaped { .. }),
                 "completed wait did not reap the leader",
             )?,
+            // Only an invocation measured by its own cgroup has a cgroup
+            // membership to check.
+            TerminationPath::CgroupMembershipStop => require(
+                matches!(&self.live, LiveCpuObservation::Enabled(live)
+                    if live.source == LiveCpuSource::CgroupV2InvocationCpuStatV1),
+                "cgroup membership stop without the invocation cgroup source",
+            )?,
             TerminationPath::NonterminalWait4Return => require(
                 matches!(
                     self.final_wait,
@@ -793,6 +808,7 @@ impl InvocationCpuObservation {
                 None
             }
             TerminationPath::AccountingUnavailableStop
+            | TerminationPath::CgroupMembershipStop
             | TerminationPath::NotStarted
             | TerminationPath::SpawnFailed => None,
         };
@@ -1571,6 +1587,65 @@ pub(crate) mod tests {
         assert!(!valid(&unknown));
         let raw = serde_json::to_string(&unknown).unwrap();
         assert!(crate::ledger::read_schema10_source_result(raw.as_bytes()).is_err());
+    }
+
+    #[test]
+    fn a_cgroup_membership_stop_charges_nothing_and_only_follows_a_cgroup_meter() {
+        let stopped = |source: &str| {
+            let mut row = executed_row();
+            let i = &mut row["cpu_observations"]["invocations"][0];
+            i["live"] = enabled();
+            i["live"]["source"] = json!(source);
+            i["live"]["first"]["cpu_usec"] = json!(7);
+            i["live"]["last"]["cpu_usec"] = json!(9);
+            i["live"]["high_water"] = i["live"]["last"].clone();
+            i["termination"] = json!("cgroup_membership_stop");
+            i["returned_cpu_charge"] = json!({"state":"unavailable"});
+            row
+        };
+        let row = stopped("cgroup_v2_invocation_cpu_stat_v1");
+        assert!(valid(&row));
+        let raw = serde_json::to_string(&row).unwrap();
+        assert!(crate::ledger::read_schema10_source_result(raw.as_bytes()).is_ok());
+        let invocation: InvocationCpuObservation =
+            serde_json::from_value(row["cpu_observations"]["invocations"][0].clone()).unwrap();
+        assert_eq!(
+            invocation.termination,
+            TerminationPath::CgroupMembershipStop
+        );
+        // Neither a success nor a return without a timeout, so no later
+        // invocation, comparison or passing verdict can rest on it.
+        assert!(!invocation.completed_successfully());
+        assert!(!invocation.returned_without_timeout());
+        assert_eq!(invocation.returned_timeout(), None);
+
+        // It never carries a CPU charge, whichever receipt the reap left.
+        for basis in ["final_wait4", "max_trigger_and_final_wait4"] {
+            let mut charged = row.clone();
+            charged["cpu_observations"]["invocations"][0]["returned_cpu_charge"] =
+                json!({"state":"value","cpu_usec":9,"basis":basis});
+            assert!(!valid(&charged), "{basis}");
+        }
+        // Only a cgroup meter has a membership to check.
+        assert!(!valid(&stopped("agent_utils_paired_pidfd_stat_v1")));
+        let mut disabled = row.clone();
+        disabled["cpu_observations"]["invocations"][0]["live"] = json!({"state":"disabled"});
+        assert!(!valid(&disabled));
+        // A trigger belongs only to a CPU-budget stop.
+        let mut triggered = row.clone();
+        let live = &mut triggered["cpu_observations"]["invocations"][0]["live"];
+        live["timeout_trigger"] = live["last"].clone();
+        assert!(!valid(&triggered));
+        // The stop's own waits may fail; a poll wait failure is a wait error.
+        for (operation, expected) in [
+            ("stop_grace", true),
+            ("blocking_stop", true),
+            ("poll", false),
+        ] {
+            let mut unreaped = row.clone();
+            unreaped["cpu_observations"]["invocations"][0]["final_wait"] = json!({"state":"unavailable","operation":operation,"errno":libc::ECHILD,"reason":"fixture wait refusal"});
+            assert_eq!(valid(&unreaped), expected, "{operation}");
+        }
     }
 
     #[test]
