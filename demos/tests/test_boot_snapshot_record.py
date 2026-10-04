@@ -23,6 +23,7 @@ stand-in files, and demo 5's boot_once and demo 6's ensure_boot_snapshot and
 resume_once with QEMU, Hermit and demo 5 replaced.
 """
 
+import ast
 import contextlib
 import hashlib
 import io
@@ -994,6 +995,55 @@ class Demo5RecordTest(_StandIns):
             dc.verify_boot_snapshot(custom, self.root, self.assets)
         self.assertFalse(self.snapshot.exists())
         self.assertFalse(dc.boot_snapshot_record_path(self.snapshot).exists())
+
+
+class WriteBootSnapshotRecordDocumentationTest(unittest.TestCase):
+    """write_boot_snapshot_record's docstring names the producer demo 5 passes.
+
+    Review finding R7-8 on https://github.com/rrnewton/hermit/pull/3703: it
+    said ``producer`` "is what initramfs_producer returned before the boot",
+    but demo 5 passes what booted_initramfs_producer returned for the private
+    copy of the initramfs that QEMU boots.
+    """
+
+    def test_the_docstring_names_booted_initramfs_producer(self):
+        doc = " ".join(dc.write_boot_snapshot_record.__doc__.split())
+        self.assertIn(
+            "Demo 5 passes what booted_initramfs_producer returned before the boot for "
+            "the private copy of the initramfs that QEMU boots",
+            doc,
+        )
+        self.assertNotIn("is what initramfs_producer returned", doc)
+
+    def test_demo_5_passes_what_booted_initramfs_producer_returned(self):
+        # What the docstring says is what demo 5 does: every record it writes
+        # gets ``producer``, and ``producer`` is set once, from
+        # booted_initramfs_producer.
+        tree = ast.parse((DEMOS_DIR / "05-qemu-boot" / "run.py").read_text())
+        records = [
+            node.args[2]
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "write_boot_snapshot_record"
+        ]
+        producer = ast.dump(ast.Name(id="producer", ctx=ast.Load()))
+        self.assertEqual([ast.dump(argument) for argument in records], [producer, producer])
+        assigned = [
+            node.value
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+            and any(
+                isinstance(target, ast.Name) and target.id == "producer"
+                for target in (node.targets if isinstance(node, ast.Assign) else [node.target])
+            )
+        ]
+        self.assertEqual(len(assigned), 1)
+        self.assertIsInstance(assigned[0], ast.Call)
+        self.assertEqual(
+            ast.dump(assigned[0].func),
+            ast.dump(ast.Name(id="booted_initramfs_producer", ctx=ast.Load())),
+        )
 
 
 class Demo7EnsureBootSnapshotTest(_StandIns):
