@@ -155,7 +155,14 @@
       # Native libraries need both their runtime and development outputs. A Nix
       # image does not populate FHS search paths, so the environment below makes
       # these exact pinned outputs visible to build scripts and the C compiler.
-      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl ];
+      # xz supplies liblzma. Nixpkgs' libunwind.pc lists `-llzma` in
+      # Libs.private, and reverie-ptrace's build script asks pkg-config for
+      # libunwind-ptrace's --static closure, so every link of a crate that
+      # depends on reverie-ptrace names -llzma. The library was already in the
+      # image closure (libunwind's runtime and dev outputs reference it) but
+      # not on LIBRARY_PATH, which made the link fail with
+      # `unable to find library -llzma`.
+      nativeLibs = with pkgs; [ libunwind elfutils zlib openssl xz ];
       # ⚠️ unixtools.xxd IS A BUILD DEPENDENCY, NOT A CONVENIENCE. e9patch's Makefile
       # generates two C sources by running `xxd -i` over its loader binaries
       # (Makefile:73 and :79). Without it the build dies at `Error 127` -- command not
