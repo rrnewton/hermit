@@ -2449,6 +2449,26 @@ fn prepare_kvm_mountinfo_config(
     Ok(())
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3695): Review
+// host metadata timestamps for KVM runs.
+/// Whether a KVM run asks the backend for the timestamps the kernel stored
+/// rather than its fixed value.
+///
+/// With virtual metadata, Detcore rewrites every timestamp that a stat call
+/// returns to the guest, and it reads the stored host values for its own
+/// checks: `set_file_times` confirms that `utimensat` stored the requested
+/// mtime. KVM replaces those timestamps with a fixed value unless the run asks
+/// for the stored ones. The backend refuses this setting unless Detcore owns
+/// every guest thread. The stored values sit in the guest's buffer until
+/// Detcore rewrites them, so the run must also sequentialize threads: then no
+/// other guest thread runs in that interval.
+fn kvm_reports_stored_metadata_timestamps(config: &DetConfig) -> bool {
+    config.virtualize_metadata
+        && config.backend_dispatches_thread_tools
+        && config.sequentialize_threads
+}
+
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
 async fn run_kvm(
     command: &Command,
@@ -2565,6 +2585,11 @@ async fn run_kvm(
     // needed.
     if !config.backend_dispatches_thread_tools {
         backend.unmonitored_threads();
+    }
+    if kvm_reports_stored_metadata_timestamps(&config) {
+        backend
+            .set_host_metadata_timestamps(true)
+            .map_err(|error| anyhow!("failed to configure KVM metadata timestamps: {error}"))?;
     }
 
     let execution_started = Instant::now();
@@ -5190,6 +5215,46 @@ mod tests {
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
         assert!(!ptrace.backend_virtualizes_capability_prctls);
         assert!(!ptrace.backend_defers_vfork_child_registration);
+    }
+
+    #[test]
+    fn kvm_reports_stored_metadata_timestamps_only_for_sequential_tool_threads() {
+        let sequential = prepare_backend_config(
+            super::DetConfig {
+                sequentialize_threads: true,
+                virtualize_metadata: true,
+                ..super::DetConfig::default()
+            },
+            Backend::Kvm,
+        );
+        assert!(sequential.backend_dispatches_thread_tools);
+        assert!(super::kvm_reports_stored_metadata_timestamps(&sequential));
+
+        // Another guest thread could read the stored values before Detcore
+        // rewrites them.
+        let concurrent = super::DetConfig {
+            sequentialize_threads: false,
+            ..sequential.clone()
+        };
+        assert!(!super::kvm_reports_stored_metadata_timestamps(&concurrent));
+
+        // Nothing rewrites the stored values.
+        let host_metadata = super::DetConfig {
+            virtualize_metadata: false,
+            ..sequential.clone()
+        };
+        assert!(!super::kvm_reports_stored_metadata_timestamps(
+            &host_metadata
+        ));
+
+        // The backend owns the threads, so no Detcore rewrite runs on them.
+        let host_threads = super::DetConfig {
+            backend_dispatches_thread_tools: false,
+            ..sequential
+        };
+        assert!(!super::kvm_reports_stored_metadata_timestamps(
+            &host_threads
+        ));
     }
 
     #[test]
