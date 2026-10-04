@@ -134,7 +134,6 @@ system-utils/openssl-rand naked -
 system-utils/openssl-x509 naked -
 system-utils/proc-random-uuid naked -
 system-utils/proc-uptime naked -
-system-utils/procfs-sanitized-paths verify ptrace
 system-utils/random-device naked -
 system-utils/shuf-permutation naked -
 system-utils/sort-random naked -

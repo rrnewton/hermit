@@ -581,7 +581,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and sync_cells_round_trips_a_parity_selected_kvm_cell, added in 32053b6d
     // (https://github.com/rrnewton/hermit/issues/3606) without a pin change;
     // `cargo nextest list --profile ci` over this node's selection measured 847.
-    ("test.regular_crates", 847),
+    // test-harness's sync_cells_records_disabling_an_optional_cell, added in
+    // 6166181d8f (the same issue) without a pin change, retains all 847 prior
+    // identities (`cargo nextest list --profile ci` measured 848).
+    ("test.regular_crates", 848),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1056,8 +1059,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The detcore-model named-seed test listed for test.regular_crates retains
     // all 843 prior identities.
     // The three sync-cells tests of 32053b6d listed for test.regular_crates
-    // bring the measured count to 847.
-    ("test.regular_crates_on_host", 847),
+    // bring the measured count to 847, and the optional-cell sync test of
+    // 6166181d8f listed there to 848.
+    ("test.regular_crates_on_host", 848),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
