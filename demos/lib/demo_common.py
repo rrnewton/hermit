@@ -1619,6 +1619,12 @@ def wait_for_process(
     ``start_new_session=True``; once the process exits, drain_output keeps the
     same cap while the rest of its output is copied.
 
+    The exit status is returned without reaping the process: until it is
+    reaped, Linux gives its PID, and the process group ID it leads, to no other
+    process, so a later stop_process_group cannot signal one that reused them.
+    The caller reaps it with stop_process_group (or stop_process) when it is
+    done with the group.
+
     When ``first_output_label`` is set (used with ``stream_path``), a live
     seconds-counter ticks until the very first byte of streamed output appears,
     then freezes as ``(N.Ns to first output)``. For the QEMU boot demo this makes
@@ -1668,7 +1674,7 @@ def wait_for_process(
                     sys.stdout.buffer.write(chunk)
                     sys.stdout.buffer.flush()
 
-            return_code = process.poll()
+            return_code = _exit_status_without_reaping(process)
             if return_code is not None:
                 if stream is not None:
                     chunk = stream.read()
@@ -1877,6 +1883,92 @@ class SerialSession:
         self.transcript.close()
 
 
+def _exit_status_without_reaping(process: subprocess.Popen) -> Optional[int]:
+    """The exit status of ``process`` once it has exited, else None; never reaps it.
+
+    The status is what Popen.returncode would hold: the exit code, or minus the
+    number of the signal that ended the process. Popen.poll() and Popen.wait()
+    reap the child, after which Linux may give its PID, and the process group
+    ID it led, to a new process. This asks with waitid(WNOWAIT) instead, which
+    leaves an exited child a zombie: until it is reaped, its PID and its group
+    ID remain its own, so a signal sent to either cannot reach another process.
+    """
+    if process.returncode is not None:
+        return process.returncode
+    try:
+        info = os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT)
+    except ChildProcessError:
+        # Reaped elsewhere, not through this Popen; let it record that.
+        return process.poll()
+    if info is None:
+        return None
+    if info.si_code == os.CLD_EXITED:
+        return info.si_status
+    return -info.si_status
+
+
+def _wait_without_reaping(process: subprocess.Popen, timeout: float) -> Optional[int]:
+    """Wait up to ``timeout`` seconds for ``process`` to exit, without reaping it.
+
+    Returns its exit status, or None if it is still running.
+    """
+    deadline = time.monotonic() + timeout
+    delay = 0.0005
+    while True:
+        status = _exit_status_without_reaping(process)
+        if status is not None:
+            return status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        delay = min(delay * 2, remaining, 0.05)
+        time.sleep(delay)
+
+
+def _signal_unreaped(process: subprocess.Popen, group: Optional[int], sig: int) -> None:
+    """Send ``sig`` to process group ``group``, or else to ``process`` alone.
+
+    Only for a ``process`` that has not been reaped, so that neither number can
+    belong to anything else. ``group`` is ``process``'s PID when it leads its
+    own group, else None.
+    """
+    if group is not None:
+        try:
+            os.killpg(group, sig)
+            return
+        except (ProcessLookupError, PermissionError):
+            pass
+    try:
+        os.kill(process.pid, sig)
+    except OSError:
+        pass
+
+
+def _stop_unreaped(process: subprocess.Popen) -> None:
+    """stop_process without the reaping: the child is left for the caller to reap.
+
+    Sends nothing if ``process`` had already exited when this was called, and
+    nothing more once it turns out to have been reaped elsewhere (its numbers
+    may then belong to another process already).
+    """
+    if _exit_status_without_reaping(process) is not None:
+        return
+    group: Optional[int] = None
+    try:
+        if os.getpgid(process.pid) == process.pid:
+            group = process.pid
+    except OSError:
+        group = None
+    _signal_unreaped(process, group, signal.SIGTERM)
+    _wait_without_reaping(process, 10)
+    if process.returncode is not None:
+        return
+    # Sent even if the child has exited meanwhile: the rest of its group may
+    # still be running. The child is still unreaped, so the group ID is its own.
+    _signal_unreaped(process, group, signal.SIGKILL)
+    _wait_without_reaping(process, 10)
+
+
 def stop_process(process: Optional[subprocess.Popen]) -> None:
     """Stop a launched child, and its descendants when it leads its own group.
 
@@ -1886,52 +1978,78 @@ def stop_process(process: Optional[subprocess.Popen]) -> None:
     the whole tree. That is only safe when the child leads a group of its own
     (otherwise the group is ours and we would kill the demo), so callers launch
     long-running children with ``start_new_session=True``.
+
+    SIGTERM, up to 10 seconds for the child to exit, then SIGKILL and up to 10
+    more. The child is reaped only after the SIGKILL has been sent: until then
+    Linux gives its PID, and the group ID it leads, to no other process, so
+    neither signal can reach a process that reused them. Nothing is sent to a
+    child that has already exited; it is only reaped.
     """
-    if process is None or process.poll() is not None:
+    if process is None or process.returncode is not None:
         return
-    group: Optional[int] = None
-    try:
-        if os.getpgid(process.pid) == process.pid:
-            group = process.pid
-    except (OSError, ProcessLookupError):
-        group = None
+    _stop_unreaped(process)
+    process.poll()
 
-    def signal_all(sig: int) -> None:
-        if group is not None:
-            try:
-                os.killpg(group, sig)
-                return
-            except (ProcessLookupError, PermissionError):
-                pass
+
+def _other_group_members(group: int, leader: int) -> bool:
+    """Whether a process other than ``leader`` is in process group ``group``.
+
+    Reads the group ID of every process in /proc. A member that has exited but
+    has not been reaped counts, as it does for kill(). A member this process may
+    not signal does not count: nothing more can be done about it from here.
+    Permission is asked through a pidfd with signal 0, which delivers nothing.
+    """
+    wanted = str(group).encode()
+    for entry in os.scandir("/proc"):
+        name = entry.name
+        if not name.isdigit() or int(name) == leader:
+            continue
         try:
-            process.send_signal(sig)
-        except (ProcessLookupError, OSError):
-            pass
+            descriptor = os.open("/proc/{}/stat".format(name), os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            data = os.read(descriptor, 4096)
+        except OSError:
+            continue
+        finally:
+            os.close(descriptor)
+        # The command name (field 2) is in parentheses and may contain spaces
+        # and parentheses; state, parent and process group follow the last ")".
+        fields = data[data.rfind(b")") + 2 :].split(b" ", 3)
+        if len(fields) < 3 or fields[2] != wanted:
+            continue
+        try:
+            pidfd = os.pidfd_open(int(name))
+        except ProcessLookupError:
+            continue
+        except (AttributeError, OSError):
+            return True  # Cannot ask; count it.
+        try:
+            signal.pidfd_send_signal(pidfd, 0)
+        except (ProcessLookupError, PermissionError):
+            continue
+        except OSError:
+            return True
+        finally:
+            os.close(pidfd)
+        return True
+    return False
 
-    signal_all(signal.SIGTERM)
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        pass
-    signal_all(signal.SIGKILL)
-    try:
-        process.wait(timeout=10)
-    except subprocess.TimeoutExpired:
-        pass
 
+def _group_empty(process: subprocess.Popen, group: int, timeout: float) -> bool:
+    """Whether ``process`` exits and its process group ``group`` empties within ``timeout`` seconds.
 
-def _group_empty(group: int, timeout: float) -> bool:
-    """Whether process group ``group`` empties within ``timeout`` seconds.
-
-    A member that has exited but not yet been reaped still counts. A group whose
-    remaining members this process may not signal counts as empty: nothing more
-    can be done about them from here.
+    ``process`` leads the group and counts until it has exited; it is not
+    reaped here, which keeps the group ID its own. Any other member that has
+    exited but not yet been reaped still counts; a member this process may not
+    signal does not (see _other_group_members).
     """
     deadline = time.monotonic() + timeout
     while True:
-        try:
-            os.killpg(group, 0)
-        except (ProcessLookupError, PermissionError):
+        if _exit_status_without_reaping(process) is not None and not _other_group_members(
+            group, process.pid
+        ):
             return True
         if time.monotonic() >= deadline:
             return False
@@ -1939,36 +2057,38 @@ def _group_empty(group: int, timeout: float) -> bool:
 
 
 def stop_process_group(process: Optional[subprocess.Popen]) -> None:
-    """Stop a launched child and everything left in its process group.
+    """Stop a launched child and everything left in its process group, then reap the child.
 
     stop_process does nothing once the child has exited, but processes the
     child started stay in its group and can keep running, still writing to the
     output they inherited from it. This stops the child if it is still running
-    (with stop_process), then signals the group itself: SIGTERM, up to 10
+    (as stop_process does), then signals the group itself: SIGTERM, up to 10
     seconds for the group to empty, then SIGKILL and up to 10 more.
 
     It is meant for children started with ``start_new_session=True``, whose
-    group ID is the child's PID. Linux does not give that number to a new
-    process while any member of the group exists, so the signal reaches only
-    the child's own processes. Once the group is empty, the number can be
-    given out again, and a new process that made it a group ID before this
-    runs would receive the signal; that needs the PID counter to wrap (pid_max
-    numbers) between the last member's exit and this call. The caller's own
+    group ID is the child's PID. Linux gives that number to no other process
+    while the child is unreaped, even after it has exited, and the child is
+    reaped only here, after the last signal (wait_for_process and drain_output
+    leave it unreaped), so every signal reaches only the child's own group.
+    A child that was reaped before this call may have had its PID and group ID
+    given to another process since, so nothing is sent then. The caller's own
     group is never signalled.
     """
-    if process is None:
+    if process is None or process.returncode is not None:
         return
-    stop_process(process)
+    _stop_unreaped(process)
     group = process.pid
-    if group == os.getpgrp():
-        return
-    for sig in (signal.SIGTERM, signal.SIGKILL):
-        try:
-            os.killpg(group, sig)
-        except (ProcessLookupError, PermissionError):
-            return
-        if _group_empty(group, 10):
-            return
+    if group != os.getpgrp():
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            if process.returncode is not None:
+                break  # Reaped elsewhere meanwhile.
+            try:
+                os.killpg(group, sig)
+            except (ProcessLookupError, PermissionError):
+                break
+            if _group_empty(process, group, 10):
+                break
+    process.poll()
 
 
 def drain_output(
@@ -1991,7 +2111,18 @@ def drain_output(
     time.monotonic() value; by default, when this call began). If the output
     is still open after ``timeout`` seconds, the group is stopped and
     RuntimeError is raised, naming ``label``.
+
+    ``process`` must not have been reaped yet: wait for it with
+    wait_for_process, not Popen.wait() or Popen.poll(). The group can only be
+    signalled safely while its leader is unreaped (see stop_process_group), so
+    a reaped ``process`` raises ValueError before anything is waited for.
     """
+    if process.returncode is not None:
+        raise ValueError(
+            "drain_output needs {} unreaped, but it was already reaped (exit status "
+            "{}), so the processes it left in its group can no longer be stopped "
+            "safely; wait for it with wait_for_process".format(label, process.returncode)
+        )
     began = time.monotonic()
     if started is None:
         started = began
