@@ -18,21 +18,23 @@
 //! 1. The retired-id map renames exactly the documented ids: every id is the
 //!    bucket-prefix rename except the one collision, and it is a bijection onto
 //!    live ids.
-//! 2. The committed CI plan selects 1105 cells, with per-(lane, backend, mode)
+//! 2. The committed CI plan selects 1233 cells, with per-(lane, backend, mode)
 //!    counts equal to the pre-fold plan's plus exactly the cells slice S13
 //!    added (895 portable and 5 privileged), the 189 portable cells of the
 //!    compatibility-corpus fold, the 2 portable select replay cells and the 6
 //!    portable KVM verify selections, the three socket selections, and one
 //!    poll-readiness, one epoll-pwait2, one fsync-durability, one fcntl-owner
-//!    and one msync-writeback selection,
+//!    and one msync-writeback selection, and the 128 portable SaBRe verify
+//!    cells promoted on 2026-10-03,
 //!    after applying the later lane moves listed
-//!    in `LATER_LANE_MOVES` (now 1098 portable and 7 privileged).
+//!    in `LATER_LANE_MOVES` (now 1226 portable and 7 privileged).
 //! 3. The committed compatibility cell table has 14800 rows, with
 //!    per-(backend, mode, status) counts equal to the pre-fold table's plus
 //!    exactly the rows slice S13 added or reclassified and the 3024 rows of the
 //!    compatibility-corpus fold, plus the 2 select replay and 6 KVM verify
 //!    selection changes, plus three socket, one poll-readiness, one epoll-pwait2,
 //!    one fsync-durability, one fcntl-owner and one msync-writeback selection,
+//!    and the 128 SaBRe verify promotions of 2026-10-03,
 //!    that keep the row total unchanged, plus the later SaBRe, strict and rr
 //!    compatibility folds described below.
 //! 4. The command the c-programs nodes run refuses a selection of zero cells,
@@ -307,6 +309,20 @@ const KVM_MSYNC_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] = &[("portable", "k
 const KVM_MSYNC_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
     ("kvm", "verify", "green", 1),
     ("kvm", "verify", "not-applicable", -1),
+];
+
+/// The 2026-10-03 SaBRe promotion (`SABRE_2026_10_03_*` in
+/// `ci/manifest-plan/src/timeouts.rs`): 128 SaBRe verify cells that passed 10 of
+/// 10 no-retry pressure runs become required, all portable. 120 of them were
+/// declared not applicable and 8 were enabled but kept out of CI (red); 116 are
+/// c-programs cells, 10 system-utils, 1 determinism-stress-c and 1
+/// language-runtimes. The ordinary bounds are unchanged.
+const SABRE_2026_10_03_PLAN_ADDITIONS: &[(&str, &str, &str, usize)] =
+    &[("portable", "sabre", "verify", 128)];
+const SABRE_2026_10_03_CELL_DELTAS: &[(&str, &str, &str, isize)] = &[
+    ("sabre", "verify", "green", 128),
+    ("sabre", "verify", "not-applicable", -120),
+    ("sabre", "verify", "red", -8),
 ];
 
 /// Cells that later changes moved between lanes after the fold, as
@@ -638,11 +654,12 @@ fn the_committed_plan_keeps_its_cell_counts() {
     // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
     // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
     // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+    // The 128 portable SaBRe verify cells of `SABRE_2026_10_03_PLAN_ADDITIONS`.
     assert_eq!(
         (cells.len(), lane("portable"), lane("privileged")),
         (
-            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1
+            900 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 128,
+            895 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 128
                 - moved_out("portable")
                 + moved_in("portable"),
             5 - moved_out("privileged") + moved_in("privileged"),
@@ -651,7 +668,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
     assert_eq!(
         (lane("portable"), lane("privileged")),
         (
-            893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+            893 + COMPAT_FOLD_TESTS + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 128,
             7
         ),
         "the lane moves above are the only ones since the fold"
@@ -700,6 +717,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         .chain(KVM_FSYNC_PLAN_ADDITIONS)
         .chain(KVM_FCNTL_OWNER_PLAN_ADDITIONS)
         .chain(KVM_MSYNC_PLAN_ADDITIONS)
+        .chain(SABRE_2026_10_03_PLAN_ADDITIONS)
     {
         *expected
             .entry((lane.into(), backend.into(), mode.into()))
@@ -726,7 +744,8 @@ fn the_committed_plan_keeps_its_cell_counts() {
     // cell of `KVM_EPOLL_PWAIT2_PLAN_ADDITIONS`, plus one fsync-durability
     // cell of `KVM_FSYNC_PLAN_ADDITIONS` and one fcntl-owner cell
     // of `KVM_FCNTL_OWNER_PLAN_ADDITIONS`, plus one msync-writeback cell
-    // of `KVM_MSYNC_PLAN_ADDITIONS` above.
+    // of `KVM_MSYNC_PLAN_ADDITIONS` above, and the 116 c-programs cells of
+    // `SABRE_2026_10_03_PLAN_ADDITIONS`.
     let retirement = retired_ids();
     let successors = retirement.successors_of(RETIRED_BUCKET).unwrap();
     let mut by_bucket = BTreeMap::<(String, String), usize>::new();
@@ -747,7 +766,7 @@ fn the_committed_plan_keeps_its_cell_counts() {
         BTreeMap::from([
             (
                 ("portable".into(), "c-programs".into()),
-                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1
+                437 + 276 + 29 + SELECT_REPLAY_TESTS + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116
             ),
             (("privileged".into(), "c-programs".into()), 3 + 1),
         ])
@@ -799,6 +818,7 @@ fn the_committed_cell_table_keeps_its_row_counts() {
         .chain(KVM_FSYNC_CELL_DELTAS.iter().copied())
         .chain(KVM_FCNTL_OWNER_CELL_DELTAS.iter().copied())
         .chain(KVM_MSYNC_CELL_DELTAS.iter().copied())
+        .chain(SABRE_2026_10_03_CELL_DELTAS.iter().copied())
     {
         let count = expected
             .entry((backend.into(), mode.into(), status.into()))

@@ -107,6 +107,10 @@ use crate::timeouts::NON_CI_CELL_COUNT;
 use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 #[cfg(test)]
+use crate::timeouts::SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS;
+#[cfg(test)]
+use crate::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT;
+#[cfg(test)]
 use crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::SELECT_REPLAY_2026_10_03_TESTS;
@@ -4648,8 +4652,16 @@ fn monitor_process<R>(
                 }
                 Err(error) => {
                     let reason = error.reason;
-                    let missing_since = cpu_accounting_missing_since.get_or_insert(now);
-                    if now.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
+                    // Time the grace from when the failed sample returned, not
+                    // from `now`, which was taken before it ran. One host-wide
+                    // /proc census can itself outlast the grace, and proccpu
+                    // then serves its refusal again for 500 ms
+                    // (https://github.com/rrnewton/hermit/issues/3377). Timed
+                    // from `now`, that census alone would stop the command at
+                    // the next poll, with no fresh sample in between.
+                    let failed_at = Instant::now();
+                    let missing_since = cpu_accounting_missing_since.get_or_insert(failed_at);
+                    if failed_at.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
                         observation.termination = TerminationPath::AccountingUnavailableStop;
                         return match stop_process_group(pid, started, &mut observation.final_wait) {
                             Ok(_) => Err(format!(
@@ -8567,7 +8579,26 @@ mod tests {
                 + 1
                 // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
                 + 1
+                + SABRE_2026_10_03_SELECTED_CI_CELL_COUNT
         );
+        // The SaBRe verify selections of 2026-10-03 have the ordinary bounds,
+        // and the ones that were enabled with ci:false are now required.
+        fn sabre_verify<'a>(
+            population: &'a [SelectedCell],
+            test: &str,
+        ) -> Option<&'a SelectedCell> {
+            population.iter().find(|cell| {
+                cell.id.test == test
+                    && cell.id.mode == "verify"
+                    && cell.id.backend.as_deref() == Some("sabre")
+            })
+        }
+        for test in SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS {
+            let cell = sabre_verify(&required, test)
+                .unwrap_or_else(|| panic!("{test} verify/sabre is not required"));
+            assert_eq!(cell.cpu_timeout_seconds, DEFAULT_TEST_CPU_TIMEOUT_SECONDS);
+            assert_eq!(cell.timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
+        }
         // Slice S13 of https://github.com/rrnewton/hermit/issues/3301 selected three
         // DBT verify cells that were enabled with ci:false and enabled one new
         // ci:false DBT verify cell; the timeouts module names them.
@@ -8599,7 +8630,8 @@ mod tests {
             NON_CI_CELL_COUNT
                 - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
                 - DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS.len()
-                + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len(),
+                + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len()
+                - SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS.len(),
             "the current manifest census records every enabled ci:false cell"
         );
 
@@ -9459,6 +9491,122 @@ mod tests {
         assert_eq!(live.valid_polls, 1);
         assert!(live.unavailable_polls > 1);
         assert!(matches!(live.last_error, RequiredNullable::Value(_)));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_slow_failed_sample_does_not_use_up_the_unavailable_grace() {
+        // One host-wide /proc census can outlast the whole grace. proccpu then
+        // refuses it ("scan deadline") and serves that refusal again for 500 ms
+        // (https://github.com/rrnewton/hermit/issues/3377). The grace is timed
+        // from when the failed sample returned, so the refusal served right
+        // after a slow census cannot stop the command before a fresh sample
+        // runs. The samples are synthetic so the sequence is exact on any host.
+        let root = cpu_reader_test_root("reader-slow-failure");
+        let done = root.join("done");
+        let (child, started, mut observation) = spawn_cpu_reader_fixture(
+            &root,
+            "slow",
+            "while [ ! -f done ]; do sleep 0.02; done",
+            true,
+        );
+        let pid = child.id();
+        let mut samples = 0;
+        let output = monitor_process(
+            child,
+            ProcessLimits {
+                deadline: Instant::now() + Duration::from_secs(10),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            |_| {
+                samples += 1;
+                match samples {
+                    1 => {
+                        std::thread::sleep(CELL_CPU_ACCOUNTING_GRACE + Duration::from_millis(200));
+                        Err("fixture scan deadline".into())
+                    }
+                    2 => Err("fixture scan deadline".into()),
+                    _ => {
+                        fs::write(&done, b"complete").map_err(|error| error.to_string())?;
+                        Ok(0.0)
+                    }
+                }
+            },
+        )
+        .expect("a slow failed sample followed by a valid one must not stop the command");
+        assert!(output.status.success());
+        assert_eq!(output.timeout, None);
+        assert!(started.elapsed() > CELL_CPU_ACCOUNTING_GRACE);
+        assert!(samples >= 3);
+        assert!(done.is_file());
+        assert!(owned_child_is_reaped(pid));
+        assert_process_observation(&observation, &output);
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.unavailable_polls, 2);
+        assert!(live.valid_polls >= 1);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_slow_census_that_keeps_failing_still_stops_the_command() {
+        // The refusal above never clears here: every fresh census takes 1 s and
+        // fails, and its refusal is served again for 500 ms, as proccpu does
+        // (https://github.com/rrnewton/hermit/issues/3377). The command must
+        // still be stopped and reaped through the accounting stop, at least
+        // the grace after the first failed census returned. The grace is only
+        // checked when a sample returns, so the census running when it expires
+        // adds its own length: there is no fixed stop time.
+        let root = cpu_reader_test_root("reader-slow-permanent-failure");
+        let (child, started, mut observation) =
+            spawn_cpu_reader_fixture(&root, "permanent", "exec sleep 30", true);
+        let pid = child.id();
+        let mut censuses = 0;
+        let mut last_census_returned: Option<Instant> = None;
+        let mut first_census_returned: Option<Instant> = None;
+        let result = monitor_process(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(15),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            |_| {
+                if last_census_returned
+                    .is_none_or(|returned| returned.elapsed() >= Duration::from_millis(500))
+                {
+                    censuses += 1;
+                    std::thread::sleep(Duration::from_secs(1));
+                    let returned = Instant::now();
+                    last_census_returned = Some(returned);
+                    first_census_returned.get_or_insert(returned);
+                }
+                Err("fixture scan deadline".into())
+            },
+        );
+        let error = result
+            .map(|_| ())
+            .expect_err("a census that never succeeds must stop the command");
+        assert!(error.contains("sampling: fixture scan deadline"), "{error}");
+        assert_eq!(
+            observation.termination,
+            TerminationPath::AccountingUnavailableStop
+        );
+        assert!(first_census_returned.unwrap().elapsed() >= CELL_CPU_ACCOUNTING_GRACE);
+        // The cached refusal ends 500 ms after the first census returns, inside
+        // the grace, so a fresh census ran before the stop.
+        assert!(censuses >= 2, "{censuses}");
+        assert!(owned_child_is_reaped(pid));
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.valid_polls, 0);
+        assert!(live.unavailable_polls >= 2);
+        measured_final_cpu(&observation);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -12768,7 +12916,9 @@ exit "$(cat "$PWD/exit-status")"
         // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
         // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
         // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1 + 1 + 1 + 1);
+        // 89 SaBRe candidates from the 2026-10-03 selection of ten-for-ten
+        // SaBRe verify cells (timeouts::SABRE_2026_10_03_EVIDENCE_SHA).
+        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89);
         let mut by_backend = BTreeMap::new();
         for cell in &candidates {
             *by_backend
@@ -12781,7 +12931,7 @@ exit "$(cat "$PWD/exit-status")"
                 ("dbt", 1),
                 ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1 + 1),
                 ("liteinst", 97),
-                ("sabre", 1)
+                ("sabre", 1 + 89)
             ])
         );
         assert!(
@@ -12811,8 +12961,8 @@ exit "$(cat "$PWD/exit-status")"
         }
     }
 
-    /// The kvm, liteinst and sabre candidates pinned above (75 + 6 + 3 + 1, 97 and 1) used to
-    /// add a ptrace reference run and a `hermit log-diff` comparison, and the
+    /// The kvm, liteinst and sabre candidates pinned above (75 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+    /// 97 and 1 + 89) used to add a ptrace reference run and a `hermit log-diff` comparison, and the
     /// comparison could overwrite their outcome. Since
     /// https://github.com/rrnewton/hermit/issues/3301 each one runs only its own
     /// backend's strict verification, even when its log differs from ptrace's.

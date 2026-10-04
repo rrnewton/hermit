@@ -14723,19 +14723,22 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
     // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
     // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+    // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*) adds 128
+    // portable SaBRe verify cells, none of them kvm: 116 c-programs, 10
+    // system-utils, 1 determinism-stress-c and 1 language-runtimes.
     let portable_partial: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
         (
             "e2e.manifest_c_programs",
             195 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-            744 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+            744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116,
         ),
         ("e2e.manifest_data_handling", 1, 7),
         ("e2e.manifest_debugger_c", 1, 4),
         ("e2e.manifest_determinism_stress", 2, 8),
-        ("e2e.manifest_determinism_stress_c", 2, 14),
-        ("e2e.manifest_language_runtimes", 14, 33),
-        ("e2e.manifest_system_utils", 25, 74),
+        ("e2e.manifest_determinism_stress_c", 2, 14 + 1),
+        ("e2e.manifest_language_runtimes", 14, 33 + 1),
+        ("e2e.manifest_system_utils", 25, 74 + 10),
     ];
     let privileged_partial: &[(&str, usize, usize)] = &[
         ("privileged-e2e.manifest_c_programs", 1, 4),
@@ -14804,9 +14807,9 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         .iter()
         .find(|b| b.lane == "portable" && b.category == "c-programs")
         .ok_or("host-inapplicable cells: required plan lost portable/c-programs")?;
-    if c_programs.selected != 744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 || c_programs.withheld != 0 {
+    if c_programs.selected != 744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116 || c_programs.withheld != 0 {
         return Err(format!(
-            "host-inapplicable cells: with KVM present all 758 portable/c-programs cells must be \
+            "host-inapplicable cells: with KVM present all 874 portable/c-programs cells must be \
              counted and none withheld: {c_programs:?}"
         ));
     }
@@ -14946,7 +14949,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     }
 
     println!(
-        "  host-inapplicable cells: plan rows 258 kvm withheld / 758 portable c-programs counted, \
+        "  host-inapplicable cells: plan rows 258 kvm withheld / 874 portable c-programs counted, \
          portable 8 running recorded / 0 withheld, full 10 running recorded / 1 withheld, \
          qualifying 2 complete / violating 2 NO_RESULT, attribution 1 shared / 2 refused"
     );
@@ -15029,19 +15032,20 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
     // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
     // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
     // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+    // The 128 SaBRe verify cells of 2026-10-03 add only selected cells, as above.
     let portable: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
         (
             "e2e.manifest_c_programs",
             195 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-            744 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+            744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116,
         ),
         ("e2e.manifest_data_handling", 1, 7),
         ("e2e.manifest_debugger_c", 1, 4),
         ("e2e.manifest_determinism_stress", 2, 8),
-        ("e2e.manifest_determinism_stress_c", 2, 14),
-        ("e2e.manifest_language_runtimes", 14, 33),
-        ("e2e.manifest_system_utils", 25, 74),
+        ("e2e.manifest_determinism_stress_c", 2, 14 + 1),
+        ("e2e.manifest_language_runtimes", 14, 33 + 1),
+        ("e2e.manifest_system_utils", 25, 74 + 10),
     ];
     let full_privileged: &[(&str, usize, usize)] = &[
         ("privileged-e2e.manifest_applications", 1, 1),
@@ -15056,7 +15060,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
     let c_programs: &[(&str, usize, usize)] = &[(
         "e2e.manifest_c_programs",
         195 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-        744 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
+        744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116,
     )];
     // (label, argv, expected (tag, kvm cells, selected cells) rows, node-level kvm tag)
     type RefusedCase<'a> = (
@@ -15247,7 +15251,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
 
     println!(
         "  committed cell capability: KVM absent refuses 5 selections (portable 8 nodes / 255 \
-         kvm cells, --only full and --only portable c-programs 209 of 758, full 11 nodes, \
+         kvm cells, --only full and --only portable c-programs 209 of 874, full 11 nodes, \
          privileged 3 nodes) with the graph unchanged; every capability present admits all 5 \
          unchanged; 3 kvm-free selections admitted with KVM absent; unreadable plan refused"
     );
@@ -17023,7 +17027,9 @@ mod nextest_timeout_tests {
                 // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
                 + 1
                 // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-                + 1,
+                + 1
+                // The 128 SaBRe verify cells promoted on 2026-10-03.
+                + hermit_manifest_plan::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT,
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {

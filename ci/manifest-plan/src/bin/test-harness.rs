@@ -5690,11 +5690,13 @@ sys.exit(1 if failed else 0)
         // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
         // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
         // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+        // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*)
+        // selects 89 folded SaBRe verify candidates under the same rule.
         assert_eq!(
             (selection.len(), lines),
             (
-                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1
+                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89,
+                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89
             )
         );
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
@@ -5730,9 +5732,12 @@ sys.exit(1 if failed else 0)
             // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
             // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
             // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+            // The 2026-10-03 SaBRe promotion makes 120 more cells applicable,
+            // each reported by the node that plans its ptrace side; its 8
+            // red-to-green cells were already applicable and reported.
             (
-                628 + 6 + 3 + 1 + 215 + 1 + 1 + 1 + 1,
-                624 + 6 + 3 + 1 + 185 + 1 + 1 + 1 + 1,
+                628 + 6 + 3 + 1 + 215 + 1 + 1 + 1 + 1 + 120,
+                624 + 6 + 3 + 1 + 185 + 1 + 1 + 1 + 1 + 120,
                 4 + 30,
             ),
             "{unreported:?}"

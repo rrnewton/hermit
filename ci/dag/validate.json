@@ -1222,6 +1222,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/aio-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/append-pwrite",
           "mode": "verify",
           "backend": "kvm"
@@ -1239,6 +1246,13 @@
           "test": "c-programs/append-pwrite",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/append-pwrite",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1274,6 +1288,13 @@
           "test": "c-programs/bind-getsockname",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/bind-getsockname",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1355,6 +1376,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/cachestat-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
           "backend": "kvm"
@@ -1372,6 +1400,13 @@
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/child-subreaper-refusal",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1488,6 +1523,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/copy-file-range-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/cpu-virtualization",
           "mode": "verify",
           "backend": "kvm"
@@ -1505,6 +1547,13 @@
           "test": "c-programs/cpu-virtualization",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/cpu-virtualization",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1530,6 +1579,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/cwd-roundtrip",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-copied-tiocgpgrp",
           "mode": "verify",
           "backend": "kvm"
@@ -1547,6 +1603,13 @@
           "test": "c-programs/dbt-copied-tiocgpgrp",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-copied-tiocgpgrp",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1691,6 +1754,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-wait-accounting",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-wait-lifecycle",
           "mode": "verify",
           "backend": "dbt"
@@ -1712,6 +1782,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-wait-lifecycle",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dup-shared-offset",
           "mode": "verify",
           "backend": "kvm"
@@ -1729,6 +1806,13 @@
           "test": "c-programs/dup-shared-offset",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dup-shared-offset",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1796,6 +1880,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/epoll-pwait2",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/epoll-readiness",
           "mode": "verify",
           "backend": "kvm"
@@ -1813,6 +1904,13 @@
           "test": "c-programs/epoll-readiness",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/epoll-readiness",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1831,6 +1929,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/event-delivery-ordering",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/eventfd-semantics",
           "mode": "verify",
           "backend": "kvm"
@@ -1848,6 +1953,13 @@
           "test": "c-programs/eventfd-semantics",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/eventfd-semantics",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1873,6 +1985,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/faccessat2-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/fadvise-hints",
           "mode": "verify",
           "backend": "kvm"
@@ -1890,6 +2009,13 @@
           "test": "c-programs/fadvise-hints",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fadvise-hints",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1915,6 +2041,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/fallocate-extents",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/fchmod-bits",
           "mode": "verify",
           "backend": "kvm"
@@ -1932,6 +2065,13 @@
           "test": "c-programs/fchmod-bits",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fchmod-bits",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1957,6 +2097,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/fchmodat2-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/fcntl-owner",
           "mode": "verify",
           "backend": "kvm"
@@ -1974,6 +2121,13 @@
           "test": "c-programs/fcntl-owner",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fcntl-owner",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -1999,6 +2153,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/fd-duplication",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/file-backed-mmap",
           "mode": "verify",
           "backend": "kvm"
@@ -2016,6 +2177,13 @@
           "test": "c-programs/file-backed-mmap",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/file-backed-mmap",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -2041,6 +2209,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/file-io-roundtrip",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/flock-lifecycle",
           "mode": "verify",
           "backend": "kvm"
@@ -2058,6 +2233,13 @@
           "test": "c-programs/flock-lifecycle",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/flock-lifecycle",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -2118,6 +2300,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/fsync-durability",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/ftruncate-sparse",
           "mode": "verify",
           "backend": "kvm"
@@ -2135,6 +2324,13 @@
           "test": "c-programs/ftruncate-sparse",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ftruncate-sparse",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -2240,6 +2436,13 @@
           "test": "c-programs/get-robust-list-child",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-child",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -2293,6 +2496,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/getcpu-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/getcpu",
           "mode": "verify",
           "backend": "kvm"
@@ -2352,6 +2562,13 @@
           "test": "c-programs/getpriority-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/getpriority-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -2454,6 +2671,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/host-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/inline-syscall-sites",
           "mode": "verify",
           "backend": "kvm"
@@ -2475,6 +2699,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/inline-syscall-sites",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "liteinst"
@@ -2485,6 +2716,13 @@
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-watch",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -2590,6 +2828,13 @@
           "test": "c-programs/ioctl-fionread",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ioctl-fionread",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -2678,6 +2923,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/kcmp-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/keyctl-enosys",
           "mode": "verify",
           "backend": "kvm"
@@ -2737,6 +2989,13 @@
           "test": "c-programs/linkat-flags",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/linkat-flags",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -2797,6 +3056,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/lseek-positioning",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/lsm-get-self-attr-enosys",
           "mode": "verify",
           "backend": "kvm"
@@ -2930,6 +3196,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mce-kill-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/membarrier-query",
           "mode": "verify",
           "backend": "kvm"
@@ -2951,6 +3224,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/membarrier-query",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/memfd-create",
           "mode": "verify",
           "backend": "kvm"
@@ -2968,6 +3248,13 @@
           "test": "c-programs/memfd-create",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/memfd-create",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3098,6 +3385,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mempolicy-default",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mincore-residency",
           "mode": "verify",
           "backend": "kvm"
@@ -3115,6 +3409,13 @@
           "test": "c-programs/mincore-residency",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/mincore-residency",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3140,6 +3441,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mixed-inline-and-libc-syscalls",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mkdir-rmdir",
           "mode": "verify",
           "backend": "kvm"
@@ -3161,6 +3469,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mkdir-rmdir",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mknod-special",
           "mode": "verify",
           "backend": "kvm"
@@ -3178,6 +3493,13 @@
           "test": "c-programs/mknod-special",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/mknod-special",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3196,6 +3518,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mmap-determinism-heap",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mmap-determinism-shared",
           "mode": "verify",
           "backend": "dbt"
@@ -3210,6 +3539,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mmap-determinism-shared",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mmap-determinism",
           "mode": "verify",
           "backend": "dbt"
@@ -3266,6 +3602,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mmap-layout-pointer-order",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mmap-stress-determinism",
           "mode": "verify",
           "backend": "kvm"
@@ -3304,6 +3647,13 @@
           "test": "c-programs/msync-writeback",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/msync-writeback",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3409,6 +3759,13 @@
           "test": "c-programs/name-to-handle-refusal",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/name-to-handle-refusal",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3637,6 +3994,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/no-new-privs-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/numa-node-identity",
           "mode": "verify",
           "backend": "kvm"
@@ -3654,6 +4018,13 @@
           "test": "c-programs/numa-node-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/numa-node-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3679,6 +4050,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/o-tmpfile-anon",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/openat-flags",
           "mode": "verify",
           "backend": "kvm"
@@ -3696,6 +4074,13 @@
           "test": "c-programs/openat-flags",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/openat-flags",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3721,6 +4106,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/openat2-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/path-file-ops",
           "mode": "verify",
           "backend": "kvm"
@@ -3738,6 +4130,13 @@
           "test": "c-programs/path-file-ops",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/path-file-ops",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3752,6 +4151,13 @@
           "test": "c-programs/pause-alarm-interrupt",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pause-alarm-interrupt",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3864,6 +4270,13 @@
           "test": "c-programs/personality-domain",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/personality-domain",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -3924,6 +4337,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/pidfd-open-self-pair",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/pidfd-open-self",
           "mode": "verify",
           "backend": "kvm"
@@ -3973,6 +4393,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/pidfd-waitid-child",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/pipe-capacity-pin",
           "mode": "verify",
           "backend": "kvm"
@@ -3994,6 +4421,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/pipe-capacity-pin",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/pipe-capacity",
           "mode": "verify",
           "backend": "kvm"
@@ -4011,6 +4445,13 @@
           "test": "c-programs/pipe-capacity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pipe-capacity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -4085,6 +4526,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/pipe2-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/poll-readiness",
           "mode": "replay",
           "backend": "ptrace"
@@ -4109,6 +4557,13 @@
           "test": "c-programs/poll-readiness",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/poll-readiness",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -4183,6 +4638,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/prctl-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/prctl-option-policy",
           "mode": "verify",
           "backend": "kvm"
@@ -4197,6 +4659,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/prctl-option-policy",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/prctl-pdeathsig",
           "mode": "verify",
           "backend": "liteinst"
@@ -4207,6 +4676,13 @@
           "test": "c-programs/prctl-pdeathsig",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/prctl-pdeathsig",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -4246,6 +4722,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/preadv2-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/print-memaddrs",
           "mode": "verify",
           "backend": "kvm"
@@ -4256,6 +4739,13 @@
           "test": "c-programs/print-memaddrs",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -4291,6 +4781,13 @@
           "test": "c-programs/proc-fdinfo",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/proc-fdinfo",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -4477,6 +4974,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/ptrace-attach-eperm",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/ptrace-eperm",
           "mode": "verify",
           "backend": "kvm"
@@ -4508,6 +5012,13 @@
           "test": "c-programs/ptrace-seize-eperm",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-seize-eperm",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -4596,6 +5107,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/random-sources-root-only",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/random-sources",
           "mode": "verify",
           "backend": "ptrace"
@@ -4645,6 +5163,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/readdir-entries",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/readdir-order-identity",
           "mode": "verify",
           "backend": "kvm"
@@ -4676,6 +5201,13 @@
           "test": "c-programs/record-lock",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-lock",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -4820,6 +5352,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/remap-file-pages-tmpfile-enosys",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/rename-ops",
           "mode": "verify",
           "backend": "kvm"
@@ -4841,6 +5380,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/rename-ops",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/renameat2-flags",
           "mode": "verify",
           "backend": "kvm"
@@ -4858,6 +5404,13 @@
           "test": "c-programs/renameat2-flags",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/renameat2-flags",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -4911,6 +5464,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/rlimit-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/robust-list",
           "mode": "verify",
           "backend": "kvm"
@@ -4932,6 +5492,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/robust-list",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sched-getaffinity-identity",
           "mode": "verify",
           "backend": "kvm"
@@ -4949,6 +5516,13 @@
           "test": "c-programs/sched-getaffinity-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sched-getaffinity-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5072,6 +5646,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/seccomp-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sendfile-copy",
           "mode": "verify",
           "backend": "kvm"
@@ -5089,6 +5670,13 @@
           "test": "c-programs/sendfile-copy",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sendfile-copy",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5107,6 +5695,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/session-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/set-tid-address",
           "mode": "verify",
           "backend": "kvm"
@@ -5124,6 +5719,13 @@
           "test": "c-programs/set-tid-address",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/set-tid-address",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5142,6 +5744,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/setitimer-determinism",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/short-io-split-identity",
           "mode": "verify",
           "backend": "kvm"
@@ -5163,6 +5772,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/short-io-split-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/shutdown-socketpair",
           "mode": "verify",
           "backend": "kvm"
@@ -5184,6 +5800,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/shutdown-socketpair",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigaction-state",
           "mode": "verify",
           "backend": "dbt"
@@ -5198,6 +5821,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigaction-state",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigaltstack-state",
           "mode": "verify",
           "backend": "dbt"
@@ -5208,6 +5838,13 @@
           "test": "c-programs/sigaltstack-state",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigaltstack-state",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5254,6 +5891,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/signal-disposition",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/signal-waitstatus-identity",
           "mode": "verify",
           "backend": "liteinst"
@@ -5289,9 +5933,23 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/signalfd-create",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigpipe-siginfo",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigpipe-siginfo",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5306,6 +5964,13 @@
           "test": "c-programs/sigprocmask-state",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigprocmask-state",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5352,6 +6017,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/so-incoming-cpu-tcp4",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-tcp6",
           "mode": "verify",
           "backend": "kvm"
@@ -5509,6 +6181,13 @@
           "test": "c-programs/socket-epoll-ordering",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-epoll-ordering",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5548,6 +6227,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-options",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "kvm"
@@ -5565,6 +6251,13 @@
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-timestamp-timespec",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5590,6 +6283,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-timestamp-timeval",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socketpair-flags",
           "mode": "verify",
           "backend": "kvm"
@@ -5611,6 +6311,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socketpair-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sockname-unnamed",
           "mode": "verify",
           "backend": "kvm"
@@ -5628,6 +6335,13 @@
           "test": "c-programs/sockname-unnamed",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sockname-unnamed",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5674,6 +6388,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/stat-metadata-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/statfs-free-determinism",
           "mode": "verify",
           "backend": "kvm"
@@ -5691,6 +6412,13 @@
           "test": "c-programs/statfs-free-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/statfs-free-determinism",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5751,6 +6479,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/statx-metadata",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/symlink-ops",
           "mode": "verify",
           "backend": "kvm"
@@ -5772,6 +6507,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/symlink-ops",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sync-file-range",
           "mode": "verify",
           "backend": "kvm"
@@ -5789,6 +6531,13 @@
           "test": "c-programs/sync-file-range",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sync-file-range",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -5898,6 +6647,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sysinfo",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/syslog-deterministic",
           "mode": "verify",
           "backend": "kvm"
@@ -5940,6 +6696,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sysv-ipc-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sysv-sem-enosys",
           "mode": "verify",
           "backend": "kvm"
@@ -6083,6 +6846,13 @@
           "test": "c-programs/thp-disable",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thp-disable",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -6157,6 +6927,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/umask-mode",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/uname-identity",
           "mode": "verify",
           "backend": "kvm"
@@ -6174,6 +6951,13 @@
           "test": "c-programs/uname-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/uname-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -6325,6 +7109,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/utimensat-determinism",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/vectored-file-io",
           "mode": "verify",
           "backend": "kvm"
@@ -6346,6 +7137,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/vectored-file-io",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/vectored-io",
           "mode": "verify",
           "backend": "kvm"
@@ -6363,6 +7161,13 @@
           "test": "c-programs/vectored-io",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vectored-io",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -6412,6 +7217,13 @@
           "test": "c-programs/wait-on-child",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/wait-on-child",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -9692,7 +10504,7 @@
       "group": "sabrecompat",
       "job": "manifest_compat",
       "desc": "The compatibility corpus on SaBRe",
-      "description": "The sabre-compat-only run type: `test-harness run --label sabre-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are each corpus row's SaBRe verify cell (the `focused` section: every row but lsof, netlink-route, netlink-sock-diag and shell-build) and both cells of the 30 rows only this run type has (23 programs the SaBRe corpus had and the strict corpus lacks; lua-direct, perl-direct and df-direct, which keep that corpus's single-image argv for programs whose strict rows run under a bash wrapper; and rustc, javac, java and node, whose ptrace cells get 600 seconds). It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, whose install tree carries the SaBRe loader and libdetcore_sabre.so, against the fixtures sabrecompatprep.fixtures writes; each cell runs Hermit's stripped --verify once and must also pass the harness's SaBRe execution-path contract (an RPC from the in-guest tool, zero ptrace-fallback and zero trusted shared-object system-call sites). A cell measured red stays enabled with `ci: false` and its failure class's issue (https://github.com/rrnewton/hermit/issues/3486 and the issues it names), so `--ci-only` selects only the cells that pass. FOR NOW IT GATES NO SABRE CELL: the 65 SaBRe cells that pass with a host-built release Hermit are also `ci: false`, citing https://github.com/rrnewton/hermit/issues/3652, because the pinned-root artifact's libdetcore_sabre.so needs GLIBC_2.38 and on an older-glibc host (devbig030 has 2.34) SaBRe intercepts nothing (the validation of 57883eff8 on 2026-10-03 ended all 65 with no result); until that is fixed the node requires only its 27 ptrace cells. A program that diverges, crashes or leaves SaBRe's measured path turns it red. Until 2026-10-01 these rows were 212 separate sabrecompat.<program> nodes that checked only Hermit's exit status, so a program whose children ran outside SaBRe passed, and on a fresh checkout their release Hermit had no SaBRe loader at all. The node's 2120-second wall bound is the 1820 seconds `scripts/validate.rs --self-test` requires of it as outer headroom, plus 300 seconds for the rest of the bucket, so a hung heavy cell is reported as that cell's timeout rather than ending the node. The self-test models every manifest cell as two attempts with 10 seconds of termination grace each, and its representative 1.5x wall multiplier turns the largest selected cells (rustc and node on ptrace, 600 seconds each) into 900-second windows: 2 x (900 + 10). The two attempts are that conservative model only; compat cells carry the manifest's no_retry_reason, so the harness never retries them.",
+      "description": "The sabre-compat-only run type: `test-harness run --label sabre-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are each corpus row's SaBRe verify cell (the `focused` section: every row but lsof, netlink-route, netlink-sock-diag and shell-build) and both cells of the 30 rows only this run type has (23 programs the SaBRe corpus had and the strict corpus lacks; lua-direct, perl-direct and df-direct, which keep that corpus's single-image argv for programs whose strict rows run under a bash wrapper; and rustc, javac, java and node, whose ptrace cells get 600 seconds). It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, whose install tree carries the SaBRe loader and libdetcore_sabre.so, against the fixtures sabrecompatprep.fixtures writes; each cell runs Hermit's stripped --verify once and must also pass the harness's SaBRe execution-path contract (an RPC from the in-guest tool, zero ptrace-fallback and zero trusted shared-object system-call sites). A cell measured red stays enabled with `ci: false` and its failure class's issue (https://github.com/rrnewton/hermit/issues/3486 and the issues it names), so `--ci-only` selects only the cells that pass. The guest's own dynamic loader loads libdetcore_sabre.so against the guest's libc, so the artifact's publication and verification refuse a plugin that records a library search path, needs a library outside glibc, or requires a glibc symbol version newer than 2.34 (https://github.com/rrnewton/hermit/issues/3652). A program that diverges, crashes or leaves SaBRe's measured path turns it red. Until 2026-10-01 these rows were 212 separate sabrecompat.<program> nodes that checked only Hermit's exit status, so a program whose children ran outside SaBRe passed, and on a fresh checkout their release Hermit had no SaBRe loader at all. The node's 2120-second wall bound is the 1820 seconds `scripts/validate.rs --self-test` requires of it as outer headroom, plus 300 seconds for the rest of the bucket, so a hung heavy cell is reported as that cell's timeout rather than ending the node. The self-test models every manifest cell as two attempts with 10 seconds of termination grace each, and its representative 1.5x wall multiplier turns the largest selected cells (rustc and node on ptrace, 600 seconds each) into 900-second windows: 2 x (900 + 10). The two attempts are that conservative model only; compat cells carry the manifest's no_retry_reason, so the harness never retries them.",
       "labels": [
         "sabre-compat-only"
       ],
@@ -9705,9 +10517,79 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/arch",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/b2sum",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/base32",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/base64",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/basename",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/basenc",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/bash",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/bracket",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/cal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/cat",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/cksum",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -9740,9 +10622,30 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/curl",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/date",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/df-direct",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/df-direct",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -9754,9 +10657,30 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/dirname",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/dos2unix",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/du",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/echo",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -9768,9 +10692,23 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/expr",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/fallocate",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/findmnt",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -9782,7 +10720,84 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/free",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/getconf",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/getopt",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/groups",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/head",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/hostname",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/id",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/kill",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ls",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsirq",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lsmod",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/lua-direct",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -9791,7 +10806,14 @@
           "category": "compat",
           "test": "compat/lua-direct",
           "mode": "verify",
-          "backend": "ptrace"
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/md5sum",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -9831,6 +10853,41 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/nproc",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numactl-hardware",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numastat",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/numfmt",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/openssl",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/pathchk",
           "mode": "verify",
           "backend": "ptrace"
@@ -9841,6 +10898,83 @@
           "test": "compat/perl-direct",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/perl-direct",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pidstat-disk",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pinky",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pr",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/printf",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ps",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/pwd",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/python3",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/readlink",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/realpath",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/ruby",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -9866,9 +11000,65 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/sha1sum",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha224sum",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha256sum",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha384sum",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sha512sum",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/shred",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sleep",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/stat",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/sum",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -9880,6 +11070,27 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/sysctl-random-uuid",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/test",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/true",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/truncate",
           "mode": "verify",
           "backend": "ptrace"
@@ -9887,9 +11098,65 @@
         {
           "lane": "portable",
           "category": "compat",
+          "test": "compat/uname",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/uptime",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/users",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
           "test": "compat/uuidgen",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/vmstat-disk",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/vmstat",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/wc-lines",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/wc",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "compat",
+          "test": "compat/whoami",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "kind": "structured-test-results",
@@ -11586,6 +12853,13 @@
         {
           "lane": "portable",
           "category": "determinism-stress-c",
+          "test": "determinism-stress-c/pipe-prefill",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
           "test": "determinism-stress-c/producer-consumer",
           "mode": "verify",
           "backend": "ptrace"
@@ -12004,6 +13278,13 @@
         {
           "lane": "portable",
           "category": "language-runtimes",
+          "test": "language-runtimes/rust-hashmap-iteration",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
           "test": "language-runtimes/tcl-rand-clock",
           "mode": "verify",
           "backend": "kvm"
@@ -12156,6 +13437,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/cat-file-read",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/clock-determinism",
           "mode": "custom",
           "backend": "liteinst"
@@ -12194,6 +13482,13 @@
           "test": "system-utils/clock-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/clock-determinism",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -12247,6 +13542,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/echo-stdout",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/errno-path-identity",
           "mode": "verify",
           "backend": "kvm"
@@ -12257,6 +13559,13 @@
           "test": "system-utils/errno-path-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/errno-path-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -12303,6 +13612,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/file-timestamp-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/find-tree-metadata",
           "mode": "verify",
           "backend": "kvm"
@@ -12313,6 +13629,13 @@
           "test": "system-utils/find-tree-metadata",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/find-tree-metadata",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -12457,6 +13780,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/printf-argument-forwarding",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/proc-random-uuid",
           "mode": "verify",
           "backend": "ptrace"
@@ -12562,6 +13892,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/shm-coherency-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/shuf-permutation",
           "mode": "verify",
           "backend": "kvm"
@@ -12611,6 +13948,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/startup-surface-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/startup-tls-guards",
           "mode": "verify",
           "backend": "kvm"
@@ -12635,6 +13979,13 @@
           "test": "system-utils/true-exit-zero",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/true-exit-zero",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -12945,7 +14296,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "828",
+        "NEXTEST_EXPECTED_EXECUTED": "834",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -20116,6 +21467,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/aio-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/append-pwrite",
           "mode": "verify",
           "backend": "liteinst"
@@ -20126,6 +21484,13 @@
           "test": "c-programs/append-pwrite",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/append-pwrite",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20151,6 +21516,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/bind-getsockname",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/bpf-enosys",
           "mode": "verify",
           "backend": "liteinst"
@@ -20207,6 +21579,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/cachestat-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
           "backend": "liteinst"
@@ -20217,6 +21596,13 @@
           "test": "c-programs/child-subreaper-refusal",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/child-subreaper-refusal",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20305,6 +21691,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/copy-file-range-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/cpu-virtualization",
           "mode": "verify",
           "backend": "liteinst"
@@ -20315,6 +21708,13 @@
           "test": "c-programs/cpu-virtualization",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/cpu-virtualization",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20333,6 +21733,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/cwd-roundtrip",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-copied-tiocgpgrp",
           "mode": "verify",
           "backend": "liteinst"
@@ -20343,6 +21750,13 @@
           "test": "c-programs/dbt-copied-tiocgpgrp",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dbt-copied-tiocgpgrp",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20459,6 +21873,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-wait-accounting",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dbt-wait-lifecycle",
           "mode": "verify",
           "backend": "dbt"
@@ -20480,6 +21901,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/dbt-wait-lifecycle",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/dup-shared-offset",
           "mode": "verify",
           "backend": "liteinst"
@@ -20490,6 +21918,13 @@
           "test": "c-programs/dup-shared-offset",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dup-shared-offset",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20543,6 +21978,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/epoll-pwait2",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/epoll-readiness",
           "mode": "verify",
           "backend": "liteinst"
@@ -20553,6 +21995,13 @@
           "test": "c-programs/epoll-readiness",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/epoll-readiness",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20571,6 +22020,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/event-delivery-ordering",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/eventfd-semantics",
           "mode": "verify",
           "backend": "liteinst"
@@ -20581,6 +22037,13 @@
           "test": "c-programs/eventfd-semantics",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/eventfd-semantics",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20599,6 +22062,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/faccessat2-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/fadvise-hints",
           "mode": "verify",
           "backend": "liteinst"
@@ -20609,6 +22079,13 @@
           "test": "c-programs/fadvise-hints",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fadvise-hints",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20627,6 +22104,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/fallocate-extents",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/fchmod-bits",
           "mode": "verify",
           "backend": "liteinst"
@@ -20637,6 +22121,13 @@
           "test": "c-programs/fchmod-bits",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fchmod-bits",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20655,6 +22146,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/fchmodat2-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/fcntl-owner",
           "mode": "verify",
           "backend": "liteinst"
@@ -20665,6 +22163,13 @@
           "test": "c-programs/fcntl-owner",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fcntl-owner",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20683,6 +22188,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/fd-duplication",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/file-backed-mmap",
           "mode": "verify",
           "backend": "liteinst"
@@ -20693,6 +22205,13 @@
           "test": "c-programs/file-backed-mmap",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/file-backed-mmap",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20711,6 +22230,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/file-io-roundtrip",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/flock-lifecycle",
           "mode": "verify",
           "backend": "liteinst"
@@ -20721,6 +22247,13 @@
           "test": "c-programs/flock-lifecycle",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/flock-lifecycle",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20767,6 +22300,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/fsync-durability",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/ftruncate-sparse",
           "mode": "verify",
           "backend": "liteinst"
@@ -20777,6 +22317,13 @@
           "test": "c-programs/ftruncate-sparse",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ftruncate-sparse",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20854,6 +22401,13 @@
           "test": "c-programs/get-robust-list-child",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/get-robust-list-child",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -20893,6 +22447,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/getcpu-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/getcpu",
           "mode": "verify",
           "backend": "ptrace"
@@ -20931,6 +22492,13 @@
           "test": "c-programs/getpriority-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/getpriority-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21019,6 +22587,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/host-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/inline-syscall-sites",
           "mode": "verify",
           "backend": "liteinst"
@@ -21033,6 +22608,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/inline-syscall-sites",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "liteinst"
@@ -21043,6 +22625,13 @@
           "test": "c-programs/inotify-watch",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/inotify-watch",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21120,6 +22709,13 @@
           "test": "c-programs/ioctl-fionread",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ioctl-fionread",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21187,6 +22783,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/kcmp-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/keyctl-enosys",
           "mode": "verify",
           "backend": "ptrace"
@@ -21225,6 +22828,13 @@
           "test": "c-programs/linkat-flags",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/linkat-flags",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21271,6 +22881,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/lseek-positioning",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/lsm-get-self-attr-enosys",
           "mode": "verify",
           "backend": "ptrace"
@@ -21362,6 +22979,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mce-kill-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/membarrier-query",
           "mode": "verify",
           "backend": "liteinst"
@@ -21376,6 +23000,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/membarrier-query",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/memfd-create",
           "mode": "verify",
           "backend": "liteinst"
@@ -21386,6 +23017,13 @@
           "test": "c-programs/memfd-create",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/memfd-create",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21474,6 +23112,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mempolicy-default",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mincore-residency",
           "mode": "verify",
           "backend": "liteinst"
@@ -21484,6 +23129,13 @@
           "test": "c-programs/mincore-residency",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/mincore-residency",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21502,6 +23154,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mixed-inline-and-libc-syscalls",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mkdir-rmdir",
           "mode": "verify",
           "backend": "liteinst"
@@ -21512,6 +23171,13 @@
           "test": "c-programs/mkdir-rmdir",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/mkdir-rmdir",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21530,6 +23196,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mknod-special",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mmap-determinism-heap",
           "mode": "verify",
           "backend": "dbt"
@@ -21544,6 +23217,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mmap-determinism-heap",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mmap-determinism-shared",
           "mode": "verify",
           "backend": "dbt"
@@ -21554,6 +23234,13 @@
           "test": "c-programs/mmap-determinism-shared",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/mmap-determinism-shared",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21600,6 +23287,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/mmap-layout-pointer-order",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/mmap-stress-determinism",
           "mode": "verify",
           "backend": "ptrace"
@@ -21624,6 +23318,13 @@
           "test": "c-programs/msync-writeback",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/msync-writeback",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21701,6 +23402,13 @@
           "test": "c-programs/name-to-handle-refusal",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/name-to-handle-refusal",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21866,6 +23574,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/no-new-privs-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/numa-node-identity",
           "mode": "verify",
           "backend": "liteinst"
@@ -21876,6 +23591,13 @@
           "test": "c-programs/numa-node-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/numa-node-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21894,6 +23616,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/o-tmpfile-anon",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/openat-flags",
           "mode": "verify",
           "backend": "liteinst"
@@ -21904,6 +23633,13 @@
           "test": "c-programs/openat-flags",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/openat-flags",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -21922,6 +23658,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/openat2-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/path-file-ops",
           "mode": "verify",
           "backend": "liteinst"
@@ -21936,6 +23679,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/path-file-ops",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/pause-alarm-interrupt",
           "mode": "verify",
           "backend": "liteinst"
@@ -21946,6 +23696,13 @@
           "test": "c-programs/pause-alarm-interrupt",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pause-alarm-interrupt",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22030,6 +23787,13 @@
           "test": "c-programs/personality-domain",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/personality-domain",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22076,6 +23840,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/pidfd-open-self-pair",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/pidfd-open-self",
           "mode": "verify",
           "backend": "ptrace"
@@ -22111,6 +23882,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/pidfd-waitid-child",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/pipe-capacity-pin",
           "mode": "verify",
           "backend": "liteinst"
@@ -22125,6 +23903,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/pipe-capacity-pin",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/pipe-capacity",
           "mode": "verify",
           "backend": "liteinst"
@@ -22135,6 +23920,13 @@
           "test": "c-programs/pipe-capacity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pipe-capacity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22188,6 +23980,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/pipe2-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/poll-readiness",
           "mode": "replay",
           "backend": "ptrace"
@@ -22205,6 +24004,13 @@
           "test": "c-programs/poll-readiness",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/poll-readiness",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22258,9 +24064,23 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/prctl-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/prctl-option-policy",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/prctl-option-policy",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22275,6 +24095,13 @@
           "test": "c-programs/prctl-pdeathsig",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/prctl-pdeathsig",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22300,9 +24127,23 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/preadv2-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/print-memaddrs",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/print-memaddrs",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22338,6 +24179,13 @@
           "test": "c-programs/proc-fdinfo",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/proc-fdinfo",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22482,6 +24330,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/ptrace-attach-eperm",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/ptrace-eperm",
           "mode": "verify",
           "backend": "ptrace"
@@ -22499,6 +24354,13 @@
           "test": "c-programs/ptrace-seize-eperm",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/ptrace-seize-eperm",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22566,6 +24428,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/random-sources-root-only",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/random-sources",
           "mode": "verify",
           "backend": "ptrace"
@@ -22601,6 +24470,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/readdir-entries",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/readdir-order-identity",
           "mode": "verify",
           "backend": "liteinst"
@@ -22625,6 +24501,13 @@
           "test": "c-programs/record-lock",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/record-lock",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22727,6 +24610,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/remap-file-pages-tmpfile-enosys",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/rename-ops",
           "mode": "verify",
           "backend": "liteinst"
@@ -22741,6 +24631,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/rename-ops",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/renameat2-flags",
           "mode": "verify",
           "backend": "liteinst"
@@ -22751,6 +24648,13 @@
           "test": "c-programs/renameat2-flags",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/renameat2-flags",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22790,6 +24694,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/rlimit-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/robust-list",
           "mode": "verify",
           "backend": "liteinst"
@@ -22804,6 +24715,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/robust-list",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sched-getaffinity-identity",
           "mode": "verify",
           "backend": "liteinst"
@@ -22814,6 +24732,13 @@
           "test": "c-programs/sched-getaffinity-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sched-getaffinity-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22902,6 +24827,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/seccomp-refusal",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sendfile-copy",
           "mode": "verify",
           "backend": "liteinst"
@@ -22912,6 +24844,13 @@
           "test": "c-programs/sendfile-copy",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sendfile-copy",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22923,6 +24862,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/session-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/set-tid-address",
           "mode": "verify",
           "backend": "liteinst"
@@ -22933,6 +24879,13 @@
           "test": "c-programs/set-tid-address",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/set-tid-address",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22944,6 +24897,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/setitimer-determinism",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/short-io-split-identity",
           "mode": "verify",
           "backend": "liteinst"
@@ -22954,6 +24914,13 @@
           "test": "c-programs/short-io-split-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/short-io-split-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -22972,6 +24939,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/shutdown-socketpair",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigaction-state",
           "mode": "verify",
           "backend": "dbt"
@@ -22986,6 +24960,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sigaction-state",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sigaltstack-state",
           "mode": "verify",
           "backend": "dbt"
@@ -22996,6 +24977,13 @@
           "test": "c-programs/sigaltstack-state",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigaltstack-state",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23042,6 +25030,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/signal-disposition",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/signal-waitstatus-identity",
           "mode": "verify",
           "backend": "liteinst"
@@ -23064,6 +25059,20 @@
           "lane": "portable",
           "category": "c-programs",
           "test": "c-programs/signalfd-create",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/signalfd-create",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigpipe-siginfo",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -23072,7 +25081,7 @@
           "category": "c-programs",
           "test": "c-programs/sigpipe-siginfo",
           "mode": "verify",
-          "backend": "ptrace"
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23087,6 +25096,13 @@
           "test": "c-programs/sigprocmask-state",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sigprocmask-state",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23126,6 +25142,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/so-incoming-cpu-tcp4",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/so-incoming-cpu-tcp6",
           "mode": "verify",
           "backend": "liteinst"
@@ -23245,6 +25268,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-epoll-ordering",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socket-ioctl-timestamp",
           "mode": "verify",
           "backend": "liteinst"
@@ -23273,6 +25303,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-options",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "liteinst"
@@ -23283,6 +25320,13 @@
           "test": "c-programs/socket-timestamp-timespec",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/socket-timestamp-timespec",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23301,6 +25345,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socket-timestamp-timeval",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/socketpair-flags",
           "mode": "verify",
           "backend": "liteinst"
@@ -23315,6 +25366,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/socketpair-flags",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sockname-unnamed",
           "mode": "verify",
           "backend": "liteinst"
@@ -23325,6 +25383,13 @@
           "test": "c-programs/sockname-unnamed",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sockname-unnamed",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23357,6 +25422,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/stat-metadata-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/statfs-free-determinism",
           "mode": "verify",
           "backend": "liteinst"
@@ -23367,6 +25439,13 @@
           "test": "c-programs/statfs-free-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/statfs-free-determinism",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23406,6 +25485,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/statx-metadata",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/symlink-ops",
           "mode": "verify",
           "backend": "liteinst"
@@ -23420,6 +25506,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/symlink-ops",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/sync-file-range",
           "mode": "verify",
           "backend": "liteinst"
@@ -23430,6 +25523,13 @@
           "test": "c-programs/sync-file-range",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sync-file-range",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23518,6 +25618,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/sysinfo",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/syslog-deterministic",
           "mode": "verify",
           "backend": "ptrace"
@@ -23542,6 +25649,13 @@
           "test": "c-programs/sysv-ipc-refusal",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sysv-ipc-refusal",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23640,6 +25754,13 @@
           "test": "c-programs/thp-disable",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/thp-disable",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23700,6 +25821,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/umask-mode",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/uname-identity",
           "mode": "verify",
           "backend": "liteinst"
@@ -23710,6 +25838,13 @@
           "test": "c-programs/uname-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/uname-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23819,6 +25954,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/utimensat-determinism",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/vectored-file-io",
           "mode": "verify",
           "backend": "liteinst"
@@ -23833,6 +25975,13 @@
         {
           "lane": "portable",
           "category": "c-programs",
+          "test": "c-programs/vectored-file-io",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
           "test": "c-programs/vectored-io",
           "mode": "verify",
           "backend": "liteinst"
@@ -23843,6 +25992,13 @@
           "test": "c-programs/vectored-io",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/vectored-io",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -23871,6 +26027,13 @@
           "test": "c-programs/wait-on-child",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/wait-on-child",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -25577,6 +27740,13 @@
         {
           "lane": "portable",
           "category": "determinism-stress-c",
+          "test": "determinism-stress-c/pipe-prefill",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "determinism-stress-c",
           "test": "determinism-stress-c/producer-consumer",
           "mode": "verify",
           "backend": "ptrace"
@@ -25878,6 +28048,13 @@
         {
           "lane": "portable",
           "category": "language-runtimes",
+          "test": "language-runtimes/rust-hashmap-iteration",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "language-runtimes",
           "test": "language-runtimes/tcl-rand-clock",
           "mode": "verify",
           "backend": "ptrace"
@@ -26011,6 +28188,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/cat-file-read",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/clock-determinism",
           "mode": "custom",
           "backend": "liteinst"
@@ -26042,6 +28226,13 @@
           "test": "system-utils/clock-determinism",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/clock-determinism",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -26081,9 +28272,23 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/echo-stdout",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/errno-path-identity",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/errno-path-identity",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -26109,9 +28314,23 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/file-timestamp-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/find-tree-metadata",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/find-tree-metadata",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -26200,6 +28419,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/printf-argument-forwarding",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/proc-random-uuid",
           "mode": "verify",
           "backend": "ptrace"
@@ -26277,6 +28503,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/shm-coherency-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/shuf-permutation",
           "mode": "verify",
           "backend": "ptrace"
@@ -26305,6 +28538,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/startup-surface-identity",
+          "mode": "verify",
+          "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/startup-tls-guards",
           "mode": "verify",
           "backend": "ptrace"
@@ -26322,6 +28562,13 @@
           "test": "system-utils/true-exit-zero",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/true-exit-zero",
+          "mode": "verify",
+          "backend": "sabre"
         },
         {
           "lane": "portable",
@@ -33819,7 +36066,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "828",
+        "NEXTEST_EXPECTED_EXECUTED": "834",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,

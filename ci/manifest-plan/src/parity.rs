@@ -5165,14 +5165,18 @@ mod tests {
         // https://github.com/rrnewton/reverie/issues/838
         // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
         // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
+        // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*)
+        // enables 120 verify cells that were not applicable and turns 8
+        // more on in CI: 120 more applicable, 128 more selectable, and 89
+        // more selected (the promoted folded backend-parity-c tests).
         assert_eq!(
             row(&counts.all),
             (
                 3700,
-                843 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-                527 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-                177 + 6 + 3 + 1 + 1 + 1 + 1 + 1
+                843 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 120,
+                527 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 128,
+                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89,
+                177 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89
             )
         );
         let by_backend: Vec<_> = counts
@@ -5195,7 +5199,8 @@ mod tests {
                     )
                 ),
                 ("liteinst", (925, 149, 146, 99, 98)),
-                ("sabre", (925, 359, 112, 2, 1)),
+                // The same 120, 128 and 89 SaBRe cells as above.
+                ("sabre", (925, 359 + 120, 112 + 128, 2 + 89, 1 + 89)),
             ]
         );
     }
