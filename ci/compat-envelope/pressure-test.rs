@@ -66,6 +66,7 @@ use hermit_manifest_plan::environmental_block::EnvBlockObservation;
 use hermit_manifest_plan::environmental_block::environmental_block_observation;
 use hermit_manifest_plan::host_capability::CapabilityVerdict;
 use hermit_manifest_plan::host_capability::HostCapability;
+use hermit_manifest_plan::invocation_cgroup::ALLOW_PROCESS_GROUP_CPU_SCAN_ENV;
 use hermit_manifest_plan::parity;
 use hermit_manifest_plan::runner::AttemptResult;
 use hermit_manifest_plan::runner::CELL_RESULT_SCHEMA;
@@ -2294,6 +2295,12 @@ fn run() -> Result<(), String> {
             let run_timeout_seconds = selection
                 .run_timeout_seconds
                 .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
+            // establish_pressure_cgroups boxes this run or refuses it. In a
+            // boxed run a budgeted cell whose own CPU cgroup cannot be created
+            // must stop, so a caller's process-group CPU scan marker never
+            // reaches the cells. It is removed before boxing re-executes this
+            // process or starts its signal thread.
+            env::remove_var(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV);
             let cgroups = establish_pressure_cgroups(run_timeout_seconds)?;
             require_empty_result_dir(&results)?;
             let started = Instant::now();
