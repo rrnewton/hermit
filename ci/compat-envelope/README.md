@@ -303,10 +303,19 @@ instead of resolving the conflict by file order.
 
 A retained pass under a declared stripped comparator (the default `--verify`,
 below L2) is selected in its own comparison domain, so a cell's newest stripped
-pass and its newest canonical comparison are each imported. The stripped pass
-records a Pass bound to its exact run, outer attempt and evidence digest. It
-records no canonical comparison, establishes no canonical coverage, and retires
-no canonical result, so an older canonical failure stays active beside it.
+pass and its newest canonical comparison are each imported. Every outer attempt
+of a retained run is read before one is selected: a run whose attempts declare
+different comparators is refused, and the selected attempt is the latest one
+that carries a comparison, so a retry that produced none does not erase an
+earlier failure; a pass followed by such a retry is not counted. The stripped
+pass records a Pass bound to its exact run, outer attempt and evidence digest.
+It records no canonical comparison and establishes no canonical coverage. A
+canonical failure in the same input stays active beside it unless canonical
+evidence supersedes it: a newer retained canonical pass, or a current
+classification described below. Because the import rebuilds its ordinary
+projection from the input, it refuses, before writing anything, an input that
+supplies a cell's stripped pass but no canonical comparison while the tracked
+projection holds a canonical comparison for that cell.
 
 A retained comparison without a divergence position is imported as historical
 evidence with its own SHA. A retained position is handled only after a current
@@ -314,9 +323,18 @@ pressure summary classifies it: FRESH imports the matching retained position;
 DRIFTED replaces it with the current position; WRONG discards it because the
 current comparison matches; UNCHECKABLE withholds it because the current row
 did not establish a trustworthy result. Each outcome is printed per cell.
+Only current rows counted as canonical can make the outcome FRESH, DRIFTED or
+WRONG. A row with a typed verification report counts as a match only if the
+report is a canonical bitwise match (`require_canonical_match`), and as a
+divergence only if the report compared canonical evidence
+(`require_canonical_comparison`); a row without a report is counted by its
+result alone. Any other row, such as a below-L2 stripped match or a match
+without bitwise parity, is counted apart and named in the printed reason; with
+no canonical current row the outcome is UNCHECKABLE.
 One matching run is UNCHECKABLE rather than WRONG because these cells can match
-once and diverge on another run. WRONG requires at least two distinct current
-runs and no divergence; every classification prints the run count it used.
+once and diverge on another run. WRONG requires at least two distinct canonical
+current matches and no current divergence under any comparison; every
+classification prints the run count it used.
 
 The writers refuse unrelated tracked changes. `import-results` may replace its
 own two generated outputs so the same retained corpus can be imported again.

@@ -10823,6 +10823,19 @@ fn retained_comparison_cell_count(cells: &[RetainedCellResults]) -> usize {
         .len()
 }
 
+/// The below-L2 stripped passes that `import-results` folds, as (cells, pass
+/// rows). A stripped result set holds only passes, one for every distinct
+/// retained run at the cell's newest stripped revision, so the two numbers
+/// differ whenever several runs passed there.
+fn retained_stripped_pass_counts(cells: &[RetainedCellResults]) -> (usize, usize) {
+    cells
+        .iter()
+        .filter(|cell| cell.domain == RetainedComparisonDomain::Stripped)
+        .fold((0, 0), |(cells, rows), cell| {
+            (cells + 1, rows + cell.candidates.len())
+        })
+}
+
 fn import_results(
     root: &Path,
     results: &Path,
@@ -10872,6 +10885,7 @@ fn import_results(
         no_result_cells,
     } = read_retained_results(root, results, &import_cells)?;
     let retained_cell_count = retained_comparison_cell_count(&retained_cells);
+    let (stripped_pass_cells, stripped_pass_rows) = retained_stripped_pass_counts(&retained_cells);
     let current = read_current_pressure_evidence(root, current_summaries, &before)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
     // The removal below runs before the fold, so it must not remove a
@@ -10889,7 +10903,6 @@ fn import_results(
     let mut fold = ValidateFold::default();
     let mut parity_unavailable = Vec::new();
     let mut historical_without_coordinates = 0usize;
-    let mut retained_stripped_passes = 0usize;
     let mut outcome_counts: BTreeMap<RetainedComparisonState, usize> = BTreeMap::new();
     let mut outcome_rows = Vec::new();
     let mut retained_rows_imported = 0usize;
@@ -10937,9 +10950,8 @@ fn import_results(
         let decision = if has_coordinate {
             Some(retained_coordinate_decision(retained, &current))
         } else {
-            if retained.domain == RetainedComparisonDomain::Stripped {
-                retained_stripped_passes += 1;
-            } else {
+            // Stripped passes are counted, as passes, before this loop.
+            if retained.domain != RetainedComparisonDomain::Stripped {
                 historical_without_coordinates += 1;
             }
             let rows = BTreeMap::from([(retained.id.clone(), retained.candidates.clone())]);
@@ -11072,7 +11084,7 @@ fn import_results(
         no_result_cells.len()
     );
     println!(
-        "  retained below-L2 stripped pass(es), in their own comparison domain: {retained_stripped_passes}; they establish no canonical coverage and retire no canonical result"
+        "  retained below-L2 stripped pass row(s), each in its own comparison domain: {stripped_pass_rows} in {stripped_pass_cells} cell(s); they record no canonical comparison and establish no canonical coverage (an input that supplies a stripped pass but no canonical comparison for a cell with a tracked canonical comparison is refused)"
     );
     println!(
         "  current canonical divergence row(s) imported from typed reports without retained run logs: {}",
@@ -35214,6 +35226,46 @@ mod post_verdict_transaction_tests {
             0,
             "a stripped-only cell adds nothing to the printed retained-comparison cell count"
         );
+        assert_eq!(retained_stripped_pass_counts(&retained.cells), (1, 1));
+    }
+
+    /// The printed stripped-pass count sums passes, not cells: two distinct
+    /// stripped runs at one revision are two pass rows in one cell, and
+    /// neither is a canonical comparison.
+    #[test]
+    fn goalpost_two_stripped_runs_at_one_revision_count_as_two_passes_in_one_cell() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, mut first) = stripped_row(&measured);
+        let mut second = first.clone();
+        first["run_id"] = "first-stripped-run".into();
+        second["run_id"] = "second-stripped-run".into();
+        goalpost_write_retained_rows(&fixture, &[first, second]);
+        let retained = read_retained_results(
+            &fixture.root,
+            &fixture.options.results,
+            &BTreeSet::from([id.clone()]),
+        )
+        .unwrap();
+        assert_eq!(retained.cells.len(), 1, "one cell in one comparison domain");
+        assert_eq!(retained.cells[0].domain, RetainedComparisonDomain::Stripped);
+        assert_eq!(
+            retained.cells[0]
+                .candidates
+                .iter()
+                .map(|candidate| candidate.row.run_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["first-stripped-run", "second-stripped-run"]),
+            "both stripped runs are retained"
+        );
+        assert_eq!(retained.terminal_comparisons, 0);
+        assert_eq!(
+            retained_stripped_pass_counts(&retained.cells),
+            (1, 2),
+            "two stripped passes in one cell"
+        );
+        assert_eq!(retained_comparison_cell_count(&retained.cells), 0);
     }
 
     #[test]
@@ -35301,6 +35353,11 @@ mod post_verdict_transaction_tests {
             ]
         );
         assert_eq!(retained_comparison_cell_count(&retained.cells), 1);
+        assert_eq!(
+            retained_stripped_pass_counts(&retained.cells),
+            (1, 1),
+            "the canonical divergence is not counted as a stripped pass"
+        );
     }
 
     /// The stripped compatibility cell's canonical `--verify-strict` row at
