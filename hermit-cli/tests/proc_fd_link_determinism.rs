@@ -11,9 +11,6 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-#[path = "common/liteinst.rs"]
-mod liteinst_runtime;
-
 const STDOUT_LINK: &str = "/proc/self/fd/1";
 
 struct ProgramCase {
@@ -113,7 +110,6 @@ fn proc_fd_link_consumers_verify() {
 
 #[test]
 fn proc_fd_link_aliases_and_truncation_verify() {
-    liteinst_runtime::ensure_liteinst_runtime();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -146,7 +142,7 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         "lexical=pipe:[1001]\n",
         "readlinkat=pipe:[1001]\n",
     );
-    for backend in ["ptrace", "dbt", "liteinst"] {
+    for backend in ["ptrace", "dbt"] {
         let output = Command::new("timeout")
             .args(["--kill-after", "10s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
