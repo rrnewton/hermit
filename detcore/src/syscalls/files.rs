@@ -1913,7 +1913,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(bytes.len() as i64);
         }
 
-        let (fd_type, physically_nonblocking, logically_nonblocking, resource, random_device) =
+        let (fd_type, physically_nonblocking, logically_nonblocking, resource, detfd) =
             guest.thread_state_mut().with_detfd(call.fd(), |detfd| {
                 (
                     detfd.ty(),
@@ -1940,8 +1940,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let res = match fd_type {
             FdType::Rng => {
                 trace!("Read call RNG fd {}, simulating...", call.fd());
-                let status_flags = random_device.status_flags();
-                random_device
+                let status_flags = detfd.status_flags();
+                detfd
                     .with_random_device_stream(|offset| {
                         require_random_device_read_access(status_flags)?;
                         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
@@ -1962,7 +1962,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     base: call.buf().map_or(0, |buf| buf.as_raw()),
                     len: call.len(),
                 };
-                self.read_timerfd(guest, call.fd(), &[iovec]).await
+                self.read_timerfd(guest, &detfd, &[iovec]).await
             }
             FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
                 trace!(
@@ -2782,7 +2782,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else if fd_type == FdType::Timerfd && self.virtual_timerfds() {
             // AUTONOMOUS-BOT-IMPLEMENTED
             match read_iovecs(&guest.memory(), call.iov(), call.len()) {
-                Ok(iovecs) => self.read_timerfd(guest, call.fd(), &iovecs).await,
+                Ok(iovecs) => self.read_timerfd(guest, &detfd, &iovecs).await,
                 Err(errno) => Err(errno.into()),
             }
         } else if physically_nonblocking
@@ -2910,14 +2910,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         if vectored_offset(call.pos_l(), call.pos_h()) == -1
             && call.flags() == 0
             && self.virtual_timerfds()
-            && guest
-                .thread_state()
-                .with_detfd(call.fd(), |detfd| detfd.ty())?
-                == FdType::Timerfd
         {
-            let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
-            let iovecs = read_iovecs(&guest.memory(), call.iov(), count)?;
-            return self.read_timerfd(guest, call.fd(), &iovecs).await;
+            let timer = guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (detfd.ty() == FdType::Timerfd).then(|| detfd.clone())
+            })?;
+            if let Some(timer) = timer {
+                let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
+                let iovecs = read_iovecs(&guest.memory(), call.iov(), count)?;
+                return self.read_timerfd(guest, &timer, &iovecs).await;
+            }
         }
 
         let is_procfs = guest
@@ -4776,33 +4777,35 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// -ERESTARTSYS). As in fs/timerfd.c, a total length below 8 is EINVAL
     /// before anything else, and the count is consumed before it is copied
     /// out, so a faulting buffer loses the expirations and reports EFAULT.
+    ///
+    /// `timer` is the open file the caller resolved when the syscall began.
+    /// Like the file reference Linux's read holds (fdget), it is never looked
+    /// up by number again: a blocked read keeps reading this timer after
+    /// another thread closes the descriptor, or a new file takes its number.
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd read counts, EAGAIN, and
-    // blocking restart.
+    // blocking restart; the read holds its open file across the wait.
     async fn read_timerfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        fd: RawFd,
+        timer: &DetFd,
         iovecs: &[TimerSlackIovec],
     ) -> Result<i64, Error> {
         if iovecs.iter().map(|iovec| iovec.len).sum::<usize>() < 8 {
             return Err(Errno::EINVAL.into());
         }
-        let nonblocking = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.is_nonblocking())?;
+        let nonblocking = timer.is_nonblocking();
         loop {
             let now = thread_observe_time(guest).await;
-            let pending = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| detfd.timerfd_state().map(|s| s.pending(now)))?
+            let pending = timer
+                .timerfd_state()
+                .map(|s| s.pending(now))
                 .ok_or(Errno::EINVAL)?;
             if pending > 0 {
-                guest.thread_state().with_detfd(fd, |detfd| {
-                    detfd.with_timerfd_mut(|s| {
-                        s.consumed += pending;
-                        s.generation += 1;
-                    })
-                })?;
+                timer.with_timerfd_mut(|s| {
+                    s.consumed += pending;
+                    s.generation += 1;
+                });
                 let mut bytes: &[u8] = &pending.to_ne_bytes();
                 for iovec in iovecs {
                     if bytes.is_empty() {
