@@ -43,9 +43,10 @@ MAX_GUEST_COMMAND_BYTES = GUEST_COMMAND_READ_BYTES - 1
 # QEMU's own reason is in the log.
 FAILED_LOG_TAIL_LINES = 40
 FAILED_LOG_TAIL_BYTES = 64 << 10
-# close() kills QEMU and Hermit's tracer by pid and waits at most this long for
-# both to exit, then at most HERMIT_EXIT_SECONDS for the process the demo
-# started (Hermit, or a wrapper that runs it) to exit by itself.
+# close() kills QEMU and Hermit's tracer one by one, each through a pidfd, and
+# waits at most this long for both to exit, then at most HERMIT_EXIT_SECONDS
+# for the process the demo started (Hermit, or a wrapper that runs it) to exit
+# by itself.
 OWNED_PROCESS_EXIT_SECONDS = 10.0
 HERMIT_EXIT_SECONDS = 10.0
 
@@ -493,29 +494,42 @@ def _is_running(pid: int, start_time: int) -> bool:
     )
 
 
+class _NoSignalSent(Exception):
+    """A process that needed SIGKILL could not be signalled through a pidfd, so got no signal."""
+
+
 def _kill_if_running(pid: int, start_time: int) -> None:
-    """Send SIGKILL to ``pid`` only if it is still the process that started at ``start_time``."""
+    """Send SIGKILL to ``pid`` only if it is still the process that started at ``start_time``.
+
+    The signal goes only through a pidfd. A process that has exited, even if
+    not yet reaped, or whose pid now belongs to a process with a different
+    start time, is not signalled. Any other failure to open or use the pidfd
+    raises _NoSignalSent, and no signal is sent by pid instead: these processes
+    are not this process's children, so nothing keeps their pids from being
+    given to another process between a check and a signal by pid.
+    """
+    if not _is_running(pid, start_time):
+        return
     try:
         # A pidfd refers to the process that had the pid when it was opened, so
         # a start time that still matches after opening it identifies the
         # process the signal reaches, even if the pid is reused meanwhile.
-        pidfd = os.pidfd_open(pid)  # type: Optional[int]
+        pidfd = os.pidfd_open(pid)
     except ProcessLookupError:
-        return
-    except (AttributeError, OSError):
-        pidfd = None  # No pidfd support: check, then signal by pid.
+        return  # ESRCH: it has exited.
+    except (AttributeError, OSError) as error:
+        raise _NoSignalSent("pidfd_open failed: {}".format(error)) from error
     try:
         if not _is_running(pid, start_time):
             return
-        if pidfd is None:
-            os.kill(pid, signal.SIGKILL)
-        else:
+        try:
             signal.pidfd_send_signal(pidfd, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
+        except ProcessLookupError:
+            return  # ESRCH: it exited after the check.
+        except (AttributeError, OSError) as error:
+            raise _NoSignalSent("pidfd_send_signal failed: {}".format(error)) from error
     finally:
-        if pidfd is not None:
-            os.close(pidfd)
+        os.close(pidfd)
 
 
 def _tracer_of(pid: int, start_time: int) -> Optional[int]:
@@ -537,20 +551,29 @@ def _tracer_of(pid: int, start_time: int) -> Optional[int]:
 
 def _kill_and_wait(
     processes: List[Tuple[str, int, int]], timeout: float
-) -> List[Tuple[str, int, int]]:
+) -> Tuple[List[Tuple[str, int, int]], List[Tuple[str, int, int, str]]]:
     """SIGKILL each (name, pid, start time) and wait up to ``timeout`` seconds for all to exit.
 
-    Returns the processes still running when the wait ends. A process that has
-    exited, even if not yet reaped, or whose pid now belongs to a process with a
-    different start time, counts as gone and is not signalled.
+    Returns the processes still running when the wait ends, and, each with the
+    reason, those that could not be signalled through a pidfd and so were sent
+    no signal; the wait is not spent on these. A process that has exited, even
+    if not yet reaped, or whose pid now belongs to a process with a different
+    start time, counts as gone and is not signalled.
     """
-    for _, pid, start_time in processes:
-        _kill_if_running(pid, start_time)
+    signalled = []  # type: List[Tuple[str, int, int]]
+    not_signalled = []  # type: List[Tuple[str, int, int, str]]
+    for name, pid, start_time in processes:
+        try:
+            _kill_if_running(pid, start_time)
+        except _NoSignalSent as error:
+            not_signalled.append((name, pid, start_time, str(error)))
+        else:
+            signalled.append((name, pid, start_time))
     deadline = time.monotonic() + timeout
     while True:
-        running = [process for process in processes if _is_running(process[1], process[2])]
+        running = [process for process in signalled if _is_running(process[1], process[2])]
         if not running or time.monotonic() >= deadline:
-            return running
+            return running, not_signalled
         time.sleep(0.02)
 
 
@@ -705,7 +728,7 @@ class HermitGuestProgram:
         self._process_group = None  # type: Optional[int]
         self._qemu_pid = None  # type: Optional[int]
         self._tracer_tgid = None  # type: Optional[int]
-        # (name, pid, start time) of each process close() must kill by pid.
+        # (name, pid, start time) of each process close() must kill through a pidfd.
         self._owned_processes = []  # type: List[Tuple[str, int, int]]
         self._memory = None  # type: Optional[int]
         self._qmp = None  # type: Optional[QmpClient]
@@ -1039,7 +1062,9 @@ class HermitGuestProgram:
         printed, and its snapshot copy is removed (demo 5's is 94 MB).
 
         QEMU or Hermit's tracer still running after close() has killed it and
-        waited is reported; after a pass that finished, close() then raises.
+        waited is reported, and so is one that close() could not signal through
+        a pidfd, which it then sends no signal at all; after a pass that
+        finished, close() then raises.
         """
         if self._memory is not None:
             os.close(self._memory)
@@ -1058,32 +1083,47 @@ class HermitGuestProgram:
                 except OSError:
                     pass
                 setattr(self, attribute, None)
-        # Kill QEMU and Hermit's tracer by pid. The process-group SIGKILL below
-        # does not reach them when `hermit` is a wrapper that runs Hermit
+        # Kill QEMU and Hermit's tracer one by one. The process-group SIGKILL
+        # below does not reach them when `hermit` is a wrapper that runs Hermit
         # elsewhere: safehermit runs it as a systemd user unit, where the
         # tracer, stopped since the last observation, and QEMU outlived every
-        # pass. A pid is signalled only while it still has the start time
-        # recorded when start(), or here a pass that failed first, found it,
-        # so a reused pid is left alone.
+        # pass. Each is signalled only through a pidfd, and only while its pid
+        # still has the start time recorded when start(), or here a pass that
+        # failed first, found it, so a reused pid is left alone. One that cannot
+        # be signalled through a pidfd is sent no signal, and that is reported.
         if self._process is not None and self._process.poll() is None:
             self._own_unrecorded_processes()
         stopped = []  # type: List[str]
-        survivors = []  # type: List[Tuple[str, int, int]]
+        unstopped = []  # type: List[Tuple[str, int, int]]
         if self._owned_processes:
-            stopped = [
-                name
+            running = [
+                (name, pid)
                 for name, pid, start_time in self._owned_processes
                 if _is_running(pid, start_time)
             ]
-            survivors = _kill_and_wait(self._owned_processes, OWNED_PROCESS_EXIT_SECONDS)
-            self._owned_processes = survivors
-            for name, pid, _ in survivors:
-                print(
-                    "{} (pid {}) is still running {:g} s after SIGKILL.".format(
+            survivors, not_signalled = _kill_and_wait(
+                self._owned_processes, OWNED_PROCESS_EXIT_SECONDS
+            )
+            reasons = {(name, pid): reason for name, pid, _, reason in not_signalled}
+            stopped = [name for name, pid in running if (name, pid) not in reasons]
+            unstopped = [
+                process
+                for process in self._owned_processes
+                if process in survivors or process[:2] in reasons
+            ]
+            self._owned_processes = unstopped
+            for name, pid, _ in unstopped:
+                if (name, pid) in reasons:
+                    message = (
+                        "Could not stop {} (pid {}): {}. It was sent no signal: a "
+                        "signal sent by pid alone could reach another process given "
+                        "that pid.".format(name, pid, reasons[(name, pid)])
+                    )
+                else:
+                    message = "{} (pid {}) is still running {:g} s after SIGKILL.".format(
                         name, pid, OWNED_PROCESS_EXIT_SECONDS
-                    ),
-                    file=sys.stderr,
-                )
+                    )
+                print(message, file=sys.stderr)
             # Without its tracer Hermit exits, and a wrapper then finishes its
             # own cleanup (safehermit stops and resets its unit), which the
             # process-group SIGKILL below would cut short.
@@ -1125,11 +1165,11 @@ class HermitGuestProgram:
             self.qmp_socket.unlink(missing_ok=True)
         if failed:
             self._report_failed_pass(stopped)
-        elif survivors:
+        elif unstopped:
             # A failed pass is already raising; this would replace its error.
             raise RuntimeError(
                 "could not stop {} after the pass".format(
-                    ", ".join("{} (pid {})".format(name, pid) for name, pid, _ in survivors)
+                    ", ".join("{} (pid {})".format(name, pid) for name, pid, _ in unstopped)
                 )
             )
 
