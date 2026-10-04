@@ -842,13 +842,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_fault_of_the_whole_copy_copies_nothing;
     // https://github.com/rrnewton/hermit/pull/3226) retain all 881 prior
     // identities: 881 + 23 = 904 (`cargo nextest list --profile ci` measured 904).
-    // Forty-four unit tests (memory::tests 3, procfs::tests 7,
-    // syscalls::files::inject_fstat_scratch 18,
+    // Forty-seven unit tests (memory::tests 3, procfs::tests 7,
+    // syscalls::files::inject_fstat_scratch 21,
     // syscalls::files::procfs_wiring_guard 2, syscalls::namespace::tests 4,
     // syscalls::namespace::tests::other_proc_fd_target 3 and tool_global::tests 7;
     // https://github.com/rrnewton/hermit/pull/3255) retain all 904 prior
-    // identities: 904 + 44 = 948 (`cargo nextest list --profile ci` measured 948).
-    ("test.detcore_unit", 948),
+    // identities: 904 + 47 = 951 (`cargo nextest list --profile ci` measured 951).
+    ("test.detcore_unit", 951),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1093,13 +1093,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 878 prior identities: 878 + 3 = 881.
     // The host twin selects the same 23 directory-stream tests
     // (https://github.com/rrnewton/hermit/pull/3226): 881 + 23 = 904.
-    // Forty-four unit tests (memory::tests 3, procfs::tests 7,
-    // syscalls::files::inject_fstat_scratch 18,
+    // Forty-seven unit tests (memory::tests 3, procfs::tests 7,
+    // syscalls::files::inject_fstat_scratch 21,
     // syscalls::files::procfs_wiring_guard 2, syscalls::namespace::tests 4,
     // syscalls::namespace::tests::other_proc_fd_target 3 and tool_global::tests 7;
     // https://github.com/rrnewton/hermit/pull/3255) retain all 904 prior
-    // identities: 904 + 44 = 948.
-    ("test.detcore_unit_on_host", 948),
+    // identities: 904 + 47 = 951.
+    ("test.detcore_unit_on_host", 951),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

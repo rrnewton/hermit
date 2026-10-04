@@ -1166,34 +1166,44 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    `GUEST_STAT_PATH_CAPACITY` bytes. On the ptrace backend it lies below
     ///    the red zone under the guest's stack pointer, and an injection there
     ///    has 896 bytes, which must hold the path buffer and the 144-byte
-    ///    `struct stat`. Both buffers are zeroed afterwards. That memory need
-    ///    not be writable, for the reasons `inject_fstat` gives. The fault
-    ///    belongs to Detcore's bookkeeping, not to the guest
-    ///    (<https://github.com/rrnewton/hermit/issues/3328>), so an `EFAULT`
-    ///    from committing the scratch, staging the path, the `fstatat` itself
-    ///    (whose path and buffer are both Detcore's) or zeroing either buffer
-    ///    sends the stat to the transient page below. Both buffers are first
-    ///    zeroed as far as they are writable: every write into the scratch,
+    ///    `struct stat`. That memory is the guest's own: a guest that issues
+    ///    raw system calls may keep live data below its red zone, and Linux
+    ///    never writes there for it. So the bytes under both buffers are read
+    ///    before the scratch is committed and written back afterwards, on
+    ///    success, on a failed stat and after a fault alike, before the
+    ///    scratch guard drops (backends whose scratch is a Tool-owned arena
+    ///    free it then). A scratch whose bytes cannot be read is not used.
+    ///    That memory need not be writable either, for the reasons
+    ///    `inject_fstat` gives. The fault belongs to Detcore's bookkeeping,
+    ///    not to the guest (<https://github.com/rrnewton/hermit/issues/3328>),
+    ///    so an `EFAULT` from reading the scratch, committing it, staging the
+    ///    path, the `fstatat` itself (whose path and buffer are both
+    ///    Detcore's) or writing either buffer back sends the stat to the
+    ///    transient page below. Both buffers are first written back as far as
+    ///    they are writable: every write into the scratch, the commit's and
     ///    the kernel's included, runs forward from a buffer's start and stops
-    ///    at its first fault, so whatever it left is a prefix that zeroing
-    ///    from the same start reaches. Every other error propagates.
+    ///    at its first fault, so whatever it changed is a prefix that writing
+    ///    back from the same start reaches. Every other error propagates.
     /// 2. A private anonymous mapping made for this call alone, of whole
     ///    pages sized for the NUL-terminated path and an 8-aligned
     ///    `struct stat`. It serves a stack scratch that is too small, a fault
     ///    there, and every path of `GUEST_STAT_PATH_CAPACITY` bytes or more.
     ///    The guest never learns its address, and it is unmapped whole before
-    ///    the guest resumes, so the guest's address space is the same as
-    ///    before the call. An `EFAULT` there means no answer.
+    ///    the guest resumes. If that `munmap` fails, which is not expected for
+    ///    a page this call mapped and whose address the guest never saw,
+    ///    Detcore only warns and keeps the answer, and the page stays mapped.
+    ///    An `EFAULT` there means no answer.
     ///
     /// ⚠️ WHEN THAT MAPPING CANNOT BE MADE, THE STAT HAS NO ANSWER. This
     /// returns `Ok(None)`, as a failed stat does, rather than an error:
     /// every caller has an answer without the stat, and the call it serves
     /// (a `read` of `maps` or `smaps`, a `readlink` of `/proc/<pid>/fd/<n>`)
-    /// must not fail because Detcore could not map a page of its own. The
-    /// failure is not always a function of guest state, though:
-    /// `RLIMIT_AS` and the guest's mapping count are, but a strict
-    /// overcommit policy (`vm.overcommit_memory=2`) refuses the page on
-    /// the host's commit charge, so on such a host the answer -- and the
+    /// must not fail because Detcore could not map a page of its own. Why
+    /// the `mmap` fails is partly guest state and partly host state: the
+    /// guest's `RLIMIT_AS` and its mapping count are the guest's, but the
+    /// limit on that count (`vm.max_map_count`) is a host setting, and a
+    /// strict overcommit policy (`vm.overcommit_memory=2`) refuses the page
+    /// on the host's commit charge. So on such a host the answer -- and the
     /// identity a caller keys on without it -- can differ between runs.
     pub(crate) async fn stat_guest_path<G: Guest<Self>>(
         &self,
@@ -1229,34 +1239,50 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let path_address: AddrMut<[u8; GUEST_STAT_PATH_CAPACITY]> = stack.reserve();
         let statptr = StatPtr(stack.reserve());
-        // Keep the guard until both buffers are zeroed: backends whose scratch
-        // is a Tool-owned arena (DBT, SaBRe) free it when the guard drops.
-        let stack_guard = match stack.commit() {
+        // On ptrace both buffers are the guest's own stack memory below its
+        // red zone, which the commit, the staged path and the kernel's stat
+        // overwrite. Save what is there first, so it can be put back.
+        let mut saved_path = [0u8; GUEST_STAT_PATH_CAPACITY];
+        let mut saved_stat = [0u8; std::mem::size_of::<libc::stat>()];
+        let saved = {
+            let memory = guest.memory();
+            memory
+                .read_exact(path_address.cast::<u8>(), &mut saved_path)
+                .and_then(|()| memory.read_exact(statptr.0.cast(), &mut saved_stat))
+        };
+        match saved {
+            Ok(()) => {}
             Err(Errno::EFAULT) => {
                 trace!(
-                    "guest stack scratch cannot hold a stat of {:?}",
+                    "guest stack scratch cannot be read for a stat of {:?}",
                     String::from_utf8_lossy(path)
                 );
                 return Ok(StackStat::Unusable);
             }
-            result => result?,
+            Err(errno) => return Err(errno),
+        }
+        // Keep the guard until both buffers are written back: backends whose
+        // scratch is a Tool-owned arena (DBT, SaBRe, LiteInst, e9patch) free
+        // it when the guard drops. A failed commit is written back too: the
+        // ptrace commit writes page by page, so it can fail after writing a
+        // lower writable page.
+        let committed = stack.commit();
+        let identity = match &committed {
+            Ok(_) => {
+                Self::fstatat_in_scratch(guest, path, path_address.cast::<u8>(), statptr).await
+            }
+            Err(errno) => Err(*errno),
         };
-        let identity =
-            Self::fstatat_in_scratch(guest, path, path_address.cast::<u8>(), statptr).await;
-        // Both buffers are zeroed even after a fault: a staging write or the
-        // kernel may have filled a prefix first.
         let mut memory = guest.memory();
-        let zeroed_stat =
-            memory.write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()]);
-        let zeroed_path =
-            memory.write_exact(path_address.cast::<u8>(), &[0; GUEST_STAT_PATH_CAPACITY]);
-        drop(stack_guard);
+        let restored_stat = memory.write_exact(statptr.0.cast(), &saved_stat);
+        let restored_path = memory.write_exact(path_address.cast::<u8>(), &saved_path);
+        drop(committed);
         // An error other than EFAULT from any step wins over an EFAULT from
         // another.
         let failure = [
             identity.as_ref().err(),
-            zeroed_stat.as_ref().err(),
-            zeroed_path.as_ref().err(),
+            restored_stat.as_ref().err(),
+            restored_path.as_ref().err(),
         ]
         .into_iter()
         .flatten()
@@ -1353,9 +1379,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         path_address: AddrMut<'_, u8>,
         statptr: StatPtr<'_>,
     ) -> Result<Option<libc::stat>, Errno> {
-        // Both scratches start zero-filled -- `reserve` zero-fills, and so
-        // does a fresh anonymous mapping -- so the path stays NUL-terminated.
-        guest.memory().write_exact(path_address, path)?;
+        // The NUL is staged with the path: the stack scratch holds whatever
+        // the guest left there until the commit, and some backends' commits
+        // write nothing.
+        let mut staged = Vec::with_capacity(path.len() + 1);
+        staged.extend_from_slice(path);
+        staged.push(0);
+        guest.memory().write_exact(path_address, &staged)?;
         let call = syscalls::Fstatat::new()
             .with_dirfd(libc::AT_FDCWD)
             .with_path(PathPtr::from_ptr(
@@ -7336,14 +7366,19 @@ pub(crate) mod inject_fstat_scratch {
 
     /// A guest stack scratch whose commit fails with `commit_error` when one
     /// is set, like the ptrace scratch below an `rsp` with no writable memory
-    /// under it (`EFAULT`) or of a task that has gone (`ESRCH`). A successful
+    /// under it (`EFAULT`) or of a task that has gone (`ESRCH`). Otherwise a
     /// commit writes nothing, as on backends whose scratch is a Tool-owned
     /// arena (DBT), so a scratch that is not writable faults only when it is
-    /// written. `reserve` hands out `arena` in order. The arena belongs to the
-    /// guest and outlives every guard, so an early guard drop is reported by
-    /// `guard_live` rather than by a write into freed memory.
+    /// written -- unless `commit_writes` is set, when it writes zeros over
+    /// every reserved byte in one write from the scratch's start and fails
+    /// with `EFAULT` at the first byte it cannot write, as the ptrace commit
+    /// writes its whole region. `reserve` hands out `arena` in order. The
+    /// arena belongs to the guest and outlives every guard, so an early
+    /// guard drop is reported by `guard_live` rather than by a write into
+    /// freed memory.
     pub(crate) struct ScriptedStack {
         commit_error: Option<Errno>,
+        commit_writes: bool,
         arena: usize,
         arena_len: usize,
         reserved: usize,
@@ -7395,6 +7430,12 @@ pub(crate) mod inject_fstat_scratch {
             if let Some(errno) = self.commit_error {
                 return Err(errno);
             }
+            if self.commit_writes {
+                LocalMemory::new().write_exact(
+                    AddrMut::from_raw(self.arena).unwrap(),
+                    &vec![0; self.reserved],
+                )?;
+            }
             self.guard_live.store(true, Ordering::SeqCst);
             Ok(ScriptedStackGuard {
                 guard_live: self.guard_live,
@@ -7403,9 +7444,25 @@ pub(crate) mod inject_fstat_scratch {
     }
 
     /// This process's memory as `LocalMemory` reaches it, except that every
-    /// write fails with `write_error` when one is set.
+    /// write fails with `write_error` when one is set. Counts each write that
+    /// starts in the test-supplied stack scratch while no stack guard is
+    /// live.
     pub(crate) struct ScriptedMemory {
         write_error: Option<Errno>,
+        scratch: Option<(usize, usize)>,
+        guard_live: Arc<AtomicBool>,
+        unguarded_scratch_writes: Arc<AtomicUsize>,
+    }
+
+    impl ScriptedMemory {
+        fn note_write(&self, address: usize) {
+            if let Some((start, len)) = self.scratch
+                && (start..start + len).contains(&address)
+                && !self.guard_live.load(Ordering::SeqCst)
+            {
+                self.unguarded_scratch_writes.fetch_add(1, Ordering::SeqCst);
+            }
+        }
     }
 
     impl MemoryAccess for ScriptedMemory {
@@ -7421,6 +7478,9 @@ pub(crate) mod inject_fstat_scratch {
             read_from: &[std::io::IoSlice],
             write_to: &mut [std::io::IoSliceMut],
         ) -> Result<usize, Errno> {
+            for slice in write_to.iter() {
+                self.note_write(slice.as_ptr() as usize);
+            }
             match self.write_error {
                 Some(errno) => Err(errno),
                 None => LocalMemory::new().write_vectored(read_from, write_to),
@@ -7433,6 +7493,7 @@ pub(crate) mod inject_fstat_scratch {
             LocalMemory::new().read(addr, buf)
         }
         fn write(&mut self, addr: AddrMut<u8>, buf: &[u8]) -> Result<usize, Errno> {
+            self.note_write(addr.as_raw());
             match self.write_error {
                 Some(errno) => Err(errno),
                 None => LocalMemory::new().write(addr, buf),
@@ -7443,6 +7504,7 @@ pub(crate) mod inject_fstat_scratch {
             addr: AddrMut<u8>,
             buf: &[u8],
         ) -> Result<usize, Errno> {
+            self.note_write(addr.as_raw());
             match self.write_error {
                 Some(errno) => Err(errno),
                 None => LocalMemory::new().write_with_user_access(addr, buf),
@@ -7454,6 +7516,9 @@ pub(crate) mod inject_fstat_scratch {
         pub(crate) config: Config,
         pub(crate) thread: ThreadState<()>,
         commit_error: Option<Errno>,
+        /// Whether a commit writes the scratch, as on ptrace: see
+        /// `ScriptedStack`.
+        commit_writes: bool,
         /// (address, length) of the stack scratch when the test supplies one;
         /// otherwise the scratch is `arena` and does not report its size.
         scratch: Option<(usize, usize)>,
@@ -7463,6 +7528,9 @@ pub(crate) mod inject_fstat_scratch {
         guard_live: Arc<AtomicBool>,
         /// How many times a stack scratch was committed, successfully or not.
         commits: Arc<AtomicUsize>,
+        /// Writes into the test-supplied stack scratch made while no stack
+        /// guard was live.
+        unguarded_scratch_writes: Arc<AtomicUsize>,
         pub(crate) injected: Vec<Sysno>,
         /// Whether a stack guard was live when each fstat was injected.
         fstat_guard_live: Vec<bool>,
@@ -7509,12 +7577,14 @@ pub(crate) mod inject_fstat_scratch {
                 config,
                 thread,
                 commit_error: (!stack_writable).then_some(Errno::EFAULT),
+                commit_writes: false,
                 scratch: None,
                 write_error: None,
                 mmap_fails,
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 guard_live: Arc::new(AtomicBool::new(false)),
                 commits: Arc::new(AtomicUsize::new(0)),
+                unguarded_scratch_writes: Arc::new(AtomicUsize::new(0)),
                 injected: Vec::new(),
                 fstat_guard_live: Vec::new(),
                 fstat_buffers: Vec::new(),
@@ -7542,6 +7612,12 @@ pub(crate) mod inject_fstat_scratch {
             guest.scratch = Some((address, len));
             guest.commit_error = commit_error;
             (tool, guest)
+        }
+
+        /// How many writes went into the test-supplied stack scratch while
+        /// no stack guard was live.
+        fn unguarded_scratch_writes(&self) -> usize {
+            self.unguarded_scratch_writes.load(Ordering::SeqCst)
         }
     }
 
@@ -7589,6 +7665,9 @@ pub(crate) mod inject_fstat_scratch {
         fn memory(&self) -> Self::Memory {
             ScriptedMemory {
                 write_error: self.write_error,
+                scratch: self.scratch,
+                guard_live: self.guard_live.clone(),
+                unguarded_scratch_writes: self.unguarded_scratch_writes.clone(),
             }
         }
         fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
@@ -7611,6 +7690,7 @@ pub(crate) mod inject_fstat_scratch {
             };
             ScriptedStack {
                 commit_error: self.commit_error,
+                commit_writes: self.commit_writes,
                 arena,
                 arena_len,
                 reserved: 0,
@@ -7891,15 +7971,50 @@ pub(crate) mod inject_fstat_scratch {
             }
         }
 
-        /// Whether the `len` bytes at `offset`, which must be accessible, are
-        /// all zero.
-        fn zeroed(&self, offset: usize, len: usize) -> bool {
+        /// `count` fresh pages filled with `SENTINEL`, like guest stack memory
+        /// that holds live data: the first `writable` can be read and
+        /// written, the pages after them up to `readable` can only be read,
+        /// and the rest cannot be accessed.
+        pub(crate) fn sentinel(count: usize, writable: usize, readable: usize) -> Self {
+            assert!(writable <= readable && readable <= count);
+            let pages = Self::map(count, count);
+            // SAFETY: the `len` bytes at `address` were just mapped writable.
+            unsafe { std::ptr::write_bytes(pages.address as *mut u8, SENTINEL, pages.len) };
+            for (first, end, prot) in [
+                (writable, readable, libc::PROT_READ),
+                (readable, count, libc::PROT_NONE),
+            ] {
+                if end > first {
+                    assert_eq!(
+                        unsafe {
+                            libc::mprotect(
+                                (pages.address + first * page_size()) as *mut libc::c_void,
+                                (end - first) * page_size(),
+                                prot,
+                            )
+                        },
+                        0,
+                        "mprotect of the sentinel pages"
+                    );
+                }
+            }
+            pages
+        }
+
+        /// Whether the `len` bytes at `offset`, which must be readable, all
+        /// still hold `SENTINEL`.
+        fn holds_sentinel(&self, offset: usize, len: usize) -> bool {
             assert!(offset + len <= self.len);
             unsafe { std::slice::from_raw_parts((self.address + offset) as *const u8, len) }
                 .iter()
-                .all(|byte| *byte == 0)
+                .all(|byte| *byte == SENTINEL)
         }
     }
+
+    /// What `Pages::sentinel` fills its pages with: a stand-in for live data
+    /// the guest keeps below its red zone, which no step of a stat may
+    /// leave changed.
+    const SENTINEL: u8 = 0xa5;
 
     impl Drop for Pages {
         fn drop(&mut self) {
@@ -7957,39 +8072,82 @@ pub(crate) mod inject_fstat_scratch {
     }
 
     #[tokio::test]
-    async fn stat_guest_path_stats_the_path_in_its_scratch_and_zeroes_it() {
+    async fn stat_guest_path_stats_the_path_in_its_scratch_and_restores_it() {
         let file = tempfile::NamedTempFile::new().unwrap();
         let path = file.path().as_os_str().as_bytes();
         let metadata = file.as_file().metadata().unwrap();
-        let scratch = Pages::map(1, 1);
+        // A commit that writes zeros over the scratch, as on ptrace, and one
+        // that writes nothing over the guest's bytes, so the path's NUL must
+        // be staged with it.
+        for commit_writes in [true, false] {
+            let scratch = Pages::sentinel(1, 1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.commit_writes = commit_writes;
+
+            let result = tool.stat_guest_path(&mut guest, path).await;
+
+            let stat = result
+                .expect("stat_guest_path failed")
+                .expect("the guest's stat must be the answer");
+            assert_eq!((stat.st_dev, stat.st_ino), (metadata.dev(), metadata.ino()));
+            assert_eq!(guest.injected, [Sysno::newfstatat]);
+            assert_eq!(
+                guest.fstatat_paths,
+                [path.to_vec()],
+                "fstatat must name the whole path, NUL-terminated (commit_writes: \
+                 {commit_writes})"
+            );
+            assert_eq!(
+                guest.fstatat_guard_live,
+                [true],
+                "the stack guard must outlive the injected fstatat: backends whose \
+                 scratch is an arena free it when the guard drops"
+            );
+            assert_eq!(
+                guest.unguarded_scratch_writes(),
+                0,
+                "both buffers must be written back before the stack guard drops"
+            );
+            assert!(
+                guest.mapped.is_empty(),
+                "a stack scratch that works needs no transient page: {:?}",
+                guest.mapped
+            );
+            assert!(
+                scratch.holds_sentinel(0, scratch.len),
+                "the guest's bytes under the path and the stat must be put back \
+                 (commit_writes: {commit_writes})"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_restores_its_scratch_when_the_guests_stat_fails() {
+        let directory = tempfile::tempdir().unwrap();
+        let absent = directory.path().join("absent");
+        let path = absent.as_os_str().as_bytes();
+        let scratch = Pages::sentinel(1, 1, 1);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.commit_writes = true;
 
         let result = tool.stat_guest_path(&mut guest, path).await;
 
-        let stat = result
-            .expect("stat_guest_path failed")
-            .expect("the guest's stat must be the answer");
-        assert_eq!((stat.st_dev, stat.st_ino), (metadata.dev(), metadata.ino()));
-        assert_eq!(guest.injected, [Sysno::newfstatat]);
-        assert_eq!(
-            guest.fstatat_paths,
-            [path.to_vec()],
-            "fstatat must name the whole path, NUL-terminated"
+        assert!(
+            matches!(result, Ok(None)),
+            "a path the guest cannot stat has no answer: {}",
+            outcome(&result)
         );
         assert_eq!(
-            guest.fstatat_guard_live,
-            [true],
-            "the stack guard must outlive the injected fstatat: backends whose \
-             scratch is an arena free it when the guard drops"
+            guest.injected,
+            [Sysno::newfstatat],
+            "a failed stat is the guest's answer, not a reason to retry"
         );
+        assert_eq!(guest.fstatat_paths, [path.to_vec()]);
+        assert_eq!(guest.fstatat_guard_live, [true]);
+        assert_eq!(guest.unguarded_scratch_writes(), 0);
         assert!(
-            guest.mapped.is_empty(),
-            "a stack scratch that works needs no transient page: {:?}",
-            guest.mapped
-        );
-        assert!(
-            scratch.zeroed(0, scratch.len),
-            "neither the path nor the stat may be left in the guest's stack scratch"
+            scratch.holds_sentinel(0, scratch.len),
+            "the guest's bytes must be put back after a failed stat"
         );
     }
 
@@ -8013,7 +8171,7 @@ pub(crate) mod inject_fstat_scratch {
     async fn stat_guest_path_uses_a_transient_page_when_its_scratch_is_too_small() {
         // One byte short of the path buffer and the stat buffer.
         let needed = 512 + std::mem::size_of::<libc::stat>();
-        let scratch = Pages::map(1, 1);
+        let scratch = Pages::sentinel(1, 1, 1);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, needed - 1, None);
 
         let result = tool.stat_guest_path(&mut guest, b"/").await;
@@ -8034,12 +8192,15 @@ pub(crate) mod inject_fstat_scratch {
         let page = sole_transient_page(&guest, 1);
         assert_eq!(guest.fstatat_paths, [b"/".to_vec()]);
         assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
-        assert!(scratch.zeroed(0, scratch.len), "the stack scratch was used");
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the stack scratch was used"
+        );
     }
 
     #[tokio::test]
     async fn stat_guest_path_uses_a_transient_page_when_its_scratch_cannot_be_committed() {
-        let scratch = Pages::map(1, 1);
+        let scratch = Pages::sentinel(1, 1, 1);
         let (tool, mut guest) =
             ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
 
@@ -8067,14 +8228,84 @@ pub(crate) mod inject_fstat_scratch {
         );
         assert_eq!(guest.fstatat_guard_live, [false]);
         assert!(
-            scratch.zeroed(0, scratch.len),
-            "nothing may be left in the stack scratch"
+            scratch.holds_sentinel(0, scratch.len),
+            "nothing may be left changed in the stack scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_restores_what_a_failed_commit_wrote() {
+        // As on ptrace, the commit writes the whole scratch in one write from
+        // its start: here its first 256 bytes, on a writable page, before it
+        // faults on the read-only page after them.
+        let written = 256;
+        let scratch = Pages::sentinel(2, 1, 2);
+        let start = page_size() - written;
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address + start, scratch.len - start, None);
+        guest.commit_writes = true;
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        let stat = result
+            .expect("a scratch the guest cannot hold must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(guest.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap],
+            "no stat may be injected into a scratch whose commit failed"
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the bytes the failed commit wrote must be put back"
+        );
+    }
+
+    #[tokio::test]
+    async fn stat_guest_path_does_not_use_a_scratch_it_cannot_save() {
+        // The path buffer fills the last 512 bytes of a writable page and the
+        // stat buffer starts the inaccessible page after it, whose bytes
+        // cannot be read and so could not be put back.
+        let path_capacity = 512;
+        let scratch = Pages::sentinel(2, 1, 1);
+        let path_buffer = page_size() - path_capacity;
+        let (tool, mut guest) = ScriptedGuest::with_scratch(
+            scratch.address + path_buffer,
+            scratch.len - path_buffer,
+            None,
+        );
+        guest.commit_writes = true;
+
+        let result = tool.stat_guest_path(&mut guest, b"/").await;
+
+        let stat = result
+            .expect("a scratch that cannot be saved must not fail the caller")
+            .expect("the transient page must give the guest's answer");
+        assert_eq!((stat.st_dev, stat.st_ino), identity_of(b"/"));
+        assert_eq!(
+            guest.commits.load(Ordering::SeqCst),
+            0,
+            "a scratch whose bytes cannot be saved must not be committed"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::newfstatat, Sysno::munmap]
+        );
+        let page = sole_transient_page(&guest, 1);
+        assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
+        assert!(
+            scratch.holds_sentinel(path_buffer, path_capacity),
+            "no byte of a scratch that cannot be saved may be written"
         );
     }
 
     #[tokio::test]
     async fn stat_guest_path_propagates_a_commit_error_other_than_efault() {
-        let scratch = Pages::map(1, 1);
+        let scratch = Pages::sentinel(1, 1, 1);
         let (tool, mut guest) =
             ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::ESRCH));
 
@@ -8086,12 +8317,14 @@ pub(crate) mod inject_fstat_scratch {
             outcome(&result)
         );
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+        assert!(scratch.holds_sentinel(0, scratch.len));
     }
 
     #[tokio::test]
     async fn stat_guest_path_uses_a_transient_page_when_its_path_cannot_be_staged() {
-        // No byte of this scratch is writable, so there is nothing to zero.
-        let scratch = Pages::map(1, 0);
+        // This scratch can be read, so its bytes can be saved, but no byte of
+        // it can be written.
+        let scratch = Pages::sentinel(1, 0, 1);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
 
         let result = tool.stat_guest_path(&mut guest, b"/").await;
@@ -8108,15 +8341,17 @@ pub(crate) mod inject_fstat_scratch {
         );
         let page = sole_transient_page(&guest, 1);
         assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(1)]);
+        assert!(scratch.holds_sentinel(0, scratch.len));
     }
 
     #[tokio::test]
-    async fn stat_guest_path_zeroes_a_partly_staged_path_before_using_a_transient_page() {
-        // The path buffer starts four bytes before the end of a writable page,
-        // so staging a five-byte path writes four bytes and then faults.
+    async fn stat_guest_path_restores_a_partly_staged_path_before_using_a_transient_page() {
+        // The path buffer starts four bytes before the end of a writable page
+        // and the page after it can only be read, so staging a five-byte path
+        // writes four bytes and then faults.
         let path = b"/////";
         let staged = 4;
-        let scratch = Pages::map(2, 1);
+        let scratch = Pages::sentinel(2, 1, 2);
         let path_buffer = page_size() - staged;
         let (tool, mut guest) = ScriptedGuest::with_scratch(
             scratch.address + path_buffer,
@@ -8141,17 +8376,17 @@ pub(crate) mod inject_fstat_scratch {
             [page + transient_stat_offset(path.len())]
         );
         assert!(
-            scratch.zeroed(path_buffer, staged),
-            "the staged prefix of the path must be zeroed"
+            scratch.holds_sentinel(0, scratch.len),
+            "the guest's bytes under the staged prefix of the path must be put back"
         );
     }
 
     #[tokio::test]
     async fn stat_guest_path_retries_in_a_transient_page_when_its_stat_buffer_faults() {
         // The path buffer fills the last 512 bytes of a writable page and the
-        // stat buffer starts the inaccessible page after it.
+        // stat buffer starts the page after it, which can only be read.
         let path_capacity = 512;
-        let scratch = Pages::map(2, 1);
+        let scratch = Pages::sentinel(2, 1, 2);
         let path_buffer = page_size() - path_capacity;
         let (tool, mut guest) = ScriptedGuest::with_scratch(
             scratch.address + path_buffer,
@@ -8181,7 +8416,7 @@ pub(crate) mod inject_fstat_scratch {
                 scratch.address + page_size(),
                 page + transient_stat_offset(1)
             ],
-            "this test needs the first stat buffer at the start of the inaccessible \
+            "this test needs the first stat buffer at the start of the read-only \
              page, and the retry in the transient page"
         );
         assert_eq!(
@@ -8190,8 +8425,8 @@ pub(crate) mod inject_fstat_scratch {
             "the stack guard must outlive the first fstatat and be gone by the retry"
         );
         assert!(
-            scratch.zeroed(path_buffer, path_capacity),
-            "the staged path must still be zeroed"
+            scratch.holds_sentinel(0, scratch.len),
+            "the guest's bytes under the staged path must be put back"
         );
     }
 
@@ -8206,7 +8441,7 @@ pub(crate) mod inject_fstat_scratch {
             let mut path = vec![b'/'; len - name.len()];
             path.extend_from_slice(name);
             assert_eq!(path.len(), len);
-            let scratch = Pages::map(1, 1);
+            let scratch = Pages::sentinel(1, 1, 1);
             let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
 
             let result = tool.stat_guest_path(&mut guest, &path).await;
@@ -8231,7 +8466,10 @@ pub(crate) mod inject_fstat_scratch {
                 "fstatat must name the whole {len}-byte path, NUL-terminated"
             );
             assert_eq!(guest.fstatat_buffers, [page + transient_stat_offset(len)]);
-            assert!(scratch.zeroed(0, scratch.len), "the stack scratch was used");
+            assert!(
+                scratch.holds_sentinel(0, scratch.len),
+                "the stack scratch was used"
+            );
         }
     }
 
