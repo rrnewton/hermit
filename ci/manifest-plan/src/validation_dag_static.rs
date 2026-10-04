@@ -695,7 +695,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // only_exact_canonical_host_mtimes_are_kept and
     // first_seen_mtime_is_resolved_by_the_first_stat) retain all 874 prior
     // identities: 874 + 2 = 876.
-    ("test.detcore_unit", 876),
+    // Two bootstrap-turn scheduler-time tests (scheduler::test::
+    // bootstrap_syscall_turn_withholds_scheduler_time_except_for_polling_retries
+    // and io_buffers::event_tests::
+    // bootstrap_syscall_marks_its_resource_requests_only_while_it_is_uncharged,
+    // https://github.com/rrnewton/hermit/issues/3517) retain all 876 prior
+    // identities: 876 + 2 = 878.
+    ("test.detcore_unit", 878),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -908,7 +914,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin carries test.detcore_time's PMU-free filter: 2 of 31
     // (https://github.com/rrnewton/hermit/issues/3663).
     ("test.detcore_time_on_host", 2),
-    ("test.detcore_unit_on_host", 876),
+    // The two bootstrap-turn scheduler-time tests listed for test.detcore_unit
+    // (https://github.com/rrnewton/hermit/issues/3517) retain all 876 prior
+    // identities.
+    ("test.detcore_unit_on_host", 878),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
