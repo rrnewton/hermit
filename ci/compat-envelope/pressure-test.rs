@@ -16513,15 +16513,19 @@ fn self_test(root: &Path) -> Result<(), String> {
         // canonical divergence or a skid refusal is an intact history, so it
         // is refused with no unknown history and no evidence error, and so is
         // a qualifying PASS the re-decision refuses (another backend's
-        // dispatch record, a canonical report under stripped relaxations,
-        // stdout the skid row's declaration forbids, or a guest exit the rows
-        // do not expect); each has a control that earns credit. A skid row or
-        // a selected PASS whose retained runtime copies are not its report's
-        // is refused the same way, beside a control whose copies agree. So is
-        // a PASS or a skid row whose command lines select another backend
-        // than the one the row records, or carry a run flag its relaxations
-        // do not record, beside verdicts-skid-recovered, whose rows also
-        // carry no runtime.
+        // dispatch record, a canonical report under stripped relaxations, or
+        // stdout the skid row's declaration forbids); each has a control that
+        // earns credit. A skid row or a selected PASS whose retained runtime
+        // copies are not its report's is refused the same way, beside a
+        // control whose copies agree. So is a PASS or a skid row whose command
+        // lines select another backend than the one the row records, or carry
+        // a run flag its relaxations do not record, beside
+        // verdicts-skid-recovered, whose rows also carry no runtime. A PASS
+        // whose guest exit is not the one its row declares is refused as the
+        // full summary refuses it ([`matched_attempts_end_as_declared`]), so
+        // its history is not intact; the check after this loop pins that
+        // refusal as its only evidence error, and the exit-7 PASS is its
+        // control.
         for (name, earlier, later, verdict, recovered, history_intact) in [
             (
                 "verdicts-skid-recovered",
@@ -16753,7 +16757,7 @@ fn self_test(root: &Path) -> Result<(), String> {
                 &exit0_pass,
                 "FLAKY",
                 0,
-                true,
+                false,
             ),
             (
                 "verdicts-skid-then-liteinst-invocation-pass",
@@ -16823,6 +16827,25 @@ fn self_test(root: &Path) -> Result<(), String> {
                     "{name}: a retried pass was misjudged: {outcome:?} {written}"
                 ));
             }
+        }
+        // The declared exit-7 cell's exit-0 PASS, read above as a history that
+        // is not intact: the rows-only reader refuses its row as the full
+        // summary does, and that refusal is its only evidence error.
+        let (_, written) = judge(&scratch.join("verdicts-exit7-skid-then-exit0-pass"), 3)?;
+        let summary = &written["cells"][0];
+        if summary["unknown_history_repetitions"] != json!(1)
+            || !summary["evidence_errors"].as_array().is_some_and(|errors| {
+                errors.len() == 1
+                    && errors[0].as_str().is_some_and(|error| {
+                        error.starts_with(
+                            "outer attempt 2 passed a matched comparison that does not end as its cell declares",
+                        )
+                    })
+            })
+        {
+            return Err(format!(
+                "a declared exit-7 cell's exit-0 PASS was not refused with only the declared-exit refusal: {written}"
+            ));
         }
         // A skid row whose declared-stdout record omits one member, which no
         // runner writes. Read leniently, the omitted member would be null:
