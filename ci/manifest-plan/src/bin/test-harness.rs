@@ -2097,7 +2097,10 @@ fn audit_run_dag_workflow_runner(label: &str, workflow: &YamlValue) -> Result<()
     const PORTABLE: &str = "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable ${{ inputs.max_mem != '' && format('--max-mem {0}', inputs.max_mem) || '' }} -v";
     const DAG_PRIVILEGED: &str =
         "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 -v";
-    const VALIDATION_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\nenv -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
+    // Both launches are pinned: the boxing-capable one whenever the step's
+    // environment carries any cgroup input the runner reads, and the explicit
+    // unboxed one only when it carries none.
+    const VALIDATION_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\nif [[ -n ${DAGRUN_DELEGATED_CGROUP+set}${DAGRUN_IN_SCOPE+set}${DAGRUN_SCOPE_UNIT+set}${DAGRUN_DIRECT_CGROUP+set}${DAGRUN_DELEGATED_UNBOXED+set}${DAGRUN_FORCE_SCOPE_ATTEMPT+set} ]]; then\n  env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\nelse\n  env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\nfi";
     const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
     const FIXTURES: &[&str] = &[
         "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
@@ -3313,6 +3316,7 @@ mod tests {
     use super::PINNED_COMMAND_SEPARATOR;
     use super::PREBUILT_COMMAND_PREFIX;
     use super::TestResults;
+    use super::YamlValue;
     use super::accumulate_cell_cpu_usage;
     use super::audit_privileged_unboxed_guard;
     use super::audit_run_dag_workflow_runner;
@@ -5384,6 +5388,266 @@ sys.exit(1 if failed else 0)
             let error = audit_validation_levels_policy(&changed).unwrap_err();
             assert!(
                 error.contains(planted.split(':').next().unwrap()),
+                "{error}"
+            );
+        }
+    }
+
+    /// Runs the committed validation-levels privileged DAG step through the
+    /// real public launcher, against a runner that records only its arguments
+    /// and the process-group CPU scan marker it inherits. Under
+    /// `--allow-cgroup-failure` the pinned runner reads each of these
+    /// variables before it settles on running unboxed, so a step whose
+    /// environment carries any of them keeps that boxing-capable launch, which
+    /// never carries the marker. Only an Actions step carrying none of them,
+    /// where that launch was certainly unboxed, selects `--unsafe-no-cgroups`,
+    /// and only that launch hands its cells the marker. Outside Actions the
+    /// step refuses before launching anything.
+    #[test]
+    fn validation_levels_privileged_dag_keeps_available_boxing_and_marks_only_the_unboxed_launch() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::path::PathBuf;
+        use std::process::Command;
+
+        struct Scratch(PathBuf);
+        impl Drop for Scratch {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+
+        const MARKER: &str = "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN";
+        const BOXING_INPUTS: [(&str, &str); 6] = [
+            (
+                "DAGRUN_DELEGATED_CGROUP",
+                "/sys/fs/cgroup/delegated-by-an-outer-scheduler",
+            ),
+            ("DAGRUN_DELEGATED_UNBOXED", "1"),
+            ("DAGRUN_IN_SCOPE", "1"),
+            ("DAGRUN_SCOPE_UNIT", "dagrun-outer.scope"),
+            ("DAGRUN_DIRECT_CGROUP", "1"),
+            ("DAGRUN_FORCE_SCOPE_ATTEMPT", "1"),
+        ];
+
+        let workflow: YamlValue = serde_yaml::from_str(include_str!(
+            "../../../../.github/workflows/validation-levels.yml"
+        ))
+        .unwrap();
+        let step_script = workflow["jobs"]["full"]["steps"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .find(|step| step["name"].as_str() == Some("Privileged PMU and CPUID test DAG"))
+            .and_then(|step| step["run"].as_str())
+            .expect("the validation-levels full job runs the privileged DAG step")
+            .to_string();
+
+        let scratch = Scratch(std::env::temp_dir().join(format!(
+            "hermit-validation-levels-privileged-dag-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        )));
+        let fixture = scratch.0.clone();
+        let _ = fs::remove_dir_all(&fixture);
+        for directory in ["ci", "agent-utils/common/bin", "bin", "runner-temp"] {
+            fs::create_dir_all(fixture.join(directory)).unwrap();
+        }
+        let repo = super::root(None);
+        for relative in ["ci/run-dag.sh", "ci/configure-build-jobs.sh"] {
+            fs::copy(repo.join(relative), fixture.join(relative)).unwrap();
+        }
+        let write_executable = |path: PathBuf, body: String| {
+            fs::write(&path, body).unwrap();
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        // The launcher looks here when DAGRUN_BIN is unset, which the step
+        // guarantees with `env -u DAGRUN_BIN`.
+        write_executable(
+            fixture.join("agent-utils/common/bin/dagrun"),
+            format!(
+                "#!/bin/sh\nset -eu\nprintf '%s\\n' \"$*\" \"${{{MARKER}-unset}}\" >\"$VALIDATION_LEVELS_DAG_CAPTURE\"\n"
+            ),
+        );
+        // The launcher only resolves rust-script; nothing here executes it.
+        write_executable(
+            fixture.join("bin/rust-script"),
+            "#!/bin/sh\nexit 97\n".into(),
+        );
+        let script = fixture.join("privileged-dag-step.sh");
+        fs::write(&script, &step_script).unwrap();
+        let capture = fixture.join("captured-launch");
+        let path = format!(
+            "{}:{}",
+            fixture.join("bin").display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+
+        let run_step = |actions: bool, inputs: &[(&str, &str)], caller_marker: Option<&str>| {
+            match fs::remove_file(&capture) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("cannot reset the captured launch: {error}"),
+            }
+            let mut command = Command::new("bash");
+            command
+                .arg("-e")
+                .arg(&script)
+                .current_dir(&fixture)
+                .env("PATH", &path)
+                .env("RUNNER_TEMP", fixture.join("runner-temp"))
+                .env("VALIDATION_LEVELS_DAG_CAPTURE", &capture)
+                .env(
+                    "DAGRUN_BIN",
+                    fixture.join("a-caller-runner-the-step-must-drop"),
+                )
+                .env_remove("CI_DAG_BUILD_JOBS")
+                .env_remove("RUN_DAG_FILE_OVERRIDE")
+                .env_remove("VALIDATE_RUN_STATE")
+                .env_remove("E2E_RESULT_ROOT")
+                .env_remove("E2E_BUILD_ROOT");
+            for (name, _) in BOXING_INPUTS {
+                command.env_remove(name);
+            }
+            for (name, value) in inputs {
+                command.env(name, value);
+            }
+            if actions {
+                command.env("GITHUB_ACTIONS", "true");
+            } else {
+                command.env_remove("GITHUB_ACTIONS");
+            }
+            match caller_marker {
+                Some(value) => command.env(MARKER, value),
+                None => command.env_remove(MARKER),
+            };
+            let output = command.output().unwrap();
+            let launch = match fs::read_to_string(&capture) {
+                Ok(text) => Some(text),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => panic!("cannot read the captured launch: {error}"),
+            };
+            (output, launch)
+        };
+        let launched = |label: &str,
+                        (output, launch): (std::process::Output, Option<String>)|
+         -> (String, String) {
+            assert!(
+                output.status.success(),
+                "{label}: the step failed with {}: {}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let launch =
+                launch.unwrap_or_else(|| panic!("{label}: the step never reached the runner"));
+            let mut lines = launch.lines();
+            let arguments = lines.next().unwrap_or_default().to_string();
+            let marker = lines.next().unwrap_or_default().to_string();
+            assert!(
+                arguments.starts_with("run --dag ")
+                    && arguments.contains(" --labels hosted-privileged -j 2 ")
+                    && arguments.ends_with(" -v"),
+                "{label}: unexpected runner arguments {arguments:?}"
+            );
+            (arguments, marker)
+        };
+
+        // Actions with no boxing input: the old launch was certainly unboxed,
+        // so the step opts out by flag and its cells get the scan marker.
+        for caller_marker in [None, Some("0")] {
+            let label = format!("unboxed Actions step, caller marker {caller_marker:?}");
+            let (arguments, marker) = launched(&label, run_step(true, &[], caller_marker));
+            assert!(
+                arguments.contains(" --unsafe-no-cgroups ")
+                    && !arguments.contains("--allow-cgroup-failure"),
+                "{label}: expected the explicit unboxed launch, got {arguments:?}"
+            );
+            assert_eq!(
+                marker, "1",
+                "{label}: the unboxed launch must hand its cells the marker"
+            );
+        }
+
+        // Any boxing input keeps the launch that lets the runner box the DAG,
+        // and that launch never carries the marker, even a caller's.
+        for input in BOXING_INPUTS {
+            for caller_marker in [None, Some("1")] {
+                let label = format!(
+                    "Actions step with {}, caller marker {caller_marker:?}",
+                    input.0
+                );
+                let (arguments, marker) = launched(&label, run_step(true, &[input], caller_marker));
+                assert!(
+                    arguments.contains(" --allow-cgroup-failure ")
+                        && !arguments.contains("--unsafe-no-cgroups"),
+                    "{label}: available boxing was bypassed: {arguments:?}"
+                );
+                assert_eq!(
+                    marker, "unset",
+                    "{label}: a launch that may be boxed handed its cells the scan marker"
+                );
+            }
+        }
+
+        // Outside Actions the step refuses, whatever the environment says.
+        for inputs in [&[][..], &BOXING_INPUTS[..1]] {
+            let (output, launch) = run_step(false, inputs, Some("1"));
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "outside Actions with {inputs:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains(
+                    "privileged DAG: refusing explicit unboxed execution outside GitHub Actions"
+                ),
+                "outside Actions with {inputs:?}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert_eq!(
+                launch, None,
+                "outside Actions with {inputs:?}: the runner was launched"
+            );
+        }
+    }
+
+    /// The exact-command audit pins both launches of the validation-levels
+    /// privileged DAG step: dropping either one is a different command.
+    #[test]
+    fn validation_levels_run_dag_audit_pins_both_privileged_launches() {
+        let mut workflow: YamlValue = serde_yaml::from_str(include_str!(
+            "../../../../.github/workflows/validation-levels.yml"
+        ))
+        .unwrap();
+        const LABEL: &str = ".github/workflows/validation-levels.yml";
+        audit_run_dag_workflow_runner(LABEL, &workflow).unwrap();
+        let index = workflow["jobs"]["full"]["steps"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .position(|step| step["name"].as_str() == Some("Privileged PMU and CPUID test DAG"))
+            .expect("the validation-levels full job runs the privileged DAG step");
+        let committed = workflow["jobs"]["full"]["steps"][index]["run"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let guard = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\n";
+        let launch = |flag: &str| {
+            format!(
+                "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 {flag} --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\n"
+            )
+        };
+        for single in [
+            format!("{guard}{}", launch("--unsafe-no-cgroups")),
+            format!("{guard}{}", launch("--allow-cgroup-failure")),
+        ] {
+            assert_ne!(single, committed);
+            workflow["jobs"]["full"]["steps"][index]["run"] = YamlValue::String(single.clone());
+            let error = audit_run_dag_workflow_runner(LABEL, &workflow)
+                .expect_err("a single-launch privileged step must not pass the exact audit");
+            assert!(
+                error.contains("differ from the exact Rust-runner commands"),
                 "{error}"
             );
         }
