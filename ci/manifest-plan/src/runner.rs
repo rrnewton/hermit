@@ -5534,6 +5534,25 @@ fn spawn_process(
     };
     let stdout_file = open_capture(stdout, SpawnStage::StdoutCapture)?;
     let stderr_file = open_capture(stderr, SpawnStage::StderrCapture)?;
+    // A failed cgroup join and a failed exec reach this process as the same
+    // bare error code, so the child writes one byte to this pipe when the join
+    // is what failed.
+    let join_report = match enrollment {
+        Some(_) => match join_failure_pipe() {
+            Ok(pipe) => Some(pipe),
+            Err(error) => {
+                let reason =
+                    format!("cannot open the pipe that reports a failed cgroup join: {error}");
+                observation.launch = LaunchObservation::SpawnFailed {
+                    stage: SpawnStage::Spawn,
+                    reason: reason.clone(),
+                };
+                observation.termination = TerminationPath::SpawnFailed;
+                return Err(reason);
+            }
+        },
+        None => None,
+    };
     let identity = &observation.command;
     let program = &identity.argv[0];
     let mut command = Command::new(program);
@@ -5545,6 +5564,7 @@ fn spawn_process(
         .stderr(stderr_file);
     command.envs(identity.env_overrides.iter());
     let enrollment_fd = enrollment.map(|(fd, _)| fd);
+    let join_report_fd = join_report.as_ref().map(|(_, write)| write.as_raw_fd());
     unsafe {
         command.pre_exec(move || {
             if libc::setpgid(0, 0) == -1 {
@@ -5554,36 +5574,53 @@ fn spawn_process(
             // program and of anything it starts is charged to that cgroup. The
             // descriptor is close-on-exec, so the program never sees it.
             if let Some(fd) = enrollment_fd {
-                loop {
+                let joined = loop {
                     let written = libc::write(fd, b"0\n".as_ptr().cast(), 2);
                     if written == 2 {
-                        break;
+                        break Ok(());
                     }
                     if written < 0 {
                         let error = std::io::Error::last_os_error();
                         if error.raw_os_error() == Some(libc::EINTR) {
                             continue;
                         }
-                        return Err(error);
+                        break Err(error);
                     }
-                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                    break Err(std::io::Error::from_raw_os_error(libc::EIO));
+                };
+                if let Err(error) = joined {
+                    if let Some(report) = join_report_fd {
+                        libc::write(report, b"j".as_ptr().cast(), 1);
+                    }
+                    return Err(error);
                 }
             }
             Ok(())
         });
     }
-    match command.spawn() {
+    let spawned = command.spawn();
+    // The child wrote its report, if any, before it sent the error that ends
+    // the spawn, so a failed spawn finds the byte already in the pipe.
+    let join_failed = match (&spawned, join_report) {
+        (Err(_), Some((read, _write))) => {
+            let mut byte = [0u8; 1];
+            let read = unsafe { libc::read(read.as_raw_fd(), byte.as_mut_ptr().cast(), 1) };
+            read == 1
+        }
+        _ => false,
+    };
+    match spawned {
         Ok(child) => {
             observation.launch = LaunchObservation::Spawned { pid: child.id() };
             Ok(child)
         }
         Err(error) => {
             let reason = match enrollment {
-                Some((_, cgroup)) => format!(
-                    "cannot execute {program}: {error}; before exec the child also joins invocation cgroup {}",
+                Some((_, cgroup)) if join_failed => format!(
+                    "cannot join invocation cgroup {} before exec, so {program} was not started: {error}",
                     cgroup.display()
                 ),
-                None => format!("cannot execute {program}: {error}"),
+                _ => format!("cannot execute {program}: {error}"),
             };
             observation.launch = LaunchObservation::SpawnFailed {
                 stage: SpawnStage::Spawn,
@@ -5593,6 +5630,17 @@ fn spawn_process(
             Err(reason)
         }
     }
+}
+
+/// A close-on-exec, nonblocking pipe, read end first, through which a child
+/// reports that its cgroup join failed before exec.
+fn join_failure_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) } == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: pipe2 returned two new descriptors that nothing else owns.
+    Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
 }
 
 /// Monitor with a reader that reports live CPU in seconds, as agent-utils
@@ -10299,6 +10347,86 @@ mod tests {
         )
         .unwrap();
         (child, started, observation)
+    }
+
+    /// Spawn `program` with `enrollment` standing in for an invocation
+    /// cgroup's `cgroup.procs` descriptor, and return the spawn error.
+    fn spawn_error_with_enrollment(
+        root: &Path,
+        label: &str,
+        program: &str,
+        enrollment: &File,
+    ) -> (String, InvocationCpuObservation) {
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: label.into(),
+                backend: RequiredNullable::Null,
+            },
+            root,
+            program,
+            &[],
+            &BTreeMap::new(),
+            &root.join(format!("{label}.stdout")),
+            &root.join(format!("{label}.stderr")),
+        );
+        let mut observation = InvocationCpuObservation::pending(
+            1,
+            request.role,
+            request.command,
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let error = spawn_process(
+            &request.cwd,
+            &request.stdout,
+            &request.stderr,
+            Some((
+                enrollment.as_raw_fd(),
+                Path::new("/sys/fs/cgroup/stand-in-invocation"),
+            )),
+            &mut observation,
+        )
+        .expect_err("the spawn must fail");
+        (error, observation)
+    }
+
+    #[test]
+    fn a_failed_spawn_names_the_exec_or_the_cgroup_join_whichever_failed() {
+        let root = cpu_reader_test_root("spawn-failure-step");
+        // The join's write succeeds on /dev/null, so only the exec can fail,
+        // and its reason reads exactly as it does without a cgroup.
+        let accepting = OpenOptions::new().write(true).open("/dev/null").unwrap();
+        let missing = root.join("missing-program");
+        let (error, observation) =
+            spawn_error_with_enrollment(&root, "exec", missing.to_str().unwrap(), &accepting);
+        let exec_failure = format!(
+            "cannot execute {}: No such file or directory (os error 2)",
+            missing.display()
+        );
+        assert_eq!(error, exec_failure);
+        assert_eq!(
+            observation.launch,
+            LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: exec_failure,
+            }
+        );
+        assert_eq!(observation.termination, TerminationPath::SpawnFailed);
+        // A descriptor opened read-only refuses the join's write, so the join
+        // fails before an existing program could be started.
+        let refusing = File::open("/dev/null").unwrap();
+        let (error, observation) =
+            spawn_error_with_enrollment(&root, "join", "/bin/true", &refusing);
+        let join_failure = "cannot join invocation cgroup /sys/fs/cgroup/stand-in-invocation before exec, so /bin/true was not started: Bad file descriptor (os error 9)";
+        assert_eq!(error, join_failure);
+        assert_eq!(
+            observation.launch,
+            LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: join_failure.into(),
+            }
+        );
+        assert_eq!(observation.termination, TerminationPath::SpawnFailed);
+        fs::remove_dir_all(root).unwrap();
     }
 
     fn owned_child_is_reaped(pid: u32) -> bool {

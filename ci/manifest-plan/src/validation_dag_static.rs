@@ -635,7 +635,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // `cargo nextest list --profile ci -p hermit-manifest-plan` measured 654
     // at e3424b2c0f29 and 686 with these commits on it; no other selected
     // crate changes.
-    ("test.regular_crates", 883),
+    // runner::tests::a_failed_spawn_names_the_exec_or_the_cgroup_join_whichever_failed
+    // retains all 883.
+    ("test.regular_crates", 884),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1126,8 +1128,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 9fd0c01a39 listed there to 851.
     // The invocation-cgroup CPU tests listed for test.regular_crates add 33
     // identities and remove one, so 850 of the 851 prior identities are
-    // retained (+32).
-    ("test.regular_crates_on_host", 883),
+    // retained (+32). The spawn-failure test listed there retains all 883.
+    ("test.regular_crates_on_host", 884),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
