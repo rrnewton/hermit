@@ -545,7 +545,26 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // under a name that says what it checks. `cargo nextest list --profile ci
     // -p hermit-manifest-plan` measured the +2 against 4773cd0aad80; no other
     // selected crate changes.
-    ("test.regular_crates", 836),
+    // Measuring each budgeted invocation's live CPU from a cgroup of its own
+    // adds fifteen tests and retains all 836 prior identities:
+    // invocation_cgroup::tests::the_process_group_scan_marker_accepts_only_exactly_one,
+    // the_unified_cgroup_entry_maps_to_sys_fs_cgroup_or_is_classified,
+    // a_missing_or_non_cgroup_parent_is_eligible_and_a_file_parent_is_not,
+    // a_symlinked_parent_cgroup_is_refused_and_not_eligible,
+    // a_fresh_invocation_cgroup_counts_its_process_monotonically_and_is_removed
+    // and a_read_only_parent_cgroup_is_eligible_for_the_fallback; and
+    // runner::tests::monotonic_cpu_sampler_refuses_a_decrease_and_keeps_the_high_value,
+    // a_decreasing_cgroup_sample_is_refused_after_the_unavailable_grace,
+    // a_transient_cgroup_decrease_is_graced_until_the_counter_recovers,
+    // a_boxed_run_whose_invocation_cgroup_cannot_be_created_still_stops_the_cell,
+    // the_fallback_marker_does_not_hide_an_ineligible_cgroup_failure,
+    // a_run_without_cgroups_measures_with_the_process_group_scan_under_its_own_source_name,
+    // a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source,
+    // a_malformed_fallback_marker_refuses_the_budgeted_command_before_launch
+    // and an_escaped_setsid_burner_is_charged_and_killed_through_the_invocation_cgroup.
+    // `cargo nextest list --profile ci -p hermit-manifest-plan` measured the
+    // +15; no other selected crate changes.
+    ("test.regular_crates", 851),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -988,7 +1007,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.regular_crates retain all 828 prior identities.
     // The falling- and flat-history cgroup CPU tests listed for
     // test.regular_crates retain 833 of the 834 prior identities (+2).
-    ("test.regular_crates_on_host", 836),
+    // The fifteen invocation-cgroup tests listed for test.regular_crates
+    // retain all 836 prior identities.
+    ("test.regular_crates_on_host", 851),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
