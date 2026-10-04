@@ -102,6 +102,7 @@ function require_complete_resources {
     for path in \
         libdetcore_dbt.so \
         libdetcore_sabre.so \
+        libdetcore_liteinst.so \
         libreverie_dbt_client.so \
         libreverie_liteinst.so; do
         [[ -f $install/rsrcs/$path && ! -L $install/rsrcs/$path && -s $install/rsrcs/$path ]] ||

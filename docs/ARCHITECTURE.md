@@ -69,7 +69,7 @@ determinism curve:
 | Backend | Mechanism | Status | Trade-off |
 | --- | --- | --- | --- |
 | **ptrace** | seccomp-BPF `SECCOMP_RET_TRACE` + `PTRACE`, out-of-process tracer | Production; the only in-tree backend (`reverie-ptrace`) | Complete and strongly deterministic; per-event context-switch cost |
-| **LiteInst + ptrace** | Online hot-site patching with a ptrace-owned Tool and in-guest patch/helper DSO | Experimental hybrid | Keeps ptrace lifecycle/PMU correctness while replacing eligible repeated syscall traps; dynamically linked scope, and hook installation is single-task only |
+| **LiteInst** | Preloaded DSO installs Detcore's Tool inside the guest; patched syscall sites and a seccomp `SIGSYS` fallback dispatch to it; global state stays in Hermit over RPC | Experimental | No tracer on the syscall path; dynamically linked scope, no preemption timer yet, and no thread creation or `exec` yet |
 | **DBT** (SaBRe / DynamoRIO style) | In-process binary rewriting / function hooking of syscall sites | Experimental / research | Low overhead; today it is a syscall-boundary interceptor, **not** a deterministic backend |
 | **KVM / SVM** | Run the guest inside a hardware VM and trap via VM-exits | Exploratory | Can trap instructions ptrace cannot (see CPUID below); heaviest isolation and integration cost |
 | **e9patch + ptrace** | Cached offline main-ELF rewriting followed by the ptrace Detcore runtime | Experimental hybrid | Exact coverage of e9tool-recovered candidate sites; raw random/TSX instructions remain unsupported even when mapped |
@@ -80,19 +80,17 @@ backend the rest of this document describes. It is complete (it sees every
 subscribed event from every thread) and integrates with the PMU for RCB-based
 preemption, at the cost of a context switch per intercepted event.
 
-**LiteInst host hybrid.** Ptrace owns the sole Detcore Tool and GlobalTool from
-the initial exec, including PMU scheduling and CPUID/RDTSC handling. A preload
-DSO contains only LiteInst patch/helper state. The first eligible syscall site
-is validated by the tracer and may be patched; later invocations enter the
-trampoline but preserve the same ptrace-owned lifecycle. The current scope is
-dynamically linked. Threads and child processes run under the ordinary ptrace
-lifecycle, but **hook installation is single-task only**: the patch helper runs
-on a process-global stack and the installer is not re-entrant across tasks, so
-the hook set freezes at the first `clone`/`clone3`/`fork`/`vfork`. A
-task-creating syscall site is never patched, because the kernel starts the new
-task at the instruction after the `syscall` and that address must still be an
-instruction boundary. A `vfork` child and an exec after start both still fail
-closed, because neither can preserve the preload runtime.
+**LiteInst.** Hermit preloads `libdetcore_liteinst.so`, whose constructor
+installs Detcore's Tool inside the guest process before the program's `main`.
+Patched syscall sites and a seccomp `SIGSYS` fallback dispatch to that Tool in
+the guest; the GlobalTool stays in Hermit, reached over a coordinator RPC
+socket. No ptrace tracer sits on the syscall path. The current scope is
+dynamically linked programs, and the in-guest Tool host does not yet deliver
+Detcore's preemption timer, so a run requires `--max-timeslice=disabled`. A
+plain `fork` is supported and `vfork` runs as a copying fork; thread creation
+and `exec` are refused with `EOPNOTSUPP`. Code that runs before the
+constructor — the dynamic loader, the C library's initialization and the
+program's own library constructors — is not monitored.
 
 **e9patch hybrid.** The `e9patch` backend loads the cached instruction map for
 the main executable and invokes `e9tool -O0` with an exact file-offset matcher.

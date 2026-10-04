@@ -33,11 +33,23 @@ mod kvm_synchronous_fault;
 #[path = "common/kvm_waitid_copyout.rs"]
 mod kvm_waitid_copyout;
 
-// Its runtime-staging helpers are used only by the LiteInst run tests, which
-// a build without the `liteinst` feature leaves out.
+// Its helpers test `scripts/stage-liteinst-runtime.sh`, which still stages the
+// Reverie LiteInst runtime; the in-guest backend does not load that library.
 #[cfg_attr(not(feature = "liteinst"), allow(dead_code))]
 #[path = "common/liteinst.rs"]
 mod liteinst_runtime;
+
+// The LiteInst dispatch record and backend statistics are checked against
+// in-guest runs in this binary.
+#[cfg(feature = "liteinst")]
+#[path = "common/dispatch_stats.rs"]
+mod dispatch_stats;
+
+// Real programs under in-guest LiteInst, formerly the liteinst_advanced test
+// binary (https://github.com/rrnewton/hermit/issues/3520).
+#[cfg(feature = "liteinst")]
+#[path = "common/liteinst_in_guest_programs.rs"]
+mod liteinst_in_guest_programs;
 
 #[path = "common/readonly_proc.rs"]
 mod readonly_proc;
@@ -465,7 +477,7 @@ fn liteinst_inert_runtime() -> &'static Path {
             .expect("hermit-cli should be inside the repository");
         let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-inert-runtime");
         fs::create_dir_all(&build_root).expect("failed to create inert runtime directory");
-        let runtime = build_root.join("libreverie_liteinst_inert.so");
+        let runtime = build_root.join("libdetcore_liteinst_inert.so");
         let output = Command::new("cc")
             .args(["-shared", "-fPIC", "-Wall", "-Wextra", "-Werror"])
             .arg(repository.join("tests/c/liteinst_inert_runtime.c"))
@@ -479,7 +491,6 @@ fn liteinst_inert_runtime() -> &'static Path {
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
-        write_matching_liteinst_revision(&runtime);
         runtime
     })
 }
@@ -2794,48 +2805,6 @@ fn run_dbt_strict_returns_with_blocked_stdin_source() {
     assert!(stderr(&output).contains("unsupported syscall"));
 }
 
-// AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-736): Review the real LiteInst Detcore CLI assertion.
-#[test]
-#[cfg(feature = "liteinst")]
-fn run_liteinst_verifies_detcore_backend() {
-    liteinst_runtime::ensure_liteinst_runtime();
-    let args = [
-        "--backend",
-        "liteinst",
-        "run",
-        "--strict",
-        "--verify",
-        "--",
-        "/bin/echo",
-        "liteinst-cli-ok",
-    ];
-    let mut command = Command::new(liteinst_runtime::hermit_binary());
-    append_hermit_args(&mut command, &args);
-    let output = command
-        .output()
-        .unwrap_or_else(|error| panic!("failed to run selected LiteInst Hermit: {error}"));
-    assert_success(&output, &args);
-    assert_eq!(stdout(&output), "liteinst-cli-ok\n");
-    let stderr = stderr(&output);
-    assert!(
-        stderr.contains(
-            "liteinst host hybrid] activation verified (traps=1, hooks=31); Detcore Tool active in ptrace host"
-        ),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains("Success: deterministic. Determinism verified."),
-        "{stderr}"
-    );
-    assert!(
-        stderr.contains(
-            "LiteInst host hybrid (reverie-liteinst patch runtime + ptrace Detcore Tool)"
-        ),
-        "{stderr}"
-    );
-}
-
 /// Backend statistics are a HARNESS record and must stay out of the INFO parity
 /// envelope, while remaining available to anyone who asks for DEBUG.
 ///
@@ -2910,72 +2879,49 @@ fn backend_stats_are_debug_gated_and_absent_from_the_info_envelope() {
 
 /// LiteInst reports its own counters, under the same DEBUG gate as ptrace.
 ///
-/// The guest is Hermit's activation probe: 32 `getpid` calls from one
-/// instruction site, of which the first traps and installs the hook and the
-/// other 31 go through it. So a record that really came from this run counts
-/// at least 31 direct hooks; other sites in the probe's own start-up may add
-/// more. Exactly one record is required because the activation check Hermit
-/// runs first happens before logging is set up.
+/// The guest is the dispatch-record guest (`common/dispatch_stats.rs`): 64 raw
+/// `getppid` calls through one `syscall` site in the C library. In-guest
+/// LiteInst traps the site's first call, patches the site, and runs the other
+/// 63 through the patched hook, so a record that really came from this run
+/// counts at least 63 direct hooks; other sites in the guest's start-up may
+/// add more. In-guest, each guest process submits its own counts, so the one
+/// process here is `process_reports=1`; under the retired ptrace-hosted hybrid
+/// the host counted every hook itself and this read 0.
 ///
-/// Hermit reports from two call sites, one per way of running the guest: a
-/// plain `run` waits for the exit status, while `--verify` (and `analyze`)
-/// capture the output. Both are checked. Under `--verify --keep-logs` each of
-/// the two compared runs writes its DEBUG log to its own file, and after a
-/// match Hermit keeps only run 1's as the golden log and deletes run 2's
-/// (https://github.com/rrnewton/hermit/issues/3301). So run 2's log must be
-/// gone, and each log must hold exactly one record from its own run: the
-/// golden log, and run 2's, through a link made while Hermit ran. Plain
-/// `--verify` compares only selected DETLOG and scheduler COMMIT records
-/// (`filter_deterministic` in `detcore/src/logdiff.rs`), so the match does not
-/// imply that run 2's log holds this DEBUG record.
-///
-/// `process_reports=0` is today's architecture, not a gap: the ptrace host
-/// counts every hook entry itself, so no guest process submits a report.
-/// When Detcore moves into the guest (https://github.com/rrnewton/hermit/issues/3520)
-/// each guest process reports its own counts and this becomes 1.
+/// The hybrid version of this test also ran the guest under `--verify
+/// --keep-logs` and required exactly one record in run 1's golden log and in
+/// run 2's log (https://github.com/rrnewton/hermit/issues/3301). In-guest
+/// LiteInst refuses `--verify` until it forwards guest records
+/// (https://github.com/rrnewton/hermit/issues/3520), so only the plain-run call
+/// site is checked here.
 #[test]
 #[cfg(feature = "liteinst")]
 fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
-    liteinst_runtime::ensure_liteinst_runtime();
-    let hermit = liteinst_runtime::hermit_binary();
-    let hermit_path = hermit.to_str().expect("Hermit test binary path is UTF-8");
-    // With `verify` as `Some((logs, capture))` the guest runs under
-    // `--verify --keep-logs` into `logs`, and run 2's log is also returned
-    // through a hard link at `capture`.
-    let run = |log: &[&str], verify: Option<(&Path, &Path)>| {
+    let _guard = hermit_run_guard();
+    let guest = dispatch_stats::build_guest("guest-liteinst-stats", &[]);
+    let run = |log: &[&str]| {
         let mut args = log.to_vec();
-        args.extend(["--backend", "liteinst", "run"]);
-        if let Some((logs, _)) = verify {
-            let logs = logs.to_str().expect("verify-log directory path is UTF-8");
-            args.extend(["--verify", "--keep-logs", "--verify-log-dir", logs]);
-        }
         args.extend([
+            "--backend",
+            "liteinst",
+            "run",
             "--strict",
-            "--env=HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE=1",
+            "--max-timeslice=disabled",
             "--",
-            hermit_path,
         ]);
-        let mut command = Command::new(&hermit);
+        args.push(guest.to_str().expect("dispatch guest path is UTF-8"));
+        let mut command = hermit_command(&args);
         command
             .env_remove("RUST_LOG")
             .env_remove("HERMIT_LOG")
-            .env_remove("HERMIT_LOG_FILE");
-        append_hermit_args(&mut command, &args);
-        let (output, run2_log) = match verify {
-            Some((logs, capture)) => output_capturing_run2_log(&mut command, logs, capture),
-            None => (
-                command.output().unwrap_or_else(|error| {
-                    panic!("failed to run LiteInst Hermit with {args:?}: {error}")
-                }),
-                None,
-            ),
-        };
+            .env_remove("HERMIT_LOG_FILE")
+            .stdin(Stdio::null());
+        let output = command
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run LiteInst Hermit with {args:?}: {error}"));
         assert_success(&output, &args);
-        assert_eq!(
-            stdout(&output),
-            "hermit-liteinst-activation calls=32 traps=1 hooks=31\n"
-        );
-        (stderr(&output), run2_log)
+        assert_eq!(stdout(&output), "dispatch-stats-guest 1\n");
+        stderr(&output)
     };
     let check_record = |source: &str, text: &str| {
         let records: Vec<&str> = text
@@ -2989,7 +2935,7 @@ fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
         };
         assert!(
             record.contains(
-                "backend run complete backend=liteinst stats=LiteInst instrumentation stats: process_reports=0 "
+                "backend run complete backend=liteinst stats=LiteInst instrumentation stats: process_reports=1 "
             ),
             "{source}: {record}"
         );
@@ -3002,54 +2948,21 @@ fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
             .and_then(|digits| digits.parse().ok())
             .unwrap_or_else(|| panic!("no direct_hook count in {source}: {record}"));
         assert!(
-            direct_hooks >= 31,
-            "the probe makes 31 hooked calls, but {source} counts {direct_hooks}: {record}"
+            direct_hooks >= dispatch_stats::GUEST_SYSCALLS - 1,
+            "the guest makes {} hooked calls, but {source} counts {direct_hooks}: {record}",
+            dispatch_stats::GUEST_SYSCALLS - 1
         );
     };
 
     for log in [&[][..], &["--log", "info"][..]] {
-        let (stderr, _) = run(log, None);
+        let stderr = run(log);
         assert!(
             !stderr.contains("backend run complete"),
             "the record is DEBUG-only, but {log:?} printed it:\n{stderr}"
         );
     }
 
-    check_record("the run's stderr", &run(&["--log", "debug"], None).0);
-
-    let directory = tempfile::Builder::new()
-        .prefix("liteinst-stats-verify-")
-        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
-        .expect("failed to create LiteInst verify directory")
-        .keep();
-    eprintln!(
-        "LiteInst statistics verification artifacts retained at {}",
-        directory.display()
-    );
-    let logs = directory.join("verify-logs");
-    fs::create_dir(&logs).expect("failed to create LiteInst verify-log directory");
-    let link = directory.join("captured-run2.log");
-    let (verify_stderr, run2_log) = run(&["--log", "debug"], Some((&logs, &link)));
-    assert!(
-        verify_stderr.contains("Success: deterministic. Determinism verified."),
-        "{verify_stderr}"
-    );
-    let golden = retained_captures(&logs, "run1_log_");
-    let [capture] = &golden[..] else {
-        panic!("expected exactly one run1_log_ capture, found {golden:?}");
-    };
-    let duplicates = retained_captures(&logs, "run2_log_");
-    assert!(
-        duplicates.is_empty(),
-        "a matched verification must delete run 2's log: {duplicates:?}"
-    );
-    let run2_log = run2_log.expect("run 2's log, captured while the command ran");
-    for path in [capture, &run2_log] {
-        let text = fs::read_to_string(path)
-            .unwrap_or_else(|error| panic!("failed to read {}: {error}", path.display()));
-        check_record(&path.display().to_string(), &text);
-    }
-    fs::remove_file(&run2_log).expect("failed to remove run 2's checked log");
+    check_record("the run's stderr", &run(&["--log", "debug"]));
 }
 
 #[test]
@@ -3108,22 +3021,24 @@ fn inherited_container_output_does_not_expose_capture_offset() {
 
 #[test]
 #[cfg(feature = "liteinst")]
-fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
+fn run_liteinst_rejects_a_non_runtime_override_before_dispatch() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create false LiteInst runtime directory");
     let runtime = directory.path().join("not-a-liteinst-runtime");
     fs::copy("/bin/true", &runtime).expect("failed to copy false LiteInst runtime fixture");
-    write_matching_liteinst_revision(&runtime);
+    // The in-guest Tool host has no preemption timer, so the run disables it
+    // and reaches runtime validation instead of the timeslice refusal.
     let args = [
         "--backend",
         "liteinst",
         "run",
         "--strict",
+        "--max-timeslice=disabled",
         "--",
         "/bin/true",
     ];
     let output = hermit_command(&args)
-        .env("HERMIT_LITEINST_RUNTIME", &runtime)
+        .env("HERMIT_LITEINST_TOOL_RUNTIME", &runtime)
         .output()
         .expect("failed to run Hermit with a false LiteInst runtime");
     assert!(!output.status.success(), "{output:?}");
@@ -3135,27 +3050,141 @@ fn run_liteinst_rejects_a_non_runtime_override_before_activation_claim() {
 
 #[test]
 #[cfg(feature = "liteinst")]
-fn run_liteinst_rejects_an_inert_dso_before_activation_claim() {
+fn run_liteinst_rejects_an_inert_dso_before_dispatch() {
+    // As above, the timer is disabled so that runtime validation decides.
     let args = [
         "--backend",
         "liteinst",
         "run",
         "--strict",
+        "--max-timeslice=disabled",
         "--",
         "/bin/true",
     ];
     let output = hermit_command(&args)
-        .env("HERMIT_LITEINST_RUNTIME", liteinst_inert_runtime())
+        .env("HERMIT_LITEINST_TOOL_RUNTIME", liteinst_inert_runtime())
         .output()
         .expect("failed to run Hermit with an inert LiteInst runtime");
     assert!(!output.status.success(), "{output:?}");
     let stderr = stderr(&output);
     assert!(
-        stderr.contains("does not register reverie_liteinst_initialize as a preload constructor"),
+        stderr.contains("does not register detcore_liteinst_initialize as a preload constructor"),
         "{stderr}"
     );
     assert!(!stderr.contains("activation verified"), "{stderr}");
     assert!(!stderr.contains("Success: deterministic"), "{stderr}");
+}
+
+/// An installed Hermit finds the in-guest runtime as the packaged resource
+/// `rsrcs/libdetcore_liteinst.so`, which `hermit-install` stages beside the DBT
+/// and SaBRe Detcore runtimes, and a packaged resource is consulted before the
+/// Cargo artifact directory.
+///
+/// The installation is a directory holding a link to (or copy of) this test's
+/// Hermit and an `rsrcs/` directory, the layout a dereferenced copy of
+/// `target/install_pkg` has. Nothing else can supply the runtime there: no
+/// `libdetcore_liteinst.so` sits beside that Hermit, and
+/// `HERMIT_LITEINST_TOOL_RUNTIME` and `HERMIT_INSTALL_DIR` are removed. So the
+/// run fails while `rsrcs/` is empty, which is the control, and succeeds in-guest
+/// once the runtime is staged there. Last, the Cargo-built Hermit, whose own
+/// directory does hold the real runtime, is pointed at an installation whose
+/// packaged runtime is the inert fixture, and must refuse that fixture.
+#[test]
+#[cfg(feature = "liteinst")]
+fn run_liteinst_finds_the_runtime_staged_as_an_installed_resource() {
+    let _guard = hermit_run_guard();
+    let link_or_copy = |source: &Path, destination: &Path| {
+        if fs::hard_link(source, destination).is_err() {
+            fs::copy(source, destination).unwrap_or_else(|error| {
+                panic!(
+                    "failed to copy {} to {}: {error}",
+                    source.display(),
+                    destination.display()
+                )
+            });
+        }
+    };
+    let built = Path::new(env!("CARGO_BIN_EXE_hermit"));
+    let runtime = built
+        .parent()
+        .expect("the Cargo-built Hermit has a profile directory")
+        .join("libdetcore_liteinst.so");
+    assert!(
+        runtime.is_file(),
+        "{} is missing; build it with `cargo build -p detcore-liteinst` in this profile",
+        runtime.display()
+    );
+    let install = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the installation directory");
+    let installed_hermit = install.path().join("hermit");
+    link_or_copy(built, &installed_hermit);
+    let resources = install.path().join("rsrcs");
+    fs::create_dir(&resources).expect("failed to create the rsrcs directory");
+
+    let args = [
+        "--backend",
+        "liteinst",
+        "run",
+        "--strict",
+        "--max-timeslice=disabled",
+        "--",
+        "/bin/echo",
+        "installed-liteinst-ok",
+    ];
+    let run_installed = || {
+        let mut command = Command::new(&installed_hermit);
+        append_hermit_args(&mut command, &args);
+        command
+            .env_remove("HERMIT_INSTALL_DIR")
+            .env_remove("HERMIT_LITEINST_TOOL_RUNTIME")
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run the installed Hermit")
+    };
+
+    let missing = run_installed();
+    let missing_stderr = stderr(&missing);
+    assert!(!missing.status.success(), "{missing:?}");
+    assert!(
+        missing_stderr.contains("the in-guest Detcore runtime is unavailable"),
+        "{missing_stderr}"
+    );
+    assert!(
+        !stdout(&missing).contains("installed-liteinst-ok"),
+        "the guest ran without a runtime: {missing:?}"
+    );
+
+    link_or_copy(&runtime, &resources.join("libdetcore_liteinst.so"));
+    let installed = run_installed();
+    assert_success(&installed, &args);
+    assert_eq!(stdout(&installed), "installed-liteinst-ok\n");
+    assert!(
+        stderr(&installed).lines().any(|line| line
+            == "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool"),
+        "{}",
+        stderr(&installed)
+    );
+
+    let inert_install = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the inert installation directory");
+    fs::create_dir(inert_install.path().join("rsrcs")).expect("failed to create rsrcs");
+    fs::copy(
+        liteinst_inert_runtime(),
+        inert_install.path().join("rsrcs/libdetcore_liteinst.so"),
+    )
+    .expect("failed to stage the inert runtime");
+    let output = hermit_command(&args)
+        .env("HERMIT_INSTALL_DIR", inert_install.path())
+        .env_remove("HERMIT_LITEINST_TOOL_RUNTIME")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit with an inert packaged runtime");
+    assert!(!output.status.success(), "{output:?}");
+    let stderr = stderr(&output);
+    assert!(
+        stderr.contains("does not register detcore_liteinst_initialize as a preload constructor"),
+        "the packaged runtime must be consulted before the one beside Hermit: {stderr}"
+    );
 }
 
 /// A build without the `liteinst` feature has no LiteInst backend, so
@@ -6320,8 +6349,8 @@ fn log_file_that_cannot_be_opened_is_refused_by_path() {
 /// (<https://github.com/rrnewton/hermit/issues/3419>). The fbsource Buck import
 /// runs tests from such a tree, and `stage-liteinst-runtime.sh` used to derive
 /// the pin through `ci/run-reverie-pin-check.sh --print-pin`, which lists
-/// tracked files with git, so `run_liteinst_verifies_detcore_backend` failed
-/// with "fatal: not a git repository". The test helper now hands the script
+/// tracked files with git, so the LiteInst tests that staged the runtime
+/// failed with "fatal: not a git repository". The test helper now hands the script
 /// the pin embedded in the Hermit binary under test.
 ///
 /// This drives the helper's own staging command with git made unreachable (a
@@ -11967,10 +11996,9 @@ fn run_timeout_refuses_backends_where_it_cannot_bound_the_run() {
     }
 }
 
-/// In-guest LiteInst (`HERMIT_LITEINST_IN_GUEST=1`,
-/// https://github.com/rrnewton/hermit/issues/3520) cannot deliver Detcore's
-/// preemption timer yet: the in-guest Tool host refuses `set_timer` with
-/// `ENOSYS`, which Detcore treats as fatal. A run with the default maximum
+/// In-guest LiteInst (https://github.com/rrnewton/hermit/issues/3520) cannot
+/// deliver Detcore's preemption timer yet: the in-guest Tool host refuses
+/// `set_timer` with `ENOSYS`, which Detcore treats as fatal. A run with the default maximum
 /// timeslice must be REFUSED before dispatch, not fail inside the guest. The
 /// refusal comes from argument validation, so it holds in builds without the
 /// `liteinst` feature or runtime too.
@@ -11986,7 +12014,6 @@ fn liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch() {
         "/bin/echo",
         "unreachable",
     ])
-    .env("HERMIT_LITEINST_IN_GUEST", "1")
     .stdin(Stdio::null())
     .output()
     .expect("failed to run hermit");
@@ -12007,38 +12034,6 @@ fn liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch() {
     assert!(
         stderr.contains("pass --max-timeslice=disabled"),
         "the refusal must say how to run without the timer. stderr:\n{stderr}"
-    );
-    assert!(
-        !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
-        "the guest must not run"
-    );
-}
-
-/// The selector accepts only "unset" (the ptrace-hosted hybrid) and `1`, so a
-/// typo cannot silently pick the hybrid.
-#[test]
-fn liteinst_in_guest_selector_rejects_unknown_values() {
-    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-
-    let output = hermit_command(&[
-        "--backend",
-        "liteinst",
-        "run",
-        "--max-timeslice=disabled",
-        "--",
-        "/bin/echo",
-        "unreachable",
-    ])
-    .env("HERMIT_LITEINST_IN_GUEST", "yes")
-    .stdin(Stdio::null())
-    .output()
-    .expect("failed to run hermit");
-    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-
-    assert!(!output.status.success(), "stderr:\n{stderr}");
-    assert!(
-        stderr.contains("HERMIT_LITEINST_IN_GUEST=\"yes\" is not a LiteInst runtime selection"),
-        "stderr:\n{stderr}"
     );
     assert!(
         !String::from_utf8_lossy(&output.stdout).contains("unreachable"),
@@ -12068,7 +12063,6 @@ fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
         "/bin/echo",
         "unreachable",
     ])
-    .env("HERMIT_LITEINST_IN_GUEST", "1")
     .stdin(Stdio::piped())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -12205,7 +12199,6 @@ fn liteinst_in_guest_refuses_a_statically_linked_guest() {
         "--",
         guest_arg,
     ])
-    .env("HERMIT_LITEINST_IN_GUEST", "1")
     .stdin(Stdio::null())
     .output()
     .expect("failed to run hermit");
@@ -12309,11 +12302,7 @@ fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
             "--",
         ];
         args.extend(program);
-        let mut command = hermit_command(&args);
-        if backend == "liteinst" {
-            command.env("HERMIT_LITEINST_IN_GUEST", "1");
-        }
-        command
+        hermit_command(&args)
     };
     let check_stderr = |backend: &str, stderr: &str| {
         if backend == "liteinst" {
@@ -12810,11 +12799,7 @@ fn liteinst_in_guest_signals_during_a_blocking_wait4_match_ptrace() {
                 command
             }
             "ptrace" => hermit("ptrace"),
-            "in-guest" => {
-                let mut command = hermit("liteinst");
-                command.env("HERMIT_LITEINST_IN_GUEST", "1");
-                command
-            }
+            "in-guest" => hermit("liteinst"),
             _ => panic!("unknown runner {runner}"),
         };
         let mut child = command
@@ -13152,11 +13137,9 @@ fn liteinst_in_guest_signals_during_a_blocking_wait4_match_ptrace() {
         }
     };
 
-    // An in-guest run's stderr must show that the guest preload, not the host
-    // hybrid, hosted Detcore.
-    const IN_GUEST_SELECTED: &str = "hermit: [liteinst in-guest] selected: the guest preload is \
-                                     to host the Detcore Tool; the host-hybrid activation probe \
-                                     does not apply";
+    // An in-guest run's stderr must show that the guest preload hosted Detcore.
+    const IN_GUEST_SELECTED: &str =
+        "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool";
     let check_in_guest_selected = |stderr: &str, context: &str| {
         assert!(
             stderr.lines().any(|line| line == IN_GUEST_SELECTED),

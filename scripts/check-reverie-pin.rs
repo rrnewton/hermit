@@ -2172,9 +2172,8 @@ fn exact_40_hex_tokens(line: &str) -> Vec<String> {
 ///
 /// SCOPE IS DELIBERATELY NARROW. Only NON-COMMENT lines in the two files above
 /// are read. Those files carry a long carry-history in comments naming every
-/// previous calibration revision, and `ci/liteinst-strict-node.sh` writes an
-/// arbitrary 40-hex string into a `.revision` self-test fixture. Neither is a
-/// binding and neither may block a bump.
+/// previous calibration revision. That history is not a binding and may not
+/// block a bump.
 fn check_dbt_budget_bindings(root: &Path, pin: &str) -> Result<i32, String> {
     let mut violations: Vec<(String, String)> = Vec::new();
     let mut absent: Vec<&str> = Vec::new();

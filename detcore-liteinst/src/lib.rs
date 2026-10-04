@@ -1,9 +1,8 @@
 //! In-guest Detcore runtime for the LiteInst backend.
 //!
-//! Hermit preloads this library into the guest when `HERMIT_LITEINST_IN_GUEST=1`
-//! selects LiteInst's in-guest runtime. When the dynamic loader loads it, its
-//! constructor installs Detcore's `Tool` inside the guest process before the
-//! program's `main`. The loader, the C library's initialization, `IFUNC`
+//! Hermit preloads this library into the guest for `--backend=liteinst`. When
+//! the dynamic loader loads it, its constructor installs Detcore's `Tool`
+//! inside the guest process before the program's `main`. The loader, the C library's initialization, `IFUNC`
 //! resolvers and the constructors of the program's own shared libraries run
 //! earlier, unmonitored. A loader that fails to load the library runs the
 //! guest without it; Hermit reports that the guest never connected only after

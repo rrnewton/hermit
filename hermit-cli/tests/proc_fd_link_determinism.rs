@@ -11,10 +11,12 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
 
-#[path = "common/liteinst.rs"]
-mod liteinst_runtime;
-
 const STDOUT_LINK: &str = "/proc/self/fd/1";
+
+/// The line Hermit prints when it runs the guest under in-guest LiteInst.
+#[cfg(feature = "liteinst")]
+const IN_GUEST_SELECTED: &str =
+    "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool";
 
 struct ProgramCase {
     name: &'static str,
@@ -113,7 +115,6 @@ fn proc_fd_link_consumers_verify() {
 
 #[test]
 fn proc_fd_link_aliases_and_truncation_verify() {
-    liteinst_runtime::ensure_liteinst_runtime();
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
@@ -138,15 +139,19 @@ fn proc_fd_link_aliases_and_truncation_verify() {
         candidates: &[],
         args: &[],
     };
+    // The guest reads the links of a file it creates, not of its stdout pipe:
+    // c7531a837a65 ("Stabilize proc-fd alias parity fixture", 2026-08-01)
+    // changed it so that harness capture names could not become guest output,
+    // and left this expectation naming the old pipe target.
     let expected = concat!(
-        "canonical=pipe:[1001]\n",
-        "truncated=pipe:[1001\n",
-        "numeric=pipe:[1001]\n",
-        "dev-fd=pipe:[1001]\n",
-        "lexical=pipe:[1001]\n",
-        "readlinkat=pipe:[1001]\n",
+        "canonical=/tmp/hermit-proc-fd-link-aliases\n",
+        "truncated=/tmp/hermi\n",
+        "numeric=/tmp/hermit-proc-fd-link-aliases\n",
+        "dev-fd=/tmp/hermit-proc-fd-link-aliases\n",
+        "lexical=/tmp/hermit-proc-fd-link-aliases\n",
+        "readlinkat=/tmp/hermit-proc-fd-link-aliases\n",
     );
-    for backend in ["ptrace", "dbt", "liteinst"] {
+    for backend in ["ptrace", "dbt"] {
         let output = Command::new("timeout")
             .args(["--kill-after", "10s", "90s"])
             .arg(env!("CARGO_BIN_EXE_hermit"))
@@ -170,5 +175,39 @@ fn proc_fd_link_aliases_and_truncation_verify() {
             case.name
         );
         assert_eq!(stdout, expected, "{} differed on {backend}", case.name);
+    }
+
+    // In-guest LiteInst (https://github.com/rrnewton/hermit/issues/3520) runs
+    // the same guest and must print the same aliases. It refuses `--verify`
+    // until it forwards guest records to Hermit, and a maximum timeslice until
+    // it can deliver Detcore's preemption timer, so this run has neither; the
+    // determinism verdict for this backend waits for guest-record forwarding.
+    #[cfg(feature = "liteinst")]
+    {
+        let output = Command::new("timeout")
+            .args(["--kill-after", "10s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args(["--log", "DEBUG", "--backend=liteinst", "run"])
+            .args(["--strict", "--max-timeslice=disabled", "--"])
+            .arg(&guest)
+            .output()
+            .expect("failed to start Hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "{} failed under in-guest LiteInst\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            case.name
+        );
+        assert!(
+            stderr.lines().any(|line| line == IN_GUEST_SELECTED),
+            "{} did not run under in-guest LiteInst\nstderr:\n{stderr}",
+            case.name
+        );
+        assert_eq!(
+            stdout, expected,
+            "{} differed on in-guest LiteInst",
+            case.name
+        );
     }
 }

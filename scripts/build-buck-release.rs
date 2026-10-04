@@ -106,9 +106,10 @@ const GENERATED_MARKERS: [&str; 3] = [
     "manifest_dir = \":reverie-dbt-0.4-materialized-manifest\"",
     "load(\"@shim//build_defs:materialized_manifest.bzl\", \"materialized_manifest\")",
 ];
-const REQUIRED_RESOURCES: [(&str, bool); 10] = [
+const REQUIRED_RESOURCES: [(&str, bool); 11] = [
     ("rsrcs/libdetcore_dbt.so", false),
     ("rsrcs/libdetcore_sabre.so", false),
+    ("rsrcs/libdetcore_liteinst.so", false),
     ("rsrcs/libreverie_dbt_client.so", false),
     ("rsrcs/libreverie_liteinst.so", false),
     ("rsrcs/dynamorio/bin64/drrun", true),

@@ -41,10 +41,9 @@ pub(super) const RUN_TIMEOUT_UNWIND_GRACE: Duration = Duration::from_secs(10);
 /// reader must not read a passing fallback test as evidence that some specific
 /// teardown hang is handled.
 ///
-/// Deliberately keyed off an environment variable named like the existing
-/// `HERMIT_INTERNAL_LITEINST_ACTIVATION_PROBE` rather than a `cfg(test)` gate:
-/// the fallback lives in the shipped binary and must be exercised there, not in
-/// a differently-compiled one.
+/// Deliberately keyed off an internal environment variable rather than a
+/// `cfg(test)` gate: the fallback lives in the shipped binary and must be
+/// exercised there, not in a differently-compiled one.
 pub(super) fn stall_the_unwind_if_asked() {
     const STALL_ENV: &str = "HERMIT_INTERNAL_RUN_TIMEOUT_STALL_UNWIND";
     if std::env::var_os(STALL_ENV).as_deref() != Some(std::ffi::OsStr::new("1")) {
