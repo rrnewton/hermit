@@ -4714,11 +4714,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// instant lies far in the logical past and fires at once, and a host
     /// CLOCK_REALTIME instant can lie months in the logical future. The
     /// kernel timerfd keeps the timer on the clock the guest reads.
+    ///
+    /// The backend must also support the model
+    /// (`backend_supports_virtual_timerfds`). Where a fork copies each
+    /// process's Detcore state (DBT, SaBRe, in-guest LiteInst), a model would
+    /// give parent and child separate timers where Linux shares one. Where
+    /// the backend services a wait itself (KVM's `ppoll`), the wait would poll
+    /// a host timerfd that is never armed.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3229): timerfds stay on the host clock when time is
-    // not virtualized.
+    // not virtualized, and on the host kernel where the backend cannot share
+    // the model across a fork or routes a wait around Detcore.
     pub(crate) fn virtual_timerfds(&self) -> bool {
-        self.cfg.sequentialize_threads && self.cfg.virtualize_time && !self.cfg.recordreplay_modes
+        self.cfg.sequentialize_threads
+            && self.cfg.virtualize_time
+            && !self.cfg.recordreplay_modes
+            && self.cfg.backend_supports_virtual_timerfds
     }
 
     /// Serialize a notification descriptor control operation.
