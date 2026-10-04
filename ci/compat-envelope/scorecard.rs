@@ -14548,6 +14548,22 @@ fn current_comparison_representation(
                         key.base.run_id, key.base.hermit_sha
                     ));
                 }
+                // One outer attempt of a run produces one row. A current row
+                // for the same attempt with other evidence, a no-verdict row
+                // included, is a different invocation than the one this pass
+                // recorded, so the stored pass cannot stand beside it.
+                if current
+                    .range((key.base.clone(), String::new())..)
+                    .take_while(|((census, _), _)| *census == key.base)
+                    .any(|((_, census_digest), census_attempt)| {
+                        *census_attempt == attempt && census_digest != digest
+                    })
+                {
+                    return Err(format!(
+                        "stripped pass for run {} at {} records outer attempt {attempt}, but the current result holds different evidence for that attempt",
+                        key.base.run_id, key.base.hermit_sha
+                    ));
+                }
             }
         }
     }
@@ -14566,11 +14582,12 @@ fn current_comparison_representation(
                 .push((base, attempts));
         }
     }
+    let cells = SeriesCellIndex::new(tracked);
     let mut events = BTreeSet::new();
     let mut covered = BTreeSet::new();
     let mut represented_counts = BTreeMap::<DirectEvidenceKey, usize>::new();
     for row in rows {
-        if row.producer != SeriesProducer::Validate || row.schema != SeriesSchema::V3 {
+        if row.producer != SeriesProducer::Validate {
             continue;
         }
         let row_cell = series_row_cell(row);
@@ -14583,6 +14600,15 @@ fn current_comparison_representation(
             .map(Vec::as_slice)
             .unwrap_or(&[]);
         if matches.is_empty() {
+            continue;
+        }
+        // A stripped pass stores only its exact invocation, which the legacy
+        // matcher in direct_representation cannot pair with an older event's
+        // result key. So an event of an earlier schema that claims the outer
+        // attempt of such a binding is reconciled here, under the same checks
+        // as a current event. One that claims none keeps the legacy path.
+        let historical = row.schema != SeriesSchema::V3;
+        if historical && !claims_exact_invocation(row, matches) {
             continue;
         }
         let [(base, attempts)] = matches else {
@@ -14626,12 +14652,22 @@ fn current_comparison_representation(
                     .into(),
             );
         }
+        // An earlier schema records its verdict in `outcome`; read it the way
+        // the projector does, never through a field that schema did not set.
+        let row_result = if historical {
+            let [cell] = cells.matching(&row_cell) else {
+                return Err("historical series event has ambiguous cell identity".into());
+            };
+            series_evidence(row, &cell.id).and_then(|evidence| evidence.result)
+        } else {
+            row.series.result
+        };
         for (attempt, key) in matching {
             let bound_result = match &key.kind {
                 DirectEvidenceKind::Result(result) => Some(*result),
                 DirectEvidenceKind::ExactInvocation { result, .. } => *result,
             };
-            if bound_result.is_none() || row.series.result != bound_result {
+            if bound_result.is_none() || row_result != bound_result {
                 return Err("current series result disagrees with its bound comparison".into());
             }
             let bound_count = attempts
@@ -14661,6 +14697,23 @@ fn current_comparison_representation(
         .filter_map(|(key, count)| (direct_counts.get(&key) == Some(&count)).then_some(key))
         .collect();
     Ok((events, represented))
+}
+
+/// Whether a series row's outer-attempt span covers the exact invocation of a
+/// stripped pass bound to one of its candidate bases.
+fn claims_exact_invocation(
+    row: &SeriesRow,
+    matches: &[(&DirectEvidenceBase, &BTreeMap<u64, DirectEvidenceKey>)],
+) -> bool {
+    let first = row.series.run_index;
+    series_last_run_index(row).is_some_and(|last| {
+        first <= last
+            && matches.iter().any(|(_, attempts)| {
+                attempts
+                    .range(first..=last)
+                    .any(|(_, key)| matches!(key.kind, DirectEvidenceKind::ExactInvocation { .. }))
+            })
+    })
 }
 
 fn direct_representation(
@@ -34524,6 +34577,44 @@ mod post_verdict_transaction_tests {
         }
     }
 
+    /// A series event with another result does not cover a stripped pass at
+    /// its own outer attempt, whether or not the event carries the detcore
+    /// tree. The write-back refuses the transaction and history is unchanged.
+    #[test]
+    fn an_event_with_another_result_does_not_cover_a_stripped_pass() {
+        let _fixture_lock = history_fixture_lock();
+        for with_detcore_tree in [false, true] {
+            let mut fixture = Fixture::new();
+            let measured = fixture.options.results_head.clone().unwrap();
+            let detcore_tree = with_detcore_tree
+                .then(|| git_rev_parse(&fixture.root, &format!("{measured}:detcore")).unwrap());
+            let (id, mut stripped) = stripped_row(&measured);
+            stripped["attempt"] = 2.into();
+            let sibling_id = fixture.id.clone();
+            fixture.publish_rows(&[fixture.row.clone(), stripped.clone()]);
+            let mut events = stripped_retry_events(
+                &measured,
+                stripped["run_id"].as_str().unwrap(),
+                (&sibling_id, &id),
+                2,
+                detcore_tree.as_deref(),
+            );
+            for (key, value) in [
+                ("result", "determinism-failure"),
+                ("outcome", "diverged"),
+                ("failure_class", "product_failure"),
+            ] {
+                events[1]["series"][key] = value.into();
+            }
+            let error = publish_raw_snapshot(&mut fixture, &events).unwrap_err();
+            assert!(
+                error.contains("current series result disagrees with its bound comparison"),
+                "detcore tree {with_detcore_tree}: {error}"
+            );
+            assert!(read_history_files(&fixture.root).unwrap() == fixture.baseline);
+        }
+    }
+
     /// The exact invocation stays a stripped pass's binding in every later
     /// publication. A later publication carries the ledger's earlier series
     /// events, but its current-result census belongs to another run and
@@ -37137,6 +37228,245 @@ mod post_verdict_transaction_tests {
             "ledger publication must not mutate Hermit's catalogue or page"
         );
     }
+    // Expect FAIL at c900554692a6, PASS with the F2 storage/binding changes absent:
+    // stress-series/v2 remains admitted for historical projection, but a correct
+    // attempt-1 event with a Detcore tree has a Result key, while the pass now has
+    // only an ExactInvocation key. The new binding loop skips every v2 event.
+    #[test]
+    fn goalpost3655_an_exact_stripped_pass_accepts_its_supported_historical_v2_event() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        let sibling_id = fixture.id.clone();
+        let tree = git_rev_parse(&fixture.root, &format!("{measured}:detcore")).unwrap();
+        fixture.publish_rows(&[fixture.row.clone(), stripped.clone()]);
+        let mut events = stripped_retry_events(
+            &measured,
+            stripped["run_id"].as_str().unwrap(),
+            (&sibling_id, &id),
+            1,
+            Some(&tree),
+        );
+        events[1]["schema"] = "stress-series/v2".into();
+        events[1]["series"]
+            .as_object_mut()
+            .unwrap()
+            .remove("comparison");
+        let historical: SeriesRow = serde_json::from_value(events[1].clone()).unwrap();
+        assert!(
+            historical.validate_for_read().is_ok(),
+            "historical read control"
+        );
+        assert!(
+            historical.validate_for_projection().is_ok(),
+            "projection control"
+        );
+        publish_raw_snapshot(&mut fixture, &events).unwrap();
+        let published = fixture.cells();
+        let cell = tracked_cell(&published, &id);
+        assert_eq!(cell.observations.len(), 1, "the event was counted twice");
+        assert!(
+            cell.observations
+                .iter()
+                .all(|observation| observation.canonical_comparisons.is_empty()
+                    && observation.backend_parity_comparisons.is_empty())
+        );
+    }
+
+    // Expect FAIL at this head: the census guard searches only for the stored
+    // digest. A current no-verdict row with another digest at the same base and
+    // attempt creates no new stripped/receipt binding, so the old pass still
+    // represents the pass event although it disagrees with the held current row.
+    #[test]
+    fn goalpost3655_a_changed_current_digest_cannot_borrow_an_old_stripped_pass() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, mut original) = stripped_row(&measured);
+        original["attempt"] = 2.into();
+        let sibling_id = fixture.id.clone();
+        let run = original["run_id"].as_str().unwrap().to_string();
+        fixture.publish_rows(&[fixture.row.clone(), original.clone()]);
+        let old_digest = stripped_evidence_identity(&fixture, &id);
+        let events = stripped_retry_events(&measured, &run, (&sibling_id, &id), 2, None);
+        publish_raw_snapshot(&mut fixture, &events).unwrap();
+        assert_stripped_pass_bound(&fixture.cells(), &id, &measured, (2, &old_digest));
+        let before = read_history_files(&fixture.root).unwrap();
+
+        let report =
+            serde_json::to_value(canonical_verdict::VerificationReport::no_result()).unwrap();
+        let mut changed = with_report(&original, &report);
+        changed["outcome"] = "ERROR".into();
+        changed["result"] = JsonValue::Null;
+        changed["failure_class"] = "no_result".into();
+        changed["error_kind"] = "incomplete-verification-evidence".into();
+        changed["attempts"][0]["outcome"] = "ERROR".into();
+        changed["attempts"][0]["status"] = 75.into();
+        changed["attempts"][0]["error_kind"] = "incomplete-verification-evidence".into();
+        let typed: ResultRow = serde_json::from_value(changed.clone()).unwrap();
+        assert!(
+            matches!(
+                typed.comparison_evidence_from(ResultInput::Current),
+                Ok(ValidateRowEvidence::Unavailable { .. } | ValidateRowEvidence::NotRun { .. })
+            ),
+            "the current no-verdict row must be independently admissible"
+        );
+        assert_ne!(typed.evidence_identity().unwrap(), old_digest);
+        assert_eq!(changed["run_id"], original["run_id"]);
+        assert_eq!(changed["attempt"], original["attempt"]);
+        fixture.publish_rows(&[fixture.row.clone(), changed]);
+        let error = publish_raw_snapshot(&mut fixture, &events).expect_err(
+            "the old passing event was accepted despite conflicting current evidence at its run and attempt");
+        assert!(
+            error.contains("evidence")
+                || error.contains("digest")
+                || error.contains("attempt")
+                || error.contains("disagree"),
+            "unrelated refusal: {error}"
+        );
+        assert!(
+            read_history_files(&fixture.root).unwrap() == before,
+            "refusing current evidence reconciliation changed history"
+        );
+    }
+
+    // This should PASS unmodified and FAIL with the new stripped-binding
+    // collision check disabled. Canonical observation first is essential:
+    // placing it second would exercise the unchanged receipt collision guard.
+    #[test]
+    fn goalpost3655_a_stripped_binding_cannot_overwrite_a_receipt_at_the_same_attempt() {
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let stripped_digest = "c".repeat(64);
+        let canonical_digest = "d".repeat(64);
+        let run = "same-base-and-outer-attempt";
+        let mut tracked: TrackedCells = serde_json::from_value(serde_json::json!({
+            "schema":8,"cells":[{"lane":"portable","category":"fixture","test":"fixture/retry",
+                "mode":"verify","backend":"ptrace","status":"green","observations":[{
+                    "detcore_tree":tree,"provenance":"validate","hermit_shas":[head],
+                    "results":["determinism-failure"],"canonical_comparisons":[{
+                        "hermit_sha":head,"hermit_commits":1,"hermit_first_parent":1,
+                        "run_id":run,"evidence_sha256":canonical_digest,
+                        "result":"determinism-failure","left_info_messages":[1],"right_info_messages":[1]
+                    }],"invocations":[]
+                },{
+                    "detcore_tree":tree,"provenance":"validate","hermit_shas":[head],
+                    "results":["pass"],"canonical_comparisons":[],"invocations":[{
+                        "hermit_sha":head,"run_id":run,"attempt":2,
+                        "evidence_sha256":stripped_digest,"result":"pass","argv":["hermit"],
+                        "guest_argv":["fixture"],"env":{},"cwd":"/","attempts":[]
+                    }]
+                }]}]
+        })).unwrap();
+        refresh_measurement(&mut tracked);
+        validate_observation_identity_namespace(&tracked).unwrap();
+        let base = DirectEvidenceBase {
+            cell: "fixture/retry/verify/ptrace".into(),
+            identity: SeriesObservationIdentity::DetcoreTree(tree.clone()),
+            provenance: ObservationProvenance::Validate,
+            hermit_sha: head.clone(),
+            run_id: run.into(),
+        };
+        let current = ValidatedComparisonAttempts::from([
+            ((base.clone(), canonical_digest), 2),
+            ((base, stripped_digest), 2),
+        ]);
+        let event: SeriesRow = serde_json::from_value(serde_json::json!({
+            "schema":"stress-series/v3","event_id":"claimed-stripped-pass-2",
+            "event_type":"series.observation","emitted_at":"2026-09-22T00:00:00Z",
+            "team":"hermit","host":"fixture","producer":"validate","run_id":run,
+            "series":{"cell":"fixture/retry/verify/ptrace","tree":head,
+                "detcore_tree":tree,"run_index":2,"attempt":2,"num_runs":1,
+                "result":"pass","outcome":"passed","failure_class":null,
+                "comparison":{"strictness":"stripped","bitwise_parity":false},
+                "source_tree_dirty":false,"machine_shortname":"fixture","kernel_version":"fixture",
+                "host_capabilities":{"cpuid-faulting":{"present":false,"evidence":"synthetic fixture"},
+                    "kvm":{"present":false,"evidence":"synthetic fixture"}}}
+        })).unwrap();
+        event.validate_for_projection().unwrap();
+        let error = direct_representation(&tracked, &[event], &current).unwrap_err();
+        assert!(
+            error.contains("more than one record for outer attempt 2"),
+            "{error}"
+        );
+    }
+
+    // The census check compares a stored stripped pass only with current rows
+    // for its own run and outer attempt. Another attempt of the same run, such
+    // as the failed attempt a retry replaced, leaves it bound; any other
+    // evidence at its own attempt, a no-verdict row included, refuses it.
+    #[test]
+    fn a_stored_stripped_pass_is_checked_against_current_evidence_at_its_own_attempt_only() {
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let stripped_digest = "c".repeat(64);
+        let other_digest = "d".repeat(64);
+        let run = "stripped-retry-with-current-census";
+        let mut tracked: TrackedCells = serde_json::from_value(serde_json::json!({
+            "schema":8,"cells":[{"lane":"portable","category":"fixture","test":"fixture/retry",
+                "mode":"verify","backend":"ptrace","status":"green","observations":[{
+                    "detcore_tree":tree,"provenance":"validate","hermit_shas":[head],
+                    "results":["pass"],"canonical_comparisons":[],"invocations":[{
+                        "hermit_sha":head,"run_id":run,"attempt":2,
+                        "evidence_sha256":stripped_digest,"result":"pass","argv":["hermit"],
+                        "guest_argv":["fixture"],"env":{},"cwd":"/","attempts":[]
+                    }]
+                }]}]
+        }))
+        .unwrap();
+        refresh_measurement(&mut tracked);
+        validate_observation_identity_namespace(&tracked).unwrap();
+        let base = DirectEvidenceBase {
+            cell: "fixture/retry/verify/ptrace".into(),
+            identity: SeriesObservationIdentity::DetcoreTree(tree.clone()),
+            provenance: ObservationProvenance::Validate,
+            hermit_sha: head.clone(),
+            run_id: run.into(),
+        };
+        let event: SeriesRow = serde_json::from_value(serde_json::json!({
+            "schema":"stress-series/v3","event_id":"stripped-pass-2",
+            "event_type":"series.observation","emitted_at":"2026-09-22T00:00:00Z",
+            "team":"hermit","host":"fixture","producer":"validate","run_id":run,
+            "series":{"cell":"fixture/retry/verify/ptrace","tree":head,
+                "detcore_tree":tree,"run_index":2,"attempt":2,"num_runs":1,
+                "result":"pass","outcome":"passed","failure_class":null,
+                "comparison":{"strictness":"stripped","bitwise_parity":false},
+                "source_tree_dirty":false,"machine_shortname":"fixture","kernel_version":"fixture",
+                "host_capabilities":{"cpuid-faulting":{"present":false,"evidence":"synthetic fixture"},
+                    "kvm":{"present":false,"evidence":"synthetic fixture"}}}
+        }))
+        .unwrap();
+        event.validate_for_projection().unwrap();
+        let events = [event];
+
+        // Attempt 1's row and the pass's own row are both current.
+        let retried = ValidatedComparisonAttempts::from([
+            ((base.clone(), other_digest.clone()), 1),
+            ((base.clone(), stripped_digest.clone()), 2),
+        ]);
+        let representation = direct_representation(&tracked, &events, &retried).unwrap();
+        assert_eq!(
+            representation.represented_event_ids,
+            BTreeSet::from(["stripped-pass-2".to_string()])
+        );
+
+        // Attempt 2 now names other evidence than the stored pass.
+        for current in [
+            ValidatedComparisonAttempts::from([((base.clone(), other_digest.clone()), 2)]),
+            ValidatedComparisonAttempts::from([
+                ((base.clone(), other_digest.clone()), 2),
+                ((base.clone(), stripped_digest.clone()), 1),
+            ]),
+        ] {
+            let error = direct_representation(&tracked, &events, &current).unwrap_err();
+            assert!(
+                error.contains("holds different evidence for that attempt")
+                    || error.contains("binds its evidence to another attempt"),
+                "{error}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -38153,6 +38483,163 @@ mod evidence_identity_tests {
             "{error}"
         );
         assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+    }
+
+    /// Two stripped passes of one run, at outer attempts 1 and 2, are both
+    /// covered by one event whose `num_runs` spans them, whichever form of
+    /// Detcore identity the stored observation and the event carry, with or
+    /// without the current census. The span must cover exactly the stored
+    /// attempts: an event that overlaps another event's attempt, one that
+    /// declares an attempt no stored pass holds, one that pairs a span with a
+    /// single outer attempt, and one with another result are refused, as is an
+    /// event whose Detcore tree is not the stored observation's.
+    #[test]
+    fn a_stripped_span_binds_each_exact_invocation_it_covers() {
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let other_tree = "e".repeat(40);
+        let digests = ["c".repeat(64), "d".repeat(64)];
+        let cell = "fixture/retry/verify/ptrace";
+        let tracked_cells = |stored_tree: Option<&str>| -> TrackedCells {
+            let invocations = [1u64, 2].map(|attempt| {
+                let digest = &digests[attempt as usize - 1];
+                serde_json::json!({"hermit_sha":head,"run_id":"current-retries","attempt":attempt,
+                    "evidence_sha256":digest,"result":"pass","argv":["hermit"],
+                    "guest_argv":["fixture"],"env":{},"cwd":"/","attempts":[]})
+            });
+            let mut observation = serde_json::json!({
+                "provenance":"validate","hermit_shas":[head],"results":["pass"],
+                "canonical_comparisons":[],"invocations":invocations
+            });
+            if let Some(stored_tree) = stored_tree {
+                observation["detcore_tree"] = stored_tree.into();
+            }
+            serde_json::from_value(serde_json::json!({
+                "schema":8,"cells":[{"lane":"portable","category":"fixture","test":"fixture/retry",
+                    "mode":"verify","backend":"ptrace","status":"green",
+                    "observations":[observation]}]
+            }))
+            .unwrap()
+        };
+        let base = |identity: SeriesObservationIdentity| DirectEvidenceBase {
+            cell: cell.into(),
+            identity,
+            provenance: ObservationProvenance::Validate,
+            hermit_sha: head.clone(),
+            run_id: "current-retries".into(),
+        };
+        let event = |id: &str,
+                     (run_index, num_runs): (u64, u64),
+                     attempt: Option<u64>,
+                     result: ObservedResult,
+                     event_tree: Option<&str>|
+         -> SeriesRow {
+            let passed = result == ObservedResult::Pass;
+            let mut series = serde_json::json!({
+                "cell":cell,"tree":head,"run_index":run_index,"num_runs":num_runs,
+                "result":result,"outcome":if passed {"passed"} else {"diverged"},
+                "failure_class":if passed {None} else {Some("product_failure")},
+                "source_tree_dirty":false,"machine_shortname":"fixture","kernel_version":"fixture",
+                "host_capabilities":{"cpuid-faulting":{"present":false,"evidence":"synthetic fixture"},
+                    "kvm":{"present":false,"evidence":"synthetic fixture"}}
+            });
+            if let Some(attempt) = attempt {
+                series["attempt"] = attempt.into();
+            }
+            if let Some(event_tree) = event_tree {
+                series["detcore_tree"] = event_tree.into();
+            }
+            serde_json::from_value(serde_json::json!({
+                "schema":"stress-series/v3","event_id":id,
+                "event_type":"series.observation","emitted_at":"2026-09-22T00:00:00Z",
+                "team":"hermit","host":"fixture","producer":"validate","run_id":"current-retries",
+                "series":series
+            }))
+            .unwrap()
+        };
+        let pass = ObservedResult::Pass;
+        let coverage = "current series lacks complete bound outer-attempt coverage: declared attempts disagree with bound comparisons";
+        for (stored_tree, event_tree) in [
+            (Some(tree.as_str()), None),
+            (Some(tree.as_str()), Some(tree.as_str())),
+            (None, None),
+        ] {
+            let tracked = tracked_cells(stored_tree);
+            let identity = match stored_tree {
+                Some(stored_tree) => SeriesObservationIdentity::DetcoreTree(stored_tree.into()),
+                None => SeriesObservationIdentity::HermitCommit(head.clone()),
+            };
+            let before = serde_json::to_vec(&tracked).unwrap();
+            let both_attempts = ValidatedComparisonAttempts::from([
+                ((base(identity.clone()), digests[0].clone()), 1),
+                ((base(identity), digests[1].clone()), 2),
+            ]);
+            for census in [ValidatedComparisonAttempts::new(), both_attempts] {
+                let form = format!(
+                    "stored tree {stored_tree:?}, event tree {event_tree:?}, {} census rows",
+                    census.len()
+                );
+                let span = event("span", (1, 2), None, pass, event_tree);
+                let represented =
+                    direct_representation(&tracked, &[span.clone()], &census).unwrap();
+                assert_eq!(
+                    represented.represented_event_ids,
+                    BTreeSet::from([span.event_id.clone()]),
+                    "{form}"
+                );
+                assert!(!represented.has_unrepresented_direct_evidence, "{form}");
+                for (rows, expected) in [
+                    (
+                        vec![
+                            span.clone(),
+                            event("second", (2, 1), Some(2), pass, event_tree),
+                        ],
+                        "current series cannot map one-to-one: events overlap the same bound outer attempt",
+                    ),
+                    (
+                        vec![event("late", (2, 2), None, pass, event_tree)],
+                        coverage,
+                    ),
+                    (
+                        vec![event("long", (1, 3), None, pass, event_tree)],
+                        coverage,
+                    ),
+                    (
+                        vec![event("pinned", (1, 2), Some(1), pass, event_tree)],
+                        "current series has inconsistent outer-attempt coverage",
+                    ),
+                    (
+                        vec![event(
+                            "diverged",
+                            (1, 2),
+                            None,
+                            ObservedResult::DeterminismFailure,
+                            event_tree,
+                        )],
+                        "current series result disagrees with its bound comparison",
+                    ),
+                ] {
+                    let error = direct_representation(&tracked, &rows, &census).unwrap_err();
+                    assert_eq!(error, expected, "{form}");
+                }
+            }
+            assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+        }
+        for (stored_tree, event_tree) in [
+            (Some(tree.as_str()), other_tree.as_str()),
+            (None, tree.as_str()),
+        ] {
+            let error = direct_representation(
+                &tracked_cells(stored_tree),
+                &[event("span", (1, 2), None, pass, Some(event_tree))],
+                &ValidatedComparisonAttempts::new(),
+            )
+            .unwrap_err();
+            assert_eq!(
+                error, "current series detcore identity disagrees with its bound comparison",
+                "stored tree {stored_tree:?}"
+            );
+        }
     }
 
     #[test]
