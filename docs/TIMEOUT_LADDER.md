@@ -104,9 +104,11 @@ leader is reaped, whatever is left in the cgroup is killed there and the cgroup
 is removed. A sample that cannot be read, or that is lower than one already
 read, is a failed sample. CPU that stays unmeasurable for 1 s, timed from when
 the first failed sample returned, stops the execution rather than letting it run
-without its budget. The execution also stops that way when its cgroup cannot be
-created, for example because the harness's own cgroup is not writable. The one
-exception is a launcher that ran without cgroups on purpose and set
+without its budget. An execution whose cgroup cannot be created, for example
+because the harness's own cgroup is not writable, has no CPU source at all, so
+it is refused before it starts and the cell is an `ERROR`; that grace is only
+for a meter that was established and then failed. The one exception is a
+launcher that ran without cgroups on purpose and set
 `HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1`: the agent-utils process-group
 scan then measures the execution, and its rows name
 `agent_utils_paired_pidfd_stat_v1` instead of `cgroup_v2_invocation_cpu_stat_v1`
