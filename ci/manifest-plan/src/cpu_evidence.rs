@@ -156,6 +156,9 @@ pub enum SpawnStage {
     StdoutCapture,
     StderrCapture,
     Spawn,
+    /// No source can measure the CPU of a budgeted invocation, so it was
+    /// refused before anything, even its capture files, was created.
+    LiveCpuMeter,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -1883,6 +1886,10 @@ pub(crate) mod tests {
             ),
             (
                 json!({"state":"spawn_failed","stage":"spawn","reason":"fixture refusal"}),
+                "spawn_failed",
+            ),
+            (
+                json!({"state":"spawn_failed","stage":"live_cpu_meter","reason":"fixture refusal"}),
                 "spawn_failed",
             ),
         ] {
