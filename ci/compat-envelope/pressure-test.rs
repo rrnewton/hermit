@@ -7150,6 +7150,16 @@ fn inner_pressure_history(
                 categories.insert(category);
             }
         }
+        // The per-attempt check above admits a declared exit on Hermit's
+        // status alone. A row is credited only as the full summary credits it
+        // ([`matched_attempts_end_as_declared`]): the report and the invocation
+        // must corroborate the declaration too.
+        if !matched_attempts_end_as_declared(row) {
+            return Err(format!(
+                "outer attempt {} passed a matched comparison that does not end as its cell declares: a declared guest exit counts only from verify run with --verify-allow=failure, with Hermit's status, the report's guest disposition and both compared outputs all naming the declaration",
+                row.attempt
+            ));
+        }
     }
     Ok(categories)
 }
@@ -7183,6 +7193,7 @@ fn repetition_qualifies_for_promotion(terminal_result: &str, rows: &[CellResult]
             rows[0].expected_guest_exit.as_ref(),
             &rows[0].attempts,
         )
+        && matched_attempts_end_as_declared(&rows[0])
 }
 
 fn repeated_run_has_unacceptable_product_result(
@@ -18855,6 +18866,20 @@ mod pressure_sample_tests {
             std::slice::from_ref(&row)
         ));
         row.expected_guest_exit = Some(code_23.clone());
+        // As in the full summary, the row credits a declared exit only from
+        // verify run with --verify-allow=failure.
+        assert!(!matched_attempts_end_as_declared(&row));
+        let error = inner_pressure_history(std::slice::from_ref(&row)).unwrap_err();
+        assert!(
+            error.contains("does not end as its cell declares"),
+            "{error}"
+        );
+        assert!(!repetition_qualifies_for_promotion(
+            "pass",
+            std::slice::from_ref(&row)
+        ));
+        row.attempts[0].argv.push("--verify-allow=failure".into());
+        assert!(matched_attempts_end_as_declared(&row));
         assert!(
             inner_pressure_history(std::slice::from_ref(&row))
                 .unwrap()
@@ -18889,6 +18914,260 @@ mod pressure_sample_tests {
             Some(&code_23),
             std::slice::from_ref(&diverged)
         ));
+    }
+
+    #[test]
+    fn rows_only_verdicts_credit_a_declared_exit_only_as_report_and_invocation_corroborate() {
+        // `verdicts` judges result rows retained by another runner, with no
+        // verify log or runner evidence, so the rows carry the full summary's
+        // rule themselves: a matched repetition counts a declared guest exit
+        // only from verify run with --verify-allow=failure, with Hermit's
+        // status, the report's guest disposition and both compared outputs
+        // all naming the declaration.
+        let root = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-rows-declared-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir(&root).unwrap();
+        let guard = SelfTestDirectory::new(root.clone());
+        let refusal = "outer attempt 1 passed a matched comparison that does not end as its cell declares: a declared guest exit counts only from verify run with --verify-allow=failure, with Hermit's status, the report's guest disposition and both compared outputs all naming the declaration";
+        // (label, declared (code, signal), Hermit's status, the report's and
+        // both compared outputs' guest (code, signal), whether Hermit ran
+        // with --verify-allow=failure, whether the repetition is credited)
+        type Disposition = (Option<i32>, Option<i32>);
+        let cases: [(&str, Disposition, i32, Disposition, bool, bool); 6] = [
+            (
+                "a corroborated exit code 23",
+                (Some(23), None),
+                23,
+                (Some(23), None),
+                true,
+                true,
+            ),
+            (
+                "a corroborated signal 11 as status 139",
+                (None, Some(11)),
+                139,
+                (None, Some(11)),
+                true,
+                true,
+            ),
+            (
+                "signal 11 as status 139 whose report names exit code 139",
+                (None, Some(11)),
+                139,
+                (Some(139), None),
+                true,
+                false,
+            ),
+            (
+                "exit code 23 whose report names exit code 22",
+                (Some(23), None),
+                23,
+                (Some(22), None),
+                true,
+                false,
+            ),
+            (
+                "exit code 23 without --verify-allow=failure",
+                (Some(23), None),
+                23,
+                (Some(23), None),
+                false,
+                false,
+            ),
+            (
+                "exit code 23 from a guest that exited 0",
+                (Some(23), None),
+                0,
+                (Some(0), None),
+                true,
+                false,
+            ),
+        ];
+        let mut judged = Vec::new();
+        for (index, (label, declared, status, guest, allowed, credited)) in
+            cases.into_iter().enumerate()
+        {
+            let mut attempt = comparison_attempt("verify", 0);
+            let mut report: JsonValue =
+                serde_json::from_str(attempt.verification_report.as_ref().unwrap()).unwrap();
+            report["guest_exit_code"] = json!(guest.0);
+            report["guest_signal"] = json!(guest.1);
+            for side in ["left", "right"] {
+                report["compared_outputs"][side]["exit_code"] = json!(guest.0);
+                report["compared_outputs"][side]["signal"] = json!(guest.1);
+            }
+            replace_report(&mut attempt, report);
+            attempt.status = Some(status);
+            attempt.argv = ["hermit", "run", "--strict", "--verify", "--verify-strict"]
+                .into_iter()
+                .chain(allowed.then_some("--verify-allow=failure"))
+                .chain(["--", "fixture"])
+                .map(str::to_owned)
+                .collect();
+            attempt.shell_command =
+                literal_shell_command(&attempt.cwd, &attempt.env, &attempt.argv);
+            let mut row = history_row("verify", "PASS", 1, vec![attempt.clone()]);
+            row.hermit_sha = "0123456789abcdef0123456789abcdef01234567".into();
+            row.argv = attempt.argv.clone();
+            row.guest_argv = attempt.guest_argv.clone();
+            row.env = attempt.env.clone();
+            row.cwd = attempt.cwd.clone();
+            row.shell_command = attempt.shell_command.clone();
+            row.timeout_seconds = 20;
+            row.execution_cpu_timeout_seconds = Some(10);
+            row.execution_wall_timeout_seconds = Some(20);
+            row.expected_guest_exit = Some(ExpectedGuestExit {
+                code: declared.0,
+                signal: declared.1,
+                reason: "the fixture guest exits as declared".into(),
+            });
+            // Ten retained repetitions, read back through the real reader.
+            let case_root = root.join(format!("case-{index}"));
+            let slug = base_cell_slug(&CellId {
+                lane: row.lane.clone(),
+                category: row.category.clone(),
+                test: row.test.clone(),
+                mode: row.mode.clone(),
+                backend: row.backend.clone().unwrap(),
+            });
+            for number in 1..=PROMOTION_REPETITIONS {
+                row.run_id = format!("rows-declared-{index}-{number}");
+                row.run_index = Some(u64::try_from(number).unwrap());
+                let dir = case_root
+                    .join("cells")
+                    .join(format!("{slug}-repetition-{number:04}"));
+                fs::create_dir_all(&dir).unwrap();
+                row.artifact_dir = dir.join("artifacts").to_string_lossy().into_owned();
+                fs::write(
+                    dir.join("results.jsonl"),
+                    format!("{}\n", serde_json::to_string(&row).unwrap()),
+                )
+                .unwrap();
+                let sample = read_rows_repetition(&dir, &slug);
+                assert!(sample.row_valid, "{label}: {:?}", sample.evidence_errors);
+            }
+            let outcome = verdicts(&case_root, PROMOTION_REPETITIONS);
+            let written: JsonValue =
+                serde_json::from_str(&fs::read_to_string(case_root.join("verdicts.json")).unwrap())
+                    .unwrap();
+            judged.push((label, credited, row, outcome, written["cells"][0].clone()));
+        }
+        // Every case is judged before any is checked, so a failure names each
+        // declaration the reader misjudged.
+        let misjudged = judged
+            .iter()
+            .filter(|(_, credited, _, _, summary)| {
+                (summary["promotion_candidate"] == json!(true)) != *credited
+            })
+            .map(|(label, ..)| *label)
+            .collect::<Vec<_>>();
+        assert!(
+            misjudged.is_empty(),
+            "the rows-only reader misjudged {misjudged:?}"
+        );
+        for (label, credited, row, outcome, summary) in judged {
+            assert_eq!(
+                summary["passes"],
+                json!(PROMOTION_REPETITIONS),
+                "{label}: {summary}"
+            );
+            if credited {
+                assert_eq!(outcome, Ok(()), "{label}: {summary}");
+                assert_eq!(summary["verdict"], json!("CLEAN"), "{label}: {summary}");
+                assert_eq!(
+                    summary["classification"],
+                    json!("promotion-candidate"),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["promotion_candidate"],
+                    json!(true),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["qualifying_passes"],
+                    json!(PROMOTION_REPETITIONS),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["unknown_history_repetitions"],
+                    json!(0),
+                    "{label}: {summary}"
+                );
+                assert_eq!(summary["evidence_errors"], json!([]), "{label}: {summary}");
+            } else {
+                let Err(error) = outcome else {
+                    panic!(
+                        "{label}: the rows-only reader credited a declaration its evidence contradicts: {summary}"
+                    );
+                };
+                assert!(
+                    error.contains("1 of 1 cell(s) are not CLEAN")
+                        && error.contains("is INCOMPLETE"),
+                    "{label}: {error}"
+                );
+                assert_eq!(
+                    summary["verdict"],
+                    json!("INCOMPLETE"),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["classification"],
+                    json!("incomplete"),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["promotion_candidate"],
+                    json!(false),
+                    "{label}: {summary}"
+                );
+                assert_eq!(summary["qualifying_passes"], json!(0), "{label}: {summary}");
+                assert_eq!(
+                    summary["unknown_history_repetitions"],
+                    json!(PROMOTION_REPETITIONS),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["evidence_errors"],
+                    json!([refusal]),
+                    "{label}: {summary}"
+                );
+            }
+            // Each invocation alone still passes the per-attempt check: its
+            // status is 0 or the declared one. Only the whole row can show
+            // whether the declaration is corroborated.
+            assert!(
+                qualifying_subruns("verify", row.expected_guest_exit.as_ref(), &row.attempts),
+                "{label}"
+            );
+            assert_eq!(matched_attempts_end_as_declared(&row), credited, "{label}");
+            if credited {
+                assert!(
+                    inner_pressure_history(std::slice::from_ref(&row))
+                        .unwrap()
+                        .is_empty(),
+                    "{label}"
+                );
+            } else {
+                assert_eq!(
+                    inner_pressure_history(std::slice::from_ref(&row)),
+                    Err(refusal.to_string()),
+                    "{label}"
+                );
+            }
+            assert_eq!(
+                repetition_qualifies_for_promotion("pass", std::slice::from_ref(&row)),
+                credited,
+                "{label}"
+            );
+        }
+        guard.remove().unwrap();
     }
 
     fn history_row(
