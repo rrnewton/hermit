@@ -382,10 +382,11 @@ elif MODE not in (
     "describe",
     "validate-update",
     "select-registry",
+    "check-retention",
 ):
     refuse(
         "expected validate, validate-update, select-registry, describe, extract, "
-        "retain, or finalize mode"
+        "check-retention, retain, or finalize mode"
     )
 
 
@@ -705,6 +706,18 @@ def builds_index_html(
             "</tr>"
         )
     kept_bytes = sum(pin["file_bytes"] for _, pin, _ in kept)
+    if len(kept) == 1:
+        holding = (
+            "This site keeps 1 compatibility website build. It is a complete copy "
+            "of the website as it was published, and it holds "
+            f"{escape(megabytes(kept_bytes))}."
+        )
+    else:
+        holding = (
+            f"This site keeps {len(kept)} compatibility website builds, newest "
+            "first. Each one is a complete copy of the website as it was "
+            f"published, and together they hold {escape(megabytes(kept_bytes))}."
+        )
     page = f"""<!doctype html>
 <html lang="en">
 <head>
@@ -722,9 +735,9 @@ code {{ font-size: 0.95em; }}
 <body>
 <p><a href="../../">Hermetic Infra</a> &middot; <a href="../latest/">Latest compatibility scorecard</a></p>
 <h1>Compatibility website builds</h1>
-<p>This site keeps {len(kept)} compatibility website builds, newest first. Each one is a complete copy of the website as it was published, and together they hold {escape(megabytes(kept_bytes))}.</p>
+<p>{holding}</p>
 <p>Retention rule: {escape(retention["rule"])}</p>
-<p>Here the budget is {escape(megabytes(retention["budget_bytes"]))}, max_builds is {retention["max_builds"]}, and the latest build holds {escape(megabytes(latest_pin["file_bytes"]))}, so N = {limit}. Builds published before {escape(eastern_time(retention["not_before"]))} are not kept here.</p>
+<p>Here the budget is {escape(megabytes(retention["budget_bytes"]))}, max_builds is {retention["max_builds"]}, and the latest build holds {escape(megabytes(latest_pin["file_bytes"]))}, so N = {limit}. N uses only the latest build's size, so the kept builds together can hold more or less than the budget, and the extra <a href="../latest/">latest</a> copy of the newest build is not counted. Apart from the latest build, builds published before {escape(eastern_time(retention["not_before"]))} are not kept here.</p>
 <p>All {len(registry["releases"])} builds, including those not kept here, are listed in <a href="../{REGISTRY_FILE}">{REGISTRY_FILE}</a> and stay downloadable from <a href="https://github.com/{escape(repository)}/releases">the GitHub releases</a>.</p>
 <table>
 <thead><tr><th>Published</th><th>Hermit main</th><th>Size</th><th>Files</th><th>Build</th><th>Release</th></tr></thead>
@@ -872,6 +885,16 @@ if MODE == "validate":
         f"verified append-only release registry against {len(historical)} "
         "historical versions"
     )
+    raise SystemExit(0)
+
+
+if MODE == "check-retention":
+    # The rebuild adapter asks here before an expensive rebuild, so one
+    # function decides what retention settings are acceptable.
+    if len(sys.argv) != 3:
+        refuse("check-retention mode requires one builder-config path")
+    load_retention(Path(sys.argv[2]))
+    print("builder config retention is the rule this publisher applies")
     raise SystemExit(0)
 
 

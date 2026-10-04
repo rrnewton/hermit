@@ -61,16 +61,43 @@ class HostedAdapterTests(unittest.TestCase):
             ("max_builds", True),
             ("max_builds", -1),
             ("not_before", "2026-10-04"),
+            ("not_before", "2030-02-30T00:00:00Z"),
             ("rule", ""),
+            ("rule", "Keep the newest 5 builds."),
             ("extra", 1),
         ):
             wrong = copy.deepcopy(self.config)
             wrong["retention"][key] = value
             path.write_text(json.dumps(wrong))
-            with self.subTest(retention=key, value=value), self.assertRaises(
-                ValueError
+            with self.subTest(retention=key, value=value), self.assertRaisesRegex(
+                ValueError, "refused by the publisher: compatibility website refused: "
             ):
                 ADAPTER.configuration(path)
+
+    def test_config_retention_is_decided_by_the_publisher(self):
+        # The adapter asks the publisher's own check, so a rule the publisher
+        # does not apply, an impossible date, or a duplicated key is refused
+        # before a rebuild, with the publisher's reason.
+        path = self.root / "config.json"
+        retention = json.dumps(self.config["retention"])
+        body = json.dumps(self.config)
+        duplicated = body[:-1] + ', "retention": ' + retention + "}"
+        self.assertEqual(json.loads(duplicated), self.config)
+        path.write_text(duplicated)
+        with self.assertRaisesRegex(ValueError, "duplicate object key 'retention'"):
+            ADAPTER.configuration(path)
+        wrong = copy.deepcopy(self.config)
+        wrong["retention"]["rule"] = "Keep the newest 5 builds."
+        path.write_text(json.dumps(wrong))
+        with self.assertRaisesRegex(
+            ValueError, "not the rule this publisher applies"
+        ):
+            ADAPTER.configuration(path)
+        wrong = copy.deepcopy(self.config)
+        wrong["retention"]["not_before"] = "2030-02-30T00:00:00Z"
+        path.write_text(json.dumps(wrong))
+        with self.assertRaisesRegex(ValueError, "not a valid UTC timestamp"):
+            ADAPTER.configuration(path)
 
     def source_git(self, root, *args):
         if args == ("rev-parse", "HEAD^{commit}"):

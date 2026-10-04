@@ -154,27 +154,22 @@ def configuration(path=CONFIG):
         raise ValueError(
             "website builder requires exact reviewed parent and Hermit source commits"
         )
-    # The publisher applies the retention rule and checks its wording; refuse a
-    # malformed block here too, before an expensive rebuild reaches publication.
-    retention = value["retention"]
-    if (
-        not isinstance(retention, dict)
-        or set(retention) != {"rule", "budget_bytes", "max_builds", "not_before"}
-        or not isinstance(retention["rule"], str)
-        or not retention["rule"]
-        or any(
-            not isinstance(retention[key], int)
-            or isinstance(retention[key], bool)
-            or retention[key] <= 0
-            for key in ("budget_bytes", "max_builds")
+    # The publisher applies the retention rule, so ask it whether it accepts
+    # this block before an expensive rebuild reaches publication. One function
+    # (load_retention in the publisher) decides; this adapter keeps no copy.
+    checked = subprocess.run(
+        [sys.executable, str(HELPER), "check-retention", str(path)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        timeout=60,
+    )
+    if checked.returncode != 0:
+        reason = checked.stderr.strip().splitlines() or ["no reason given"]
+        raise ValueError(
+            "website builder retention settings are refused by the publisher: "
+            + reason[-1]
         )
-        or not isinstance(retention["not_before"], str)
-        or not re.fullmatch(
-            r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z",
-            retention["not_before"],
-        )
-    ):
-        raise ValueError("website builder retention settings are malformed")
     return value
 
 

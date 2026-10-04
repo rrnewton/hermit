@@ -299,7 +299,7 @@ class RetentionTests(unittest.TestCase):
             if not path.is_symlink():
                 path.chmod(0o700)
 
-    def make_build(self, digit):
+    def make_build(self, digit, commit=None):
         identity = digit * 64
         tree = self.trees / identity
         (tree / "assets").mkdir(parents=True)
@@ -310,9 +310,9 @@ class RetentionTests(unittest.TestCase):
             "tree_sha256": "c" * 64,
             "counts": {"cells": int(digit)},
             "directories": [{"path": "."}, {"path": "assets"}],
-            "provenance": {"hermit_main_commit": digit * 40},
+            "provenance": {"hermit_main_commit": commit or digit * 40},
         }
-        if digit == "4":
+        if digit == "4" and commit is None:
             del build["provenance"]
         (tree / "build.json").write_text(json.dumps(build))
         described = json.loads(self.helper("describe", tree).stdout)
@@ -373,6 +373,53 @@ class RetentionTests(unittest.TestCase):
 
     def expect(self, *digits):
         return [[self.index_of(digit), digit * 64] for digit in digits]
+
+    def set_published(self, digit, value):
+        path = self.metadata / f"{digit * 64}.json"
+        path.write_text(json.dumps(dict(json.loads(path.read_bytes()), published_at=value)))
+
+    def replace_build(self, digit, commit):
+        """Rebuild one tree recording `commit`, and pin the new bytes."""
+        tree = self.trees / (digit * 64)
+        self.make_writable(tree)
+        shutil.rmtree(tree)
+        pin = self.make_build(digit, commit)
+        index = int(self.index_of(digit))
+        self.assertEqual(self.registry["releases"][index]["identity"], pin["identity"])
+        self.registry["releases"][index] = pin
+        self.registry_path.write_text(json.dumps(self.registry))
+
+    def test_check_retention_applies_the_same_check_as_retain(self):
+        result = self.helper("check-retention", BUILDER)
+        self.assertIn(b"is the rule this publisher applies", result.stdout)
+        wrong = self.config(dict(self.retention, rule="Keep the newest 5 builds."))
+        result = self.helper("check-retention", wrong, check=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(b"rule is not the rule this publisher applies", result.stderr)
+        for args in [(), (BUILDER, BUILDER)]:
+            with self.subTest(arguments=len(args)):
+                result = self.helper("check-retention", *args, check=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn(b"requires one builder-config path", result.stderr)
+
+    def test_not_before_is_inclusive_to_the_second(self):
+        retention = dict(self.retention, budget_bytes=10**12)
+        self.set_published("4", NOT_BEFORE)
+        self.assertEqual(self.kept(retention), self.expect("2", "5", "1", "4"))
+        self.set_published("4", "2029-12-31T23:59:59Z")
+        self.assertEqual(self.kept(retention), self.expect("2", "5", "1"))
+
+    def test_equal_publication_times_keep_the_larger_identity(self):
+        # Registry order is identity order, so a sort on time alone would keep
+        # "1" here; the documented tie-break keeps "5".
+        self.set_published("1", PUBLISHED["5"])
+        retention = dict(self.retention, budget_bytes=10**12)
+        self.assertEqual(
+            self.kept(dict(retention, max_builds=2)), self.expect("2", "5")
+        )
+        self.assertEqual(
+            self.kept(dict(retention, max_builds=3)), self.expect("2", "5", "1")
+        )
 
     def test_checked_in_builder_config_states_the_rule_this_publisher_applies(self):
         retention = json.loads(BUILDER.read_bytes())["retention"]
@@ -509,6 +556,13 @@ class RetentionTests(unittest.TestCase):
         self.assertIn("2030-01-05 00:00 ET", page)
         self.assertEqual(page.count("(latest)"), 1)
         self.assertIn("so N = 3", page)
+        self.assertIn("This site keeps 3 compatibility website builds, newest first.",
+                      page)
+        self.assertIn("N uses only the latest build's size, so the kept builds together "
+                      "can hold more or less than the budget", page)
+        self.assertIn("newest build is not counted.", page)
+        self.assertIn("Apart from the latest build, builds published before "
+                      "2029-12-31 19:00 ET are not kept here.", page)
         self.assertIn('href="../releases.json"', page)
         self.assertIn('href="../latest/"', page)
 
@@ -518,6 +572,41 @@ class RetentionTests(unittest.TestCase):
         self.finalize(root, retention)
         page = (root / "builds/index.html").read_text()
         self.assertEqual(page.count("not recorded"), 1)
+
+    def test_finalize_shows_only_a_full_lowercase_hermit_commit(self):
+        retention = dict(self.retention, budget_bytes=10**12)
+        for value, raw in [
+            ("ABCDEF0123" * 4, "ABCDEF0123"),
+            (("abcdef0123" * 4)[:39], "abcdef0123"),
+            ("<i>" + "c" * 37, "<i>"),
+        ]:
+            with self.subTest(value=value):
+                self.replace_build("5", value)
+                root = self.publish(["1", "2", "4", "5"])
+                try:
+                    self.finalize(root, retention)
+                    page = (root / "builds/index.html").read_text()
+                    self.assertEqual(page.count("not recorded"), 2)
+                    self.assertNotIn(raw, page)
+                    self.assertIn(f"/commit/{'1' * 40}\"", page)
+                finally:
+                    self.make_writable(root)
+                    shutil.rmtree(root)
+
+    def test_finalize_words_a_single_kept_build_in_the_singular(self):
+        retention = dict(self.retention, budget_bytes=self.latest_bytes - 1)
+        root = self.publish(["2"])
+        self.finalize(root, retention)
+        page = (root / "builds/index.html").read_text()
+        self.assertIn("so N = 1", page)
+        self.assertIn("This site keeps 1 compatibility website build. It is a complete "
+                      "copy", page)
+        self.assertNotIn("builds, newest first", page)
+        self.assertNotIn("together they hold", page)
+
+    def test_the_site_landing_page_links_the_builds_index(self):
+        landing = (ROOT / "docs/site/index.html").read_text()
+        self.assertIn('href="compatibility/builds/"', landing)
 
     def test_finalize_refuses_a_publication_that_is_not_the_plan(self):
         retention = dict(self.retention, budget_bytes=10**12, max_builds=3)
