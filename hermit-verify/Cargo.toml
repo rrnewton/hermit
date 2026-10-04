@@ -14,7 +14,7 @@ clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "w
 colored = "2.1.0"
 detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
 detcore-model = { version = "0.4.0", path = "../detcore-model" }
-fbinit = { version = "0.2.0", git = "https://github.com/facebookexperimental/rust-shed.git", branch = "main" }
+fbinit = "0.2.0"
 rand = "0.10.2"
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 similar = { version = "2.2.0", features = ["bytes", "inline"] }
