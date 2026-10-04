@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::convert::Infallible;
 use std::ffi::OsStr;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
 use std::io::Write;
+use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::os::unix::process::ExitStatusExt;
@@ -48,6 +50,7 @@ use crate::cpu_evidence::InvocationCpuObservation;
 use crate::cpu_evidence::InvocationRole;
 use crate::cpu_evidence::LaunchObservation;
 use crate::cpu_evidence::LiveCpuObservation;
+use crate::cpu_evidence::LiveCpuSource;
 use crate::cpu_evidence::NotStartedReason;
 use crate::cpu_evidence::RegistrationObservation;
 use crate::cpu_evidence::ReturnedCpuCharge;
@@ -58,6 +61,9 @@ use crate::cpu_evidence::WaitOperation;
 use crate::environmental_block::EnvBlockClass;
 use crate::environmental_block::environmental_block_observation;
 use crate::host_capability::probe_host_capabilities;
+use crate::invocation_cgroup::ALLOW_PROCESS_GROUP_CPU_SCAN_ENV;
+use crate::invocation_cgroup::InvocationCgroup;
+use crate::invocation_cgroup::process_group_scan_allowed;
 use crate::ledger::RequiredNullable;
 use crate::stress_series::HostCapabilities;
 use crate::stress_series::HostCapability;
@@ -2333,15 +2339,17 @@ pub struct AttemptResult {
     pub timed_out: bool,
     #[serde(default)]
     pub duration_ms: u128,
-    /// CPU consumed by the launched process group. Rows written before the
+    /// CPU consumed by the launched command. Rows written before the
     /// ptrace golden-log normalization was removed
     /// (<https://github.com/rrnewton/hermit/issues/3301>) also include that
     /// normalization process for `E2E_KEEP_VERIFY_LOGS=1` ptrace verify cells.
     ///
     /// Completed commands use `wait4`; a CPU timeout retains the last live
-    /// process-group observation when that is larger. It is not inferred from
-    /// wall time and remains attributable when cells execute concurrently or
-    /// move their work outside the enclosing DAG cgroup.
+    /// observation when that is larger. The live observation is the CPU of the
+    /// command's own invocation cgroup or, in a run that declared it has no
+    /// cgroups, of the leader's live process group; `cpu_observations` names
+    /// which. It is not inferred from wall time, so it stays attributable when
+    /// cells execute concurrently.
     #[serde(default)]
     pub cpu_usage_usec: Option<u64>,
     pub observation_sha256: Option<String>,
@@ -4928,11 +4936,13 @@ fn record_not_started(
     reason: NotStartedReason,
     observations: &mut Vec<InvocationCpuObservation>,
 ) {
+    // No process starts, so no cgroup is created and no CPU is measured. The
+    // row names the source a started invocation would try first.
     let mut observation = InvocationCpuObservation::pending(
         observations.len() as u64 + 1,
         request.role,
         request.command,
-        cpu_enabled,
+        cpu_enabled.then_some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
     );
     observation.launch = LaunchObservation::NotStarted { reason };
     observations.push(observation);
@@ -5098,44 +5108,208 @@ fn execute_process(
     )
 }
 
+/// Where a budgeted invocation's live CPU may come from. Production reads the
+/// fallback marker from the environment and creates invocation cgroups under
+/// the runner's own cgroup; a test may substitute both for its own thread.
+#[derive(Clone, Debug)]
+struct LiveCpuPlan {
+    allow_process_group_scan: Result<bool, String>,
+    cgroup_parent: Option<PathBuf>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static LIVE_CPU_PLAN_OVERRIDE: std::cell::RefCell<Option<LiveCpuPlan>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+impl LiveCpuPlan {
+    fn current() -> Self {
+        Self::test_override().unwrap_or_else(|| Self {
+            allow_process_group_scan: process_group_scan_allowed(
+                std::env::var_os(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV).as_deref(),
+            ),
+            cgroup_parent: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn test_override() -> Option<Self> {
+        LIVE_CPU_PLAN_OVERRIDE.with(|plan| plan.borrow().clone())
+    }
+
+    #[cfg(not(test))]
+    fn test_override() -> Option<Self> {
+        None
+    }
+}
+
+/// How one invocation's live CPU is measured.
+enum LiveCpuMeter {
+    /// The invocation has no CPU budget, so nothing is measured live.
+    Disabled,
+    /// The invocation runs in a cgroup of its own and is charged from that
+    /// cgroup's `cpu.stat`.
+    Cgroup(InvocationCgroup),
+    /// The launcher declared a run without cgroups and none can be created
+    /// here, so the agent-utils process-group scan measures the invocation and
+    /// its rows name that source.
+    ProcessGroupScan,
+    /// No source is available. The invocation is launched, its registration
+    /// is recorded as unavailable, and the runner stops it once the
+    /// unavailable grace has passed, as for any other unmeasurable CPU.
+    Unavailable(String),
+}
+
+impl LiveCpuMeter {
+    fn choose(plan: &LiveCpuPlan) -> Result<Self, String> {
+        let allow_process_group_scan = plan.allow_process_group_scan.clone()?;
+        let created = match &plan.cgroup_parent {
+            Some(parent) => InvocationCgroup::create_in(parent),
+            None => InvocationCgroup::create(),
+        };
+        Ok(match created {
+            Ok(cgroup) => Self::Cgroup(cgroup),
+            Err(error) if error.fallback_eligible && allow_process_group_scan => {
+                Self::ProcessGroupScan
+            }
+            Err(error) if error.fallback_eligible => Self::Unavailable(format!(
+                "{}; only a run given no cgroups on purpose may set {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}=1 to measure with the process-group scan instead",
+                error.message
+            )),
+            Err(error) => Self::Unavailable(error.message),
+        })
+    }
+
+    fn source(&self) -> Option<LiveCpuSource> {
+        match self {
+            Self::Disabled => None,
+            Self::Cgroup(_) | Self::Unavailable(_) => {
+                Some(LiveCpuSource::CgroupV2InvocationCpuStatV1)
+            }
+            Self::ProcessGroupScan => Some(LiveCpuSource::AgentUtilsPairedPidfdStatV1),
+        }
+    }
+}
+
 fn execute_process_with_cpu_poll_interval(
     request: ProcessRequest,
     limits: ProcessLimits,
     observations: &mut Vec<InvocationCpuObservation>,
 ) -> Result<ProcessOutput, String> {
     let started = Instant::now();
-    let mut observation = InvocationCpuObservation::pending(
-        observations.len() as u64 + 1,
-        request.role,
-        request.command,
-        limits.cpu_budget_usec.is_some(),
-    );
+    let ordinal = observations.len() as u64 + 1;
+    let meter = if limits.cpu_budget_usec.is_some() {
+        LiveCpuMeter::choose(&LiveCpuPlan::current())
+    } else {
+        Ok(LiveCpuMeter::Disabled)
+    };
+    let mut meter = match meter {
+        Ok(meter) => meter,
+        Err(reason) => {
+            // A malformed fallback marker is refused before anything starts.
+            let mut observation = InvocationCpuObservation::pending(
+                ordinal,
+                request.role,
+                request.command,
+                Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+            );
+            observation.launch = LaunchObservation::SpawnFailed {
+                stage: SpawnStage::Spawn,
+                reason: reason.clone(),
+            };
+            observation.termination = TerminationPath::SpawnFailed;
+            observations.push(observation);
+            return Err(reason);
+        }
+    };
+    let mut observation =
+        InvocationCpuObservation::pending(ordinal, request.role, request.command, meter.source());
+    let enrollment = match &meter {
+        LiveCpuMeter::Cgroup(cgroup) => Some((cgroup.enrollment_fd(), cgroup.path())),
+        _ => None,
+    };
     let result = spawn_process(
         &request.cwd,
         &request.stdout,
         &request.stderr,
+        enrollment,
         &mut observation,
     )
-    .and_then(|child| {
-        monitor_process(
+    .and_then(|child| match &meter {
+        LiveCpuMeter::Cgroup(cgroup) => monitor_live_cpu(
+            child,
+            limits,
+            started,
+            &mut observation,
+            |_| Ok(()),
+            monotonic_cpu_sampler(|| cgroup.cpu_usage_usec()),
+        ),
+        LiveCpuMeter::Unavailable(reason) => monitor_live_cpu(
+            child,
+            limits,
+            started,
+            &mut observation,
+            |_| Err::<Infallible, _>(reason.clone()),
+            |_, never: &Infallible| match *never {},
+        ),
+        LiveCpuMeter::Disabled | LiveCpuMeter::ProcessGroupScan => monitor_process(
             child,
             limits,
             started,
             &mut observation,
             |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
             |reader| reader.seconds().map_err(|error| error.to_string()),
-        )
+        ),
     });
+    // The leader has been reaped (or could not be). Whatever it left in its
+    // cgroup is killed there, and the cgroup is removed; a failure to do so
+    // fails the invocation rather than leaving processes behind unnoticed.
+    let result = match &mut meter {
+        LiveCpuMeter::Cgroup(cgroup) => match (result, cgroup.finish()) {
+            (result, Ok(())) => result,
+            (Ok(_), Err(cleanup)) => Err(cleanup),
+            (Err(error), Err(cleanup)) => Err(format!("{error}; {cleanup}")),
+        },
+        _ => result,
+    };
     // Retain the same observation on every error path, including successful
     // reap after accounting became unavailable. An error never fabricates zero.
     observations.push(observation);
     result
 }
 
+/// Wrap a cgroup counter read so that a value below the highest one already
+/// returned is a failed sample. The kernel never lowers `usage_usec`, so a
+/// decrease means the read is not of this invocation's counter; the monitor
+/// then treats it like any other failed sample, timed from when it returned.
+fn monotonic_cpu_sampler(
+    mut read: impl FnMut() -> Result<u64, String>,
+) -> impl FnMut(u32, &()) -> Result<u64, CpuError> {
+    let mut highest: Option<u64> = None;
+    move |_, _| {
+        let usage = read().map_err(|error| CpuError {
+            stage: CpuErrorStage::Sampling,
+            reason: format!("sampling: {error}"),
+        })?;
+        if let Some(highest) = highest.filter(|highest| usage < *highest) {
+            return Err(CpuError {
+                stage: CpuErrorStage::Sampling,
+                reason: format!(
+                    "sampling: cgroup CPU counter decreased from {highest} to {usage} usec"
+                ),
+            });
+        }
+        highest = Some(usage);
+        Ok(usage)
+    }
+}
+
 fn spawn_process(
     cwd: &Path,
     stdout: &Path,
     stderr: &Path,
+    enrollment: Option<(RawFd, &Path)>,
     observation: &mut InvocationCpuObservation,
 ) -> Result<Child, String> {
     let mut open_capture = |path: &Path, stage| {
@@ -5161,10 +5335,30 @@ fn spawn_process(
         .stdout(stdout_file)
         .stderr(stderr_file);
     command.envs(identity.env_overrides.iter());
+    let enrollment_fd = enrollment.map(|(fd, _)| fd);
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             if libc::setpgid(0, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
+            }
+            // Join the invocation cgroup before exec, so every CPU cycle of the
+            // program and of anything it starts is charged to that cgroup. The
+            // descriptor is close-on-exec, so the program never sees it.
+            if let Some(fd) = enrollment_fd {
+                loop {
+                    let written = libc::write(fd, b"0\n".as_ptr().cast(), 2);
+                    if written == 2 {
+                        break;
+                    }
+                    if written < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.raw_os_error() == Some(libc::EINTR) {
+                            continue;
+                        }
+                        return Err(error);
+                    }
+                    return Err(std::io::Error::from_raw_os_error(libc::EIO));
+                }
             }
             Ok(())
         });
@@ -5175,7 +5369,13 @@ fn spawn_process(
             Ok(child)
         }
         Err(error) => {
-            let reason = format!("cannot execute {program}: {error}");
+            let reason = match enrollment {
+                Some((_, cgroup)) => format!(
+                    "cannot execute {program}: {error}; before exec the child also joins invocation cgroup {}",
+                    cgroup.display()
+                ),
+                None => format!("cannot execute {program}: {error}"),
+            };
             observation.launch = LaunchObservation::SpawnFailed {
                 stage: SpawnStage::Spawn,
                 reason: reason.clone(),
@@ -5186,6 +5386,9 @@ fn spawn_process(
     }
 }
 
+/// Monitor with a reader that reports live CPU in seconds, as agent-utils
+/// `proccpu` does. The seconds are converted to microseconds here, and a
+/// conversion failure is a failed sample like any other.
 fn monitor_process<R>(
     child: Child,
     limits: ProcessLimits,
@@ -5193,6 +5396,40 @@ fn monitor_process<R>(
     observation: &mut InvocationCpuObservation,
     register: impl FnOnce(u32) -> Result<R, String>,
     mut sample: impl FnMut(&R) -> Result<f64, String>,
+) -> Result<ProcessOutput, String> {
+    monitor_live_cpu(
+        child,
+        limits,
+        started,
+        observation,
+        register,
+        |pid, reader| {
+            sample(reader)
+                .map_err(|error| CpuError {
+                    stage: CpuErrorStage::Sampling,
+                    reason: format!("sampling: {error}"),
+                })
+                .and_then(|seconds| {
+                    live_cpu_usage_usec(pid, seconds).map_err(|reason| CpuError {
+                        stage: CpuErrorStage::Conversion,
+                        reason,
+                    })
+                })
+        },
+    )
+}
+
+/// Wait for the invocation's leader while polling its live CPU, and stop its
+/// process group when a budget runs out or when its CPU cannot be measured for
+/// `CELL_CPU_ACCOUNTING_GRACE`. `register` binds the reader once at spawn;
+/// `sample` returns the invocation's CPU in microseconds.
+fn monitor_live_cpu<R>(
+    child: Child,
+    limits: ProcessLimits,
+    started: Instant,
+    observation: &mut InvocationCpuObservation,
+    register: impl FnOnce(u32) -> Result<R, String>,
+    mut sample: impl FnMut(u32, &R) -> Result<u64, CpuError>,
 ) -> Result<ProcessOutput, String> {
     let ProcessLimits {
         deadline,
@@ -5249,17 +5486,7 @@ fn monitor_process<R>(
         } else if let Some(limit) = cpu_budget_usec.filter(|_| now >= next_cpu_poll) {
             next_cpu_poll = now + cpu_poll_interval;
             let sample_result = match &cpu_reader {
-                Some(Ok(reader)) => sample(reader)
-                    .map_err(|error| CpuError {
-                        stage: CpuErrorStage::Sampling,
-                        reason: format!("sampling: {error}"),
-                    })
-                    .and_then(|seconds| {
-                        live_cpu_usage_usec(pid, seconds).map_err(|reason| CpuError {
-                            stage: CpuErrorStage::Conversion,
-                            reason,
-                        })
-                    }),
+                Some(Ok(reader)) => sample(pid, reader),
                 Some(Err(error)) => Err(CpuError {
                     stage: CpuErrorStage::Registration,
                     reason: format!("registration: {error}"),
@@ -9702,11 +9929,50 @@ mod tests {
         root
     }
 
+    /// Substitute the live-CPU plan for the current test thread until dropped,
+    /// in place of the fallback marker and the runner's own cgroup.
+    struct LiveCpuPlanOverride;
+
+    impl LiveCpuPlanOverride {
+        fn set(
+            allow_process_group_scan: Result<bool, String>,
+            cgroup_parent: Option<PathBuf>,
+        ) -> Self {
+            LIVE_CPU_PLAN_OVERRIDE.with(|plan| {
+                *plan.borrow_mut() = Some(LiveCpuPlan {
+                    allow_process_group_scan,
+                    cgroup_parent,
+                });
+            });
+            Self
+        }
+    }
+
+    impl Drop for LiveCpuPlanOverride {
+        fn drop(&mut self) {
+            LIVE_CPU_PLAN_OVERRIDE.with(|plan| *plan.borrow_mut() = None);
+        }
+    }
+
     fn spawn_cpu_reader_fixture(
         root: &Path,
         label: &str,
         script: &str,
         cpu_enabled: bool,
+    ) -> (Child, Instant, InvocationCpuObservation) {
+        spawn_fixture_with_source(
+            root,
+            label,
+            script,
+            cpu_enabled.then_some(LiveCpuSource::AgentUtilsPairedPidfdStatV1),
+        )
+    }
+
+    fn spawn_fixture_with_source(
+        root: &Path,
+        label: &str,
+        script: &str,
+        cpu_source: Option<LiveCpuSource>,
     ) -> (Child, Instant, InvocationCpuObservation) {
         let started = Instant::now();
         let request = ProcessRequest::new(
@@ -9722,11 +9988,12 @@ mod tests {
             &root.join(format!("{label}.stderr")),
         );
         let mut observation =
-            InvocationCpuObservation::pending(1, request.role, request.command, cpu_enabled);
+            InvocationCpuObservation::pending(1, request.role, request.command, cpu_source);
         let child = spawn_process(
             &request.cwd,
             &request.stdout,
             &request.stderr,
+            None,
             &mut observation,
         )
         .unwrap();
@@ -10261,6 +10528,192 @@ mod tests {
     }
 
     #[test]
+    fn monotonic_cpu_sampler_refuses_a_decrease_and_keeps_the_high_value() {
+        let mut reads = vec![
+            Ok(5),
+            Ok(5),
+            Ok(7),
+            Ok(6),
+            Err("fixture read failure".to_string()),
+            Ok(6),
+            Ok(7),
+            Ok(9),
+        ]
+        .into_iter();
+        let mut sample = monotonic_cpu_sampler(move || reads.next().unwrap());
+        let decreased = Err(CpuError {
+            stage: CpuErrorStage::Sampling,
+            reason: "sampling: cgroup CPU counter decreased from 7 to 6 usec".into(),
+        });
+        assert_eq!(sample(1, &()), Ok(5));
+        assert_eq!(
+            sample(1, &()),
+            Ok(5),
+            "an unchanged counter is a valid sample"
+        );
+        assert_eq!(sample(1, &()), Ok(7));
+        assert_eq!(sample(1, &()), decreased);
+        assert_eq!(
+            sample(1, &()),
+            Err(CpuError {
+                stage: CpuErrorStage::Sampling,
+                reason: "sampling: fixture read failure".into(),
+            })
+        );
+        // The refused values never lower the bar: 6 is still below 7.
+        assert_eq!(sample(1, &()), decreased);
+        assert_eq!(sample(1, &()), Ok(7));
+        assert_eq!(sample(1, &()), Ok(9));
+    }
+
+    #[test]
+    fn a_decreasing_cgroup_sample_is_refused_after_the_unavailable_grace() {
+        use std::cell::Cell;
+
+        // The kernel never lowers a cgroup's usage_usec, so a lower reading is
+        // not this invocation's counter. It is a failed sample, timed from when
+        // it returned, and a counter that stays low stops the command once the
+        // unavailable grace has passed, exactly as a failed proccpu census does.
+        let root = cpu_reader_test_root("cgroup-decrease");
+        let (child, started, mut observation) = spawn_fixture_with_source(
+            &root,
+            "decrease",
+            "exec sleep 30",
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let pid = child.id();
+        let reads = Cell::new(0u64);
+        let first_decrease_returned = Cell::new(None::<Instant>);
+        let error = monitor_live_cpu(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(15),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            monotonic_cpu_sampler(|| {
+                reads.set(reads.get() + 1);
+                Ok(match reads.get() {
+                    1 => 100,
+                    2 => 200,
+                    _ => {
+                        if first_decrease_returned.get().is_none() {
+                            first_decrease_returned.set(Some(Instant::now()));
+                        }
+                        150
+                    }
+                })
+            }),
+        )
+        .map(|_| ())
+        .expect_err("a cgroup counter that stays below its high value must stop the command");
+        assert!(
+            error.contains("sampling: cgroup CPU counter decreased from 200 to 150 usec"),
+            "{error}"
+        );
+        assert!(error.contains("stopped and reaped its leader"), "{error}");
+        assert_eq!(
+            observation.termination,
+            TerminationPath::AccountingUnavailableStop
+        );
+        assert!(
+            first_decrease_returned.get().unwrap().elapsed() >= CELL_CPU_ACCOUNTING_GRACE,
+            "stopped before the grace had passed since the first decrease"
+        );
+        assert!(owned_child_is_reaped(pid));
+        measured_final_cpu(&observation);
+        assert_eq!(
+            observation.returned_cpu_charge,
+            ReturnedCpuCharge::Unavailable
+        );
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert_eq!(live.registration, RegistrationObservation::BoundOnce);
+        assert_eq!(live.valid_polls, 2);
+        assert!(live.unavailable_polls >= 2);
+        assert_eq!(live.source_sample_calls, live.polls);
+        let (RequiredNullable::Value(high), RequiredNullable::Value(last)) =
+            (&live.high_water, &live.last)
+        else {
+            panic!("two valid samples must leave points: {live:?}");
+        };
+        assert_eq!((high.cpu_usec, last.cpu_usec), (200, 200));
+        let RequiredNullable::Value(last_error) = &live.last_error else {
+            panic!("a refused decrease must retain its typed error");
+        };
+        assert_eq!(last_error.stage, CpuErrorStage::Sampling);
+        validate_native_observation(&observation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_transient_cgroup_decrease_is_graced_until_the_counter_recovers() {
+        use std::cell::Cell;
+
+        let root = cpu_reader_test_root("cgroup-decrease-recovers");
+        let done = root.join("done");
+        let (child, started, mut observation) = spawn_fixture_with_source(
+            &root,
+            "recovers",
+            "while [ ! -f done ]; do sleep 0.02; done",
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let pid = child.id();
+        let reads = Cell::new(0u64);
+        let first_decrease_returned = Cell::new(None::<Instant>);
+        let output = monitor_live_cpu(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(10),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            monotonic_cpu_sampler(|| {
+                reads.set(reads.get() + 1);
+                match reads.get() {
+                    1 => return Ok(100),
+                    2 => return Ok(200),
+                    _ => {}
+                }
+                let first = first_decrease_returned.get().unwrap_or_else(|| {
+                    let now = Instant::now();
+                    first_decrease_returned.set(Some(now));
+                    now
+                });
+                if first.elapsed() < Duration::from_millis(500) {
+                    return Ok(150);
+                }
+                fs::write(&done, b"complete").map_err(|error| error.to_string())?;
+                Ok(250 + reads.get())
+            }),
+        )
+        .expect("a decrease shorter than the grace must not stop the command");
+        assert!(output.status.success());
+        assert_eq!(output.timeout, None);
+        assert!(done.is_file());
+        assert!(owned_child_is_reaped(pid));
+        assert_process_observation(&observation, &output);
+        let live = enabled_cpu(&observation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert!(live.unavailable_polls >= 1);
+        assert!(live.valid_polls >= 3);
+        let (RequiredNullable::Value(high), RequiredNullable::Value(last)) =
+            (&live.high_water, &live.last)
+        else {
+            panic!("valid samples must leave points: {live:?}");
+        };
+        assert_eq!(high.cpu_usec, last.cpu_usec);
+        assert!(last.cpu_usec >= 250, "{last:?}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn live_cpu_conversion_refuses_unrepresentable_values() {
         assert_eq!(live_cpu_usage_usec(42, 0.0), Ok(0));
         assert_eq!(live_cpu_usage_usec(42, 0.125), Ok(125_000));
@@ -10345,6 +10798,10 @@ mod tests {
             return;
         }
         let root = cpu_reader_test_root("actual-fd-reserve");
+        // The descriptor reserve is the agent-utils reader's own refusal, and
+        // the runner uses that reader only for a run without cgroups. Run as
+        // one: the fallback marker is set and no cgroup can be created.
+        let _plan = LiveCpuPlanOverride::set(Ok(true), Some(root.join("missing-cgroup-parent")));
         let context = run_context(&root);
         let cell = native_cpu_cell("exec sleep 20", 1);
         let mut limit = unsafe { std::mem::zeroed::<libc::rlimit>() };
@@ -10383,6 +10840,7 @@ mod tests {
         );
         measured_final_cpu(invocation);
         let live = enabled_cpu(invocation);
+        assert_eq!(live.source, LiveCpuSource::AgentUtilsPairedPidfdStatV1);
         assert_eq!(
             live.registration,
             RegistrationObservation::Unavailable {
@@ -10405,6 +10863,455 @@ mod tests {
             "CPU_FD_REFUSAL_ROW {}",
             String::from_utf8(bytes).unwrap().trim()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    /// The cgroup v2 directory named by the unified line of a saved copy of
+    /// `/proc/<pid>/cgroup`.
+    fn saved_cgroup_directory(saved: &Path) -> PathBuf {
+        let text = fs::read_to_string(saved).unwrap();
+        let relative = text
+            .lines()
+            .find_map(|line| line.strip_prefix("0::"))
+            .unwrap_or_else(|| panic!("no unified cgroup line in {text:?}"));
+        Path::new("/sys/fs/cgroup").join(relative.trim_start_matches('/'))
+    }
+
+    #[test]
+    fn a_boxed_run_whose_invocation_cgroup_cannot_be_created_still_stops_the_cell() {
+        // A boxed run carries no fallback marker. When it cannot create the
+        // invocation cgroup, it has no CPU source, so the command is stopped
+        // after the unavailable grace and the cell is an ERROR, as for any
+        // other CPU that cannot be measured. It is never measured some other
+        // way, and its budget is never dropped.
+        let root = cpu_reader_test_root("boxed-without-cgroup");
+        let plain = root.join("plain-directory");
+        fs::create_dir(&plain).unwrap();
+        for (label, parent) in [
+            ("missing", root.join("missing-cgroup-parent")),
+            ("plain", plain.clone()),
+        ] {
+            let _plan = LiveCpuPlanOverride::set(Ok(false), Some(parent.clone()));
+            let case = root.join(label);
+            fs::create_dir(&case).unwrap();
+            let context = run_context(&case);
+            let cell = native_cpu_cell("exec sleep 20", 1);
+            let started = Instant::now();
+            let failure = run_cell(&context, &cell)
+                .expect_err("a budgeted command with no CPU source must not complete");
+            assert!(
+                started.elapsed() >= CELL_CPU_ACCOUNTING_GRACE,
+                "{label}: {failure}"
+            );
+            let message = failure.to_string();
+            for expected in [
+                "registration: ",
+                parent.to_str().unwrap(),
+                "only a run given no cgroups on purpose may set HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1",
+                "stopped and reaped its leader",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "{label}: {expected:?} in {message}"
+                );
+            }
+            let row = failure.into_result(&context, &cell);
+            assert_eq!(row.outcome, "ERROR", "{label}");
+            assert_eq!(row.cpu_usage_usec, None, "{label}");
+            row.require_cpu_observations().unwrap();
+            let observations = row.cpu_observations.as_ref().unwrap();
+            assert_eq!(observations.invocations.len(), 1, "{label}");
+            let invocation = &observations.invocations[0];
+            assert_eq!(
+                invocation.termination,
+                TerminationPath::AccountingUnavailableStop,
+                "{label}"
+            );
+            assert_eq!(
+                invocation.returned_cpu_charge,
+                ReturnedCpuCharge::Unavailable,
+                "{label}"
+            );
+            measured_final_cpu(invocation);
+            let live = enabled_cpu(invocation);
+            assert_eq!(
+                live.source,
+                LiveCpuSource::CgroupV2InvocationCpuStatV1,
+                "{label}"
+            );
+            let RegistrationObservation::Unavailable { reason } = &live.registration else {
+                panic!("{label}: registration must be unavailable: {live:?}");
+            };
+            assert!(
+                reason.contains(parent.to_str().unwrap()),
+                "{label}: {reason}"
+            );
+            assert_eq!(live.source_sample_calls, 0, "{label}");
+            assert_eq!(live.valid_polls, 0, "{label}");
+            assert!(live.unavailable_polls >= 2, "{label}");
+            let RequiredNullable::Value(last_error) = &live.last_error else {
+                panic!("{label}: unavailability must retain its typed error");
+            };
+            assert_eq!(last_error.stage, CpuErrorStage::Registration, "{label}");
+            assert_cpu_source_roundtrip(&row);
+        }
+        assert_eq!(fs::read_dir(&plain).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_fallback_marker_does_not_hide_an_ineligible_cgroup_failure() {
+        // The marker allows the process-group scan only when no cgroup can be
+        // made here at all. A parent that is not a directory is a broken setup,
+        // not a run without cgroups, so the command is still stopped.
+        let root = cpu_reader_test_root("marker-ineligible");
+        let parent = root.join("regular-file");
+        fs::write(&parent, b"").unwrap();
+        let _plan = LiveCpuPlanOverride::set(Ok(true), Some(parent.clone()));
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            &root,
+            "/bin/sh",
+            &["-c".into(), "exec sleep 20".into()],
+            &BTreeMap::new(),
+            &root.join("ineligible.stdout"),
+            &root.join("ineligible.stderr"),
+        );
+        let mut observations = Vec::new();
+        let started = Instant::now();
+        let error = execute_process_with_cpu_poll_interval(
+            request,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(10),
+                cpu_budget_usec: Some(5_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            &mut observations,
+        )
+        .map(|_| ())
+        .expect_err("an ineligible cgroup failure must stop the command");
+        assert!(started.elapsed() >= CELL_CPU_ACCOUNTING_GRACE, "{error}");
+        assert!(error.contains("registration: "), "{error}");
+        assert!(error.contains("Not a directory"), "{error}");
+        assert!(!error.contains("only a run given no cgroups"), "{error}");
+        assert_eq!(observations.len(), 1);
+        let observation = &observations[0];
+        assert_eq!(
+            observation.termination,
+            TerminationPath::AccountingUnavailableStop
+        );
+        measured_final_cpu(observation);
+        let live = enabled_cpu(observation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert!(matches!(
+            live.registration,
+            RegistrationObservation::Unavailable { .. }
+        ));
+        assert_eq!(live.source_sample_calls, 0);
+        validate_native_observation(observation);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_run_without_cgroups_measures_with_the_process_group_scan_under_its_own_source_name() {
+        // With the marker set and no cgroup available, the agent-utils scan
+        // measures the command, and every row says so: no row of such a run
+        // carries the cgroup source, so no reader can count it as one.
+        let root = cpu_reader_test_root("declared-without-cgroup");
+        let plain = root.join("plain-directory");
+        fs::create_dir(&plain).unwrap();
+        for (label, parent) in [
+            ("missing", root.join("missing-cgroup-parent")),
+            ("plain", plain.clone()),
+        ] {
+            let _plan = LiveCpuPlanOverride::set(Ok(true), Some(parent));
+            let case = root.join(label);
+            fs::create_dir(&case).unwrap();
+            let context = run_context(&case);
+            // Long enough for a poll after the scan's registration, which can
+            // take most of its 1 s deadline on a loaded host.
+            let cell = native_cpu_cell("exec sleep 1.5", 1);
+            let row = run_cell(&context, &cell).unwrap();
+            // A naked cell needs two distinct outcomes to pass, so this single
+            // run is judged by its attempt: the command ran to a normal exit.
+            assert_eq!(row.error_kind, None, "{label}: {row:?}");
+            assert_eq!(row.attempts.len(), 1, "{label}: {row:?}");
+            assert_eq!(row.attempts[0].outcome, "PASS", "{label}: {row:?}");
+            assert_eq!(row.attempts[0].status, Some(0), "{label}");
+            row.require_cpu_observations().unwrap();
+            let observations = row.cpu_observations.as_ref().unwrap();
+            assert_eq!(observations.invocations.len(), 1, "{label}");
+            let invocation = &observations.invocations[0];
+            assert_eq!(
+                invocation.termination,
+                TerminationPath::CompletedWait4,
+                "{label}"
+            );
+            let live = enabled_cpu(invocation);
+            assert_eq!(
+                live.source,
+                LiveCpuSource::AgentUtilsPairedPidfdStatV1,
+                "{label}"
+            );
+            assert_eq!(
+                live.registration,
+                RegistrationObservation::BoundOnce,
+                "{label}"
+            );
+            assert!(live.polls >= 1, "{label}: {live:?}");
+            assert_eq!(live.source_sample_calls, live.polls, "{label}");
+            let json = serde_json::to_string(&row).unwrap();
+            assert!(
+                json.contains(r#""source":"agent_utils_paired_pidfd_stat_v1""#),
+                "{label}: {json}"
+            );
+            assert!(
+                !json.contains("cgroup_v2_invocation_cpu_stat_v1"),
+                "{label}: {json}"
+            );
+            assert_cpu_source_roundtrip(&row);
+        }
+        assert_eq!(fs::read_dir(&plain).unwrap().count(), 0);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source() {
+        let test = "a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        // The production plan, minus the marker: the cgroup is created under
+        // the test process's own cgroup.
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let root = cpu_reader_test_root("invocation-cgroup-row");
+        let saved = root.join("leader.cgroup");
+        let context = run_context(&root);
+        let cell = native_cpu_cell(
+            &format!(
+                "cat /proc/self/cgroup > {}; i=0; while [ $i -lt 200000 ]; do i=$((i+1)); done",
+                saved.display()
+            ),
+            1,
+        );
+        let row = run_cell(&context, &cell).unwrap();
+        // Judged by its attempt, as a naked cell needs two distinct outcomes.
+        assert_eq!(row.error_kind, None, "{row:?}");
+        assert_eq!(row.attempts.len(), 1, "{row:?}");
+        assert_eq!(row.attempts[0].outcome, "PASS", "{row:?}");
+        assert_eq!(row.attempts[0].status, Some(0));
+        row.require_cpu_observations().unwrap();
+        let invocation = &row.cpu_observations.as_ref().unwrap().invocations[0];
+        assert_eq!(invocation.termination, TerminationPath::CompletedWait4);
+        let live = enabled_cpu(invocation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        assert_eq!(live.registration, RegistrationObservation::BoundOnce);
+        assert!(live.valid_polls >= 1, "{live:?}");
+        let (RequiredNullable::Value(high), RequiredNullable::Value(last)) =
+            (&live.high_water, &live.last)
+        else {
+            panic!("valid samples must leave points: {live:?}");
+        };
+        assert_eq!(high.cpu_usec, last.cpu_usec);
+        assert!(last.cpu_usec > 0, "{last:?}");
+        let directory = saved_cgroup_directory(&saved);
+        assert!(
+            directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("hermit-e2e-invocation-"),
+            "{}",
+            directory.display()
+        );
+        assert!(!directory.exists(), "{}", directory.display());
+        let json = serde_json::to_string(&row).unwrap();
+        assert!(json.contains(r#""source":"cgroup_v2_invocation_cpu_stat_v1""#));
+        assert_cpu_source_roundtrip(&row);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_malformed_fallback_marker_refuses_the_budgeted_command_before_launch() {
+        let root = cpu_reader_test_root("malformed-marker");
+        for value in ["0", "yes", ""] {
+            let allow = process_group_scan_allowed(Some(OsStr::new(value)));
+            assert!(allow.is_err(), "{value:?}");
+            let _plan = LiveCpuPlanOverride::set(allow, None);
+            let label = format!("marker-{}", value.len());
+            let request = |label: &str| {
+                ProcessRequest::new(
+                    InvocationRole::Execution {
+                        attempt_index: "1".into(),
+                        backend: RequiredNullable::Null,
+                    },
+                    &root,
+                    "/bin/sh",
+                    &["-c".into(), "exit 0".into()],
+                    &BTreeMap::new(),
+                    &root.join(format!("{label}.stdout")),
+                    &root.join(format!("{label}.stderr")),
+                )
+            };
+            let mut observations = Vec::new();
+            let error = execute_process_with_cpu_poll_interval(
+                request(&label),
+                ProcessLimits {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    cpu_budget_usec: Some(1_000_000),
+                    cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                },
+                &mut observations,
+            )
+            .map(|_| ())
+            .expect_err("a malformed marker must refuse a budgeted command");
+            assert!(error.contains(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV), "{error}");
+            assert!(error.contains(&format!("{value:?}")), "{error}");
+            assert!(!root.join(format!("{label}.stdout")).exists());
+            assert!(!root.join(format!("{label}.stderr")).exists());
+            assert_eq!(observations.len(), 1);
+            let observation = &observations[0];
+            assert_eq!(
+                observation.launch,
+                LaunchObservation::SpawnFailed {
+                    stage: SpawnStage::Spawn,
+                    reason: error.clone(),
+                }
+            );
+            assert_eq!(observation.termination, TerminationPath::SpawnFailed);
+            assert_eq!(observation.final_wait, FinalWaitObservation::NotApplicable);
+            validate_native_observation(observation);
+
+            // An invocation without a CPU budget measures nothing live, so the
+            // marker plays no part in it.
+            let mut observations = Vec::new();
+            let output = execute_process_with_cpu_poll_interval(
+                request(&format!("{label}-unbudgeted")),
+                ProcessLimits {
+                    deadline: Instant::now() + Duration::from_secs(5),
+                    cpu_budget_usec: None,
+                    cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+                },
+                &mut observations,
+            )
+            .unwrap();
+            assert!(output.status.success());
+            assert_eq!(observations[0].live, LiveCpuObservation::Disabled);
+            assert_process_observation(&observations[0], &output);
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_escaped_setsid_burner_is_charged_and_killed_through_the_invocation_cgroup() {
+        let test = "an_escaped_setsid_burner_is_charged_and_killed_through_the_invocation_cgroup";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let root = cpu_reader_test_root("escaped-burner");
+        let pid_file = root.join("burner.pid");
+        let saved = root.join("burner.cgroup");
+        // If an assertion fails before the cgroup kills it, the burner must not
+        // outlive the test.
+        struct KillBurner(PathBuf);
+        impl Drop for KillBurner {
+            fn drop(&mut self) {
+                if let Some(pid) = fs::read_to_string(&self.0)
+                    .ok()
+                    .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+                {
+                    unsafe {
+                        libc::kill(pid, libc::SIGKILL);
+                    }
+                }
+            }
+        }
+        let _burner_guard = KillBurner(pid_file.clone());
+        // The burner starts a session of its own, so it is outside the leader's
+        // process group: the process-group scan would not count it and the
+        // group stop would not reach it. It is still in the invocation cgroup.
+        let script = format!(
+            "setsid /bin/sh -c 'echo $$ > {}; cat /proc/self/cgroup > {}; while :; do :; done' & exec sleep 60",
+            pid_file.display(),
+            saved.display()
+        );
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            &root,
+            "/bin/sh",
+            &["-c".into(), script],
+            &BTreeMap::new(),
+            &root.join("burner.stdout"),
+            &root.join("burner.stderr"),
+        );
+        let mut observations = Vec::new();
+        let started = Instant::now();
+        let output = execute_process_with_cpu_poll_interval(
+            request,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(30),
+                cpu_budget_usec: Some(150_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            &mut observations,
+        )
+        .expect("the CPU budget stop must return the charge");
+        assert_eq!(
+            output.timeout,
+            Some(ProcessTimeout::Cpu),
+            "{observations:?}"
+        );
+        let observation = &observations[0];
+        assert_eq!(observation.termination, TerminationPath::CpuBudgetStop);
+        assert_process_observation(observation, &output);
+        let live = enabled_cpu(observation);
+        assert_eq!(live.source, LiveCpuSource::CgroupV2InvocationCpuStatV1);
+        let RequiredNullable::Value(trigger) = &live.timeout_trigger else {
+            panic!("a CPU stop must retain its trigger: {live:?}");
+        };
+        let leader_cpu = measured_final_cpu(observation);
+        assert!(trigger.cpu_usec >= 150_000, "{trigger:?}");
+        assert!(
+            trigger.cpu_usec > leader_cpu,
+            "the leader's wait4 ({leader_cpu} usec) must not include the escaped burner ({trigger:?})"
+        );
+        assert_eq!(output.cpu_usage_usec, trigger.cpu_usec);
+        // The cgroup killed the burner after the leader was reaped, and was
+        // then removed.
+        let directory = saved_cgroup_directory(&saved);
+        let name = directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("hermit-e2e-invocation-"), "{name}");
+        assert!(!directory.exists(), "{}", directory.display());
+        let burner: libc::pid_t = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{burner}/stat")) {
+            let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+            // A zombie waiting for its new parent is dead; any other process
+            // with this PID must be a later one outside the invocation cgroup.
+            if state != Some(Some('Z')) {
+                let cgroup =
+                    fs::read_to_string(format!("/proc/{burner}/cgroup")).unwrap_or_default();
+                assert!(!cgroup.contains(&name), "burner {burner} survived: {stat}");
+            }
+        }
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -10555,12 +11462,17 @@ int main(int argc, char **argv) {
             &root.join("work.stderr"),
         );
         let started = Instant::now();
-        let mut observation =
-            InvocationCpuObservation::pending(1, request.role, request.command, true);
+        let mut observation = InvocationCpuObservation::pending(
+            1,
+            request.role,
+            request.command,
+            Some(LiveCpuSource::AgentUtilsPairedPidfdStatV1),
+        );
         let child = spawn_process(
             &request.cwd,
             &request.stdout,
             &request.stderr,
+            None,
             &mut observation,
         )
         .unwrap();
