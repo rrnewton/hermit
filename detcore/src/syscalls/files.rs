@@ -6294,6 +6294,24 @@ mod test {
         }
     }
 
+    /// A vectored copy that fails with `EFAULT`, which `process_vm_readv` and
+    /// the KVM backend both return when the first byte is out of the guest's
+    /// reach, copied nothing rather than failing: the caller decides what an
+    /// empty copy means, as it does for a short one.
+    #[test]
+    fn a_fault_of_the_whole_copy_copies_nothing() {
+        let buf = reverie::syscalls::AddrMut::<u8>::from_raw(16 * PAGE).unwrap();
+        let mut bytes = [0; 32];
+        assert_eq!(
+            super::read_guest_prefix(&FailingMemory(Errno::EFAULT), buf, &mut bytes),
+            Ok(0)
+        );
+        assert_eq!(
+            super::write_guest_pieces(&mut FailingMemory(Errno::EFAULT), buf, &[(0, &bytes)]),
+            Ok(0)
+        );
+    }
+
     /// A buffer starting 8 bytes before a writable page, in a page the guest
     /// cannot write. Linux's first store, the first record's position into
     /// its own `d_off`, lands in the writable page; its next, `d_ino`, fails.
