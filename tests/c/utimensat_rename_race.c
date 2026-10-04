@@ -9,12 +9,16 @@
 // One thread sets an explicit mtime on DIR/target through utimensat while
 // another keeps renaming prepared files over that name. Each prepared file also
 // has a permanent hard link, DIR/keep_N, and the guest finally reports which of
-// them it sees with the explicit mtime. Run without thread sequentialization,
-// the report must agree with the files' real mtimes: Hermit's virtual mtime may
-// only change on the file the kernel actually updated, never on the file that
-// took over the name between the call and Hermit's own lookup of it. A final
-// call after the renames end must reach the last file, so the report always
-// lists it as seen.
+// them it sees with the explicit mtime. hermit-cli/tests/utimensat_mtime.rs runs
+// it twice under Hermit:
+// - With thread sequentialization no rename runs during a call. Every file the
+//   guest sees with the explicit mtime must really have it, and a final call
+//   after the renames end must reach the last file, so the report lists that
+//   file as seen.
+// - Without sequentialization a rename can swap the name away and back during a
+//   call, so Hermit's own lookups may name a file the kernel did not update.
+//   Hermit then leaves every virtual mtime alone and the report lists no file
+//   as seen, although the final call still sets the last file's real mtime.
 //
 // Usage: utimensat_rename_race DIR
 
@@ -110,8 +114,9 @@ int main(int argc, char** argv) {
   }
   atomic_store(&done, 1);
   pthread_join(replacer, NULL);
-  // With nothing racing it, this call must reach the virtual mtime of the file
-  // that now holds the name, the last one renamed over it.
+  // With nothing racing it, this call reaches the file that now holds the name,
+  // the last one renamed over it: its real mtime always, and its virtual mtime
+  // when threads are sequentialized.
   if (utimensat(AT_FDCWD, target, times, 0) != 0) {
     fprintf(stderr, "utimensat(%s): %s\n", target, strerror(errno));
     return 1;
