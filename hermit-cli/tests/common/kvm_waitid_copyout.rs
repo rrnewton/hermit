@@ -635,9 +635,9 @@ fn run_fixture(
     let report_path = directory.join("verification.json");
     let mut args = vec![
         "--log=info",
+        "--backend=kvm",
         "run",
         "--base-env=minimal",
-        "--backend=kvm",
         "--strict",
         "--verify-strict",
         "--verify",
