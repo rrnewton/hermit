@@ -472,7 +472,7 @@ fi
 # a62d15302ee5e907667d1c02f6e629177ad87f61 and all recipe/toolchain inputs.
 # Compiler/generator choice and measured limits are unchanged. This is
 # source-identity carry, not a new timing sample or DBT qualification.
-expected_pin=950a52f1ebaa6ed3aaa631cd4c257534de3cc1f3
+expected_pin=ea82fb0b06ac3b113c6987666c4e6290f4454a1b
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

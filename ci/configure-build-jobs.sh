@@ -519,8 +519,8 @@ fi
 # a62d15302ee5e907667d1c02f6e629177ad87f61 and all recipe/toolchain inputs.
 # Compiler/generator choice and measured limits are unchanged. This is
 # source-identity carry, not a new timing sample or DBT qualification.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 950a52f1ebaa6ed3aaa631cd4c257534de3cc1f3 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 950a52f1ebaa6ed3aaa631cd4c257534de3cc1f3 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != ea82fb0b06ac3b113c6987666c4e6290f4454a1b ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie ea82fb0b06ac3b113c6987666c4e6290f4454a1b (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
