@@ -32,6 +32,9 @@ pub(crate) struct VerifiedStateRoot {
     directory: std::fs::File,
     identity: (u64, u64),
     supervisor: Option<SupervisorStateAuthority>,
+    /// Which directory the no-follow walk enters. Locators keep the logical
+    /// `ignored/validate/...` spelling either way; see `validation_state`.
+    layout: crate::validation_state::Layout,
 }
 
 struct SupervisorStateAuthority {
@@ -91,6 +94,7 @@ impl VerifiedStateRoot {
             directory,
             identity: (authority.state_dev, authority.state_ino),
             supervisor: None,
+            layout: crate::validation_state::Layout::detect(&authority.state_root),
         };
         result.verify()?;
         Ok(result)
@@ -215,10 +219,12 @@ impl VerifiedStateRoot {
             .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
             .open(&state_path)
             .map_err(|e| format!("cannot retain supervisor STATE: {e}"))?;
+        let layout = crate::validation_state::Layout::detect(&path);
         let result = Self {
             path,
             directory,
             identity: (number("state_dev")?, number("state_ino")?),
+            layout,
             supervisor: Some(SupervisorStateAuthority {
                 record,
                 record_path: supplied.to_path_buf(),
@@ -253,6 +259,9 @@ impl VerifiedStateRoot {
         Ok(())
     }
 
+    /// The logical locator for a path below the state root. A migrated root
+    /// accepts the physical `validate_tmp/...` spelling as well and names it
+    /// `ignored/validate/...`, which is what the ledger requires.
     pub(crate) fn locator(&self, path: &Path) -> Result<WorkspaceLocatorV2, String> {
         self.verify()?;
         let relative = path
@@ -260,13 +269,17 @@ impl VerifiedStateRoot {
             .map_err(|_| "log is outside authenticated state root")?;
         let locator = WorkspaceLocatorV2 {
             scope: "workspace".into(),
-            path: relative
-                .to_str()
-                .ok_or("retained path is not UTF-8")?
-                .into(),
+            path: self
+                .layout
+                .logical(relative.to_str().ok_or("retained path is not UTF-8")?),
         };
         locator.validate_retained_path()?;
         Ok(locator)
+    }
+
+    /// Where a logical locator's bytes are, as an absolute path.
+    pub(crate) fn physical_path(&self, locator: &WorkspaceLocatorV2) -> std::path::PathBuf {
+        self.path.join(self.layout.physical(&locator.path))
     }
 
     fn parent(
@@ -278,7 +291,10 @@ impl VerifiedStateRoot {
         use std::os::fd::FromRawFd;
         self.verify()?;
         locator.validate_retained_path()?;
-        let mut parts = locator.path.split('/').peekable();
+        // Validate the logical name, then walk the physical one: after the
+        // move, `ignored/validate` is a symlink this walk must still refuse.
+        let physical = self.layout.physical(&locator.path);
+        let mut parts = physical.split('/').peekable();
         let mut directory = self.directory.try_clone().map_err(|e| e.to_string())?;
         while let Some(part) = parts.next() {
             let name = std::ffi::CString::new(part).map_err(|e| e.to_string())?;
@@ -377,6 +393,7 @@ impl VerifiedStateRoot {
             directory,
             identity: (metadata.dev(), metadata.ino()),
             supervisor: None,
+            layout: crate::validation_state::Layout::detect(path),
         }
     }
 }
@@ -599,8 +616,9 @@ impl BoundExecutionPlan {
             path: format!("ignored/validate/admission/{name}/context.json"),
         };
         // The authenticated state tree may contain the source checkout. Prove
-        // retention cannot add a nonignored input to source_identity.
-        let artifact_path = state.path.join(&locator.path);
+        // retention cannot add a nonignored input to source_identity. Ask about
+        // the path that will be written, not its logical name.
+        let artifact_path = state.physical_path(&locator);
         let source = source.canonicalize().map_err(|e| e.to_string())?;
         if artifact_path.starts_with(&source) {
             let status = Command::new("git")
@@ -1941,6 +1959,77 @@ for entry in Path('/proc/self/fd').iterdir():
         std::fs::create_dir(&f.0).unwrap();
         assert!(state.verify().is_err());
         std::fs::remove_dir_all(moved).unwrap();
+    }
+
+    #[test]
+    fn admission_retained_root_on_a_migrated_parent_names_logically_and_walks_physically() {
+        use std::os::unix::fs::symlink;
+        let f = Fixture::new();
+        std::fs::create_dir(f.0.join("validate_tmp")).unwrap();
+        std::fs::create_dir(f.0.join("ignored")).unwrap();
+        symlink("../validate_tmp", f.0.join("ignored/validate")).unwrap();
+        let state = VerifiedStateRoot::fixture(&f.0);
+        let root = state.path().to_path_buf();
+
+        // Either spelling of a retained path is the one logical locator.
+        let logical = state
+            .locator(&root.join("ignored/validate/driver.log"))
+            .unwrap();
+        assert_eq!(logical.path, "ignored/validate/driver.log");
+        assert_eq!(
+            state
+                .locator(&root.join("validate_tmp/driver.log"))
+                .unwrap(),
+            logical
+        );
+        assert_eq!(
+            state.physical_path(&logical),
+            root.join("validate_tmp/driver.log")
+        );
+        for outside in ["validate_tmpx/log", "ignored/validation/log", "log"] {
+            assert!(state.locator(&root.join(outside)).is_err(), "{outside}");
+        }
+
+        // The no-follow walk enters the physical directory, so the
+        // compatibility symlink no longer refuses an ordinary create.
+        let log = state.create(&logical).unwrap();
+        log.write_exact(b"original").unwrap();
+        state.verify_file(&log).unwrap();
+        assert_eq!(
+            std::fs::read(root.join("validate_tmp/driver.log")).unwrap(),
+            b"original"
+        );
+        let nested = WorkspaceLocatorV2 {
+            scope: "workspace".into(),
+            path: "ignored/validate/admission/run/context.json".into(),
+        };
+        state.create(&nested).unwrap();
+        assert!(
+            std::fs::symlink_metadata(root.join("validate_tmp/admission/run/context.json"))
+                .unwrap()
+                .is_file()
+        );
+
+        // Links inside the physical directory are still refused, and a
+        // replaced file is still detected.
+        let outside = Fixture::new();
+        symlink(&outside.0, root.join("validate_tmp/escape")).unwrap();
+        assert!(
+            state
+                .create(&WorkspaceLocatorV2 {
+                    scope: "workspace".into(),
+                    path: "ignored/validate/escape/log".into(),
+                })
+                .is_err()
+        );
+        assert!(!outside.0.join("log").exists());
+        std::fs::rename(
+            root.join("validate_tmp/driver.log"),
+            root.join("validate_tmp/moved.log"),
+        )
+        .unwrap();
+        std::fs::write(root.join("validate_tmp/driver.log"), b"replacement").unwrap();
+        assert!(state.verify_file(&log).is_err());
     }
 
     #[test]
