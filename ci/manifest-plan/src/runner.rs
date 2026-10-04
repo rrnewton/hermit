@@ -5723,22 +5723,89 @@ fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
         else {
             continue;
         };
-        // Bytes, not text: any process on the host may name itself with
-        // bytes that are not UTF-8, and one such name must not fail the scan.
-        let stat = match fs::read(format!("/proc/{pid}/stat")) {
-            Ok(stat) => stat,
-            Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
-                continue;
-            }
-            Err(error) => return Err(format!("/proc/{pid}/stat: {error}")),
-        };
-        let group =
-            stat_process_group(&stat).ok_or_else(|| format!("/proc/{pid}/stat is malformed"))?;
-        if group == pgid {
+        if member_process_group(pid, read_process_stat, process_exists)? == Some(pgid) {
             members.push(pid);
         }
     }
     Ok(members)
+}
+
+/// One read of a `/proc/<pid>/stat` file: its bytes, or that the process
+/// no longer exists.
+#[derive(Debug)]
+enum StatRead {
+    Bytes(Vec<u8>),
+    Gone,
+}
+
+/// Read `/proc/<pid>/stat` as bytes, not text: any process on the host may
+/// name itself with bytes that are not UTF-8, and one such name must not fail
+/// the scan.
+fn read_process_stat(pid: u32) -> Result<StatRead, String> {
+    match fs::read(format!("/proc/{pid}/stat")) {
+        Ok(stat) => Ok(StatRead::Bytes(stat)),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
+            Ok(StatRead::Gone)
+        }
+        Err(error) => Err(format!("/proc/{pid}/stat: {error}")),
+    }
+}
+
+/// Whether `/proc/<pid>` still exists.
+fn process_exists(pid: u32) -> Result<bool, String> {
+    match fs::symlink_metadata(format!("/proc/{pid}")) {
+        Ok(_) => Ok(true),
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => Ok(false),
+        Err(error) => Err(format!("/proc/{pid}: {error}")),
+    }
+}
+
+/// The process group of `pid` from its `stat`, or `None` when the process no
+/// longer exists. A read whose bytes do not parse is not trusted at once: in
+/// the validation of hermit 9e698b862c8e, two such reads refused liteinst
+/// cells. If `/proc/<pid>` is gone the
+/// process has exited and is skipped, as an exited process cannot be outside
+/// the cgroup; otherwise the file is read once more. A live process whose
+/// stat still does not parse fails the check, with both reads' lengths and
+/// leading bytes in the error so the next occurrence shows what it read.
+fn member_process_group(
+    pid: u32,
+    mut read: impl FnMut(u32) -> Result<StatRead, String>,
+    exists: impl FnOnce(u32) -> Result<bool, String>,
+) -> Result<Option<u32>, String> {
+    let first = match read(pid)? {
+        StatRead::Gone => return Ok(None),
+        StatRead::Bytes(stat) => stat,
+    };
+    if let Some(group) = stat_process_group(&first) {
+        return Ok(Some(group));
+    }
+    if !exists(pid)? {
+        return Ok(None);
+    }
+    let reread = match read(pid)? {
+        StatRead::Gone => return Ok(None),
+        StatRead::Bytes(stat) => stat,
+    };
+    match stat_process_group(&reread) {
+        Some(group) => Ok(Some(group)),
+        None => Err(format!(
+            "/proc/{pid}/stat is malformed in two reads of a live process: first {}; re-read {}",
+            describe_stat_bytes(&first),
+            describe_stat_bytes(&reread)
+        )),
+    }
+}
+
+/// The length of `stat` and its first 64 bytes, escaped, for an error.
+fn describe_stat_bytes(stat: &[u8]) -> String {
+    let shown: String = stat
+        .iter()
+        .take(64)
+        .flat_map(|&byte| std::ascii::escape_default(byte))
+        .map(char::from)
+        .collect();
+    format!("{} bytes \"{shown}\"", stat.len())
 }
 
 /// The process group in the bytes of a `/proc/<pid>/stat` file, or `None`
@@ -12615,6 +12682,103 @@ mod tests {
                 String::from_utf8_lossy(malformed)
             );
         }
+    }
+
+    fn reads(
+        script: Vec<Result<StatRead, String>>,
+    ) -> (
+        std::rc::Rc<std::cell::Cell<usize>>,
+        impl FnMut(u32) -> Result<StatRead, String>,
+    ) {
+        let count = std::rc::Rc::new(std::cell::Cell::new(0));
+        let seen = count.clone();
+        let mut script = script.into_iter();
+        let read = move |pid: u32| {
+            assert_eq!(pid, 7);
+            seen.set(seen.get() + 1);
+            script.next().expect("no more reads were expected")
+        };
+        (count, read)
+    }
+
+    fn bytes(stat: &[u8]) -> Result<StatRead, String> {
+        Ok(StatRead::Bytes(stat.to_vec()))
+    }
+
+    fn unasked(_: u32) -> Result<bool, String> {
+        panic!("existence must not be checked when the first read decides")
+    }
+
+    #[test]
+    fn a_stat_that_parses_names_its_group_from_one_read() {
+        let (count, read) = reads(vec![bytes(b"7 (sleep) S 1 42 42 0 -1")]);
+        assert_eq!(member_process_group(7, read, unasked), Ok(Some(42)));
+        assert_eq!(count.get(), 1);
+    }
+
+    #[test]
+    fn a_process_gone_at_its_first_read_is_skipped() {
+        let (count, read) = reads(vec![Ok(StatRead::Gone)]);
+        assert_eq!(member_process_group(7, read, unasked), Ok(None));
+        assert_eq!(count.get(), 1);
+        let (_, failing) = reads(vec![Err("/proc/7/stat: EACCES".into())]);
+        assert_eq!(
+            member_process_group(7, failing, unasked),
+            Err("/proc/7/stat: EACCES".into())
+        );
+    }
+
+    #[test]
+    fn a_malformed_stat_of_a_process_whose_proc_entry_is_gone_is_skipped() {
+        let (count, read) = reads(vec![bytes(b"")]);
+        assert_eq!(member_process_group(7, read, |_| Ok(false)), Ok(None));
+        assert_eq!(count.get(), 1, "a gone process is not read again");
+        let (_, read) = reads(vec![bytes(b"")]);
+        assert_eq!(
+            member_process_group(7, read, |_| Err("/proc/7: EACCES".into())),
+            Err("/proc/7: EACCES".into())
+        );
+    }
+
+    #[test]
+    fn a_malformed_stat_whose_reread_finds_the_process_gone_is_skipped() {
+        let (count, read) = reads(vec![bytes(b"7 (sleep) S 1"), Ok(StatRead::Gone)]);
+        assert_eq!(member_process_group(7, read, |_| Ok(true)), Ok(None));
+        assert_eq!(count.get(), 2);
+    }
+
+    #[test]
+    fn a_malformed_stat_that_parses_when_reread_names_its_group() {
+        let (count, read) = reads(vec![bytes(b""), bytes(b"7 (sleep) S 1 42 42 0 -1")]);
+        assert_eq!(member_process_group(7, read, |_| Ok(true)), Ok(Some(42)));
+        assert_eq!(count.get(), 2);
+    }
+
+    #[test]
+    fn a_live_process_whose_stat_still_does_not_parse_fails_with_both_reads_bytes() {
+        let long = [b'x'; 70];
+        let (count, read) = reads(vec![bytes(b"7 (a\"\xff\n"), bytes(&long)]);
+        let error = member_process_group(7, read, |_| Ok(true))
+            .expect_err("a live, unparseable process must fail the check");
+        assert_eq!(count.get(), 2, "read exactly once more");
+        assert_eq!(
+            error,
+            format!(
+                "/proc/7/stat is malformed in two reads of a live process: \
+                 first 7 bytes \"7 (a\\\"\\xff\\n\"; re-read 70 bytes \"{}\"",
+                "x".repeat(64)
+            )
+        );
+    }
+
+    #[test]
+    fn the_real_existence_reader_sees_this_process_and_not_a_reaped_one() {
+        assert_eq!(process_exists(std::process::id()), Ok(true));
+        let mut child = Command::new("/bin/true").spawn().unwrap();
+        let reaped = child.id();
+        child.wait().unwrap();
+        assert_eq!(process_exists(reaped), Ok(false));
+        assert!(matches!(read_process_stat(reaped), Ok(StatRead::Gone)));
     }
 
     #[test]
