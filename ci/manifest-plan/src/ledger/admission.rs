@@ -678,6 +678,13 @@ impl AdmissionIdentity<'_> {
         }
         match (a.kind.as_str(), f.kind.as_str()) {
             ("validate", "current-main") if f.sha == f.observed_main_sha => {}
+            // A post-landing run of a commit that a later observed main
+            // contains: the floor is the target itself, the same floor a
+            // current-main run of that commit had while it was the tip.
+            ("validate", "main-ancestor")
+                if f.sha == self.target_sha
+                    && f.tree == self.target_tree
+                    && f.observed_main_sha != self.target_sha => {}
             ("frozen-validate", "frozen-target")
                 if f.sha == self.target_sha && f.tree == self.target_tree => {}
             _ => return Err("admission floor disagrees with its authority kind/identity".into()),
@@ -926,8 +933,12 @@ impl AdmissionEvidence {
             Self::V2(e) => &e.context.authority,
         }
     }
+    /// Ordinary validation authority is canonical whether the target was the
+    /// observed main (`current-main`) or a commit that main already contained
+    /// (`main-ancestor`); only frozen validation is noncanonical.
     pub fn is_canonical(&self) -> bool {
-        self.validate().is_ok() && self.floor().kind == "current-main"
+        self.validate().is_ok()
+            && matches!(self.floor().kind.as_str(), "current-main" | "main-ancestor")
     }
     pub fn log_identity(&self) -> Option<&WorkspaceLocatorV2> {
         match self {
@@ -1093,11 +1104,17 @@ mod tests {
         frozen.floor.sha = frozen.target_sha.clone();
         frozen.floor.tree = frozen.target_tree.clone();
         frozen.pin_bindings[0].base_sha = frozen.target_sha.clone();
+        let mut ancestor = basic.clone();
+        ancestor.floor.kind = "main-ancestor".into();
+        ancestor.floor.sha = ancestor.target_sha.clone();
+        ancestor.floor.tree = ancestor.target_tree.clone();
+        ancestor.pin_bindings[0].base_sha = ancestor.target_sha.clone();
         for (name, c) in [
             ("basic", basic),
             ("escaped", escaped),
             ("large-u64", large),
             ("frozen", frozen),
+            ("main-ancestor", ancestor),
         ] {
             let bytes = admission_context_v2_bytes(&c).unwrap();
             assert_eq!(admission_context_v2_from_bytes(&bytes).unwrap(), c);
@@ -1412,6 +1429,41 @@ mod tests {
                 .admission_evidence()
                 .is_err()
         );
+    }
+
+    /// A main-ancestor floor is canonical only as the target's own floor,
+    /// observed under a later main, with every pin binding based on it.
+    #[test]
+    fn main_ancestor_floor_is_canonical_only_as_the_targets_own_floor() {
+        let mut ancestor = context_v2();
+        ancestor.floor.kind = "main-ancestor".into();
+        ancestor.floor.sha = ancestor.target_sha.clone();
+        ancestor.floor.tree = ancestor.target_tree.clone();
+        ancestor.pin_bindings[0].base_sha = ancestor.target_sha.clone();
+        ancestor.validate().unwrap();
+        assert!(AdmissionEvidence::V2(evidence_v2(ancestor.clone())).is_canonical());
+
+        let refused = |c: AdmissionContextV2| c.validate().unwrap_err();
+        // An older main commit is not the target's own floor.
+        let mut older = ancestor.clone();
+        older.floor.sha = "a".repeat(40);
+        older.pin_bindings[0].base_sha = older.floor.sha.clone();
+        assert!(refused(older).contains("floor disagrees"));
+        let mut tree = ancestor.clone();
+        tree.floor.tree = "b".repeat(40);
+        assert!(refused(tree).contains("floor disagrees"));
+        // A target that is the observed main is a current-main run.
+        let mut tip = ancestor.clone();
+        tip.floor.observed_main_sha = tip.target_sha.clone();
+        assert!(refused(tip).contains("floor disagrees"));
+        // Frozen authority never selects it.
+        let mut frozen = ancestor.clone();
+        frozen.authority.kind = "frozen-validate".into();
+        assert!(refused(frozen).contains("floor disagrees"));
+        // A pin binding against the observed main instead of the floor.
+        let mut pin = ancestor;
+        pin.pin_bindings[0].base_sha = pin.floor.observed_main_sha.clone();
+        assert!(refused(pin).contains("pin binding"));
     }
 
     #[test]
