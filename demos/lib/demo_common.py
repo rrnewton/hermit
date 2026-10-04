@@ -2172,6 +2172,49 @@ def stop_process(process: Optional[subprocess.Popen]) -> None:
         process.poll()
 
 
+def _may_signal(pid: int) -> bool:
+    """Whether this process may signal ``pid``, asked through a pidfd with signal 0.
+
+    Signal 0 delivers nothing. The answer is False when ``pid`` no longer
+    exists or the signal is refused for permission, and True when it is
+    accepted. It is also True when the question cannot be asked (no pidfd_open,
+    too many open files) or fails some other way: a failed observation is not
+    an absence.
+    """
+    try:
+        pidfd = os.pidfd_open(pid)
+    except ProcessLookupError:
+        return False
+    except (AttributeError, OSError):
+        return True  # Cannot ask; count it.
+    try:
+        signal.pidfd_send_signal(pidfd, 0)
+    except (ProcessLookupError, PermissionError):
+        return False
+    except OSError:
+        return True
+    finally:
+        os.close(pidfd)
+    return True
+
+
+def _unreadable_stat_counts(pid: int, error: OSError) -> bool:
+    """Whether a process whose /proc/<pid>/stat could not be opened or read may be a member.
+
+    ``error`` is what the open or the read raised. A process that no longer
+    exists (ENOENT, ESRCH) does not count. EPERM or EACCES is what /proc
+    mounted with hidepid=1, or a security module, answers for another user's
+    process: its group cannot be read, but whether this process may signal it
+    can still be asked (_may_signal), and a process it may not signal does not
+    count, whatever its group. Any other failure counts: the group is unknown.
+    """
+    if error.errno in (errno.ENOENT, errno.ESRCH):
+        return False
+    if error.errno in (errno.EPERM, errno.EACCES):
+        return _may_signal(pid)
+    return True  # Cannot tell; count it.
+
+
 def _other_group_members(group: int, leader: int) -> bool:
     """Whether a process other than ``leader`` may be in process group ``group``.
 
@@ -2180,14 +2223,16 @@ def _other_group_members(group: int, leader: int) -> bool:
     not signal does not count: nothing more can be done about it from here.
     Permission is asked through a pidfd with signal 0, which delivers nothing.
     A process whose stat cannot be read counts, unless the read failed because
-    the process no longer exists: a failed observation is not an absence. For
-    the same reason, if /proc itself cannot be opened or listed to the end (too
-    many open files, for example), the answer is that a member may remain.
+    the process no longer exists, or because the stat is refused (EPERM or
+    EACCES: hidepid=1 on /proc, or a security module) and this process may not
+    signal it either (see _unreadable_stat_counts): a failed observation is not
+    an absence. For the same reason, if /proc itself cannot be opened or listed
+    to the end (too many open files, for example), the answer is that a member
+    may remain.
 
     The answer is a sample of a moment: it only bounds a wait, and never decides
     whether a signal is sent (see stop_process_group).
     """
-    gone = (errno.ENOENT, errno.ESRCH)
     wanted = str(group).encode()
     try:
         entries = os.scandir("/proc")
@@ -2206,15 +2251,15 @@ def _other_group_members(group: int, leader: int) -> bool:
         try:
             descriptor = os.open("/proc/{}/stat".format(name), os.O_RDONLY)
         except OSError as error:
-            if error.errno in gone:
-                continue
-            return True  # Cannot tell; count it.
+            if _unreadable_stat_counts(int(name), error):
+                return True
+            continue
         try:
             data = os.read(descriptor, 4096)
         except OSError as error:
-            if error.errno in gone:
-                continue
-            return True  # Cannot tell; count it.
+            if _unreadable_stat_counts(int(name), error):
+                return True
+            continue
         finally:
             os.close(descriptor)
         # The command name (field 2) is in parentheses and may contain spaces
@@ -2222,21 +2267,8 @@ def _other_group_members(group: int, leader: int) -> bool:
         fields = data[data.rfind(b")") + 2 :].split(b" ", 3)
         if len(fields) < 3 or fields[2] != wanted:
             continue
-        try:
-            pidfd = os.pidfd_open(int(name))
-        except ProcessLookupError:
-            continue
-        except (AttributeError, OSError):
-            return True  # Cannot ask; count it.
-        try:
-            signal.pidfd_send_signal(pidfd, 0)
-        except (ProcessLookupError, PermissionError):
-            continue
-        except OSError:
+        if _may_signal(int(name)):
             return True
-        finally:
-            os.close(pidfd)
-        return True
 
 
 def _group_empty(process: subprocess.Popen, group: int, timeout: float) -> bool:
