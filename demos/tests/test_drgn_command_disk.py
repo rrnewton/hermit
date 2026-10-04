@@ -58,19 +58,26 @@ class CommandDiskProtocolTest(unittest.TestCase):
         program._qmp = qmp
         program._qemu_pid = 456
         program._tracer_tgid = 123
+        program._tracer = mock.Mock(tgid=123)
+        program._tracer.send.return_value = True
         program._serial_write_fd = 99
         program._wait_for_serial = mock.Mock()
 
         with mock.patch.object(dh.os, "write") as serial_write, mock.patch.object(
             dh.os, "kill"
-        ), mock.patch.object(dh, "_freeze_exact_tracer", return_value=(456, 789)):
+        ) as kill, mock.patch.object(dh, "_freeze_exact_tracer") as freeze:
             program.advance("echo deterministic", b"done")
 
         serial_write.assert_not_called()
         program._wait_for_serial.assert_called_once_with(b"done")
         self.assertEqual(qmp.commands, ["cont", "stop"])
         self.assertTrue(program._frozen)
-        self.assertEqual(program._tracer_tgid, 789)
+        # The tracer is resumed through the pidfd it is held by, never by pid,
+        # and the same held tracer is frozen again.
+        program._tracer.send.assert_called_once_with(dh.signal.SIGCONT)
+        kill.assert_not_called()
+        freeze.assert_called_once_with(456, program._tracer)
+        self.assertEqual(program._tracer_tgid, 123)
 
     def test_advance_rejects_command_other_than_preloaded_disk(self):
         program = dh.HermitGuestProgram(SimpleNamespace(advance_command="expected"))
@@ -78,6 +85,7 @@ class CommandDiskProtocolTest(unittest.TestCase):
         program._qmp = FakeQmp()
         program._qemu_pid = 456
         program._tracer_tgid = 123
+        program._tracer = mock.Mock(tgid=123)
 
         with self.assertRaisesRegex(ValueError, "preloaded command disk"):
             program.advance("different", b"done")

@@ -25,6 +25,7 @@ import dataclasses
 import errno
 import io
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -33,6 +34,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 LIB_DIR = Path(__file__).resolve().parent.parent / "lib"
@@ -441,7 +443,7 @@ class LeftoverProcessTest(_PassHarness):
 
         def status_value(pid, key):
             # The tracer stand-in does not really ptrace the QEMU stand-in.
-            if qmp_error is not None and stand_ins:
+            if stand_ins:
                 tracer = stand_ins[1][0]
                 if pid == stand_ins[0][0] and key == "TracerPid":
                     return str(tracer)
@@ -449,15 +451,15 @@ class LeftoverProcessTest(_PassHarness):
                     return str(tracer)
             return real_status_value(pid, key)
 
-        def freeze_exact_tracer(qemu_pid, timeout=20.0):
+        def freeze_exact_tracer(qemu_pid, tracer, timeout=20.0):
             # The real QEMU waits in a ptrace stop and the tracer is stopped
-            # with SIGSTOP; both stand-ins are stopped here.
+            # with SIGSTOP; both stand-ins are stopped here. start() held the
+            # tracer stand-in through a real pidfd.
+            self.assertEqual(tracer.tgid, stand_ins[1][0])
             for pid, _ in stand_ins:
                 os.kill(pid, signal.SIGSTOP)
             for pid, _ in stand_ins:
                 _wait_for_state(self, pid, "T")
-            tracer = stand_ins[1][0]
-            return tracer, tracer
 
         build_id = "0123abcd"
         with contextlib.ExitStack() as stack:
@@ -535,6 +537,172 @@ class LeftoverProcessTest(_PassHarness):
         self._assert_nothing_left(guest, stand_ins, marker, stderr)
         self.assertIn("Removed the failed pass's", stderr)
         self.assertIn(self.STOPPED_NOTE, stderr)
+
+
+# A pid that no process has: above the largest pid_max Linux allows (2**22).
+ABSENT_QEMU_PID = 2 ** 22 + 1
+
+
+class TracerSignalTest(unittest.TestCase):
+    """Hermit's tracer, which the demo finds but does not start, is signalled only through a pidfd.
+
+    A `sleep` this test starts plays the tracer. QEMU's /proc status is faked:
+    it names the `sleep` as QEMU's tracer and shows QEMU in a trace-stop.
+    Signals sent by pid or process group are recorded and not sent.
+    """
+
+    def setUp(self):
+        self.tracer = subprocess.Popen(["sleep", "1000"])
+
+        def reap():
+            self.tracer.kill()
+            self.tracer.wait(timeout=30)
+
+        self.addCleanup(reap)
+        real_status_value = dh._proc_status_value
+        real_send = signal.pidfd_send_signal
+        self.sent = []  # signals sent through a pidfd
+        self.by_pid = []  # signals asked for by pid or process group
+
+        def status_value(pid, key):
+            if pid == ABSENT_QEMU_PID:
+                return {"TracerPid": str(self.tracer.pid), "State": "t"}[key]
+            return real_status_value(pid, key)
+
+        def pidfd_send_signal(pidfd, sig, *rest):
+            self.sent.append(sig)
+            return real_send(pidfd, sig, *rest)
+
+        for target, name, replacement in (
+            (dh, "_proc_status_value", status_value),
+            (dh.signal, "pidfd_send_signal", pidfd_send_signal),
+            (dh.os, "kill", lambda *call: self.by_pid.append(("kill",) + call)),
+            (dh.os, "killpg", lambda *call: self.by_pid.append(("killpg",) + call)),
+        ):
+            patcher = mock.patch.object(target, name, replacement)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+    def _hold(self):
+        tracer = dh._hold_exact_tracer(ABSENT_QEMU_PID)
+        self.addCleanup(tracer.close)
+        self.assertEqual(tracer.tgid, self.tracer.pid)
+        self.assertEqual(tracer.start_time, _stat_identity(self.tracer.pid)[1])
+        return tracer
+
+    def test_the_freeze_and_the_advance_signal_the_tracer_only_through_its_pidfd(self):
+        tracer = self._hold()
+        dh._freeze_exact_tracer(ABSENT_QEMU_PID, tracer)
+        self.assertEqual(_stat_identity(self.tracer.pid)[0], "T")
+        program = dh.HermitGuestProgram(SimpleNamespace(advance_command="echo deterministic"))
+        program._frozen = True
+        program._qmp = mock.Mock()
+        program._qmp.status.return_value = "paused"
+        program._qemu_pid = ABSENT_QEMU_PID
+        program._tracer = tracer
+        program._tracer_tgid = tracer.tgid
+        program._wait_for_serial = mock.Mock()
+        program.advance("echo deterministic", b"done")
+        self.assertEqual(self.by_pid, [], "a signal was sent to the tracer by pid")
+        self.assertEqual(self.sent[0], signal.SIGSTOP)
+        self.assertIn(signal.SIGCONT, self.sent)
+        self.assertEqual(self.sent[-1], signal.SIGSTOP)
+        self.assertLessEqual(set(self.sent), {signal.SIGSTOP, signal.SIGCONT})
+        self.assertEqual(_stat_identity(self.tracer.pid)[0], "T")
+
+    def test_a_tracer_pid_given_to_another_process_meanwhile_is_not_held(self):
+        real_identity = dh._proc_identity
+        reads = []
+
+        def identity(pid):
+            found = real_identity(pid)
+            reads.append(pid)
+            if len(reads) == 1:
+                # Read before the pidfd is opened: an earlier process had the pid.
+                return found[0], found[1] - 1
+            return found
+
+        descriptors = len(os.listdir("/proc/self/fd"))
+        with mock.patch.object(dh, "_proc_identity", identity):
+            with self.assertRaisesRegex(RuntimeError, "changed while it was being held"):
+                dh._hold_exact_tracer(ABSENT_QEMU_PID)
+        self.assertEqual(len(os.listdir("/proc/self/fd")), descriptors, "the pidfd was left open")
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.by_pid, [])
+
+    def test_a_pidfd_that_cannot_be_opened_is_reported_and_nothing_is_sent_by_pid(self):
+        with mock.patch.object(
+            dh.os, "pidfd_open", side_effect=OSError(errno.EMFILE, "Too many open files")
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"could not open a pidfd for Hermit's tracer \(pid {}\): .*Too many open files.*"
+                r"not signalled by pid".format(self.tracer.pid),
+            ):
+                dh._hold_exact_tracer(ABSENT_QEMU_PID)
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.by_pid, [])
+
+    def test_a_pidfd_signal_error_is_reported_and_nothing_is_sent_by_pid(self):
+        tracer = self._hold()
+        with mock.patch.object(
+            dh.signal,
+            "pidfd_send_signal",
+            side_effect=PermissionError(errno.EPERM, "Operation not permitted"),
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"could not send SIGSTOP to Hermit's tracer \(pid {}\) through its pidfd: "
+                r".*Operation not permitted.*no signal was sent by pid".format(self.tracer.pid),
+            ):
+                dh._freeze_exact_tracer(ABSENT_QEMU_PID, tracer)
+        self.assertEqual(self.by_pid, [])
+        self.assertNotEqual(_stat_identity(self.tracer.pid)[0], "T")
+
+    def test_a_tracer_that_has_exited_is_not_signalled_by_pid(self):
+        # ESRCH through the pidfd: the tracer has exited, so the freeze cannot
+        # happen, and nothing is sent to a pid that may be another process's.
+        tracer = self._hold()
+        with mock.patch.object(
+            dh.signal, "pidfd_send_signal", side_effect=ProcessLookupError(errno.ESRCH, "No such process")
+        ):
+            with self.assertRaisesRegex(
+                RuntimeError, r"Hermit's tracer \(pid {}\) exited".format(self.tracer.pid)
+            ):
+                dh._freeze_exact_tracer(ABSENT_QEMU_PID, tracer)
+        self.assertEqual(self.by_pid, [])
+
+    def test_close_kills_the_held_tracer_through_the_same_pidfd(self):
+        tracer = self._hold()
+        program = dh.HermitGuestProgram(SimpleNamespace())
+        program._tracer = tracer
+        program._tracer_tgid = tracer.tgid
+        program._owned_processes = [("Hermit's tracer", tracer.tgid, tracer.start_time)]
+        held = tracer.pidfd
+        opened = []
+        real_open = os.pidfd_open
+
+        def pidfd_open(pid, *rest):
+            opened.append(pid)
+            return real_open(pid, *rest)
+
+        with mock.patch.object(dh.os, "pidfd_open", pidfd_open), mock.patch.object(
+            dh, "OWNED_PROCESS_EXIT_SECONDS", 10.0
+        ):
+            program.close()
+        self.assertEqual(opened, [], "close() opened a second pidfd for the held tracer")
+        self.assertEqual(self.sent, [signal.SIGKILL])
+        self.assertEqual(self.by_pid, [])
+        self.assertIsNone(tracer.pidfd, "close() did not release the tracer's pidfd")
+        self.assertEqual(self.tracer.wait(timeout=30), -signal.SIGKILL)
+        self.assertIsNotNone(held)
+
+    def test_the_module_sends_no_signal_by_pid(self):
+        # Only the process group of the Hermit the demo started is signalled
+        # without a pidfd; that group's leader is the demo's own unreaped child.
+        source = Path(dh.__file__).read_text()
+        self.assertNotIn("os.kill(", source)
+        self.assertEqual(re.findall(r"os\.killpg\(([^,]*),", source), ["self._process_group"])
 
 
 class OwnedProcessKillTest(unittest.TestCase):
