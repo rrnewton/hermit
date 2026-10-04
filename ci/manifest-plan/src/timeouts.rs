@@ -80,13 +80,16 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// One ptrace verify cell re-selected after the guest mount model excluded
 /// ephemeral per-process host FUSE seed mounts (`fuse.squashfuse_ll` under
 /// `/mnt/xarfuse/`): `system-utils/procfs-sanitized-paths` passed twenty
-/// consecutive strict canonical repetitions at the evidence head under its
-/// manifest comparison profile (`compare_io_buffers: false, rcb_time: false`).
-/// Evidence SHA is the first commit of this change (the tree the
-/// qualification binary was built from).
+/// consecutive `test-harness run` repetitions, each one first-attempt PASS, at
+/// the evidence head under its manifest comparison profile
+/// (`compare_io_buffers: true, rcb_time: false`), with 14 `fuse.squashfuse_ll`
+/// rows in the host mountinfo. The first qualification, 20 of 20 on
+/// 2026-09-25 at 9721082f52fec889af9100c39a7d581d2eb1e044 with
+/// `compare_io_buffers: false`, predates the rebase onto the stricter I/O
+/// comparison. Evidence SHA is the tree the qualification binary was built from.
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
-    "9721082f52fec889af9100c39a7d581d2eb1e044";
-pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-09-25T09:23:58Z";
+    "88bcd6efcd0fa95208efbf6116687a9ed66fc986";
+pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-04T07:20:11Z";
 pub const PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT: usize = 1;
 /// Cells slice S13 of <https://github.com/rrnewton/hermit/issues/3301> selected
 /// when it replaced `tests/backend-parity/run_matrix.py --backend dbt` with
@@ -1981,11 +1984,11 @@ mod tests {
         assert_eq!(PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT, 4);
         assert_eq!(
             PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA,
-            "9721082f52fec889af9100c39a7d581d2eb1e044"
+            "88bcd6efcd0fa95208efbf6116687a9ed66fc986"
         );
         assert_eq!(
             PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC,
-            "2026-09-25T09:23:58Z"
+            "2026-10-04T07:20:11Z"
         );
         assert_eq!(PROCFS_MOUNTINFO_2026_09_25_SELECTED_CI_CELL_COUNT, 1);
         assert_eq!(

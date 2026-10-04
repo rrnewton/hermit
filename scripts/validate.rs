@@ -14828,6 +14828,8 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*) adds 128
     // portable SaBRe verify cells, none of them kvm: 116 c-programs, 10
     // system-utils, 1 determinism-stress-c and 1 language-runtimes.
+    // The procfs mountinfo selection (timeouts::PROCFS_MOUNTINFO_2026_09_25_*)
+    // adds one portable ptrace verify cell to system-utils, not kvm.
     let portable_partial: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
         (
@@ -14840,7 +14842,7 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         ("e2e.manifest_determinism_stress", 2, 8),
         ("e2e.manifest_determinism_stress_c", 2, 14 + 1),
         ("e2e.manifest_language_runtimes", 14, 33 + 1),
-        ("e2e.manifest_system_utils", 25, 74 + 10),
+        ("e2e.manifest_system_utils", 25, 74 + 10 + 1),
     ];
     let privileged_partial: &[(&str, usize, usize)] = &[
         ("privileged-e2e.manifest_c_programs", 1, 4),
@@ -15135,6 +15137,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
     // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
     // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
     // The 128 SaBRe verify cells of 2026-10-03 add only selected cells, as above.
+    // So does the one procfs-sanitized-paths ptrace verify cell.
     let portable: &[(&str, usize, usize)] = &[
         ("e2e.manifest_applications", 1, 4),
         (
@@ -15147,7 +15150,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         ("e2e.manifest_determinism_stress", 2, 8),
         ("e2e.manifest_determinism_stress_c", 2, 14 + 1),
         ("e2e.manifest_language_runtimes", 14, 33 + 1),
-        ("e2e.manifest_system_utils", 25, 74 + 10),
+        ("e2e.manifest_system_utils", 25, 74 + 10 + 1),
     ];
     let full_privileged: &[(&str, usize, usize)] = &[
         ("privileged-e2e.manifest_applications", 1, 1),
