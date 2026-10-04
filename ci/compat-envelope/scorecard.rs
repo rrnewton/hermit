@@ -11268,11 +11268,20 @@ fn project_and_observe_results(
     )
 }
 
+/// Source ancestry answers already read from git, keyed by the (previous,
+/// measured) commit pair. Ancestry is a property of two commits, not of a cell:
+/// a Current write-back gives every result cell the same measured commit, and
+/// hundreds of cells carry one of a handful of previous stamps. Without this,
+/// each cell paid two git subprocesses for an answer another cell had already
+/// read. Only answers are stored; a git failure still aborts the caller.
+type SourceAncestryAnswers = BTreeMap<(String, String), bool>;
+
 fn current_source_may_replace_stamp(
     root: &Path,
     previous: Option<&LastTested>,
     measured: &str,
     detcore_tree: &str,
+    answers: &mut SourceAncestryAnswers,
 ) -> Result<bool, String> {
     let Some(previous) = previous else {
         return Ok(true);
@@ -11283,16 +11292,193 @@ fn current_source_may_replace_stamp(
         }
         return Ok(true);
     }
+    let key = (previous.hermit_sha.clone(), measured.to_string());
+    if let Some(&proven) = answers.get(&key) {
+        return Ok(proven);
+    }
+    let proven = previous_source_is_proven_ancestor(root, &previous.hermit_sha, measured)?;
+    answers.insert(key, proven);
+    Ok(proven)
+}
+
+fn previous_source_is_proven_ancestor(
+    root: &Path,
+    previous: &str,
+    measured: &str,
+) -> Result<bool, String> {
     // A missing old object does not make the new result newer. Its observation
     // is still retained, but only proven ancestry can advance a source stamp.
-    if git_no_replace_rev_parse(root, &format!("{}^{{commit}}", previous.hermit_sha))
+    if git_no_replace_rev_parse(root, &format!("{previous}^{{commit}}"))
         .ok()
         .as_deref()
-        != Some(previous.hermit_sha.as_str())
+        != Some(previous)
     {
         return Ok(false);
     }
-    git_is_ancestor(root, &previous.hermit_sha, measured)
+    git_is_ancestor(root, previous, measured)
+}
+
+#[cfg(test)]
+mod source_ancestry_answer_tests {
+    use super::*;
+
+    fn git(root: &Path, args: &[&str]) -> String {
+        let output = fixture_git()
+            .args([
+                "-c",
+                "maintenance.auto=false",
+                "-c",
+                "gc.auto=0",
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args(args)
+            .current_dir(root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn stamp(hermit_sha: &str, detcore_tree: &str) -> LastTested {
+        LastTested {
+            hermit_sha: hermit_sha.into(),
+            detcore_tree: detcore_tree.into(),
+            depth: BTreeMap::new(),
+            check: None,
+            applicable_when_tested: None,
+            comparison_verdict: None,
+        }
+    }
+
+    #[test]
+    fn each_distinct_previous_commit_is_read_from_git_once_and_reused() {
+        let repo = tempfile::tempdir().unwrap();
+        let root = repo.path();
+        git(root, &["init", "--quiet"]);
+        git(root, &["commit", "--quiet", "--allow-empty", "-m", "older"]);
+        let older = git(root, &["rev-parse", "HEAD"]);
+        git(
+            root,
+            &["commit", "--quiet", "--allow-empty", "-m", "measured"],
+        );
+        let measured = git(root, &["rev-parse", "HEAD"]);
+        git(root, &["checkout", "--quiet", "--orphan", "unrelated"]);
+        git(
+            root,
+            &["commit", "--quiet", "--allow-empty", "-m", "unrelated"],
+        );
+        let unrelated = git(root, &["rev-parse", "HEAD"]);
+        let missing = "0123456789abcdef0123456789abcdef01234567".to_string();
+        let tree = "d".repeat(40);
+        // Many cells share three previous stamps, as on a real write-back.
+        let cells = (0..30)
+            .map(|index| {
+                let sha = [&older, &unrelated, &missing][index % 3];
+                stamp(sha, &tree)
+            })
+            .collect::<Vec<_>>();
+        let expected = |stamp: &LastTested| stamp.hermit_sha == older;
+        let mut answers = SourceAncestryAnswers::new();
+        for cell in &cells {
+            assert_eq!(
+                current_source_may_replace_stamp(root, Some(cell), &measured, &tree, &mut answers),
+                Ok(expected(cell)),
+                "{}",
+                cell.hermit_sha
+            );
+        }
+        assert_eq!(
+            answers.len(),
+            3,
+            "one stored answer per distinct previous commit"
+        );
+        // Every stored answer agrees with an uncached read.
+        for ((previous, at), proven) in &answers {
+            assert_eq!(at, &measured);
+            assert_eq!(
+                previous_source_is_proven_ancestor(root, previous, at),
+                Ok(*proven)
+            );
+        }
+        // Reuse is real: with the repository gone, git can no longer prove
+        // `older` an ancestor, yet the stored answer is still returned.
+        let gone = tempfile::tempdir().unwrap();
+        assert_eq!(
+            previous_source_is_proven_ancestor(gone.path(), &older, &measured),
+            Ok(false)
+        );
+        for cell in &cells {
+            assert_eq!(
+                current_source_may_replace_stamp(
+                    gone.path(),
+                    Some(cell),
+                    &measured,
+                    &tree,
+                    &mut answers
+                ),
+                Ok(expected(cell))
+            );
+        }
+        // An answer for one measured commit is never reused for another:
+        // `older` is an ancestor of `measured`, not of `unrelated`.
+        assert_eq!(
+            current_source_may_replace_stamp(
+                root,
+                Some(&stamp(&older, &tree)),
+                &unrelated,
+                &tree,
+                &mut answers
+            ),
+            Ok(false)
+        );
+        assert_eq!(answers.len(), 4);
+        // Same-commit Detcore conflicts are still checked per cell, whatever
+        // has been stored, and no stamp means the current result is taken.
+        assert!(
+            current_source_may_replace_stamp(
+                root,
+                Some(&stamp(&measured, &"e".repeat(40))),
+                &measured,
+                &tree,
+                &mut answers
+            )
+            .is_err()
+        );
+        assert_eq!(
+            current_source_may_replace_stamp(
+                root,
+                Some(&stamp(&measured, &tree)),
+                &measured,
+                &tree,
+                &mut answers
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            current_source_may_replace_stamp(root, None, &measured, &tree, &mut answers),
+            Ok(true)
+        );
+        // A git failure is reported, not stored as an answer.
+        let mut fresh = SourceAncestryAnswers::new();
+        assert!(
+            current_source_may_replace_stamp(
+                root,
+                Some(&stamp(&older, &tree)),
+                &missing,
+                &tree,
+                &mut fresh
+            )
+            .is_err()
+        );
+        assert!(fresh.is_empty());
+    }
 }
 
 /// Files authorizing a transaction stay open, with every containing directory
@@ -11835,12 +12021,19 @@ where
     // Preserve a newer or incomparable projected stamp without discarding any
     // of the current observations or pretending they are retained imports.
     let mut current_stamps = BTreeMap::new();
+    let mut ancestry_answers = SourceAncestryAnswers::new();
     for cell in &tracked.cells {
         if !result_rows.contains_key(&cell.id) {
             continue;
         }
         let prior = projected_stamps.get(&cell.id).and_then(Option::as_ref);
-        let replace = current_source_may_replace_stamp(root, prior, measured, &detcore_tree)?;
+        let replace = current_source_may_replace_stamp(
+            root,
+            prior,
+            measured,
+            &detcore_tree,
+            &mut ancestry_answers,
+        )?;
         current_stamps.insert(
             cell.id.clone(),
             if replace {
@@ -35331,12 +35524,14 @@ mod post_verdict_transaction_tests {
             applicable_when_tested: None,
             comparison_verdict: None,
         };
+        let mut answers = SourceAncestryAnswers::new();
         assert!(
             !current_source_may_replace_stamp(
                 &fixture.root,
                 Some(&incomparable),
                 &measured,
-                &original_tree
+                &original_tree,
+                &mut answers
             )
             .unwrap()
         );
