@@ -3189,7 +3189,7 @@ pub fn skid_overshoot_reason(count: u64) -> String {
 ///   accepts ([`accepted_guest_disposition`] of the row's
 ///   `expected_guest_exit`);
 /// - every such report satisfies the backend evidence a passing attempt of
-///   the row's backend must carry ([`dispatch_record_error`] finds nothing in
+///   the row's backend must carry (`dispatch_record_error` finds nothing in
 ///   its `runtime`), and the row's execution-path evidence is the one its own
 ///   retained attempts decide ([`retained_execution_path_error`] finds
 ///   nothing: SaBRe evidence bytes that match their digests, summarized to
@@ -3201,9 +3201,9 @@ pub fn skid_overshoot_reason(count: u64) -> String {
 ///   ([`CellResult::declared_stdout`]), and every attempt's own evidence
 ///   satisfies them: the exact `expected_stdout` is checked against both
 ///   compared runs' stdout digests in the attempt's report
-///   ([`check_expected_stdout`]), and the `expected_stdout_contains` text is
+///   (`check_expected_stdout`), and the `expected_stdout_contains` text is
 ///   searched in the attempt's captured stdout, which must be the bytes of
-///   both compared runs ([`check_expected_stdout_contains`]). An assertion
+///   both compared runs (`check_expected_stdout_contains`). An assertion
 ///   that fails or cannot be decided, or a row that records no declaration
 ///   (one written before the record existed), disqualifies the row.
 ///
@@ -6141,7 +6141,7 @@ fn argv_selects_sabre(argv: &[String]) -> bool {
 /// retained attempts decide, if it is not.
 ///
 /// The runner summarizes a row's SaBRe execution-path evidence from the
-/// evidence files its attempts wrote ([`summarize_sabre_path_evidence`]) and
+/// evidence files its attempts wrote (`summarize_sabre_path_evidence`) and
 /// fails a `PASS` whose summary is ineligible. A retained row carries the
 /// summary as a label beside each attempt's retained evidence text and the
 /// digest of the bytes the runner read, so a reader admitting such a row
@@ -6150,7 +6150,7 @@ fn argv_selects_sabre(argv: &[String]) -> bool {
 /// retained evidence text is the bytes its `sabre_path_evidence_sha256`
 /// names (both absent for an attempt that wrote none), and the summary of
 /// those retained attempts is valid, equals the row's `execution_path`, and
-/// is eligible ([`execution_path_ineligible`] is false). A row of another
+/// is eligible (`execution_path_ineligible` is false). A row of another
 /// backend therefore has no evidence and no `execution_path`.
 pub fn retained_execution_path_error(result: &CellResult) -> Option<String> {
     let sabre = result.backend.as_deref() == Some("sabre");
