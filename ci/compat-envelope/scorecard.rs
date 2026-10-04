@@ -10437,11 +10437,14 @@ fn apply_validate_results_from(
             // than a pressure-sourced one: no per-run record, no run_id, and no
             // pasteable command to reproduce the divergence it reports.
             //
-            // A retained stripped pass has no canonical receipt to carry its
-            // binding, so it keeps its exact invocation: source, run, outer
-            // attempt and evidence digest. That record is what the next
-            // retained import finds and replaces as its own projection.
-            let exact = unavailable_reason.is_some() || (stripped_pass && !store_invocation);
+            // A stripped pass has no canonical receipt to carry its binding,
+            // so it keeps its exact invocation: source, run, outer attempt and
+            // evidence digest, whether it is published or retained. The series
+            // publisher binds the pass's own event through that record, so a
+            // retry at outer attempt 2 publishes with its event and an event
+            // from another attempt cannot cover it. The next retained import
+            // finds the same record and replaces it as its own projection.
+            let exact = unavailable_reason.is_some() || stripped_pass;
             let inserted = if store_invocation || exact {
                 observation.invocations.insert(ObservedInvocation {
                     hermit_sha: row.hermit_sha.clone(),
@@ -14338,7 +14341,9 @@ fn source_direct_evidence_key(
 
 /// The validate producer uses run_index for the outer attempt and may omit
 /// detcore_tree. Resolve that form only through comparison digests already
-/// checked against the held current-result census, never through a run label.
+/// checked against the held current-result census, or through the exact outer
+/// attempt and evidence digest that a stripped pass stores in place of a
+/// receipt, never through a run label.
 fn current_comparison_representation(
     tracked: &TrackedCells,
     rows: &[SeriesRow],
@@ -14376,6 +14381,56 @@ fn current_comparison_representation(
                     return Err(format!(
                         "series evidence claims direct run {} at {}, but the retained scorecard has {} records for that exact identity",
                         key.base.run_id, key.base.hermit_sha, direct_counts[&key]
+                    ));
+                }
+            }
+            // A stripped pass carries no receipt. Its exact invocation is the
+            // binding: the outer attempt and evidence digest the fold took
+            // from the verified census row. It binds without that census, as
+            // it must for every later publication, and must agree with the
+            // census whenever the census holds the same evidence.
+            for invocation in &observation.invocations {
+                if !is_imported_stripped_pass(observation, invocation) {
+                    continue;
+                }
+                let (Some(attempt), Some(digest)) =
+                    (invocation.attempt, invocation.evidence_sha256.as_ref())
+                else {
+                    continue;
+                };
+                let base = DirectEvidenceBase {
+                    cell: series_cell_key(&cell.id),
+                    identity: identity.clone(),
+                    provenance: observation.provenance,
+                    hermit_sha: invocation.hermit_sha.clone(),
+                    run_id: invocation.run_id.clone(),
+                };
+                if current
+                    .get(&(base.clone(), digest.clone()))
+                    .is_some_and(|census| *census != attempt)
+                {
+                    return Err(format!(
+                        "stripped pass for run {} at {} records outer attempt {attempt}, but the current result binds its evidence to another attempt",
+                        base.run_id, base.hermit_sha
+                    ));
+                }
+                let key = DirectEvidenceKey {
+                    base: base.clone(),
+                    kind: DirectEvidenceKind::ExactInvocation {
+                        attempt,
+                        evidence_sha256: digest.clone(),
+                        result: invocation.result,
+                    },
+                };
+                if bound
+                    .entry(base)
+                    .or_default()
+                    .insert(attempt, key.clone())
+                    .is_some()
+                {
+                    return Err(format!(
+                        "series evidence claims direct run {} at {}, but the retained scorecard has more than one record for outer attempt {attempt}",
+                        key.base.run_id, key.base.hermit_sha
                     ));
                 }
             }
@@ -14457,7 +14512,11 @@ fn current_comparison_representation(
             );
         }
         for (attempt, key) in matching {
-            if row.series.result.map(DirectEvidenceKind::Result).as_ref() != Some(&key.kind) {
+            let bound_result = match &key.kind {
+                DirectEvidenceKind::Result(result) => Some(*result),
+                DirectEvidenceKind::ExactInvocation { result, .. } => *result,
+            };
+            if bound_result.is_none() || row.series.result != bound_result {
                 return Err("current series result disagrees with its bound comparison".into());
             }
             let bound_count = attempts
@@ -33842,6 +33901,214 @@ mod post_verdict_transaction_tests {
         assert!(!canonical.observations[0].canonical_comparisons.is_empty());
     }
 
+    /// The series events of a mixed write-back transaction for `run_id`: the
+    /// canonical sibling's at outer attempt 1 and the stripped cell's at
+    /// `stripped_attempt`, each carrying `detcore_tree` when it is given.
+    fn stripped_retry_events(
+        measured: &str,
+        run_id: &str,
+        (sibling_id, id): (&CellId, &CellId),
+        stripped_attempt: u64,
+        detcore_tree: Option<&str>,
+    ) -> [JsonValue; 2] {
+        let event =
+            |cell_id: &CellId, event_id: &str, attempt: u64, comparison: Option<JsonValue>| {
+                let mut series = serde_json::json!({
+                    "cell": series_cell_key(cell_id), "tree": measured, "outcome": "passed",
+                    "result": "pass", "failure_class": null, "run_index": attempt,
+                    "attempt": attempt, "num_runs": 1, "source_tree_dirty": false,
+                    "machine_shortname": "fixture", "kernel_version": "fixture",
+                    "host_capabilities": {
+                        "cpuid-faulting": {"present": false, "evidence": "synthetic fixture"},
+                        "kvm": {"present": false, "evidence": "synthetic fixture"}}
+                });
+                if let Some(tree) = detcore_tree {
+                    series["detcore_tree"] = tree.into();
+                }
+                if let Some(comparison) = comparison {
+                    series["comparison"] = comparison;
+                }
+                serde_json::json!({
+                    "schema": "stress-series/v3", "event_id": format!("{run_id}-{event_id}"),
+                    "event_type": "series.observation", "emitted_at": "2026-09-22T00:00:00Z",
+                    "team": "hermit", "host": "fixture", "producer": "validate",
+                    "run_id": run_id, "series": series
+                })
+            };
+        [
+            event(sibling_id, "canonical-pass", 1, None),
+            event(
+                id,
+                "stripped-pass",
+                stripped_attempt,
+                Some(serde_json::json!({"strictness": "stripped", "bitwise_parity": false})),
+            ),
+        ]
+    }
+
+    /// The evidence digest of the stripped cell's row in the fixture's
+    /// current results.
+    fn stripped_evidence_identity(fixture: &Fixture, id: &CellId) -> String {
+        read_retained_results(
+            &fixture.root,
+            &fixture.options.results,
+            &BTreeSet::from([id.clone()]),
+        )
+        .unwrap()
+        .cells[0]
+            .candidates[0]
+            .evidence_identity
+            .clone()
+    }
+
+    /// The stripped cell holds one observation: its pass at `measured`, with
+    /// no series event of its own and no canonical or parity comparison,
+    /// bound by its exact invocation to the outer attempt and evidence digest
+    /// of its census row.
+    fn assert_stripped_pass_bound(
+        cells: &TrackedCells,
+        id: &CellId,
+        measured: &str,
+        (attempt, identity): (u64, &str),
+    ) {
+        let compat = cells.cells.iter().find(|cell| &cell.id == id).unwrap();
+        assert_eq!(compat.observations.len(), 1, "{:?}", compat.observations);
+        let observation = &compat.observations[0];
+        assert!(
+            observation.event_ids.is_empty()
+                && observation.hermit_shas == BTreeSet::from([measured.to_string()]),
+            "{observation:?}"
+        );
+        assert_eq!(observation.results, BTreeSet::from([ObservedResult::Pass]));
+        assert!(
+            observation.canonical_comparisons.is_empty()
+                && observation.backend_parity_comparisons.is_empty(),
+            "a stripped pass recorded a canonical or parity comparison"
+        );
+        let invocations = observation
+            .invocations
+            .iter()
+            .map(|invocation| {
+                (
+                    invocation.attempt,
+                    invocation.evidence_sha256.as_deref(),
+                    invocation.result,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            invocations,
+            [(Some(attempt), Some(identity), Some(ObservedResult::Pass))],
+            "the stripped pass lost its exact outer attempt"
+        );
+    }
+
+    /// A stripped pass at outer attempt 2 (the runner retried the cell after
+    /// its first attempt) publishes with its own series event, whether or not
+    /// the event carries the detcore tree. The write-back used to store a
+    /// published stripped pass without its outer attempt, so it refused both
+    /// transactions: https://github.com/rrnewton/hermit/issues/3655, second
+    /// finding.
+    #[test]
+    fn a_stripped_retry_publishes_with_its_own_event() {
+        let _fixture_lock = history_fixture_lock();
+        for with_detcore_tree in [false, true] {
+            let mut fixture = Fixture::new();
+            let measured = fixture.options.results_head.clone().unwrap();
+            let detcore_tree = with_detcore_tree
+                .then(|| git_rev_parse(&fixture.root, &format!("{measured}:detcore")).unwrap());
+            let (id, mut stripped) = stripped_row(&measured);
+            stripped["attempt"] = 2.into();
+            let sibling_id = fixture.id.clone();
+            fixture.publish_rows(&[fixture.row.clone(), stripped.clone()]);
+            let identity = stripped_evidence_identity(&fixture, &id);
+            let events = stripped_retry_events(
+                &measured,
+                stripped["run_id"].as_str().unwrap(),
+                (&sibling_id, &id),
+                2,
+                detcore_tree.as_deref(),
+            );
+            publish_raw_snapshot(&mut fixture, &events).unwrap();
+            let published = fixture.cells();
+            assert_stripped_pass_bound(&published, &id, &measured, (2, &identity));
+            let canonical = published
+                .cells
+                .iter()
+                .find(|cell| cell.id == sibling_id)
+                .unwrap();
+            assert_eq!(
+                canonical.observations.len(),
+                1,
+                "{:?}",
+                canonical.observations
+            );
+            assert!(!canonical.observations[0].canonical_comparisons.is_empty());
+        }
+    }
+
+    /// A series event does not cover a stripped pass from another outer
+    /// attempt: neither an attempt-1 event the attempt-2 pass, which the
+    /// write-back used to publish, nor an attempt-2 event an attempt-1 pass.
+    /// The write-back refuses the transaction and history is unchanged.
+    #[test]
+    fn an_event_from_another_outer_attempt_does_not_cover_a_stripped_pass() {
+        let _fixture_lock = history_fixture_lock();
+        for (row_attempt, event_attempt) in [(2, 1), (1, 2)] {
+            let mut fixture = Fixture::new();
+            let measured = fixture.options.results_head.clone().unwrap();
+            let (id, mut stripped) = stripped_row(&measured);
+            stripped["attempt"] = row_attempt.into();
+            let sibling_id = fixture.id.clone();
+            fixture.publish_rows(&[fixture.row.clone(), stripped.clone()]);
+            let events = stripped_retry_events(
+                &measured,
+                stripped["run_id"].as_str().unwrap(),
+                (&sibling_id, &id),
+                event_attempt,
+                None,
+            );
+            let error = publish_raw_snapshot(&mut fixture, &events).unwrap_err();
+            assert!(
+                error.contains("lacks complete bound outer-attempt coverage"),
+                "row attempt {row_attempt}, event attempt {event_attempt}: {error}"
+            );
+            assert!(read_history_files(&fixture.root).unwrap() == fixture.baseline);
+        }
+    }
+
+    /// The exact invocation stays a stripped pass's binding in every later
+    /// publication. A later publication carries the ledger's earlier series
+    /// events, but its current-result census belongs to another run and
+    /// cannot bind the earlier pass again. Publishing a later run that covers
+    /// only the canonical sibling represents the earlier stripped retry's
+    /// event through its stored attempt: the stripped cell keeps its one
+    /// observation and its event is not projected a second time.
+    #[test]
+    fn a_published_stripped_retry_stays_bound_in_a_later_publication() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, mut stripped) = stripped_row(&measured);
+        stripped["attempt"] = 2.into();
+        let sibling_id = fixture.id.clone();
+        fixture.publish_rows(&[fixture.row.clone(), stripped.clone()]);
+        let identity = stripped_evidence_identity(&fixture, &id);
+        let run_id = stripped["run_id"].as_str().unwrap().to_string();
+        let first = stripped_retry_events(&measured, &run_id, (&sibling_id, &id), 2, None);
+        publish_raw_snapshot(&mut fixture, &first).unwrap();
+        assert_stripped_pass_bound(&fixture.cells(), &id, &measured, (2, &identity));
+
+        fixture.row["run_id"] = "later-run".into();
+        fixture.publish_rows(&[fixture.row.clone()]);
+        let [mut later, _] =
+            stripped_retry_events(&measured, "later-run", (&sibling_id, &id), 1, None);
+        later["emitted_at"] = "2026-09-23T00:00:00Z".into();
+        let [canonical, stripped_event] = first;
+        publish_raw_snapshot(&mut fixture, &[canonical, stripped_event, later]).unwrap();
+        assert_stripped_pass_bound(&fixture.cells(), &id, &measured, (2, &identity));
+    }
+
     /// The two arms in one transaction: a stripped pass does not carry a
     /// canonical match without bitwise parity through with it. The write-back
     /// refuses the transaction, in either row order, as it refuses that report
@@ -37295,6 +37562,91 @@ mod retired_id_join_tests {
 #[cfg(test)]
 mod evidence_identity_tests {
     use super::*;
+
+    /// A stripped pass has no receipt. Its exact invocation binds its series
+    /// event at the outer attempt it records, with or without the current
+    /// census, and refuses an event from another attempt, an event with
+    /// another result, and a census that binds the same evidence to another
+    /// attempt.
+    #[test]
+    fn a_stripped_pass_binds_its_event_through_its_exact_invocation() {
+        let head = "a".repeat(40);
+        let tree = "b".repeat(40);
+        let digest = "c".repeat(64);
+        let tracked: TrackedCells = serde_json::from_value(serde_json::json!({
+            "schema":8,"cells":[{"lane":"portable","category":"fixture","test":"fixture/retry",
+                "mode":"verify","backend":"ptrace","status":"green","observations":[{
+                    "detcore_tree":tree,"provenance":"validate","hermit_shas":[head],
+                    "results":["pass"],"canonical_comparisons":[],
+                    "invocations":[{"hermit_sha":head,"run_id":"current-retries","attempt":2,
+                        "evidence_sha256":digest,"result":"pass","argv":["hermit"],
+                        "guest_argv":["fixture"],"env":{},"cwd":"/","attempts":[]}]
+                }]}]
+        }))
+        .unwrap();
+        let base = DirectEvidenceBase {
+            cell: "fixture/retry/verify/ptrace".into(),
+            identity: SeriesObservationIdentity::DetcoreTree(tree.clone()),
+            provenance: ObservationProvenance::Validate,
+            hermit_sha: head.clone(),
+            run_id: "current-retries".into(),
+        };
+        let event = |attempt: u64, result: ObservedResult| -> SeriesRow {
+            let passed = result == ObservedResult::Pass;
+            serde_json::from_value(serde_json::json!({
+                "schema":"stress-series/v3","event_id":format!("retry-{attempt}-{result:?}"),
+                "event_type":"series.observation","emitted_at":"2026-09-22T00:00:00Z",
+                "team":"hermit","host":"fixture","producer":"validate","run_id":"current-retries",
+                "series":{"cell":base.cell,"tree":head,"run_index":attempt,"attempt":attempt,
+                    "num_runs":1,"result":result,"outcome":if passed {"passed"} else {"diverged"},
+                    "failure_class":if passed {None} else {Some("product_failure")},
+                    "source_tree_dirty":false,"machine_shortname":"fixture","kernel_version":"fixture",
+                    "host_capabilities":{"cpuid-faulting":{"present":false,"evidence":"synthetic fixture"},
+                        "kvm":{"present":false,"evidence":"synthetic fixture"}}}
+            }))
+            .unwrap()
+        };
+        let before = serde_json::to_vec(&tracked).unwrap();
+        for census in [
+            ValidatedComparisonAttempts::new(),
+            ValidatedComparisonAttempts::from([((base.clone(), digest.clone()), 2)]),
+        ] {
+            let pass = event(2, ObservedResult::Pass);
+            let represented = direct_representation(&tracked, &[pass.clone()], &census).unwrap();
+            assert_eq!(
+                represented.represented_event_ids,
+                BTreeSet::from([pass.event_id])
+            );
+            assert!(!represented.has_unrepresented_direct_evidence);
+            let error = direct_representation(&tracked, &[event(1, ObservedResult::Pass)], &census)
+                .unwrap_err();
+            assert_eq!(
+                error,
+                "current series lacks complete bound outer-attempt coverage: declared attempts disagree with bound comparisons"
+            );
+            let error = direct_representation(
+                &tracked,
+                &[event(2, ObservedResult::DeterminismFailure)],
+                &census,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error,
+                "current series result disagrees with its bound comparison"
+            );
+        }
+        let contradicted = ValidatedComparisonAttempts::from([((base.clone(), digest.clone()), 1)]);
+        let error =
+            direct_representation(&tracked, &[event(2, ObservedResult::Pass)], &contradicted)
+                .unwrap_err();
+        assert!(
+            error.contains(
+                "records outer attempt 2, but the current result binds its evidence to another attempt"
+            ),
+            "{error}"
+        );
+        assert_eq!(serde_json::to_vec(&tracked).unwrap(), before);
+    }
 
     #[test]
     fn current_comparisons_bind_validate_retry_indices_and_source_identity() {
