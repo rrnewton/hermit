@@ -27,6 +27,10 @@ use build_support::build_date;
 use build_support::emit_git_revision;
 
 fn main() {
+    // Only the Cargo/OSS build runs this script. The synchronous OSS fbinit
+    // wrapper is the separately audited early-main boundary, unlike fbcode.
+    println!("cargo:rustc-check-cfg=cfg(hermit_oss_early_main)");
+    println!("cargo:rustc-cfg=hermit_oss_early_main");
     let date = build_date();
 
     emit_git_revision();

@@ -2456,6 +2456,7 @@ async fn run_kvm(
     print_summary: bool,
     print_summary_to_json_file: &Option<PathBuf>,
     capture_output: bool,
+    native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
 ) -> Result<Output, Error> {
     let dispatch_started = Instant::now();
     prepare_kvm_mountinfo_config(&mut config, capture_mountinfo_identity_order)?;
@@ -2542,6 +2543,11 @@ async fn run_kvm(
     let random_seed = config.rng_seed();
     let mut backend = reverie_kvm::KvmBackend::new_with_stdin(KVM_GUEST_MEMORY_BYTES, stdin)
         .map_err(|error| anyhow!("failed to initialize reverie-kvm: {error}"))?;
+    if let Some(client) = native_exit {
+        backend
+            .set_native_exit_broker(client)
+            .map_err(|error| anyhow!("failed to configure native KVM exit: {error}"))?;
+    }
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1120): Review KVM's canonical Detcore root identity.
     backend
@@ -2654,6 +2660,9 @@ fn kvm_execution_error(
 
 #[cfg(test)]
 mod kvm_failure_tests;
+
+#[cfg(test)]
+mod parent_death_exec_tests;
 
 #[cfg(all(test, feature = "kvm-execution-tests"))]
 mod kvm_execution_tests;
@@ -2839,6 +2848,37 @@ pub fn run_with_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<ExitStatus, Error> {
+    run_with_backend_timeout_and_native_exit(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        None,
+    )
+}
+
+/// CLI handoff of an already authenticated native exit client. This never
+/// bootstraps a broker; the original launcher retains the same-thread reap owner.
+pub fn run_with_backend_timeout_and_native_exit(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+    native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
+) -> Result<ExitStatus, Error> {
+    if let Some(client) = native_exit.as_ref() {
+        if backend != Backend::Kvm {
+            anyhow::bail!("native exit client requires the ordinary KVM backend");
+        }
+        client
+            .authenticated_broker_identity()
+            .map_err(|error| anyhow!("native exit client identity: {error:?}"))?;
+    }
+
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
         return ptrace_completion::run(timeout, move |control| async move {
@@ -2851,6 +2891,7 @@ pub fn run_with_backend_timeout(
                 &summary_path,
                 backend,
                 Some(control),
+                None,
             )
             .await;
             report.finish(result)
@@ -2868,6 +2909,7 @@ pub fn run_with_backend_timeout(
         print_summary_to_json_file,
         backend,
         timeout,
+        native_exit,
     );
     skid_overshoot_report.finish(result)
 }
@@ -3030,6 +3072,7 @@ async fn run_with_backend_inner(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     timeout: Option<Duration>,
+    native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
 ) -> Result<ExitStatus, Error> {
     refuse_in_guest_liteinst_timeout(backend, timeout)?;
     // Keep the large backend future off the container supervisor's stack
@@ -3042,6 +3085,7 @@ async fn run_with_backend_inner(
         print_summary_to_json_file,
         backend,
         None,
+        native_exit,
     ));
     with_run_deadline(timeout, guest).await
 }
@@ -3053,6 +3097,7 @@ async fn dispatch_backend(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
+    native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
 ) -> Result<ExitStatus, Error> {
     if backend == Backend::Kvm {
         return Ok(run_kvm(
@@ -3061,6 +3106,7 @@ async fn dispatch_backend(
             print_summary,
             print_summary_to_json_file,
             false,
+            native_exit,
         )
         .await?
         .status);
@@ -3231,6 +3277,37 @@ pub fn run_with_output_backend_timeout(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<Output, Error> {
+    run_with_output_backend_timeout_and_native_exit(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        None,
+    )
+}
+
+/// CLI handoff of an already authenticated native exit client. This never
+/// bootstraps a broker; the original launcher retains the same-thread reap owner.
+pub fn run_with_output_backend_timeout_and_native_exit(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+    native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
+) -> Result<Output, Error> {
+    if let Some(client) = native_exit.as_ref() {
+        if backend != Backend::Kvm {
+            anyhow::bail!("native exit client requires the ordinary KVM backend");
+        }
+        client
+            .authenticated_broker_identity()
+            .map_err(|error| anyhow!("native exit client identity: {error:?}"))?;
+    }
+
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
         return ptrace_completion::run(timeout, move |control| async move {
@@ -3242,19 +3319,22 @@ pub fn run_with_output_backend_timeout(
                 &summary_path,
                 backend,
                 Some(control),
+                None,
             )
             .await;
             report.finish(result)
         });
     }
-    let (output, skid_overshoots) = run_with_output_backend_timeout_and_skid_overshoots(
-        command,
-        config,
-        print_summary,
-        print_summary_to_json_file,
-        backend,
-        timeout,
-    )?;
+    let (output, skid_overshoots) =
+        run_with_output_backend_timeout_and_skid_overshoots_and_native_exit(
+            command,
+            config,
+            print_summary,
+            print_summary_to_json_file,
+            backend,
+            timeout,
+            native_exit,
+        )?;
     if skid_overshoots > 0 {
         return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
     }
@@ -3274,6 +3354,37 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
     backend: Backend,
     timeout: Option<Duration>,
 ) -> Result<(Output, u64), Error> {
+    run_with_output_backend_timeout_and_skid_overshoots_and_native_exit(
+        command,
+        config,
+        print_summary,
+        print_summary_to_json_file,
+        backend,
+        timeout,
+        None,
+    )
+}
+
+/// CLI handoff of an already authenticated native exit client. This never
+/// bootstraps a broker; the original launcher retains the same-thread reap owner.
+pub fn run_with_output_backend_timeout_and_skid_overshoots_and_native_exit(
+    command: Command,
+    config: DetConfig,
+    print_summary: bool,
+    print_summary_to_json_file: &Option<PathBuf>,
+    backend: Backend,
+    timeout: Option<Duration>,
+    native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
+) -> Result<(Output, u64), Error> {
+    if let Some(client) = native_exit.as_ref() {
+        if backend != Backend::Kvm {
+            anyhow::bail!("native exit client requires the ordinary KVM backend");
+        }
+        client
+            .authenticated_broker_identity()
+            .map_err(|error| anyhow!("native exit client identity: {error:?}"))?;
+    }
+
     if backend == Backend::Ptrace {
         let summary_path = print_summary_to_json_file.clone();
         return ptrace_completion::run(timeout, move |control| async move {
@@ -3285,6 +3396,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
                 &summary_path,
                 backend,
                 Some(control),
+                None,
             )
             .await;
             report.finish_with_count(result)
@@ -3305,6 +3417,7 @@ pub fn run_with_output_backend_timeout_and_skid_overshoots(
         print_summary_to_json_file,
         backend,
         timeout,
+        native_exit,
     );
     skid_overshoot_report.finish_with_count(result)
 }
@@ -3317,6 +3430,7 @@ async fn run_with_output_backend_inner(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     timeout: Option<Duration>,
+    native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
 ) -> Result<Output, Error> {
     refuse_in_guest_liteinst_timeout(backend, timeout)?;
     let Some(limit) = timeout else {
@@ -3327,6 +3441,7 @@ async fn run_with_output_backend_inner(
             print_summary_to_json_file,
             backend,
             None,
+            native_exit,
         )
         .await;
     };
@@ -3339,6 +3454,7 @@ async fn run_with_output_backend_inner(
             print_summary_to_json_file,
             backend,
             None,
+            native_exit,
         ),
     )
     .await
@@ -3355,6 +3471,7 @@ async fn dispatch_output_backend(
     print_summary_to_json_file: &Option<PathBuf>,
     backend: Backend,
     control: Option<std::rc::Rc<ptrace_completion::Control>>,
+    native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
 ) -> Result<Output, Error> {
     if backend == Backend::Kvm {
         return run_kvm(
@@ -3363,6 +3480,7 @@ async fn dispatch_output_backend(
             print_summary,
             print_summary_to_json_file,
             true,
+            native_exit,
         )
         .await;
     }

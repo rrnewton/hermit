@@ -193,6 +193,10 @@ pub enum ProtocolFailure {
     Unsupported,
     Overflow,
     UnexpectedControl,
+    /// An enrolled parent-death recipient requested a wait without a delivery path.
+    ParentDeathUnsupportedWait,
+    /// Preserve the backend query errno; failure never means unenrolled.
+    ParentDeathQuery(i32),
     Timer(TimerFailure),
     Observation(reverie::SignalObservationFailure),
 }
@@ -247,6 +251,12 @@ pub(super) struct ParkedRequests {
     wake: Ivar<()>,
     pub failure: Option<ProtocolFailure>,
     pub control: Option<reverie::BackendSignalControl>,
+    /// True only after the backend accepted the explicit publication/wait contract.
+    pub parent_death_enabled: bool,
+    /// Bounded process/signal hints; authoritative pending membership is queried at selection.
+    pub parent_death_pending: BTreeMap<(ProcessGeneration, i32), u64>,
+    /// Retained committed failures forwarded only after releasing the scheduler lock.
+    pub parent_death_failures: Vec<reverie::ParentDeathPublication>,
     pub permits: BTreeMap<DetTid, SignalDeliveryPermit>,
     pub exit_fences: BTreeMap<DetTid, ExitBoundaryFence>,
     pub child_exit_reservations: BTreeMap<ProcessGeneration, ChildExitReservation>,
@@ -743,7 +753,7 @@ impl Scheduler {
                 }
                 // Other wait families remain pending for their existing return
                 // boundary; this does not claim that their interruption works.
-                self.begin_alarm_observation(pid, tid, recipient.task)
+                self.begin_pending_signal_observation(pid, tid, recipient.task)
                     .map_err(|failure| SelectionFailure {
                         pid,
                         tid: Some(tid),
@@ -752,7 +762,7 @@ impl Scheduler {
                 break;
             }
         }
-        Ok(())
+        self.select_parked_parent_death()
     }
 
     fn validate_membership(&self, tid: DetTid) -> Result<(), ProtocolFailure> {
@@ -779,7 +789,7 @@ impl Scheduler {
             .expect("validated scheduler membership")
     }
 
-    fn begin_alarm_observation(
+    pub(super) fn begin_pending_signal_observation(
         &mut self,
         pid: DetPid,
         tid: DetTid,
