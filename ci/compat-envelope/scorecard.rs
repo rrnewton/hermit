@@ -2733,6 +2733,10 @@ impl ResultRow {
         let mut divergence_positions = Vec::new();
         let mut saw_canonical_match = false;
         let mut saw_stripped_match = false;
+        // Whether any attempt's report is a stripped match, credited or not:
+        // one the runner did not pass, or one that fails the runner's
+        // stripped rule, still makes the row a stripped-comparator row.
+        let mut saw_stripped_comparison = false;
         let mut saw_no_result = false;
         let mut saw_not_run = false;
         let mut unavailable = None;
@@ -2902,6 +2906,7 @@ impl ResultRow {
                             comparison.strictness
                                 == canonical_verdict::LogCompareStrictness::Stripped
                         });
+                    saw_stripped_comparison |= stripped_match;
                     match report.verdict {
                         canonical_verdict::Verdict::Matched
                             if (report.verified && report.bitwise_parity) || stripped_match =>
@@ -3221,8 +3226,11 @@ impl ResultRow {
         }
 
         // One row is one comparator. A stripped match beside a canonical
-        // comparison is not evidence this file can rank.
-        if saw_stripped_match && (saw_canonical_match || !divergence_positions.is_empty()) {
+        // comparison is not evidence this file can rank, whether or not the
+        // stripped match earned credit: one that fails the runner's stripped
+        // rule earns none itself, and must not leave a canonical divergence
+        // beside it credited as the row's result.
+        if saw_stripped_comparison && (saw_canonical_match || !divergence_positions.is_empty()) {
             return Err("row mixes stripped and canonical comparison attempts".into());
         }
 
@@ -35185,6 +35193,192 @@ mod post_verdict_transaction_tests {
                     "{location} {field} was admitted as a green stripped pass"
                 );
             }
+        }
+    }
+
+    /// One row is one comparator, whether or not its stripped match meets the
+    /// runner's stripped rule: a stripped match that fails the rule (time not
+    /// virtualized, or logs not compared) beside a canonical divergence is a
+    /// mixed row, refused in either attempt order, and does not earn the
+    /// divergence canonical credit.
+    #[test]
+    fn goalpost_unqualified_stripped_match_does_not_credit_mixed_canonical_divergence() {
+        let measured = "a".repeat(40);
+        let (_, stripped) = stripped_row(&measured);
+        let mut report = verify_canonical_report(&measured);
+        report["verdict"] = "diverged".into();
+        report["verified"] = false.into();
+        report["bitwise_parity"] = false.into();
+        report["first_divergent_record"] = 1.into();
+        let mut canonical = with_report(&stripped, &report);
+        canonical["relaxations"] = serde_json::json!([]);
+        let argv = vec![
+            "hermit",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            "fixture",
+        ];
+        canonical["argv"] = serde_json::json!(argv);
+        canonical["effective_args"] = serde_json::json!(&argv[1..]);
+        canonical["shell_command"] = literal_shell_command(
+            "/repo",
+            &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        )
+        .into();
+        for field in ["argv", "shell_command"] {
+            canonical["attempts"][0][field] = canonical[field].clone();
+        }
+        canonical["outcome"] = "FAIL".into();
+        canonical["result"] = "determinism-failure".into();
+        canonical["failure_class"] = "product_failure".into();
+        canonical["first_divergent_record"] = 1.into();
+        canonical["attempts"][0]["outcome"] = "FAIL".into();
+        canonical["attempts"][0]["status"] = 1.into();
+        canonical["attempts"][0]["first_divergent_record"] = 1.into();
+        let control: ResultRow = serde_json::from_value(canonical.clone()).unwrap();
+        assert!(
+            matches!(
+                control.comparison_evidence(),
+                Ok(ValidateRowEvidence::Diverged { .. })
+            ),
+            "control must be an admitted canonical divergence"
+        );
+        let canonical_attempt = canonical["attempts"][0].clone();
+        for (field, value) in [
+            ("virtualize_time", serde_json::json!(false)),
+            ("compare_logs", serde_json::json!(false)),
+        ] {
+            let weak = with_edited_report(&stripped, &|report| {
+                report["comparison"][field] = value.clone();
+            });
+            let weak_control: ResultRow = serde_json::from_value(weak.clone()).unwrap();
+            assert!(
+                matches!(
+                    weak_control.comparison_evidence(),
+                    Ok(ValidateRowEvidence::Unavailable { .. })
+                ),
+                "control must fail the runner's rule"
+            );
+            let stripped_attempt = weak["attempts"][0].clone();
+            for (label, first, second) in [
+                ("stripped first", &stripped_attempt, &canonical_attempt),
+                ("canonical first", &canonical_attempt, &stripped_attempt),
+            ] {
+                let mut row = weak.clone();
+                for field in ["argv", "guest_argv", "env", "cwd", "shell_command"] {
+                    row[field] = first[field].clone();
+                }
+                row["effective_args"] = serde_json::json!(&first["argv"].as_array().unwrap()[1..]);
+                row["outcome"] = "FAIL".into();
+                row["result"] = "determinism-failure".into();
+                row["failure_class"] = "product_failure".into();
+                row["first_divergent_record"] = 1.into();
+                let mut second = second.clone();
+                second["index"] = "2".into();
+                row["attempts"] = serde_json::json!([first, second]);
+                let row: ResultRow = serde_json::from_value(row).unwrap();
+                let error = row.comparison_evidence().expect_err(
+                    "a mixed row must not gain canonical evidence when the stripped rule fails",
+                );
+                assert!(
+                    error.contains("row mixes stripped and canonical comparison attempts"),
+                    "{field}: {label}: {error}"
+                );
+            }
+        }
+    }
+
+    /// The one-comparator rule also covers a stripped match the runner did
+    /// not pass, which earns no credit itself: beside a canonical divergence,
+    /// in either attempt order, the row is refused rather than credited as
+    /// that divergence.
+    #[test]
+    fn a_failed_stripped_match_beside_a_canonical_divergence_is_a_mixed_row() {
+        let measured = "a".repeat(40);
+        let (_, stripped) = stripped_row(&measured);
+        let mut report = verify_canonical_report(&measured);
+        report["verdict"] = "diverged".into();
+        report["verified"] = false.into();
+        report["bitwise_parity"] = false.into();
+        report["first_divergent_record"] = 1.into();
+        let mut canonical = with_report(&stripped, &report);
+        canonical["relaxations"] = serde_json::json!([]);
+        let argv = vec![
+            "hermit",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            "fixture",
+        ];
+        canonical["argv"] = serde_json::json!(argv);
+        canonical["effective_args"] = serde_json::json!(&argv[1..]);
+        canonical["shell_command"] = literal_shell_command(
+            "/repo",
+            &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        )
+        .into();
+        for field in ["argv", "shell_command"] {
+            canonical["attempts"][0][field] = canonical[field].clone();
+        }
+        canonical["outcome"] = "FAIL".into();
+        canonical["result"] = "determinism-failure".into();
+        canonical["failure_class"] = "product_failure".into();
+        canonical["first_divergent_record"] = 1.into();
+        canonical["attempts"][0]["outcome"] = "FAIL".into();
+        canonical["attempts"][0]["status"] = 1.into();
+        canonical["attempts"][0]["first_divergent_record"] = 1.into();
+        let control: ResultRow = serde_json::from_value(canonical.clone()).unwrap();
+        assert!(
+            matches!(
+                control.comparison_evidence(),
+                Ok(ValidateRowEvidence::Diverged { .. })
+            ),
+            "control: the canonical divergence alone is admitted"
+        );
+        let canonical_attempt = canonical["attempts"][0].clone();
+        let mut failed = with_matched_exit(&stripped, 3);
+        failed["attempts"][0]["outcome"] = "FAIL".into();
+        failed["outcome"] = "FAIL".into();
+        failed["result"] = "crash-error".into();
+        failed["failure_class"] = "product_failure".into();
+        let failed_control: ResultRow = serde_json::from_value(failed.clone()).unwrap();
+        assert!(
+            matches!(
+                failed_control.comparison_evidence(),
+                Ok(ValidateRowEvidence::Unavailable { .. })
+            ),
+            "control: the failed stripped match alone earns no credit"
+        );
+        let failed_attempt = failed["attempts"][0].clone();
+        for (label, first, second) in [
+            ("failed stripped first", &failed_attempt, &canonical_attempt),
+            ("canonical first", &canonical_attempt, &failed_attempt),
+        ] {
+            let mut row = failed.clone();
+            for field in ["argv", "guest_argv", "env", "cwd", "shell_command"] {
+                row[field] = first[field].clone();
+            }
+            row["effective_args"] = serde_json::json!(&first["argv"].as_array().unwrap()[1..]);
+            row["result"] = "determinism-failure".into();
+            row["first_divergent_record"] = 1.into();
+            let mut second = second.clone();
+            second["index"] = "2".into();
+            row["attempts"] = serde_json::json!([first, second]);
+            let row: ResultRow = serde_json::from_value(row).unwrap();
+            let error = row
+                .comparison_evidence()
+                .expect_err("a mixed row must not be credited as the canonical divergence");
+            assert!(
+                error.contains("row mixes stripped and canonical comparison attempts"),
+                "{label}: {error}"
+            );
         }
     }
 
