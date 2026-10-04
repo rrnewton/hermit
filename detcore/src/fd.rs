@@ -296,6 +296,10 @@ pub(crate) struct EpollTimerInterest {
     pub target: TimerFdLink,
 }
 
+/// Linux `KTIME_MAX`: the largest time a timer can hold, in nanoseconds.
+/// `ktime_add_safe` clamps any sum of times beyond it to it.
+pub const KTIME_MAX_NS: u64 = i64::MAX as u64;
+
 /// Virtual timerfd state, in detcore's single logical-time domain.
 ///
 /// Every guest clock (REALTIME, MONOTONIC, BOOTTIME) reads the same logical
@@ -364,14 +368,18 @@ impl TimerFdState {
         if now < deadline {
             return Some(deadline);
         }
-        // Saturate like the rest of logical time: a guest-chosen deadline and
-        // interval near the top of the range must not overflow here.
+        // hrtimer_forward adds the interval with ktime_add_safe, so the next
+        // expiry stops at KTIME_MAX: a guest-chosen deadline and interval near
+        // the top of the range neither overflow nor pass Linux's maximum.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): forwarded expiries clamp at KTIME_MAX.
         let elapsed = now.as_nanos() - deadline.as_nanos();
         let k = elapsed / self.interval.as_nanos() + 1;
         Some(LogicalTime::from_nanos(
             deadline
                 .as_nanos()
-                .saturating_add(k.saturating_mul(self.interval.as_nanos())),
+                .saturating_add(k.saturating_mul(self.interval.as_nanos()))
+                .min(KTIME_MAX_NS),
         ))
     }
 }
@@ -1501,19 +1509,35 @@ mod tests {
         // Disarmed: nothing.
         s.deadline = None;
         assert_eq!(s.expirations(LogicalTime::from_nanos(10_000)), 0);
-        // A deadline and interval at the top of the range saturate rather
-        // than overflow.
+        // A deadline and interval at the top of the range stop at KTIME_MAX,
+        // as hrtimer_forward's ktime_add_safe does, rather than overflow or
+        // pass it.
+        s.deadline = Some(LogicalTime::from_nanos(KTIME_MAX_NS - 10));
+        s.interval = LogicalTime::from_nanos(KTIME_MAX_NS / 2);
+        assert_eq!(
+            s.next_expiry(LogicalTime::from_nanos(KTIME_MAX_NS - 5)),
+            Some(LogicalTime::from_nanos(KTIME_MAX_NS))
+        );
+        // Inputs past KTIME_MAX, which no arming can produce, still neither
+        // overflow nor pass it.
         s.deadline = Some(LogicalTime::from_nanos(u64::MAX - 10));
         s.interval = LogicalTime::from_nanos(u64::MAX / 2);
         assert_eq!(
             s.next_expiry(LogicalTime::from_nanos(u64::MAX - 5)),
-            Some(LogicalTime::from_nanos(u64::MAX))
+            Some(LogicalTime::from_nanos(KTIME_MAX_NS))
         );
         s.deadline = Some(LogicalTime::from_nanos(1_000));
-        s.interval = LogicalTime::from_nanos(i64::MAX as u64);
+        s.interval = LogicalTime::from_nanos(KTIME_MAX_NS);
         assert_eq!(
             s.next_expiry(LogicalTime::from_nanos(6_000_000)),
-            Some(LogicalTime::from_nanos(1_000 + i64::MAX as u64))
+            Some(LogicalTime::from_nanos(KTIME_MAX_NS))
+        );
+        // Below the maximum the forwarded expiry is exact.
+        s.deadline = Some(LogicalTime::from_nanos(KTIME_MAX_NS - 100));
+        s.interval = LogicalTime::from_nanos(40);
+        assert_eq!(
+            s.next_expiry(LogicalTime::from_nanos(KTIME_MAX_NS - 70)),
+            Some(LogicalTime::from_nanos(KTIME_MAX_NS - 60))
         );
     }
 

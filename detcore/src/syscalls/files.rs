@@ -75,9 +75,6 @@ pub(crate) fn timespec_valid(ts: &libc::timespec) -> bool {
     ts.tv_sec >= 0 && (0..1_000_000_000).contains(&ts.tv_nsec)
 }
 
-/// Linux `KTIME_MAX`: the largest time a timer can hold, in nanoseconds.
-const KTIME_MAX_NS: u64 = i64::MAX as u64;
-
 /// Flatten a guest timespec to nanoseconds as Linux `timespec64_to_ktime`
 /// does: negative fields clamp to zero, and a second count at or above
 /// `KTIME_MAX / NSEC_PER_SEC` clamps the whole value to `KTIME_MAX`.
@@ -88,6 +85,15 @@ pub(crate) fn timespec_ns(ts: libc::timespec) -> u64 {
         return KTIME_MAX_NS;
     }
     secs * 1_000_000_000 + nsec
+}
+
+/// The expiry of a relative timerfd arming `value_ns` after `now`. Linux's
+/// hrtimer_start adds the current time with ktime_add_safe, which clamps a sum
+/// beyond KTIME_MAX to KTIME_MAX.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3229): relative expiries clamp at KTIME_MAX.
+pub(crate) fn timerfd_relative_deadline(now: LogicalTime, value_ns: u64) -> LogicalTime {
+    LogicalTime::from_nanos(now.as_nanos().saturating_add(value_ns).min(KTIME_MAX_NS))
 }
 
 pub(crate) fn ns_timespec(ns: u64) -> libc::timespec {
@@ -4776,7 +4782,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Guest clocks and logical time share one domain; see TimerFdState.
             Some(LogicalTime::from_nanos(value_ns))
         } else {
-            Some(now + std::time::Duration::from_nanos(value_ns))
+            Some(timerfd_relative_deadline(now, value_ns))
         };
         // Linux silently ignores CANCEL_ON_SET unless the arming is an ABSTIME
         // CLOCK_REALTIME one (timerfd_setup_cancel); it is never an error.
@@ -6199,10 +6205,13 @@ mod test {
     use reverie::syscalls::Whence;
 
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+    use super::ns_timespec;
     use super::pipe_capacity_request_exceeds_ceiling;
     use super::timerfd_gettime_spec;
+    use super::timerfd_relative_deadline;
     use super::timespec_ns;
     use super::timespec_valid;
+    use crate::fd::KTIME_MAX_NS;
     use crate::test_pages::PAGE;
     use crate::test_pages::Pages;
     use crate::types::LogicalTime;
@@ -6363,6 +6372,43 @@ mod test {
             assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
             assert_eq!(Errno::last(), Errno::EBADF);
         }
+    }
+
+    #[test]
+    fn timerfd_relative_deadline_clamps_at_ktime_max() {
+        let ts = |tv_sec, tv_nsec| libc::timespec { tv_sec, tv_nsec };
+        let now = LogicalTime::from_nanos(1_700_000_000_000_000_000);
+        assert_eq!(
+            timerfd_relative_deadline(now, 5),
+            LogicalTime::from_nanos(1_700_000_000_000_000_005)
+        );
+        // A value at KTIME_MAX, or just below it, plus the current time would
+        // pass KTIME_MAX: ktime_add_safe stops there.
+        assert_eq!(
+            timerfd_relative_deadline(now, KTIME_MAX_NS),
+            LogicalTime::from_nanos(KTIME_MAX_NS)
+        );
+        assert_eq!(
+            timerfd_relative_deadline(now, timespec_ns(ts(9_223_372_035, 999_999_999))),
+            LogicalTime::from_nanos(KTIME_MAX_NS)
+        );
+        // An expiry that lands exactly on KTIME_MAX is kept.
+        assert_eq!(
+            timerfd_relative_deadline(LogicalTime::from_nanos(7), KTIME_MAX_NS - 7),
+            LogicalTime::from_nanos(KTIME_MAX_NS)
+        );
+        // The time left is then KTIME_MAX minus the current time, as Linux
+        // reports for an absolute arming at KTIME_MAX.
+        let mut s = crate::fd::TimerFdState::new(libc::CLOCK_MONOTONIC);
+        s.deadline = Some(timerfd_relative_deadline(now, KTIME_MAX_NS));
+        let left = timerfd_gettime_spec(&s, now).it_value;
+        let want = ns_timespec(KTIME_MAX_NS - now.as_nanos());
+        assert_eq!((left.tv_sec, left.tv_nsec), (want.tv_sec, want.tv_nsec));
+        assert_eq!(
+            (left.tv_sec, left.tv_nsec),
+            (7_523_372_036, 854_775_807),
+            "KTIME_MAX - 1.7e18 ns"
+        );
     }
 
     #[test]

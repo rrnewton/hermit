@@ -103,7 +103,13 @@
  *       closed, does not stall an unrelated sleep.
  *   huge_interval / max_interval
  *       An interval beyond KTIME_MAX reads back clamped to KTIME_MAX, and the
- *       next expiry after the first one neither wraps nor crashes.
+ *       next expiry after the first one neither wraps nor crashes: it stops at
+ *       KTIME_MAX, so the time left equals that of an absolute timer armed at
+ *       KTIME_MAX, read just before and just after.
+ *   huge_relative / near_max_relative
+ *       A relative arming whose expiry would pass KTIME_MAX (a value beyond it,
+ *       or one just below it plus the current time) expires at KTIME_MAX, the
+ *       same instant as that absolute reference.
  *   epoll_pwait_masked_ready
  *       epoll_pwait with a signal mask returns a ready pipe beside a distant
  *       timerfd, and an expired timerfd, without blocking.
@@ -1080,7 +1086,32 @@ static void check_settime_errors(void) {
     else ok(name);
 }
 
+/* The reference for expiries Linux clamps: a CLOCK_MONOTONIC timer armed at
+ * the absolute time KTIME_MAX. Returns -1 if it cannot be armed. */
+static int ktime_max_reference(void) {
+    int ref = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    if (ref < 0) return -1;
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+    its.it_value.tv_sec = 9223372036L;
+    its.it_value.tv_nsec = 854775807L;
+    if (timerfd_settime(ref, TFD_TIMER_ABSTIME, &its, NULL) != 0) {
+        close(ref);
+        return -1;
+    }
+    return ref;
+}
+
+/* Time left on a timerfd in nanoseconds, or -1 if timerfd_gettime fails. */
+static int64_t time_left_ns(int tfd) {
+    struct itimerspec cur;
+    memset(&cur, 0, sizeof cur);
+    if (timerfd_gettime(tfd, &cur) != 0) return -1;
+    return (int64_t)cur.it_value.tv_sec * 1000000000LL + cur.it_value.tv_nsec;
+}
+
 static void check_huge_interval(const char *name, long interval_sec) {
+    int ref = ktime_max_reference();
     int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
     struct itimerspec its;
     memset(&its, 0, sizeof its);
@@ -1088,18 +1119,28 @@ static void check_huge_interval(const char *name, long interval_sec) {
     its.it_interval.tv_sec = interval_sec;
     long set = timerfd_settime(tfd, 0, &its, NULL);
     sleep_ns(5 * MS);
+    int64_t ref_before = time_left_ns(ref);
     struct itimerspec cur;
     memset(&cur, 0, sizeof cur);
     long got = timerfd_gettime(tfd, &cur);
+    int64_t ref_mid = time_left_ns(ref);
     uint64_t count = 0;
     ssize_t r = read(tfd, &count, sizeof count);
     struct itimerspec after;
     memset(&after, 0, sizeof after);
     long got_after = timerfd_gettime(tfd, &after);
+    int64_t ref_after = time_left_ns(ref);
     close(tfd);
-    /* timespec64_to_ktime clamps to KTIME_MAX; the next expiry must not wrap. */
+    if (ref >= 0) close(ref);
+    int64_t cur_ns = (int64_t)cur.it_value.tv_sec * 1000000000LL + cur.it_value.tv_nsec;
+    int64_t after_ns = (int64_t)after.it_value.tv_sec * 1000000000LL + after.it_value.tv_nsec;
+    /* timespec64_to_ktime clamps the interval to KTIME_MAX, and hrtimer_forward
+     * adds it with ktime_add_safe, which clamps the next expiry to KTIME_MAX:
+     * it must neither wrap nor pass KTIME_MAX. */
     if (set != 0 || got != 0 || got_after != 0)
         fail(name, "settime=%ld gettime=%ld", set, got != 0 ? got : got_after);
+    else if (ref < 0 || ref_before < 0 || ref_mid < 0 || ref_after < 0)
+        fail(name, "reference=%ld gettime=%ld", (long)ref, (long)ref_after);
     else if (cur.it_interval.tv_sec != 9223372036L || cur.it_interval.tv_nsec != 854775807L)
         fail(name, "interval_sec=%ld nsec=%ld", (long)cur.it_interval.tv_sec,
              (long)cur.it_interval.tv_nsec);
@@ -1107,6 +1148,38 @@ static void check_huge_interval(const char *name, long interval_sec) {
     else if (cur.it_value.tv_sec < 1000000000L || after.it_value.tv_sec < 1000000000L)
         fail(name, "value_sec=%ld after_sec=%ld", (long)cur.it_value.tv_sec,
              (long)after.it_value.tv_sec);
+    else if (cur_ns > ref_before || cur_ns < ref_mid)
+        fail(name, "left_ns=%ld reference_ns=%ld", (long)cur_ns, (long)ref_before);
+    else if (after_ns > ref_mid || after_ns < ref_after)
+        fail(name, "after_ns=%ld reference_ns=%ld", (long)after_ns, (long)ref_mid);
+    else ok(name);
+}
+
+static void check_huge_relative(const char *name, long value_sec, long value_nsec) {
+    int ref = ktime_max_reference();
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK);
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+    its.it_value.tv_sec = value_sec;
+    its.it_value.tv_nsec = value_nsec;
+    long set = timerfd_settime(tfd, 0, &its, NULL);
+    int64_t ref_before = time_left_ns(ref);
+    int64_t left = time_left_ns(tfd);
+    int64_t ref_after = time_left_ns(ref);
+    uint64_t count = 0;
+    errno = 0;
+    ssize_t r = read(tfd, &count, sizeof count);
+    long read_err = r < 0 ? errno : 0;
+    close(tfd);
+    if (ref >= 0) close(ref);
+    /* hrtimer_start adds the current time with ktime_add_safe, which clamps an
+     * expiry beyond KTIME_MAX to KTIME_MAX: the absolute reference's instant. */
+    if (set != 0 || left < 0) fail(name, "settime=%ld gettime=%ld", set, (long)left);
+    else if (ref < 0 || ref_before < 0 || ref_after < 0)
+        fail(name, "reference=%ld gettime=%ld", (long)ref, (long)ref_after);
+    else if (left > ref_before || left < ref_after)
+        fail(name, "left_ns=%ld reference_ns=%ld", (long)left, (long)ref_before);
+    else if (r != -1 || read_err != EAGAIN) fail(name, "read=%ld errno=%ld", (long)r, read_err);
     else ok(name);
 }
 
@@ -1210,6 +1283,8 @@ int main(void) {
     check_fine_periodic_sleep(1);
     check_huge_interval("huge_interval", 17000000000L);
     check_huge_interval("max_interval", 0x7fffffffffffffffL);
+    check_huge_relative("huge_relative", 17000000000L, 0);
+    check_huge_relative("near_max_relative", 9223372035L, 999999999L);
     check_epoll_pwait_masked_ready();
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
