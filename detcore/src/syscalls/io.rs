@@ -42,7 +42,6 @@ use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
-use crate::syscalls::helpers::probe_was_interrupted_by_signal;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::signal::read_kernel_sigset;
@@ -635,7 +634,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // as on Linux.
         let mut signals = (sigmask.is_none()
             && self.cfg.backend_supports_blocked_wait_signal_interruption)
-            .then(|| KernelSignalWait::new(guest, 0, false));
+            .then(|| KernelSignalWait::new(guest, 0, false, Errno::ERESTARTNOHAND));
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         let _guard = stack.commit()?;
         let probe = call
@@ -694,16 +693,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
                     write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
 
-                    let raw_result = guest.inject(probe).await;
-                    if signals.is_some()
-                        && let Err(errno) = raw_result
-                        && probe_was_interrupted_by_signal(errno)
-                    {
-                        // A signal stopped the probe; it runs again after the backend
-                        // delivers the signal (see `KernelSignalWait`).
-                        self.write_pselect6_remaining(guest, call, deadline).await?;
-                        break Err(Errno::ERESTARTNOINTR.into());
-                    }
+                    let raw_result = match signals.as_mut() {
+                        // A signal stop that does not end the wait is absorbed (see
+                        // `KernelSignalWait`).
+                        Some(signals) => match signals.inject_absorbing(guest, probe).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                self.write_pselect6_remaining(guest, call, deadline).await?;
+                                break Err(error);
+                            }
+                        },
+                        None => guest.inject(probe).await,
+                    };
                     let result = pselect6_probe_result(raw_result);
                     if result != Ok(0) {
                         let copy_result = if result.is_ok() {
@@ -891,7 +892,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut signals = self
             .cfg
             .backend_supports_blocked_wait_signal_interruption
-            .then(|| KernelSignalWait::new(guest, 0, false));
+            .then(|| KernelSignalWait::new(guest, 0, false, Errno::ERESTARTNOHAND));
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         let _guard = stack.commit()?;
         let probe = call
@@ -949,16 +950,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
                     write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
 
-                    let result = guest.inject(probe).await;
-                    if signals.is_some()
-                        && let Err(errno) = result
-                        && probe_was_interrupted_by_signal(errno)
-                    {
-                        // A signal stopped the probe; it runs again after the backend
-                        // delivers the signal (see `KernelSignalWait`).
-                        self.write_select_remaining(guest, call, deadline).await?;
-                        break Err(Errno::ERESTARTNOINTR.into());
-                    }
+                    let result = match signals.as_mut() {
+                        // A signal stop that does not end the wait is absorbed (see
+                        // `KernelSignalWait`).
+                        Some(signals) => match signals.inject_absorbing(guest, probe).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                self.write_select_remaining(guest, call, deadline).await?;
+                                break Err(error);
+                            }
+                        },
+                        None => guest.inject(probe).await,
+                    };
                     if result != Ok(0) {
                         let copy_result = if result.is_ok() {
                             self.copy_select_results(guest, probe, call, len)
