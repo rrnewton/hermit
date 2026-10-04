@@ -197,6 +197,9 @@ pub const SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS: [&str; 8] = [
 /// LiteInst host-hybrid cells selected after ten clean first-attempt strict
 /// verification repetitions each. Keep this evidence separate from the frozen
 /// census and the KVM qualifications; the ordinary 22/57 bounds are unchanged.
+/// This group and the 2026-09-17 group below are history: the owner reset of
+/// 2026-10-04 switched every LiteInst cell off
+/// (<https://github.com/rrnewton/hermit/issues/3745>).
 pub const LITEINST_2026_09_16_EVIDENCE_SHA: &str = "ed99e05133b00058fafed7f3dfaf48ab8fd334e6";
 pub const LITEINST_2026_09_16_EVIDENCE_COMPLETED_UTC: &str = "2026-09-16T22:31:37Z";
 pub const LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT: usize =
