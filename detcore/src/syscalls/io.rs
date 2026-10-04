@@ -609,6 +609,56 @@ fn write_control_prefix<T: Copy>(bytes: &mut [u8], value: T) -> usize {
     write_len
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3229): timerfds sent over SCM_RIGHTS go to the kernel.
+/// The descriptors named by the SCM_RIGHTS messages of a control buffer that
+/// is about to be sent. The walk follows net/core/scm.c (__scm_send): each
+/// header must hold at least itself and fit in the buffer, the payload is the
+/// rest of the declared length, and the next header starts at the aligned end.
+/// A malformed header ends the walk; the kernel then fails the send with
+/// EINVAL.
+fn scm_rights_fds(control: &[u8]) -> Vec<i32> {
+    let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+    let mut fds = Vec::new();
+    let mut offset = 0usize;
+    while let Some(header_bytes) = control.get(offset..) {
+        let Some(header) = read_control_value::<libc::cmsghdr>(header_bytes) else {
+            break;
+        };
+        if header.cmsg_len < header_len {
+            break;
+        }
+        let Some(end) = offset.checked_add(header.cmsg_len) else {
+            break;
+        };
+        if end > control.len() {
+            break;
+        }
+        if header.cmsg_level == libc::SOL_SOCKET && header.cmsg_type == libc::SCM_RIGHTS {
+            fds.extend(
+                control[offset + header_len..end]
+                    .chunks_exact(std::mem::size_of::<i32>())
+                    .filter_map(|chunk| chunk.try_into().ok().map(i32::from_ne_bytes)),
+            );
+        }
+        let Some(next) = offset.checked_add(cmsg_align(header.cmsg_len)) else {
+            break;
+        };
+        if next <= offset {
+            break;
+        }
+        offset = next;
+    }
+    fds
+}
+
+// AUTONOMOUS-BOT-IMPLEMENTED
+/// The (address, length) of a message header's control buffer, if it has one.
+fn message_control(message: &libc::msghdr) -> Option<(usize, usize)> {
+    (!message.msg_control.is_null() && message.msg_controllen != 0)
+        .then(|| (message.msg_control as usize, message.msg_controllen))
+}
+
 fn socket_timestamp_messages(control: &[u8]) -> Vec<SocketTimestampMessage> {
     let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
     let mut messages = Vec::new();
@@ -1707,6 +1757,24 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): timerfds received over SCM_RIGHTS go to the
+    // kernel.
+    /// Whether timerfd_settime and timerfd_gettime on `fd` go to the kernel:
+    /// the timer was handed to the kernel, or Detcore never saw the
+    /// descriptor created, as for one received over SCM_RIGHTS. Base main
+    /// sends every timerfd call to the kernel, so such a descriptor behaves
+    /// as it does there, including the kernel's EBADF for a closed number and
+    /// EINVAL for one that is not a timerfd. A sender hands its virtual
+    /// timerfds to the kernel before the send (`hand_sent_timerfds_to_kernel`),
+    /// so both ends then use the kernel's timer.
+    pub(crate) fn timerfd_control_on_kernel<G: Guest<Self>>(&self, guest: &mut G, fd: i32) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.timerfd_kernel_backed())
+            .unwrap_or(true)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
     /// Hand a virtual timerfd to the kernel, where base main keeps every
     /// timerfd. The host vessel is armed with the virtual timer's remaining
@@ -1876,6 +1944,41 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.hand_epoll_timerfds_to_kernel(guest, fd as i32).await?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): timerfds sent over SCM_RIGHTS go to the
+    // kernel.
+    /// Hand every virtual timerfd that an SCM_RIGHTS message in these control
+    /// buffers names to the kernel, before the send. The receiver gets a
+    /// descriptor Detcore never saw created, whose timerfd_settime and
+    /// timerfd_gettime go to the kernel (`timerfd_control_on_kernel`), so
+    /// the timer must already be there for the two ends to share it. Each
+    /// control buffer is an (address, length) pair. One that cannot be read
+    /// is skipped: the kernel cannot read it either and fails the send.
+    async fn hand_sent_timerfds_to_kernel<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        controls: Vec<(usize, usize)>,
+    ) -> Result<(), Error> {
+        if !self.virtual_timerfds() {
+            return Ok(());
+        }
+        let mut sent = Vec::new();
+        for (address, length) in controls {
+            let Some(addr) = AddrMut::<u8>::from_raw(address) else {
+                continue;
+            };
+            let mut bytes = vec![0u8; length.min(MAX_CONTROL_BYTES)];
+            if guest.memory().read_exact(addr, &mut bytes).is_ok() {
+                sent.extend(scm_rights_fds(&bytes));
+            }
+        }
+        for fd in sent {
+            // A descriptor that is not a virtual timerfd is left alone.
+            self.hand_timerfd_to_kernel(guest, fd).await?;
         }
         Ok(())
     }
@@ -2984,6 +3087,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Sendmsg,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): timerfds sent over SCM_RIGHTS go to the
+        // kernel. A header the kernel cannot read either fails the send.
+        if self.virtual_timerfds() {
+            let controls: Vec<(usize, usize)> = call
+                .msg()
+                .and_then(|address| guest.memory().read_value(address).ok())
+                .and_then(|message: libc::msghdr| message_control(&message))
+                .into_iter()
+                .collect();
+            self.hand_sent_timerfds_to_kernel(guest, controls).await?;
+        }
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         guest.thread_state().forget_flock_modes();
         Ok(result)
@@ -2998,6 +3113,31 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Sendmmsg,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): timerfds sent over SCM_RIGHTS go to the
+        // kernel. net/socket.c (__sys_sendmmsg) caps the batch at UIO_MAXIOV
+        // and stops at the first header it cannot read, so the headers read
+        // here are the ones the kernel can send.
+        if self.virtual_timerfds() {
+            let controls: Vec<(usize, usize)> = match call.msgvec() {
+                Some(address) => {
+                    let first = address.as_raw();
+                    let count = call.vlen().min(libc::UIO_MAXIOV as u32) as usize;
+                    let stride = std::mem::size_of::<libc::mmsghdr>();
+                    (0..count)
+                        .map_while(|index| {
+                            let address = Addr::<libc::mmsghdr>::from_raw(
+                                first.checked_add(index * stride)?,
+                            )?;
+                            guest.memory().read_value(address).ok()
+                        })
+                        .filter_map(|message: libc::mmsghdr| message_control(&message.msg_hdr))
+                        .collect()
+                }
+                None => Vec::new(),
+            };
+            self.hand_sent_timerfds_to_kernel(guest, controls).await?;
+        }
         let result = self.execute_nonblockable_fd_syscall(guest, call).await?;
         if result > 0 {
             guest.thread_state().forget_flock_modes();
@@ -3657,6 +3797,73 @@ mod tests {
         assert_eq!(timespec.tv_sec, 2);
         assert_eq!(timespec.tv_nsec, 345_678_901);
         assert_eq!(control[third_offset..], unrelated_message);
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    #[test]
+    fn scm_rights_fds_names_the_descriptors_each_rights_message_sends() {
+        let header_len = cmsg_align(std::mem::size_of::<libc::cmsghdr>());
+        let int_len = std::mem::size_of::<i32>();
+        // Two descriptors, then a timestamp message, then one descriptor.
+        let first_len = header_len + 2 * int_len;
+        let second_offset = cmsg_align(first_len);
+        let second_len = header_len + std::mem::size_of::<libc::timeval>();
+        let third_offset = second_offset + cmsg_align(second_len);
+        let third_len = header_len + int_len;
+        let mut control = vec![0; third_offset + cmsg_align(third_len)];
+        let header = |cmsg_len, cmsg_level, cmsg_type| libc::cmsghdr {
+            cmsg_len,
+            cmsg_level,
+            cmsg_type,
+        };
+        assert!(write_control_value(
+            &mut control,
+            header(first_len, libc::SOL_SOCKET, libc::SCM_RIGHTS)
+        ));
+        assert!(write_control_value(&mut control[header_len..], 7_i32));
+        assert!(write_control_value(
+            &mut control[header_len + int_len..],
+            9_i32
+        ));
+        assert!(write_control_value(
+            &mut control[second_offset..],
+            header(second_len, libc::SOL_SOCKET, SCM_TIMESTAMP_OLD)
+        ));
+        assert!(write_control_value(
+            &mut control[third_offset..],
+            header(third_len, libc::SOL_SOCKET, libc::SCM_RIGHTS)
+        ));
+        assert!(write_control_value(
+            &mut control[third_offset + header_len..],
+            11_i32
+        ));
+        assert_eq!(scm_rights_fds(&control), vec![7, 9, 11]);
+
+        // The same type number at another level sends no descriptors.
+        let mut other_level = control.clone();
+        assert!(write_control_value(
+            &mut other_level,
+            header(first_len, libc::IPPROTO_IP, libc::SCM_RIGHTS)
+        ));
+        assert_eq!(scm_rights_fds(&other_level), vec![11]);
+
+        // A header shorter than itself, or one that runs past the buffer, is
+        // the kernel's EINVAL: the walk stops there.
+        let mut short = control.clone();
+        assert!(write_control_value(
+            &mut short[second_offset..],
+            header(header_len - 1, libc::SOL_SOCKET, SCM_TIMESTAMP_OLD)
+        ));
+        assert_eq!(scm_rights_fds(&short), vec![7, 9]);
+        let mut long = control.clone();
+        assert!(write_control_value(
+            &mut long[third_offset..],
+            header(third_len + 64, libc::SOL_SOCKET, libc::SCM_RIGHTS)
+        ));
+        assert_eq!(scm_rights_fds(&long), vec![7, 9]);
+
+        // A buffer too short for one header sends nothing.
+        assert!(scm_rights_fds(&control[..header_len - 1]).is_empty());
     }
 
     #[test]

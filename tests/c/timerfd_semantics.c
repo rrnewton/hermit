@@ -119,6 +119,12 @@
  *       ppoll reports an expired timerfd beside a ready pipe, ends a finite
  *       and an infinite wait when an armed timer fires, and times out when
  *       the timer was disarmed before it could fire.
+ *   scm_rights_sendmsg / scm_rights_sendmmsg
+ *       A timerfd received over SCM_RIGHTS, through sendmsg or sendmmsg, is
+ *       the sender's timer under a new number: the arming made before the
+ *       send reads back through the new number, a re-arming through the new
+ *       number reads back through the original, and so does a disarming
+ *       through the original.
  *
  * With the single argument `sharing`, only fork_expired, fork_rearm,
  * fork_disarm and the ppoll cases run. They check what a forked child shares
@@ -141,6 +147,7 @@
 #include <sys/epoll.h>
 #include <sys/mman.h>
 #include <sys/select.h>
+#include <sys/socket.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/timerfd.h>
@@ -1886,6 +1893,99 @@ static void wait_form_masked_wait(int form) {
     else ok(name);
 }
 
+/* Sends `fd` over SCM_RIGHTS with one byte of data, through sendmsg or
+ * sendmmsg; 0 on success. */
+static int send_fd_once(int sock, int fd, int use_sendmmsg) {
+    char byte = 'x';
+    struct iovec iov = {&byte, 1};
+    union {
+        struct cmsghdr align;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } control;
+    memset(&control, 0, sizeof control);
+    struct mmsghdr message;
+    memset(&message, 0, sizeof message);
+    message.msg_hdr.msg_iov = &iov;
+    message.msg_hdr.msg_iovlen = 1;
+    message.msg_hdr.msg_control = control.buf;
+    message.msg_hdr.msg_controllen = sizeof control.buf;
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message.msg_hdr);
+    header->cmsg_level = SOL_SOCKET;
+    header->cmsg_type = SCM_RIGHTS;
+    header->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(header), &fd, sizeof fd);
+    if (use_sendmmsg) return sendmmsg(sock, &message, 1, 0) == 1 ? 0 : -1;
+    return sendmsg(sock, &message.msg_hdr, 0) == 1 ? 0 : -1;
+}
+
+/* Receives one descriptor sent by send_fd_once; -1 on failure. */
+static int recv_fd_once(int sock) {
+    char byte = 0;
+    struct iovec iov = {&byte, 1};
+    union {
+        struct cmsghdr align;
+        char buf[CMSG_SPACE(sizeof(int))];
+    } control;
+    memset(&control, 0, sizeof control);
+    struct msghdr message;
+    memset(&message, 0, sizeof message);
+    message.msg_iov = &iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control.buf;
+    message.msg_controllen = sizeof control.buf;
+    if (recvmsg(sock, &message, 0) != 1) return -1;
+    struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+    if (header == NULL || header->cmsg_level != SOL_SOCKET || header->cmsg_type != SCM_RIGHTS)
+        return -1;
+    int fd;
+    memcpy(&fd, CMSG_DATA(header), sizeof fd);
+    return fd;
+}
+
+/* A timerfd received over SCM_RIGHTS is the sender's open file under a new
+ * number, as for a dup: the arming made before the send is what the new
+ * number reads back, a re-arming through the new number is what the original
+ * reads back, and so is a disarming through the original. */
+static void check_scm_rights(int use_sendmmsg) {
+    const char *name = use_sendmmsg ? "scm_rights_sendmmsg" : "scm_rights_sendmsg";
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) {
+        fail(name, "socketpair errno=%ld step=%ld", errno, 0);
+        return;
+    }
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 100000 * MS, 0, 0);
+    int rfd = -1;
+    if (tfd < 0 || send_fd_once(sv[0], tfd, use_sendmmsg) != 0 || (rfd = recv_fd_once(sv[1])) < 0) {
+        fail(name, "setup errno=%ld rfd=%ld", errno, rfd);
+    } else {
+        int64_t armed = time_left_ns(rfd);
+        struct itimerspec rearm;
+        memset(&rearm, 0, sizeof rearm);
+        rearm.it_value.tv_sec = 50;
+        errno = 0;
+        long set = timerfd_settime(rfd, 0, &rearm, NULL);
+        long set_errno = errno;
+        int64_t rearmed = time_left_ns(tfd);
+        struct itimerspec disarm;
+        memset(&disarm, 0, sizeof disarm);
+        long unset = timerfd_settime(tfd, 0, &disarm, NULL);
+        int64_t disarmed = time_left_ns(rfd);
+        if (armed <= 0 || armed > 100000 * MS)
+            fail(name, "received_left_ms=%ld step=%ld", (long)(armed < 0 ? armed : armed / MS), 1);
+        else if (set != 0)
+            fail(name, "settime_received=%ld errno=%ld", set, set_errno);
+        else if (rearmed <= 0 || rearmed > 50000 * MS)
+            fail(name, "original_left_ms=%ld step=%ld", (long)(rearmed < 0 ? rearmed : rearmed / MS), 3);
+        else if (unset != 0 || disarmed != 0)
+            fail(name, "disarm=%ld received_left_ns=%ld", unset, (long)disarmed);
+        else ok(name);
+    }
+    if (rfd >= 0) close(rfd);
+    if (tfd >= 0) close(tfd);
+    close(sv[0]);
+    close(sv[1]);
+}
+
 /* The fork and ppoll cases that check sharing and readiness only, never the
  * guest's clock; the `sharing` argument runs only these. */
 static void check_sharing_cases(void) {
@@ -1975,6 +2075,8 @@ int main(int argc, char **argv) {
     wait_form_masked_wait(0);
     wait_form_masked_wait(1);
     wait_form_masked_wait(2);
+    check_scm_rights(0);
+    check_scm_rights(1);
     check_sharing_cases();
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;

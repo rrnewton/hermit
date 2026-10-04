@@ -4767,7 +4767,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::TimerfdSettime,
     ) -> Result<i64, Error> {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        if !self.virtual_timerfds() || self.timerfd_kernel_backed(guest, call.fd()) {
+        if !self.virtual_timerfds() || self.timerfd_control_on_kernel(guest, call.fd()) {
             return self.notification_fd_control(guest, call.into()).await;
         }
         let fd = call.fd();
@@ -4781,9 +4781,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EINVAL.into());
         }
         // A descriptor Detcore did not see created, such as one received over
-        // SCM_RIGHTS, reports EBADF, like every other Detcore operation on it.
-        // Forwarding it would arm the host vessel on the host clock, invisible
-        // to aliases that read the virtual state.
+        // SCM_RIGHTS, went to the kernel above, as on base main; the sender
+        // handed the timer to the kernel before the send.
         let state = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.timerfd_state())?
@@ -4938,7 +4937,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::TimerfdGettime,
     ) -> Result<i64, Error> {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        if !self.virtual_timerfds() || self.timerfd_kernel_backed(guest, call.fd()) {
+        if !self.virtual_timerfds() || self.timerfd_control_on_kernel(guest, call.fd()) {
             return self.notification_fd_control(guest, call.into()).await;
         }
         // fs/timerfd.c resolves the descriptor (EBADF, or EINVAL for a
