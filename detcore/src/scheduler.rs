@@ -3865,9 +3865,14 @@ impl Scheduler {
             self.pending_run_queue_admissions.remove(dtid);
             self.pending_run_queue_removals.remove(dtid);
             self.run_queue.remove_tid(*dtid);
-        } else {
-            // Preserve deterministic removal at the next drain, including an
-            // asynchronous exec reconnect during a live tentative selection.
+        } else if self.next_turns.contains_key(dtid)
+            || self.run_queue.contains_tid(*dtid)
+            || self.pending_run_queue_admissions.contains_key(dtid)
+            || self.pending_run_queue_removals.contains_key(dtid)
+        {
+            // Preserve every existing registration, queue slot and deferred
+            // intent through the deterministic drain. A repeated retirement
+            // after all four have gone must not create a new removal debt.
             self.deschedule_or_defer(*dtid);
         }
         // Remove from all non-runnable pools:
@@ -4034,6 +4039,10 @@ impl Scheduler {
         // ordinary targets are logically dead, while the replacement key is not
         // runnable until that old slot has been removed and its admission
         // applied. No handler mutates the queue inside a tentative window.
+        // The old leader may already have retired and drained before this exec.
+        // Record its removal as part of the inseparable replacement handoff,
+        // rather than relying on a repeated registration retirement to do it.
+        self.deschedule_or_defer(new_leader);
         self.replace_retired_run_queue_incarnation(new_leader, AdmitIntent::Fixed(AdmitSide::Back));
         self.started_up.try_put(());
 
@@ -10696,6 +10705,108 @@ mod test {
     }
 
     #[test]
+    fn repeated_drained_thread_retirement_creates_no_new_queue_debt() {
+        let mut sched = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(5);
+        let child = DetTid::from_raw(9);
+        let mm = MmId::initial(leader);
+        sched.thread_tree.add_child(leader, leader, true);
+        sched.thread_tree.add_child(leader, child, false);
+        for tid in [leader, child] {
+            register_known_thread(&mut sched, tid);
+            sched.runqueue_push_back(tid);
+        }
+        sched.logically_kill_thread(&child, &leader, mm);
+        assert_eq!(
+            sched.pending_run_queue_removals.get(&child),
+            Some(&RemovalDisposition::Retire)
+        );
+        sched.drain_pending_run_queue_removals();
+        assert!(!sched.next_turns.contains_key(&child));
+        assert!(!sched.run_queue.contains_tid(child));
+        assert!(sched.pending_run_queue_admissions.is_empty());
+        assert!(sched.pending_run_queue_removals.is_empty());
+        let history = sched.thread_tree.tree.clone();
+        let queue = sched.run_queue.tids().copied().collect::<Vec<_>>();
+        let time = sched.committed_time;
+        let turn = sched.turn;
+        for _ in 0..2 {
+            sched.logically_kill_thread(&child, &leader, mm);
+            assert!(sched.pending_run_queue_removals.is_empty());
+            assert!(sched.pending_run_queue_admissions.is_empty());
+            assert_eq!(sched.run_queue.tids().copied().collect::<Vec<_>>(), queue);
+            assert_eq!(sched.thread_tree.tree, history);
+            assert_eq!(sched.committed_time, time);
+            assert_eq!(sched.turn, turn);
+            assert!(sched.next_turns.contains_key(&leader));
+            assert!(!sched.next_turns.contains_key(&child));
+        }
+    }
+
+    #[test]
+    fn repeated_undrained_thread_retirement_keeps_real_queue_debt() {
+        let mut sched = Scheduler::new(&Config::default());
+        let leader = DetTid::from_raw(5);
+        let child = DetTid::from_raw(9);
+        let mm = MmId::initial(leader);
+        sched.thread_tree.add_child(leader, leader, true);
+        sched.thread_tree.add_child(leader, child, false);
+        for tid in [leader, child] {
+            register_known_thread(&mut sched, tid);
+            sched.runqueue_push_back(tid);
+        }
+        assert_eq!(sched.run_queue.tentative_pop_tid(child), Some(child));
+        for _ in 0..2 {
+            sched.logically_kill_thread(&child, &leader, mm);
+            assert!(sched.run_queue.tentative_pop_in_progress());
+            assert!(sched.run_queue.contains_tid(child));
+            assert_eq!(
+                sched.pending_run_queue_removals.get(&child),
+                Some(&RemovalDisposition::Retire)
+            );
+            assert!(!sched.next_turns.contains_key(&child));
+        }
+        sched.run_queue.undo_tentative_pop();
+        sched.drain_pending_run_queue_removals();
+        assert!(!sched.run_queue.contains_tid(child));
+        assert!(sched.run_queue.contains_tid(leader));
+        assert!(sched.pending_run_queue_removals.is_empty());
+    }
+
+    #[test]
+    fn unqueued_registration_and_buffered_admission_still_retire_at_drain() {
+        for buffered in [false, true] {
+            let mut sched = Scheduler::new(&Config::default());
+            let leader = DetTid::from_raw(5);
+            let child = DetTid::from_raw(9);
+            let mm = MmId::initial(leader);
+            sched.thread_tree.add_child(leader, leader, true);
+            sched.thread_tree.add_child(leader, child, false);
+            register_known_thread(&mut sched, leader);
+            register_known_thread(&mut sched, child);
+            sched.runqueue_push_back(leader);
+            if buffered {
+                sched.admit_to_run_queue(child, AdmitIntent::Fixed(AdmitSide::Back));
+                assert!(sched.pending_run_queue_admissions.contains_key(&child));
+            }
+            assert!(!sched.run_queue.contains_tid(child));
+            sched.logically_kill_thread(&child, &leader, mm);
+            assert_eq!(
+                sched.pending_run_queue_removals.get(&child),
+                Some(&RemovalDisposition::Retire)
+            );
+            assert!(!sched.next_turns.contains_key(&child));
+            assert!(!sched.pending_run_queue_admissions.contains_key(&child));
+            sched.drain_pending_run_queue_removals();
+            sched.drain_pending_run_queue_admissions();
+            assert!(!sched.run_queue.contains_tid(child));
+            assert!(sched.run_queue.contains_tid(leader));
+            assert!(sched.pending_run_queue_removals.is_empty());
+            assert!(sched.pending_run_queue_admissions.is_empty());
+        }
+    }
+
+    #[test]
     fn deferred_removal_survives_tentative_window_and_drains() {
         let mut sched = Scheduler::new(&Config::default());
         let anchor = DetTid::from_raw(5);
@@ -10859,6 +10970,79 @@ mod test {
         assert!(sched.next_turns.contains_key(&leader));
         assert!(sched.pending_run_queue_admissions.is_empty());
         assert!(sched.pending_run_queue_removals.is_empty());
+    }
+
+    #[test]
+    fn modeled_nonleader_exec_after_leader_drain_preserves_replacement_during_tentative_window() {
+        let config = Config {
+            sequentialize_threads: true,
+            cancel_killed_thread_rpcs: true,
+            ..Config::default()
+        };
+        let mut sched = Scheduler::new(&config);
+        let leader = DetTid::from_raw(17);
+        let caller = DetTid::from_raw(18);
+        let (detpid, pre_exec_mm, old_leader_request) =
+            install_runnable_exec_group(&mut sched, leader, caller);
+        assert_eq!(sched.clear_tid_owner, ClearTidOwner::Modeled);
+        sched.logically_kill_thread(&leader, &detpid, pre_exec_mm);
+        sched.drain_pending_run_queue_removals();
+        assert!(matches!(old_leader_request.try_read(), Some(Err(_))));
+        assert!(!sched.next_turns.contains_key(&leader));
+        assert!(!sched.run_queue.contains_tid(leader));
+        assert!(sched.pending_run_queue_removals.is_empty());
+        assert!(sched.pending_run_queue_admissions.is_empty());
+        assert!(sched.next_turns.contains_key(&caller));
+        let caller_request = sched.next_turns[&caller].req.clone();
+        let history = sched.thread_tree.tree.clone();
+        let time = sched.committed_time;
+        let turn = sched.turn;
+        assert_eq!(sched.run_queue.tentative_pop_tid(caller), Some(caller));
+        let queue = sched.run_queue.tids().copied().collect::<Vec<_>>();
+
+        let retired = reconnect_nonleader_exec(&mut sched, leader, caller, detpid, pre_exec_mm);
+
+        assert_eq!(retired, vec![leader, caller]);
+        assert!(sched.run_queue.tentative_pop_in_progress());
+        assert_eq!(sched.run_queue.tids().copied().collect::<Vec<_>>(), queue);
+        assert_eq!(
+            sched.pending_run_queue_removals.get(&leader),
+            Some(&RemovalDisposition::ReplaceThenAdmit)
+        );
+        assert_eq!(
+            sched.pending_run_queue_removals.get(&caller),
+            Some(&RemovalDisposition::Retire)
+        );
+        assert_eq!(sched.pending_run_queue_removals.len(), 2);
+        assert!(matches!(
+            sched.pending_run_queue_admissions.get(&leader),
+            Some(AdmitIntent::Fixed(AdmitSide::Back))
+        ));
+        assert_eq!(sched.pending_run_queue_admissions.len(), 1);
+        assert!(matches!(caller_request.try_read(), Some(Err(_))));
+        assert!(!sched.next_turns.contains_key(&caller));
+        assert!(sched.next_turns[&leader].req.try_read().is_none());
+        assert_eq!(sched.priorities.get(&leader), Some(&DEFAULT_PRIORITY));
+        assert!(sched.rpc_incarnation_matches(leader, pre_exec_mm.for_exec(detpid)));
+        assert!(!sched.rpc_incarnation_matches(leader, pre_exec_mm));
+        assert_eq!(sched.thread_tree.tree, history);
+        assert_eq!(sched.committed_time, time);
+        assert_eq!(sched.turn, turn);
+
+        sched.run_queue.undo_tentative_pop();
+        sched.drain_pending_run_queue_removals();
+        sched.drain_pending_run_queue_admissions();
+        assert_eq!(
+            sched.run_queue.tids().copied().collect::<Vec<_>>(),
+            vec![leader]
+        );
+        assert!(sched.next_turns.contains_key(&leader));
+        assert!(!sched.next_turns.contains_key(&caller));
+        assert!(sched.pending_run_queue_removals.is_empty());
+        assert!(sched.pending_run_queue_admissions.is_empty());
+        assert_eq!(sched.thread_tree.tree, history);
+        assert_eq!(sched.committed_time, time);
+        assert_eq!(sched.turn, turn);
     }
 
     #[test]

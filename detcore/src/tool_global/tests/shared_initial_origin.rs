@@ -209,6 +209,97 @@ async fn shared_initial_final_wait_refuses_live_or_unobserved_child_and_changed_
     }
 }
 
+// The provider/birth and completed backend wait are controlled premises. The
+// real group-exit response and complete Tool terminal callback execute here;
+// this is a component regression, not an original native exit invocation.
+#[tokio::test]
+async fn shared_initial_group_exit_after_child_join_retains_actual_terminal_history() {
+    let mut f = Fixture::new().await;
+    f.finish_child();
+    let owner = f.parent.owner();
+    let process = f.parent.logical_process();
+    let history_size = f.state.sched.lock().unwrap().thread_tree.size();
+    let time = f.state.global_time.lock().unwrap().as_nanos();
+    {
+        let mut scheduler = f.state.sched.lock().unwrap();
+        assert!(
+            scheduler
+                .thread_tree
+                .my_thread_group(&owner.thread)
+                .contains(&f.child.owner().thread),
+            "the completed child remains in the actual group history"
+        );
+        let history = scheduler
+            .shared_initial_terminal_history(owner, &f.parent, &f.initial)
+            .unwrap();
+        assert!(Arc::ptr_eq(history.initial(), &f.initial));
+        assert_eq!(history.children().len(), 1);
+        assert!(Arc::ptr_eq(&history.children()[0], &f.child_projection));
+    }
+    let mut request = Resources::new(owner.thread);
+    request.insert(
+        ResourceID::Exit {
+            group: true,
+            process,
+            mm: owner.mm,
+        },
+        Permission::RW,
+    );
+    let response = f
+        .state
+        .finish_resource_response(
+            Tid::from_raw(owner.thread.as_raw()),
+            process,
+            request,
+            Some(owner.mm),
+            SchedResponse::Go(None),
+        )
+        .await;
+    assert_eq!(
+        response,
+        (
+            SchedulerRpcResult::Continue(ResourceReply::Grant(ResumeStatus::Normal)),
+            None,
+        )
+    );
+    assert!(!f.initial.completed_initial_final_wait(&f.parent));
+    // No artificial scheduler drain occurs after the real exit-group handler.
+    let tool: Detcore = Detcore::new(Tid::from_raw(process.as_raw()), &f.state.cfg);
+    tool.on_backend_thread_terminal(
+        Tid::from_raw(owner.thread.as_raw()),
+        &f.state,
+        &mut f.parent_state,
+        ExitStatus::Exited(0),
+    );
+    assert!(
+        f.initial.completed_initial_final_wait(&f.parent),
+        "actual Tool terminal after exit-group must retain the original complete history"
+    );
+    assert!(!f.state.sched.lock().unwrap().backend_failed());
+    assert!(
+        f.child_projection
+            .completed_child_for_initial_finalization(&f.parent)
+            .is_some()
+    );
+    assert!(f.child_projection.completed_final_wait(&f.parent).is_none());
+    assert_eq!(
+        f.state.sched.lock().unwrap().thread_tree.size(),
+        history_size
+    );
+    assert_eq!(f.state.global_time.lock().unwrap().as_nanos(), time);
+    assert!(
+        f.state
+            .network_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .controlled_shared_initial_finalization()
+            .is_ok()
+    );
+    f.cleanup(&f.parent);
+}
+
 // The existing native_connected fixture is copied here because this off-tree
 // checkpoint may not edit or expose the legacy test module. Only its constructor
 // selects the new release policy; selected old provider/Call/return/custody
