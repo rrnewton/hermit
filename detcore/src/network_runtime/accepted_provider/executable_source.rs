@@ -159,6 +159,18 @@ pub(in crate::network_runtime) fn validate_collection(
         || r.entered.iovec_base != expected.registers
         || r.entered.iovec_length != 216
     {
+        tracing::error!(
+            operation_prefix = ?observed.status.operation.as_bytes().get(..64).unwrap_or(observed.status.operation.as_bytes()),
+            operation_bytes = observed.status.operation.len(),
+            returned = observed.status.returned,
+            errno = ?observed.status.errno,
+            observed = ?e,
+            ?expected,
+            provider,
+            task,
+            start,
+            "executable source collection rejected"
+        );
         return Err(io::Error::other(
             "executable source changed actual collection/command/identity",
         ));
