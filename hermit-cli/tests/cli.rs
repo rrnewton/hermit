@@ -12505,7 +12505,9 @@ fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
 /// Each mode runs natively, once under the ptrace backend and three times
 /// under in-guest LiteInst. Every run must print the mode's expected lines, end
 /// with its expected status and write no line starting with `FAIL ` to stderr.
-/// The native run shows that the expected lines are what Linux does. When the
+/// The native run shows that the expected lines are what Linux does. In
+/// handler-after-reap, the native run's child also waits until Linux reports
+/// the parent asleep in `wait4` (`wait-for-parent-asleep`, see the guest). When the
 /// guest is killed by a signal, `hermit` raises the same signal on itself
 /// (`ExitStatus::raise_or_exit`), so every runner must end in that signal
 /// death.
@@ -12758,6 +12760,12 @@ fn liteinst_in_guest_signals_during_a_blocking_wait4_match_ptrace() {
         if let Some(status_file) = status_file {
             remove_stale(status_file);
             guest_args.push(status_file.to_str().expect("status path is not UTF-8"));
+        }
+        // Natively, nothing makes handler-after-reap's child exit after its
+        // parent is asleep in `wait4`, so the child also waits until Linux
+        // reports that (see the guest).
+        if runner == "native" && mode == "handler-after-reap" {
+            guest_args.push("wait-for-parent-asleep");
         }
         let log_args = log.map(|log| {
             remove_stale(log);
