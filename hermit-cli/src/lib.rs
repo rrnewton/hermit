@@ -3452,6 +3452,8 @@ async fn dispatch_output_backend(
         }
     }
     if backend == Backend::Sabre {
+        #[cfg(not(feature = "sabre"))]
+        backend.ensure_available()?;
         command.stdin(output_backend_stdin()?);
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
