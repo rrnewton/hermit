@@ -406,29 +406,126 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::EFAULT.into());
         };
 
-        // Known limit: the scheduler keeps this copy of the mask, and the real
-        // call copies it again from the guest pointer once the thread has left
-        // the run queue. A sibling that rewrites the sigset in between, which
-        // races with the call in the guest program itself, can make the two
-        // differ, and the kernel's copy then lands at a host-timed moment.
-        // This is the non-interference assumption the scheduler already makes
-        // for every action it starts in the background; see the `BACKGROUND`
-        // commit in `Scheduler::block_for_one_resource`.
-        let temporary_mask = self.read_rt_sigsuspend_mask(guest, mask_addr).await?;
-        let pending = self.blocked_pending_signals(guest).await?;
+        // The scheduler decides from this copy of the mask whether another
+        // guest's signal wakes the thread, and on a backend that reports
+        // interrupted waits it then holds the turn until that report arrives.
+        // The real call would copy the mask again from the guest pointer once
+        // the thread has left the run queue. A sibling that rewrote the sigset
+        // in between to block the signal would leave the thread asleep, and
+        // the scheduler would wait forever for its report. So the kernel is
+        // made to copy this mask itself; see `pin_rt_sigsuspend_mask`. Where
+        // that is not possible, the wait is harvested like other external IO,
+        // which does not rely on a report.
+        let (temporary_mask, mask_read_directly) =
+            self.read_rt_sigsuspend_mask(guest, mask_addr).await?;
+        let (pending, pending_read_directly) = self.blocked_pending_signals(guest).await?;
 
-        if pending & !temporary_mask != 0 {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): a report is relied on only when the
+        // kernel installs exactly the mask the scheduler keeps.
+        let reports = self.cfg.backend_reports_signal_interrupted_external_io;
+        let pinned = if reports && mask_read_directly && pending_read_directly {
+            self.pin_rt_sigsuspend_mask(guest, mask_addr, temporary_mask)
+                .await
+        } else {
+            None
+        };
+
+        let res = if pending & !temporary_mask != 0 {
             // The kernel will consume an already-pending signal as soon as it
             // atomically installs the temporary mask. Keep this immediate case
             // out of the terminal-wait classification; the real syscall still
             // performs delivery and restores the old mask.
             self.record_or_replay_blocking(guest, call.into()).await
-        } else {
+        } else if pinned.is_some() || !reports {
+            // A backend that does not report interrupted waits keeps the
+            // thread in the scheduler's pool and never waits for a report.
             self.record_or_replay_rt_sigsuspend(guest, call, temporary_mask)
                 .await
+        } else {
+            tracing::warn!(
+                "[dtid {}] cannot make rt_sigsuspend install the scheduler's copy of its mask; waiting for it as external IO",
+                guest.thread_state().dettid
+            );
+            self.record_or_replay_blocking(guest, call.into()).await
+        };
+
+        match pinned {
+            Some(pin) => Self::unpin_rt_sigsuspend_mask(guest, pin, res).await,
+            None => res,
         }
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): the kernel copies the scheduler's mask.
+    /// Make the pending `rt_sigsuspend` copy `mask`, the copy the scheduler
+    /// keeps, instead of whatever the guest's sigset holds when the call runs.
+    ///
+    /// The mask is pushed below the thread's red zone, where injected syscalls
+    /// keep their arguments, and the call's first argument register is
+    /// pointed at it. The ptrace backend resumes the pending syscall in place
+    /// with the thread's registers, so the kernel copies this mask and a
+    /// sibling's later store to the guest's sigset is ordered after that copy.
+    /// Linux allows that order: the sibling's store raced with the call.
+    ///
+    /// TODO-HUMAN-REVIEW(PR-3229): at a `syscall` instruction that e9patch
+    /// preprocessing rewrote in the main executable, Reverie re-issues the
+    /// call from its own arguments instead of the thread's registers, so the
+    /// kernel there still copies the guest's sigset.
+    ///
+    /// Returns `None` and leaves the registers untouched when the stack pointer
+    /// leaves no room below the red zone, when the copy would overlap the
+    /// guest's sigset, or when the copy or the register cannot be written.
+    /// Otherwise returns the guard that keeps the copy reserved and the
+    /// guest's register value, which `unpin_rt_sigsuspend_mask` restores.
+    async fn pin_rt_sigsuspend_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        guest_mask: Addr<'_, libc::sigset_t>,
+        mask: KernelSigset,
+    ) -> Option<(<G::Stack as Stack>::StackGuard, u64)> {
+        // The scratch stack starts 128 bytes below the stack pointer and its
+        // addresses are computed by subtraction.
+        let regs = guest.regs().await;
+        if usize::try_from(regs.rsp).map_or(true, |rsp| rsp <= 128 + KERNEL_SIGSET_SIZE) {
+            return None;
+        }
+        let mut stack = guest.stack().await;
+        let copy = stack.push(mask);
+        if sigsets_overlap(guest_mask.as_raw(), copy.as_raw()) {
+            return None;
+        }
+        let guard = stack.commit().ok()?;
+        let mut pinned = regs;
+        pinned.rdi = copy.as_raw() as u64;
+        guest.set_regs(pinned).await.ok()?;
+        Some((guard, regs.rdi))
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): the guest's register is back before a
+    // signal frame saves it or a restart reads it.
+    /// Point the call's first argument back at the guest's sigset after a
+    /// pinned `rt_sigsuspend` returns, before the thread leaves its syscall
+    /// exit. A caught signal saves this register in its frame, a restarted
+    /// call reads the guest's sigset through it again, and the guest expects
+    /// the syscall to preserve it.
+    async fn unpin_rt_sigsuspend_mask<G: Guest<Self>>(
+        guest: &mut G,
+        (guard, guest_rdi): (<G::Stack as Stack>::StackGuard, u64),
+        res: Result<i64, Error>,
+    ) -> Result<i64, Error> {
+        let mut regs = guest.regs().await;
+        regs.rdi = guest_rdi;
+        let restored = guest.set_regs(regs).await;
+        drop(guard);
+        let ret = res?;
+        restored?;
+        Ok(ret)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): the returned flag gates the pin.
     /// The temporary mask an `rt_sigsuspend` passes, read without using up the
     /// pending syscall where the backend allows it.
     ///
@@ -443,14 +540,19 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `read_exact_with_user_access` is `process_vm_readv`, which, unlike a
     /// ptrace peek, refuses a page the guest cannot read. The real call copies
     /// the mask from the same guest pointer, so the kernel still decides
-    /// whether the guest gets `EFAULT`. A read that fails falls back to the
+    /// whether the guest gets `EFAULT`. `pin_rt_sigsuspend_mask` points the
+    /// call at Detcore's copy instead only after this read has shown that the
+    /// guest can read its sigset. A read that fails falls back to the
     /// probe, because `process_vm_readv` also refuses some pages the guest can
     /// read, such as a write-only mapping.
+    ///
+    /// The flag is true when the mask was read without the probe, so the
+    /// pending syscall is still intact.
     async fn read_rt_sigsuspend_mask<G: Guest<Self>>(
         &self,
         guest: &mut G,
         address: Addr<'_, libc::sigset_t>,
-    ) -> Result<KernelSigset, Error> {
+    ) -> Result<(KernelSigset, bool), Error> {
         if self.cfg.backend_reports_signal_interrupted_external_io {
             let mut mask = [0_u8; KERNEL_SIGSET_SIZE];
             if guest
@@ -458,7 +560,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .read_exact_with_user_access(address.cast::<u8>(), &mut mask)
                 .is_ok()
             {
-                return Ok(KernelSigset::from_ne_bytes(mask));
+                return Ok((KernelSigset::from_ne_bytes(mask), true));
             }
             // The probe makes the real call an injection again, so say so in
             // the compared log, as `blocked_pending_signals` does.
@@ -467,9 +569,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 guest.thread_state().dettid
             );
         }
-        read_kernel_sigset(guest, address).await
+        Ok((read_kernel_sigset(guest, address).await?, false))
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): the returned flag gates the pin.
     /// The signals pending for the thread or its process that the thread
     /// blocks, as `rt_sigpending` reports them.
     ///
@@ -484,8 +588,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// logged `ERESTARTSYS` in one run and the kernel's `ERESTARTNOHAND` in
     /// the next: a `--verify` divergence. Resuming the pending syscall lets
     /// the kernel see the signal and return `ERESTARTNOHAND` either way. See
-    /// `external_io_signal_mask` for the same hazard.
-    async fn blocked_pending_signals<G: Guest<Self>>(&self, guest: &mut G) -> Result<u64, Error> {
+    /// `external_io_signal_mask` for the same hazard. The flag is true when
+    /// procfs answered, so the pending syscall is still intact.
+    async fn blocked_pending_signals<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(u64, bool), Error> {
         if self.cfg.backend_reports_signal_interrupted_external_io {
             let tid = guest.tid();
             let pending = std::fs::read_to_string(format!("/proc/{}/status", tid.as_raw()))
@@ -493,7 +601,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .as_deref()
                 .and_then(blocked_pending_signals_from_proc_status);
             if let Some(pending) = pending {
-                return Ok(pending);
+                return Ok((pending, true));
             }
             // A stopped tracee's status is always readable; if it is not,
             // fall back to asking the kernel, and say so in the compared log.
@@ -514,7 +622,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest.inject_with_retry(pending_call).await?;
         let pending: u64 = guest.memory().read_value(pending_addr)?;
         drop(pending_guard);
-        Ok(pending)
+        Ok((pending, false))
     }
 
     /// rt_sigaction
@@ -920,6 +1028,13 @@ fn should_notify_cross_task_signal(sender: DetTid, target: DetTid, raw_signal: i
     raw_signal != 0 && target != sender
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3229): keeps the pinned copy off the guest's sigset.
+/// Whether kernel-sized sigsets at these two addresses share a byte.
+fn sigsets_overlap(a: usize, b: usize) -> bool {
+    a < b.saturating_add(KERNEL_SIGSET_SIZE) && b < a.saturating_add(KERNEL_SIGSET_SIZE)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -929,6 +1044,17 @@ mod tests {
             tv_sec: seconds,
             tv_usec: micros,
         }
+    }
+
+    #[test]
+    fn sigsets_overlap_exactly_when_they_share_a_byte() {
+        assert!(sigsets_overlap(0x1000, 0x1000));
+        assert!(sigsets_overlap(0x1000, 0x1007));
+        assert!(sigsets_overlap(0x1007, 0x1000));
+        assert!(!sigsets_overlap(0x1000, 0x1008));
+        assert!(!sigsets_overlap(0x1008, 0x1000));
+        assert!(sigsets_overlap(usize::MAX - 3, usize::MAX - 7));
+        assert!(!sigsets_overlap(usize::MAX - 7, usize::MAX - 15));
     }
 
     #[test]

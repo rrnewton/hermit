@@ -368,8 +368,10 @@ pub struct RtSigsuspendWait {
     /// and then restores the original mask, so a signal sent to this thread
     /// now can be left pending under a mask the scheduler never saw. The
     /// scheduler no longer knows which signals the thread takes. Set by
-    /// `notify_signal_pending`. On a backend that reports every signal
-    /// delivered to a blocked thread
+    /// `notify_signal_pending`, or when the thread enters the pool if that
+    /// signal came after it asked to begin the wait; see
+    /// `Scheduler::rt_sigsuspend_released_before_entry`. On a backend that
+    /// reports every signal delivered to a blocked thread
     /// (`backend_reports_signal_interrupted_external_io`), the next scheduler
     /// step moves a released waiter back to the run queue to await that
     /// report; see `requeue_signal_released_waiters`.
@@ -751,6 +753,16 @@ pub struct Scheduler {
     /// in waitid or restartable internal IO polling. Applied at step2, where
     /// run-queue mutation is safe.
     pending_cross_task_signals: BTreeMap<DetTid, Vec<SigWrapper>>,
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): a sibling may run between a waiter's
+    // `BlockingRtSigsuspend` request and its pool entry.
+    /// `rt_sigsuspend` operations that another guest's signal released after
+    /// the thread asked to begin them and before it entered the pool. The
+    /// thread's temporary mask admits the signal, so the call it is about to
+    /// run returns at once; the pool entry starts released. See
+    /// `notify_signal_pending`.
+    rt_sigsuspend_released_before_entry: BTreeMap<DetTid, ExternalOpId>,
 
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
@@ -1911,6 +1923,7 @@ impl Scheduler {
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
+            rt_sigsuspend_released_before_entry: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             empty_queue_kick_turn: None,
@@ -2446,6 +2459,7 @@ impl Scheduler {
         self.remove_blocking_entries(dtid);
         self.remove_physical_thread(dtid, mm);
         self.vfork_registration_origins.remove(dtid);
+        self.rt_sigsuspend_released_before_entry.remove(dtid);
         self.real_timers.retire_task(*detpid, *dtid);
         self.retire_parked_requests(*dtid);
 
@@ -3950,11 +3964,22 @@ impl Scheduler {
     /// `ExternalIoWait::released`.
     /// The send happened at this guest's deterministic point, so the mark is
     /// deterministic too.
+    ///
+    /// A target that has asked to begin `rt_sigsuspend` but has not yet
+    /// entered the pool is marked too, and enters it released: its request
+    /// was posted at its own deterministic point, and the signal, already
+    /// queued when the call starts, ends the wait at once.
     pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
-        if let Some(wait) = self.blocked.rt_sigsuspend_blockers.get_mut(&dettid)
-            && !wait.blocks_raw(signal.raw())
-        {
-            wait.released = true;
+        if let Some(wait) = self.blocked.rt_sigsuspend_blockers.get_mut(&dettid) {
+            if !wait.blocks_raw(signal.raw()) {
+                wait.released = true;
+            }
+        } else if let Some(op_id) = self.requested_rt_sigsuspend_admitting(dettid, signal.raw()) {
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // TODO-HUMAN-REVIEW(PR-3229): without this mark the scheduler
+            // missed the report until some later signal released the wait.
+            self.rt_sigsuspend_released_before_entry
+                .insert(dettid, op_id);
         }
         if let Some(wait) = self.blocked.external_io_blockers.get_mut(&dettid)
             && wait.known_to_admit_raw(signal.raw())
@@ -3969,6 +3994,32 @@ impl Scheduler {
                 signals.push(signal);
             }
         }
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): the request is read, never rewritten.
+    /// The operation of the `rt_sigsuspend` that `dettid` has asked to begin
+    /// and not yet begun, when its temporary mask admits the raw `signal`.
+    fn requested_rt_sigsuspend_admitting(
+        &self,
+        dettid: DetTid,
+        signal: i32,
+    ) -> Option<ExternalOpId> {
+        let resources = self
+            .next_turns
+            .get(&dettid)
+            .and_then(|next_turn| next_turn.req.try_read())
+            .and_then(Result::ok)?;
+        resources
+            .resources
+            .keys()
+            .find_map(|resource| match resource {
+                ResourceID::BlockingRtSigsuspend {
+                    op_id,
+                    temporary_mask,
+                } if !sigset_blocks(*temporary_mask, signal) => Some(*op_id),
+                _ => None,
+            })
     }
 
     /// Requeue every waiter that another guest's signal released, on a backend
@@ -4968,7 +5019,13 @@ impl Scheduler {
                 // BlockedExternalContinue do we record which blocked pool owns it.
                 let started_twice =
                     if let ResourceID::BlockingRtSigsuspend { temporary_mask, .. } = rid {
-                        let wait = RtSigsuspendWait::new(*op_id, *temporary_mask);
+                        let mut wait = RtSigsuspendWait::new(*op_id, *temporary_mask);
+                        // AUTONOMOUS-BOT-IMPLEMENTED
+                        // TODO-HUMAN-REVIEW(PR-3229): a signal sent since the
+                        // request ends the wait at once; see
+                        // `notify_signal_pending`.
+                        wait.released = self.rt_sigsuspend_released_before_entry.remove(&dettid)
+                            == Some(*op_id);
                         self.blocked
                             .rt_sigsuspend_blockers
                             .insert(dettid, wait)
@@ -9713,6 +9770,50 @@ mod test {
 
         assert!(scheduler.step2_drain_prefix().is_ok());
 
+        assert!(scheduler.run_queue.contains_tid(waiter));
+        assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): pins the pre-entry release that the
+    // sigsuspend_sibling_signal_wake raw-race phase exercises end to end.
+    #[test]
+    fn a_signal_sent_before_the_rt_sigsuspend_grant_releases_the_pool_entry() {
+        // A sibling can run between the waiter's `BlockingRtSigsuspend`
+        // request and the grant that enters it in the pool. The signal is
+        // already queued when the real call starts, so the kernel returns at
+        // once, and the entry must begin released for the step2 drain to
+        // await that report.
+        let (mut scheduler, _leader, waiter) = external_io_group(&Config::default());
+        let op_id = ExternalOpId::new(waiter, 7);
+        let begin = ResourceID::BlockingRtSigsuspend {
+            op_id,
+            temporary_mask: 1_u64 << (Signal::SIGUSR2 as i32 - 1),
+        };
+        let mut request = Resources::new(waiter);
+        request.insert(begin.clone(), Permission::RW);
+        scheduler.next_turns.get_mut(&waiter).unwrap().req = Ivar::full(Ok(request));
+        scheduler.runqueue_push_back(waiter);
+
+        // The temporary mask blocks SIGUSR2, so it cannot end the wait.
+        scheduler.notify_signal_pending(waiter, SigWrapper(libc::SIGUSR2));
+        assert!(scheduler.rt_sigsuspend_released_before_entry.is_empty());
+        scheduler.notify_signal_pending(waiter, SigWrapper(libc::SIGUSR1));
+        assert_eq!(
+            scheduler.rt_sigsuspend_released_before_entry.get(&waiter),
+            Some(&op_id)
+        );
+
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(waiter), Some(waiter));
+        assert!(
+            scheduler
+                .block_for_one_resource(waiter, &begin, &Permission::RW, None, &Ivar::new())
+                .is_err()
+        );
+        assert!(scheduler.blocked.rt_sigsuspend_blockers[&waiter].released);
+        assert!(scheduler.rt_sigsuspend_released_before_entry.is_empty());
+
+        assert!(scheduler.step2_drain_prefix().is_ok());
         assert!(scheduler.run_queue.contains_tid(waiter));
         assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
     }
