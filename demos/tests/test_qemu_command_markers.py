@@ -974,6 +974,24 @@ class Demo6ResumeTest(unittest.TestCase):
                 )
                 self.assertIs(caught.exception.__cause__, stopped_by)
 
+    def test_a_log_found_past_the_cap_after_hermit_exited_says_only_when_it_was_checked(self):
+        # The size checked after Hermit exited, or after the copy of its output
+        # ended, was past the cap, and nothing was seen still writing.
+        transcript = FRAME_BEGIN + b"\r\n| done\r\n" + _end(0) + b"\r\n"
+        log_cap = self.demo6["LogCapExceeded"](
+            Path("hermit-info.log"), 536871936, 536870912, 16.25, exit_status=0, final_check=True
+        )
+        with self.assertRaises(RuntimeError) as caught:
+            self._resume(transcript, "echo done", stopped_by=log_cap)
+        self.assertEqual(
+            str(caught.exception),
+            "Hermit's INFO log hermit-info.log was 536871936 bytes, past the "
+            "536870912-byte cap (QEMU_MAX_LOG_BYTES), when checked 16.2s into the "
+            "resume, after Hermit had exited with status 0, and anything Hermit left "
+            "running was stopped; the guest command had finished with exit status 0",
+        )
+        self.assertIs(caught.exception.__cause__, log_cap)
+
     def test_the_guest_state_is_read_from_the_serial_log(self):
         progress = self.demo6["guest_command_progress"]
         serial_log = self.directory / "serial.log"

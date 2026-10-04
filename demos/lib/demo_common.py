@@ -1569,6 +1569,13 @@ class LogCapExceeded(RuntimeError):
     wait_for_process raises it while the launched process runs. drain_output
     raises it after that process exited while processes it left behind still
     wrote to the log; ``exit_status`` is then the launched process's exit status.
+
+    Each also checks the size once more before it returns: wait_for_process
+    once the launched process has exited, drain_output once the copy of its
+    output has ended. A log past the cap then raises this with
+    ``final_check`` set and ``exit_status`` the launched process's exit
+    status. Nothing was then seen still writing to the log, so the message
+    says only when the size was checked.
     """
 
     def __init__(
@@ -1578,8 +1585,17 @@ class LogCapExceeded(RuntimeError):
         max_log_bytes: int,
         elapsed: float,
         exit_status: Optional[int] = None,
+        final_check: bool = False,
     ):
-        if exit_status is None:
+        if final_check:
+            message = (
+                "{} was {} bytes, past the {}-byte log cap, when checked after the "
+                "launched process exited with status {}; anything left in its "
+                "process group was stopped".format(
+                    log_path, log_size, max_log_bytes, exit_status
+                )
+            )
+        elif exit_status is None:
             message = "{} grew to {} bytes, past the {}-byte log cap; the run was stopped".format(
                 log_path, log_size, max_log_bytes
             )
@@ -1596,6 +1612,15 @@ class LogCapExceeded(RuntimeError):
         # Seconds from the start of the run (or of the wait) until the cap was seen.
         self.elapsed = elapsed
         self.exit_status = exit_status
+        self.final_check = final_check
+
+
+def _log_size(log_path: Path) -> int:
+    """The size of ``log_path`` in bytes, or 0 while it does not exist."""
+    try:
+        return Path(log_path).stat().st_size
+    except FileNotFoundError:
+        return 0
 
 
 def wait_for_process(
@@ -1613,9 +1638,11 @@ def wait_for_process(
     TimeoutError is raised. When ``log_path`` and ``max_log_bytes`` are both
     set, the file is also watched: if it grows past the cap, the process group
     is stopped and LogCapExceeded (a RuntimeError) names the cap, so a runaway
-    log cannot fill the disk. Either way the group is stopped before the error
-    is raised, so nothing in it keeps writing while the caller cleans up. The
-    caller is expected to have started the process with
+    log cannot fill the disk. The size is checked once more after the process
+    exits, before its exit status is returned, so output written since the
+    previous check is held to the cap too. Either way the group is stopped
+    before the error is raised, so nothing in it keeps writing while the caller
+    cleans up. The caller is expected to have started the process with
     ``start_new_session=True``; once the process exits, drain_output keeps the
     same cap while the rest of its output is copied.
 
@@ -1682,6 +1709,22 @@ def wait_for_process(
                         note_first_output()
                         sys.stdout.buffer.write(chunk)
                         sys.stdout.buffer.flush()
+                # The process may have written past the cap, and exited, since
+                # the previous check; that output is checked here, before the
+                # exit status is returned.
+                if log_path is not None and max_log_bytes is not None:
+                    log_size = _log_size(log_path)
+                    if log_size > max_log_bytes:
+                        elapsed = time.monotonic() - started
+                        stop_process_group(process)
+                        raise LogCapExceeded(
+                            Path(log_path),
+                            log_size,
+                            max_log_bytes,
+                            elapsed,
+                            exit_status=return_code,
+                            final_check=True,
+                        )
                 if progress_label is not None:
                     done_elapsed = time.monotonic() - started
                     print(
@@ -1699,10 +1742,7 @@ def wait_for_process(
                 return return_code
 
             if log_path is not None and max_log_bytes is not None:
-                try:
-                    log_size = Path(log_path).stat().st_size
-                except FileNotFoundError:
-                    log_size = 0
+                log_size = _log_size(log_path)
                 if log_size > max_log_bytes:
                     stop_process_group(process)
                     raise LogCapExceeded(
@@ -2108,7 +2148,9 @@ def drain_output(
     waiting, the log is held to the cap wait_for_process applies: once it
     grows past ``max_log_bytes``, the child's group is stopped and
     LogCapExceeded is raised, with ``elapsed`` counted from ``started`` (a
-    time.monotonic() value; by default, when this call began). If the output
+    time.monotonic() value; by default, when this call began). The size is
+    checked once more when the copy ends, before this returns, so output that
+    was all copied between two checks is held to the cap too. If the output
     is still open after ``timeout`` seconds, the group is stopped and
     RuntimeError is raised, naming ``label``.
 
@@ -2130,12 +2172,24 @@ def drain_output(
     while True:
         copier.join(0.1)
         if not copier.is_alive():
+            # The copy has ended, so nothing more reaches the log through it.
+            # Output copied since the previous check is checked here.
+            if log_path is not None and max_log_bytes is not None:
+                log_size = _log_size(log_path)
+                if log_size > max_log_bytes:
+                    elapsed = time.monotonic() - started
+                    stop_process_group(process)
+                    raise LogCapExceeded(
+                        Path(log_path),
+                        log_size,
+                        max_log_bytes,
+                        elapsed,
+                        exit_status=process.returncode,
+                        final_check=True,
+                    )
             return
         if log_path is not None and max_log_bytes is not None:
-            try:
-                log_size = Path(log_path).stat().st_size
-            except FileNotFoundError:
-                log_size = 0
+            log_size = _log_size(log_path)
             if log_size > max_log_bytes:
                 stop_process_group(process)
                 raise LogCapExceeded(

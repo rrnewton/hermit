@@ -268,8 +268,25 @@ def stopped_run_message(error: Exception, serial_log: Path) -> str:
     `sleep 1000000` after about 29 seconds, well before the 120-second
     QEMU_TIMEOUT. Neither bound can end in SUCCESS. The cap also holds after
     Hermit exits, while processes it left running still write to its output
-    (see drain_output); LogCapExceeded then carries Hermit's exit status.
+    (see drain_output); LogCapExceeded then carries Hermit's exit status. It
+    carries it too when the log was found past the cap by the check made once
+    Hermit had exited, or once the copy of its output had ended
+    (``final_check``); nothing was then seen still writing.
     """
+    if isinstance(error, LogCapExceeded) and error.final_check:
+        cause = (
+            "Hermit's INFO log {} was {} bytes, past the {}-byte cap "
+            "(QEMU_MAX_LOG_BYTES), when checked {:.1f}s into the resume, after "
+            "Hermit had exited with status {}, and anything Hermit left running "
+            "was stopped".format(
+                error.log_path,
+                error.log_size,
+                error.max_log_bytes,
+                error.elapsed,
+                error.exit_status,
+            )
+        )
+        return "{}; {}".format(cause, guest_command_progress(serial_log, hermit_exited=True))
     if isinstance(error, LogCapExceeded) and error.exit_status is not None:
         cause = (
             "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
