@@ -28,6 +28,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import runpy
 import subprocess
 import sys
@@ -42,6 +43,7 @@ REPOSITORY_ROOT = DEMOS_DIR.parent
 sys.path.insert(0, str(DEMOS_DIR / "lib"))
 
 import demo_common as dc  # noqa: E402
+import drgn_hermit as dh  # noqa: E402
 
 INITRAMFS = b"stand-in for the initramfs"
 SNAPSHOT = b"stand-in for the demo 5 boot snapshot"
@@ -738,6 +740,333 @@ class Demo5RecordTest(_StandIns):
             },
         )
         self.assert_record(custom, INITRAMFS)
+
+
+class Demo7EnsureBootSnapshotTest(_StandIns):
+    """Demo 7 accepts the boot snapshot by demo 6's rules
+    (drgn_hermit.ensure_boot_snapshot), not because it exists."""
+
+    def setUp(self):
+        super().setUp()
+        self.rebuilds = 0
+
+    def ensure(self, snapshot: Path, demo5=None) -> str:
+        """Run ensure_boot_snapshot for ``snapshot``; ``demo5`` stands in for
+        demo 5 when it is run. Returns what was printed."""
+
+        def rebuild():
+            self.rebuilds += 1
+            if demo5 is not None:
+                demo5()
+
+        printed = io.StringIO()
+        with contextlib.redirect_stdout(printed):
+            dh.ensure_boot_snapshot(snapshot, self.root, self.assets, rebuild)
+        return printed.getvalue()
+
+    def demo5_saves(self, data: bytes = b"a snapshot of the current initramfs"):
+        def demo5():
+            self.snapshot.write_bytes(data)
+            self.record(self.snapshot)
+
+        return demo5
+
+    def test_a_default_snapshot_of_the_current_initramfs_is_used_as_it_is(self):
+        self.snapshot.write_bytes(SNAPSHOT)
+        self.record(self.snapshot)
+        self.ensure(self.snapshot)
+        self.assertEqual(self.rebuilds, 0)
+        self.assertEqual(self.snapshot.read_bytes(), SNAPSHOT)
+
+    def test_a_default_snapshot_without_a_matching_record_is_rebuilt(self):
+        # Demo 7 used to restore any snapshot that existed.
+        for name, prepare, reason in (
+            ("no record", lambda: None, "it has no record"),
+            (
+                "older version",
+                lambda: (self.record(self.snapshot), _write_assets_script(self.root, 10)),
+                "it was booted from initramfs version 9, and demos/lib/qemu-assets.sh "
+                "now builds version 10",
+            ),
+            (
+                "replaced snapshot",
+                lambda: (self.record(self.snapshot), self.snapshot.write_bytes(b"replaced")),
+                "{} has SHA-256 {}".format(self.snapshot, _sha256(b"replaced")),
+            ),
+        ):
+            with self.subTest(case=name):
+                _write_assets_script(self.root, 9)
+                dc.boot_snapshot_record_path(self.snapshot).unlink(missing_ok=True)
+                self.snapshot.write_bytes(SNAPSHOT)
+                prepare()
+                self.rebuilds = 0
+                printed = self.ensure(self.snapshot, demo5=self.demo5_saves())
+                self.assertEqual(self.rebuilds, 1)
+                self.assertIn(
+                    "Demo 5 boot snapshot {} is not from the current initramfs: "
+                    "{}".format(self.snapshot, reason),
+                    printed,
+                )
+                dc.verify_boot_snapshot(self.snapshot, self.root, self.assets)
+
+    def test_a_missing_default_snapshot_is_built(self):
+        printed = self.ensure(self.snapshot, demo5=self.demo5_saves())
+        self.assertEqual(self.rebuilds, 1)
+        self.assertIn("Demo 5 boot snapshot missing; running demo 5 first...", printed)
+
+    def test_demo5_that_leaves_a_snapshot_without_a_record_fails(self):
+        self.snapshot.write_bytes(SNAPSHOT)
+
+        def demo5():
+            self.snapshot.write_bytes(b"a snapshot without a record")
+
+        with self.assertRaises(RuntimeError) as caught:
+            self.ensure(self.snapshot, demo5=demo5)
+        self.assertTrue(
+            str(caught.exception).startswith(
+                "Demo 5 ran, but {} still does not match the current initramfs: it has "
+                "no record".format(self.snapshot)
+            ),
+            str(caught.exception),
+        )
+
+    def test_demo5_that_saves_no_snapshot_fails(self):
+        with self.assertRaises(RuntimeError) as caught:
+            self.ensure(self.snapshot)
+        self.assertEqual(str(caught.exception), "Demo 5 did not produce {}".format(self.snapshot))
+
+    def test_a_custom_snapshot_without_a_matching_record_is_refused(self):
+        custom = self.directory / "custom-boot.qcow2"
+        record_path = dc.boot_snapshot_record_path(custom)
+        for name, prepare, reason in (
+            ("no record", lambda: None, "it has no record of the initramfs it was booted from"),
+            (
+                "another initramfs",
+                lambda: (self.record(custom), self.initramfs.write_bytes(b"another initramfs")),
+                "it was booted from an initramfs with SHA-256 {}".format(_sha256(INITRAMFS)),
+            ),
+            (
+                "replaced snapshot",
+                lambda: (self.record(custom), custom.write_bytes(b"replaced")),
+                "{} has SHA-256 {}".format(custom, _sha256(b"replaced")),
+            ),
+        ):
+            with self.subTest(case=name):
+                self.initramfs.write_bytes(INITRAMFS)
+                record_path.unlink(missing_ok=True)
+                custom.write_bytes(SNAPSHOT)
+                prepare()
+                before = custom.read_bytes()
+                self.rebuilds = 0
+                with self.assertRaises(RuntimeError) as caught:
+                    self.ensure(custom, demo5=self.demo5_saves())
+                message = str(caught.exception)
+                self.assertTrue(
+                    message.startswith(
+                        "refusing to restore the custom boot snapshot {} "
+                        "(DEMO07_SNAPSHOT_DISK): {}".format(custom, reason)
+                    ),
+                    message,
+                )
+                self.assertIn(
+                    "Rebuild it by running demo 5 with QEMU_SNAPSHOT_DISK={} and the same "
+                    "QEMU_ASSETS, or unset DEMO07_SNAPSHOT_DISK".format(custom),
+                    message,
+                )
+                self.assertIsInstance(caught.exception.__cause__, dc.BootSnapshotMismatch)
+                # Demo 5 did not run, and nothing was touched.
+                self.assertEqual(self.rebuilds, 0)
+                self.assertEqual(custom.read_bytes(), before)
+                self.assertFalse(self.snapshot.exists())
+
+    def test_a_custom_snapshot_of_the_current_initramfs_is_used(self):
+        custom = self.directory / "custom-boot.qcow2"
+        custom.write_bytes(SNAPSHOT)
+        self.record(custom)
+        self.ensure(custom)
+        self.assertEqual(self.rebuilds, 0)
+
+    def test_a_missing_custom_snapshot_is_refused(self):
+        custom = self.directory / "custom-boot.qcow2"
+        with self.assertRaises(RuntimeError) as caught:
+            self.ensure(custom, demo5=self.demo5_saves())
+        self.assertEqual(
+            str(caught.exception),
+            "missing custom boot snapshot: {}; produce it before demo 7".format(custom),
+        )
+        self.assertEqual(self.rebuilds, 0)
+
+
+class Demo7RestoreCopyTest(_StandIns):
+    """Each demo 7 pass checks the copy of the boot snapshot QEMU restores."""
+
+    def setUp(self):
+        super().setUp()
+        for name in ("hermit", "qemu", "bzImage", "vmlinux"):
+            (self.directory / name).write_bytes(b"")
+        self.snapshot.write_bytes(SNAPSHOT)
+        self.record(self.snapshot)
+        environment = mock.patch.dict(
+            os.environ, {"QEMU_SOCKET_DIR": str(self.directory / "sockets")}
+        )
+        environment.start()
+        self.addCleanup(environment.stop)
+        self.config = dh.GuestConfig(
+            root=self.root,
+            hermit=self.directory / "hermit",
+            qemu=self.directory / "qemu",
+            kernel=self.directory / "bzImage",
+            initrd=self.initramfs,
+            vmlinux=self.directory / "vmlinux",
+            snapshot_disk=self.snapshot,
+            snapshot_name="hermit-boot",
+            advance_command="echo deterministic",
+            artifact_dir=self.directory / "artifacts",
+            assets=self.assets,
+        )
+
+    def start(self, copy=None):
+        """Run start() until it would start Hermit; ``copy`` replaces the copy
+        of the snapshot. Returns the error start() raised and whether Hermit
+        was started."""
+        popen = mock.Mock(side_effect=ReachedHermit)
+        program = dh.HermitGuestProgram(self.config)
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(dh, "ensure_vmlinux", return_value=self.config.vmlinux)
+            )
+            stack.enter_context(mock.patch.object(dh.subprocess, "Popen", popen))
+            if copy is not None:
+                stack.enter_context(mock.patch.object(dh.shutil, "copyfile", copy))
+            try:
+                program.start()
+            except Exception as error:  # noqa: BLE001 - returned to the test
+                caught = error
+            else:
+                caught = None
+        return caught, popen.called
+
+    def test_a_matching_copy_is_restored(self):
+        caught, started = self.start()
+        self.assertIsInstance(caught, ReachedHermit)
+        self.assertTrue(started)
+
+    def test_a_copy_that_does_not_match_the_record_is_not_restored(self):
+        # The snapshot still matches its record; only the copy QEMU would
+        # restore does not. A check of the snapshot alone would accept it.
+        def copy_other_bytes(source, destination):
+            Path(destination).write_bytes(b"other bytes than the snapshot")
+
+        caught, started = self.start(copy=copy_other_bytes)
+        self.assertIsInstance(caught, RuntimeError)
+        self.assertIsInstance(caught.__cause__, dc.BootSnapshotMismatch)
+        message = str(caught)
+        self.assertRegex(
+            message,
+            r"^the copy \S+/snapshot\.qcow2 of the boot snapshot {} does not match "
+            r"demo 5's record: \S+/snapshot\.qcow2 has SHA-256 {}".format(
+                re.escape(str(self.snapshot)), _sha256(b"other bytes than the snapshot")
+            ),
+        )
+        self.assertFalse(started)
+        dc.verify_boot_snapshot(self.snapshot, self.root, self.assets)
+
+    def test_a_snapshot_replaced_after_the_check_is_not_restored(self):
+        self.snapshot.write_bytes(b"replaced after the check")
+        caught, started = self.start()
+        self.assertIsInstance(caught, RuntimeError)
+        self.assertIsInstance(caught.__cause__, dc.BootSnapshotMismatch)
+        self.assertIn("demo 5 may have replaced the boot snapshot", str(caught))
+        self.assertFalse(started)
+
+    def test_a_snapshot_of_another_initramfs_is_not_restored(self):
+        self.initramfs.write_bytes(b"another initramfs")
+        caught, started = self.start()
+        self.assertIsInstance(caught, RuntimeError)
+        self.assertIn(
+            "it was booted from an initramfs with SHA-256 {}".format(_sha256(INITRAMFS)),
+            str(caught),
+        )
+        self.assertFalse(started)
+
+
+class Demo7ChecksTheSnapshotFirstTest(unittest.TestCase):
+    """Demo 7's drgn script checks the boot snapshot before its first pass."""
+
+    def setUp(self):
+        names = ("drgn", "drgn.helpers", "drgn.helpers.linux", "drgn.helpers.linux.list")
+        stubs = {name: types.ModuleType(name) for name in names}
+        stubs["drgn.helpers.linux.list"].list_for_each_entry = mock.Mock()
+        with mock.patch.dict(sys.modules, stubs), mock.patch.object(sys, "path", list(sys.path)):
+            self.module = runpy.run_path(
+                str(DEMOS_DIR / "07-drgn-kernel" / "task_evolution.py"),
+                run_name="demo07_task_evolution",
+            )
+        self.environment = {
+            "DEMO07_RUNS": "2",
+            "DEMO07_TASK_LIMIT": "16",
+            "DEMO07_SNAPSHOT_DISK": "assets-dir/hermit-boot.qcow2",
+            "DEMO07_ASSETS": "assets-dir",
+        }
+
+    def test_the_snapshot_is_checked_before_any_pass(self):
+        events = []
+        main = self.module["main"]
+        with mock.patch.dict(
+            main.__globals__,
+            {
+                "_config": lambda: object(),
+                "ensure_boot_snapshot": lambda *arguments: events.append(
+                    ("ensure",) + arguments
+                ),
+                "_run_once": mock.Mock(
+                    side_effect=lambda *_: events.append(("pass",)) or ReachedHermit()
+                ),
+            },
+        ), mock.patch.dict(os.environ, self.environment):
+            with self.assertRaises(Exception):
+                main()
+        self.assertEqual(
+            events[0],
+            (
+                "ensure",
+                Path("assets-dir/hermit-boot.qcow2"),
+                REPOSITORY_ROOT,
+                Path("assets-dir"),
+                main.__globals__["_rebuild_boot_snapshot"],
+            ),
+        )
+        self.assertEqual(events[1], ("pass",))
+
+    def test_a_refused_snapshot_starts_no_pass(self):
+        run_once = mock.Mock()
+
+        def refuse(*_):
+            raise RuntimeError("refusing to restore the custom boot snapshot")
+
+        main = self.module["main"]
+        with mock.patch.dict(
+            main.__globals__,
+            {"_config": lambda: object(), "ensure_boot_snapshot": refuse, "_run_once": run_once},
+        ), mock.patch.dict(os.environ, self.environment):
+            with self.assertRaises(RuntimeError):
+                main()
+        run_once.assert_not_called()
+
+    def test_the_rebuild_runs_demo_5_with_demo_7s_assets(self):
+        run = mock.Mock()
+        rebuild = self.module["_rebuild_boot_snapshot"]
+        with mock.patch.object(subprocess, "run", run), mock.patch.dict(
+            os.environ, self.environment
+        ):
+            rebuild()
+        run.assert_called_once()
+        self.assertEqual(
+            run.call_args.args[0],
+            ["make", "--no-print-directory", "-C", str(DEMOS_DIR), "demo5"],
+        )
+        self.assertEqual(run.call_args.kwargs["env"]["QEMU_ASSETS"], "assets-dir")
+        self.assertTrue(run.call_args.kwargs["check"])
 
 
 if __name__ == "__main__":

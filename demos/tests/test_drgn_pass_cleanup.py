@@ -59,6 +59,19 @@ def _hermit_options(argv):
     return argv[argv.index("run") + 1 : argv.index("--")]
 
 
+def _record_boot_snapshot(root: Path, assets: Path) -> None:
+    """Give ``assets``/hermit-boot.qcow2 the record demo 5 writes, so that
+    start() restores it: ``root`` is a stand-in checkout whose qemu-assets.sh
+    builds INITRAMFS_VERSION 9, and ``assets`` holds the initramfs."""
+    script = root / "demos/lib/qemu-assets.sh"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("INITRAMFS_VERSION=9\n")
+    snapshot = assets / "hermit-boot.qcow2"
+    dc.write_boot_snapshot_record(
+        snapshot, dc.hash_file(snapshot), dc.initramfs_producer(root, assets)
+    )
+
+
 class _PassHarness(unittest.TestCase):
     def setUp(self):
         # Neither the checkout nor the inputs are under host /tmp unless a test
@@ -79,6 +92,7 @@ class _PassHarness(unittest.TestCase):
         for name in ("hermit", "qemu", "bzImage", "initramfs.cpio.gz"):
             (inputs / name).write_bytes(b"")
         (inputs / "hermit-boot.qcow2").write_bytes(b"q" * 4096)
+        _record_boot_snapshot(self.root, inputs)
         return dh.GuestConfig(
             root=self.root,
             hermit=inputs / "hermit",
@@ -90,6 +104,7 @@ class _PassHarness(unittest.TestCase):
             snapshot_name="hermit-boot",
             advance_command="echo deterministic",
             artifact_dir=artifact_dir,
+            assets=inputs,
         )
 
     def _launch_patches(self, config, popen, connect):
