@@ -364,6 +364,66 @@ class WaitForProcessBoundsTest(unittest.TestCase):
         self.assertIsNone(process.returncode, "drain_output reaped the child")
         self._assert_descendant_stops(descendant)
 
+    def _slow_group_stops(self, seconds: float) -> List[float]:
+        """Make every stop_process_group call wait ``seconds`` before it stops the group.
+
+        Returns the list of times (time.monotonic()) at which the calls began.
+        """
+        began: List[float] = []
+        real_stop = dc.stop_process_group
+
+        def slow_stop(process: Optional[subprocess.Popen]) -> None:
+            began.append(time.monotonic())
+            time.sleep(seconds)
+            real_stop(process)
+
+        patcher = mock.patch.object(dc, "stop_process_group", slow_stop)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return began
+
+    def test_the_time_of_a_cap_seen_while_the_child_runs_leaves_out_the_stop(self):
+        # The elapsed time is read when the size is found past the cap. The
+        # group's stop is made 1 s slower, so a time read after the stop is at
+        # least 1 s later than the stop's start.
+        log = self.directory / "hermit-info.log"
+        process, descendant = self._launch(str(log))
+        began = self._slow_group_stops(1.0)
+        called = time.monotonic()
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(dc.LogCapExceeded) as caught:
+                dc.wait_for_process(process, timeout=60, log_path=log, max_log_bytes=4096)
+        error = caught.exception
+        self.assertIsNone(error.exit_status, "the cap was not seen while the child ran")
+        self.assertEqual(len(began), 1)
+        self.assertLessEqual(
+            error.elapsed,
+            began[0] - called,
+            "the elapsed time includes the time it took to stop the group",
+        )
+        self._assert_descendant_stopped(descendant)
+
+    def test_the_time_of_a_cap_seen_in_the_drain_leaves_out_the_stop(self):
+        process, descendant, copier, log = self._leave_behind("write", 7)
+        began = self._slow_group_stops(1.0)
+        called = time.monotonic()
+        with self.assertRaises(dc.LogCapExceeded) as caught:
+            dc.drain_output(
+                copier, process, 60, log_path=log, max_log_bytes=4096, started=called
+            )
+        error = caught.exception
+        self.assertEqual(error.exit_status, 7)
+        self.assertFalse(error.final_check, "the cap was not seen while the output was open")
+        self.assertEqual(len(began), 1)
+        self.assertLessEqual(
+            error.elapsed,
+            began[0] - called,
+            "the elapsed time includes the time it took to stop the group",
+        )
+        self._assert_descendant_stopped(descendant)
+        copier.join(10)
+        self.assertFalse(copier.is_alive(), "the output was still open after the group was stopped")
+
     def _record_signals(self, leader: int) -> List[Tuple[str, int, int, Optional[str]]]:
         """Record every kill() and killpg() made from now on, with ``leader``'s state then.
 

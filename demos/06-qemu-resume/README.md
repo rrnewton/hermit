@@ -353,7 +353,8 @@ scheduler turns instead of 287149.
 A run that does not finish. The guest-side controller has no deadline of its
 own, because time inside Hermit is virtual. Two bounds outside Hermit stop a
 resume that does not end by itself (a command that never exits, or an END
-line that a kernel message hid), and whichever is reached first wins:
+line that a kernel message hid). The demo checks both repeatedly, the size
+first, and the first check that finds a bound passed stops the run:
 
 - `QEMU_MAX_LOG_BYTES`, the size of Hermit's INFO log. At the default log
   filter Hermit wrote 18.5 to 19.2 MB of INFO log per second of resume on
@@ -366,8 +367,10 @@ line that a kernel message hid), and whichever is reached first wins:
 
 Either way the demo prints a FAILURE line that names the bound, the size or
 time it reached, and how far the guest had got, read from the serial log: no
-BEGIN line yet, a BEGIN line with no END line (the command had not finished),
-or an END line while Hermit and QEMU had not exited. Neither ends in
+BEGIN line (the command was not seen to start; a BEGIN line that a kernel
+message split looks the same), a BEGIN line with no END line (the command was
+not seen to finish; an END line that a kernel message hid looks the same), or
+an END line while Hermit and QEMU had not exited. Neither ends in
 `SUCCESS`, and the run exits 1. For example, the command
 `printf '__HERMIT_COMMAND_END__\001status=0\n' >&0; echo __HERMIT_COMMAND_END__ status=0; sleep 1000000`
 ended on 2026-10-03, 30.9 seconds after the demo started, with (path shortened):
@@ -375,6 +378,15 @@ ended on 2026-10-03, 30.9 seconds after the demo started, with (path shortened):
 ```text
 WARN: Demo 6: QEMU Snapshot Resume: FAILURE: Hermit's INFO log .../run-history/resume-20261003T171535.068191Z-2392757/hermit-info.log grew to 538851401 bytes, past the 536870912-byte cap (QEMU_MAX_LOG_BYTES), 29.2s into the resume, so the run was stopped before QEMU_TIMEOUT (120s); the guest command had not finished: the serial log has the __HERMIT_COMMAND_BEGIN__ format=3 line but no END line
 ```
+
+That line was captured before three corrections. The time in a cap message is
+now read when the size is found past the cap, before the processes are
+stopped. The message now says `when checked Ns into the resume (QEMU_TIMEOUT
+is 120s), so the run was stopped` rather than that the run was stopped before
+QEMU_TIMEOUT: when a check finds both bounds passed, the size is checked first
+and is what is reported. A BEGIN line without an END line is now reported as
+`the guest command was not seen to finish`, and a serial log without a BEGIN
+line as `the guest was not seen to start the command`.
 
 At either bound the demo stops Hermit and every process still in Hermit's
 process group before it reports: the group is sent SIGTERM and then SIGKILL,
