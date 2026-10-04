@@ -356,5 +356,74 @@ class TaskEvolutionResultTest(unittest.TestCase):
         self.assertIn("\n" + self._result_line() + "\n", readme)
 
 
+class TaskListDisplayTest(unittest.TestCase):
+    """Demo 7 prints only the first rows of each task list.
+
+    The comparison uses every row, so a row that is not printed can be in the
+    task-list diff. The line that counts the rows left out must not call them
+    unchanged.
+    """
+
+    def setUp(self):
+        self.module = _load_task_evolution()
+
+    def _printed(self, label, rows, limit):
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            self.module._print_tasks(label, rows, limit)
+        return output.getvalue().splitlines()
+
+    def test_rows_left_out_are_counted_but_not_called_unchanged(self):
+        before = [(0, "swapper/0"), (1, "init"), (95, "sleep")]
+        after = [(0, "swapper/0"), (1, "sh"), (101, "sleep"), (102, "sleep")]
+        removed, added = self.module._task_diff(before, after)
+        # Every row after the first, which is the only one shown, is in the
+        # difference.
+        self.assertEqual(sorted(removed + added), sorted(before[1:] + after[1:]))
+        for label, rows, omitted in (("before", before, 2), ("after", after, 3)):
+            with self.subTest(label=label):
+                lines = self._printed(label, rows, 1)
+                self.assertEqual(
+                    lines,
+                    [
+                        "{} tasks ({} total; first 1 shown, pid comm):".format(
+                            label, len(rows)
+                        ),
+                        "      0 swapper/0",
+                        "  ... {} rows omitted from display".format(omitted),
+                    ],
+                )
+                self.assertNotIn("unchanged", "\n".join(lines))
+
+    def test_a_list_within_the_limit_has_no_omission_line(self):
+        # Positive control: nothing is left out, so nothing is counted.
+        rows = [(0, "swapper/0"), (1, "init")]
+        self.assertEqual(
+            self._printed("before", rows, 16),
+            [
+                "before tasks (2 total; first 2 shown, pid comm):",
+                "      0 swapper/0",
+                "      1 init",
+            ],
+        )
+
+    def test_the_readme_shows_the_omission_lines_the_script_prints(self):
+        readme = (DEMO07_DIR / "README.md").read_text()
+        headers = re.findall(
+            r"^(before|after) tasks \((\d+) total; first (\d+) shown, pid comm\):$",
+            readme,
+            re.MULTILINE,
+        )
+        self.assertEqual([label for label, _, _ in headers], ["before", "after"])
+        expected = []
+        for label, total, shown in headers:
+            rows = [(pid, "task") for pid in range(int(total))]
+            expected.append(self._printed(label, rows, int(shown))[-1])
+        in_readme = re.findall(
+            r"^  \.\.\. .*omitted from display$", readme, re.MULTILINE
+        )
+        self.assertEqual(in_readme, expected)
+
+
 if __name__ == "__main__":
     unittest.main()
