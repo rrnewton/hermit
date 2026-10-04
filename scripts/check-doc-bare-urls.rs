@@ -49,12 +49,13 @@
 //! stricter than rustdoc, and the fix for a position rustdoc would not flag is
 //! the same one-line `<...>` wrap. It is also stricter on a module rustdoc
 //! never compiles when what excludes it is a `#[cfg(test)]` above the doc
-//! comment, a `cfg` that is never true, or an enclosing const block: it checks
-//! that module's outer doc. It skips a module with `#[cfg(test)]` between its
-//! doc and the `mod` line, and the bodies of items other than modules marked
-//! `#[doc(hidden)]`, as rustdoc does. It also skips every `macro_rules!` body by its braces, which rustdoc
-//! does not: a `///` inside a local macro the crate invokes is linted after
-//! expansion, and this checker misses it. It does not read `#[doc = ...]`.
+//! comment, a `cfg` that is false when rustdoc builds, or an enclosing const
+//! block: it checks that module's outer doc. It skips a module with
+//! `#[cfg(test)]` between its doc and the `mod` line, and the bodies of items
+//! other than modules marked `#[doc(hidden)]`, as rustdoc does. It also skips
+//! every `macro_rules!` body by its braces, which rustdoc does not: a `///`
+//! inside a local macro the crate invokes is linted after expansion, and this
+//! checker misses it. It does not read `#[doc = ...]`.
 //!
 //! Measured 2026-10-04 on this repository by injecting a distinct bare URL
 //! into each of 6251 doc blocks and running rustdoc nightly under
@@ -146,14 +147,19 @@ fn documented_roots(metadata: &serde_json::Value) -> Result<Vec<(PathBuf, Kind)>
 /// Whether `line`, from a `macro_rules!` body, contains a `mod NAME;`
 /// declaration: a file module, whose path depends on where the macro is
 /// invoked. NAME may be a metavariable (`mod $name;`) and the declaration may
-/// sit inside a repetition (`$(mod $name;)*`). `mod NAME {` declares no file.
+/// sit inside a repetition (`$(mod $name;)*`) or follow a `{` on the same line.
+/// `mod NAME {` declares no file, and neither does text in a string literal or
+/// a `/* */` comment that closes on the same line.
 fn declares_a_module_file(line: &str) -> bool {
-    let mut rest = line;
+    let code = without_literals(line);
+    let mut rest = code.as_str();
     while let Some(at) = rest.find("mod") {
         let before = rest[..at].chars().next_back();
         let after = &rest[at + 3..];
         rest = after;
-        if before.is_some_and(|c| !c.is_whitespace() && c != '(')
+        // Only a character that can continue an identifier (`amod`, `$mod`,
+        // `r#mod`) makes this something other than the keyword.
+        if before.is_some_and(|c| c.is_alphanumeric() || matches!(c, '_' | '$' | '#'))
             || !after.starts_with(char::is_whitespace)
         {
             continue;
@@ -167,6 +173,46 @@ fn declares_a_module_file(line: &str) -> bool {
         }
     }
     false
+}
+
+/// `line` with the contents of its string literals, character literals and
+/// `/* */` comments replaced by spaces.
+fn without_literals(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let mut code = String::with_capacity(line.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        let skip_to = match bytes[index] {
+            b'"' => {
+                let mut end = index + 1;
+                while end < bytes.len() && bytes[end] != b'"' {
+                    end += if bytes[end] == b'\\' { 2 } else { 1 };
+                }
+                end + 1
+            }
+            b'\'' if bytes.get(index + 2) == Some(&b'\'') => index + 3,
+            b'\'' if bytes.get(index + 1) == Some(&b'\\') => bytes[index + 2..]
+                .iter()
+                .position(|b| *b == b'\'')
+                .map_or(index + 1, |offset| index + offset + 3),
+            b'/' if bytes.get(index + 1) == Some(&b'*') => line[index + 2..]
+                .find("*/")
+                .map_or(bytes.len(), |offset| index + offset + 4),
+            _ => {
+                let c = line[index..].chars().next().unwrap_or(' ');
+                code.push(c);
+                index += c.len_utf8();
+                continue;
+            }
+        };
+        let mut skip_to = skip_to.min(bytes.len());
+        while !line.is_char_boundary(skip_to) {
+            skip_to += 1;
+        }
+        code.extend(std::iter::repeat_n(' ', skip_to - index));
+        index = skip_to;
+    }
+    code
 }
 
 /// `line` without its visibility qualifier (`pub`, `pub(crate)`, ...).
@@ -1346,6 +1392,36 @@ pub fn g() {}
     }
 
     #[test]
+    fn macro_body_module_declarations() {
+        for line in [
+            "mod $n;",
+            "pub(crate) mod $n ;",
+            "$(pub mod $n;)*",
+            "($n:ident) => {mod $n; $($t)*};",
+            "[mod $n;]",
+            "mod r#x;",
+            "#[path = \"é.rs\"] mod x;",
+        ] {
+            assert!(declares_a_module_file(line), "{line}");
+        }
+        for line in [
+            "mod $n {",
+            "$(mod $n { })*",
+            "amod x;",
+            "$mod x;",
+            "r#mod x;",
+            "module;",
+            "use super::mod_x;",
+            "const S: &str = \" mod x;\";",
+            "f(/* mod x; */);",
+            "let c = '\"'; let d = \"mod x;\";",
+            "é mod é {",
+        ] {
+            assert!(!declares_a_module_file(line), "{line}");
+        }
+    }
+
+    #[test]
     fn module_paths_follow_declarations() {
         let directory = std::env::temp_dir().join(format!(
             "check-doc-bare-urls-{}",
@@ -1429,6 +1505,15 @@ pub fn g() {}
             let error = module_tree(&directory.join("lib.rs")).unwrap_err();
             assert!(error.contains(&format!("lib.rs:3: `{body}`")), "{error}");
         }
+        // rustfmt leaves a one-line arm with a repetition as it is, so a
+        // declaration can follow `{` (finding 1 of the sixth review).
+        fs::write(
+            directory.join("lib.rs"),
+            "macro_rules! decl {\n    ($n:ident $(, $t:item)*) => {mod $n; $($t)*};\n}\ndecl!(e);\n",
+        )
+        .unwrap();
+        let error = module_tree(&directory.join("lib.rs")).unwrap_err();
+        assert!(error.contains("lib.rs:2: "), "{error}");
         fs::remove_dir_all(&directory).unwrap();
     }
 
