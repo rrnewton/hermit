@@ -228,7 +228,12 @@ def guest_command_progress(serial_log: Path, hermit_exited: bool = False) -> str
 
     ``hermit_exited`` says Hermit had exited (processes it left running were
     stopped later), so a finished command is not reported as one whose Hermit
-    had not exited.
+    had not exited. A BEGIN line without an END line shows only that the
+    command was not seen to finish: a command still running and one whose END
+    line a kernel message hid leave the same serial log. In the same way, no
+    BEGIN line shows only that the command was not seen to start: a BEGIN line
+    that a kernel message split does not start the frame (see
+    STALE_BEGIN_PREFIX_RE in qemu_controller).
     """
     try:
         transcript = serial_log.read_bytes()
@@ -250,10 +255,10 @@ def guest_command_progress(serial_log: Path, hermit_exited: bool = False) -> str
         )
     if parser.started:
         return (
-            "the guest command had not finished: the serial log has the {} line "
-            "but no END line".format(BEGIN_LINE.decode())
+            "the guest command was not seen to finish: the serial log has the {} "
+            "line but no END line".format(BEGIN_LINE.decode())
         )
-    return "the guest had not started the command: the serial log has no {} line".format(
+    return "the guest was not seen to start the command: the serial log has no {} line".format(
         BEGIN_LINE.decode()
     )
 
@@ -272,6 +277,11 @@ def stopped_run_message(error: Exception, serial_log: Path) -> str:
     carries it too when the log was found past the cap by the check made once
     Hermit had exited, or once the copy of its output had ended
     (``final_check``); nothing was then seen still writing.
+
+    The time a cap message gives is when the size was found past the cap, read
+    before anything was stopped. The message names QEMU_TIMEOUT without saying
+    whether it had passed by then: the size is checked before the deadline, so
+    a log past the cap is what is reported even when both bounds were passed.
     """
     if isinstance(error, LogCapExceeded) and error.final_check:
         cause = (
@@ -304,8 +314,8 @@ def stopped_run_message(error: Exception, serial_log: Path) -> str:
     if isinstance(error, LogCapExceeded):
         cause = (
             "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
-            "(QEMU_MAX_LOG_BYTES), {:.1f}s into the resume, so the run was "
-            "stopped before QEMU_TIMEOUT ({}s)".format(
+            "(QEMU_MAX_LOG_BYTES), when checked {:.1f}s into the resume "
+            "(QEMU_TIMEOUT is {}s), so the run was stopped".format(
                 error.log_path,
                 error.log_size,
                 error.max_log_bytes,
