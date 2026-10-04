@@ -13577,3 +13577,13 @@ fn run_kvm_wait4_int_min_preserves_errno_and_arenas() {
 fn run_kvm_wait4_nothread_admits_only_the_creating_thread() {
     kvm_waitid_copyout::run_wait4_nothread();
 }
+
+#[test]
+fn run_kvm_waitid_parked_foreign_waiters_contend_for_one_child() {
+    kvm_waitid_copyout::run_parked_foreign_waiters("waitid");
+}
+
+#[test]
+fn run_kvm_wait4_parked_foreign_waiters_contend_for_one_child() {
+    kvm_waitid_copyout::run_parked_foreign_waiters("wait4");
+}

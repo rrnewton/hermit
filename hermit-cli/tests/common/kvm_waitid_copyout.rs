@@ -1518,3 +1518,793 @@ fn assert_wait4_nothread_observations(stdout: &[u8]) {
     assert_eq!(children.len(), 8);
     assert_eq!(worker_tids.len(), 4);
 }
+
+// Serial-KVM foreign waiters contend for children that the leader holds alive
+// on a pipe. The guest checks the Linux results. This harness proves, from
+// both retained INFO logs, the scheduling facts the guest cannot see:
+//
+// * Every contender entered the child-wait pool after its wait began and
+//   before the leader's release write began. The park record is the witness:
+//   the scheduler emits it exactly when it inserts the thread into
+//   `blocked.child_waiters`.
+// * Each blocking wait made one WaitChild request. The scheduler parked it,
+//   parked it again on the same request if another waiter took the child
+//   first, and granted it once, after its last park. That grant is the last
+//   scheduler decision of any thread before the wait's result, so no other
+//   thread ran between the winner's selection and its consumption.
+// * The foreign `__WNOTHREAD` waits for the leader's live child are refused
+//   without a park, before that child could exit, and the foreign thread's
+//   blocking wait for its own child stays parked through the leader's
+//   child's exit.
+//
+// A guest sleep or yield proves none of this. If any contender had not parked
+// before its child could exit, the test fails.
+//
+// Windows, and how each is covered:
+//
+// * Child exit before a contender parks: excluded by the guest-causal
+//   handoff. A child exits only after the leader's release write, and the
+//   check below requires every park to precede that write's entry.
+// * Exit publication against selection: exercised. The scheduler records
+//   the logical exit and wakes every matching parked waiter in one step
+//   (`logically_kill_thread` calling `wake_child_waiters`), admitting the
+//   woken waiters in dettid order. The loser of each race then gets ECHILD
+//   (case 1) or parks again for the next child (case 3).
+// * Grant against consumption: excluded. The ready check, the private
+//   proof, the CPU publication check and the consumption run in the turn
+//   the WaitChild grant opens; the check below requires that no thread's
+//   scheduler decision falls between the final grant and the result.
+// * Child CPU publication: crossed by every consuming wait; the guest
+//   requires exactly one child's CPU time added per reap.
+// * Signal interruption: excluded, because every thread blocks SIGCHLD. The
+//   interrupted-wait paths are the waitid error fixture's EINTR and
+//   SA_RESTART cases.
+// * Scheduler quiescence: excluded. The leader stays runnable until each
+//   release, so the all-blocked check never runs during a contention.
+// * Physical-child waits: KVM never requests one; the check below fails on
+//   any physical-child park.
+pub(super) fn run_parked_foreign_waiters(family: &'static str) {
+    assert!(matches!(family, "waitid" | "wait4"));
+    run_fixture(
+        &format!("parked-foreign-waiters-{family}"),
+        "kvm_wait_contenders.c",
+        &[family],
+        |stdout| {
+            contenders_from_stdout(stdout, family);
+        },
+        |log, stdout| assert_contender_parks(log, &contenders_from_stdout(stdout, family), family),
+    );
+}
+
+/// The thread and child identities and outcomes that the guest printed.
+struct Contenders {
+    leader: u64,
+    tid: BTreeMap<&'static str, u64>,
+    /// Child name to (pid, exit status, release write descriptor).
+    child: BTreeMap<&'static str, (u64, i64, u64)>,
+    case1_winner: &'static str,
+    case1_loser: &'static str,
+    observed: bool,
+    case3_winner: &'static str,
+    case3_next: &'static str,
+}
+
+fn contenders_from_stdout(stdout: &[u8], family: &str) -> Contenders {
+    const UNWRITTEN: i64 = 0x5a5a5a5a;
+    let text = std::str::from_utf8(stdout).expect("complete contender fixture UTF-8");
+    assert!(text.ends_with('\n'));
+    let rows: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON row"))
+        .collect();
+    assert_eq!(
+        rows.len(),
+        54,
+        "7 threads, 6 spawns, 17 waits, 16 CPU rows, 3 outcomes, 4 cases, 1 summary"
+    );
+    let of_type = |kind: &str| -> Vec<&serde_json::Value> {
+        rows.iter().filter(|row| row["type"] == kind).collect()
+    };
+    let summary = rows.last().unwrap();
+    assert_eq!(summary["type"], "summary");
+    assert_eq!(summary["family"], family);
+    for (key, value) in [
+        ("cases", 4),
+        ("children", 6),
+        ("threads", 7),
+        ("calls", 17),
+        ("assertions", 277),
+    ] {
+        assert_eq!(summary[key], value, "summary {key}");
+    }
+    assert_eq!(summary["passed"], true);
+    let leader = summary["leader"].as_u64().unwrap();
+    assert!(leader > 0);
+
+    let threads = of_type("thread");
+    assert_eq!(threads.len(), 7);
+    let mut tid = BTreeMap::new();
+    for (name, case, kind) in [
+        ("N", 1, 4),
+        ("A", 1, 1),
+        ("B", 1, 1),
+        ("O", 2, 3),
+        ("Q", 2, 1),
+        ("X", 3, 2),
+        ("Y", 3, 2),
+    ] {
+        let found: Vec<_> = threads.iter().filter(|row| row["name"] == name).collect();
+        assert_eq!(found.len(), 1, "one thread row for {name}");
+        assert_eq!(found[0]["case"], case);
+        assert_eq!(found[0]["kind"], kind);
+        let value = found[0]["tid"].as_u64().unwrap();
+        assert!(value > 0 && value != leader, "{name} is a sibling thread");
+        tid.insert(name, value);
+    }
+    assert_eq!(
+        tid.values().collect::<BTreeSet<_>>().len(),
+        7,
+        "distinct threads"
+    );
+
+    let spawns = of_type("spawn");
+    assert_eq!(spawns.len(), 6);
+    let mut child = BTreeMap::new();
+    for (name, case, status, actor) in [
+        ("K", 0, 60, "main"),
+        ("C", 1, 61, "main"),
+        ("D", 1, 62, "N"),
+        ("E", 2, 63, "main"),
+        ("F", 3, 64, "main"),
+        ("G", 3, 65, "main"),
+    ] {
+        let found: Vec<_> = spawns.iter().filter(|row| row["name"] == name).collect();
+        assert_eq!(found.len(), 1, "one spawn row for {name}");
+        let row = found[0];
+        assert_eq!(row["case"], case);
+        assert_eq!(row["status"], status);
+        assert_eq!(row["actor"], actor);
+        let creator = if actor == "main" { leader } else { tid[actor] };
+        assert_eq!(row["tid"], creator, "{name} was created by {actor}");
+        let pid = row["child"].as_u64().unwrap();
+        let fd = row["release_fd"].as_u64().unwrap();
+        assert!(pid > 0 && fd > 2);
+        child.insert(name, (pid, status, fd));
+    }
+    assert_eq!(
+        child
+            .values()
+            .map(|value| value.0)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        6
+    );
+    assert_eq!(
+        child
+            .values()
+            .map(|value| value.2)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        6
+    );
+
+    let waits = of_type("wait");
+    assert_eq!(waits.len(), 17);
+    let wait = |case: u64, actor: &str, name: &str| -> &serde_json::Value {
+        let found: Vec<_> = waits
+            .iter()
+            .filter(|row| row["case"] == case && row["actor"] == actor && row["name"] == name)
+            .collect();
+        assert_eq!(found.len(), 1, "one wait row: case {case} {actor} {name}");
+        let row = found[0];
+        let thread = if actor == "main" { leader } else { tid[actor] };
+        assert_eq!(row["tid"], thread);
+        row
+    };
+    // The exact call: target None is pid -1 or P_ALL.
+    let shape = |row: &serde_json::Value, call: &str, target: Option<&str>, options: i64| {
+        assert_eq!(row["call"], call, "{row}");
+        let pid = target.map(|name| child[name].0);
+        if call == "waitid" {
+            assert_eq!(
+                row["which"],
+                if pid.is_some() {
+                    libc::P_PID
+                } else {
+                    libc::P_ALL
+                },
+                "{row}"
+            );
+            assert_eq!(row["id"], pid.unwrap_or(0), "{row}");
+        } else {
+            assert_eq!(row["pid"], pid.map_or(-1, |pid| pid as i64), "{row}");
+        }
+        assert_eq!(row["options"], options, "{row}");
+    };
+    let family_shape =
+        |row: &serde_json::Value, target: Option<&str>, nohang: bool, nothread: bool| {
+            let mut options = 0;
+            if nohang {
+                options |= libc::WNOHANG;
+            }
+            if nothread {
+                options |= libc::__WNOTHREAD;
+            }
+            if family == "waitid" {
+                options |= libc::WEXITED;
+            }
+            shape(row, family, target, i64::from(options));
+        };
+    let reaped = |row: &serde_json::Value, name: &str| -> bool {
+        let (pid, status, _) = child[name];
+        if row["call"] == "waitid" {
+            row["rc"] == 0
+                && row["errno"] == 0
+                && row["si_signo"] == libc::SIGCHLD
+                && row["si_code"] == libc::CLD_EXITED
+                && row["si_pid"] == pid
+                && row["si_status"] == status
+        } else {
+            row["rc"] == pid && row["errno"] == 0 && row["raw_status"] == status << 8
+        }
+    };
+    let echild = |row: &serde_json::Value| -> bool {
+        if row["call"] == "waitid" {
+            row["rc"] == -1
+                && row["errno"] == libc::ECHILD
+                && row["si_signo"] == 0
+                && row["si_code"] == 0
+                && row["si_pid"] == 0
+                && row["si_status"] == 0
+        } else {
+            row["rc"] == -1 && row["errno"] == libc::ECHILD && row["raw_status"] == UNWRITTEN
+        }
+    };
+    let live = |row: &serde_json::Value| -> bool {
+        if row["call"] == "waitid" {
+            row["rc"] == 0
+                && row["errno"] == 0
+                && row["si_signo"] == 0
+                && row["si_code"] == 0
+                && row["si_pid"] == 0
+                && row["si_status"] == 0
+        } else {
+            row["rc"] == 0 && row["errno"] == 0 && row["raw_status"] == UNWRITTEN
+        }
+    };
+
+    let row = wait(0, "main", "control-consume");
+    family_shape(row, Some("K"), false, false);
+    assert!(reaped(row, "K"), "{row}");
+    let row = wait(0, "main", "control-echild");
+    family_shape(row, Some("K"), true, false);
+    assert!(echild(row), "{row}");
+    for name in ["deny-nohang", "deny-blocking"] {
+        let row = wait(1, "N", name);
+        family_shape(row, Some("C"), name == "deny-nohang", true);
+        assert!(
+            echild(row),
+            "foreign __WNOTHREAD never selects the leader's child: {row}"
+        );
+    }
+    let row = wait(1, "N", "own-live");
+    family_shape(row, None, true, true);
+    assert!(live(row), "{row}");
+    let row = wait(1, "N", "own-consume");
+    family_shape(row, None, false, true);
+    assert!(
+        reaped(row, "D"),
+        "the foreign waiter reaps only its own child: {row}"
+    );
+    let row = wait(1, "N", "own-echild");
+    family_shape(row, None, true, true);
+    assert!(echild(row), "{row}");
+    for (case, name) in [(1, "C"), (1, "D"), (2, "E")] {
+        let label = if name == "D" {
+            "foreign-echild"
+        } else {
+            "later-echild"
+        };
+        let row = wait(case, "main", label);
+        family_shape(row, Some(name), true, false);
+        assert!(echild(row), "{name} was consumed once: {row}");
+    }
+    let row = wait(3, "main", "later-echild");
+    family_shape(row, None, true, false);
+    assert!(echild(row), "no child remains: {row}");
+
+    let a = wait(1, "A", "contend");
+    let b = wait(1, "B", "contend");
+    for row in [a, b] {
+        family_shape(row, Some("C"), false, false);
+    }
+    let (case1_winner, case1_loser) = match (reaped(a, "C"), reaped(b, "C")) {
+        (true, false) => ("A", "B"),
+        (false, true) => ("B", "A"),
+        other => panic!("exactly one consumer reaps C: {other:?}"),
+    };
+    assert!(
+        echild(if case1_winner == "A" { b } else { a }),
+        "the other consumer gets ECHILD"
+    );
+
+    let o = wait(2, "O", "observe");
+    shape(
+        o,
+        "waitid",
+        Some("E"),
+        i64::from(libc::WEXITED | libc::WNOWAIT),
+    );
+    let observed = reaped(o, "E");
+    assert!(
+        observed || echild(o),
+        "the observer sees E or finds it consumed: {o}"
+    );
+    let q = wait(2, "Q", "contend");
+    family_shape(q, Some("E"), false, false);
+    assert!(reaped(q, "E"), "the only consumer reaps E: {q}");
+
+    let x = wait(3, "X", "contend");
+    let y = wait(3, "Y", "contend");
+    for row in [x, y] {
+        family_shape(row, None, false, false);
+    }
+    let (case3_winner, case3_next) = match (reaped(x, "F"), reaped(y, "F")) {
+        (true, false) => ("X", "Y"),
+        (false, true) => ("Y", "X"),
+        other => panic!("exactly one any-child consumer reaps F: {other:?}"),
+    };
+    assert!(
+        reaped(if case3_winner == "X" { y } else { x }, "G"),
+        "the loser reaps the next child G"
+    );
+
+    let outcomes = of_type("outcome");
+    assert_eq!(outcomes.len(), 3);
+    let outcome = |case: u64| -> &serde_json::Value {
+        let found: Vec<_> = outcomes.iter().filter(|row| row["case"] == case).collect();
+        assert_eq!(found.len(), 1);
+        found[0]
+    };
+    let row = outcome(1);
+    assert_eq!(row["winner"], case1_winner);
+    assert_eq!(row["winner_tid"], tid[case1_winner]);
+    assert_eq!(row["loser"], case1_loser);
+    assert_eq!(row["loser_tid"], tid[case1_loser]);
+    let row = outcome(2);
+    assert_eq!(
+        row["observer"],
+        if observed { "observed" } else { "echild" }
+    );
+    assert_eq!(row["observer_tid"], tid["O"]);
+    assert_eq!(row["consumer_tid"], tid["Q"]);
+    let row = outcome(3);
+    assert_eq!(row["winner"], case3_winner);
+    assert_eq!(row["winner_tid"], tid[case3_winner]);
+    assert_eq!(row["next"], case3_next);
+    assert_eq!(row["next_tid"], tid[case3_next]);
+
+    // Children CPU: '0' none yet, '=' unchanged, '+' exactly one more child's.
+    // The children run identical code, so every reap adds about the control
+    // reap's amount; two children's worth, or none, falls outside the band.
+    let cpu = of_type("cpu");
+    let expected = [
+        (0, "before-release", '0'),
+        (0, "after-reap", '+'),
+        (0, "after-echild", '='),
+        (1, "before-release", '='),
+        (1, "after-contest", '+'),
+        (1, "after-echild", '='),
+        (1, "after-foreign-reap", '+'),
+        (1, "after-foreign-echild", '='),
+        (2, "before-release", '='),
+        (2, "after-pair", '+'),
+        (2, "after-echild", '='),
+        (3, "before-release", '='),
+        (3, "after-first", '+'),
+        (3, "before-second-release", '='),
+        (3, "after-second", '+'),
+        (3, "after-echild", '='),
+    ];
+    assert_eq!(cpu.len(), expected.len());
+    let mut previous = (0, 0);
+    let mut unit = None;
+    for (row, (case, name, relation)) in cpu.iter().zip(expected) {
+        assert_eq!(row["case"], case);
+        assert_eq!(row["name"], name);
+        assert_eq!(row["actor"], "main");
+        let now = (
+            row["user_us"].as_i64().unwrap(),
+            row["system_us"].as_i64().unwrap(),
+        );
+        match relation {
+            '0' => assert_eq!(now, (0, 0), "no child CPU before the first reap"),
+            '=' => assert_eq!(now, previous, "children CPU unchanged: {row}"),
+            _ => {
+                assert!(now.0 >= previous.0 && now.1 >= previous.1, "{row}");
+                let added = (now.0 - previous.0) + (now.1 - previous.1);
+                let unit = *unit.get_or_insert(added);
+                assert!(unit > 0, "the control reap adds child CPU");
+                assert!(
+                    2 * added > unit && 2 * added < 3 * unit,
+                    "one child's CPU per reap ({added} us against {unit} us): {row}"
+                );
+            }
+        }
+        previous = now;
+    }
+
+    let cases = of_type("case");
+    let names = [
+        "control",
+        "two-consumers-and-foreign-nothread",
+        "observer-and-consumer",
+        "any-consumers-next-child",
+    ];
+    assert_eq!(cases.len(), names.len());
+    for (number, (row, name)) in cases.iter().zip(names).enumerate() {
+        assert_eq!(row["case"], number);
+        assert_eq!(row["name"], name);
+        assert_eq!(row["passed"], true);
+    }
+    Contenders {
+        leader,
+        tid,
+        child,
+        case1_winner,
+        case1_loser,
+        observed,
+        case3_winner,
+        case3_next,
+    }
+}
+
+enum TraceEvent {
+    Entry(u64, String),
+    Finish(u64, String, String),
+    /// A child-wait pool entry: dettid and its spec.
+    Park(u64, String),
+    /// The WaitChild commit that ends a child wait's scheduler request.
+    Grant(u64, String),
+    /// Any other scheduler decision, of any thread.
+    Decision,
+}
+
+fn assert_contender_parks(log: &[u8], run: &Contenders, family: &str) {
+    let records = info_records(std::str::from_utf8(log).expect("complete UTF-8 INFO log"));
+    let entry = regex::Regex::new(
+        r"^DETLOG \[syscall\]\[detcore, dtid (\d+)\] inbound syscall: (.+) = \?$",
+    )
+    .unwrap();
+    let finish = regex::Regex::new(
+        r"^DETLOG \[syscall\]\[detcore, dtid (\d+)\] finish syscall #(\d+): (.+) = (.+)$",
+    )
+    .unwrap();
+    let park = regex::Regex::new(
+        r"^\[scheduler\] NONCOMMIT turn \d+, parking dettid (\d+) for (child (ChildWaitSpec \{ [^\n]+ \})|physical child \d+)$",
+    )
+    .unwrap();
+    let grant = regex::Regex::new(&format!(
+        r"(?s)^\[sched-step5\] >>>>>>>\n\n COMMIT turn \d+, dettid (\d+) using resources \{{WaitChild \{{ parent: DetPid\({}\), spec: (ChildWaitSpec \{{ [^\n]+ \}}) \}}: R\}}, on previously committed \S+$",
+        run.leader
+    ))
+    .unwrap();
+    let decision =
+        regex::Regex::new(r"(?s)^\[(scheduler|sched-step5)\] .*COMMIT turn \d+").unwrap();
+    let mut events = Vec::new();
+    for (index, record) in records.iter().enumerate() {
+        if let Some(capture) = park.captures(record) {
+            let spec = capture.get(3).map(|spec| spec.as_str().to_owned());
+            // KVM reports no physical exits, so no wait parks for one.
+            let spec = spec.unwrap_or_else(|| panic!("unexpected physical-child park: {record}"));
+            events.push((index, TraceEvent::Park(capture[1].parse().unwrap(), spec)));
+            continue;
+        }
+        let Some((message, metadata)) = record.rsplit_once(" DETLOG_RECORD=") else {
+            if decision.is_match(record) {
+                events.push((index, TraceEvent::Decision));
+            }
+            continue;
+        };
+        let value: serde_json::Value = serde_json::from_str(metadata).unwrap();
+        assert_eq!(value["schema"], 1);
+        if let Some(capture) = entry.captures(message) {
+            assert_eq!(value["event"]["kind"], "syscall");
+            events.push((
+                index,
+                TraceEvent::Entry(capture[1].parse().unwrap(), capture[2].to_owned()),
+            ));
+        } else if let Some(capture) = finish.captures(message) {
+            assert_eq!(value["event"]["kind"], "syscall_result");
+            assert_eq!(
+                value["event"]["finished_syscall_number"].as_u64(),
+                Some(capture[2].parse::<u64>().unwrap())
+            );
+            events.push((
+                index,
+                TraceEvent::Finish(
+                    capture[1].parse().unwrap(),
+                    capture[3].to_owned(),
+                    capture[4].to_owned(),
+                ),
+            ));
+        } else if value["event"]["kind"] == "scheduler_commit" {
+            match grant.captures(message) {
+                Some(capture) => events.push((
+                    index,
+                    TraceEvent::Grant(capture[1].parse().unwrap(), capture[2].to_owned()),
+                )),
+                None => events.push((index, TraceEvent::Decision)),
+            }
+        } else if decision.is_match(message) {
+            events.push((index, TraceEvent::Decision));
+        }
+    }
+
+    // Every call of `tid` matching `pattern`: (entry index, result index, result).
+    let calls = |tid: u64, pattern: &str| -> Vec<(usize, usize, String)> {
+        let expression = regex::Regex::new(pattern).unwrap();
+        let mut found = Vec::new();
+        for (position, (begin, event)) in events.iter().enumerate() {
+            let TraceEvent::Entry(actual, call) = event else {
+                continue;
+            };
+            if *actual != tid || !expression.is_match(call) {
+                continue;
+            }
+            let (end, result) = events[position + 1..]
+                .iter()
+                .find_map(|(index, event)| match event {
+                    TraceEvent::Entry(other, next) if *other == tid => {
+                        panic!("{call}: dettid {tid} entered {next} before its result")
+                    }
+                    TraceEvent::Finish(other, finished, result) if *other == tid => {
+                        assert_eq!(finished, call);
+                        Some((*index, result.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{call}: dettid {tid} has no result"));
+            found.push((*begin, end, result));
+        }
+        found
+    };
+    let one = |tid: u64, pattern: String, result: &str| -> (usize, usize) {
+        let found = calls(tid, &pattern);
+        assert_eq!(found.len(), 1, "one call by dettid {tid}: {pattern}");
+        assert_eq!(found[0].2, result, "{pattern}");
+        (found[0].0, found[0].1)
+    };
+    let release = |name: &str| -> usize {
+        let fd = run.child[name].2;
+        one(
+            run.leader,
+            format!(r"^write\({fd}, 0x[0-9a-f]+, 1\)$"),
+            "Ok(1)",
+        )
+        .0
+    };
+    // The family's call text: target None is pid -1 or P_ALL.
+    let pattern = |target: Option<&str>, nohang: bool, nothread: bool| -> String {
+        let pid = target.map(|name| run.child[name].0);
+        if family == "waitid" {
+            let mut options = libc::WEXITED;
+            if nohang {
+                options |= libc::WNOHANG;
+            }
+            if nothread {
+                options |= libc::__WNOTHREAD;
+            }
+            match pid {
+                Some(pid) => format!(r"^waitid\(1, {pid}, 0x[0-9a-f]+, {options}, NULL\)$"),
+                None => format!(r"^waitid\(0, 0, 0x[0-9a-f]+, {options}, NULL\)$"),
+            }
+        } else {
+            let flags = match (nohang, nothread) {
+                (false, false) => "0x0",
+                (true, false) => "WNOHANG",
+                (false, true) => "__WNOTHREAD",
+                (true, true) => r"WNOHANG \| __WNOTHREAD",
+            };
+            let pid = pid.map_or(-1, |pid| pid as i64);
+            format!(r"^wait4\({pid}, 0x[0-9a-f]+, WaitPidFlag\({flags}\), NULL\)$")
+        }
+    };
+    let success = |name: &str| -> String {
+        if family == "waitid" {
+            "Ok(0)".to_owned()
+        } else {
+            format!("Ok({})", run.child[name].0)
+        }
+    };
+    const ECHILD: &str = "Err(Errno(ECHILD))";
+    let exact = |name: &str| {
+        format!(
+            "ChildWaitSpec {{ selector: Exact(DetPid({})), owner: None, exit_class: Sigchld }}",
+            run.child[name].0
+        )
+    };
+    let any = "ChildWaitSpec { selector: Any, owner: None, exit_class: Sigchld }".to_owned();
+
+    // One blocking wait: park i lies inside bounds[i]. Its one request is
+    // granted once, after the last park; a woken waiter whose child was taken
+    // is parked again by the scheduler on that same request. The grant is
+    // the last scheduler decision of any thread before the result, so the
+    // ready check, the private proof and the consumption share one turn.
+    let parked = |tid: u64, window: (usize, usize), spec: &str, bounds: &[(usize, usize)]| {
+        let mut parks = Vec::new();
+        let mut grants = Vec::new();
+        for (index, event) in &events {
+            if *index <= window.0 || *index >= window.1 {
+                continue;
+            }
+            match event {
+                TraceEvent::Park(actual, actual_spec) if *actual == tid => {
+                    assert_eq!(actual_spec, spec, "dettid {tid} parked with its own spec");
+                    parks.push(*index);
+                }
+                TraceEvent::Grant(actual, actual_spec) if *actual == tid => {
+                    assert_eq!(actual_spec, spec, "dettid {tid} granted its own spec");
+                    grants.push(*index);
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            parks.len(),
+            bounds.len(),
+            "dettid {tid}: pool entries in {window:?}"
+        );
+        assert_eq!(grants.len(), 1, "dettid {tid}: one granted request");
+        let last = grants[0];
+        for (number, (park, (low, high))) in parks.iter().zip(bounds).enumerate() {
+            assert!(
+                low < park && park < high,
+                "dettid {tid} park {number} at {park} outside ({low}, {high})"
+            );
+            assert!(*park < last, "dettid {tid}: granted after park {number}");
+        }
+        assert!(
+            !events.iter().any(|(index, event)| {
+                last < *index
+                    && *index < window.1
+                    && matches!(
+                        event,
+                        TraceEvent::Park(..) | TraceEvent::Grant(..) | TraceEvent::Decision
+                    )
+            }),
+            "dettid {tid}: no scheduler decision between its final grant and its result"
+        );
+    };
+
+    let tid = |name: &str| run.tid[name];
+    let (rel_c, rel_d, rel_e, rel_f, rel_g) = (
+        release("C"),
+        release("D"),
+        release("E"),
+        release("F"),
+        release("G"),
+    );
+    assert!(rel_c < rel_d && rel_d < rel_e && rel_e < rel_f && rel_f < rel_g);
+    let start = 0;
+
+    // Case 1: the foreign __WNOTHREAD waits for the leader's live child C are
+    // refused before C could exit. The blocking one makes one scheduler
+    // request, granted at once because nothing it may select exists; no park.
+    let n = tid("N");
+    let refused = one(n, pattern(Some("C"), true, true), ECHILD);
+    let refused_blocking = one(n, pattern(Some("C"), false, true), ECHILD);
+    assert!(refused_blocking.1 < rel_c, "refused before C could exit");
+    let owner_scoped = format!(
+        "ChildWaitSpec {{ selector: Exact(DetPid({})), owner: Some(DetPid({n})), exit_class: Sigchld }}",
+        run.child["C"].0
+    );
+    let parks_and_grants = |window: (usize, usize)| -> (usize, Vec<String>) {
+        let mut parks = 0;
+        let mut grants = Vec::new();
+        for (index, event) in &events {
+            if window.0 < *index && *index < window.1 {
+                match event {
+                    TraceEvent::Park(actual, _) if *actual == n => parks += 1,
+                    TraceEvent::Grant(actual, spec) if *actual == n => grants.push(spec.clone()),
+                    _ => {}
+                }
+            }
+        }
+        (parks, grants)
+    };
+    assert_eq!(
+        parks_and_grants(refused),
+        (0, vec![]),
+        "nonblocking refusal needs no turn"
+    );
+    assert_eq!(parks_and_grants(refused_blocking), (0, vec![owner_scoped]));
+    let probes = calls(n, &pattern(None, true, true));
+    assert_eq!(probes.len(), 2, "own-live and own-echild");
+    assert_eq!(probes[0].2, "Ok(0)");
+    assert_eq!(probes[1].2, ECHILD);
+    // N's own blocking wait enters the pool before C's release, stays parked
+    // through C's exit and consumption, and completes only after D's release.
+    let own = one(n, pattern(None, false, true), &success("D"));
+    let own_spec =
+        format!("ChildWaitSpec {{ selector: Any, owner: Some(DetPid({n})), exit_class: Sigchld }}");
+    parked(n, own, &own_spec, &[(start, rel_c)]);
+    assert!(probes[0].1 < own.0 && own.1 < probes[1].0 && rel_d < own.1);
+
+    // Two exact consumers for C: both parked before the release; the winner
+    // is the guest-reported one and the loser's single park ends in ECHILD.
+    let mut finished = Vec::new();
+    for (name, result) in [
+        (run.case1_winner, success("C")),
+        (run.case1_loser, ECHILD.to_owned()),
+    ] {
+        let window = one(tid(name), pattern(Some("C"), false, false), &result);
+        parked(tid(name), window, &exact("C"), &[(start, rel_c)]);
+        assert!(rel_c < window.1 && window.1 < rel_d);
+        finished.push(window.1);
+    }
+    assert!(
+        finished[0] < finished[1],
+        "the winner's result precedes the loser's"
+    );
+
+    // Case 2: an observer and a consumer, both parked before E's release.
+    let observer_result = if run.observed { "Ok(0)" } else { ECHILD };
+    let observer = one(
+        tid("O"),
+        format!(
+            r"^waitid\(1, {}, 0x[0-9a-f]+, {}, NULL\)$",
+            run.child["E"].0,
+            libc::WEXITED | libc::WNOWAIT
+        ),
+        observer_result,
+    );
+    parked(tid("O"), observer, &exact("E"), &[(rel_d, rel_e)]);
+    let consumer = one(tid("Q"), pattern(Some("E"), false, false), &success("E"));
+    parked(tid("Q"), consumer, &exact("E"), &[(rel_d, rel_e)]);
+    assert!(rel_e < observer.1 && rel_e < consumer.1 && observer.1 < rel_f && consumer.1 < rel_f);
+
+    // Case 3: both any-child consumers parked before F's release; the loser
+    // parked again after F's release and reaped G after G's release.
+    let winner = one(
+        tid(run.case3_winner),
+        pattern(None, false, false),
+        &success("F"),
+    );
+    parked(tid(run.case3_winner), winner, &any, &[(rel_e, rel_f)]);
+    assert!(rel_f < winner.1 && winner.1 < rel_g);
+    let next = one(
+        tid(run.case3_next),
+        pattern(None, false, false),
+        &success("G"),
+    );
+    parked(
+        tid(run.case3_next),
+        next,
+        &any,
+        &[(rel_e, rel_f), (rel_f, rel_g)],
+    );
+    assert!(rel_g < next.1);
+
+    // No contender entered the pool anywhere else.
+    for (name, expected) in [
+        ("N", 1),
+        ("A", 1),
+        ("B", 1),
+        ("O", 1),
+        ("Q", 1),
+        (run.case3_winner, 1),
+        (run.case3_next, 2),
+    ] {
+        let total = events
+            .iter()
+            .filter(
+                |(_, event)| matches!(event, TraceEvent::Park(actual, _) if *actual == tid(name)),
+            )
+            .count();
+        assert_eq!(
+            total, expected,
+            "{name}: child-wait pool entries in the whole log"
+        );
+    }
+}
