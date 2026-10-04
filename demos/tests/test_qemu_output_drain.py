@@ -208,12 +208,14 @@ class _OutputDrainScenarios:
 
         def wait_when_ready(process, timeout, **keywords):
             # Start the clock once the fake Hermit is up, so that a slow start
-            # on a busy machine does not count against QEMU_TIMEOUT.
+            # on a busy machine does not count against QEMU_TIMEOUT. Asked
+            # without reaping it: the demo's drain_output and
+            # stop_process_group need it unreaped.
             self.log_path = Path(keywords["log_path"])
             deadline = time.monotonic() + READY_TIMEOUT
             while (
                 not self.pids_file.is_file()
-                and process.poll() is None
+                and dc._exit_status_without_reaping(process) is None
                 and time.monotonic() < deadline
             ):
                 time.sleep(0.01)

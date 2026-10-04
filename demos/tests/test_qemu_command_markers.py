@@ -896,7 +896,8 @@ class Demo6ResumeTest(unittest.TestCase):
             "release_demo_lock": lambda handle: None,
             "stage_guest_controller": lambda destination: destination,
             "subprocess": types.SimpleNamespace(
-                Popen=lambda command, **keywords: mock.Mock(),
+                # Not yet reaped, as wait_for_process leaves Hermit for drain_output.
+                Popen=lambda command, **keywords: mock.Mock(returncode=None),
                 DEVNULL=subprocess.DEVNULL,
                 PIPE=subprocess.PIPE,
                 STDOUT=subprocess.STDOUT,
