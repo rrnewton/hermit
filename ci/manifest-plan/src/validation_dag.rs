@@ -3415,21 +3415,25 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             ));
         }
         // The single quick build consumes Nextest from the pinned image, and
-        // the width-8 rust-script producer now has a 900-second wall boundary
-        // with the measured quick/super 1200-second CPU budget. 9300 = 9180
+        // the width-8 rust-script producer has a 1200-second wall boundary
+        // with the measured quick/super 1200-second CPU budget. 9600 = 9180
         // plus the 120 seconds setup.manifest_plan's wall cap grew (180 to 300)
-        // in https://github.com/rrnewton/hermit/issues/3381.
-        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 9300 {
+        // in https://github.com/rrnewton/hermit/issues/3381, plus the 300
+        // seconds the rust-script producer's wall bound grew (900 to 1200) to
+        // keep 1.5 times its largest observed wall.
+        if profile.label == "quick" && critical_path_wall_seconds(&selected)? != 9600 {
             return Err(format!(
-                "quick selected critical path differs from 9300 seconds with image-owned Nextest, the measured rust-script wall bound and the 300-second setup.manifest_plan wall: {}",
+                "quick selected critical path differs from 9600 seconds with image-owned Nextest, the measured rust-script wall bound and the 300-second setup.manifest_plan wall: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
-        // 4620 = 4500 plus the 120 seconds setup.manifest_plan's wall cap grew
-        // (180 to 300) in https://github.com/rrnewton/hermit/issues/3381.
-        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 4620 {
+        // 4920 = 4500 plus the 120 seconds setup.manifest_plan's wall cap grew
+        // (180 to 300) in https://github.com/rrnewton/hermit/issues/3381, plus
+        // the 300 seconds the rust-script producer's wall bound grew (900 to
+        // 1200).
+        if profile.label == "privileged" && critical_path_wall_seconds(&selected)? != 4920 {
             return Err(format!(
-                "local privileged selected critical path differs from 4620 seconds with the measured rust-script wall bound and the 300-second setup.manifest_plan wall: {}",
+                "local privileged selected critical path differs from 4920 seconds with the measured rust-script wall bound and the 300-second setup.manifest_plan wall: {}",
                 critical_path_wall_seconds(&selected)?
             ));
         }
@@ -3497,10 +3501,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             {
                 return Err("hosted privileged graph gained an unmeasured resource demand".into());
             }
+            // 2400 = 2100 plus the 300 seconds the rust-script producer's
+            // wall bound grew (900 to 1200).
             let critical = critical_path_wall_seconds(&selected)?;
-            if critical != 2100 {
+            if critical != 2400 {
                 return Err(format!(
-                    "hosted privileged critical path differs from 2100 seconds with the measured rust-script wall bound: {critical}"
+                    "hosted privileged critical path differs from 2400 seconds with the measured rust-script wall bound: {critical}"
                 ));
             }
         }

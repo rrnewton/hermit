@@ -60,11 +60,13 @@ runnable DAG.
 The local privileged selection contains 19 nodes (20 until the one-build change
 of 2026-09-30 retired the unconsumed host copy of
 `privileged-only-build.privileged_tests`, which compiled Hermit on the host)
-with a 4620-second critical
+with a 4920-second critical
 path (4500 until setup.manifest_plan's wall cap went from 180 to 300 seconds in
-https://github.com/rrnewton/hermit/issues/3381). The separately labelled hosted privileged smoke preserves its historical
-12-node population and has a 2100-second critical path, so the manual workflow
-uses an audited 2160-second launcher bound. The stale hosted file omitted CPU
+https://github.com/rrnewton/hermit/issues/3381, then 4620 until the Rust-script
+producer's wall cap went from 900 to 1200 seconds). The separately labelled hosted privileged smoke preserves its historical
+12-node population and has a 2400-second critical path (2100 before the
+Rust-script producer's wall cap went from 900 to 1200 seconds), so the manual
+workflow uses an audited 2460-second launcher bound. The stale hosted file omitted CPU
 budgets and therefore inherited dagrun's 10-second fallback; every hosted node
 now carries the corresponding current-plan CPU budget explicitly. This is a
 correctness repair, not a claim that the obsolete fallback was equivalent.
@@ -124,8 +126,11 @@ helper during command lookup.
 The quick build now depends on Nextest setup because preparation needs it.
 This adds the existing 600-second setup timeout to its worst-case dependency
 path (8580 to 9180 seconds); individual node timeouts and CPU caps are unchanged.
-The quick path is 9300 seconds since setup.manifest_plan's wall cap went from
-180 to 300 seconds (https://github.com/rrnewton/hermit/issues/3381).
+The quick path was 9300 seconds after setup.manifest_plan's wall cap went from
+180 to 300 seconds (https://github.com/rrnewton/hermit/issues/3381), and is
+9600 seconds since the Rust-script producer's wall cap went from 900 to 1200
+seconds, 1.5 times its largest observed wall of 644.5 seconds rounded up to
+the next 300-second bucket.
 These sums are scheduling bounds, not measured preparation or execution times.
 The pressure runner's batch preparation similarly retains the Nextest setup
 prerequisite: ten nodes including LiteInst, or nine without it. This adds 600

@@ -2002,9 +2002,11 @@ fn portable_shard_step<'a>(
         .ok_or_else(|| format!("portable shard names missing DAG node {node}"))
 }
 
-// 3900 = 3780 plus the 120 seconds setup.manifest_plan's wall cap grew (180 to
-// 300) in https://github.com/rrnewton/hermit/issues/3381.
-const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 3900;
+// 4200 = 3780 plus the 120 seconds setup.manifest_plan's wall cap grew (180 to
+// 300) in https://github.com/rrnewton/hermit/issues/3381, plus the 300 seconds
+// build.rust_scripts' wall cap grew (900 to 1200) to keep 1.5 times its
+// largest observed wall.
+const PORTABLE_PREFLIGHT_CRITICAL_PATH_SECONDS: u64 = 4200;
 const PORTABLE_PREFLIGHT_OVERHEAD_SECONDS: u64 = 420;
 const PORTABLE_CHECKS_CRITICAL_PATH_SECONDS: u64 = 2400;
 const PORTABLE_CHECKS_OVERHEAD_SECONDS: u64 = 600;
@@ -2302,7 +2304,7 @@ fn audit_run_dag_workflow_runner(label: &str, workflow: &YamlValue) -> Result<()
     // environment carries any cgroup input the runner reads, and the explicit
     // unboxed one only when it carries none.
     const VALIDATION_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\nif [[ -n ${DAGRUN_DELEGATED_CGROUP+set}${DAGRUN_IN_SCOPE+set}${DAGRUN_SCOPE_UNIT+set}${DAGRUN_DIRECT_CGROUP+set}${DAGRUN_DELEGATED_UNBOXED+set}${DAGRUN_FORCE_SCOPE_ATTEMPT+set} ]]; then\n  env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --allow-cgroup-failure --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\nelse\n  env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v\nfi";
-    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
+    const STANDALONE_PRIVILEGED: &str = "if [[ ${GITHUB_ACTIONS:-} != true ]]; then\n  echo 'privileged DAG: refusing explicit unboxed execution outside GitHub Actions' >&2\n  exit 2\nfi\ntimeout --foreground --kill-after=10s 2460s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -j 2 --unsafe-no-cgroups --perf-dir \"$RUNNER_TEMP/hermit-privileged-dag-perf\" -v";
     const FIXTURES: &[&str] = &[
         "env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh portable -v",
         "timeout --foreground --kill-after=10s 2160s env -u DAGRUN_BIN DAGRUN_ENGINE=rust ci/run-dag.sh privileged -v",
@@ -7449,7 +7451,7 @@ sys.exit(1 if failed else 0)
             .unwrap_err();
         assert!(
             error.contains(
-                "portable preflight job 600s must cover its 3900s constructed DAG critical path plus at least 420s"
+                "portable preflight job 600s must cover its 4200s constructed DAG critical path plus at least 420s"
             ),
             "{error}"
         );
@@ -7485,7 +7487,7 @@ sys.exit(1 if failed else 0)
         let error = super::audit_privileged_workflow_overhead(&privileged_workflow).unwrap_err();
         assert!(
             error.contains(
-                "privileged job 2640s must cover 2610s of explicit inner step budgets plus at least 300s"
+                "privileged job 2640s must cover 2910s of explicit inner step budgets plus at least 300s"
             ),
             "{error}"
         );
