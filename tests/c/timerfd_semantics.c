@@ -86,6 +86,13 @@
  *       A readv or preadv2 whose iovecs hold no bytes returns 0 without
  *       consuming the expiration, and without waiting on a blocking timer;
  *       a read of 0 bytes is EINVAL and leaves the expiration in place.
+ *   read_readonly / readv_readonly / read_straddle_readonly /
+ *   readv_readonly_partial / gettime_readonly / settime_old_readonly
+ *       Results are copied out with the caller's access rights: a read into a
+ *       read-only page is EFAULT and leaves the page untouched, a buffer that
+ *       runs into a read-only page gets the bytes before it, and either way
+ *       the expiration is gone; gettime, and settime's old value, into a
+ *       read-only page are EFAULT, and settime's new arming still holds.
  *   create_errors / gettime_errors / settime_errors
  *       Linux's argument-checking order: bad flags or clock are EINVAL (even
  *       for an alarm clock); gettime checks the descriptor before the output
@@ -113,6 +120,7 @@
 #include <poll.h>
 #include <pthread.h>
 #include <sys/epoll.h>
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
@@ -897,6 +905,102 @@ static void check_zero_length_reads(void) {
     else ok("read_zero_einval");
 }
 
+/* Zero the read-only page, which needs write access for a moment. */
+static void clear_readonly(unsigned char *ro, long pg) {
+    mprotect(ro, pg, PROT_READ | PROT_WRITE);
+    memset(ro, 0, pg);
+    mprotect(ro, pg, PROT_READ);
+}
+
+/* The first written byte at the head of the read-only page, or -1. */
+static long readonly_dirty(const unsigned char *ro) {
+    for (long b = 0; b < 32; b++)
+        if (ro[b] != 0) return b;
+    return -1;
+}
+
+/* Results are copied out with the caller's access rights, as copy_to_iter and
+ * copy_to_user do: a read-only page faults instead of being written, the bytes
+ * before a fault stay copied, and a read loses its expirations either way. */
+static void check_readonly_buffers(void) {
+    long pg = sysconf(_SC_PAGESIZE);
+    unsigned char *map =
+        mmap(NULL, 2 * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (map == MAP_FAILED) {
+        fail("readonly_setup", "errno=%ld pg=%ld", errno, pg);
+        return;
+    }
+    unsigned char *ro = map + pg;
+    const char *names[4] = {"read_readonly", "readv_readonly", "read_straddle_readonly",
+                            "readv_readonly_partial"};
+    for (int i = 0; i < 4; i++) {
+        memset(map, 0xff, pg);
+        clear_readonly(ro, pg);
+        int tfd = expired_tfd();
+        struct iovec v[2] = {{ro, 8}, {ro, 4}};
+        ssize_t want = i < 2 ? -1 : 4;
+        errno = 0;
+        ssize_t r;
+        if (i == 0) r = read(tfd, ro, 8);
+        else if (i == 1) r = readv(tfd, v, 1);
+        else if (i == 2) r = read(tfd, ro - 4, 8);
+        else {
+            v[0].iov_base = map;
+            v[0].iov_len = 4;
+            r = readv(tfd, v, 2);
+        }
+        int err = errno;
+        uint64_t count = 0;
+        errno = 0;
+        ssize_t again = read(tfd, &count, sizeof count);
+        int again_err = errno;
+        close(tfd);
+        uint32_t low = 0;
+        memcpy(&low, i == 2 ? ro - 4 : map, sizeof low);
+        if (r != want || (want == -1 && err != EFAULT))
+            fail(names[i], "r=%ld errno=%ld", (long)r, err);
+        else if (readonly_dirty(ro) >= 0)
+            fail(names[i], "readonly_written r=%ld at=%ld", (long)r, readonly_dirty(ro));
+        else if (want == 4 && low != 1) fail(names[i], "low=%ld r=%ld", (long)low, (long)r);
+        else if (again != -1 || again_err != EAGAIN)
+            fail(names[i], "again=%ld errno=%ld", (long)again, again_err);
+        else ok(names[i]);
+    }
+
+    clear_readonly(ro, pg);
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 10000 * MS, 0, 0);
+    errno = 0;
+    long r = syscall(SYS_timerfd_gettime, tfd, ro);
+    int err = errno;
+    close(tfd);
+    if (r != -1 || err != EFAULT) fail("gettime_readonly", "r=%ld errno=%ld", r, err);
+    else if (readonly_dirty(ro) >= 0)
+        fail("gettime_readonly", "readonly_written r=%ld at=%ld", r, readonly_dirty(ro));
+    else ok("gettime_readonly");
+
+    clear_readonly(ro, pg);
+    tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+    its.it_value.tv_sec = 10;
+    errno = 0;
+    r = syscall(SYS_timerfd_settime, tfd, 0, &its, ro);
+    err = errno;
+    struct itimerspec cur;
+    memset(&cur, 0, sizeof cur);
+    timerfd_gettime(tfd, &cur);
+    close(tfd);
+    /* The new arming is in effect before the old value is copied out. */
+    if (r != -1 || err != EFAULT) fail("settime_old_readonly", "r=%ld errno=%ld", r, err);
+    else if (readonly_dirty(ro) >= 0)
+        fail("settime_old_readonly", "readonly_written r=%ld at=%ld", r, readonly_dirty(ro));
+    else if (cur.it_value.tv_sec < 5)
+        fail("settime_old_readonly", "value_sec=%ld nsec=%ld", (long)cur.it_value.tv_sec,
+             (long)cur.it_value.tv_nsec);
+    else ok("settime_old_readonly");
+    munmap(map, 2 * pg);
+}
+
 static void check_create_errors(void) {
     const char *name = "create_errors";
     struct { int clock; int flags; } cases[] = {
@@ -1098,6 +1202,7 @@ int main(void) {
     check_read_across_close("readv_across_close", 1, 0);
     check_read_across_close("readv_across_reuse", 1, 1);
     check_zero_length_reads();
+    check_readonly_buffers();
     check_create_errors();
     check_gettime_errors();
     check_settime_errors();
