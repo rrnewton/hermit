@@ -79,11 +79,13 @@ file system or network deterministic.
 > shuts down (btrfs-progs commit
 > [73e211a7](https://github.com/kdave/btrfs-progs/commit/73e211a7a8ff3d2395783daaed71bf3792bd753f)):
 > the main thread could free the progress thread's state while the thread was
-> still reading it. We rebuilt btrfs-progs v7.1 with that bug put back and
-> compiled it with AddressSanitizer, which turns a read of freed memory into an
-> immediate abort with a report. Run natively 40 times, the buggy binary never
-> produced a complete report or a failing exit status: 29 runs showed nothing,
-> and 11 printed the start of a report and then exited with status 0, because
+> still reading it. We rebuilt btrfs-progs v7.1 with that race put back (the
+> thread detached and never joined, as before the fix, but with the demo's own
+> shutdown code) and compiled it with AddressSanitizer, which turns a read of
+> freed memory into an immediate abort with a report. Run natively 40 times,
+> the buggy binary never produced a complete report or a failing exit status:
+> 29 runs showed nothing, and 11 printed the start of a report and then exited
+> with status 0, because
 > the main thread finished before the report did. Under `hermit run --chaos`,
 > 5 of 32 scheduler seeds crashed it with a complete report, while the fixed
 > binary showed no use-after-free on any of the same 32 seeds. On that host
