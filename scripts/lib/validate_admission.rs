@@ -878,6 +878,27 @@ impl AuthenticatedValidationAdmission {
                     ],
                 )?;
             }
+            // A post-landing run of a commit main already contains. Its floor is
+            // the target itself, exactly the floor a current-main run of the
+            // same commit had while it was the tip, so the run measures the same
+            // tree against the same pin base. The authority observed a later
+            // main; this re-proves that the target is that main's ancestor, so
+            // a diverged head can never select this kind.
+            ("validate", "main-ancestor")
+                if self.floor.sha == self.authority.target
+                    && self.floor.tree == self.target_tree
+                    && self.floor.observed_main_sha != self.authority.target =>
+            {
+                git(
+                    root,
+                    &[
+                        "merge-base",
+                        "--is-ancestor",
+                        &self.authority.target,
+                        &self.floor.observed_main_sha,
+                    ],
+                )?;
+            }
             ("frozen-validate", "frozen-target") if self.floor.sha == self.authority.target => {}
             _ => {
                 return Err(
@@ -1372,6 +1393,61 @@ for entry in Path('/proc/self/fd').iterdir():
         frozen["reason_code"] = "canonical-holder-kind-not-validate".into();
         frozen["admission_floor"]["kind"] = "frozen-target".into();
         assert!(!f.admit(&frozen, &target).unwrap().canonical());
+    }
+
+    /// A post-landing run of a commit that freshly fetched main already
+    /// contains is admitted with that commit as its own floor, and only then.
+    #[test]
+    fn main_ancestor_floor_admits_only_a_target_that_main_contains() {
+        let f = Fixture::new();
+        let base = f.commit("main before the target landed");
+        let target = f.commit("landed target");
+        let main = f.commit("main advanced after the target landed");
+        f.command(&["checkout", "--quiet", "--detach", &target]);
+        let side = f.commit("diverged head built on the target");
+        f.command(&["checkout", "--quiet", "--detach", &target]);
+        let ancestor = |target: &str, observed: &str| {
+            let mut status = f.authority(target, target);
+            status["admission_floor"]["kind"] = "main-ancestor".into();
+            status["admission_floor"]["observed_main_sha"] = observed.into();
+            status
+        };
+
+        let admitted = f.admit(&ancestor(&target, &main), &target).unwrap();
+        assert_eq!(admitted.floor().kind, "main-ancestor");
+        assert_eq!(admitted.floor().sha, target);
+        // The floor is the target, so every pin binding compares the target's
+        // pin with itself, exactly as a current-main run did at the tip.
+        admitted.verify_source(&f.0).unwrap();
+
+        // A head main does not contain is refused, even though it contains
+        // the floor: ancestry runs from the target to the observed main.
+        f.command(&["checkout", "--quiet", "--detach", &side]);
+        let diverged = f.admit(&ancestor(&side, &main), &side).unwrap_err();
+        assert!(diverged.contains("merge-base"), "{diverged}");
+        f.command(&["checkout", "--quiet", "--detach", &target]);
+
+        // The floor must be the target itself: neither an older main commit
+        // the target contains nor the newer observed main is accepted.
+        for floor in [&base, &main] {
+            let mut other = ancestor(&target, &main);
+            other["admission_floor"]["sha"] = floor.as_str().into();
+            other["admission_floor"]["tree"] = f
+                .command(&["rev-parse", &format!("{floor}^{{tree}}")])
+                .into();
+            let refused = f.admit(&other, &target).unwrap_err();
+            assert!(refused.contains("does not match"), "{refused}");
+        }
+
+        // A target that IS the observed main is a current-main run.
+        assert!(f.admit(&ancestor(&target, &target), &target).is_err());
+
+        // Only ordinary validation authority may select it.
+        let mut frozen = ancestor(&target, &main);
+        frozen["holder"]["kind"] = "frozen-validate".into();
+        frozen["admissible"] = false.into();
+        frozen["reason_code"] = "canonical-holder-kind-not-validate".into();
+        assert!(f.admit(&frozen, &target).is_err());
     }
 
     #[test]
