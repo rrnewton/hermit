@@ -206,6 +206,18 @@ struct OpenFileDescription {
     /// with host probe results.
     #[serde(default)]
     epoll_timerfds: std::collections::BTreeMap<(i32, OpenFileId), EpollTimerInterest>,
+    /// Events delivered from `epoll_timerfds` so far (FdType::Epoll only).
+    /// Each delivery ranks its interest after every other one; see
+    /// [`EpollTimerInterest::ready_rank`].
+    #[serde(default)]
+    epoll_timer_deliveries: u64,
+    /// Whether the next wait on this epoll gives ready virtual timerfds the
+    /// first claim on maxevents (FdType::Epoll only). The host and the
+    /// virtual timers each keep a ready order of their own, so when both are
+    /// ready beyond maxevents a wait alternates which side fills first, and
+    /// neither can starve the other.
+    #[serde(default)]
+    epoll_timers_first: bool,
     /// Whether Detcore has EVER known this description's lock state.
     ///
     /// This separates two different unknowns that `flock_mode_known == false`
@@ -269,6 +281,16 @@ pub(crate) struct EpollTimerInterest {
     pub edge_reported: Option<u64>,
     /// EPOLLONESHOT: disabled by a delivered event until EPOLL_CTL_MOD.
     pub oneshot_disarmed: bool,
+    /// Position in the epoll's virtual ready order: lower ranks report
+    /// first, equal ranks in key order. Linux re-queues a delivered
+    /// level-triggered item at the tail of the ready list, so delivering an
+    /// event ranks its interest after every other one. ADD installs the
+    /// delivery count current at the time, and MOD keeps the interest's
+    /// rank, as Linux leaves a queued item in place on EPOLL_CTL_MOD. The
+    /// epoll owns this field: [`DetFd::epoll_timer_add`] overwrites whatever
+    /// the caller passes.
+    #[serde(default)]
+    pub ready_rank: u64,
     /// The watched timerfd.
     #[serde(skip)]
     pub target: TimerFdLink,
@@ -406,6 +428,8 @@ impl DetFd {
                 flock_mode_ever_known: true,
                 timerfd: None,
                 epoll_timerfds: Default::default(),
+                epoll_timer_deliveries: 0,
+                epoll_timers_first: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -874,16 +898,28 @@ impl DetFd {
         })
     }
 
-    /// Record/replace an epoll interest in a virtual timerfd (ADD/MOD).
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd epoll ready order.
+    /// Record/replace an epoll interest in a virtual timerfd (ADD/MOD). A
+    /// new interest is ranked at the current delivery count: after
+    /// everything delivered before it, level with the most recent delivery.
+    /// A replaced one (MOD) keeps its rank: Linux leaves an item that is
+    /// already on the ready list where it is, so an event loop that
+    /// re-applies EPOLL_CTL_MOD to its interests on every iteration does not
+    /// reorder, and so cannot starve, the ones it touches.
     pub(crate) fn epoll_timer_add(
         &self,
         fd: i32,
         target: OpenFileId,
-        interest: EpollTimerInterest,
+        mut interest: EpollTimerInterest,
     ) {
-        self.description()
+        let mut description = self.description();
+        let key = (fd, target);
+        interest.ready_rank = description
             .epoll_timerfds
-            .insert((fd, target), interest);
+            .get(&key)
+            .map_or(description.epoll_timer_deliveries, |old| old.ready_rank);
+        description.epoll_timerfds.insert(key, interest);
     }
 
     /// Drop an epoll interest in a virtual timerfd (DEL).
@@ -891,32 +927,56 @@ impl DetFd {
         self.description().epoll_timerfds.remove(&(fd, target));
     }
 
-    /// This epoll instance's live virtual timerfd interests, in key order.
-    /// Interests whose timerfd was released are dropped first, as Linux does
-    /// when the watched file's last reference closes.
+    /// This epoll instance's live virtual timerfd interests, in ready order:
+    /// by [`EpollTimerInterest::ready_rank`], then by key. Interests whose
+    /// timerfd was released are dropped first, as Linux does when the
+    /// watched file's last reference closes.
     pub(crate) fn epoll_timer_interests(&self) -> Vec<((i32, OpenFileId), EpollTimerInterest)> {
         let mut description = self.description();
         description
             .epoll_timerfds
             .retain(|_, interest| interest.target.is_live());
-        description
+        let mut interests: Vec<_> = description
             .epoll_timerfds
             .iter()
             .map(|(key, interest)| (*key, interest.clone()))
-            .collect()
+            .collect();
+        // Stable over the key-ordered map, so equal ranks stay in key order.
+        interests.sort_by_key(|(_, interest)| interest.ready_rank);
+        interests
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd epoll ready order.
     /// Commit the consequence of delivering one timerfd event to the guest:
-    /// EPOLLET consumes this arming's edge, EPOLLONESHOT disables the interest.
+    /// EPOLLET consumes this arming's edge, EPOLLONESHOT disables the
+    /// interest, and every delivery ranks the interest after all others, as
+    /// Linux re-queues a delivered level-triggered item at the ready list's
+    /// tail.
     pub(crate) fn epoll_timer_delivered(&self, key: (i32, OpenFileId), generation: u64) {
-        if let Some(interest) = self.description().epoll_timerfds.get_mut(&key) {
+        let mut description = self.description();
+        let rank = description.epoll_timer_deliveries.saturating_add(1);
+        if let Some(interest) = description.epoll_timerfds.get_mut(&key) {
             if interest.events & libc::EPOLLET as u32 != 0 {
                 interest.edge_reported = Some(generation);
             }
             if interest.events & libc::EPOLLONESHOT as u32 != 0 {
                 interest.oneshot_disarmed = true;
             }
+            interest.ready_rank = rank;
+            description.epoll_timer_deliveries = rank;
         }
+    }
+
+    /// Whether the next wait on this epoll lets ready virtual timerfds claim
+    /// maxevents slots before the host probe does.
+    pub(crate) fn epoll_timers_first(&self) -> bool {
+        self.description().epoll_timers_first
+    }
+
+    /// Choose which side claims maxevents slots first on the next wait.
+    pub(crate) fn set_epoll_timers_first(&self, timers_first: bool) {
+        self.description().epoll_timers_first = timers_first;
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1463,6 +1523,7 @@ mod tests {
             data: 7,
             edge_reported: None,
             oneshot_disarmed: false,
+            ready_rank: 0,
             target,
         }
     }
@@ -1545,6 +1606,92 @@ mod tests {
         assert_eq!(interests[&edge].edge_reported, Some(3));
         assert!(!interests[&edge].oneshot_disarmed);
         assert!(interests[&oneshot].oneshot_disarmed);
+    }
+
+    /// Linux re-queues a delivered level-triggered epitem at the tail of the
+    /// ready list, so with maxevents 1 two always-ready items alternate. The
+    /// shadow's ready order does the same: a delivery ranks its interest
+    /// after every other one, whatever its key, ADD ranks an interest at the
+    /// current delivery count, and MOD keeps its rank, regardless of the rank
+    /// passed in.
+    #[test]
+    fn epoll_timer_delivery_rotates_the_ready_order() {
+        let owner = DetTid::from_raw(10);
+        let first_id = OpenFileId::new(owner, 1);
+        let second_id = OpenFileId::new(owner, 2);
+        let first = DetFd::new(5, OFlag::empty(), FdType::Timerfd, first_id);
+        let second = DetFd::new(6, OFlag::empty(), FdType::Timerfd, second_id);
+        first.init_timerfd(libc::CLOCK_MONOTONIC);
+        second.init_timerfd(libc::CLOCK_MONOTONIC);
+        let epoll = DetFd::new(7, OFlag::empty(), FdType::Epoll, OpenFileId::new(owner, 3));
+        let level = libc::EPOLLIN as u32;
+        let mut stale = timer_interest(level, second.timerfd_link().unwrap());
+        stale.ready_rank = 99;
+        epoll.epoll_timer_add(
+            5,
+            first_id,
+            timer_interest(level, first.timerfd_link().unwrap()),
+        );
+        epoll.epoll_timer_add(6, second_id, stale);
+        let order = |epoll: &DetFd| -> Vec<i32> {
+            epoll
+                .epoll_timer_interests()
+                .into_iter()
+                .map(|((fd, _), _)| fd)
+                .collect()
+        };
+        assert_eq!(order(&epoll), [5, 6], "equal ranks report in key order");
+        epoll.epoll_timer_delivered((5, first_id), 0);
+        assert_eq!(order(&epoll), [6, 5], "a delivered interest moves last");
+        epoll.epoll_timer_delivered((6, second_id), 0);
+        assert_eq!(order(&epoll), [5, 6]);
+        epoll.epoll_timer_delivered((5, first_id), 0);
+        assert_eq!(order(&epoll), [6, 5]);
+        // MOD keeps each interest's place, whatever rank the caller passes:
+        // re-applying both interests does not reorder them.
+        for (fd, id, link) in [
+            (6, second_id, second.timerfd_link().unwrap()),
+            (5, first_id, first.timerfd_link().unwrap()),
+        ] {
+            let mut modified = timer_interest(level, link);
+            modified.ready_rank = 0;
+            epoll.epoll_timer_add(fd, id, modified);
+        }
+        assert_eq!(order(&epoll), [6, 5], "MOD keeps the ready order");
+        // A delivery for an interest that is gone ranks nothing and does not
+        // advance the count, so an ADD after DEL ranks at 3, level with the
+        // latest delivery and ahead of it only by key.
+        epoll.epoll_timer_delivered((9, second_id), 0);
+        epoll.epoll_timer_remove(6, second_id);
+        epoll.epoll_timer_add(
+            6,
+            second_id,
+            timer_interest(level, second.timerfd_link().unwrap()),
+        );
+        let ranks: Vec<(i32, u64)> = epoll
+            .epoll_timer_interests()
+            .into_iter()
+            .map(|((fd, _), interest)| (fd, interest.ready_rank))
+            .collect();
+        assert_eq!(ranks, [(5, 3), (6, 3)]);
+    }
+
+    /// The fill-order flag lives on the epoll's open file description, so a
+    /// dup of the epoll descriptor shares it; a new epoll starts host-first.
+    #[test]
+    fn epoll_fill_order_is_shared_by_aliases_and_starts_host_first() {
+        let epoll = DetFd::new(
+            7,
+            OFlag::empty(),
+            FdType::Epoll,
+            OpenFileId::new(DetTid::from_raw(10), 3),
+        );
+        let alias = epoll.clone().with_fd(8);
+        assert!(!epoll.epoll_timers_first());
+        alias.set_epoll_timers_first(true);
+        assert!(epoll.epoll_timers_first());
+        epoll.set_epoll_timers_first(false);
+        assert!(!alias.epoll_timers_first());
     }
 
     /// Settime and a consuming read both bump the arming generation; the
