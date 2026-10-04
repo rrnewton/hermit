@@ -639,8 +639,8 @@ pub struct Scheduler {
     /// line. It is cleared as soon as the step sees a thread or a waiter again,
     /// and a committed turn makes the recorded turn stale.
     ///
-    /// See https://github.com/rrnewton/hermit/issues/3360 and
-    /// https://github.com/rrnewton/hermit/issues/3223.
+    /// See <https://github.com/rrnewton/hermit/issues/3360> and
+    /// <https://github.com/rrnewton/hermit/issues/3223>.
     empty_queue_kick_turn: Option<u64>,
 
     // A fatal backend result ends this run; it is never a guest response.

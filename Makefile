@@ -185,6 +185,8 @@ lint-checks: ## The lint checkers CI schedules as one node (everything in `lint`
 	./scripts/check-github-actions-triggers.rs
 	./scripts/docs-pages-contract.rs
 	./scripts/test-pre-push-submodule-diagnosis.sh
+	./scripts/check-doc-bare-urls.rs
+	./scripts/test-pre-push-doc-bare-urls.sh
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh
 	python3 ./scripts/test_check_outcome_adapter_authority.py

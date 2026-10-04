@@ -140,7 +140,7 @@ struct DetInodeInfo {
 
 /// Whole-second host mtimes, with a zero nanosecond part, that a file keeps
 /// when Hermit first sees it, instead of having its mtime replaced by the
-/// epoch (https://github.com/rrnewton/hermit/issues/3639).
+/// epoch (<https://github.com/rrnewton/hermit/issues/3639>).
 ///
 /// These values are canonical and content-independent: they are written
 /// deliberately by tools that erase timestamps, so they carry no host clock
