@@ -8486,10 +8486,16 @@ mod test {
             wait.released = true;
             wait
         };
+        // A vfork parent's request (BlockingVfork) carries no mask, so
+        // production records it with an unknown mask, the last case. The
+        // Some(0) case shows that the vfork barrier alone keeps the wait.
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): the vfork-parent state production records.
         let cases = [
             ("mask blocks the signal", Some(alarm | usr1), false),
             ("mask unknown", None, false),
             ("vfork parent", Some(0), true),
+            ("vfork parent, mask unknown (production)", None, true),
         ];
         for (case, signal_mask, vfork_parent) in cases {
             let (mut scheduler, _leader, waiter) = external_io_group(&Config::default());
@@ -9690,7 +9696,13 @@ mod test {
         let reader = DetTid::from_raw(102);
         let masked = DetTid::from_raw(103);
         let vfork_parent = DetTid::from_raw(104);
-        for tid in [reader, masked, vfork_parent] {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): the vfork-parent state production records.
+        // Production records a vfork parent with no mask (BlockingVfork
+        // carries none); `vfork_parent` gives its wait a mask that admits
+        // everything, so that only the barrier keeps it.
+        let vfork_unknown = DetTid::from_raw(105);
+        for tid in [reader, masked, vfork_parent, vfork_unknown] {
             scheduler.thread_tree.add_child(leader, tid, false);
             register_known_thread(&mut scheduler, tid);
         }
@@ -9714,15 +9726,23 @@ mod test {
             .external_io_blockers
             .insert(vfork_parent, vfork_wait);
         scheduler.vfork_barriers.insert(vfork_parent, None);
+        let vfork_unknown_wait = ExternalIoWait::new(ExternalOpId::new(vfork_unknown, 58), None);
+        scheduler
+            .blocked
+            .external_io_blockers
+            .insert(vfork_unknown, vfork_unknown_wait);
+        scheduler.vfork_barriers.insert(vfork_unknown, None);
 
-        for tid in [waiter, masked, reader, vfork_parent] {
+        for tid in [waiter, masked, reader, vfork_parent, vfork_unknown] {
             scheduler.notify_signal_pending(tid, SigWrapper(libc::SIGUSR2));
         }
         // Notification alone leaves every waiter where it was.
         assert!(scheduler.blocked.rt_sigsuspend_blockers[&waiter].released);
         assert!(!scheduler.blocked.rt_sigsuspend_blockers[&masked].released);
         assert!(scheduler.blocked.external_io_blockers[&reader].released);
-        for tid in [waiter, masked, reader, vfork_parent] {
+        // An unknown mask is never known to admit the signal.
+        assert!(!scheduler.blocked.external_io_blockers[&vfork_unknown].released);
+        for tid in [waiter, masked, reader, vfork_parent, vfork_unknown] {
             assert!(!scheduler.run_queue.contains_tid(tid), "{tid:?}");
         }
 
@@ -9750,7 +9770,11 @@ mod test {
                 .contains_key(&masked)
         );
         assert!(scheduler.blocked.external_io_blockers[&vfork_parent].released);
-        for tid in [masked, vfork_parent] {
+        assert_eq!(
+            scheduler.blocked.external_io_blockers.get(&vfork_unknown),
+            Some(&vfork_unknown_wait)
+        );
+        for tid in [masked, vfork_parent, vfork_unknown] {
             assert!(!scheduler.run_queue.contains_tid(tid), "{tid:?}");
         }
     }
