@@ -2415,13 +2415,30 @@ pub struct AttemptResult {
 }
 
 /// The stdout assertions a verify cell declares for its backend: the exact
-/// `expected_stdout` and the `expected_stdout_contains` text, each absent
+/// `expected_stdout` and the `expected_stdout_contains` text, each `null`
 /// when the cell declares none.
+///
+/// Both members must be present when a row is read. Serde would otherwise
+/// read an omitted member as `None`, so a row that dropped `exact` would read
+/// as a cell that declares no exact stdout, and the skid checks would
+/// re-decide the attempts against an empty declaration instead of the one
+/// the runner recorded. The runner always writes both members.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DeclaredStdout {
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub exact: Option<String>,
+    #[serde(deserialize_with = "deserialize_required_nullable")]
     pub contains: Option<String>,
+}
+
+/// Reads a member that must be present but may be `null`. A field with a
+/// `deserialize_with` and no `default` is a missing-field error when omitted.
+fn deserialize_required_nullable<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer)
 }
 
 /// One test-harness cell observation written to `results.jsonl`.
@@ -15623,9 +15640,26 @@ cp "{}" "$verdict"
             "{skid_row}"
         );
         assert_eq!(skid_overshoot_only_reports(&skid_result), Some(2));
-        let reread: CellResult = serde_json::from_value(skid_row).unwrap();
+        let reread: CellResult = serde_json::from_value(skid_row.clone()).unwrap();
         assert_eq!(reread.declared_stdout, Some(DeclaredStdout::default()));
         assert_eq!(skid_overshoot_only_reports(&reread), Some(2));
+        // Each member is required, though it may be null: a record that
+        // omits one is refused rather than read as a declaration of nothing.
+        for (omitted, record) in [
+            ("exact", serde_json::json!({"contains": null})),
+            ("contains", serde_json::json!({"exact": null})),
+            ("exact", serde_json::json!({})),
+        ] {
+            let mut row = skid_row.clone();
+            row["declared_stdout"] = record;
+            let error = serde_json::from_value::<CellResult>(row).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("missing field `{omitted}`")),
+                "{error}"
+            );
+        }
 
         let (plain_result, plain_row) =
             expected_exit_row(None, canonical_verification_report(), "exit 0");

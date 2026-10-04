@@ -15562,6 +15562,29 @@ fn self_test(root: &Path) -> Result<(), String> {
             exact: Some("other\n".into()),
             contains: None,
         });
+        // A skid row declaring only `expected_stdout_contains`, which its
+        // compared runs printed, and a PASS whose compared runs printed it
+        // too. The empty-stdout PASS above does not contain it.
+        let marker_stdout = "skid-marker\n";
+        let print_marker = |row: &CellResult| -> Result<CellResult, String> {
+            let mut row = rewrite_report(row, &|report| {
+                for side in ["left", "right"] {
+                    report["compared_outputs"][side]["stdout_sha256"] = json!(format!(
+                        "{:x}",
+                        sha2::Sha256::digest(marker_stdout.as_bytes())
+                    ));
+                    report["compared_outputs"][side]["stdout_bytes"] = json!(marker_stdout.len());
+                }
+            })?;
+            row.attempts[0].stdout = marker_stdout.into();
+            Ok(row)
+        };
+        let mut contains_skid = print_marker(&skid)?;
+        contains_skid.declared_stdout = Some(hermit_manifest_plan::runner::DeclaredStdout {
+            exact: None,
+            contains: Some("skid-marker".into()),
+        });
+        let marker_pass = print_marker(&retry_pass)?;
         // A cell declaring guest exit 7: its skid row and its PASS, a PASS
         // whose guest exited 0 instead, and a PASS whose guest exited 7 while
         // Hermit exited 0.
@@ -15599,6 +15622,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         for (case, row) in [
             ("stripped skid", &stripped_skid),
             ("declared skid", &declared_skid),
+            ("contains-declared skid", &contains_skid),
             ("exit-7 skid", &exit7_skid),
             ("other-backend skid", &other_backend_skid),
             ("other-test skid", &other_test_skid),
@@ -15615,6 +15639,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             ("forged-dispatch", &forged_dispatch_pass),
             ("canonical-under-stripped", &canonical_under_stripped_pass),
             ("unexpected-stdout", &unexpected_stdout_pass),
+            ("marker", &marker_pass),
             ("exit-0", &exit0_pass),
             ("status-0", &status0_pass),
             ("classified", &classified_pass),
@@ -15779,6 +15804,18 @@ fn self_test(root: &Path) -> Result<(), String> {
                 "declared skid then unexpected-stdout pass",
                 "pass",
                 vec![declared_skid.clone(), unexpected_stdout_pass.clone()],
+                false,
+            ),
+            (
+                "contains-declared skid then marker pass",
+                "pass",
+                vec![contains_skid.clone(), marker_pass.clone()],
+                true,
+            ),
+            (
+                "contains-declared skid then pass",
+                "pass",
+                vec![contains_skid.clone(), retry_pass.clone()],
                 false,
             ),
             (
@@ -16031,6 +16068,22 @@ fn self_test(root: &Path) -> Result<(), String> {
                 true,
             ),
             (
+                "verdicts-contains-skid-then-marker-pass",
+                &contains_skid,
+                &marker_pass,
+                "INCOMPLETE",
+                1,
+                true,
+            ),
+            (
+                "verdicts-contains-skid-then-pass",
+                &contains_skid,
+                &retry_pass,
+                "FLAKY",
+                0,
+                true,
+            ),
+            (
                 "verdicts-exit7-skid-then-exit0-pass",
                 &exit7_skid,
                 &exit0_pass,
@@ -16080,6 +16133,84 @@ fn self_test(root: &Path) -> Result<(), String> {
             {
                 return Err(format!(
                     "{name}: a retried pass was misjudged: {outcome:?} {written}"
+                ));
+            }
+        }
+        // A skid row whose declared-stdout record omits one member, which no
+        // runner writes. Read leniently, the omitted member would be null:
+        // the declared empty stdout, or the declared marker, would read as no
+        // declaration, and the PASS that violates it would earn recovery
+        // credit like the undeclared control. The row is refused instead, so
+        // the repetition is never CLEAN, earns no credit, and its evidence
+        // error names the missing member. The controls that keep both members
+        // are verdicts-skid-recovered (both explicitly null) and the declared
+        // and contains-declared cases above.
+        let explicit_null =
+            serde_json::to_value(&skid).map_err(|e| format!("cannot encode skid fixture: {e}"))?;
+        if explicit_null["declared_stdout"] != json!({"exact": null, "contains": null}) {
+            return Err(format!(
+                "the undeclared skid control does not record both members as null: {explicit_null}"
+            ));
+        }
+        for (name, earlier, later, omitted) in [
+            (
+                "verdicts-exact-omitted-skid-then-unexpected-stdout-pass",
+                &declared_skid,
+                &unexpected_stdout_pass,
+                "exact",
+            ),
+            (
+                "verdicts-contains-omitted-skid-then-pass",
+                &contains_skid,
+                &retry_pass,
+                "contains",
+            ),
+        ] {
+            let root = scratch.join(name);
+            let run = format!("{name}-1");
+            let mut first = observation(earlier, &sample_b, &run);
+            first.artifact_dir = format!("{}/attempt-1", first.artifact_dir);
+            let mut second = observation(later, &sample_b, &run);
+            second.artifact_dir = format!("{}/attempt-2", second.artifact_dir);
+            let mut first = serde_json::to_value(&first)
+                .map_err(|e| format!("cannot encode {name} fixture: {e}"))?;
+            first["declared_stdout"]
+                .as_object_mut()
+                .and_then(|record| record.remove(omitted))
+                .ok_or_else(|| format!("{name}: the skid row records no `{omitted}` member"))?;
+            let second = serde_json::to_value(&second)
+                .map_err(|e| format!("cannot encode {name} fixture: {e}"))?;
+            let dir = root
+                .join("cells")
+                .join(format!("{}-repetition-0001", base_cell_slug(&sample_b)));
+            fs::create_dir_all(&dir)
+                .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            fs::write(dir.join("results.jsonl"), format!("{first}\n{second}\n"))
+                .map_err(|e| format!("cannot write {name} fixture: {e}"))?;
+            for number in 2..=3 {
+                write(
+                    &root,
+                    &sample_b,
+                    number,
+                    &[observation(&pass, &sample_b, &format!("{name}-{number}"))],
+                )?;
+            }
+            let (outcome, written) = judge(&root, 3)?;
+            let summary = &written["cells"][0];
+            if !outcome
+                .as_ref()
+                .is_err_and(|error| error.contains("1 of 1 cell(s) are not CLEAN"))
+                || written["cells"].as_array().map(Vec::len) != Some(1)
+                || summary["verdict"] == json!("CLEAN")
+                || summary["clean_passes"] != json!(2)
+                || summary["infrastructure_recovered_passes"] != json!(0)
+                || summary["promotion_candidate"] != json!(false)
+                || !summary["evidence_errors"]
+                    .to_string()
+                    .contains(&format!("missing field `{omitted}`"))
+            {
+                return Err(format!(
+                    "{name}: a skid row omitting `{omitted}` from its declaration was not refused: {outcome:?} {written}"
                 ));
             }
         }
