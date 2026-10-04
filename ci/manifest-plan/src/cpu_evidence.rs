@@ -370,9 +370,9 @@ fn raw_usec(value: &RawTimeval) -> Option<u64> {
 }
 
 impl LiveCpuEnabled {
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(source: LiveCpuSource) -> Self {
         Self {
-            source: LiveCpuSource::AgentUtilsPairedPidfdStatV1,
+            source,
             registration: RegistrationObservation::NotAttempted,
             polls: 0,
             source_sample_calls: 0,
@@ -541,11 +541,13 @@ impl LiveCpuEnabled {
 }
 
 impl InvocationCpuObservation {
+    /// `cpu_source` names the live CPU source of a budgeted invocation, or is
+    /// `None` when the invocation has no CPU budget.
     pub(crate) fn pending(
         ordinal: u64,
         role: InvocationRole,
         command: CommandIdentity,
-        cpu_enabled: bool,
+        cpu_source: Option<LiveCpuSource>,
     ) -> Self {
         Self {
             ordinal,
@@ -554,10 +556,9 @@ impl InvocationCpuObservation {
             launch: LaunchObservation::NotStarted {
                 reason: NotStartedReason::WallBudgetAlreadyExhausted,
             },
-            live: if cpu_enabled {
-                LiveCpuObservation::Enabled(Box::new(LiveCpuEnabled::new()))
-            } else {
-                LiveCpuObservation::Disabled
+            live: match cpu_source {
+                Some(source) => LiveCpuObservation::Enabled(Box::new(LiveCpuEnabled::new(source))),
+                None => LiveCpuObservation::Disabled,
             },
             final_wait: FinalWaitObservation::NotApplicable,
             termination: TerminationPath::NotStarted,
@@ -1406,8 +1407,7 @@ pub(crate) mod tests {
     /// A bound reader's live summary, built by the production summarizer from
     /// successive samples taken 100 ms apart.
     fn recorded_live(source: LiveCpuSource, samples: &[u64]) -> Value {
-        let mut live = LiveCpuEnabled::new();
-        live.source = source;
+        let mut live = LiveCpuEnabled::new(source);
         live.registration = RegistrationObservation::BoundOnce;
         for (index, &cpu_usec) in samples.iter().enumerate() {
             live.record_poll(
