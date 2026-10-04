@@ -641,7 +641,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and runner::tests::a_process_named_with_bytes_that_are_not_utf8_does_not_fail_the_scan
     // retain all 884 (`cargo nextest list --profile ci -p hermit-manifest-plan`
     // measured 687 at 7e2fc5cfd65d and 689 with them).
-    ("test.regular_crates", 886),
+    // parity::tests::an_imported_pair_earns_clean_credit_only_when_both_cells_ran_alike,
+    // parity::tests::an_imported_reference_never_reuses_an_earlier_golden and
+    // test-harness tests::parity_compare_finds_an_imported_runs_logs_through_its_summary,
+    // added in 9af999677494, retain all 886
+    // (`cargo nextest list --profile ci -p hermit-manifest-plan` measured 689 at
+    // be7f2dc15590 and 692 with them; the whole selection measured 889 at
+    // 238e148313e1).
+    ("test.regular_crates", 889),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1134,7 +1141,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities and remove one, so 850 of the 851 prior identities are
     // retained (+32). The spawn-failure test listed there retains all 883.
     // The two process-group scan tests listed there retain all 884.
-    ("test.regular_crates_on_host", 886),
+    // The three imported-pair parity tests listed there retain all 886.
+    ("test.regular_crates_on_host", 889),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
