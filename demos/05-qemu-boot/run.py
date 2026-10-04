@@ -399,6 +399,17 @@ def boot_once() -> str:
         if not snapshot_exists(snapshot_disk, SNAPSHOT_NAME):
             raise RuntimeError("snapshot {} was not saved".format(SNAPSHOT_NAME))
         canonicalize_qcow2_snapshot_timestamp(snapshot_disk, SNAPSHOT_NAME)
+        # Every check of the boot itself comes before the snapshot's .id file,
+        # its records and its publication, so a published snapshot with a
+        # matching record means the boot passed them. Demos 6 and 7 rely on
+        # that when demo 5 exits non-zero after a rebuild
+        # (accept_snapshot_after_failed_rebuild): after publication come only
+        # the archive copy, the display, the run's metadata and the comparison
+        # with the reference run. Review finding R7-6 on
+        # https://github.com/rrnewton/hermit/pull/3703.
+        serial_text = serial_log.read_text(errors="replace")
+        if "2022-01-01T" not in serial_text:
+            raise RuntimeError("serial transcript lacks the fixed RTC epoch")
 
         snapshot_sha = hash_file(snapshot_disk)
         (snapshot_disk.with_suffix(snapshot_disk.suffix + ".id")).write_text(
@@ -419,9 +430,6 @@ def boot_once() -> str:
         copy_file(snapshot_disk, archived_disk)
         # serial_log already lives inside run_dir, so it is published with the
         # anchor/archive directly; no separate copy step is needed.
-        serial_text = serial_log.read_text(errors="replace")
-        if "2022-01-01T" not in serial_text:
-            raise RuntimeError("serial transcript lacks the fixed RTC epoch")
 
         banner("Snapshot ready")
         snapshot_display = display_path(snapshot_disk, ROOT)
