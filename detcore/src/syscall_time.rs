@@ -187,11 +187,12 @@ pub(crate) const MAX_UNCHARGED_BOOTSTRAP_SYSCALLS: u32 = 32768;
 /// the time left on a timer, and the `time` field an `adjtimex` or
 /// `clock_adjtime` query returns (glibc's `ntp_gettime` reads the clock that
 /// way). `timerfd_gettime` is listed because its result is a timer value: the
-/// time left on a timerfd. In sequentialized runs outside record/replay
-/// (`Detcore::virtual_timerfds`) that value comes from the virtual clock; in
-/// record/replay and non-sequentialized runs timerfds still pass through to a
-/// host timer (<https://github.com/rrnewton/hermit/issues/1923>), so there it
-/// is host time left.
+/// time left on a timerfd. In sequentialized runs with virtual time outside
+/// record/replay (`Detcore::virtual_timerfds`) that value comes from the
+/// virtual clock; in record/replay, non-sequentialized and
+/// `--no-virtualize-time` runs timerfds still pass through to a host timer
+/// (<https://github.com/rrnewton/hermit/issues/1923>), so there it is host
+/// time left.
 ///
 /// Inside a backend-runtime bootstrap window these syscalls are always charged,
 /// so two such reads on the bootstrapping thread differ by at least one syscall

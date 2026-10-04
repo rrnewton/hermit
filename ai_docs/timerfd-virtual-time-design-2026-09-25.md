@@ -27,13 +27,18 @@ committed turns, so whether the timer had fired when another thread probed
 
 ## Mode gate
 
-`virtual_timerfds() = sequentialize_threads && !recordreplay_modes`
+`virtual_timerfds() = sequentialize_threads && virtualize_time && !recordreplay_modes`
 (`detcore/src/syscalls/files.rs`). Only then are timerfds virtual. Every other
 mode keeps the previous host passthrough unchanged: create lets the kernel
 validate the clock, settime and gettime go through `notification_fd_control`,
 and read takes the generic notification-fd path. Record/replay and
 non-sequentialized runs are excluded because their wait paths block in the
 host, where a timer that is never armed in the kernel would never wake them.
+Runs without virtual time (`--no-virtualize-time`) are excluded because the
+guest's clock reads return host time there: an absolute deadline computed from
+them is a host instant, which the logical clock would misread (a host
+CLOCK_MONOTONIC instant lies far in the logical past, a host CLOCK_REALTIME
+instant months in the logical future).
 
 ## State
 
