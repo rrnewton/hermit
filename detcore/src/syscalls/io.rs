@@ -2384,6 +2384,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// infinite wait whose timer a peer consumed in between, or refuse a
     /// wait whose timer a peer armed in between.
     ///
+    /// Every outcome is decided on that one post-turn scan merged with the
+    /// host probe, never on anything seen before the turn. Two cases follow:
+    ///
+    /// - A timer that was ready when the call was made, but that a sibling
+    ///   thread read during the yield, is not counted. A nonzero or
+    ///   infinite timeout therefore never returns 0 early (Linux's
+    ///   `ep_poll` never does); with nothing else ready the wait blocks as
+    ///   described below.
+    /// - A timer that was not ready when the call was made, but whose
+    ///   expiry the virtual clock passed during the yield (or that a peer
+    ///   armed or added then), is counted and returned at once.
+    ///
     /// With a virtual timerfd interest, a wait that need not block is one
     /// timeout-0 probe under the caller's mask, which is atomic exactly as
     /// on Linux. The host is probed too, so a ready host fd returns at once,
