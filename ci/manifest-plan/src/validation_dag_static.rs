@@ -773,7 +773,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Owning LIST for the b8ef6a82 composition measured 844 selected cases.
     // Prior identities/flags and the declared FIX1/FIX2 additions are preserved.
     // Count evidence: https://github.com/rrnewton/reverie/issues/916
-    ("test.hermit_unit", 844),
+    // Owning LIST at 85457060d9e5 measured 845 selected cases, adding the
+    // direct-JSON/deferred-console boundary control with prior flags retained.
+    // Count evidence: https://github.com/rrnewton/hermit/pull/3744
+    ("test.hermit_unit", 845),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1133,7 +1136,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Owning LIST for the b8ef6a82 composition measured 844 selected cases.
     // Prior identities/flags and the declared FIX1/FIX2 additions are preserved.
     // Count evidence: https://github.com/rrnewton/reverie/issues/916
-    ("test.hermit_unit_on_host", 844),
+    // The same owning selection at 85457060d9e5 measured 845 cases; retain
+    // local/host selection equality for the direct-JSON/console boundary test.
+    // Count evidence: https://github.com/rrnewton/hermit/pull/3744
+    ("test.hermit_unit_on_host", 845),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
