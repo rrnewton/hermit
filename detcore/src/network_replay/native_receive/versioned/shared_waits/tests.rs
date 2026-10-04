@@ -49,6 +49,16 @@ async fn fixture_engine_kind(
     split: bool,
     record: bool,
 ) -> Fixture {
+    fixture_engine_kind_with_trace(with_child, ready_poll, eof, split, record, |_| {}).await
+}
+async fn fixture_engine_kind_with_trace(
+    with_child: bool,
+    ready_poll: bool,
+    eof: bool,
+    split: bool,
+    record: bool,
+    customize: impl FnOnce(&mut detcore_model::network_trace::NetworkTraceV4),
+) -> Fixture {
     let mut trace = NetworkReplayEngine::controlled_replay_two_row_trace();
     let now = trace.epoch_global_time().unwrap();
     // Real validated immutable trace: bytes are unavailable at this first
@@ -151,6 +161,7 @@ async fn fixture_engine_kind(
             prerequisites,
         });
     }
+    customize(&mut trace);
     trace.validate().unwrap();
     let key = trace.fresh_stream_profiles[0].key;
     let record_profile = trace.fresh_stream_profiles[0].clone();

@@ -227,7 +227,10 @@ impl NetworkReplayEngine {
             }
         }
         let (sampled, _) = source.sample();
-        if sampled < intent.started || sampled > now {
+        // Record owns a scan within this Call. Replay observes persistent
+        // released state at this selected current cut, bound by `at`/`same`;
+        // its immutable source time also remains the final-zero deadline proof.
+        if sampled > now || (matches!(&source, Provenance::Record(_)) && sampled < intent.started) {
             return Err(invalid(
                 "Poll observation is outside its original call interval",
             ));

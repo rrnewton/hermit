@@ -404,3 +404,351 @@ async fn shared_poll_output_prewrite_lifetime_control_time_and_attempt_refuse_wi
             .unwrap();
     }
 }
+
+#[tokio::test]
+async fn shared_poll_replay_released_ready_precedes_later_calls_without_consumption() {
+    let mut f = fixture_with_inputs(false, true).await;
+    let sampled = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+    let mut original_snapshot = None;
+    for delay in [1, 2] {
+        // The trace input is unchanged; each original Call starts later.
+        f.now = LogicalTime::from_nanos(sampled.as_nanos() + delay);
+        let call = one_poll(&f, 5000).await;
+        let prefix = f
+            .runtime
+            .join_shared_foreground_prefix(f.root.clone(), &f.engine, Some(call.id))
+            .await
+            .unwrap();
+        f.runtime
+            .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+                let grant = f
+                    .scheduler
+                    .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+                let mut e = f.engine.lock().unwrap();
+                let count = f.runtime.with_shared_replay_poll_output(
+                    &prefix,
+                    lineage,
+                    &mut e,
+                    call.id,
+                    |e, proof| {
+                        let SharedPollDecision::Store(plan) = e
+                            .plan_shared_replay_poll(call.id, &grant, proof, f.now)
+                            .expect("released ready snapshot predating Poll must be observed in the current Call")
+                        else {
+                            panic!("released nonzero readiness must produce output");
+                        };
+                        e.reserve_shared_replay_poll(plan, &grant, proof, f.now)
+                            .map_err(std::io::Error::other)
+                    },
+                    |e, source, interval| {
+                        assert_eq!(source.input(), (f.binding.slot.fd, libc::POLLIN, 5000));
+                        assert_eq!(source.revents(), libc::POLLIN);
+                        let snapshot = e
+                            .shared_poll_snapshot(f.binding.open_file)
+                            .unwrap()
+                            .unwrap();
+                        assert_eq!(snapshot.observed_at, sampled);
+                        assert_eq!(snapshot.consumed_prefix, 0);
+                        if let Some(original) = original_snapshot {
+                            assert_eq!(snapshot, original);
+                        } else {
+                            original_snapshot = Some(snapshot);
+                        }
+                        assert!(
+                            e.begin_stream_call_release(f.root.owner(), call.id)
+                                .is_err()
+                        );
+                        e.with_shared_poll_store_retention(source, &grant, f.now, |retainer| {
+                            retainer.retain(SharedPollStoreAttempt::controlled_with_interval(
+                                source.clone(),
+                                Outcome::Attempted {
+                                    raw: Ok(2),
+                                    postcheck: Ok(()),
+                                },
+                                interval.clone(),
+                            ))
+                        })
+                        .unwrap()
+                        .unwrap();
+                        let count = e
+                            .complete_shared_replay_poll_store(source, &grant, f.now)
+                            .unwrap();
+                        assert!(!e.stream_calls.contains_key(&call.id));
+                        assert_eq!(e.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+                        assert_eq!(
+                            e.shadow.as_ref().unwrap().sockets[&f.binding.open_file].consume_epoch,
+                            0
+                        );
+                        assert_eq!(
+                            e.shared_poll_snapshot(f.binding.open_file).unwrap(),
+                            original_snapshot
+                        );
+                        Ok(count)
+                    },
+                )?;
+                assert_eq!(count, 1);
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+async fn zero_poll_fixture(final_scan: bool) -> Fixture {
+    let mut f = fixture_engine_kind_with_trace(false, false, false, false, false, |trace| {
+        let epoch = trace.epoch_global_time().unwrap();
+        let started = LogicalTime::from_nanos(epoch.as_nanos() + 38);
+        let sampled = if final_scan {
+            LogicalTime::from_nanos(started.as_nanos() + 5_000_000_000)
+        } else {
+            LogicalTime::from_nanos(started.as_nanos() - 1)
+        };
+        // Construct a quiet connected socket before engine construction: there
+        // are no data, EOF or error inputs, including beyond the Poll deadline.
+        assert!(matches!(
+            trace.inputs[0].event,
+            NetworkInputKindV2::Connect(_)
+        ));
+        trace.inputs.truncate(1);
+        trace.native_receive_observations.clear();
+        assert!(trace.outputs.is_empty());
+        trace.release_model = NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 {
+            nodes: trace.release_model.nodes()[..2].to_vec(),
+        };
+        let ordinal = trace.inputs.len() as u64;
+        let cut = NetworkReceiveEntryCutV4(trace.release_model.nodes().len() as u64);
+        let prerequisites = trace.entry_frontier(cut).unwrap();
+        trace.inputs.push(NetworkInputEventV4 {
+            ordinal,
+            channel: NetworkChannelId(1),
+            release: NetworkReleaseV4 {
+                not_before_global_time: sampled,
+                receive_entry_cut: cut,
+                prerequisites: prerequisites.clone(),
+            },
+            event: NetworkInputKindV2::SharedRawTcpPollState {
+                consumed_prefix: 0,
+                revents: 0,
+                control_generation: 0,
+                receive_low_water: 1,
+            },
+        });
+        let NetworkReleaseModelV4::SerializedSharedMmAttemptsV1 { nodes } =
+            &mut trace.release_model
+        else {
+            unreachable!()
+        };
+        nodes.push(NetworkReleaseNodeV4 {
+            id: NetworkReleaseNodeIdV4(cut.0),
+            kind: NetworkReleaseNodeKindV4::Input {
+                input_ordinal: ordinal,
+            },
+            prerequisites,
+        });
+    })
+    .await;
+    f.now = LogicalTime::from_nanos(f.now.as_nanos() + 38);
+    let e = f.engine.lock().unwrap();
+    let queue = &e.channels[&NetworkChannelId(1)];
+    assert!(queue.inbound.is_empty());
+    assert!(!queue.peer_write_closed && !queue.local_read_shutdown);
+    assert_eq!(e.native_trace_fixture().inputs.len(), 2);
+    assert_eq!(
+        e.shadow.as_ref().unwrap().sockets[&f.binding.open_file]
+            .options
+            .receive_low_water,
+        1
+    );
+    drop(e);
+    f
+}
+
+#[tokio::test]
+async fn shared_poll_replay_old_zero_is_pending_but_only_final_zero_can_timeout() {
+    for final_scan in [false, true] {
+        let f = zero_poll_fixture(final_scan).await;
+        let old_sample = LogicalTime::from_nanos(f.now.as_nanos() - 1);
+        let deadline = LogicalTime::from_nanos(f.now.as_nanos() + 5_000_000_000);
+        let trace = f.engine.lock().unwrap().native_trace_fixture();
+        let call = one_poll(&f, 5000).await;
+        let prefix = f
+            .runtime
+            .join_shared_foreground_prefix(f.root.clone(), &f.engine, Some(call.id))
+            .await
+            .unwrap();
+        f.runtime
+            .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+                let grant = f
+                    .scheduler
+                    .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+                let mut e = f.engine.lock().unwrap();
+                f.runtime
+                    .with_shared_attempt_prefix(&prefix, &mut e, |e, proof| {
+                        assert!(matches!(
+                            e.plan_shared_replay_poll(call.id, &grant, proof, f.now)
+                                .unwrap(),
+                            SharedPollDecision::Pending
+                        ));
+                        if !final_scan {
+                            assert!(matches!(
+                                e.plan_shared_replay_poll(call.id, &grant, proof, deadline),
+                                Err(NetworkReplayError::FdPublicationProtocol(message))
+                                    if message == "Poll timeout lacks an actual final zero scan"
+                            ));
+                            assert_eq!(
+                                e.shared_poll_snapshot(f.binding.open_file)
+                                    .unwrap()
+                                    .unwrap()
+                                    .observed_at,
+                                old_sample
+                            );
+                            assert!(e.stream_calls.contains_key(&call.id));
+                            assert!(
+                                e.shared_wait(f.root.owner(), call.id)
+                                    .unwrap()
+                                    .1
+                                    .poll_output
+                                    .is_none()
+                            );
+                        }
+                        assert_eq!(e.native_trace_fixture(), trace);
+                        assert!(e.channels[&NetworkChannelId(1)].inbound.is_empty());
+                        assert!(!e.channels[&NetworkChannelId(1)].peer_write_closed);
+                        assert!(!e.channels[&NetworkChannelId(1)].local_read_shutdown);
+                        assert_eq!(e.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+                        Ok(())
+                    })
+            })
+            .unwrap();
+        if !final_scan {
+            continue;
+        }
+        f.runtime
+            .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+                let grant = f
+                    .scheduler
+                    .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+                let mut e = f.engine.lock().unwrap();
+                let count = f.runtime.with_shared_replay_poll_output(
+                    &prefix,
+                    lineage,
+                    &mut e,
+                    call.id,
+                    |e, proof| {
+                        let SharedPollDecision::Store(plan) = e
+                            .plan_shared_replay_poll(call.id, &grant, proof, deadline)
+                            .unwrap()
+                        else {
+                            panic!("the released final zero must produce timeout output");
+                        };
+                        e.reserve_shared_replay_poll(plan, &grant, proof, deadline)
+                            .map_err(std::io::Error::other)
+                    },
+                    |e, source, interval| {
+                        assert_eq!(source.revents(), 0);
+                        assert_eq!(source.count(), 0);
+                        assert_eq!(
+                            e.shared_poll_snapshot(f.binding.open_file)
+                                .unwrap()
+                                .unwrap()
+                                .observed_at,
+                            deadline
+                        );
+                        e.with_shared_poll_store_retention(source, &grant, deadline, |retainer| {
+                            retainer.retain(SharedPollStoreAttempt::controlled_with_interval(
+                                source.clone(),
+                                Outcome::Attempted {
+                                    raw: Ok(2),
+                                    postcheck: Ok(()),
+                                },
+                                interval.clone(),
+                            ))
+                        })
+                        .unwrap()
+                        .unwrap();
+                        let count = e
+                            .complete_shared_replay_poll_store(source, &grant, deadline)
+                            .unwrap();
+                        assert!(!e.stream_calls.contains_key(&call.id));
+                        assert_eq!(e.native_trace_fixture(), trace);
+                        assert!(e.channels[&NetworkChannelId(1)].inbound.is_empty());
+                        assert!(!e.channels[&NetworkChannelId(1)].peer_write_closed);
+                        assert!(!e.channels[&NetworkChannelId(1)].local_read_shutdown);
+                        assert_eq!(e.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+                        assert_eq!(
+                            e.shadow.as_ref().unwrap().sockets[&f.binding.open_file].consume_epoch,
+                            0
+                        );
+                        Ok(count)
+                    },
+                )?;
+                assert_eq!(count, 0);
+                Ok(())
+            })
+            .unwrap();
+    }
+}
+
+#[tokio::test]
+async fn shared_poll_replay_future_source_and_shifted_reservation_refuse() {
+    for future_source in [true, false] {
+        let mut f = fixture_with_inputs(false, true).await;
+        let sampled = LogicalTime::from_nanos(f.now.as_nanos() + 37);
+        if !future_source {
+            f.now = LogicalTime::from_nanos(sampled.as_nanos() + 1);
+        }
+        let call = one_poll(&f, 5000).await;
+        let prefix = f
+            .runtime
+            .join_shared_foreground_prefix(f.root.clone(), &f.engine, Some(call.id))
+            .await
+            .unwrap();
+        f.runtime
+            .with_shared_foreground_lineage(f.root.owner(), |lineage| {
+                let grant = f
+                    .scheduler
+                    .shared_mm_foreground_observation(f.root.owner(), lineage)?;
+                let mut e = f.engine.lock().unwrap();
+                let trace = e.native_trace_fixture();
+                f.runtime.with_shared_attempt_prefix(&prefix, &mut e, |e, proof| {
+                    if future_source {
+                        let earlier = LogicalTime::from_nanos(sampled.as_nanos() - 1);
+                        assert!(matches!(
+                            e.plan_shared_replay_poll(call.id, &grant, proof, earlier).unwrap(),
+                            SharedPollDecision::Pending
+                        ));
+                        // Deliberately inconsistent state exercises the upper
+                        // bound; ordinary release never makes this sample due.
+                        e.release_native_eligible(sampled).unwrap();
+                        assert!(matches!(
+                            e.plan_shared_replay_poll(call.id, &grant, proof, earlier),
+                            Err(NetworkReplayError::FdPublicationProtocol(message))
+                                if message == "Poll observation is outside its original call interval"
+                        ));
+                    } else {
+                        let SharedPollDecision::Store(plan) = e
+                            .plan_shared_replay_poll(call.id, &grant, proof, f.now)
+                            .unwrap()
+                        else {
+                            panic!("released ready sample");
+                        };
+                        let later = LogicalTime::from_nanos(f.now.as_nanos() + 1);
+                        assert!(matches!(
+                            e.reserve_shared_replay_poll(plan, &grant, proof, later),
+                            Err(NetworkReplayError::FdPublicationProtocol(message))
+                                if message == "Poll reservation changed selected observation"
+                        ));
+                    }
+                    assert!(e.stream_calls.contains_key(&call.id));
+                    assert!(e.shared_wait(f.root.owner(), call.id).unwrap().1.poll_output.is_none());
+                    assert_eq!(
+                        e.shared_poll_snapshot(f.binding.open_file).unwrap().unwrap().observed_at,
+                        sampled
+                    );
+                    assert_eq!(e.native_trace_fixture(), trace);
+                    assert_eq!(e.channels[&NetworkChannelId(1)].inbound_consumed, 0);
+                    Ok(())
+                })
+            })
+            .unwrap();
+    }
+}
