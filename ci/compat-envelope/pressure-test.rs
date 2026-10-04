@@ -6489,14 +6489,19 @@ fn reconcile_recorded_result(
     Ok(recorded_result.as_str())
 }
 
+/// `unknown_history_passes` counts terminal passes that earned no clean-pass
+/// credit because their retained result history is unknown or contradicts the
+/// PASS label. Such a pass is neither a product failure nor a clean pass, so
+/// any of them leaves the cell incomplete rather than clean or flaky.
 fn repeated_result_description(
     terminal_passes: usize,
     clean_passes: usize,
     infrastructure_errors: usize,
     retried: usize,
     total: usize,
+    unknown_history_passes: usize,
 ) -> &'static str {
-    if total == 0 || infrastructure_errors > 0 {
+    if total == 0 || infrastructure_errors > 0 || unknown_history_passes > 0 {
         "incomplete"
     } else if clean_passes == total && retried == 0 {
         "passed every repetition"
@@ -6527,11 +6532,21 @@ fn repeated_result_description(
 /// (<https://github.com/rrnewton/hermit/issues/1845>). It never makes a cell
 /// FLAKY, and because it is still a retried repetition it never lets the cell
 /// read CLEAN either, so alone it leaves the cell INCOMPLETE.
+///
+/// A terminal pass denied clean-pass credit because its retained result
+/// history is unknown or contradicts its label (`unknown_history_passes`) is
+/// not a recovered product failure either: the evidence cannot say what the
+/// guest did. It never makes a cell FLAKY, and because it is also an
+/// unknown-history repetition it never lets the cell read CLEAN, so alone it
+/// leaves the cell INCOMPLETE. Withholding its clean credit therefore changes
+/// no verdict: `passes_after_retry` is the same number it was when such a pass
+/// was still counted clean.
 fn flake_verdict(counts: RepeatedOutcomeCounts) -> &'static str {
     let passes_after_retry = counts
         .terminal_passes
         .saturating_sub(counts.clean_passes)
-        .saturating_sub(counts.infrastructure_recovered_passes);
+        .saturating_sub(counts.infrastructure_recovered_passes)
+        .saturating_sub(counts.unknown_history_passes);
     if counts.product_failures > 0 || passes_after_retry > 0 {
         if counts.terminal_passes > 0 {
             "FLAKY"
@@ -6569,6 +6584,11 @@ struct RepeatedOutcomeCounts {
     mixed_repetitions: usize,
     missing_repetitions: usize,
     unknown_history_repetitions: usize,
+    /// Terminal passes whose outer label alone would be a clean pass but whose
+    /// retained result history is unknown or contradicts that label. Each is
+    /// also a terminal pass and an unknown-history repetition, and never a
+    /// clean pass or a skid-recovered pass.
+    unknown_history_passes: usize,
     retried_repetitions: usize,
 }
 
@@ -6811,14 +6831,17 @@ fn classify_nonpassing_repetition(
     }
 }
 
+/// `unknown_history_passes` is as in [`repeated_result_description`]: any of
+/// them leaves the batch incomplete.
 fn repeated_batch_result_description(
     _terminal_passes: usize,
     clean_passes: usize,
     infrastructure_errors: usize,
     retried: usize,
     total: usize,
+    unknown_history_passes: usize,
 ) -> &'static str {
-    if total == 0 || infrastructure_errors > 0 {
+    if total == 0 || infrastructure_errors > 0 || unknown_history_passes > 0 {
         "incomplete"
     } else if clean_passes == total && retried == 0 {
         "passed every repeated check"
@@ -6834,6 +6857,7 @@ fn top_level_repeated_result_description(
     infrastructure_errors: usize,
     retried: usize,
     total: usize,
+    unknown_history_passes: usize,
 ) -> &'static str {
     if metadata.is_exact() {
         repeated_result_description(
@@ -6842,6 +6866,7 @@ fn top_level_repeated_result_description(
             infrastructure_errors,
             retried,
             total,
+            unknown_history_passes,
         )
     } else {
         repeated_batch_result_description(
@@ -6850,6 +6875,7 @@ fn top_level_repeated_result_description(
             infrastructure_errors,
             retried,
             total,
+            unknown_history_passes,
         )
     }
 }
@@ -7398,7 +7424,6 @@ fn fold_repetition(
     } = *sample;
     tally.total += 1;
     tally.terminal_passes += usize::from(result == "pass");
-    tally.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
     tally.infrastructure_errors +=
         usize::from(matches!(result, "infrastructure-error" | "sandbox-denied"));
     let inner_history = if rows.is_empty() {
@@ -7406,16 +7431,18 @@ fn fold_repetition(
     } else {
         Some(inner_pressure_history(rows))
     };
-    // A clean pass is credited from the outer PASS label alone. A history
-    // that would be credited so, but whose PASS row retains an invocation
-    // that did not pass, contradicts that label and cannot read CLEAN. Only
+    // What the outer labels alone would credit as a clean pass: a terminal
+    // pass whose every retained row is labelled PASS. The label is never
+    // enough by itself; the clean-pass credit below also requires a known,
+    // uncontradicted result history.
+    let labelled_clean = repetition_passed_cleanly(result, rows);
+    // A history the labels alone would credit as clean, but whose PASS row
+    // retains an invocation that did not pass, contradicts that label. Only
     // such histories are checked: a retried history already cannot read
     // CLEAN (`flake_verdict` requires no retried repetition), and inner
     // evidence that does not validate is refused separately below.
     let contradicted_pass = match &inner_history {
-        Some(Ok(_)) if repetition_passed_cleanly(result, rows) => {
-            pass_row_retaining_a_nonpassing_invocation(rows)
-        }
+        Some(Ok(_)) if labelled_clean => pass_row_retaining_a_nonpassing_invocation(rows),
         _ => None,
     };
     // Skid-recovery credit is granted only to a history that passed the
@@ -7438,24 +7465,34 @@ fn fold_repetition(
                 .all(|category| *category == RepetitionClassification::InfrastructureFailure)
         )
         && passed_after_skid_retries_only(result, rows);
-    tally.infrastructure_recovered += usize::from(recovered_from_infrastructure);
-    tally.retried += usize::from(retained_attempts > 1);
-    let counts = &mut tally.counts;
-    counts.expected_repetitions += 1;
-    counts.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
-    counts.retried_repetitions += usize::from(retained_attempts > 1);
     // A typed NoResult stamp legitimately has no comparison. Only
     // that one verified reader refusal may be explained here; missing
     // captures, golden output or other artifact errors stay incomplete.
     let sample_artifacts_valid =
         evidence_error_count == 0 || (typed_no_comparison_refusal && evidence_error_count == 1);
-    counts.unknown_history_repetitions += usize::from(
-        inner_history
-            .as_ref()
-            .is_some_and(|history| history.is_err())
-            || contradicted_pass.is_some()
-            || (row_valid && !sample_artifacts_valid),
-    );
+    // A repetition whose retained result history is unknown (inner evidence
+    // that does not validate, or retained artifacts that do not) or
+    // contradicts its own PASS label. This is decided before any clean-pass
+    // credit, and a repetition it names earns none: the PASS label alone
+    // never makes a clean pass that the retained history cannot confirm. Such
+    // a pass is still a terminal pass, recorded separately as an
+    // unknown-history pass, so the cell reads incomplete rather than clean or
+    // flaky.
+    let unknown_history = inner_history
+        .as_ref()
+        .is_some_and(|history| history.is_err())
+        || contradicted_pass.is_some()
+        || (row_valid && !sample_artifacts_valid);
+    let passed_cleanly = labelled_clean && !unknown_history;
+    tally.clean_passes += usize::from(passed_cleanly);
+    tally.infrastructure_recovered += usize::from(recovered_from_infrastructure);
+    tally.retried += usize::from(retained_attempts > 1);
+    let counts = &mut tally.counts;
+    counts.expected_repetitions += 1;
+    counts.clean_passes += usize::from(passed_cleanly);
+    counts.retried_repetitions += usize::from(retained_attempts > 1);
+    counts.unknown_history_repetitions += usize::from(unknown_history);
+    counts.unknown_history_passes += usize::from(labelled_clean && unknown_history);
     if let Some(Err(error)) = &inner_history {
         sample_evidence_errors.push(error.clone());
     }
@@ -7540,6 +7577,7 @@ fn print_repeated_cell_table(
             infrastructure_errors + infrastructure_recovered,
             retried,
             total,
+            counts.unknown_history_passes,
         );
         let verdict = flake_verdict(counts);
         *verdicts.entry(verdict).or_default() += 1;
@@ -7593,6 +7631,7 @@ fn repeated_cell_summary(cell: &CellId, counts: RepeatedOutcomeCounts, result: &
         "mixed_repetitions": counts.mixed_repetitions,
         "missing_repetitions": counts.missing_repetitions,
         "unknown_history_repetitions": counts.unknown_history_repetitions,
+        "unknown_history_passes": counts.unknown_history_passes,
     })
 }
 
@@ -7648,6 +7687,9 @@ fn verify_repetition_summary_json(
         let unknown_history = cell
             .get("unknown_history_repetitions")
             .and_then(JsonValue::as_u64);
+        let unknown_history_passes = cell
+            .get("unknown_history_passes")
+            .and_then(JsonValue::as_u64);
         let classification = cell.get("classification").and_then(JsonValue::as_str);
         let promotion_candidate = cell.get("promotion_candidate").and_then(JsonValue::as_bool);
         if terminal_passes.is_none()
@@ -7665,6 +7707,7 @@ fn verify_repetition_summary_json(
             || mixed.is_none()
             || missing.is_none()
             || unknown_history.is_none()
+            || unknown_history_passes.is_none()
             || classification.is_none()
             || promotion_candidate.is_none()
             || cell.get("result").and_then(JsonValue::as_str).is_none()
@@ -7673,12 +7716,17 @@ fn verify_repetition_summary_json(
             return Err("summary JSON has an incomplete repeated-cell result".into());
         }
         // A skid-recovered pass is a terminal pass that is neither clean nor
-        // unretried.
+        // unretried. An unknown-history pass is a terminal pass that is
+        // neither clean nor skid-recovered, and an unknown-history repetition.
         if terminal_passes > total
             || clean_passes > terminal_passes
             || retried > total
-            || infrastructure_recovered.unwrap() > terminal_passes.unwrap() - clean_passes.unwrap()
+            || infrastructure_recovered
+                .unwrap()
+                .checked_add(unknown_history_passes.unwrap())
+                .is_none_or(|passes| passes > terminal_passes.unwrap() - clean_passes.unwrap())
             || infrastructure_recovered > retried
+            || unknown_history_passes > unknown_history
         {
             return Err("summary JSON has impossible repeated-cell counts".into());
         }
@@ -7696,6 +7744,7 @@ fn verify_repetition_summary_json(
             mixed_repetitions: mixed.unwrap() as usize,
             missing_repetitions: missing.unwrap() as usize,
             unknown_history_repetitions: unknown_history.unwrap() as usize,
+            unknown_history_passes: unknown_history_passes.unwrap() as usize,
             retried_repetitions: retried.unwrap() as usize,
         };
         let expected_classification = classify_pressure_sample(counts);
@@ -7736,6 +7785,7 @@ fn repeated_summary_line(
     infrastructure_recovered: usize,
     retried: usize,
     total: usize,
+    unknown_history_passes: usize,
 ) -> String {
     let result = top_level_repeated_result_description(
         metadata,
@@ -7744,11 +7794,14 @@ fn repeated_summary_line(
         infrastructure_errors + infrastructure_recovered,
         retried,
         total,
+        unknown_history_passes,
     );
     if metadata.is_exact() {
         if result == "incomplete" {
             let mut reasons = Vec::new();
-            if infrastructure_errors > 0 || infrastructure_recovered == 0 {
+            if infrastructure_errors > 0
+                || (infrastructure_recovered == 0 && unknown_history_passes == 0)
+            {
                 reasons.push(format!(
                     "{infrastructure_errors} check(s) have no trustworthy result"
                 ));
@@ -7756,6 +7809,11 @@ fn repeated_summary_line(
             if infrastructure_recovered > 0 {
                 reasons.push(format!(
                     "{infrastructure_recovered} check(s) passed only after a typed skid-overshoot retry"
+                ));
+            }
+            if unknown_history_passes > 0 {
+                reasons.push(format!(
+                    "{unknown_history_passes} check(s) passed under a label their retained result history contradicts or cannot confirm"
                 ));
             }
             format!(
@@ -8832,6 +8890,7 @@ fn summarize(
             infrastructure_errors + infrastructure_recovered,
             retried,
             total,
+            counts.unknown_history_passes,
         );
         println!(
             "{}",
@@ -8843,6 +8902,7 @@ fn summarize(
                 infrastructure_recovered,
                 retried,
                 total,
+                counts.unknown_history_passes,
             )
         );
         println!(
@@ -8867,6 +8927,10 @@ fn summarize(
         let infrastructure_errors: usize = repeated.values().map(|t| t.infrastructure_errors).sum();
         let infrastructure_recovered: usize =
             repeated.values().map(|t| t.infrastructure_recovered).sum();
+        let unknown_history_passes: usize = repeated
+            .values()
+            .map(|t| t.counts.unknown_history_passes)
+            .sum();
         let result = top_level_repeated_result_description(
             &metadata,
             repeated_terminal_pass_count,
@@ -8874,6 +8938,7 @@ fn summarize(
             infrastructure_errors + infrastructure_recovered,
             retried_repetitions,
             repeated_total_count,
+            unknown_history_passes,
         );
         println!(
             "{}",
@@ -8885,6 +8950,7 @@ fn summarize(
                 infrastructure_recovered,
                 retried_repetitions,
                 repeated_total_count,
+                unknown_history_passes,
             )
         );
         Some(result)
@@ -8966,8 +9032,23 @@ fn summarize(
         retried_repetitions,
         repeated_total_count,
     ) {
+        // A repetition whose retained result history is unknown or
+        // contradicts its label earned no clean-pass credit above; the
+        // refusal names how many there were, so a green run refused for that
+        // reason does not read as a plain product failure.
+        let repeated_unknown_history_count: usize = repeated
+            .values()
+            .map(|t| t.counts.unknown_history_repetitions)
+            .sum();
+        let unknown_history_clause = if repeated_unknown_history_count > 0 {
+            format!(
+                "; {repeated_unknown_history_count} repetition(s) kept an unknown or contradictory result history and earned no clean-pass credit"
+            )
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "only {}/{} repeated green-cell checks passed cleanly; {} repetition(s) required a retry, and the retained summary classifies every non-pass",
+            "only {}/{} repeated green-cell checks passed cleanly; {} repetition(s) required a retry, and the retained summary classifies every non-pass{unknown_history_clause}",
             repeated_clean_pass_count, repeated_total_count, retried_repetitions
         ));
     }
@@ -10640,6 +10721,7 @@ fn pressure_sample_classification_self_test() -> Result<(), String> {
         mixed_repetitions: 0,
         missing_repetitions,
         unknown_history_repetitions: 0,
+        unknown_history_passes: 0,
         retried_repetitions,
     };
     let promotion_cases = [
@@ -11819,6 +11901,42 @@ fn flake_verdict_self_test() -> Result<(), String> {
                 ..base
             },
             "INCOMPLETE",
+        ),
+        // The same ten passes as `fold_repetition` counts them: no clean
+        // credit, each an unknown-history pass. Still INCOMPLETE, never FLAKY.
+        (
+            RepeatedOutcomeCounts {
+                terminal_passes: 10,
+                unknown_history_repetitions: 10,
+                unknown_history_passes: 10,
+                ..base
+            },
+            "INCOMPLETE",
+        ),
+        // An unknown-history pass does not absorb a second pass that needed a
+        // retry after a product failure.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 8,
+                terminal_passes: 10,
+                unknown_history_repetitions: 1,
+                unknown_history_passes: 1,
+                retried_repetitions: 1,
+                ..base
+            },
+            "FLAKY",
+        ),
+        // Nor does it hide a terminal product failure elsewhere.
+        (
+            RepeatedOutcomeCounts {
+                clean_passes: 8,
+                terminal_passes: 9,
+                unknown_history_repetitions: 1,
+                unknown_history_passes: 1,
+                product_failures: 1,
+                ..base
+            },
+            "FLAKY",
         ),
         // A repetition with no retained evidence at all is not clean either.
         (
@@ -14287,7 +14405,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         ));
     }
     let green_replay_description =
-        top_level_repeated_result_description(&green_replay_metadata, 1, 1, 0, 0, 2);
+        top_level_repeated_result_description(&green_replay_metadata, 1, 1, 0, 0, 2, 0);
     if green_replay_description != "one or more repeated checks failed or required a retry" {
         return Err(format!(
             "mode-filtered green replay batch has an exact-cell description: {green_replay_description:?}"
@@ -14331,7 +14449,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         ));
     }
     let one_cell_mode_description =
-        top_level_repeated_result_description(&one_cell_mode_metadata, 1, 1, 0, 0, 2);
+        top_level_repeated_result_description(&one_cell_mode_metadata, 1, 1, 0, 0, 2, 0);
     if one_cell_mode_description != "one or more repeated checks failed or required a retry" {
         return Err(format!(
             "a one-cell mode-filtered green batch was described as an exact flaky cell: {one_cell_mode_description:?}"
@@ -14354,7 +14472,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     )?;
     if !one_cell_sample_metadata.green
         || one_cell_sample_metadata.cells.len() != 1
-        || top_level_repeated_result_description(&one_cell_sample_metadata, 1, 1, 0, 0, 2)
+        || top_level_repeated_result_description(&one_cell_sample_metadata, 1, 1, 0, 0, 2, 0)
             != "one or more repeated checks failed or required a retry"
     {
         return Err("a one-cell sampled green batch was described as an exact flaky cell".into());
@@ -14383,8 +14501,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     let disabled_batch_result_metadata = disabled_batch_metadata;
     if !repeated_metadata.is_exact()
         || green_batch_metadata.is_exact()
-        || top_level_repeated_result_description(&repeated_metadata, 1, 1, 0, 0, 2) != "flaky"
-        || top_level_repeated_result_description(&red_batch_result_metadata, 1, 1, 0, 0, 2)
+        || top_level_repeated_result_description(&repeated_metadata, 1, 1, 0, 0, 2, 0) != "flaky"
+        || top_level_repeated_result_description(&red_batch_result_metadata, 1, 1, 0, 0, 2, 0)
             != "one or more repeated checks failed or required a retry"
     {
         return Err(
@@ -14392,24 +14510,25 @@ fn self_test(root: &Path) -> Result<(), String> {
         );
     }
     let exact_red_heading = summary_heading(&repeated_metadata);
-    let exact_red_result = repeated_summary_line(&repeated_metadata, 1, 1, 0, 0, 0, 2);
-    let retried_exact_red_result = repeated_summary_line(&repeated_metadata, 2, 1, 0, 0, 1, 2);
+    let exact_red_result = repeated_summary_line(&repeated_metadata, 1, 1, 0, 0, 0, 2, 0);
+    let retried_exact_red_result = repeated_summary_line(&repeated_metadata, 2, 1, 0, 0, 1, 2, 0);
     let all_recovered_exact_red_result =
-        repeated_summary_line(&repeated_metadata, 2, 0, 0, 0, 2, 2);
-    let all_failed_exact_red_result = repeated_summary_line(&repeated_metadata, 0, 0, 0, 0, 2, 2);
+        repeated_summary_line(&repeated_metadata, 2, 0, 0, 0, 2, 2, 0);
+    let all_failed_exact_red_result =
+        repeated_summary_line(&repeated_metadata, 0, 0, 0, 0, 2, 2, 0);
     let red_batch_heading = summary_heading(&red_batch_result_metadata);
-    let red_batch_result = repeated_summary_line(&red_batch_result_metadata, 1, 1, 0, 0, 0, 2);
+    let red_batch_result = repeated_summary_line(&red_batch_result_metadata, 1, 1, 0, 0, 0, 2, 0);
     let one_recovered_red_batch_result =
-        repeated_summary_line(&red_batch_result_metadata, 2, 1, 0, 0, 1, 2);
+        repeated_summary_line(&red_batch_result_metadata, 2, 1, 0, 0, 1, 2, 0);
     let recovered_red_batch_result =
-        repeated_summary_line(&red_batch_result_metadata, 2, 0, 0, 0, 2, 2);
+        repeated_summary_line(&red_batch_result_metadata, 2, 0, 0, 0, 2, 2, 0);
     let failed_red_batch_result =
-        repeated_summary_line(&red_batch_result_metadata, 0, 0, 0, 0, 2, 2);
+        repeated_summary_line(&red_batch_result_metadata, 0, 0, 0, 0, 2, 2, 0);
     let green_batch_heading = summary_heading(&green_batch_metadata);
-    let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 1, 0, 0, 0, 2);
+    let green_batch_result = repeated_summary_line(&green_batch_metadata, 1, 1, 0, 0, 0, 2, 0);
     let disabled_batch_heading = summary_heading(&disabled_batch_result_metadata);
     let disabled_batch_result =
-        repeated_summary_line(&disabled_batch_result_metadata, 1, 1, 0, 0, 0, 2);
+        repeated_summary_line(&disabled_batch_result_metadata, 1, 1, 0, 0, 0, 2, 0);
     if exact_red_heading != "# Repeated red-cell results"
         || exact_red_result != "Repeated result: 1/2 terminally passed; 1/2 passed cleanly; flaky."
         || retried_exact_red_result
@@ -14440,6 +14559,29 @@ fn self_test(root: &Path) -> Result<(), String> {
              red_batch={red_batch_heading:?}/{red_batch_result:?} \
              green_batch={green_batch_heading:?}/{green_batch_result:?} \
              disabled_batch={disabled_batch_heading:?}/{disabled_batch_result:?}"
+        ));
+    }
+    // A pass whose retained history is unknown or contradicts its label earns
+    // no clean credit and leaves the result incomplete; the exact-cell line
+    // names that reason beside any other.
+    let unknown_history_exact_result =
+        repeated_summary_line(&repeated_metadata, 2, 0, 0, 0, 0, 2, 2);
+    let unknown_history_beside_infrastructure_exact_result =
+        repeated_summary_line(&repeated_metadata, 1, 0, 1, 0, 0, 2, 1);
+    let unknown_history_batch_result =
+        repeated_summary_line(&red_batch_result_metadata, 2, 0, 0, 0, 0, 2, 2);
+    if unknown_history_exact_result
+        != "Repeated result: 2/2 terminally passed; 0/2 passed cleanly; incomplete because 2 check(s) passed under a label their retained result history contradicts or cannot confirm."
+        || unknown_history_beside_infrastructure_exact_result
+            != "Repeated result: 1/2 terminally passed; 0/2 passed cleanly; incomplete because 1 check(s) have no trustworthy result and 1 check(s) passed under a label their retained result history contradicts or cannot confirm."
+        || unknown_history_batch_result
+            != "Repeated red-cell batch: 2/2 terminally passed; 0/2 passed cleanly; incomplete."
+    {
+        return Err(format!(
+            "repeated summary rendering did not report unknown-history passes as incomplete: \
+             exact={unknown_history_exact_result:?} \
+             beside_infrastructure={unknown_history_beside_infrastructure_exact_result:?} \
+             batch={unknown_history_batch_result:?}"
         ));
     }
     let green_batch_dag_text = fs::read_to_string(green_batch_results.join("dag.json"))
@@ -15122,24 +15264,30 @@ fn self_test(root: &Path) -> Result<(), String> {
             "failure bucketing changed unexpectedly: {classifications:?}"
         ));
     }
-    if repeated_result_description(2, 2, 0, 0, 2) != "passed every repetition"
-        || repeated_result_description(2, 1, 0, 1, 2) != "flaky"
-        || repeated_result_description(1, 0, 0, 1, 1) != "flaky"
-        || repeated_result_description(2, 0, 0, 2, 2) != "flaky"
-        || repeated_result_description(1, 1, 0, 0, 2) != "flaky"
-        || repeated_result_description(0, 0, 0, 0, 2) != "failed every repetition"
-        || repeated_result_description(0, 0, 0, 2, 2) != "failed every repetition"
-        || repeated_result_description(1, 1, 1, 0, 2) != "incomplete"
-        || repeated_result_description(0, 0, 2, 0, 2) != "incomplete"
-        || repeated_batch_result_description(2, 1, 0, 1, 2)
+    if repeated_result_description(2, 2, 0, 0, 2, 0) != "passed every repetition"
+        || repeated_result_description(2, 1, 0, 1, 2, 0) != "flaky"
+        || repeated_result_description(1, 0, 0, 1, 1, 0) != "flaky"
+        || repeated_result_description(2, 0, 0, 2, 2, 0) != "flaky"
+        || repeated_result_description(1, 1, 0, 0, 2, 0) != "flaky"
+        || repeated_result_description(0, 0, 0, 0, 2, 0) != "failed every repetition"
+        || repeated_result_description(0, 0, 0, 2, 2, 0) != "failed every repetition"
+        || repeated_result_description(1, 1, 1, 0, 2, 0) != "incomplete"
+        || repeated_result_description(0, 0, 2, 0, 2, 0) != "incomplete"
+        // A terminal pass whose retained history is unknown or contradicts
+        // its label is neither clean nor a recovered failure.
+        || repeated_result_description(2, 0, 0, 0, 2, 2) != "incomplete"
+        || repeated_result_description(2, 1, 0, 0, 2, 1) != "incomplete"
+        || repeated_batch_result_description(2, 0, 0, 0, 2, 2) != "incomplete"
+        || repeated_batch_result_description(2, 1, 0, 0, 2, 1) != "incomplete"
+        || repeated_batch_result_description(2, 1, 0, 1, 2, 0)
             != "one or more repeated checks failed or required a retry"
-        || repeated_batch_result_description(2, 0, 0, 2, 2)
+        || repeated_batch_result_description(2, 0, 0, 2, 2, 0)
             != "one or more repeated checks failed or required a retry"
-        || repeated_batch_result_description(0, 0, 0, 2, 2)
+        || repeated_batch_result_description(0, 0, 0, 2, 2, 0)
             != "one or more repeated checks failed or required a retry"
-        || repeated_batch_result_description(1, 1, 0, 0, 2)
+        || repeated_batch_result_description(1, 1, 0, 0, 2, 0)
             != "one or more repeated checks failed or required a retry"
-        || repeated_batch_result_description(1, 1, 1, 0, 2) != "incomplete"
+        || repeated_batch_result_description(1, 1, 1, 0, 2, 0) != "incomplete"
         || repeated_run_has_unacceptable_product_result(Some(2), true, 1, 0, 2)
         || repeated_run_has_unacceptable_product_result(Some(2), true, 2, 1, 2)
         || !repeated_run_has_unacceptable_product_result(Some(2), false, 1, 0, 2)
@@ -17609,9 +17757,15 @@ fn self_test(root: &Path) -> Result<(), String> {
         true,
     )?;
     let adverse_summary = read_summary()?;
+    // The PASS row retains an inner invocation that failed, which contradicts
+    // its label: the pass stays a terminal pass but earns no clean credit.
     if adverse_summary["repeated_cells"][0]["passes"] != 1
-        || adverse_summary["repeated_cells"][0]["clean_passes"] != 1
+        || adverse_summary["repeated_cells"][0]["clean_passes"] != 0
         || adverse_summary["repeated_cells"][0]["qualifying_passes"] != 0
+        || adverse_summary["repeated_cells"][0]["unknown_history_repetitions"] != 1
+        || adverse_summary["repeated_cells"][0]["unknown_history_passes"] != 1
+        || adverse_summary["repeated_cells"][0]["result"] != "incomplete"
+        || adverse_summary["repeated_cells"][0]["verdict"] != "INCOMPLETE"
         || adverse_summary["repeated_cells"][0]["promotion_candidate"] != false
         || adverse_summary["rows"][0]["result"] != "pass"
         || adverse_summary["rows"][0]["invocation"]["attempts"]
@@ -17641,10 +17795,15 @@ fn self_test(root: &Path) -> Result<(), String> {
         true,
     )?;
     let unknown_summary = read_summary()?;
+    // An inner invocation with no retained status leaves the history
+    // unknown: the pass stays a terminal pass but earns no clean credit.
     if unknown_summary["repeated_cells"][0]["passes"] != 1
-        || unknown_summary["repeated_cells"][0]["clean_passes"] != 1
+        || unknown_summary["repeated_cells"][0]["clean_passes"] != 0
         || unknown_summary["repeated_cells"][0]["qualifying_passes"] != 0
         || unknown_summary["repeated_cells"][0]["unknown_history_repetitions"] != 1
+        || unknown_summary["repeated_cells"][0]["unknown_history_passes"] != 1
+        || unknown_summary["repeated_cells"][0]["result"] != "incomplete"
+        || unknown_summary["repeated_cells"][0]["verdict"] != "INCOMPLETE"
         || unknown_summary["repeated_cells"][0]["classification"] != "incomplete"
         || unknown_summary["rows"][0]["result"] != "pass"
     {
@@ -17851,6 +18010,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             0,
             1,
             1,
+            0,
         ),
         "repeated_cells": [one_recovered],
     });
@@ -17865,6 +18025,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             0,
             2,
             2,
+            0,
         ),
         "repeated_cells": [all_recovered.clone()],
     });
@@ -17879,6 +18040,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             0,
             1,
             2,
+            0,
         ),
         "repeated_cells": [retry_summary.clone()],
     });
@@ -17893,6 +18055,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             0,
             2,
             2,
+            0,
         ),
         "repeated_cells": [all_recovered],
     });
@@ -17907,6 +18070,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             0,
             2,
             2,
+            0,
         ),
         "repeated_cells": [all_terminal_failures.clone()],
     });
@@ -17921,6 +18085,7 @@ fn self_test(root: &Path) -> Result<(), String> {
             0,
             2,
             2,
+            0,
         ),
         "repeated_cells": [all_terminal_failures],
     });
@@ -18048,6 +18213,84 @@ fn self_test(root: &Path) -> Result<(), String> {
         ("product flake called INCOMPLETE", &flake_called_incomplete),
     ] {
         if verify_repetition_summary_json(forged, 3, 1).is_ok() {
+            return Err(format!("summary JSON with a {name} was accepted: {forged}"));
+        }
+    }
+    // A pass whose retained history is unknown or contradicts its label
+    // survives the summary round trip as a terminal pass with no clean credit,
+    // and the cell reads INCOMPLETE. A summary that drops the count, restores
+    // the clean credit beside it, claims more such passes than unknown-history
+    // repetitions, relabels one as a product flake, or calls the cell CLEAN is
+    // refused.
+    let unknown_history_pass_counts = RepeatedOutcomeCounts {
+        unknown_history_repetitions: 1,
+        unknown_history_passes: 1,
+        ..repeated_counts(2, 2, 1, 0, 0)
+    };
+    let unknown_history_pass_json = json!({
+        "probe_disabled": false,
+        "attempted": 2,
+        "retried_repetitions": 0,
+        "repeated_cells": [repeated_cell_summary(
+            &sample_a,
+            unknown_history_pass_counts,
+            repeated_result_description(2, 1, 0, 0, 2, 1),
+        )],
+    });
+    if unknown_history_pass_json["repeated_cells"][0]["verdict"] != "INCOMPLETE"
+        || unknown_history_pass_json["repeated_cells"][0]["result"] != "incomplete"
+        || unknown_history_pass_json["repeated_cells"][0]["clean_passes"] != 1
+        || unknown_history_pass_json["repeated_cells"][0]["unknown_history_passes"] != 1
+        || unknown_history_pass_json["repeated_cells"][0]["promotion_candidate"] != false
+    {
+        return Err(format!(
+            "an unknown-history pass lost its summary accounting: {unknown_history_pass_json}"
+        ));
+    }
+    verify_repetition_summary_json(&unknown_history_pass_json, 2, 0)?;
+    let mut missing_unknown_history_passes = unknown_history_pass_json.clone();
+    missing_unknown_history_passes["repeated_cells"][0]
+        .as_object_mut()
+        .expect("repeated-cell fixture is an object")
+        .remove("unknown_history_passes");
+    let mut unknown_history_pass_credited_clean = unknown_history_pass_json.clone();
+    unknown_history_pass_credited_clean["repeated_cells"][0]["clean_passes"] = json!(2);
+    let mut unknown_history_passes_without_history = unknown_history_pass_json.clone();
+    unknown_history_passes_without_history["repeated_cells"][0]["unknown_history_repetitions"] =
+        json!(0);
+    let mut inflated_unknown_history_passes = unknown_history_pass_json.clone();
+    inflated_unknown_history_passes["repeated_cells"][0]["unknown_history_passes"] = json!(2);
+    let mut unknown_history_pass_relabeled = unknown_history_pass_json.clone();
+    unknown_history_pass_relabeled["repeated_cells"][0]["unknown_history_passes"] = json!(0);
+    let mut unknown_history_pass_called_clean = unknown_history_pass_json.clone();
+    unknown_history_pass_called_clean["repeated_cells"][0]["verdict"] = json!("CLEAN");
+    for (name, forged) in [
+        (
+            "missing unknown-history pass count",
+            &missing_unknown_history_passes,
+        ),
+        (
+            "clean credit beside an unknown-history pass",
+            &unknown_history_pass_credited_clean,
+        ),
+        (
+            "unknown-history pass without an unknown-history repetition",
+            &unknown_history_passes_without_history,
+        ),
+        (
+            "inflated unknown-history pass count",
+            &inflated_unknown_history_passes,
+        ),
+        (
+            "unknown-history pass relabeled as a product flake",
+            &unknown_history_pass_relabeled,
+        ),
+        (
+            "unknown-history pass called CLEAN",
+            &unknown_history_pass_called_clean,
+        ),
+    ] {
+        if verify_repetition_summary_json(forged, 2, 0).is_ok() {
             return Err(format!("summary JSON with a {name} was accepted: {forged}"));
         }
     }
@@ -19279,8 +19522,9 @@ mod pressure_sample_tests {
         // retains passed, and `verdicts` credits a clean pass from that label.
         // A PASS row that retains a divergence, an infrastructure error or a
         // comparison that never ran beside a declared-exit match contradicts
-        // itself and must not read CLEAN. The same invocations honestly
-        // labelled FAIL are a product failure; the match alone stays CLEAN.
+        // itself and must not read CLEAN, earn a clean pass or read "passed
+        // every repetition". The same invocations honestly labelled FAIL are a
+        // product failure; the match alone stays CLEAN.
         let root = env::temp_dir().join(format!(
             "hermit-pressure-self-test-rows-contradicted-pass-{}-{}",
             std::process::id(),
@@ -19421,6 +19665,17 @@ mod pressure_sample_tests {
                 inner_pressure_history(std::slice::from_ref(&row)).is_ok(),
                 "{label}"
             );
+            // A retained divergence is a product failure in the inner history
+            // whatever the row's label says, which is why a PASS label beside
+            // it can never earn a clean pass.
+            if row.attempts.iter().any(|attempt| attempt.outcome == "FAIL") {
+                assert!(
+                    inner_pressure_history(std::slice::from_ref(&row))
+                        .unwrap()
+                        .contains(&RepetitionClassification::ProductFailure),
+                    "{label}"
+                );
+            }
             assert!(matched_attempts_end_as_declared(&row), "{label}");
             // Ten retained repetitions, read back through the real reader.
             let case_root = root.join(format!("case-{index}"));
@@ -19471,8 +19726,61 @@ mod pressure_sample_tests {
             misjudged.is_empty(),
             "the rows-only reader misjudged {misjudged:?}"
         );
+        // A repetition whose retained history contradicts its PASS label earns
+        // no clean-pass credit, and its cell reads incomplete, as its verdict
+        // does: neither a clean pass nor a flake. Every case is checked before
+        // any detail, so a failure names each history credited or described
+        // wrongly.
+        let expected_clean_passes = |verdict: &str| {
+            if verdict == "CLEAN" {
+                PROMOTION_REPETITIONS
+            } else {
+                0
+            }
+        };
+        let expected_result = |verdict: &str| match verdict {
+            "CLEAN" => "passed every repetition",
+            "FAILING" => "failed every repetition",
+            _ => "incomplete",
+        };
+        let miscredited = judged
+            .iter()
+            .filter(|(_, _, verdict, _, _, summary)| {
+                summary["clean_passes"] != json!(expected_clean_passes(verdict))
+                    || summary["result"] != json!(expected_result(verdict))
+            })
+            .map(|(label, _, _, _, _, summary)| {
+                format!(
+                    "{label}: clean_passes {} result {}",
+                    summary["clean_passes"], summary["result"]
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            miscredited.is_empty(),
+            "the rows-only reader credited or described {miscredited:?}"
+        );
         for (label, outcome, verdict, refusal, judgement, summary) in judged {
             let labelled_pass = outcome == "PASS";
+            assert_eq!(
+                summary["clean_passes"],
+                json!(expected_clean_passes(verdict)),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                summary["result"],
+                json!(expected_result(verdict)),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                summary["unknown_history_passes"],
+                json!(if refusal.is_some() {
+                    PROMOTION_REPETITIONS
+                } else {
+                    0
+                }),
+                "{label}: {summary}"
+            );
             assert_eq!(
                 summary["passes"],
                 json!(if labelled_pass {
@@ -19542,6 +19850,317 @@ mod pressure_sample_tests {
             }
         }
         guard.remove().unwrap();
+    }
+
+    /// The full summary of a repeated green-cell run applies the rows-only
+    /// reader's rule. Ten PASS rows that each retain a canonical divergence
+    /// beside the declared-exit match earn no clean pass and read incomplete,
+    /// and the green-run gate refuses the run and says how many repetitions
+    /// kept a history it cannot trust. The match alone is still a clean
+    /// promotion candidate, and the same invocations honestly labelled FAIL
+    /// are still refused as a failing cell with the gate's existing message.
+    /// Every input is written under the test's own temporary directories, and
+    /// no guest or Hermit binary runs.
+    #[test]
+    fn full_summary_refuses_a_green_run_whose_pass_rows_retain_a_divergence() {
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let selection = CellSelection {
+            green: true,
+            test: Some("system-utils/sh-exit-status".into()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            repetitions: Some(PROMOTION_REPETITIONS),
+            no_retry: true,
+            run_timeout_seconds: Some(1_000_000),
+            run_id_prefix: Some("green-summary-divergence".into()),
+            ..CellSelection::default()
+        };
+        // The cell declares guest exit 23. A canonical match ends so, with
+        // Hermit's status, the report and both compared outputs naming it.
+        let mut matched = comparison_attempt("verify", 23);
+        matched.argv = [
+            "hermit",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-allow=failure",
+            "--",
+            "fixture",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        matched.shell_command = literal_shell_command(&matched.cwd, &matched.env, &matched.argv);
+        // A canonical divergence retained under its own index, with a report
+        // whose digest matches its bytes.
+        let mut diverged = matched.clone();
+        diverged.index = "2".into();
+        diverged.outcome = "FAIL".into();
+        diverged.status = Some(1);
+        let mut report: JsonValue =
+            serde_json::from_str(diverged.verification_report.as_ref().unwrap()).unwrap();
+        report["verdict"] = json!("diverged");
+        report["verified"] = json!(false);
+        report["bitwise_parity"] = json!(false);
+        report["first_divergent_record"] = json!(93);
+        report["first_divergent_syscall"] = json!(37);
+        report["first_divergent_scheduler_turn"] = json!(68);
+        report["first_divergent_virtual_nanoseconds"] = json!(7);
+        report["first_divergent_left_message"] = json!("INFO detcore: left event");
+        report["first_divergent_right_message"] = json!("INFO detcore: right event");
+        replace_report(&mut diverged, report);
+        diverged.first_divergent_record = Some(93);
+        diverged.first_divergent_syscall = Some(37);
+        diverged.first_divergent_scheduler_turn = Some(68);
+        diverged.first_divergent_virtual_nanoseconds = Some(7);
+        diverged.first_divergent_left_message = Some("INFO detcore: left event".into());
+        diverged.first_divergent_right_message = Some("INFO detcore: right event".into());
+        // (label, every row's outcome, the invocations each row retains)
+        let variants = [
+            ("matched-only", "PASS", vec![matched.clone()]),
+            ("mixed", "PASS", vec![matched.clone(), diverged.clone()]),
+            (
+                "honest-fail",
+                "FAIL",
+                vec![matched.clone(), diverged.clone()],
+            ),
+        ];
+        let mut judged = Vec::new();
+        for (label, outcome, inner) in variants {
+            let (results, cleanup) =
+                parity_self_test_results(&format!("green-summary-divergence-{label}"));
+            let (mut metadata, _) = write_plan_after_scorecard_check(
+                &checked,
+                &results,
+                &results.join("dag.json"),
+                &selection,
+            )
+            .unwrap();
+            metadata.source_tree_dirty = false;
+            fs::write(
+                results.join("run.json"),
+                serde_json::to_vec_pretty(&metadata).unwrap(),
+            )
+            .unwrap();
+            assert!(metadata.green, "{label}");
+            assert_eq!(metadata.cells.len(), 1, "{label}: {:?}", metadata.cells);
+            let cell = metadata.cells[0].clone();
+            let passed = outcome == "PASS";
+            // A pass retains run 1's golden log and the match's report; a
+            // divergence retains both runs' logs and its own report.
+            let terminal = if passed { &matched } else { &diverged };
+            let terminal_report = terminal.verification_report.clone().unwrap();
+            let mut evidence = BTreeMap::new();
+            for repetition in 1..=PROMOTION_REPETITIONS {
+                let slug = cell_run_slug(&cell, Some(repetition));
+                let run_id = cell_evidence_run_id(
+                    &cell,
+                    Some(repetition),
+                    metadata.run_id_prefix.as_deref(),
+                );
+                let dir = results.join("cells").join(&slug);
+                fs::create_dir_all(&dir).unwrap();
+                fs::write(
+                    dir.join("harness-status"),
+                    if passed { "0\n" } else { "1\n" },
+                )
+                .unwrap();
+                let artifact = results.join("runs").join(&run_id).join("attempt-1");
+                let logs = artifact.join("verify-logs/verify-1");
+                fs::create_dir_all(&logs).unwrap();
+                fs::write(
+                    logs.join("run1_log_fixture.log"),
+                    "INFO fixture golden log\n",
+                )
+                .unwrap();
+                if !passed {
+                    fs::write(
+                        logs.join("run2_log_fixture.log"),
+                        "INFO fixture second log\n",
+                    )
+                    .unwrap();
+                }
+                fs::write(verification_report_path(&artifact), &terminal_report).unwrap();
+                let mut row = history_row("verify", outcome, 1, inner.clone());
+                row.hermit_sha = metadata.hermit_sha.clone();
+                row.argv = matched.argv.clone();
+                row.guest_argv = matched.guest_argv.clone();
+                row.env = matched.env.clone();
+                row.cwd = matched.cwd.clone();
+                row.shell_command = matched.shell_command.clone();
+                row.timeout_seconds = 20;
+                row.execution_cpu_timeout_seconds = Some(10);
+                row.execution_wall_timeout_seconds = Some(20);
+                row.expected_guest_exit = Some(ExpectedGuestExit {
+                    code: Some(23),
+                    signal: None,
+                    reason: "the fixture guest exits as declared".into(),
+                });
+                row.run_id = run_id;
+                row.run_index = Some(u64::try_from(repetition).unwrap());
+                row.test = cell.test.clone();
+                row.category = cell.category.clone();
+                row.lane = cell.lane.clone();
+                row.artifact_dir = artifact.to_string_lossy().into_owned();
+                if !passed {
+                    row.result = Some(ObservedResult::DeterminismFailure);
+                    row.failure_class = Some(FailureClass::ProductFailure);
+                }
+                // Each retained invocation is valid evidence on its own and
+                // the match corroborates the declaration, so only the PASS
+                // label beside the divergence can be at fault.
+                assert!(
+                    inner_pressure_history(std::slice::from_ref(&row)).is_ok(),
+                    "{label}"
+                );
+                assert!(matched_attempts_end_as_declared(&row), "{label}");
+                fs::write(
+                    dir.join("results.jsonl"),
+                    format!("{}\n", serde_json::to_string(&row).unwrap()),
+                )
+                .unwrap();
+                evidence.insert(
+                    format!("cell.{slug}"),
+                    if passed {
+                        RunnerEvidence {
+                            seen: true,
+                            ok: true,
+                            timed_out: false,
+                            oom: false,
+                            output_log_available: true,
+                            environmental_block_observation: EnvBlockObservation::NoDenial,
+                        }
+                    } else {
+                        RunnerEvidence {
+                            seen: true,
+                            ok: false,
+                            ..RunnerEvidence::default()
+                        }
+                    },
+                );
+            }
+            let judgement = summarize(&root, &results, false, Some(&evidence), true);
+            let summary: JsonValue =
+                serde_json::from_str(&fs::read_to_string(results.join("summary.json")).unwrap())
+                    .unwrap();
+            judged.push((label, judgement, summary["repeated_cells"][0].clone()));
+            cleanup.remove().unwrap();
+        }
+        let gate_refusal = |unknown: usize| {
+            let mut refusal = format!(
+                "only 0/{PROMOTION_REPETITIONS} repeated green-cell checks passed cleanly; 0 repetition(s) required a retry, and the retained summary classifies every non-pass"
+            );
+            if unknown > 0 {
+                refusal.push_str(&format!(
+                    "; {unknown} repetition(s) kept an unknown or contradictory result history and earned no clean-pass credit"
+                ));
+            }
+            refusal
+        };
+        // (label, the summary's outcome, verdict, clean passes, result)
+        let expected = [
+            (
+                "matched-only",
+                Ok(()),
+                "CLEAN",
+                PROMOTION_REPETITIONS,
+                "passed every repetition",
+            ),
+            (
+                "mixed",
+                Err(gate_refusal(PROMOTION_REPETITIONS)),
+                "INCOMPLETE",
+                0,
+                "incomplete",
+            ),
+            (
+                "honest-fail",
+                Err(gate_refusal(0)),
+                "FAILING",
+                0,
+                "failed every repetition",
+            ),
+        ];
+        // Every variant is summarized before any is checked, so a failure
+        // names each run the summary misjudged.
+        let misjudged = judged
+            .iter()
+            .zip(&expected)
+            .filter(
+                |((_, judgement, summary), (_, outcome, verdict, clean, result))| {
+                    judgement != outcome
+                        || summary["verdict"] != json!(verdict)
+                        || summary["clean_passes"] != json!(clean)
+                        || summary["result"] != json!(result)
+                },
+            )
+            .map(|((label, judgement, summary), _)| {
+                format!(
+                    "{label}: {judgement:?}, verdict {}, clean_passes {}, result {}",
+                    summary["verdict"], summary["clean_passes"], summary["result"]
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            misjudged.is_empty(),
+            "the full summary misjudged {misjudged:?}"
+        );
+        for ((label, judgement, summary), (expected_label, outcome, verdict, clean, result)) in
+            judged.into_iter().zip(expected)
+        {
+            assert_eq!(label, expected_label);
+            assert_eq!(judgement, outcome, "{label}: {summary}");
+            assert_eq!(summary["verdict"], json!(verdict), "{label}: {summary}");
+            assert_eq!(summary["clean_passes"], json!(clean), "{label}: {summary}");
+            assert_eq!(summary["result"], json!(result), "{label}: {summary}");
+            let mixed = label == "mixed";
+            let unknown = if mixed { PROMOTION_REPETITIONS } else { 0 };
+            assert_eq!(
+                summary["unknown_history_repetitions"],
+                json!(unknown),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                summary["unknown_history_passes"],
+                json!(unknown),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                summary["passes"],
+                json!(if label == "honest-fail" {
+                    0
+                } else {
+                    PROMOTION_REPETITIONS
+                }),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                summary["terminal_product_failures"],
+                json!(if label == "honest-fail" {
+                    PROMOTION_REPETITIONS
+                } else {
+                    0
+                }),
+                "{label}: {summary}"
+            );
+            let candidate = verdict == "CLEAN";
+            assert_eq!(
+                summary["qualifying_passes"],
+                json!(if candidate { PROMOTION_REPETITIONS } else { 0 }),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                summary["promotion_candidate"],
+                json!(candidate),
+                "{label}: {summary}"
+            );
+        }
     }
 
     fn history_row(
