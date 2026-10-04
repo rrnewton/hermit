@@ -5827,38 +5827,65 @@ fn parity_store_shas(input: &ParityStoreInput) -> BTreeSet<String> {
         .collect()
 }
 
-/// This checkout's copy of the fork's `main`. A parity run whose Hermit commit
-/// it does not reach is a branch run, which never headlines over a main run
+/// The managed checkout's copy of the fork's `main`
+/// ([`parity_main_checkout`]). A parity run whose Hermit commit it does not
+/// reach is a branch run, which never headlines over a main run
 /// ([`summarize_parity`]). A commit that lands after this copy was last
 /// fetched counts as a branch commit until it is fetched again.
 ///
-/// The copy must be the fork's and current. A frozen validation's checkout
-/// points this ref at the historical commit it measures. The automatic
-/// publication paths never render from that checkout, but a manual publication
-/// from it ([`publish_history_command`], or the mirror's own command line)
-/// would place every later commit off main
+/// The copy is never the rendered checkout's own. A frozen validation's
+/// checkout is an independent clone whose copy of this ref names the
+/// historical commit it measures, so a publication rendered from it
+/// ([`publish_history_command`], or the mirror's own command line) would
+/// otherwise place every later commit off main
 /// (https://github.com/rrnewton/hermit/issues/3687).
 const PARITY_MAIN_REF: &str = "refs/remotes/origin/main";
 
-/// What the checkout at `root` records about the Hermit commits a parity
-/// store names: each commit's [`SourceDepth`], whether [`PARITY_MAIN_REF`]
-/// reaches it, and the cells its [`PARITY_CELLS_PATH`] selects
-/// ([`committed_parity_cells`]).
+/// The fork whose `main` places parity runs, as the managed checkout's
+/// `remote.origin.url` names it ([`git_commits_off_main`]).
+const HERMIT_FORK_REPOSITORY: &str = "https://github.com/rrnewton/hermit.git";
+
+/// The managed checkout whose [`PARITY_MAIN_REF`] places parity runs:
+/// `<workspace>/hermit`, where the workspace is the nearest directory above
+/// `ledger` that holds `ci-hub/series/mirror.py` as a file, the test
+/// [`publish_history_command`] applies to find it. `None` when no directory
+/// above `ledger` is one.
 ///
-/// However many runs the store holds, this costs at most four Git processes
-/// -- one `cat-file --batch` for the commits and their files, one
-/// `rev-list --parents` for the ancestry both depths are counted over, and
-/// one `rev-parse --is-shallow-repository` and one `rev-list` over main's
-/// history for the commits main reaches -- and none when the store names no
-/// commit.
+/// Every publication reaches the same checkout, whichever checkout it renders:
+/// the mirror renders from a copy of the ledger under the workspace
+/// (`ignored/ci-hub/test-ledger-render-*`), and a direct render reads the
+/// workspace's own `hermit_test_ledger` ([`ledger_root`]).
+/// [`git_commits_off_main`] then checks that the directory is the fork's
+/// checkout.
+fn parity_main_checkout(ledger: &Path) -> Option<PathBuf> {
+    ledger
+        .ancestors()
+        .skip(1)
+        .find(|directory| directory.join("ci-hub/series/mirror.py").is_file())
+        .map(|workspace| workspace.join("hermit"))
+}
+
+/// What Git records about the Hermit commits a parity store names: each
+/// commit's [`SourceDepth`] and the cells its [`PARITY_CELLS_PATH`] selects
+/// ([`committed_parity_cells`]), read in the checkout at `root`, and whether
+/// the managed checkout's [`PARITY_MAIN_REF`] reaches it
+/// ([`parity_main_checkout`]).
+///
+/// However many runs the store holds, this costs at most five Git processes
+/// -- one `cat-file --batch` for the commits and their files and one
+/// `rev-list --parents` for the ancestry both depths are counted over, in
+/// `root`, and one `config`, one `rev-parse` and one `rev-list` over main's
+/// history in the managed checkout ([`git_commits_off_main`]) -- and none
+/// when the store names no commit.
 #[derive(Debug, Default)]
 struct ParityCommitFacts {
     /// Each named object that is a commit in this checkout, with its depth.
     depths: BTreeMap<String, SourceDepth>,
-    /// Each named object that is a commit in this checkout, and whether
-    /// [`PARITY_MAIN_REF`] reaches it, read now rather than taken from any
-    /// row: a branch head that lands later is a main commit from then on.
-    /// Empty when Git cannot say, so no run's place is guessed.
+    /// Each name, and whether the managed checkout's [`PARITY_MAIN_REF`]
+    /// reaches it, read now rather than taken from any row: a branch head
+    /// that lands later is a main commit from then on. A name that main's
+    /// history does not list is off main, whether or not this checkout has
+    /// the commit. Empty when Git cannot say, so no run's place is guessed.
     on_main: BTreeMap<String, bool>,
     /// Each name's selection. `Ok(None)` when this checkout cannot read
     /// [`PARITY_CELLS_PATH`] at that commit (it does not have the commit, or
@@ -5868,9 +5895,11 @@ struct ParityCommitFacts {
 }
 
 impl ParityCommitFacts {
-    /// Read the facts for `shas` (see [`parity_store_shas`]) in the checkout
-    /// at `root`.
-    fn read(root: &Path, shas: &BTreeSet<String>) -> Self {
+    /// Read the facts for `shas` (see [`parity_store_shas`]): depths and
+    /// selections in the checkout at `root`, places against main in the
+    /// managed checkout at `main` ([`parity_main_checkout`]). With no `main`,
+    /// no run is placed.
+    fn read(root: &Path, main: Option<&Path>, shas: &BTreeSet<String>) -> Self {
         if shas.is_empty() {
             return Self::default();
         }
@@ -5878,7 +5907,7 @@ impl ParityCommitFacts {
             shas,
             git_cat_file_batch(root, &Self::batch_names(shas)),
             |commits| git_commit_depths(root, commits),
-            |commits| git_commits_off_main(root, commits),
+            |names| main.and_then(|main| git_commits_off_main(main, names)),
         )
     }
 
@@ -5890,11 +5919,12 @@ impl ParityCommitFacts {
             .collect()
     }
 
-    /// The facts from Git's answers: `objects` answers [`Self::batch_names`]
-    /// ([`git_cat_file_batch`]). Of the names that are commits, `depths_of`
-    /// counts the depths ([`git_commit_depths`]), and `off_main_of` names
-    /// those [`PARITY_MAIN_REF`] does not reach, or is `None` when Git cannot
-    /// say ([`git_commits_off_main`]).
+    /// The facts from Git's answers: `off_main_of` names the names in `shas`
+    /// that [`PARITY_MAIN_REF`] does not reach, or is `None` when Git cannot
+    /// say ([`git_commits_off_main`]), and `objects` answers
+    /// [`Self::batch_names`] ([`git_cat_file_batch`]). Of the names that are
+    /// commits in this checkout, `depths_of` counts the depths
+    /// ([`git_commit_depths`]).
     fn from_answers(
         shas: &BTreeSet<String>,
         objects: Result<Option<Vec<Option<(String, Vec<u8>)>>>, String>,
@@ -5902,6 +5932,13 @@ impl ParityCommitFacts {
         off_main_of: impl FnOnce(&[&str]) -> Option<BTreeSet<String>>,
     ) -> Self {
         let mut facts = Self::default();
+        let names = shas.iter().map(String::as_str).collect::<Vec<_>>();
+        if let Some(off_main) = off_main_of(&names) {
+            facts.on_main = names
+                .iter()
+                .map(|&name| (name.to_string(), !off_main.contains(name)))
+                .collect();
+        }
         let objects = match objects {
             Ok(Some(objects)) => objects,
             Ok(None) => {
@@ -5937,12 +5974,6 @@ impl ParityCommitFacts {
             facts.committed.insert(sha.clone(), committed);
         }
         facts.depths = depths_of(&commits);
-        if let Some(off_main) = off_main_of(&commits) {
-            facts.on_main = commits
-                .iter()
-                .map(|&commit| (commit.to_string(), !off_main.contains(commit)))
-                .collect();
-        }
         facts
     }
 
@@ -6066,47 +6097,71 @@ fn git_commit_depths(root: &Path, commits: &[&str]) -> BTreeMap<String, SourceDe
     commit_depths_from_parents(&text, commits)
 }
 
-/// The commits in `commits` that [`PARITY_MAIN_REF`] does not reach, from
-/// every commit main reaches: one `git rev-list PARITY_MAIN_REF` over main's
-/// whole history, after one `git rev-parse --is-shallow-repository`. `None`
-/// when Git cannot list that history in full: this checkout has no
-/// [`PARITY_MAIN_REF`], is shallow, or lacks a commit main reaches.
+/// The names in `names` that [`PARITY_MAIN_REF`] does not reach in the
+/// managed checkout at `checkout`, from every commit main reaches: one
+/// `git rev-list PARITY_MAIN_REF` over main's whole history, after one
+/// `git config` and one `git rev-parse` that establish the checkout. `None`
+/// when Git cannot list that history in full from the fork's own checkout:
+/// `checkout`'s `remote.origin.url` is not [`HERMIT_FORK_REPOSITORY`],
+/// `checkout` is not the top of its repository, or the repository is
+/// shallow, has no [`PARITY_MAIN_REF`], or lacks a commit main reaches.
 ///
-/// The listing has to be of main itself. `rev-list <commits> --not main` asks
+/// The listing has to be of main itself. `rev-list <names> --not main` asks
 /// the same question, but Git skips a commit it cannot read on the excluded
 /// side and still exits 0, so a missing main commit would list the main
 /// commits beneath it as branch commits. Walking main fails on a missing
 /// commit instead, and a shallow clone, whose boundary commits read as roots,
-/// is refused before the walk. The history is read from this clone's object
+/// is refused before the walk. Legacy grafts and replacement refs, which cut
+/// or reroute a walk without making the clone shallow, are ignored
+/// (`GIT_GRAFT_FILE=/dev/null`, `--no-replace-objects`), and the inherited
+/// [`GIT_REPOSITORY_LOCATION_VARIABLES`] are dropped, so Git reads `checkout`
+/// and no other repository. The history is read from this clone's object
 /// store alone, as in [`git_local_rev_parse`], so a missing commit is never
 /// fetched from a promisor remote.
-fn git_commits_off_main(root: &Path, commits: &[&str]) -> Option<BTreeSet<String>> {
-    if commits.is_empty() {
+///
+/// The walk is linear in main's length: one process listing 3,667 commits
+/// (about 150 KB) took 0.11 s wall in the managed checkout on 2026-10-03.
+fn git_commits_off_main(checkout: &Path, names: &[&str]) -> Option<BTreeSet<String>> {
+    if names.is_empty() {
         return Some(BTreeSet::new());
     }
-    let git = |args: &[&str]| {
-        let output = Command::new("git")
+    let git = |args: &[&str]| -> Option<String> {
+        let mut command = Command::new("git");
+        command
             .arg("--no-replace-objects")
             .args(args)
             .env("GIT_NO_LAZY_FETCH", "1")
-            .current_dir(root)
-            .output()
-            .ok()?;
+            .env("GIT_GRAFT_FILE", "/dev/null")
+            .current_dir(checkout);
+        for name in GIT_REPOSITORY_LOCATION_VARIABLES {
+            command.env_remove(name);
+        }
+        let output = command.output().ok()?;
         if !output.status.success() {
             return None;
         }
         String::from_utf8(output.stdout).ok()
     };
-    if git(&["rev-parse", "--is-shallow-repository"])?.trim() != "false" {
+    // Repository identity is the configured URL, as for the ledger
+    // ([`ledger_root`]).
+    if git(&["config", "--get", "remote.origin.url"])?.trim() != HERMIT_FORK_REPOSITORY {
+        return None;
+    }
+    let shape = git(&["rev-parse", "--is-shallow-repository", "--show-toplevel"])?;
+    let mut shape = shape.lines();
+    let (Some("false"), Some(toplevel), None) = (shape.next(), shape.next(), shape.next()) else {
+        return None;
+    };
+    if fs::canonicalize(toplevel).ok()? != fs::canonicalize(checkout).ok()? {
         return None;
     }
     let reached = git(&["rev-list", PARITY_MAIN_REF, "--"])?;
     let reached = reached.lines().collect::<BTreeSet<_>>();
     Some(
-        commits
+        names
             .iter()
             .copied()
-            .filter(|commit| !reached.contains(commit))
+            .filter(|name| !reached.contains(name))
             .map(str::to_string)
             .collect(),
     )
@@ -6764,9 +6819,9 @@ struct ParityRunSummary {
     /// than one; none of those rows is admitted.
     conflicting_hermit_shas: Vec<String>,
     depth: Option<SourceDepth>,
-    /// Whether this checkout's [`PARITY_MAIN_REF`] reaches `hermit_sha`
-    /// ([`ParityCommitFacts`]); `None` when it cannot say. It only orders
-    /// headlines, so it is not written out.
+    /// Whether the managed checkout's [`PARITY_MAIN_REF`] reaches
+    /// `hermit_sha` ([`ParityCommitFacts`]); `None` when Git cannot say. It
+    /// only orders headlines, so it is not written out.
     #[serde(skip)]
     on_main: Option<bool>,
     emitted_at: Option<String>,
@@ -7087,8 +7142,8 @@ impl ParityRunAccumulator {
 /// [`ParityCellSummary::adversity_cmp`], the summary does not depend on the
 /// order the store was listed or the rows were written in.
 ///
-/// `on_main_of` says whether this checkout's [`PARITY_MAIN_REF`] reaches a
-/// Hermit commit, so a branch run never headlines over a main run.
+/// `on_main_of` says whether the managed checkout's [`PARITY_MAIN_REF`]
+/// reaches a Hermit commit, so a branch run never headlines over a main run.
 /// `committed_of` reads the parity selection a Hermit commit committed to
 /// ([`ParityCommitFacts`]); each run is measured against its own commit's
 /// selection, so a partial run is marked partial and headlines only when no
@@ -7290,8 +7345,8 @@ fn summarize_parity(
         });
     }
     // Only a run whose source tree state is `false` can be a headline. Among
-    // a producer's such runs, a run at a Hermit commit this checkout's main
-    // does not reach ranks below every other, by the rule "last tested at"
+    // a producer's such runs, a run at a Hermit commit the managed checkout's
+    // main does not reach ranks below every other, by the rule "last tested at"
     // uses ([`should_replace_last_tested_at`]): a branch run is not main's
     // result, however recent its base, and an unknown place ranks as main.
     // Then the run that reported every cell its own commit's selection owes;
@@ -7604,16 +7659,21 @@ fn parity_summary_without_store(tracked: &TrackedCells) -> ParitySummary {
 /// Read the ledger's parity store and summarize it beside `tracked`.
 ///
 /// A ledger without parity rows runs no Git process here; one with rows runs
-/// at most five, however many runs it holds ([`ParityCommitFacts`], and the
+/// at most six, however many runs it holds ([`ParityCommitFacts`], and the
 /// tool's own commit, which only `scorecard/parity.json` records).
 ///
 /// The only error is the ledger's own location ([`ledger_root`]), which the
 /// determinism files need as well. A store that cannot be read is refused in
-/// the summary instead ([`parity_store_input`]).
+/// the summary instead ([`parity_store_input`]). When the managed checkout
+/// cannot place the runs against main ([`parity_main_checkout`],
+/// [`git_commits_off_main`]), every run's place is unknown and ranks as a main
+/// run, as the "last tested at" line treats an unknown ancestry; ledger
+/// publication does not stop for a headline's order.
 fn load_parity_summary(root: &Path, tracked: &TrackedCells) -> Result<ParitySummary, String> {
     let ledger = ledger_root(root, false)?;
     let input = parity_store_input(&ledger);
-    let facts = ParityCommitFacts::read(root, &parity_store_shas(&input));
+    let main = parity_main_checkout(&ledger);
+    let facts = ParityCommitFacts::read(root, main.as_deref(), &parity_store_shas(&input));
     let mut summary = summarize_parity(
         &input,
         tracked,
@@ -16614,12 +16674,37 @@ mod local_rev_parse_tests {
         let landed = empty_commit(repo.path(), "landed");
         let branch = empty_commit(repo.path(), "branch");
         let named = [base.as_str(), landed.as_str(), branch.as_str()];
-        // Without a copy of main, Git cannot say, so nothing is guessed.
-        assert_eq!(git_commits_off_main(repo.path(), &named), None);
         git(repo.path(), &["update-ref", PARITY_MAIN_REF, &landed]);
+        // Only the fork's checkout places runs: with no origin, or another
+        // repository's, nothing is guessed.
+        assert_eq!(git_commits_off_main(repo.path(), &named), None);
+        git(
+            repo.path(),
+            &[
+                "config",
+                "remote.origin.url",
+                "https://github.com/facebookexperimental/hermit.git",
+            ],
+        );
+        assert_eq!(git_commits_off_main(repo.path(), &named), None);
+        git(
+            repo.path(),
+            &["config", "remote.origin.url", HERMIT_FORK_REPOSITORY],
+        );
         assert_eq!(
             git_commits_off_main(repo.path(), &named),
             Some(BTreeSet::from([branch.clone()]))
+        );
+        // A directory inside the checkout is not the checkout.
+        let inside = repo.path().join("inside");
+        std::fs::create_dir(&inside).unwrap();
+        assert_eq!(git_commits_off_main(&inside, &named), None);
+        // A commit this checkout does not have is off main: main's history
+        // does not list it.
+        let absent = "89abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            git_commits_off_main(repo.path(), &[landed.as_str(), absent]),
+            Some(BTreeSet::from([absent.to_string()]))
         );
         // The branch head lands by fast-forward: from then on main reaches
         // it, whatever was recorded while it was a branch head.
@@ -16628,6 +16713,9 @@ mod local_rev_parse_tests {
             git_commits_off_main(repo.path(), &named),
             Some(BTreeSet::new())
         );
+        // Without a copy of main, Git cannot say, so nothing is guessed.
+        git(repo.path(), &["update-ref", "-d", PARITY_MAIN_REF]);
+        assert_eq!(git_commits_off_main(repo.path(), &named), None);
         // No commit to place runs no Git process.
         assert_eq!(
             git_commits_off_main(Path::new("/nonexistent"), &[]),
@@ -16639,6 +16727,10 @@ mod local_rev_parse_tests {
     fn main_reachability_is_unknown_when_mains_history_is_incomplete() {
         let repo = tempfile::tempdir().unwrap();
         git(repo.path(), &["init", "--quiet"]);
+        git(
+            repo.path(),
+            &["config", "remote.origin.url", HERMIT_FORK_REPOSITORY],
+        );
         let oldest = empty_commit(repo.path(), "oldest");
         let middle = empty_commit(repo.path(), "middle");
         let tip = empty_commit(repo.path(), "tip");
@@ -16648,6 +16740,22 @@ mod local_rev_parse_tests {
             git_commits_off_main(repo.path(), &named),
             Some(BTreeSet::new())
         );
+
+        // A graft gives a commit other parents, so a plain walk of main stops
+        // at it. The walk ignores grafts and still lists the commit beneath.
+        let grafts = repo.path().join(".git/info/grafts");
+        std::fs::create_dir_all(grafts.parent().unwrap()).unwrap();
+        std::fs::write(&grafts, format!("{middle}\n")).unwrap();
+        assert!(
+            !git(repo.path(), &["rev-list", PARITY_MAIN_REF, "--"])
+                .lines()
+                .any(|line| line == oldest)
+        );
+        assert_eq!(
+            git_commits_off_main(repo.path(), &named),
+            Some(BTreeSet::new())
+        );
+        std::fs::remove_file(&grafts).unwrap();
 
         // A shallow boundary reads as a root, so a walk of main stops before
         // the main commit beneath it.
@@ -16686,6 +16794,26 @@ mod local_rev_parse_tests {
             oldest
         );
         assert_eq!(git_commits_off_main(repo.path(), &named), None);
+    }
+
+    #[test]
+    fn mains_checkout_is_the_workspaces_for_the_ledger_and_its_render_copies() {
+        let workspace = tempfile::tempdir().unwrap();
+        let checkout = workspace.path().join("hermit");
+        let ledger = workspace.path().join("hermit_test_ledger");
+        let copy = workspace
+            .path()
+            .join("ignored/ci-hub/test-ledger-render-x/hermit_test_ledger");
+        let mirror = workspace.path().join("ci-hub/series/mirror.py");
+        // A directory with the mirror's name does not make a workspace. A
+        // validation's TMPDIR is inside a workspace, so a directory further up
+        // may still be found, but never this one.
+        std::fs::create_dir_all(&mirror).unwrap();
+        assert_ne!(parity_main_checkout(&ledger), Some(checkout.clone()));
+        std::fs::remove_dir(&mirror).unwrap();
+        std::fs::write(&mirror, "").unwrap();
+        assert_eq!(parity_main_checkout(&ledger), Some(checkout.clone()));
+        assert_eq!(parity_main_checkout(&copy), Some(checkout));
     }
 
     #[test]
@@ -40382,6 +40510,7 @@ mod parity_summary_tests {
     #[test]
     fn a_branch_run_never_headlines_over_a_main_run() {
         const BRANCH: &str = "89abcdef0123456789abcdef0123456789abcdef";
+        const NEWER_MAIN: &str = "fedcba9876543210fedcba9876543210fedcba98";
         let main_rows = (1..=3)
             .map(|n| row(diverged(&golden(n), KVM, 10, 100, 11, 12, false)))
             .collect::<Vec<_>>();
@@ -40400,19 +40529,26 @@ mod parity_summary_tests {
             .collect::<Vec<_>>();
         let selection = committed_of_rows(&main_rows);
         let depth_of = |sha: &str| {
-            Some(if sha == BRANCH {
-                SourceDepth {
+            Some(match sha {
+                BRANCH => SourceDepth {
                     commits: 20,
                     first_parent: 10,
-                }
-            } else {
-                SourceDepth {
+                },
+                NEWER_MAIN => SourceDepth {
+                    commits: 30,
+                    first_parent: 15,
+                },
+                _ => SourceDepth {
                     commits: 10,
                     first_parent: 5,
-                }
+                },
             })
         };
-        let committed_of = |sha: &str| Ok((sha == SHA || sha == BRANCH).then(|| selection.clone()));
+        let committed_of = |sha: &str| {
+            Ok([SHA, BRANCH, NEWER_MAIN]
+                .contains(&sha)
+                .then(|| selection.clone()))
+        };
         let summarize = |rows: &[&ParityLedgerRow], on_main_of: &dyn Fn(&str) -> Option<bool>| {
             let lines = rows.iter().copied().map(line).collect::<Vec<_>>();
             summarize_parity(
@@ -40450,6 +40586,42 @@ mod parity_summary_tests {
             .find(|brief| brief.run_id == "validate-branch-run")
             .unwrap();
         assert!(!brief.headline, "{brief:#?}");
+        // A main run that reported one of the three cells its commit owes
+        // still headlines over the complete branch run.
+        let partial_main = [&main_rows[0]]
+            .into_iter()
+            .chain(&branch_rows)
+            .collect::<Vec<_>>();
+        let summary = summarize(&partial_main, &|sha| Some(sha == SHA));
+        let run = only_run(&summary);
+        assert_eq!((run.run_id.as_str(), run.on_main), (RUN, Some(true)));
+        assert_contains(&run.line, "selected 1 of 3 committed (partial)");
+        // A later main run at a deeper commit that measured no cell headlines
+        // over the main run that measured three: no key ranks a run by how
+        // many cells it measured.
+        let unmeasured_rows = main_rows
+            .iter()
+            .map(|row| {
+                rerun(
+                    missing(&row.test_id, row.backend),
+                    "validate-newer-main",
+                    NEWER_MAIN,
+                    "2026-09-29T06:00:00Z",
+                )
+            })
+            .collect::<Vec<_>>();
+        let mains = main_rows.iter().chain(&unmeasured_rows).collect::<Vec<_>>();
+        let summary = summarize(&mains, &|sha| Some(sha != BRANCH));
+        let run = only_run(&summary);
+        assert_eq!(
+            (
+                run.run_id.as_str(),
+                run.on_main,
+                run.total.measured,
+                run.total.complete()
+            ),
+            ("validate-newer-main", Some(true), 0, true)
+        );
         // A commit whose place is unknown ranks as main, above a branch run.
         let summary = summarize(&both, &|sha| (sha == BRANCH).then_some(false));
         assert_eq!(
@@ -40676,19 +40848,29 @@ mod parity_summary_tests {
                 assert_eq!(commits, [&without, &good, &broken, &directory]);
                 commit_depths_from_parents(&parents, commits)
             },
-            |commits| {
-                // Only they are placed against main: here `directory` is a
-                // branch head main does not reach yet.
-                assert_eq!(commits, [&without, &good, &broken, &directory]);
-                Some(BTreeSet::from([directory.clone()]))
+            |names| {
+                // Every name is placed against main, including one this
+                // checkout lacks: here `directory` is a branch head main does
+                // not reach yet, and `absent` is a branch commit a frozen
+                // checkout never fetched.
+                assert_eq!(
+                    names,
+                    [
+                        without.as_str(),
+                        good.as_str(),
+                        broken.as_str(),
+                        directory.as_str(),
+                        absent,
+                    ]
+                );
+                Some(BTreeSet::from([directory.clone(), absent.to_string()]))
             },
         );
         assert_eq!(facts.on_main(&without), Some(true));
         assert_eq!(facts.on_main(&good), Some(true));
         assert_eq!(facts.on_main(&broken), Some(true));
         assert_eq!(facts.on_main(&directory), Some(false));
-        // A name this checkout lacks is not placed.
-        assert_eq!(facts.on_main(absent), None);
+        assert_eq!(facts.on_main(absent), Some(false));
         // Git could not say where main is: no commit is placed, and the
         // rest of the facts stand.
         let unplaced = ParityCommitFacts::from_answers(
@@ -40749,24 +40931,26 @@ mod parity_summary_tests {
         assert!(commit_depths_from_parents(&format!("{broken} {merge}\n"), &[&broken]).is_empty());
 
         // Git could not read the checkout (a directory that is no checkout):
-        // every selection is unknown and nothing is counted. Git could not be
-        // asked at all: every selection carries the error.
+        // every selection is unknown and nothing is counted, but main's
+        // checkout still places every name. Git could not be asked at all:
+        // every selection carries the error, and with no answer about main
+        // nothing is placed.
         let no_checkout = ParityCommitFacts::from_answers(
             &shas,
             Ok(None),
             |_| panic!("no depth is counted without a checkout"),
-            |_| panic!("no commit is placed against main without a checkout"),
+            |_| Some(BTreeSet::from([directory.clone()])),
         );
         let unasked_git = ParityCommitFacts::from_answers(
             &shas,
             Err("no git".into()),
             |_| panic!("no depth is counted without git"),
-            |_| panic!("no commit is placed against main without git"),
+            |_| None,
         );
         for sha in &shas {
             assert_eq!(no_checkout.committed(sha), Ok(None), "{sha}");
             assert_eq!(no_checkout.depth(sha), None, "{sha}");
-            assert_eq!(no_checkout.on_main(sha), None, "{sha}");
+            assert_eq!(no_checkout.on_main(sha), Some(*sha != directory), "{sha}");
             assert_eq!(
                 unasked_git.committed(sha),
                 Err("no git".to_string()),
