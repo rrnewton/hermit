@@ -771,10 +771,13 @@ class Demo5RecordTest(_StandIns):
         self.assertIsNotNone(host, "no --bind covers {}".format(guest))
         return host
 
-    def boot(self, snapshot_disk_override=None, during_boot=None) -> None:
+    def boot(
+        self, snapshot_disk_override=None, during_boot=None, serial_text="2022-01-01T00:00:00\n"
+    ) -> None:
         """Run boot_once with QEMU and Hermit replaced, until it saves metadata.
 
-        ``during_boot`` runs while Hermit would be booting the guest.
+        ``during_boot`` runs while Hermit would be booting the guest, and
+        ``serial_text`` is the serial transcript the guest writes.
         """
         boot_once = self.demo5["boot_once"]
         copier = mock.Mock()
@@ -783,7 +786,7 @@ class Demo5RecordTest(_StandIns):
         def boot_the_guest(process, timeout, **keywords):
             if during_boot is not None:
                 during_boot()
-            Path(keywords["stream_path"]).write_text("2022-01-01T00:00:00\n")
+            Path(keywords["stream_path"]).write_text(serial_text)
             return 0
 
         def save_the_snapshot(path, name):
@@ -931,6 +934,66 @@ class Demo5RecordTest(_StandIns):
             },
         )
         self.assert_record(custom, INITRAMFS)
+
+    # Review finding R7-6 on https://github.com/rrnewton/hermit/pull/3703:
+    # demo 5 published the snapshot and wrote its record before it checked the
+    # serial transcript for the fixed RTC date. A boot that failed that check
+    # left a published snapshot with a matching record, and demos 6 and 7
+    # accept such a snapshot when demo 5 exits non-zero after a rebuild
+    # (accept_snapshot_after_failed_rebuild).
+
+    def boot_without_the_rtc_date(self, snapshot_disk_override=None) -> None:
+        """Boot as boot() does, with a serial transcript that lacks the fixed
+        RTC date, and require the boot to fail that check."""
+        with self.assertRaises(RuntimeError) as caught:
+            self.boot(
+                snapshot_disk_override=snapshot_disk_override,
+                serial_text="rtc: 2026-10-04T10:31:07Z\n",
+            )
+        self.assertEqual(str(caught.exception), "serial transcript lacks the fixed RTC epoch")
+
+    def test_a_boot_that_fails_the_rtc_check_publishes_no_snapshot(self):
+        self.boot_without_the_rtc_date()
+        self.assertFalse(self.snapshot.exists())
+        self.assertFalse(dc.boot_snapshot_record_path(self.snapshot).exists())
+
+    def test_a_boot_that_fails_the_rtc_check_leaves_a_stale_snapshot_refused(self):
+        # The snapshot demo 6 found stale and ran demo 5 to rebuild: its record
+        # names the version 8 initramfs, and qemu-assets.sh now builds version 9.
+        self.snapshot.write_bytes(b"a snapshot booted from the version 8 initramfs")
+        stale = dc.write_boot_snapshot_record(
+            self.snapshot,
+            dc.hash_file(self.snapshot),
+            {"initramfs_version": 8, "initramfs_sha256": _sha256(b"version 8 initramfs")},
+        )
+        before = (self.snapshot.read_bytes(), stale.read_bytes())
+        self.boot_without_the_rtc_date()
+        self.assertEqual((self.snapshot.read_bytes(), stale.read_bytes()), before)
+        # So demo 6, after demo 5 exits non-zero, does not use it.
+        failure = subprocess.CalledProcessError(1, ["python3", "demos/05-qemu-boot/run.py"])
+        printed = io.StringIO()
+        with self.assertRaises(RuntimeError) as caught, contextlib.redirect_stdout(printed):
+            dc.accept_snapshot_after_failed_rebuild(
+                self.snapshot, self.root, self.assets, failure, "demo 6"
+            )
+        self.assertIn(
+            "it was booted from initramfs version 8, and demos/lib/qemu-assets.sh now "
+            "builds version 9",
+            str(caught.exception),
+        )
+        self.assertEqual(printed.getvalue(), "")
+
+    def test_a_boot_at_qemu_snapshot_disk_that_fails_the_rtc_check_has_no_record(self):
+        custom = self.directory / "custom-boot.qcow2"
+        self.boot_without_the_rtc_date(snapshot_disk_override=str(custom))
+        # QEMU saved the snapshot there, but demo 5 wrote nothing next to it.
+        self.assertEqual(custom.read_bytes(), SNAPSHOT)
+        self.assertFalse(dc.boot_snapshot_record_path(custom).exists())
+        self.assertFalse(custom.with_suffix(custom.suffix + ".id").exists())
+        with self.assertRaises(dc.BootSnapshotMismatch):
+            dc.verify_boot_snapshot(custom, self.root, self.assets)
+        self.assertFalse(self.snapshot.exists())
+        self.assertFalse(dc.boot_snapshot_record_path(self.snapshot).exists())
 
 
 class Demo7EnsureBootSnapshotTest(_StandIns):
