@@ -1139,7 +1139,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     type ThreadState = ThreadState<T::ThreadState>;
 
     fn observe_signal_dequeues(config: &Config) -> bool {
-        config.kvm_shared_dequeue_timers && config.sequentialize_threads && config.backend_is_kvm
+        config.kvm_shared_dequeue_timers && config.sequentialize_threads
     }
 
     async fn handle_signal_dequeue<G: Guest<Self>>(
