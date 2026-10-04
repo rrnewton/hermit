@@ -523,7 +523,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the_rr_variant_keeps_the_rr_lane_programs_and_gates_only_those_that_replay,
     // which pins that variant at the retired lane's 139 programs, retain all 825
     // prior identities.
-    ("test.regular_crates", 828),
+    // Six later tests retain all 828 prior identities:
+    // cpu_evidence::tests::each_live_source_is_named_and_the_cgroup_counter_cannot_fall
+    // (dfc22fc36a19); detcore-sabre's glibc_compat::tests::
+    // dl_find_object_finds_this_code_and_its_unwind_tables,
+    // isoc23_strtol_accepts_a_binary_prefix_in_bases_0_and_2 and
+    // isoc23_strtol_matches_strtol_without_a_binary_prefix (4e05a36ee985); and
+    // runner::tests::a_slow_failed_sample_does_not_use_up_the_unavailable_grace
+    // (047c3d019b6b) and
+    // a_slow_census_that_keeps_failing_still_stops_the_command (5c4251450a21).
+    // `cargo nextest list --profile ci` over this node's selection measured 834
+    // at 5c4251450a21, and the full validation of c1312a563dc5, which has the
+    // first four, ran 832.
+    ("test.regular_crates", 834),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -953,7 +965,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // fold-3 run-type tests retain all 819.
     // The three fold-4 variant tests retain all 822 prior identities.
     // The three fold-5 replay-variant tests retain all 825 prior identities.
-    ("test.regular_crates_on_host", 828),
+    // The six later cpu_evidence, glibc_compat and runner tests listed for
+    // test.regular_crates retain all 828 prior identities.
+    ("test.regular_crates_on_host", 834),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
