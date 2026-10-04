@@ -5,6 +5,9 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::fs::{self};
 use std::io::Write;
+use std::os::fd::AsRawFd;
+use std::os::fd::FromRawFd;
+use std::os::fd::OwnedFd;
 use std::os::fd::RawFd;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
@@ -4217,8 +4220,56 @@ fn live_cpu_usage_usec(pgid: u32, seconds: f64) -> Result<u64, String> {
     Ok(usec as u64)
 }
 
+/// A pidfd for the invocation's leader, opened while the leader is this
+/// runner's unreaped child, so it names exactly that process wherever its
+/// process group goes.
+struct LeaderPidFd {
+    pid: u32,
+    fd: Option<OwnedFd>,
+}
+
+impl LeaderPidFd {
+    fn open(pid: u32) -> Self {
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+        Self {
+            pid,
+            // SAFETY: a nonnegative pidfd_open result is a new descriptor
+            // that nothing else owns.
+            fd: (fd >= 0).then(|| unsafe { OwnedFd::from_raw_fd(fd as RawFd) }),
+        }
+    }
+
+    /// SIGKILL the leader itself. Without a pidfd (a kernel older than 5.3),
+    /// or if the pidfd signal fails, the PID still names the leader: it is
+    /// this runner's unreaped child, so the kernel cannot reuse it.
+    fn kill(&self) {
+        let sent = self.fd.as_ref().is_some_and(|fd| {
+            let result = unsafe {
+                libc::syscall(
+                    libc::SYS_pidfd_send_signal,
+                    fd.as_raw_fd(),
+                    libc::SIGKILL,
+                    std::ptr::null::<libc::siginfo_t>(),
+                    0,
+                )
+            };
+            result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        });
+        if !sent {
+            unsafe {
+                libc::kill(self.pid as libc::pid_t, libc::SIGKILL);
+            }
+        }
+    }
+}
+
+/// Stop the invocation: SIGTERM its process group, wait out the 10 s grace for
+/// the leader, then SIGKILL the group, the invocation cgroup when there is one,
+/// and the leader through its pidfd, and reap the leader.
 fn stop_process_group(
     pid: u32,
+    leader: &LeaderPidFd,
+    cgroup: Option<&InvocationCgroup>,
     started: Instant,
     final_wait: &mut FinalWaitObservation,
 ) -> Result<(ExitStatus, u64), String> {
@@ -4244,6 +4295,17 @@ fn stop_process_group(
     unsafe {
         libc::kill(-(pid as i32), libc::SIGKILL);
     }
+    // A leader that moved to another process group, and anything that left
+    // the group, are beyond the group SIGKILL. The invocation cgroup still
+    // holds them all, and the pidfd still names the leader, so the blocking
+    // wait below ends with this kill rather than whenever the leader chooses.
+    // A cgroup.kill failure is not reported here: the pidfd kill still ends
+    // the wait, and the cgroup's finish() fails the invocation if anything
+    // survives.
+    if let Some(cgroup) = cgroup {
+        let _ = cgroup.kill();
+    }
+    leader.kill();
     wait4_process(pid, 0, WaitOperation::BlockingStop, started, final_wait)?.ok_or_else(|| {
         let reason = format!("blocking wait4({pid}) returned no child");
         *final_wait = FinalWaitObservation::Unavailable {
@@ -4460,11 +4522,12 @@ fn execute_process_with_cpu_poll_interval(
         &mut observation,
     )
     .and_then(|child| match &meter {
-        LiveCpuMeter::Cgroup(cgroup) => monitor_live_cpu(
+        LiveCpuMeter::Cgroup(cgroup) => monitor_live_cpu_in(
             child,
             limits,
             started,
             &mut observation,
+            Some(cgroup),
             |_| Ok(()),
             monotonic_cpu_sampler(|| cgroup.cpu_usage_usec()),
         ),
@@ -4644,6 +4707,19 @@ fn monitor_live_cpu<R>(
     started: Instant,
     observation: &mut InvocationCpuObservation,
     register: impl FnOnce(u32) -> Result<R, String>,
+    sample: impl FnMut(u32, &R) -> Result<u64, CpuError>,
+) -> Result<ProcessOutput, String> {
+    monitor_live_cpu_in(child, limits, started, observation, None, register, sample)
+}
+
+/// `monitor_live_cpu` for an invocation that runs in `cgroup`, when it has one.
+fn monitor_live_cpu_in<R>(
+    child: Child,
+    limits: ProcessLimits,
+    started: Instant,
+    observation: &mut InvocationCpuObservation,
+    cgroup: Option<&InvocationCgroup>,
+    register: impl FnOnce(u32) -> Result<R, String>,
     mut sample: impl FnMut(u32, &R) -> Result<u64, CpuError>,
 ) -> Result<ProcessOutput, String> {
     let ProcessLimits {
@@ -4652,6 +4728,7 @@ fn monitor_live_cpu<R>(
         cpu_poll_interval,
     } = limits;
     let pid = child.id();
+    let leader = LeaderPidFd::open(pid);
     // Authenticate once at spawn and retain this generation's owner through
     // final wait/stop. Disabled accounting never registers or samples a reader.
     let cpu_reader = cpu_budget_usec.map(|_| register(pid));
@@ -4735,7 +4812,13 @@ fn monitor_live_cpu<R>(
                     let missing_since = cpu_accounting_missing_since.get_or_insert(failed_at);
                     if failed_at.duration_since(*missing_since) >= CELL_CPU_ACCOUNTING_GRACE {
                         observation.termination = TerminationPath::AccountingUnavailableStop;
-                        return match stop_process_group(pid, started, &mut observation.final_wait) {
+                        return match stop_process_group(
+                            pid,
+                            &leader,
+                            cgroup,
+                            started,
+                            &mut observation.final_wait,
+                        ) {
                             Ok(_) => Err(format!(
                                 "cannot measure live CPU for process group {pid}: {reason}; stopped and reaped its leader rather than silently disabling its CPU budget"
                             )),
@@ -4756,7 +4839,7 @@ fn monitor_live_cpu<R>(
                 ProcessTimeout::Wall => TerminationPath::WallBudgetStop,
             };
             let (status, final_cpu_usage_usec) =
-                stop_process_group(pid, started, &mut observation.final_wait)?;
+                stop_process_group(pid, &leader, cgroup, started, &mut observation.final_wait)?;
             let cpu_usage_usec = observed_cpu_usec.map_or(final_cpu_usage_usec, |observed| {
                 observed.max(final_cpu_usage_usec)
             });
@@ -8647,6 +8730,8 @@ mod tests {
         );
         stop_process_group(
             pid,
+            &LeaderPidFd::open(pid),
+            None,
             Instant::now(),
             &mut FinalWaitObservation::NotApplicable,
         )
@@ -10055,6 +10140,187 @@ mod tests {
                 assert!(!cgroup.contains(&name), "burner {burner} survived: {stat}");
             }
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    const GROUP_LEAVING_LEADER_ENV: &str = "HERMIT_RUNNER_TEST_GROUP_LEAVING_LEADER";
+    const GROUP_LEAVING_CHILD_ENV: &str = "HERMIT_RUNNER_TEST_GROUP_LEAVING_CHILD";
+
+    /// A shell script that execs this test binary as
+    /// `group_leaving_leader_helper`, so the leader is a process whose every
+    /// step is known: no interpreter or wrapper stands between it and the
+    /// runner.
+    fn group_leaving_leader_script(moved: &Path, escaped_child: bool) -> String {
+        let exe = std::env::current_exe().unwrap();
+        format!(
+            "export {GROUP_LEAVING_LEADER_ENV}='{}'; {}exec '{}' --exact runner::tests::group_leaving_leader_helper --nocapture --test-threads=1",
+            moved.display(),
+            if escaped_child {
+                format!("export {GROUP_LEAVING_CHILD_ENV}=1; ")
+            } else {
+                String::new()
+            },
+            exe.display()
+        )
+    }
+
+    /// Does nothing unless `group_leaving_leader_script` started it. Then it
+    /// moves into its parent's process group (the runner's), optionally starts
+    /// a child in a session of its own that sleeps for 60 s, writes the file
+    /// named by its environment, and sleeps for 25 s before exiting 0.
+    #[test]
+    fn group_leaving_leader_helper() {
+        let Some(moved) = std::env::var_os(GROUP_LEAVING_LEADER_ENV) else {
+            return;
+        };
+        if unsafe { libc::setpgid(0, libc::getpgid(libc::getppid())) } != 0 {
+            std::process::exit(3);
+        }
+        if std::env::var_os(GROUP_LEAVING_CHILD_ENV).is_some() {
+            match unsafe { libc::fork() } {
+                0 => unsafe {
+                    libc::setsid();
+                    libc::sleep(60);
+                    libc::_exit(0);
+                },
+                -1 => std::process::exit(4),
+                _ => {}
+            }
+        }
+        fs::write(moved, b"").unwrap();
+        thread::sleep(Duration::from_secs(25));
+        std::process::exit(0);
+    }
+
+    #[test]
+    fn a_leader_that_joins_the_runners_process_group_is_killed_when_the_stop_grace_ends() {
+        let root = cpu_reader_test_root("leader-left-its-group");
+        let moved = root.join("moved");
+        // The leader moves into the runner's own process group, so neither the
+        // SIGTERM nor the SIGKILL sent to its original group reaches it. Left
+        // alone it sleeps for 25 s and then exits 0.
+        let script = group_leaving_leader_script(&moved, false);
+        let (child, started, mut observation) = spawn_fixture_with_source(
+            &root,
+            "left-group",
+            &script,
+            Some(LiveCpuSource::AgentUtilsPairedPidfdStatV1),
+        );
+        let pid = child.id();
+        let mut triggered_at = None;
+        let output = monitor_live_cpu(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(60),
+                cpu_budget_usec: Some(100_000),
+                cpu_poll_interval: Duration::from_millis(100),
+            },
+            started,
+            &mut observation,
+            |_| Ok(()),
+            |_, _| {
+                if !moved.exists() {
+                    return Ok(0);
+                }
+                triggered_at.get_or_insert_with(Instant::now);
+                Ok(200_000)
+            },
+        )
+        .expect("the CPU stop must reap the leader");
+        let stopped_at = Instant::now();
+        let triggered_at = triggered_at.expect("the leader must have left its process group");
+        assert_eq!(output.timeout, Some(ProcessTimeout::Cpu), "{observation:?}");
+        assert_eq!(observation.termination, TerminationPath::CpuBudgetStop);
+        let FinalWaitObservation::Reaped { raw_status, .. } = observation.final_wait else {
+            panic!("the stop must reap the leader: {observation:?}");
+        };
+        assert!(
+            libc::WIFSIGNALED(raw_status) && libc::WTERMSIG(raw_status) == libc::SIGKILL,
+            "the leader must be killed, not exit by itself: raw wait status {raw_status:#x}, {:?} after the trigger",
+            stopped_at.duration_since(triggered_at)
+        );
+        // The whole 10 s TERM grace is waited out; the kill that follows reaps
+        // the leader at once, long before its 25 s sleep would end.
+        let stop = stopped_at.duration_since(triggered_at);
+        assert!(
+            stop >= Duration::from_secs(10) && stop < Duration::from_secs(12),
+            "stopped {stop:?} after the trigger"
+        );
+        assert!(owned_child_is_reaped(pid));
+        assert_process_observation(&observation, &output);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn the_stop_kills_the_invocation_cgroup_before_it_waits_for_a_leader_that_left_its_group() {
+        let test =
+            "the_stop_kills_the_invocation_cgroup_before_it_waits_for_a_leader_that_left_its_group";
+        let Some(mut cgroup) =
+            crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        let root = cpu_reader_test_root("stop-kills-cgroup");
+        let moved = root.join("moved");
+        // The leader moves into the runner's process group and starts a child
+        // in a session of its own; both stay in the invocation cgroup. Left
+        // alone, the leader exits after 25 s and its child after 60 s.
+        let script = group_leaving_leader_script(&moved, true);
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            &root,
+            "/bin/sh",
+            &["-c".into(), script],
+            &BTreeMap::new(),
+            &root.join("leader.stdout"),
+            &root.join("leader.stderr"),
+        );
+        let mut observation = InvocationCpuObservation::pending(
+            1,
+            request.role,
+            request.command,
+            Some(LiveCpuSource::CgroupV2InvocationCpuStatV1),
+        );
+        let started = Instant::now();
+        let child = spawn_process(
+            &request.cwd,
+            &request.stdout,
+            &request.stderr,
+            Some((cgroup.enrollment_fd(), cgroup.path())),
+            &mut observation,
+        )
+        .unwrap();
+        let output = monitor_live_cpu_in(
+            child,
+            ProcessLimits {
+                deadline: started + Duration::from_secs(60),
+                cpu_budget_usec: Some(100_000),
+                cpu_poll_interval: Duration::from_millis(100),
+            },
+            started,
+            &mut observation,
+            Some(&cgroup),
+            |_| Ok(()),
+            |_, _| Ok(if moved.exists() { 200_000 } else { 0 }),
+        )
+        .expect("the CPU stop must reap the leader");
+        assert_eq!(output.timeout, Some(ProcessTimeout::Cpu), "{observation:?}");
+        assert_eq!(observation.termination, TerminationPath::CpuBudgetStop);
+        // The stop itself killed everything in the cgroup, the escaped child
+        // included, before finish() had a chance to.
+        let emptied_by = Instant::now() + Duration::from_secs(2);
+        while cgroup.populated().unwrap() {
+            assert!(
+                Instant::now() < emptied_by,
+                "the stop left a live process in the invocation cgroup, {:?} after launch",
+                started.elapsed()
+            );
+            thread::sleep(Duration::from_millis(20));
+        }
+        cgroup.finish().unwrap();
         fs::remove_dir_all(root).unwrap();
     }
 
