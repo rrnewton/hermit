@@ -650,15 +650,9 @@
     },
     {
       "disposition": "guest-fixture",
-      "path": "tests/c/liteinst_host_activation.c",
-      "runner": "hermit-cli/tests/liteinst_host_activation.rs",
-      "why": "tests/c/liteinst_host_activation.c is owned by hermit-cli/tests/liteinst_host_activation.rs: The Rust integration test compiles this activation-aware guest and asserts host-selected LiteInst registration and hook counters; it remains a guest fixture because a generic E2E manifest cannot build the selected runtime or verify controller-owned activation provenance."
-    },
-    {
-      "disposition": "guest-fixture",
       "path": "tests/c/liteinst_inert_runtime.c",
       "runner": "hermit-cli/tests/cli.rs",
-      "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this export-shaped but constructor-free DSO, selects the LiteInst backend, injects it as the runtime override, and asserts rejection before any activation claim; it remains a guest fixture because a generic manifest cannot express that build, injection, and fail-closed diagnostic contract."
+      "why": "tests/c/liteinst_inert_runtime.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this export-shaped but constructor-free DSO, selects the LiteInst backend, injects it as the in-guest Detcore runtime override, and asserts rejection before the guest is dispatched; it remains a guest fixture because a generic manifest cannot express that build, injection, and fail-closed diagnostic contract."
     },
     {
       "disposition": "manifest-test",
