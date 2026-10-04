@@ -60,7 +60,37 @@ impl Scheduler {
         resources: &Resources,
         capability: ControlCapability,
     ) -> Result<(), ProtocolFailure> {
-        if !self.parent_death_enrolled(tid)? {
+        // Root registration publishes ParentContinue before StartNewThread
+        // binds its signal identity. Only resources whose admission depends on
+        // enrollment need that identity; a mixed request still authenticates.
+        let needs_enrollment = resources.resources.keys().any(|resource| match resource {
+            ResourceID::SleepUntil(_)
+            | ResourceID::WaitChild { .. }
+            | ResourceID::WaitPhysicalChild(_)
+            | ResourceID::FutexWait
+            | ResourceID::InternalIOPolling
+            | ResourceID::BlockingExternalIO(_)
+            | ResourceID::BlockingVfork(_)
+            | ResourceID::BlockingRtSigsuspend(_)
+            | ResourceID::HappensBeforeCheckpoint(_) => true,
+            ResourceID::FileContents(_)
+            | ResourceID::FileMetadata(_)
+            | ResourceID::DirectoryContents(_)
+            | ResourceID::MemAddrSpace(_)
+            | ResourceID::Path(_)
+            | ResourceID::PathsTransitive(_)
+            | ResourceID::Device(_)
+            | ResourceID::Exit { .. }
+            | ResourceID::ParentContinue { .. }
+            | ResourceID::TraceReplay
+            | ResourceID::VforkFailed(_)
+            | ResourceID::BlockedExternalContinue(_)
+            | ResourceID::PriorityChangePoint(..)
+            | ResourceID::InboundSignal(_)
+            | ResourceID::WaitidSignals(_)
+            | ResourceID::SchedYield => false,
+        });
+        if !needs_enrollment || !self.parent_death_enrolled(tid)? {
             return Ok(());
         }
         for resource in resources.resources.keys() {

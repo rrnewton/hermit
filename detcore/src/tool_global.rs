@@ -1652,6 +1652,8 @@ impl GlobalTool for GlobalState {
                         // Never encode this refusal as a futex value: the old
                         // wait helper interprets a non-timeout value as success.
                         sched.fail_parked(dettid, error);
+                        drop(sched);
+                        crate::scheduler::signal_control::flush_signal_failures(&self.sched);
                         return (None, R::ThreadExited);
                     }
                 }
@@ -1937,6 +1939,8 @@ impl GlobalState {
                     "parent-death recipient wait refused before resource publication"
                 );
                 sched.fail_parked(dettid, error);
+                drop(sched);
+                crate::scheduler::signal_control::flush_signal_failures(&self.sched);
                 return (SchedulerRpcResult::ThreadExited, None);
             }
             if let Some(mm) = request_mm
@@ -4865,6 +4869,337 @@ mod tests {
         );
         scheduler.priorities.insert(dettid, DEFAULT_PRIORITY);
         scheduler.runqueue_push_back(dettid);
+    }
+
+    #[tokio::test]
+    async fn parent_death_root_registration_precedes_start_identity_binding() {
+        #[derive(Debug)]
+        struct StartupControl;
+        impl reverie::ProcessSignalControl for StartupControl {
+            fn enable_parent_death_control(&self) -> Result<(), reverie::Errno> {
+                Ok(())
+            }
+            fn parent_death_enrolled(
+                &self,
+                _: reverie::SignalProcessId,
+            ) -> Result<bool, reverie::Errno> {
+                panic!("unconditional startup resources must not query enrollment")
+            }
+            fn publish_alarm(
+                &self,
+                _: reverie::SignalProcessId,
+                _: reverie::SignalEvent,
+            ) -> reverie::ProcessSignalPublicationResult {
+                panic!("startup must not publish an alarm")
+            }
+            fn signal_recipients(
+                &self,
+                process: reverie::SignalProcessId,
+                signal: i32,
+            ) -> Result<Vec<reverie::SignalRecipient>, reverie::Errno> {
+                // Once StartNewThread binds the root, ordinary quiescent
+                // selection checks its pending alarm even without a timer.
+                assert_eq!(
+                    process,
+                    reverie::SignalProcessId {
+                        tgid: Tid::from_raw(crate::consts::ROOT_DETPID.as_raw()),
+                        generation: 1,
+                    }
+                );
+                assert_eq!(signal, libc::SIGALRM);
+                Ok(Vec::new())
+            }
+            fn reserve_delivery(
+                &self,
+                _: reverie::SignalDeliveryPermit,
+            ) -> Result<(), reverie::Errno> {
+                panic!("startup must not reserve signal delivery")
+            }
+            fn release_delivery(
+                &self,
+                _: reverie::SignalDeliveryPermit,
+            ) -> Result<(), reverie::Errno> {
+                panic!("startup must not release signal delivery")
+            }
+            fn finish_publication_failure(
+                &self,
+                _: reverie::SignalProcessId,
+            ) -> Result<(), reverie::Errno> {
+                panic!("startup must not fail publication")
+            }
+        }
+        let config = Config {
+            sequentialize_threads: true,
+            cancel_killed_thread_rpcs: true,
+            backend_is_kvm: true,
+            kvm_shared_dequeue_timers: true,
+            runs_post_fork: RunsPostFork::Parent,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .install_signal_control(Some(reverie::BackendSignalControl {
+                process: std::sync::Arc::new(StartupControl),
+            }))
+            .unwrap();
+        let tid = crate::consts::ROOT_DETPID;
+        let from = Tid::from_raw(tid.as_raw());
+        let mm = MmId::initial(tid);
+        let identity = reverie::SignalTaskIdentity {
+            process: reverie::SignalProcessId {
+                tgid: from,
+                generation: 1,
+            },
+            tid: from,
+            task_generation: 1,
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let mut registration = std::pin::pin!(state.recv_create_child_thread(
+                from,
+                mm,
+                super::ChildRegistration {
+                    parent_dettid: tid,
+                    parent_detpid: tid,
+                    child_dettid: tid,
+                    child_tid_addr: 0,
+                    flags: None,
+                    exit_signal: libc::SIGCHLD,
+                    physical_ids: None,
+                    maybe_priority: Some(DEFAULT_PRIORITY),
+                    parent_is_kernel_blocked: false,
+                },
+            ));
+            assert!(
+                futures::poll!(registration.as_mut()).is_pending(),
+                "root ParentContinue must await its scheduler turn before identity binding"
+            );
+            {
+                let sched = state.sched.lock().unwrap();
+                assert!(!sched.backend_failed());
+                assert_eq!(sched.real_timers.task_identity(tid, tid), None);
+                assert!(sched.next_turns[&tid].req.try_read().is_some());
+            }
+            let first = crate::scheduler::do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &Err(crate::scheduler::SkipTurn),
+            )
+            .await
+            .expect("root ParentContinue must commit");
+            assert_eq!(first.tid, tid);
+            assert_eq!(
+                first.resources,
+                std::collections::HashMap::from([(
+                    ResourceID::ParentContinue {
+                        parent: tid,
+                        child: tid
+                    },
+                    Permission::W
+                ),])
+            );
+            assert_eq!(registration.await, SchedulerRpcResult::Continue(()));
+            assert_eq!(
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .real_timers
+                    .task_identity(tid, tid),
+                None
+            );
+
+            let mut startup = std::pin::pin!(state.recv_start_new_thread(
+                from,
+                tid,
+                tid,
+                mm,
+                None,
+                Some(identity),
+            ));
+            assert!(futures::poll!(startup.as_mut()).is_pending());
+            assert!(futures::poll!(startup.as_mut()).is_pending());
+            assert_eq!(
+                state
+                    .sched
+                    .lock()
+                    .unwrap()
+                    .real_timers
+                    .task_identity(tid, tid),
+                Some((mm, identity))
+            );
+            let second = crate::scheduler::do_a_turn_blocking(
+                state.sched.clone(),
+                state.global_time.clone(),
+                &Ok(first),
+            )
+            .await
+            .expect("root StartNewThread must commit");
+            assert_eq!(second.tid, tid);
+            assert_eq!(
+                second.resources,
+                std::collections::HashMap::from([(ResourceID::MemAddrSpace(tid), Permission::RW),])
+            );
+            assert_eq!(startup.await, SchedulerRpcResult::Continue(None));
+            assert!(!state.sched.lock().unwrap().backend_failed());
+        })
+        .await
+        .expect("root registration and startup must complete");
+    }
+
+    async fn parent_death_refusal_notifies_subscriber(futex: bool) {
+        #[derive(Debug)]
+        struct EnrolledControl;
+        impl reverie::ProcessSignalControl for EnrolledControl {
+            fn enable_parent_death_control(&self) -> Result<(), reverie::Errno> {
+                Ok(())
+            }
+            fn parent_death_enrolled(
+                &self,
+                _: reverie::SignalProcessId,
+            ) -> Result<bool, reverie::Errno> {
+                Ok(true)
+            }
+            fn publish_alarm(
+                &self,
+                _: reverie::SignalProcessId,
+                _: reverie::SignalEvent,
+            ) -> reverie::ProcessSignalPublicationResult {
+                panic!("refusal must not publish an alarm")
+            }
+            fn signal_recipients(
+                &self,
+                _: reverie::SignalProcessId,
+                _: i32,
+            ) -> Result<Vec<reverie::SignalRecipient>, reverie::Errno> {
+                panic!("refusal must not select signals")
+            }
+            fn reserve_delivery(
+                &self,
+                _: reverie::SignalDeliveryPermit,
+            ) -> Result<(), reverie::Errno> {
+                panic!("refusal must not reserve delivery")
+            }
+            fn release_delivery(
+                &self,
+                _: reverie::SignalDeliveryPermit,
+            ) -> Result<(), reverie::Errno> {
+                panic!("refusal must not release delivery")
+            }
+            fn finish_publication_failure(
+                &self,
+                _: reverie::SignalProcessId,
+            ) -> Result<(), reverie::Errno> {
+                panic!("refusal has no partial signal publication")
+            }
+        }
+        struct FailureWake {
+            scheduler: std::sync::Arc<Mutex<crate::scheduler::Scheduler>>,
+            tid: DetTid,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl futures::task::ArcWake for FailureWake {
+            fn wake_by_ref(this: &std::sync::Arc<Self>) {
+                let sched = this
+                    .scheduler
+                    .try_lock()
+                    .expect("failure notification must release the scheduler mutex");
+                sched.assert_parent_death_refusal_for_test(this.tid);
+                this.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let config = Config {
+            sequentialize_threads: true,
+            cancel_killed_thread_rpcs: true,
+            backend_is_kvm: true,
+            kvm_shared_dequeue_timers: true,
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let tid = DetTid::from_raw(17);
+        let from = Tid::from_raw(tid.as_raw());
+        let mm = MmId::initial(tid);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched
+                .install_signal_control(Some(reverie::BackendSignalControl {
+                    process: std::sync::Arc::new(EnrolledControl),
+                }))
+                .unwrap();
+            sched.thread_tree.add_child(tid, tid, true);
+            sched
+                .real_timers
+                .bind(
+                    tid,
+                    tid,
+                    mm,
+                    reverie::SignalTaskIdentity {
+                        process: reverie::SignalProcessId {
+                            tgid: from,
+                            generation: 1,
+                        },
+                        tid: from,
+                        task_generation: 1,
+                    },
+                )
+                .unwrap();
+        }
+        install_test_registration(&state, tid, Ivar::new());
+        {
+            let mut sched = state.sched.lock().unwrap();
+            assert_eq!(sched.select_test_turn().unwrap().0, tid);
+            assert!(sched.run_queue.tentative_pop_in_progress());
+        }
+        let probe = std::sync::Arc::new(FailureWake {
+            scheduler: state.sched.clone(),
+            tid,
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let waker = futures::task::waker(probe.clone());
+        let mut context = std::task::Context::from_waker(&waker);
+        let mut subscriber = std::pin::pin!(state.wait_for_backend_failure());
+        assert!(std::future::Future::poll(subscriber.as_mut(), &mut context).is_pending());
+        let request = if futex {
+            GlobalRequest::FutexAction(
+                tid,
+                FutexAction::WaitRequest(None),
+                FutexID::private(mm, 0x404100),
+                0,
+                u32::MAX,
+            )
+        } else {
+            let mut resources = Resources::new(tid);
+            resources.insert(ResourceID::InternalIOPolling, Permission::RW);
+            GlobalRequest::RequestResources(resources, tid)
+        };
+        let mut rpc = std::pin::pin!(state.receive_rpc(from, (DetTime::new(&config), mm, request)));
+        let response = futures::poll!(rpc.as_mut());
+        assert!(
+            std::future::Future::poll(subscriber.as_mut(), &mut context).is_ready(),
+            "parent-death refusal must notify the real failure subscriber without a daemon or manual flush"
+        );
+        assert!(probe.calls.load(std::sync::atomic::Ordering::SeqCst) > 0);
+        assert!(matches!(
+            response,
+            std::task::Poll::Pending | std::task::Poll::Ready((None, GlobalResponse::ThreadExited))
+        ));
+        state
+            .sched
+            .lock()
+            .unwrap()
+            .assert_parent_death_refusal_for_test(tid);
+    }
+
+    #[tokio::test]
+    async fn parent_death_resource_refusal_notifies_failure_after_rollback() {
+        parent_death_refusal_notifies_subscriber(false).await;
+    }
+
+    #[tokio::test]
+    async fn parent_death_futex_refusal_notifies_failure_after_rollback() {
+        parent_death_refusal_notifies_subscriber(true).await;
     }
 
     // Exercise external registration and post-exec through the real global RPC

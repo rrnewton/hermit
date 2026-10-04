@@ -857,7 +857,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Candidate e51635ae0fbc owning Detcore LIST measured 920 selected cases,
     // preserving all 897 prior identities and flags plus 23 incoming tests.
     // Count evidence: https://github.com/rrnewton/reverie/issues/916
-    ("test.detcore_unit", 920),
+    // Owning LIST on 1e073 plus the startup/refusal repair measured 924;
+    // four new controls preserve all 920 previous identities and selection flags.
+    // Evidence: https://github.com/rrnewton/reverie/issues/916
+    ("test.detcore_unit", 924),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1089,7 +1092,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Candidate e51635ae0fbc owning Detcore LIST measured 920 selected cases,
     // preserving all 897 prior identities and flags plus 23 incoming tests.
     // Count evidence: https://github.com/rrnewton/reverie/issues/916
-    ("test.detcore_unit_on_host", 920),
+    // Owning LIST on 1e073 plus the startup/refusal repair measured 924;
+    // four new controls preserve all 920 previous identities and selection flags.
+    // Evidence: https://github.com/rrnewton/reverie/issues/916
+    ("test.detcore_unit_on_host", 924),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

@@ -2727,8 +2727,102 @@ fn parent_death_query_failure_is_not_an_unenrolled_answer() {
         s.parent_death_enrolled(tid),
         Err(ProtocolFailure::ParentDeathQuery(libc::EBADF))
     );
+    let identity = task(100, 100);
+    let mut resources = Resources::new(tid);
+    resources.insert(ResourceID::SleepUntil(at(100)), Permission::RW);
+    let capability = ControlCapability::ParkedWait {
+        policy: ParkedWaitPolicy::NanosleepNoHandlerRestart {
+            absolute_deadline: at(100),
+        },
+        site: reverie::CallbackSignalSite {
+            process: identity.process,
+            tid: identity.tid,
+            task_generation: identity.task_generation,
+            callback_nonce: 1,
+            boundary_nonce: 1,
+        },
+    };
+    assert_eq!(
+        s.validate_parent_death_resource(tid, &resources, capability),
+        Err(ProtocolFailure::ParentDeathQuery(libc::EBADF))
+    );
     assert!(s.next_turns[&tid].req.try_read().is_none());
     assert!(s.next_turns[&tid].resp.try_read().is_none());
+    assert!(s.blocked.timed_waiters.is_empty());
+    assert!(s.parked.requests.is_empty());
+}
+
+#[test]
+fn parent_death_unbound_sensitive_and_mixed_resources_require_identity() {
+    let (mut s, _) = parent_death_fixture();
+    let tid = DetTid::from_raw(100);
+    s.thread_tree.add_child(tid, tid, true);
+    s.next_turns.insert(
+        tid,
+        ThreadNextTurn {
+            dettid: tid,
+            child_tid_addr: 0,
+            req: Ivar::new(),
+            resp: Ivar::new(),
+            protocol: Default::default(),
+        },
+    );
+    let identity = task(100, 100);
+    let site = reverie::CallbackSignalSite {
+        process: identity.process,
+        tid: identity.tid,
+        task_generation: identity.task_generation,
+        callback_nonce: 1,
+        boundary_nonce: 1,
+    };
+    let capability = ControlCapability::ParkedWait {
+        policy: ParkedWaitPolicy::NanosleepNoHandlerRestart {
+            absolute_deadline: at(100),
+        },
+        site,
+    };
+    for resource in [
+        ResourceID::SleepUntil(at(100)),
+        ResourceID::WaitChild {
+            parent: tid,
+            spec: crate::types::ChildWaitSpec {
+                selector: crate::types::ChildWaitSelector::Any,
+                owner: None,
+                exit_class: crate::types::ChildWaitExitClass::Any,
+            },
+        },
+        ResourceID::WaitPhysicalChild(DetTid::from_raw(101)),
+        ResourceID::FutexWait,
+        ResourceID::InternalIOPolling,
+        ResourceID::BlockingExternalIO(crate::resources::ExternalOpId::new(tid, 1)),
+        ResourceID::BlockingVfork(crate::resources::ExternalOpId::new(tid, 2)),
+        ResourceID::BlockingRtSigsuspend(crate::resources::ExternalOpId::new(tid, 3)),
+        ResourceID::HappensBeforeCheckpoint(4),
+    ] {
+        for mixed in [false, true] {
+            let mut resources = Resources::new(tid);
+            resources.insert(resource.clone(), Permission::RW);
+            if mixed {
+                resources.insert(
+                    ResourceID::ParentContinue {
+                        parent: tid,
+                        child: tid,
+                    },
+                    Permission::W,
+                );
+            }
+            assert_eq!(
+                s.validate_parent_death_resource(tid, &resources, capability),
+                Err(ProtocolFailure::Identity),
+                "{resources:?}"
+            );
+        }
+    }
+    assert_eq!(s.real_timers.task_identity(tid, tid), None);
+    assert!(s.next_turns[&tid].req.try_read().is_none());
+    assert!(s.next_turns[&tid].resp.try_read().is_none());
+    assert!(s.blocked.timed_waiters.is_empty());
+    assert!(s.parked.requests.is_empty());
 }
 
 #[test]
@@ -3169,4 +3263,30 @@ fn parent_death_stale_generation_does_not_select_reused_process() {
     assert_eq!(selected(&response).permit.task, current);
     assert_eq!(backend.permits.lock().unwrap().len(), 1);
     assert_eq!(s.committed_time, at(10));
+}
+
+// Check state synchronously from the real GlobalTool subscriber's wake callback.
+// This test-only accessor keeps the production failure state private.
+impl Scheduler {
+    pub(crate) fn assert_parent_death_refusal_for_test(&self, tid: DetTid) {
+        assert_eq!(
+            self.parked.failure,
+            Some(ProtocolFailure::ParentDeathUnsupportedWait)
+        );
+        assert_eq!(
+            self.backend_failure,
+            Some(BackendFailureLocation {
+                pid: reverie::Pid::from_raw(tid.as_raw()),
+                tid: Some(reverie::Tid::from_raw(tid.as_raw())),
+                phase: "KVM parked signal protocol",
+            })
+        );
+        assert!(!self.run_queue.tentative_pop_in_progress());
+        assert!(self.next_turns[&tid].req.try_read().is_none());
+        assert!(self.next_turns[&tid].resp.try_read().is_none());
+        assert!(self.blocked.futex_waiters.is_empty());
+        assert!(self.blocked.timed_out_futex_waiters.is_empty());
+        assert!(self.blocked.timed_waiters.is_empty());
+        assert!(self.parked.requests.is_empty());
+    }
 }
