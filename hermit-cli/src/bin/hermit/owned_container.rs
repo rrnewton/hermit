@@ -104,6 +104,12 @@ const RETAINED_OWNER_REMEDY: &str = "Stop the affected run through its process s
     retrying in this process cannot release the retained owner.";
 static RETAINED: AtomicBool = AtomicBool::new(false);
 static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
+
+/// A returned error can still own a live factory. Original-main broker
+/// settlement must not stop that producer or claim successful reap implicitly.
+pub(super) fn has_retained_owner() -> bool {
+    RETAINED.load(Ordering::Acquire)
+}
 thread_local! {
     // Deliberate CLI retention, including on origin-thread exit. These owners
     // require process supervision; there is no detached reaper or generic exit.
@@ -249,7 +255,7 @@ where
     T: Serialize + DeserializeOwned + 'static,
 {
     let finalize_budget = finalize_budget()?;
-    if RETAINED.load(Ordering::Acquire) {
+    if has_retained_owner() {
         anyhow::bail!(
             "a prior CLI container owner is unresolved; backing resources remain retained; {RETAINED_OWNER_REMEDY}"
         );

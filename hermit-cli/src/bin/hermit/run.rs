@@ -3433,6 +3433,18 @@ impl RunOpts {
     }
 
     pub fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.main_with_native_exit_owner(global, None)
+    }
+
+    pub(super) fn uses_early_native_exit(&self, global: &GlobalOpts) -> bool {
+        global.backend == Some(Backend::Kvm) && !self.namespace_only
+    }
+
+    pub(super) fn main_with_native_exit_owner(
+        &mut self,
+        global: &GlobalOpts,
+        owner: Option<&reverie_kvm::native_exit_broker::BrokerOwner>,
+    ) -> Result<ExitStatus, Error> {
         // Set up an early tracing option before we're ready to set the global default:
 
         // The backend is a global option (`hermit --backend X run ...`), the only
@@ -3652,9 +3664,10 @@ impl RunOpts {
         if self.namespace_only {
             self.run_with_namespace_only(global)
         } else if self.verify {
-            self.verify(global)
+            self.verify(global, owner)
         } else {
-            let (status, _) = self.run_with_guest_capture(global, false, guest_capture.as_ref())?;
+            let (status, _) =
+                self.run_with_guest_capture(global, false, guest_capture.as_ref(), owner)?;
             if let Some(capture) = &mut guest_capture {
                 let config = hermit::prepare_backend_config(
                     self.effective_det_config(),
@@ -4647,7 +4660,7 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
-        self.run_with_guest_capture(global, capture_output, None)
+        self.run_with_guest_capture(global, capture_output, None, None)
     }
 
     fn run_with_guest_capture(
@@ -4655,6 +4668,7 @@ impl RunOpts {
         global: &GlobalOpts,
         capture_output: bool,
         guest_capture: Option<&GuestRunCaptureSession>,
+        owner: Option<&reverie_kvm::native_exit_broker::BrokerOwner>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         // main has reserved startup stdin before this can allocate a descriptor.
         // Keep the unlinked output open through the real container fork; its
@@ -4672,23 +4686,26 @@ impl RunOpts {
             .map(GuestRunCaptureSession::try_clone_for_child)
             .transpose()?;
         let timeout = self.run_timeout();
+        let handoff = super::native_exit::ForkHandoff::export(owner)?;
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
             return super::owned_container::run(
                 &mut process,
-                summary_output,
+                (summary_output, handoff),
                 "held summary/output descriptors; no PID namespace".into(),
                 false,
                 "with_container",
                 timeout,
-                move |summary| {
+                move |(summary, handoff)| {
+                    let client = handoff.adopt()?;
                     options.run_in_container(
                         &global,
                         capture_output,
                         guest_capture.as_ref(),
                         summary.as_ref(),
                         None,
+                        client,
                     )
                 },
             )
@@ -4702,18 +4719,20 @@ impl RunOpts {
         );
         super::owned_container::run(
             &mut container,
-            (tmpfs, identity, summary_output),
+            (tmpfs, identity, summary_output, handoff),
             resources,
             true,
             "with_container",
             timeout,
-            move |(_, identity, summary)| {
+            move |(_, identity, summary, handoff)| {
+                let client = handoff.adopt()?;
                 options.run_in_container(
                     &global,
                     capture_output,
                     guest_capture.as_ref(),
                     summary.as_ref(),
                     Some(identity),
+                    client,
                 )
             },
         )
@@ -4788,7 +4807,11 @@ impl RunOpts {
     }
 
     // Execution mode corresponding to `run --verify`:
-    fn verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+    fn verify(
+        &self,
+        global: &GlobalOpts,
+        owner: Option<&reverie_kvm::native_exit_broker::BrokerOwner>,
+    ) -> Result<ExitStatus, Error> {
         // Stamp an explicit no-result BEFORE any fallible work. Several exits
         // below (a run that fails to start, a rejected first-run status, a SaBRe
         // capture with zero DETLOG) return early without ever reaching
@@ -4838,7 +4861,7 @@ impl RunOpts {
         let (out1, skid_overshoots_run1) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run1,
-            || run1_options.run_verify(log1_file, global),
+            || run1_options.run_verify_with_native_exit_owner(log1_file, global, owner),
         ) {
             Ok(result) => result,
             Err(mut error) => {
@@ -5002,7 +5025,7 @@ impl RunOpts {
         let (out2, skid_overshoots_run2) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run2,
-            || run2_options.run_verify(log2_file, global),
+            || run2_options.run_verify_with_native_exit_owner(log2_file, global, owner),
         ) {
             Ok(result) => result,
             Err(mut error) => {
@@ -5306,19 +5329,31 @@ impl RunOpts {
         log_file: fs::File,
         global: &GlobalOpts,
     ) -> Result<(Output, u64), Error> {
+        self.run_verify_with_native_exit_owner(log_file, global, None)
+    }
+
+    fn run_verify_with_native_exit_owner(
+        &self,
+        log_file: fs::File,
+        global: &GlobalOpts,
+        owner: Option<&reverie_kvm::native_exit_broker::BrokerOwner>,
+    ) -> Result<(Output, u64), Error> {
         let options = self.clone();
         let global = global.clone();
+        let handoff = super::native_exit::ForkHandoff::export(owner)?;
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
             return super::owned_container::run(
                 &mut process,
-                Some(log_file),
+                (Some(log_file), handoff),
                 "verification log descriptor; no PID namespace".into(),
                 false,
                 "with_container",
                 None,
-                move |log| options.run_verify_in_container(log, &global, None),
+                move |(log, handoff)| {
+                    options.run_verify_in_container(log, &global, None, handoff.adopt()?)
+                },
             )
             .map(|(value, _guards)| value);
         }
@@ -5330,12 +5365,14 @@ impl RunOpts {
         );
         super::owned_container::run(
             &mut container,
-            (tmpfs, identity, Some(log_file)),
+            (tmpfs, identity, Some(log_file), handoff),
             resources,
             true,
             "with_container",
             None,
-            move |(_, identity, log)| options.run_verify_in_container(log, &global, Some(identity)),
+            move |(_, identity, log, handoff)| {
+                options.run_verify_in_container(log, &global, Some(identity), handoff.adopt()?)
+            },
         )
         .map(|(value, _guards)| value)
     }
@@ -5525,6 +5562,7 @@ impl RunOpts {
         guest_capture: Option<&GuestRunCaptureSession>,
         summary_output: Option<&File>,
         identity_sources: Option<&IdentityGuard>,
+        native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
     ) -> Result<(ExitStatus, Option<Output>), Error> {
         let _guard = global.init_tracing_for_backend(self.runtime_backend());
         hermit::proc_mount::warn_if_readonly_proc();
@@ -5582,13 +5620,14 @@ impl RunOpts {
             |summary_json| {
                 let result =
                     if capture_output || (guest_capture.is_some() && backend == Backend::Kvm) {
-                        let out = hermit::run_with_output_backend_timeout(
+                        let out = hermit::run_with_output_backend_timeout_and_native_exit(
                             command,
                             config,
                             self.summary,
                             summary_json,
                             backend,
                             timeout,
+                            native_exit,
                         )?;
                         if let Some(capture) = guest_capture {
                             capture.write_kvm_virtual_console(&out.stdout, &out.stderr)?;
@@ -5597,13 +5636,14 @@ impl RunOpts {
                             (out.status, Some(out))
                         }
                     } else {
-                        let status = hermit::run_with_backend_timeout(
+                        let status = hermit::run_with_backend_timeout_and_native_exit(
                             command,
                             config,
                             self.summary,
                             summary_json,
                             backend,
                             timeout,
+                            native_exit,
                         )?;
                         (status, None)
                     };
@@ -5640,6 +5680,7 @@ impl RunOpts {
         log_file: &mut Option<fs::File>,
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
+        native_exit: Option<reverie_kvm::native_exit_broker::BrokerClient>,
     ) -> Result<(Output, u64), Error> {
         hermit::proc_mount::warn_if_readonly_proc();
 
@@ -5684,13 +5725,14 @@ impl RunOpts {
         config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
 
-        let result = hermit::run_with_output_backend_timeout_and_skid_overshoots(
+        let result = hermit::run_with_output_backend_timeout_and_skid_overshoots_and_native_exit(
             command,
             config,
             self.summary,
             &self.summary_json,
             self.runtime_backend(),
             None,
+            native_exit,
         )?;
         self.relabel_e9patch_dispatch_stats(&self.summary_json)?;
         Ok(result)

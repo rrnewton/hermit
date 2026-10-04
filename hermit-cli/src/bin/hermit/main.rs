@@ -31,6 +31,7 @@ mod image;
 mod instruction_map;
 mod list;
 mod logdiff;
+mod native_exit;
 mod oci;
 mod owned_container;
 mod podman_store;
@@ -549,6 +550,14 @@ impl Subcommand {
     }
 
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.main_with_native_exit_owner(global, None)
+    }
+
+    fn main_with_native_exit_owner(
+        &mut self,
+        global: &GlobalOpts,
+        owner: Option<&reverie_kvm::native_exit_broker::BrokerOwner>,
+    ) -> Result<ExitStatus, Error> {
         // Stamp the invocation-bound NO-RESULT record BEFORE the first fallible
         // statement of the whole program. This is the outermost point at which
         // `--verify-json` is known, and it is the only placement that dominates
@@ -577,7 +586,10 @@ impl Subcommand {
         match self {
             Subcommand::HostCapabilities(x) => x.main(),
             Subcommand::Version(x) => x.main(),
-            Subcommand::Run(x) => x.main(global),
+            Subcommand::Run(x) => match owner {
+                Some(owner) => x.main_with_native_exit_owner(global, Some(owner)),
+                None => x.main(global),
+            },
             Subcommand::Strace(x) => x.main(global),
             Subcommand::Record(x) => x.main(global),
             Subcommand::Replay(x) => x.main(global),
@@ -629,36 +641,62 @@ fn main() {
     } = args_from_matches_with_clock(&matches, std::time::SystemTime::now)
         .unwrap_or_else(|error| error.exit());
 
-    // Claim the evidence destination before any fallible run preflight. The
-    // directory itself is the invocation boundary: it must not exist, so no
-    // stale success can survive and no concurrent invocation can share it.
-    let evidence = match command.run_evidence_request(global.backend) {
-        Some((directory, backend)) => match RunEvidenceSession::create(directory, backend) {
-            Ok(session) => Some(session),
-            Err(error) => {
-                display_error(error);
-                ExitStatus::Exited(HERMIT_INTERNAL_FAILURE_EXIT).raise_or_exit();
-            }
-        },
-        None => None,
+    let wants_native_exit =
+        matches!(&command, Subcommand::Run(run) if run.uses_early_native_exit(&global));
+    // Broker setup is a new fallible preflight. Invalidate any previous
+    // verification success before it; the existing inner stamp stays intact.
+    let pending_verification = if wants_native_exit {
+        command
+            .verification_json_path()
+            .map(write_pending_verification_json)
+            .transpose()
+            .map(|_| ())
+    } else {
+        Ok(())
     };
-    if let Some(session) = &evidence {
-        global.set_run_evidence_log_handle(session.log_handle(), session.write_error_latch());
-    }
+    let mut evidence = None;
+    let mut evidence_setup_failed = false;
+    let result = pending_verification.and_then(|()| {
+        native_exit::with_early_owner(wants_native_exit, |owner| {
+            // Claim the evidence destination before any fallible run preflight. The
+            // directory itself is the invocation boundary: it must not exist, so no
+            // stale success can survive and no concurrent invocation can share it.
+            evidence = match command.run_evidence_request(global.backend) {
+                Some((directory, backend)) => {
+                    match RunEvidenceSession::create(directory, backend) {
+                        Ok(session) => Some(session),
+                        Err(error) => {
+                            evidence_setup_failed = true;
+                            return Err(error);
+                        }
+                    }
+                }
+                None => None,
+            };
+            if let Some(session) = &evidence {
+                global
+                    .set_run_evidence_log_handle(session.log_handle(), session.write_error_latch());
+            }
 
-    // Open --log-file HERE, in the host's filename namespace, before any container
-    // exists. This is the moment a shell would perform `> file`, and doing it later
-    // -- inside the container, where tracing must be initialized -- resolves the path
-    // against the guest's fresh /tmp and silently discards the log.
-    let result = global.open_log_file().and_then(|()| command.main(&global));
-
-    // The manifest is the commit marker and is published only after the run
-    // result and private log are final. Evidence failure is reported but cannot
-    // replace the guest's status; a consumer observes the absent/no-result
-    // manifest and fails closed independently of the public CLI channel.
+            // Open --log-file HERE, in the host's filename namespace, before any container
+            // exists. This is the moment a shell would perform `> file`, and doing it later
+            // -- inside the container, where tracing must be initialized -- resolves the path
+            // against the guest's fresh /tmp and silently discards the log.
+            global.open_log_file().and_then(|()| match owner {
+                Some(owner) => command.main_with_native_exit_owner(&global, Some(owner)),
+                None => command.main(&global),
+            })
+        })
+    });
+    // Include original-thread broker settlement in the evidence result. A
+    // failed real wait must not leave a completed-success invocation manifest.
     let evidence_error = evidence.and_then(|session| session.finish(result.as_ref()).err());
     let status = result.unwrap_or_else(|error| {
-        let status = ExitStatus::Exited(failure_exit_code(&error));
+        let status = ExitStatus::Exited(if evidence_setup_failed {
+            HERMIT_INTERNAL_FAILURE_EXIT
+        } else {
+            failure_exit_code(&error)
+        });
         display_error(error);
         status
     });
@@ -1336,7 +1374,7 @@ mod tests {
             hits[0]
         };
         let dbt_return = sole_offset("return super::backends::run_dbt(");
-        let generic_verify = sole_offset("self.verify(global)");
+        let generic_verify = sole_offset("self.verify(global, owner)");
         assert!(
             dbt_return < generic_verify,
             "RunOpts::main must return through the dedicated DBT adapter before the generic \

@@ -11,6 +11,7 @@
 #[cfg(test)]
 pub(crate) mod exec_teardown_tests;
 pub(crate) mod parked;
+mod parent_death;
 #[cfg(test)]
 mod parked_tests;
 pub(crate) mod real_timer;
