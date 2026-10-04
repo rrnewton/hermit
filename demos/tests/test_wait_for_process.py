@@ -478,6 +478,13 @@ class WaitForProcessBoundsTest(unittest.TestCase):
         dc.stop_process_group(process)
         self.assertTrue(sent, "nothing was sent to the child's group")
         self.assertEqual(sent[0][:3], ("killpg", process.pid, signal.SIGTERM))
+        # SIGTERM ends the descendant, but the group's SIGKILL is sent anyway:
+        # what /proc showed after SIGTERM is a sample, and it never decides it.
+        self.assertEqual(
+            sent[-1][:3],
+            ("killpg", process.pid, signal.SIGKILL),
+            "the last signal was not SIGKILL to the child's group: {}".format(sent),
+        )
         self.assertEqual(
             [entry for entry in sent if entry[3] != "Z"],
             [],
@@ -685,6 +692,24 @@ class StopOrderTest(unittest.TestCase):
         ), mock.patch.object(dc, "_other_group_members", fake.other_group_members, create=True):
             return function(fake.process, *arguments)
 
+    @contextlib.contextmanager
+    def faked_proc(self, fake: _FakeGroup, listed: List[str], open_file):
+        """As run_faked, but with the real _other_group_members, reading a fake /proc.
+
+        /proc lists the entries named in ``listed``, and ``open_file`` stands in
+        for os.open. A member of ``fake.others`` is listed only if named here, as
+        when a scan reads /proc before that member exists.
+        """
+
+        def scandir(path):
+            self.assertEqual(path, "/proc")
+            return iter([SimpleNamespace(name=name) for name in listed])
+
+        fake.os.scandir = scandir
+        fake.os.open = open_file
+        with mock.patch.object(dc, "os", fake.os), mock.patch.object(dc, "time", fake.time):
+            yield
+
     def assert_nothing_sent_after_the_reap(self, fake: _FakeGroup) -> None:
         reaps = [index for index, event in enumerate(fake.events) if event[0] == "reap"]
         after = reaps[0] + 1 if reaps else len(fake.events)
@@ -726,9 +751,84 @@ class StopOrderTest(unittest.TestCase):
         fake = _FakeGroup(exited=True, status=7, others=[{signal.SIGTERM}])
         self.run_faked(fake, dc.stop_process_group)
         self.assert_nothing_sent_after_the_reap(fake)
-        self.assertEqual(fake.events, [("killpg", FAKE_PID, signal.SIGTERM), ("reap", FAKE_PID)])
+        # The SIGKILL follows even though the group looked empty after SIGTERM.
+        self.assertEqual(
+            fake.events,
+            [
+                ("killpg", FAKE_PID, signal.SIGTERM),
+                ("killpg", FAKE_PID, signal.SIGKILL),
+                ("reap", FAKE_PID),
+            ],
+        )
         self.assertEqual(fake.others, [])
         self.assertEqual(fake.process.returncode, 7)
+
+    def test_the_group_is_killed_even_when_a_scan_of_proc_finds_it_empty(self):
+        # /proc lists only the child, but another member of its group, which
+        # ignores SIGTERM, still runs: a scan is a sample and can miss a process,
+        # one forked after the scan read the directory for example.
+        fake = _FakeGroup(exited=True, status=7, others=[{signal.SIGKILL}])
+
+        def no_stat_opened(path, flags, *rest):
+            raise AssertionError("opened {}, which /proc did not list".format(path))
+
+        with self.faked_proc(fake, ["self", str(FAKE_PID)], no_stat_opened):
+            self.assertFalse(dc._other_group_members(FAKE_PID, FAKE_PID))
+            dc.stop_process_group(fake.process)
+        self.assert_nothing_sent_after_the_reap(fake)
+        self.assertEqual(
+            fake.events,
+            [
+                ("killpg", FAKE_PID, signal.SIGTERM),
+                ("killpg", FAKE_PID, signal.SIGKILL),
+                ("reap", FAKE_PID),
+            ],
+        )
+        self.assertEqual(fake.others, [], "the member the scan missed was not stopped")
+        self.assertEqual(fake.process.returncode, 7)
+
+    def test_a_member_whose_stat_cannot_be_read_is_not_taken_as_gone(self):
+        # /proc lists a second process, but reading its stat fails for a reason
+        # other than its having exited, so whether it is in the child's group is
+        # unknown. It is, and it ignores SIGTERM.
+        descriptor = 1_000_000  # Never used for real: os.read and os.close are faked.
+        for failing in ("open", "read"):
+            with self.subTest(failing=failing):
+                fake = _FakeGroup(exited=True, status=7, others=[{signal.SIGKILL}])
+                closed: List[int] = []
+
+                def open_stat(path, flags, *rest):
+                    self.assertEqual(path, "/proc/4243/stat")
+                    if failing == "open":
+                        raise PermissionError(errno.EACCES, "Permission denied", path)
+                    return descriptor
+
+                def read(fd, size):
+                    self.assertEqual(fd, descriptor)
+                    raise OSError(errno.EIO, "Input/output error")
+
+                fake.os.read = read
+                fake.os.close = closed.append
+                with self.faked_proc(fake, ["self", str(FAKE_PID), "4243"], open_stat):
+                    self.assertTrue(
+                        dc._other_group_members(FAKE_PID, FAKE_PID),
+                        "a process whose stat could not be read was counted as gone",
+                    )
+                    dc.stop_process_group(fake.process)
+                self.assert_nothing_sent_after_the_reap(fake)
+                self.assertEqual(
+                    fake.events,
+                    [
+                        ("killpg", FAKE_PID, signal.SIGTERM),
+                        ("killpg", FAKE_PID, signal.SIGKILL),
+                        ("reap", FAKE_PID),
+                    ],
+                )
+                self.assertEqual(fake.others, [], "the member whose stat was unreadable was not stopped")
+                self.assertEqual(fake.process.returncode, 7)
+                if failing == "read":
+                    self.assertTrue(closed, "the stat descriptor was not closed")
+                    self.assertEqual(set(closed), {descriptor})
 
     def test_nothing_is_sent_for_a_child_that_was_already_reaped(self):
         for stop in (dc.stop_process, dc.stop_process_group):
