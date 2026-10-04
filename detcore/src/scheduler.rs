@@ -3352,7 +3352,7 @@ impl Scheduler {
     /// may give the signal to a sibling instead: measured on ptrace, a sibling
     /// that the tracer had stopped took it, the blocked `select` was woken,
     /// found nothing to deliver, and restarted, so it never returned `EINTR`
-    /// (https://github.com/rrnewton/hermit/issues/3222, reproducer 2).
+    /// (<https://github.com/rrnewton/hermit/issues/3222>, reproducer 2).
     /// Delivering to a thread whose mask admits the signal is always a
     /// delivery Linux could make for a process-directed signal.
     ///
