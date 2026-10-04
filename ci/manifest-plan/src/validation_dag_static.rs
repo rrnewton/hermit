@@ -660,7 +660,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // helper (tests::unflip_of_a_modes_only_backend_turns_its_ci_off;
     // https://github.com/rrnewton/hermit/issues/3606) retains all 892 prior
     // identities (measured 893).
-    ("test.regular_crates", 893),
+    // One DBT timerfd configuration control
+    // (every_config_source_keeps_timerfds_on_the_host_kernel; round 8 of
+    // https://github.com/rrnewton/hermit/pull/3229) retains all 893 prior
+    // identities (`cargo nextest list --profile ci` measured 894).
+    ("test.regular_crates", 894),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -775,7 +779,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // One backend signal-report capability control
     // (only_ptrace_hosted_backends_report_signal_interrupted_external_io;
     // https://github.com/rrnewton/hermit/pull/3224) retains all 818 prior IDs.
-    ("test.hermit_unit", 819),
+    // One backend timerfd-model control
+    // (only_single_tool_backends_model_timerfds; round 8 of
+    // https://github.com/rrnewton/hermit/pull/3229) retains all 819 prior
+    // identities (`cargo nextest list --profile ci` lists 825 = 820 plus the
+    // five real_random_ PMU cases this node skips).
+    ("test.hermit_unit", 820),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -859,7 +868,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Seven virtual-timerfd controls
     // (https://github.com/rrnewton/hermit/pull/3229) retain all 927 prior
     // identities: 927 + 7 = 934.
-    ("test.detcore_unit", 934),
+    // Nine round-8 controls of the replacement of
+    // https://github.com/rrnewton/hermit/pull/3224 and
+    // https://github.com/rrnewton/hermit/pull/3229 (five epoll fill-order and
+    // slot controls, ep_max_events_matches_linux among them, the KTIME_MAX
+    // relative-deadline clamp, the SCM_RIGHTS descriptor parser, and two
+    // rt_sigsuspend grant and sigset-overlap controls) retain all 934 prior
+    // identities: 934 + 9 = 943 (`cargo nextest list --profile ci` measured 943).
+    ("test.detcore_unit", 943),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1093,7 +1109,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3224
     // and the 7 virtual-timerfd controls of
     // https://github.com/rrnewton/hermit/pull/3229.
-    ("test.detcore_unit_on_host", 934),
+    // It also selects the nine round-8 controls listed for test.detcore_unit:
+    // 934 + 9 = 943.
+    ("test.detcore_unit_on_host", 943),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1132,7 +1150,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/issues/1845 test.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3219 test.
-    ("test.hermit_unit_on_host", 819),
+    // The host twin selects the same round-8 timerfd-model control.
+    ("test.hermit_unit_on_host", 820),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
@@ -1182,7 +1201,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // main-ancestor floor admission test listed there retains all 890.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3224 test.
     // It also selects the same un-flip helper control.
-    ("test.regular_crates_on_host", 893),
+    // It also selects the same round-8 DBT timerfd configuration control.
+    ("test.regular_crates_on_host", 894),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
