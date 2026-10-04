@@ -1845,6 +1845,47 @@ static void wait_form_wait_on_epoll(int form) {
     close(tfd);
 }
 
+/* epoll_pwait and epoll_pwait2 with a signal mask block until a timerfd
+ * armed for later fires, and epoll_pwait with a mask times out on a distant
+ * one, leaving it armed. */
+static void wait_form_masked_wait(int form) {
+    static const char *names[] = {"wait_form_masked_epoll_pwait_block",
+                                  "wait_form_masked_epoll_pwait2_block",
+                                  "wait_form_masked_epoll_pwait_timeout"};
+    const char *name = names[form];
+    int tfd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, (form == 2 ? 100000 : 30) * MS, 0, 0);
+    int ep = tfd < 0 ? -1 : epoll_with(tfd, EPOLLIN, 9);
+    sigset_t mask;
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGUSR2);
+    struct timespec ts = {5, 0};
+    struct epoll_event out[4];
+    memset(out, 0, sizeof out);
+    errno = 0;
+    long n = ep < 0       ? -1
+             : form == 1 ? wait_form_pwait2(ep, out, 4, &ts, &mask, 8)
+                         : epoll_pwait(ep, out, 4, form == 2 ? 20 : 5000, &mask);
+    long err = errno;
+    uint64_t count = 0;
+    ssize_t r = n == 1 ? read(tfd, &count, sizeof count) : 0;
+    struct itimerspec cur;
+    memset(&cur, 0, sizeof cur);
+    int got = tfd >= 0 ? timerfd_gettime(tfd, &cur) : -1;
+    if (ep >= 0) close(ep);
+    if (tfd >= 0) close(tfd);
+    if (form == 2) {
+        if (n != 0) fail(name, "n=%ld errno=%ld", n, err);
+        else if (got != 0 || cur.it_value.tv_sec < 90)
+            fail(name, "got=%ld left_sec=%ld", (long)got, (long)cur.it_value.tv_sec);
+        else ok(name);
+    } else if (n != 1 || out[0].events != EPOLLIN || out[0].data.u64 != 9)
+        fail(name, "n=%ld errno=%ld", n, err);
+    else if (r != 8 || count != 1) fail(name, "r=%ld count=%ld", (long)r, (long)count);
+    else if (got != 0 || cur.it_value.tv_sec != 0 || cur.it_value.tv_nsec != 0)
+        fail(name, "got=%ld left_ns=%ld", (long)got, (long)cur.it_value.tv_nsec);
+    else ok(name);
+}
+
 /* The fork and ppoll cases that check sharing and readiness only, never the
  * guest's clock; the `sharing` argument runs only these. */
 static void check_sharing_cases(void) {
@@ -1931,6 +1972,9 @@ int main(int argc, char **argv) {
     wait_form_wait_on_epoll(1);
     wait_form_wait_on_epoll(2);
     wait_form_wait_on_epoll(3);
+    wait_form_masked_wait(0);
+    wait_form_masked_wait(1);
+    wait_form_masked_wait(2);
     check_sharing_cases();
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;

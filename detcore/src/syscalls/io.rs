@@ -2284,7 +2284,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// With a virtual timerfd interest, a wait that need not block is one
     /// timeout-0 probe under the caller's mask, which is atomic exactly as
     /// on Linux. The host is probed too, so a ready host fd returns at once,
-    /// as it does on Linux, instead of the refusal below.
+    /// as it does on Linux. A wait that must block hands the epoll's
+    /// timerfds to the kernel and then waits there, as below.
     ///
     /// Without one, this keeps the previous behavior. A non-NULL sigmask's
     /// whole purpose is to swap the signal mask atomically for the duration
@@ -2338,14 +2339,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         if total > 0 || call.timeout() == 0 {
             return Ok(total);
         }
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): a masked wait that must block hands
+        // its timerfds to the kernel instead of refusing.
         // Blocking with a temporary mask cannot be reproduced by a polling
-        // loop (see above), and the host wait would never observe the
-        // virtual timer. Refuse rather than hang or change signal
-        // semantics.
-        tracing::warn!(
-            "epoll_pwait with a signal mask must block on a virtual timerfd; unsupported"
-        );
-        Err(Errno::ENOSYS.into())
+        // loop (see above), and the host wait would never observe a virtual
+        // timer. Hand the epoll's timerfds to the kernel, where base main
+        // keeps every timerfd, and make the masked wait there, as base main
+        // does: the kernel installs the mask atomically, and the timers then
+        // run on the host clock.
+        self.hand_epoll_timerfds_to_kernel(guest, call.epfd())
+            .await?;
+        Ok(self.record_or_replay(guest, call).await?)
     }
 
     /// Handle a guest-internal `epoll_pwait` (NULL sigmask) that can be fully
@@ -2430,8 +2435,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// that far past the virtual time of the call, in nanoseconds. Without a
     /// mask a wait that blocks is the epoll_pwait polling loop
     /// (`wait_with_timerfds`). With one, a wait that need not block is one
-    /// timeout-0 probe under the mask, and a wait that must block is refused
-    /// with ENOSYS, both exactly as for a masked epoll_pwait.
+    /// timeout-0 probe under the mask, and a wait that must block hands the
+    /// epoll's timerfds to the kernel and is forwarded, both exactly as for
+    /// a masked epoll_pwait.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3229): epoll_pwait2 on a virtual timerfd reuses
     // the epoll_pwait timer machinery with a nanosecond deadline.
@@ -2455,7 +2461,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?;
             return match probed {
                 Some(total) => Ok(total),
-                // No timerfd interest is live: forward the plain masked wait.
+                // No timerfd interest is live, or the timerfds were handed
+                // to the kernel: forward the plain masked wait.
                 None => Ok(self.record_or_replay(guest, call).await?),
             };
         }
@@ -2527,8 +2534,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// timerfd, after the caller's turn: the timer half of
     /// `handle_masked_epoll_pwait`, for epoll_pwait2, whose blocking is
     /// decided by its timespec rather than the probe's timeout. None when no
-    /// timerfd interest is live at the turn, so the caller forwards its own
-    /// call.
+    /// timerfd interest is live at the turn, or when the wait must block and
+    /// the epoll's timerfds were handed to the kernel, so the caller
+    /// forwards its own call.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3229): masked epoll_pwait2 decides on the timer
     // state of its own turn.
@@ -2565,10 +2573,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         if total > 0 || !may_block {
             return Ok(Some(total));
         }
-        tracing::warn!(
-            "epoll_pwait2 with a signal mask must block on a virtual timerfd; unsupported"
-        );
-        Err(Errno::ENOSYS.into())
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): a masked wait that must block hands
+        // its timerfds to the kernel instead of refusing.
+        // As in `handle_masked_epoll_pwait`.
+        self.hand_epoll_timerfds_to_kernel(guest, probe.epfd())
+            .await?;
+        Ok(None)
     }
 
     /// epoll_wait syscall (MAYHANG)
