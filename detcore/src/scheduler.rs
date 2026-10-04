@@ -3888,6 +3888,16 @@ impl Scheduler {
     // kernel's. It stays pending in the kernel and is delivered when the wait
     // ends.
     //
+    // The waits of `select`, and of `pselect6` without a temporary mask, read
+    // the same state but are not gated and never ask
+    // (`KernelSignalWait::for_select`). Linux ends them for any caught signal,
+    // and the gate would hold a `SIGCHLD` sent from outside the container to a
+    // process that has had a child, possibly for the rest of the wait. They
+    // see the kernel's own `SIGCHLD` for a child event at a host-timed turn,
+    // as Detcore's select and pselect6 waits did before the gate. A marked
+    // `SIGCHLD` that ends one of them is dequeued when the call returns, and
+    // `note_inbound_sigchld` clears its mark as for any other dequeue.
+    //
     // Why the answer is deterministic:
     //   * Marks are set only at the scheduler's ordering points: in the sender's
     //     turn; in a step2b timed pop or the empty-queue time skip; or at a
