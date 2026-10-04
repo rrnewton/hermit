@@ -983,8 +983,14 @@ where
 /// `ChildExit` send. Those count here, and so does every `SIGCHLD` pending for a
 /// process that never had a child, which no child can have sent; that is how a
 /// `SIGCHLD` sent from outside the container interrupts such a process's wait
-/// (`Scheduler::sigchld_eligible`). The rest stay pending in the kernel and are
-/// delivered when the wait ends.
+/// (`Scheduler::sigchld_eligible`). Any other pending `SIGCHLD` does not end the
+/// wait: it stays pending in the kernel, or is held by the backend if it stopped
+/// an injection before `KernelSignalWait::block` took effect, and it counts at a
+/// later turn once the scheduler makes it eligible. If the wait ends first, it
+/// is delivered after the call returns, once the guest's mask is put back. A
+/// `SIGCHLD` sent from outside the container to a process that has had a child
+/// is not made eligible by its arrival, so it ends the wait only together with
+/// one that the scheduler makes eligible.
 ///
 /// The scheduler is asked whenever `SIGCHLD` could interrupt the wait, pending or
 /// not, so whether the question is asked depends only on the guest's mask and
