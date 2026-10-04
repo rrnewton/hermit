@@ -980,8 +980,11 @@ where
 /// The scheduler makes a `SIGCHLD` eligible at its own ordering points: a guest
 /// send in the sender's turn, its own `ChildExit` send at a granted
 /// `exit_group`'s time, and the logical death of a child that had no
-/// `ChildExit` send. Only those count here. The rest stay pending in the kernel
-/// and are delivered when the wait ends.
+/// `ChildExit` send. Those count here, and so does every `SIGCHLD` pending for a
+/// process that never had a child, which no child can have sent; that is how a
+/// `SIGCHLD` sent from outside the container interrupts such a process's wait
+/// (`Scheduler::sigchld_eligible`). The rest stay pending in the kernel and are
+/// delivered when the wait ends.
 ///
 /// The scheduler is asked whenever `SIGCHLD` could interrupt the wait, pending or
 /// not, so whether the question is asked depends only on the guest's mask and
