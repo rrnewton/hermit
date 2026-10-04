@@ -438,7 +438,7 @@ dependencies = [
 [[package]]
 name = "dagrun"
 version = "0.15.0"
-source = "git+https://github.com/rrnewton/agent-utils.git?rev=1151317720218c8dd830a50d9f6bf10fc7d175e5#1151317720218c8dd830a50d9f6bf10fc7d175e5"
+source = "git+https://github.com/rrnewton/agent-utils.git?rev=79b27f46ae3d14e5d6f517ab4908f22a706fb8c1#79b27f46ae3d14e5d6f517ab4908f22a706fb8c1"
 dependencies = [
  "libc",
  "serde",
