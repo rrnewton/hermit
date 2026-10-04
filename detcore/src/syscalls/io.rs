@@ -667,13 +667,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                         resource_request(guest, resources.clone()).await,
                         ResumeStatus::Signaled(_)
                     );
+                    // The kernel's signal state that this turn's check read, which the
+                    // probe's injection below takes as its first read once every
+                    // blockable signal is blocked (`inject_absorbing_after`).
+                    let mut turn_state = None;
                     if let Some(signals) = signals.as_ref() {
                         // A scheduler `Signaled` answer is only a hint here; the kernel's
                         // state decides. pselect6 returns ERESTARTNOHAND: EINTR after a
                         // handler, a restart with the remaining timeout after a stop.
-                        match signals.interrupted(guest).await {
-                            Ok(false) => {}
-                            Ok(true) => {
+                        match signals.interrupted_with_state(guest).await {
+                            Ok((false, state)) => turn_state = Some(state),
+                            Ok((true, _)) => {
                                 self.write_pselect6_remaining(guest, call, deadline).await?;
                                 break Err(Errno::ERESTARTNOHAND.into());
                             }
@@ -696,14 +700,23 @@ impl<T: RecordOrReplay> Detcore<T> {
 
                     let raw_result = match signals.as_mut() {
                         // A signal stop that does not end the wait is absorbed (see
-                        // `KernelSignalWait`).
-                        Some(signals) => match signals.inject_absorbing(guest, probe).await {
-                            Ok(result) => result,
-                            Err(error) => {
-                                self.write_pselect6_remaining(guest, call, deadline).await?;
-                                break Err(error);
+                        // `KernelSignalWait`). Only the guest memory writes above ran
+                        // since the turn's read, and they do not resume the thread.
+                        Some(signals) => {
+                            let injected = match turn_state {
+                                Some(state) => {
+                                    signals.inject_absorbing_after(guest, probe, state).await
+                                }
+                                None => signals.inject_absorbing(guest, probe).await,
+                            };
+                            match injected {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    self.write_pselect6_remaining(guest, call, deadline).await?;
+                                    break Err(error);
+                                }
                             }
-                        },
+                        }
                         None => guest.inject(probe).await,
                     };
                     let result = pselect6_probe_result(raw_result);
@@ -925,13 +938,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                         resource_request(guest, resources.clone()).await,
                         ResumeStatus::Signaled(_)
                     );
+                    // The kernel's signal state that this turn's check read, which the
+                    // probe's injection below takes as its first read once every
+                    // blockable signal is blocked (`inject_absorbing_after`).
+                    let mut turn_state = None;
                     if let Some(signals) = signals.as_ref() {
                         // A scheduler `Signaled` answer is only a hint here; the kernel's
                         // state decides. select returns ERESTARTNOHAND: EINTR after a
                         // handler, a restart with the remaining timeout after a stop.
-                        match signals.interrupted(guest).await {
-                            Ok(false) => {}
-                            Ok(true) => {
+                        match signals.interrupted_with_state(guest).await {
+                            Ok((false, state)) => turn_state = Some(state),
+                            Ok((true, _)) => {
                                 self.write_select_remaining(guest, call, deadline).await?;
                                 break Err(Errno::ERESTARTNOHAND.into());
                             }
@@ -954,14 +971,23 @@ impl<T: RecordOrReplay> Detcore<T> {
 
                     let result = match signals.as_mut() {
                         // A signal stop that does not end the wait is absorbed (see
-                        // `KernelSignalWait`).
-                        Some(signals) => match signals.inject_absorbing(guest, probe).await {
-                            Ok(result) => result,
-                            Err(error) => {
-                                self.write_select_remaining(guest, call, deadline).await?;
-                                break Err(error);
+                        // `KernelSignalWait`). Only the guest memory writes above ran
+                        // since the turn's read, and they do not resume the thread.
+                        Some(signals) => {
+                            let injected = match turn_state {
+                                Some(state) => {
+                                    signals.inject_absorbing_after(guest, probe, state).await
+                                }
+                                None => signals.inject_absorbing(guest, probe).await,
+                            };
+                            match injected {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    self.write_select_remaining(guest, call, deadline).await?;
+                                    break Err(error);
+                                }
                             }
-                        },
+                        }
                         None => guest.inject(probe).await,
                     };
                     if result != Ok(0) {
