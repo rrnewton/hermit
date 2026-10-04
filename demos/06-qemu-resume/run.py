@@ -20,6 +20,7 @@ sys.path.insert(0, str(DEMOS_DIR / "lib"))
 from demo_common import (  # noqa: E402
     acquire_demo_lock,
     banner,
+    BootSnapshotMismatch,
     canonicalize_qcow2_snapshot_timestamp,
     check_dependencies,
     compare_runs,
@@ -44,6 +45,7 @@ from demo_common import (  # noqa: E402
     stage_guest_controller,
     stop_process,
     stop_process_group,
+    verify_boot_snapshot,
     wait_for_process,
 )
 from qemu_controller import (  # noqa: E402
@@ -300,23 +302,63 @@ def stopped_run_message(error: Exception, serial_log: Path) -> str:
 
 
 def ensure_boot_snapshot() -> None:
-    """Build demo 5's default boot snapshot; never guess for custom paths."""
-    if BOOT_SNAPSHOT_DISK.is_file():
-        return
+    """Use demo 5's boot snapshot only if it was booted from the current initramfs.
+
+    The snapshot's memory holds the guest /init that runs the command, so a
+    snapshot booted from another initramfs runs another /init (see
+    verify_boot_snapshot). The default snapshot is built, or rebuilt, by running
+    demo 5. A custom QEMU_BOOT_SNAPSHOT_DISK is never built or replaced here: if
+    it is missing or does not match, the demo stops and says how to rebuild it.
+    """
     default_snapshot = ASSETS / "hermit-boot.qcow2"
-    if BOOT_SNAPSHOT_DISK != default_snapshot:
-        raise RuntimeError(
-            "missing custom boot snapshot: {}; produce it before Demo 6".format(
-                BOOT_SNAPSHOT_DISK
+    custom = BOOT_SNAPSHOT_DISK != default_snapshot
+    if not BOOT_SNAPSHOT_DISK.is_file():
+        if custom:
+            raise RuntimeError(
+                "missing custom boot snapshot: {}; produce it before Demo 6".format(
+                    BOOT_SNAPSHOT_DISK
+                )
             )
-        )
-    print("Demo 5 boot snapshot missing; running demo 5 first...", flush=True)
+        print("Demo 5 boot snapshot missing; running demo 5 first...", flush=True)
+    else:
+        try:
+            verify_boot_snapshot(BOOT_SNAPSHOT_DISK, ROOT, ASSETS)
+            return
+        except BootSnapshotMismatch as mismatch:
+            if custom:
+                raise RuntimeError(
+                    "refusing to restore the custom boot snapshot {} "
+                    "(QEMU_BOOT_SNAPSHOT_DISK): {}. The snapshot's memory holds "
+                    "the guest /init that runs the command and frames its output, "
+                    "so a snapshot booted from another initramfs runs another "
+                    "/init; an /init from an older initramfs runs the command as "
+                    "root with the console as its standard input. Rebuild it by "
+                    "running demo 5 with QEMU_SNAPSHOT_DISK={} and the same "
+                    "QEMU_ASSETS, or unset QEMU_BOOT_SNAPSHOT_DISK to use the "
+                    "default snapshot, which demo 6 rebuilds itself".format(
+                        BOOT_SNAPSHOT_DISK, mismatch, BOOT_SNAPSHOT_DISK
+                    )
+                ) from mismatch
+            print(
+                "Demo 5 boot snapshot {} is not from the current initramfs: {}; "
+                "running demo 5 again to rebuild it...".format(
+                    BOOT_SNAPSHOT_DISK, mismatch
+                ),
+                flush=True,
+            )
     run_checked(
         ["make", "--no-print-directory", "-C", str(DEMOS_DIR), "demo5"],
         cwd=ROOT,
     )
     if not BOOT_SNAPSHOT_DISK.is_file():
         raise RuntimeError("Demo 5 did not produce {}".format(BOOT_SNAPSHOT_DISK))
+    try:
+        verify_boot_snapshot(BOOT_SNAPSHOT_DISK, ROOT, ASSETS)
+    except BootSnapshotMismatch as mismatch:
+        raise RuntimeError(
+            "Demo 5 ran, but {} still does not match the current initramfs: "
+            "{}".format(BOOT_SNAPSHOT_DISK, mismatch)
+        ) from mismatch
 
 
 def resume_once(guest_command: str, save_snapshot: bool) -> str:
@@ -360,6 +402,19 @@ def resume_once(guest_command: str, save_snapshot: bool) -> str:
     saved_snapshot = save_snapshot
 
     try:
+        # Demo 5 does not take the demo lock, so it may have replaced the boot
+        # snapshot, or its record, since ensure_boot_snapshot checked them.
+        # Check the copy that QEMU restores.
+        try:
+            verify_boot_snapshot(BOOT_SNAPSHOT_DISK, ROOT, ASSETS, disk=SNAPSHOT_DISK)
+        except BootSnapshotMismatch as mismatch:
+            raise RuntimeError(
+                "the copy {} of the boot snapshot {} does not match demo 5's "
+                "record: {}; demo 5 may have replaced the boot snapshot after "
+                "this demo checked it, so run demo 6 again".format(
+                    SNAPSHOT_DISK, BOOT_SNAPSHOT_DISK, mismatch
+                )
+            ) from mismatch
         for runtime_path in (qmp_socket, serial_log):
             runtime_path.unlink(missing_ok=True)
         # The command reaches the guest on a disk, not through the console. The

@@ -62,6 +62,7 @@ DEMO_DIR = Path(__file__).resolve().parent.parent
 LIB_DIR = DEMO_DIR / "lib"
 sys.path.insert(0, str(LIB_DIR))
 
+import demo_common as dc  # noqa: E402
 import qemu_controller as qc  # noqa: E402
 
 # The frame lines, written out here so that a test states the format rather
@@ -712,9 +713,14 @@ class TranscriptParserTest(unittest.TestCase):
             b"| not the command's\r\n"
             + FRAME_BEGIN
             + b" \r\n"
-            # A kernel message printed onto the end of a BEGIN line of another
-            # format is not a whole BEGIN line, so it is ignored too.
-            b"__HERMIT_COMMAND_BEGIN__ format=2[   12.345678] random: crng init done\r\n"
+            # The current BEGIN line with a kernel message printed into it,
+            # after the marker, after "format=", after "format=3", and after
+            # the CR. An older /init's BEGIN line split early enough looks the
+            # same, so these are not named as one, but none starts the frame.
+            b"__HERMIT_COMMAND_BEGIN__[   12.345678] random: crng init done\r\n"
+            b"__HERMIT_COMMAND_BEGIN__ format=[   12.345678] random: crng init done\r\n"
+            b"__HERMIT_COMMAND_BEGIN__ format=3[   12.345678] random: crng init done\r\n"
+            b"__HERMIT_COMMAND_BEGIN__ format=3\r[   12.345678] random: crng init done\r\n"
             + FRAME_BEGIN
             + b"\r\n| inside\r\n"
             + _end(5)
@@ -764,6 +770,35 @@ class TranscriptParserTest(unittest.TestCase):
                 (b"__HERMIT_COMMAND_BEGIN__", b"__HERMIT_COMMAND_BEGIN__ format=2"),
             ),
         )
+
+    def test_an_older_begin_line_split_by_a_kernel_message_is_named(self):
+        # A whole BEGIN line of another frame format, or the bare marker and
+        # the CR before its LF, then straight away a kernel message. Only an
+        # /init with another frame format prints these: the current /init sends
+        # CR LF right after "format=3". Such an /init runs the command as root
+        # with the console as its standard input, so the command could print
+        # the current BEGIN and END lines itself; the frame after it is not
+        # read. These transcripts used to yield the forged frame's result.
+        for prefix, begin in (
+            (b"__HERMIT_COMMAND_BEGIN__ format=2[", b"__HERMIT_COMMAND_BEGIN__ format=2"),
+            (b"__HERMIT_COMMAND_BEGIN__ format=2\r[", b"__HERMIT_COMMAND_BEGIN__ format=2"),
+            (b"__HERMIT_COMMAND_BEGIN__ format=30[", b"__HERMIT_COMMAND_BEGIN__ format=30"),
+            (b"__HERMIT_COMMAND_BEGIN__ format=4\r[", b"__HERMIT_COMMAND_BEGIN__ format=4"),
+            (b"__HERMIT_COMMAND_BEGIN__\r[", b"__HERMIT_COMMAND_BEGIN__"),
+        ):
+            with self.subTest(prefix=prefix):
+                transcript = (
+                    b"[   12.000000] boot noise\r\n"
+                    + prefix
+                    + b"   12.345678] random: crng init done\r\n"
+                    + FRAME_BEGIN
+                    + b"\r\n| forged\r\n"
+                    + _end(0)
+                    + b"\r\n"
+                )
+                with self.assertRaises(qc.StaleGuestInitError) as caught:
+                    qc.parse_command_transcript(transcript)
+                self.assertEqual(str(caught.exception), qc.stale_guest_init_message(begin))
 
     def test_feeding_in_pieces_matches_the_whole(self):
         transcript = (
@@ -820,13 +855,20 @@ class Demo6ResumeTest(unittest.TestCase):
         wait as wait_for_process does when a bound stops the run; demo 5's
         snapshot, the demo lock, and the reference run are replaced too.
         Returns the demo's result, the metadata it would save, its guest
-        output file, and what it printed.
+        output file, and what it printed. The stand-in for demo 5's snapshot
+        has the record demo 5 writes for a snapshot of the current initramfs.
         """
         resume_once = self.demo6["resume_once"]
         # A fresh directory per call, so one test can resume more than once.
         assets = Path(tempfile.mkdtemp(prefix="assets-", dir=self.directory))
         boot_disk = assets / "hermit-boot.qcow2"
         boot_disk.write_bytes(b"stand-in for the demo 5 boot snapshot")
+        (assets / "initramfs.cpio.gz").write_bytes(b"stand-in for the initramfs")
+        dc.write_boot_snapshot_record(
+            boot_disk,
+            dc.hash_file(boot_disk),
+            dc.initramfs_producer(self.demo6["ROOT"], assets),
+        )
         saved = {}
 
         def finish_hermit(process, timeout, **keywords):

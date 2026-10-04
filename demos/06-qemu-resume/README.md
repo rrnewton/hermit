@@ -17,7 +17,9 @@ post-command snapshot.
 ## Prerequisites
 
 - Everything [demo 5](../05-qemu-boot/README.md#prerequisites) needs.
-- The boot snapshot from demo 5. If it is missing, this demo runs demo 5 first.
+- The boot snapshot from demo 5, booted from the initramfs that
+  `demos/lib/qemu-assets.sh` builds now. If it is missing, or demo 5 saved it
+  from another initramfs, this demo runs demo 5 first to rebuild it.
 
 The resume itself does not use the hardware performance counters (see "How it
 works"), but demo 5 does if it has to run first.
@@ -311,11 +313,21 @@ The framing has these consequences and limits:
   (see "A run that does not finish" below); it never ends with a cut-off
   output.
 - A boot snapshot saved before this change still runs an old `/init`, which
-  prints a bare `__HERMIT_COMMAND_BEGIN__` line or one ending in `format=2`.
-  The controller stops as soon as it sees such a line, names it, and the demo
-  says to run `demos/clean.sh` and then demo 5 again. `demos/lib/qemu-assets.sh`
-  rebuilds the initramfs by itself (its `.initramfs-version` is now 9), but
-  only demo 5 saves a new boot snapshot.
+  runs the command as root with the console as its standard input, so the
+  command could print a frame of its own. `demos/lib/qemu-assets.sh` rebuilds
+  the initramfs by itself (its `.initramfs-version` is now 9), but only demo 5
+  saves a new boot snapshot. Demo 5 therefore writes a record next to each boot
+  snapshot it saves, `hermit-boot.qcow2.producer.json`, naming the snapshot's
+  SHA-256 and the `INITRAMFS_VERSION` and SHA-256 of the initramfs it booted.
+  This demo restores the default snapshot only when that record matches the
+  snapshot and the current initramfs, and otherwise runs demo 5 again to
+  rebuild it. A snapshot named by `QEMU_BOOT_SNAPSHOT_DISK` without such a
+  record is refused, with the reason and how to rebuild it. Because demo 5 does
+  not take this demo's lock, the copy that QEMU restores is checked against the
+  record too. As a second line of defence, the controller stops as soon as it
+  sees the BEGIN line of another `/init`, a bare `__HERMIT_COMMAND_BEGIN__` line
+  or one ending in `format=2`, also when a kernel message is printed right after
+  it, names it, and the demo says to run `demos/clean.sh` and then demo 5 again.
 - A reference run saved before this change was started with another kernel
   command line, without `printk.time=1`, so its comparison reports
   `WARN: QEMU argv differs from first run` and the run ends `PARTIAL`, never
@@ -384,7 +396,7 @@ Controls (environment variables):
 | `QEMU_RESUME_REPEAT` | `1` | Set to `0` to skip the second resume of a new command, which then compares nothing. `demos/run-all.sh` always sets it to `1`. |
 | `QEMU_TIMEOUT` | `120` | Seconds before the resume is stopped, unless `QEMU_MAX_LOG_BYTES` stopped it first. With the default cap, a resume that keeps running is stopped by the cap after about 29 seconds, before this timeout; see "A run that does not finish". |
 | `QEMU_ASSETS` | `ignored/qemu-linux` | Where demo 5's snapshot and this demo's results are kept. |
-| `QEMU_BOOT_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The boot snapshot to restore. |
+| `QEMU_BOOT_SNAPSHOT_DISK` | `$QEMU_ASSETS/hermit-boot.qcow2` | The boot snapshot to restore. Another path is restored only with the record that demo 5 writes next to it (`<path>.producer.json`) for the current initramfs; run demo 5 with `QEMU_SNAPSHOT_DISK=<path>` and the same `QEMU_ASSETS` to save one. This demo never runs demo 5 for it. |
 | `QEMU_BIN` | `qemu-system-x86_64` on `PATH` | The QEMU binary. It must be the one demo 5 used. |
 | `QEMU_LOG_FILTER` | `warn,detcore=info,reverie_ptrace::task=info` | Hermit's log filter, passed to Hermit as `RUST_LOG`; the demo removes `HERMIT_LOG` and `HERMIT_LOG_FILE` from Hermit's environment. The repeat check needs Hermit's INFO records, so a filter that keeps none fails it. A different filter also changes the log, its size and so how soon `QEMU_MAX_LOG_BYTES` is reached, and a saved reference run no longer applies; run `demos/clean.sh`. |
 | `QEMU_MAX_LOG_BYTES` | 512 MiB | Stop the run if Hermit's event log grows past this size. Healthy resumes on 2026-09-30 wrote 169,751,813 bytes (`uname -a` with `--no-save-snapshot`, 10.0 to 11.4 seconds) and 258,227,125 to 259,021,561 bytes (the three commands above, saving a snapshot, 15.7 to 16.5 seconds) (Hermit 0.2.0 gdc92644f96f4, QEMU 10.1.2); Hermit 0.2.0 g770b95c505fa wrote 80 to 153 MB. A resume that keeps running reaches this cap after about 29 seconds (18.5 to 19.2 MB per second on 2026-10-03), so with the defaults it, not `QEMU_TIMEOUT`, is what stops a command that does not finish. The cap also holds while the demo waits, for up to 60 seconds after Hermit exits, for the rest of Hermit's output. |

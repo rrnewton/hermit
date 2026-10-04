@@ -65,7 +65,9 @@ computed=(
   "resume-metadata"            # demo 6's saved first runs and history
   "hermit-snapshot.qcow2"      # working snapshot disk
   "hermit-snapshot.qcow2.id"
+  "hermit-snapshot.qcow2.producer.json"
   "hermit-boot.qcow2"          # demo 5's boot snapshot, restored by demos 6 and 7
+  "hermit-boot.qcow2.producer.json" # the initramfs it was booted from
   "guest-command.img"          # demo 6's command disk
   "serial.log"                 # serial console capture
   "qmp.sock"                   # QEMU control socket
@@ -88,6 +90,7 @@ provisioned=(
 transient_globs=(
   "run-metadata.json.tmp.*"
   "hermit-boot.qcow2.tmp.*"
+  "hermit-boot.qcow2.producer.json.tmp.*"
   ".bzImage.*"
   ".initramfs.cpio.gz.*"
   ".initramfs-version.*"

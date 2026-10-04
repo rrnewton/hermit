@@ -31,6 +31,7 @@ DEMO_DIR = Path(__file__).resolve().parent.parent
 TRANSIENT_FILES = (
     "run-metadata.json.tmp.456",
     "hermit-boot.qcow2.tmp.789",
+    "hermit-boot.qcow2.producer.json.tmp.321",
     ".bzImage.123",
     ".initramfs.cpio.gz.1",
     ".initramfs-version.2",
@@ -144,6 +145,26 @@ class CleanTransientGlobTest(unittest.TestCase):
         self.assertEqual(
             sorted(path.name for path in self.assets.iterdir()),
             sorted(TRANSIENT_FILES + KEPT_ASSET_FILES),
+        )
+
+    def test_the_boot_snapshot_and_its_record_are_removed(self):
+        # Demo 5 writes a record of the initramfs next to each boot snapshot it
+        # saves; demo 6 restores the snapshot only with a matching record.
+        computed = (
+            "hermit-boot.qcow2",
+            "hermit-boot.qcow2.producer.json",
+            "hermit-snapshot.qcow2",
+            "hermit-snapshot.qcow2.id",
+            "hermit-snapshot.qcow2.producer.json",
+        )
+        for name in computed:
+            (self.assets / name).write_text(name + "\n")
+        completed = self._clean()
+        self.assertEqual(completed.returncode, 0, completed.stdout)
+        self.assertEqual(
+            sorted(path.name for path in self.assets.iterdir()),
+            sorted(KEPT_ASSET_FILES),
+            completed.stdout,
         )
 
     def test_matching_files_are_removed_when_the_caller_has_none(self):
