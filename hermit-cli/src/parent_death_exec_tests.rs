@@ -1,7 +1,8 @@
 //! First-handler controls using the actual record/replay subtool types.
 //!
-//! A positive admission stops at the first prehook state read, not at a fake
-//! successful exec. Real retained-image execution is covered by the producer.
+//! A positive admission stops at the first prehook mutable-state access,
+//! before returning a reference or performing the mutation. Real retained-image
+//! execution is covered by the producer; this witness does not claim exec success.
 
 use std::marker::PhantomData;
 use std::panic::AssertUnwindSafe;
@@ -76,7 +77,7 @@ struct BoundaryGuest<T: Tool<GlobalState = GlobalState>> {
     original: Syscall,
     enrolled: bool,
     allow_prehook_witness: bool,
-    // Admission query, state read, state mutation, memory, RPC, injection,
+    // Admission query, immutable-state access, mutable-state access, memory, RPC, injection,
     // other effects. Nothing after admission is allowed on the refusal path.
     effects: [AtomicUsize; 7],
     tool: PhantomData<T>,
@@ -134,12 +135,14 @@ impl<T: Tool<GlobalState = GlobalState>> Guest<T> for BoundaryGuest<T> {
         self.unexpected(3)
     }
     fn thread_state_mut(&mut self) -> &mut T::ThreadState {
-        self.unexpected(2)
+        self.effects[2].fetch_add(1, Ordering::SeqCst);
+        assert!(self.allow_prehook_witness, "refused exec entered prehook");
+        // The existing prehook resets its per-call flag through this accessor.
+        // Stop before returning &mut state, so the reset itself never executes.
+        std::panic::panic_any(PrehookReached)
     }
     fn thread_state(&self) -> &T::ThreadState {
-        self.effects[1].fetch_add(1, Ordering::SeqCst);
-        assert!(self.allow_prehook_witness, "refused exec entered prehook");
-        std::panic::panic_any(PrehookReached)
+        self.unexpected(1)
     }
     async fn regs(&mut self) -> libc::user_regs_struct {
         self.unexpected(6)
@@ -228,7 +231,7 @@ fn check_boundary<T: Tool<GlobalState = GlobalState>>(
             .effects
             .each_ref()
             .map(|value| value.load(Ordering::SeqCst)),
-        [usize::from(kvm), usize::from(!refuse), 0, 0, 0, 0, 0]
+        [usize::from(kvm), 0, usize::from(!refuse), 0, 0, 0, 0]
     );
 }
 
