@@ -19,6 +19,11 @@
 #define AP_EXE_VMOPS_IMAGE 0xffffffff82a8bb20ULL
 #define AP_EXE_NONOTIFY 0x02000000ULL
 #define AP_EXE_NONOTIFY_PERM 0x04000000ULL
+#define AP_EXE_FMODE_READ 0x1U
+#define AP_EXE_FMODE_WRITE 0x2U
+#define AP_EXE_FMODE_CAN_READ 0x00020000U
+#define AP_EXE_FMODE_OPENED 0x00080000U
+#define AP_EXE_FMODE_REQUIRED (AP_EXE_FMODE_READ|AP_EXE_FMODE_OPENED|AP_EXE_FMODE_CAN_READ)
 #define AP_EXE_VM_READ 0x1ULL
 #define AP_EXE_VM_FORBIDDEN (0x2ULL|0x8ULL|0x400ULL|0x4000ULL|0x40000ULL|0x400000ULL|0x10000000ULL)
 
@@ -65,8 +70,12 @@ static __attribute__((always_inline)) inline int ap_executable_observation_valid
        !o->inode_number || !o->file_size || o->file_size>0x7fffffffffffffffULL ||
        (o->inode_mode&0170000)!=0100000 || o->inode_mode>0177777 ||
        o->filesystem!=AP_SOURCE_BTRFS_MAGIC || o->writecount>=0 ||
-       o->writecount<(-2147483647LL-1) || !(o->file_mode&1) || (o->file_mode&2) ||
-       !(o->file_mode&32) ||
+       /* Linux OPEN_FMODE initializes access mode, not the __FMODE_EXEC
+        * open flag. Executable-file association and write denial are checked
+        * above; require persistent readable-open state. */
+       o->writecount<(-2147483647LL-1) ||
+       (o->file_mode&AP_EXE_FMODE_REQUIRED)!=AP_EXE_FMODE_REQUIRED ||
+       (o->file_mode&AP_EXE_FMODE_WRITE) ||
        ((o->file_mode&(AP_EXE_NONOTIFY|AP_EXE_NONOTIFY_PERM))!=AP_EXE_NONOTIFY &&
         (o->file_mode&(AP_EXE_NONOTIFY|AP_EXE_NONOTIFY_PERM))!=AP_EXE_NONOTIFY_PERM) ||
        !anchor || o->fops!=ap_grouped_image_address(anchor,AP_SOURCE_BTRFS_FOPS_IMAGE) ||

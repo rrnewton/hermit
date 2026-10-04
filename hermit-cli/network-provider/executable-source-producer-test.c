@@ -66,7 +66,7 @@ static void reset(void) {
     sb=(struct super_block){AP_SOURCE_BTRFS_MAGIC,47};
     inode=(struct inode){.i_sb=&sb,.i_ino=53,.i_size=0x4000,.i_mode=0100755,.i_writecount={-1}};
     mapping=(struct address_space){&inode};
-    file=(struct file){&inode,&mapping,(void *)AP_SOURCE_BTRFS_FOPS_IMAGE,1|32|AP_EXE_NONOTIFY};
+    file=(struct file){&inode,&mapping,(void *)AP_SOURCE_BTRFS_FOPS_IMAGE,AP_EXE_FMODE_REQUIRED|AP_EXE_NONOTIFY};
     mm.exe_file=&file;tracer=(struct task_struct){.start_boottime=29};
     target=(struct task_struct){.mm=&mm,.start_boottime=19,.parent=&tracer,.ptrace=1,
         .__state=AP_TASK_TRACED,.jobctl=AP_JOBCTL_FROZEN|AP_JOBCTL_TRACED};
@@ -146,6 +146,43 @@ static void callback_cardinality(void) {
     phase(true,0);
     CHECK(row.problem==(AP_EXE_CONTEXT|AP_EXE_HELPER) && !VALID() && published==1);
 }
+static void retry22_setup(void) {
+    reset();file.f_mode=0x0c4a801d;inode.i_size=37408;
+    vma.vm_start=0x403000;vma.vm_end=0x404000;vma.vm_pgoff=3;vma.vm_flags=0x71;
+    row.intent.address=0x403029;row.intent.length=5;
+    submitted.original_count=completion.original_count=5;
+}
+static void persistent_executable_mode(void) {
+    /* Run the actual callbacks with retry22's captured mode and geometry.
+     * Kernel objects, helper and map transport are the controlled boundary. */
+    retry22_setup();phase(false,0);
+    CHECK(!row.problem && row.phases==(AP_EXE_ENTERED|AP_EXE_OBSERVED));
+    phase(true,0);CHECK(VALID() && published==1 && find_calls==2 && !failures);
+    for(unsigned cut=0;cut<2;cut++)for(unsigned test=0;test<15;test++) {
+        retry22_setup();if(cut)phase(false,0);
+        switch(test) {
+        case 0:file.f_mode&=~AP_EXE_FMODE_READ;break;
+        case 1:file.f_mode&=~AP_EXE_FMODE_OPENED;break;
+        case 2:file.f_mode&=~AP_EXE_FMODE_CAN_READ;break;
+        case 3:file.f_mode|=AP_EXE_FMODE_WRITE;break;
+        case 4:mm.exe_file=NULL;break;
+        case 5:inode.i_writecount.counter=0;break;
+        case 6:file.f_mode&=~(AP_EXE_NONOTIFY|AP_EXE_NONOTIFY_PERM);break;
+        case 7:file.f_mode|=AP_EXE_NONOTIFY|AP_EXE_NONOTIFY_PERM;break;
+        case 8:file.f_op=(void *)(AP_SOURCE_BTRFS_FOPS_IMAGE+8);break;
+        case 9:vma.vm_ops=(void *)(AP_EXE_VMOPS_IMAGE+8);break;
+        case 10:vma.vm_flags|=2;break;
+        case 11:vma.vm_flags|=8;break;
+        case 12:inode.i_size=0x302d;break;
+        case 13:vma.vm_end=vma.vm_start;break;
+        case 14:file.f_mode=1|32|AP_EXE_NONOTIFY;break;
+        }
+        if(!cut)phase(false,0);
+        phase(true,0);
+        CHECK((row.problem&(test==4?AP_EXE_BACKING:AP_EXE_GEOMETRY)) && !VALID());
+        CHECK(published==1 && find_calls==2 && !failures);
+    }
+}
 int main(void) {
     reset();phase(false,0);CHECK(!VALID() && !published && row.phases==3);phase(true,0);
     CHECK(VALID() && published==1 && find_calls==2 && !failures);
@@ -182,5 +219,6 @@ int main(void) {
     unrelated_ptrace_requests();
     CHECK(checks==98); /* All preexisting controls remain unchanged. */
     callback_cardinality();
+    persistent_executable_mode();
     printf("executable actual producer: %u checks\n",checks);return 0;
 }

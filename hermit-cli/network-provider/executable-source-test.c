@@ -20,8 +20,17 @@ static struct ap_executable_source receipt(void) {
         .mm=31,.file=37,.exe_file=37,.inode=41,.mapping=43,
         .fops=AP_SOURCE_BTRFS_FOPS_IMAGE,.vm_ops=AP_EXE_VMOPS_IMAGE,.filesystem=AP_SOURCE_BTRFS_MAGIC,
         .device=47,.inode_number=53,.file_size=0x4000,.vm_start=0x401000,.vm_end=0x402000,
-        .vm_pgoff=1,.vm_flags=5,.file_mode=1|32|AP_EXE_NONOTIFY,.inode_mode=0100755,.writecount=-1,
+        .vm_pgoff=1,.vm_flags=5,.file_mode=AP_EXE_FMODE_REQUIRED|AP_EXE_NONOTIFY,.inode_mode=0100755,.writecount=-1,
         .iovec_base=0x701000,.iovec_length=AP_EXE_REGISTER_BYTES};
+    e.returned=e.entered;return e;
+}
+static struct ap_executable_source retry22_receipt(void) {
+    /* Actual retry22 read-only PROGRESS mapping; command/task identities remain
+     * the controlled fixture's. Linux f_mode has no __FMODE_EXEC open flag. */
+    struct ap_executable_source e=receipt();
+    e.intent.address=0x403029;e.intent.length=5;
+    e.entered.file_size=37408;e.entered.vm_start=0x403000;e.entered.vm_end=0x404000;
+    e.entered.vm_pgoff=3;e.entered.vm_flags=0x71;e.entered.file_mode=0x0c4a801d;
     e.returned=e.entered;return e;
 }
 int main(void) {
@@ -33,7 +42,7 @@ int main(void) {
         offsetof(struct ap_executable_source,phases)==432);
     CHECK(VALID()); /* Actual initial semantic MM zero is legitimate. */
     e.returned.writecount=-2;CHECK(VALID());e=receipt();
-    e.entered.file_mode=e.returned.file_mode=1|32|AP_EXE_NONOTIFY_PERM;CHECK(VALID());e=receipt();
+    e.entered.file_mode=e.returned.file_mode=AP_EXE_FMODE_REQUIRED|AP_EXE_NONOTIFY_PERM;CHECK(VALID());e=receipt();
     anchor-=0x200000;e.entered.fops=e.returned.fops-=0x200000;
     e.entered.vm_ops=e.returned.vm_ops-=0x200000;CHECK(VALID());e=receipt();anchor=AP_GROUPED_CONNECT_IMAGE;
 #define BAD_C(field,value) do {c=command();c.field=value;CHECK(!VALID());c=command();} while(0)
@@ -65,8 +74,13 @@ int main(void) {
         e=receipt();e.entered.vm_flags=e.returned.vm_flags=1|(1ULL<<bit);CHECK(!VALID());
     }
     e=receipt();
-    BAD_OBS(file_mode,1|32);BAD_OBS(file_mode,1|32|AP_EXE_NONOTIFY|AP_EXE_NONOTIFY_PERM);
-    BAD_OBS(file_mode,3|32|AP_EXE_NONOTIFY);BAD_OBS(file_mode,1|AP_EXE_NONOTIFY);
+    BAD_OBS(file_mode,AP_EXE_FMODE_REQUIRED);
+    BAD_OBS(file_mode,AP_EXE_FMODE_REQUIRED|AP_EXE_NONOTIFY|AP_EXE_NONOTIFY_PERM);
+    BAD_OBS(file_mode,AP_EXE_FMODE_REQUIRED|AP_EXE_FMODE_WRITE|AP_EXE_NONOTIFY);
+    /* The former missing-FMODE_EXEC negative asserted an open-flag property
+     * that Linux does not store in f_mode. This incomplete open remains invalid
+     * because OPENED and CAN_READ are absent; test each real bit below. */
+    BAD_OBS(file_mode,AP_EXE_FMODE_READ|AP_EXE_NONOTIFY);
     BAD_OBS(writecount,0);BAD_OBS(writecount,1);BAD_OBS(writecount,-2147483649LL);
     BAD_OBS(iovec_base,0x701001);BAD_OBS(iovec_length,215);BAD_OBS(iovec_length,217);
     /* Every immutable identity/geometry word differs at only the return cut.
@@ -83,5 +97,31 @@ int main(void) {
     }
     CHECK(ap_executable_range(0x401000,512));CHECK(ap_executable_range(0x401fff,1));
     CHECK(!ap_executable_range(0x401fff,2));CHECK(!ap_executable_range(0x800000000000ULL,1));
+    c=command();r=result();c.original_count=r.original_count=5;
+    e=retry22_receipt();CHECK(VALID());
+    for(unsigned cut=0;cut<2;cut++)for(unsigned test=0;test<15;test++) {
+        e=retry22_receipt();
+        struct ap_executable_observation *o=cut?&e.returned:&e.entered;
+        switch(test) {
+        case 0:o->file_mode&=~AP_EXE_FMODE_READ;break;
+        case 1:o->file_mode&=~AP_EXE_FMODE_OPENED;break;
+        case 2:o->file_mode&=~AP_EXE_FMODE_CAN_READ;break;
+        case 3:o->file_mode|=AP_EXE_FMODE_WRITE;break;
+        case 4:o->exe_file++;break;
+        case 5:o->writecount=0;break;
+        case 6:o->file_mode&=~(AP_EXE_NONOTIFY|AP_EXE_NONOTIFY_PERM);break;
+        case 7:o->file_mode|=AP_EXE_NONOTIFY|AP_EXE_NONOTIFY_PERM;break;
+        case 8:o->fops++;break;
+        case 9:o->vm_ops++;break;
+        case 10:o->vm_flags|=2;break;
+        case 11:o->vm_flags|=8;break;
+        case 12:o->file_size=0x302d;break;
+        case 13:o->vm_end=o->vm_start;break;
+        /* The old synthetic EXEC flag cannot replace persistent open state. */
+        case 14:o->file_mode=1|32|AP_EXE_NONOTIFY;break;
+        }
+        CHECK(!ap_executable_observation_valid(&e.intent,o,anchor));
+        CHECK(!VALID());
+    }
     printf("executable source predicate controls: %u passed\n",checks);return 0;
 }
