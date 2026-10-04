@@ -251,7 +251,13 @@ fn step_running(workflow: &str, command: &str) -> Result<String, String> {
         })
         .map(|line| line.trim_start().trim_start_matches("- name: "))
         .ok_or_else(|| format!("`{command}` is not inside a named workflow step"))?;
-    named_step(workflow, name)
+    // A step that lost its `- name:` line would otherwise resolve to the step
+    // before it.
+    let step = named_step(workflow, name)?;
+    if !step.contains(command) {
+        return Err(format!("`{command}` is not inside a named workflow step"));
+    }
+    Ok(step)
 }
 
 /// Below the builder's 12 GiB warning line, the hosted rebuild logs its peak
@@ -273,7 +279,7 @@ fn require_phase_timing(errors: &mut Vec<String>, workflow: &str) {
     }
     match literal_block(&step, "run") {
         Ok(shell) if shell.contains(PHASE_TIMING) => errors.push(format!(
-            "compatibility rebuild shell must not reassign `{PHASE_TIMING}`"
+            "compatibility rebuild shell must not mention `{PHASE_TIMING}`"
         )),
         Ok(_) => {}
         Err(error) => errors.push(error),
@@ -1315,7 +1321,7 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
         for (changed, diagnostic) in [
             // Dropped, turned off, unquoted, or declared twice.
             (
-                rebuild.replacen(&format!("{declared}\n"), "", 1),
+                rebuild.replacen(&format!("        {declared}\n"), "", 1),
                 env_diagnostic,
             ),
             (
@@ -1342,7 +1348,12 @@ with tempfile.TemporaryDirectory(prefix="docs-pages-black-box-", dir="/tmp") as 
                     &format!("set -euo pipefail\n        export {PHASE_TIMING}=0\n"),
                     1,
                 ),
-                "must not reassign",
+                "must not mention",
+            ),
+            // The step lost its name, so the nearest name belongs to another step.
+            (
+                rebuild.replacen("    - name: ", "    - title: ", 1),
+                "is not inside a named workflow step",
             ),
             // The rebuild no longer runs, or runs from a second step.
             (
