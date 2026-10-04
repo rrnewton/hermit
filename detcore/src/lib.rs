@@ -1999,6 +1999,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 })?;
             match admission {
                 reverie::ParentDeathSyscallAdmission::Admitted
+                    if matches!(call, Syscall::RtSigtimedwait(_)) =>
+                {
+                    // The signal-wait handler reads guest memory and observes
+                    // logical time before its later parent-death refusal.
+                    // Reject this unsupported consumer operation before either.
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "KVM parent-death signal unsupported enrolled rt_sigtimedwait before {}",
+                        call.number()
+                    )));
+                }
+                reverie::ParentDeathSyscallAdmission::Admitted
                     if matches!(call, Syscall::Execve(_) | Syscall::Execveat(_))
                         && !T::supports_parent_death_retained_exec() =>
                 {
