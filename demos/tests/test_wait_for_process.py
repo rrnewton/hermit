@@ -182,9 +182,8 @@ class WaitForProcessBoundsTest(unittest.TestCase):
         self.assertLess(error.elapsed, 60)
         self.assertEqual(
             str(error),
-            "{} grew to {} bytes, past the 4096-byte log cap; the run was stopped".format(
-                log, error.log_size
-            ),
+            "{} grew to {} bytes, past the 4096-byte log cap; the demo then signalled "
+            "the launched process's process group".format(log, error.log_size),
         )
         self.assertIsNotNone(process.poll(), "the child kept running past the log cap")
         self._assert_descendant_stops(descendant)
@@ -249,8 +248,10 @@ class WaitForProcessBoundsTest(unittest.TestCase):
         self.assertEqual(
             str(error),
             "{} grew to {} bytes, past the 4096-byte log cap, after the launched "
-            "process exited with status 7; the processes still writing to it were "
-            "stopped".format(log, error.log_size),
+            "process exited with status 7, while processes still wrote to it; the "
+            "demo then signalled the launched process's process group".format(
+                log, error.log_size
+            ),
         )
         self._assert_descendant_stopped(descendant)
         # Nothing holds the output any more, so the copy reaches its end.
@@ -264,8 +265,8 @@ class WaitForProcessBoundsTest(unittest.TestCase):
         self.assertNotIsInstance(caught.exception, dc.LogCapExceeded)
         self.assertEqual(
             str(caught.exception),
-            "the child's output was still open 1s after it exited, so the processes "
-            "still holding it were stopped",
+            "the child's output was still open 1s after it exited, so processes still "
+            "held it; the demo then signalled the child's process group",
         )
         self._assert_descendant_stopped(descendant)
         copier.join(10)
@@ -307,8 +308,8 @@ class WaitForProcessBoundsTest(unittest.TestCase):
         self.assertEqual(
             str(error),
             "{} was 8192 bytes, past the 4096-byte log cap, when checked after the "
-            "launched process exited with status 5; anything left in its process "
-            "group was stopped".format(log),
+            "launched process exited with status 5; the demo then signalled its "
+            "process group".format(log),
         )
         self.assertEqual(
             process.returncode, 5, "the child was not reaped after its group was stopped"
@@ -346,8 +347,8 @@ class WaitForProcessBoundsTest(unittest.TestCase):
         self.assertEqual(
             str(error),
             "{} was 8192 bytes, past the 4096-byte log cap, when checked after the "
-            "launched process exited with status 3; anything left in its process "
-            "group was stopped".format(log),
+            "launched process exited with status 3; the demo then signalled its "
+            "process group".format(log),
         )
         self.assertEqual(
             process.returncode, 3, "the child was not reaped after its group was stopped"
@@ -514,7 +515,7 @@ class WaitForProcessBoundsTest(unittest.TestCase):
             str(caught.exception),
             "drain_output needs the launched process unreaped, but it was already "
             "reaped (exit status 0), so the processes it left in its group can no "
-            "longer be stopped safely; wait for it with wait_for_process",
+            "longer be signalled safely; wait for it with wait_for_process",
         )
         self.assertEqual(sent, [], "drain_output signalled the group of a child that was already reaped")
         self._kill_if_running(descendant)

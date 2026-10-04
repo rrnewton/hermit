@@ -305,8 +305,8 @@ class _OutputDrainScenarios:
         self._assert_stopped("descendant")
         self.assertEqual(
             str(outcome),
-            "Hermit's output was still open 1s after it exited, so the processes "
-            "still holding it were stopped",
+            "Hermit's output was still open 1s after it exited, so processes still "
+            "held it; the demo then signalled Hermit's process group",
         )
         self.assertIs(type(outcome), RuntimeError)
 
@@ -400,8 +400,10 @@ class Demo5OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
     def cap_message(self, cap: dc.LogCapExceeded) -> str:
         return (
             "{} grew to {} bytes, past the {}-byte log cap, after the launched "
-            "process exited with status 0; the processes still writing to it were "
-            "stopped".format(cap.log_path, cap.log_size, SMALL_CAP)
+            "process exited with status 0, while processes still wrote to it; the "
+            "demo then signalled the launched process's process group".format(
+                cap.log_path, cap.log_size, SMALL_CAP
+            )
         )
 
     def assert_timeout_reported(self, outcome) -> None:
@@ -506,7 +508,8 @@ class Demo6OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
             "Hermit's INFO log {} grew to {} bytes, past the {}-byte cap "
             "(QEMU_MAX_LOG_BYTES), {:.1f}s into the resume, after Hermit had exited "
             "with status 0: processes it left running still wrote to its output, and "
-            "were stopped; the guest command had finished with exit status 0".format(
+            "the demo then signalled Hermit's process group; the guest command had "
+            "finished with exit status 0".format(
                 cap.log_path, cap.log_size, SMALL_CAP, cap.elapsed
             )
         )

@@ -1672,7 +1672,7 @@ def make_run_dir(parent: Path, prefix: str) -> Path:
 
 
 class LogCapExceeded(RuntimeError):
-    """A run was stopped because its log grew past its cap.
+    """A run's log grew past its cap, and the run's process group was signalled.
 
     wait_for_process raises it while the launched process runs. drain_output
     raises it after that process exited while processes it left behind still
@@ -1685,8 +1685,16 @@ class LogCapExceeded(RuntimeError):
     status. Nothing was then seen still writing to the log, so the message
     says only when the size was checked.
 
+    Either raises it after stop_process_group, which signals the launched
+    process's process group (SIGTERM, then SIGKILL) while the launched process
+    is unreaped, as it is in both. The message says that the demo signalled
+    the group and no more: stop_process_group does not report whether the
+    group emptied, and its signals reach no process outside that group, such
+    as one a wrapper started in a session of its own.
+
     ``elapsed`` is read when the size is found past the cap, before the group
-    is stopped, so the time it takes to stop the group is not counted in it.
+    is signalled, so the time the signals and their waits take is not counted
+    in it.
     """
 
     def __init__(
@@ -1701,27 +1709,31 @@ class LogCapExceeded(RuntimeError):
         if final_check:
             message = (
                 "{} was {} bytes, past the {}-byte log cap, when checked after the "
-                "launched process exited with status {}; anything left in its "
-                "process group was stopped".format(
+                "launched process exited with status {}; the demo then signalled "
+                "its process group".format(
                     log_path, log_size, max_log_bytes, exit_status
                 )
             )
         elif exit_status is None:
-            message = "{} grew to {} bytes, past the {}-byte log cap; the run was stopped".format(
-                log_path, log_size, max_log_bytes
+            message = (
+                "{} grew to {} bytes, past the {}-byte log cap; the demo then "
+                "signalled the launched process's process group".format(
+                    log_path, log_size, max_log_bytes
+                )
             )
         else:
             message = (
                 "{} grew to {} bytes, past the {}-byte log cap, after the launched "
-                "process exited with status {}; the processes still writing to it "
-                "were stopped".format(log_path, log_size, max_log_bytes, exit_status)
+                "process exited with status {}, while processes still wrote to it; "
+                "the demo then signalled the launched process's process "
+                "group".format(log_path, log_size, max_log_bytes, exit_status)
             )
         super().__init__(message)
         self.log_path = Path(log_path)
         self.log_size = log_size
         self.max_log_bytes = max_log_bytes
         # Seconds from the start of the run (or of the wait) until the size was
-        # found past the cap, read before the group was stopped.
+        # found past the cap, read before the group was signalled.
         self.elapsed = elapsed
         self.exit_status = exit_status
         self.final_check = final_check
@@ -1746,17 +1758,19 @@ def wait_for_process(
 ) -> int:
     """Wait for a process, optionally streaming a growing file or showing progress.
 
-    ``timeout`` bounds the wall time: past it, the process group is stopped and
-    TimeoutError is raised. When ``log_path`` and ``max_log_bytes`` are both
-    set, the file is also watched: if it grows past the cap, the process group
-    is stopped and LogCapExceeded (a RuntimeError) names the cap, so a runaway
-    log cannot fill the disk. The size is checked once more after the process
-    exits, before its exit status is returned, so output written since the
-    previous check is held to the cap too. Either way the group is stopped
-    before the error is raised, so nothing in it keeps writing while the caller
-    cleans up. The caller is expected to have started the process with
-    ``start_new_session=True``; once the process exits, drain_output keeps the
-    same cap while the rest of its output is copied.
+    ``timeout`` bounds the wall time: past it, the process group is signalled
+    (stop_process_group) and TimeoutError is raised. When ``log_path`` and
+    ``max_log_bytes`` are both set, the file is also watched: if it grows past
+    the cap, the process group is signalled and LogCapExceeded (a RuntimeError)
+    names the cap, so a runaway log cannot fill the disk. The size is checked
+    once more after the process exits, before its exit status is returned, so
+    output written since the previous check is held to the cap too. Either way
+    the group is signalled before the error is raised, so that what is in it
+    stops writing before the caller cleans up; whether it emptied is not
+    reported, and a process outside the group is not signalled. The caller
+    is expected to have started the process with ``start_new_session=True``;
+    once the process exits, drain_output keeps the same cap while the rest of
+    its output is copied.
 
     The exit status is returned without reaping the process: until it is
     reaped, Linux gives its PID, and the process group ID it leads, to no other
@@ -1856,7 +1870,7 @@ def wait_for_process(
             if log_path is not None and max_log_bytes is not None:
                 log_size = _log_size(log_path)
                 if log_size > max_log_bytes:
-                    # Read when the cap was seen, not after the group is stopped.
+                    # Read when the cap was seen, not after the group is signalled.
                     elapsed = time.monotonic() - started
                     stop_process_group(process)
                     raise LogCapExceeded(
@@ -2324,13 +2338,16 @@ def drain_output(
     Processes the child left in its process group inherit that pipe, so they
     can keep it open, and keep writing to it, after the child exits. While
     waiting, the log is held to the cap wait_for_process applies: once it
-    grows past ``max_log_bytes``, the child's group is stopped and
-    LogCapExceeded is raised, with ``elapsed`` counted from ``started`` (a
-    time.monotonic() value; by default, when this call began). The size is
-    checked once more when the copy ends, before this returns, so output that
-    was all copied between two checks is held to the cap too. If the output
-    is still open after ``timeout`` seconds, the group is stopped and
-    RuntimeError is raised, naming ``label``.
+    grows past ``max_log_bytes``, the child's group is signalled
+    (stop_process_group) and LogCapExceeded is raised, with ``elapsed``
+    counted from ``started`` (a time.monotonic() value; by default, when this
+    call began). The size is checked once more when the copy ends, before this
+    returns, so output that was all copied between two checks is held to the
+    cap too. If the output is still open after ``timeout`` seconds, the group
+    is signalled and RuntimeError is raised, naming ``label``. Neither message
+    says the processes stopped: stop_process_group does not report it, and a
+    process outside the group, which may be the one holding the output, is not
+    signalled.
 
     ``process`` must not have been reaped yet: wait for it with
     wait_for_process, not Popen.wait() or Popen.poll(). The group can only be
@@ -2340,7 +2357,7 @@ def drain_output(
     if process.returncode is not None:
         raise ValueError(
             "drain_output needs {} unreaped, but it was already reaped (exit status "
-            "{}), so the processes it left in its group can no longer be stopped "
+            "{}), so the processes it left in its group can no longer be signalled "
             "safely; wait for it with wait_for_process".format(label, process.returncode)
         )
     began = time.monotonic()
@@ -2369,7 +2386,7 @@ def drain_output(
         if log_path is not None and max_log_bytes is not None:
             log_size = _log_size(log_path)
             if log_size > max_log_bytes:
-                # Read when the cap was seen, not after the group is stopped.
+                # Read when the cap was seen, not after the group is signalled.
                 elapsed = time.monotonic() - started
                 stop_process_group(process)
                 raise LogCapExceeded(
@@ -2382,8 +2399,10 @@ def drain_output(
         if time.monotonic() >= deadline:
             stop_process_group(process)
             raise RuntimeError(
-                "{}'s output was still open {}s after it exited, so the processes "
-                "still holding it were stopped".format(label, timeout)
+                "{}'s output was still open {}s after it exited, so processes "
+                "still held it; the demo then signalled {}'s process group".format(
+                    label, timeout, label
+                )
             )
 
 

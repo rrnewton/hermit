@@ -114,8 +114,8 @@ def guest_environment_args() -> list:
 
 # Seconds to wait, after Hermit exits, for its last output to reach the log.
 # Processes Hermit left running can hold its output open meanwhile;
-# drain_output keeps QEMU_MAX_LOG_BYTES in force and stops them when this
-# runs out.
+# drain_output keeps QEMU_MAX_LOG_BYTES in force and, when this runs out,
+# signals Hermit's process group, which reaches those still in it.
 OUTPUT_DRAIN_TIMEOUT = 60
 
 
