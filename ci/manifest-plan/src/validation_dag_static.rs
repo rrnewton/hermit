@@ -543,7 +543,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // added with the SKID-RETRY of
     // https://github.com/rrnewton/hermit/issues/1845, retain all 834 prior
     // identities.
-    ("test.regular_crates", 838),
+    // validation_dag::tests::no_dag_text_names_a_user_home_path retains all
+    // 838 prior identities (`cargo nextest list --profile ci` over this
+    // node's selection measured 839).
+    ("test.regular_crates", 839),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -995,8 +998,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The six later cpu_evidence, glibc_compat and runner tests listed for
     // test.regular_crates retain all 828 prior identities, and the four
     // SKID-RETRY tests of https://github.com/rrnewton/hermit/issues/1845 listed
-    // there retain all 834.
-    ("test.regular_crates_on_host", 838),
+    // there retain all 834. The home-path DAG text test listed there retains
+    // all 838.
+    ("test.regular_crates_on_host", 839),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
@@ -1780,7 +1784,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"check"########,
         job: r########"portability_paths"########,
         desc: r########"Reject developer-specific paths in build/run files"########,
-        description: r########"Runs scripts/check-portable-paths.sh, which first self-tests that its scanner accepts ${HOME}-relative paths and rejects literal user homes and host names, then scans every tracked script, Rust, Python, TOML and YAML file, Makefile, everything under ci/ and .github/, and every executable file (skipping vendored, scratch and generated trees) for a /home/ or /users/ path naming a login, the owner's login name, or a development-host name. Such literals make a script or test work only on the machine where it was written, and break hosted runners and other checkouts. A ci/ script that hard-codes a user's CARGO_HOME is reported with its file and line."########,
+        description: r########"Runs scripts/check-portable-paths.sh, which first self-tests that its scanner accepts ${HOME}-relative paths and rejects literal user homes and host names, then scans every tracked script, Rust, Python, TOML and YAML file, Makefile, everything under ci/ and .github/, and every executable file (skipping vendored, scratch and generated trees) for a path under a user home directory or the macOS Users root that names a login, the owner's login name, or a development-host name. Such literals make a script or test work only on the machine where it was written, and break hosted runners and other checkouts. A ci/ script that hard-codes a user's CARGO_HOME is reported with its file and line."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,

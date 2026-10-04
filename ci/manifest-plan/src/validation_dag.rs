@@ -3833,6 +3833,46 @@ sys.exit(37)
         );
     }
 
+    /// The compatibility website export refuses any text containing "/home/",
+    /// and every finalized-proof carrier embeds the run's whole plan, so a
+    /// node description that merely mentions that prefix breaks every site
+    /// rebuild from a full plan. Name the offending field in the source and
+    /// the committed DAG, then check the whole committed file, since the
+    /// carrier holds every field. "/users/" is checked case-insensitively
+    /// because the site's per-string owner-path pattern ignores case.
+    #[test]
+    fn no_dag_text_names_a_user_home_path() {
+        fn refuse(origin: &str, field: &str, text: &str) {
+            for needle in ["/home/", "/users/"] {
+                let line = text
+                    .lines()
+                    .find(|line| line.to_ascii_lowercase().contains(needle));
+                assert!(
+                    line.is_none(),
+                    "{origin}: {field} names {needle:?}: {}",
+                    line.unwrap_or_default()
+                );
+            }
+        }
+        let text = include_str!("../../dag/validate.json");
+        let committed = dag_from_json(text).unwrap();
+        for (origin, dag) in [
+            (
+                "validation_dag_static",
+                crate::validation_dag_static::config(),
+            ),
+            (OUTPUT, committed),
+        ] {
+            refuse(origin, "the DAG description", &dag.description);
+            for step in &dag.steps {
+                let tag = step.tag();
+                refuse(origin, &format!("{tag} desc"), &step.desc);
+                refuse(origin, &format!("{tag} description"), &step.description);
+            }
+        }
+        refuse(OUTPUT, "the file", text);
+    }
+
     #[test]
     fn steps_sharing_a_result_file_never_run_in_one_run_type() {
         // e2e.manifest_compat, portablecompat.manifest_compat,
