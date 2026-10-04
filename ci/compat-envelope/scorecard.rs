@@ -10810,6 +10810,19 @@ fn observe_results(root: &Path, results: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// The eligible cells that `import-results` reports as having a retained
+/// comparison: distinct cells with a canonical or backend-parity result. A
+/// stripped pass is not a canonical comparison, so it does not make a cell
+/// count as one with a retained comparison.
+fn retained_comparison_cell_count(cells: &[RetainedCellResults]) -> usize {
+    cells
+        .iter()
+        .filter(|cell| cell.domain != RetainedComparisonDomain::Stripped)
+        .map(|cell| &cell.id)
+        .collect::<BTreeSet<_>>()
+        .len()
+}
+
 fn import_results(
     root: &Path,
     results: &Path,
@@ -10858,14 +10871,7 @@ fn import_results(
         stale_coordinate_cells,
         no_result_cells,
     } = read_retained_results(root, results, &import_cells)?;
-    // A stripped pass is not a canonical comparison, so it does not make a
-    // cell count as one with a retained comparison.
-    let retained_cell_count = retained_cells
-        .iter()
-        .filter(|cell| cell.domain != RetainedComparisonDomain::Stripped)
-        .map(|cell| &cell.id)
-        .collect::<BTreeSet<_>>()
-        .len();
+    let retained_cell_count = retained_comparison_cell_count(&retained_cells);
     let current = read_current_pressure_evidence(root, current_summaries, &before)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
     // The removal below runs before the fold, so it must not remove a
@@ -35197,6 +35203,17 @@ mod post_verdict_transaction_tests {
             BTreeSet::from([display_id(&id)]),
             "a stripped-only cell still has no retained canonical comparison"
         );
+        assert_eq!(
+            retained.cells[0].domain,
+            RetainedComparisonDomain::Stripped,
+            "the below-L2 pass is retained in its own comparison domain"
+        );
+        assert_eq!(retained.cells[0].candidates.len(), 1);
+        assert_eq!(
+            retained_comparison_cell_count(&retained.cells),
+            0,
+            "a stripped-only cell adds nothing to the printed retained-comparison cell count"
+        );
     }
 
     #[test]
@@ -35267,6 +35284,23 @@ mod post_verdict_transaction_tests {
         );
         assert_eq!(retained.stale_coordinate_rows, 0);
         assert_eq!(retained.terminal_comparisons, 1);
+        // One canonical and one stripped domain for one cell: the printed
+        // retained-comparison count names the cell once, for its canonical
+        // result only.
+        let mut domains = retained
+            .cells
+            .iter()
+            .map(|cell| cell.domain)
+            .collect::<Vec<_>>();
+        domains.sort();
+        assert_eq!(
+            domains,
+            [
+                RetainedComparisonDomain::Stripped,
+                RetainedComparisonDomain::Canonical
+            ]
+        );
+        assert_eq!(retained_comparison_cell_count(&retained.cells), 1);
     }
 
     /// The stripped compatibility cell's canonical `--verify-strict` row at
