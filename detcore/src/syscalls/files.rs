@@ -130,6 +130,19 @@ struct TimerSlackIovec {
     len: usize,
 }
 
+/// The syscall form that reached a virtual timerfd read, which decides what a
+/// read of zero bytes does.
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3229): a zero-length vector read returns 0.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TimerfdReadForm {
+    /// read(2): Linux calls timerfd_read_iter even for 0 bytes.
+    Scalar,
+    /// readv(2), or preadv2(2) at offset -1: vfs_readv returns 0 for a zero
+    /// total before it reaches the file.
+    Vectored,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TimerSlackBinding {
     target: i32,
@@ -1962,7 +1975,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     base: call.buf().map_or(0, |buf| buf.as_raw()),
                     len: call.len(),
                 };
-                self.read_timerfd(guest, &detfd, &[iovec]).await
+                self.read_timerfd(guest, &detfd, &[iovec], TimerfdReadForm::Scalar)
+                    .await
             }
             FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
                 trace!(
@@ -2782,7 +2796,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else if fd_type == FdType::Timerfd && self.virtual_timerfds() {
             // AUTONOMOUS-BOT-IMPLEMENTED
             match read_iovecs(&guest.memory(), call.iov(), call.len()) {
-                Ok(iovecs) => self.read_timerfd(guest, &detfd, &iovecs).await,
+                Ok(iovecs) => {
+                    self.read_timerfd(guest, &detfd, &iovecs, TimerfdReadForm::Vectored)
+                        .await
+                }
                 Err(errno) => Err(errno.into()),
             }
         } else if physically_nonblocking
@@ -2917,7 +2934,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             if let Some(timer) = timer {
                 let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
                 let iovecs = read_iovecs(&guest.memory(), call.iov(), count)?;
-                return self.read_timerfd(guest, &timer, &iovecs).await;
+                return self
+                    .read_timerfd(guest, &timer, &iovecs, TimerfdReadForm::Vectored)
+                    .await;
             }
         }
 
@@ -4777,6 +4796,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// -ERESTARTSYS). As in fs/timerfd.c, a total length below 8 is EINVAL
     /// before anything else, and the count is consumed before it is copied
     /// out, so a faulting buffer loses the expirations and reports EFAULT.
+    /// The one exception is a vector of zero total length, which vfs_readv
+    /// answers with 0 before the timer is reached: nothing is consumed and a
+    /// blocking timer is not waited on. A scalar read of 0 bytes does reach
+    /// the timer and stays EINVAL.
     ///
     /// `timer` is the open file the caller resolved when the syscall began.
     /// Like the file reference Linux's read holds (fdget), it is never looked
@@ -4784,14 +4807,21 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// another thread closes the descriptor, or a new file takes its number.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd read counts, EAGAIN, and
-    // blocking restart; the read holds its open file across the wait.
+    // blocking restart; the read holds its open file across the wait; a
+    // zero-length vector read returns 0.
     async fn read_timerfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
         timer: &DetFd,
         iovecs: &[TimerSlackIovec],
+        form: TimerfdReadForm,
     ) -> Result<i64, Error> {
-        if iovecs.iter().map(|iovec| iovec.len).sum::<usize>() < 8 {
+        // read_iovecs bounded the total by isize::MAX, so the sum cannot wrap.
+        let total = iovecs.iter().map(|iovec| iovec.len).sum::<usize>();
+        if total == 0 && form == TimerfdReadForm::Vectored {
+            return Ok(0);
+        }
+        if total < 8 {
             return Err(Errno::EINVAL.into());
         }
         let nonblocking = timer.is_nonblocking();
