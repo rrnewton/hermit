@@ -7188,7 +7188,14 @@ sys.exit(1 if failed else 0)
         // ci/compat-envelope/parity-cells.json records and a test keeps
         // current. This pins what the census does not show: which applicable
         // cells no full node reports.
-        assert_eq!(unreported.len(), 4 + 30, "{unreported:?}");
+        // 4 + 30 until the LiteInst reset
+        // (https://github.com/rrnewton/hermit/issues/3745) switched off the
+        // LiteInst cells of applications/example-timed-progress-bar and
+        // c-programs/socket-timestamp-edge-cases. Both were enabled but not
+        // run by full, and full planned neither side of their parity cell, so
+        // they were unreported; switched off, they are no longer applicable.
+        // The 2 left are example-timed-progress-bar's DBT and KVM cells.
+        assert_eq!(unreported.len(), 2 + 30, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
