@@ -591,7 +591,51 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // an_imported_log_index_is_trusted_whole_or_not_at_all (9fd0c01a39), both
     // landed without a pin change, retain all 848 prior identities
     // (`cargo nextest list --profile ci` measured 851).
-    ("test.regular_crates", 851),
+    // Measuring each budgeted invocation's live CPU from a cgroup of its own
+    // adds 33 identities and removes one, so 850 of the 851 prior identities
+    // are retained and the count rises by 32.
+    // cpu_evidence::tests::each_live_source_is_named_and_the_cgroup_counter_cannot_fall
+    // is replaced by
+    // each_live_source_is_named_and_a_cgroup_last_sample_cannot_fall_below_its_high_water,
+    // a name that says what it checks. The others are
+    // cpu_evidence::tests::a_falling_cgroup_history_is_refused_by_every_reader,
+    // a_flat_cgroup_history_keeps_distinct_high_water_and_last_points and
+    // a_cgroup_membership_stop_charges_nothing_and_only_follows_a_cgroup_meter;
+    // invocation_cgroup::tests::the_process_group_scan_marker_accepts_only_exactly_one,
+    // the_unified_cgroup_entry_maps_to_sys_fs_cgroup_or_is_classified,
+    // a_missing_or_non_cgroup_parent_is_eligible_and_a_file_parent_is_not,
+    // a_symlinked_parent_cgroup_is_refused_and_not_eligible,
+    // a_read_only_parent_cgroup_is_eligible_for_the_fallback,
+    // a_fresh_invocation_cgroup_counts_its_process_monotonically_and_is_removed,
+    // empty_cgroups_nested_by_the_command_are_removed_by_finish_and_by_drop and
+    // a_populated_nested_cgroup_is_killed_and_removed_by_finish;
+    // runner::tests::monotonic_cpu_sampler_refuses_a_decrease_and_keeps_the_high_value,
+    // a_decreasing_cgroup_sample_is_refused_after_the_unavailable_grace,
+    // a_transient_cgroup_decrease_is_graced_until_the_counter_recovers,
+    // a_boxed_run_whose_invocation_cgroup_cannot_be_created_still_stops_the_cell,
+    // a_boxed_run_without_an_invocation_cgroup_refuses_quick_commands_before_any_runs,
+    // the_fallback_marker_does_not_hide_an_ineligible_cgroup_failure,
+    // a_malformed_fallback_marker_refuses_the_budgeted_command_before_launch,
+    // a_run_without_cgroups_measures_with_the_process_group_scan_under_its_own_source_name,
+    // a_budgeted_cell_row_names_the_invocation_cgroup_as_its_cpu_source,
+    // an_escaped_setsid_burner_is_charged_and_killed_through_the_invocation_cgroup,
+    // a_leader_that_joins_the_runners_process_group_is_killed_when_the_stop_grace_ends,
+    // group_leaving_leader_helper (the child that test re-executes; without its
+    // environment variable it returns at once),
+    // the_stop_kills_the_invocation_cgroup_before_it_waits_for_a_leader_that_left_its_group,
+    // a_cell_whose_command_leaves_empty_nested_cgroups_passes_and_leaves_nothing_behind,
+    // a_populated_nested_cgroup_is_killed_and_removed_when_the_wall_budget_stops_the_command,
+    // a_process_that_moves_out_of_its_invocation_cgroup_is_stopped_and_refused,
+    // the_cgroup_membership_check_refuses_every_process_it_sees_outside_the_cgroup,
+    // a_membership_refusal_stops_the_invocation_and_charges_nothing and
+    // the_real_membership_readers_find_this_process_and_its_group; and
+    // test-harness
+    // tests::validation_levels_privileged_dag_keeps_available_boxing_and_marks_only_the_unboxed_launch
+    // and validation_levels_run_dag_audit_pins_both_privileged_launches.
+    // `cargo nextest list --profile ci -p hermit-manifest-plan` measured 654
+    // at e3424b2c0f29 and 686 with these commits on it; no other selected
+    // crate changes.
+    ("test.regular_crates", 883),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1080,7 +1124,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // bring the measured count to 847, and the optional-cell sync test of
     // 6166181d8f listed there to 848, and the three tests of 76521affca and
     // 9fd0c01a39 listed there to 851.
-    ("test.regular_crates_on_host", 851),
+    // The invocation-cgroup CPU tests listed for test.regular_crates add 33
+    // identities and remove one, so 850 of the 851 prior identities are
+    // retained (+32).
+    ("test.regular_crates_on_host", 883),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
