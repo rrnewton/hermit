@@ -2954,6 +2954,17 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     // resuming through the kernel's ptrace syscall-restart frame.
     config.backend_supports_parked_write_signal_interruption =
         matches!(backend, Backend::Ptrace | Backend::E9patch);
+    // Only ptrace and LiteInst have been measured to report a thread's signal state
+    // in /proc (https://github.com/rrnewton/hermit/issues/3146). Every other backend
+    // keeps the previous blocking-wait behavior. Both hand a restart errno to the
+    // kernel's signal delivery, which turns it into `EINTR` or a restart as Linux
+    // does. Ptrace does so at the syscall stop. LiteInst does so at a call site's
+    // first execution, which stops in ptrace, and at a site it has patched, where
+    // reverie rewinds the guest to the runtime's trap instruction and lets the
+    // kernel decide at a landing in the runtime's private page
+    // (https://github.com/rrnewton/reverie/commit/6c920de24642ffe921c507704748012001f23c0a).
+    config.backend_supports_blocked_wait_signal_interruption =
+        matches!(backend, Backend::Ptrace | Backend::Liteinst);
     config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
@@ -5334,6 +5345,24 @@ mod tests {
             assert_eq!(
                 config.backend_supports_parked_write_signal_interruption, supports_interruption,
                 "unexpected parked-write signal support for {backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_blocked_wait_signal_contract_is_explicit() {
+        for (backend, supports_interruption) in [
+            (Backend::Ptrace, true),
+            (Backend::Dbt, false),
+            (Backend::Kvm, false),
+            (Backend::Sabre, false),
+            (Backend::Liteinst, true),
+            (Backend::E9patch, false),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend_supports_blocked_wait_signal_interruption, supports_interruption,
+                "unexpected blocked-wait signal support for {backend:?}"
             );
         }
     }

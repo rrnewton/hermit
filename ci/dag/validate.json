@@ -14352,7 +14352,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "818",
+        "NEXTEST_EXPECTED_EXECUTED": "819",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -14401,7 +14401,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "904",
+        "NEXTEST_EXPECTED_EXECUTED": "942",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -14835,12 +14835,12 @@
       "group": "test",
       "job": "liteinst_strict",
       "desc": "Portable LiteInst strict compatibility",
-      "description": "Exercises the LiteInst backend on real programs: the liteinst_advanced integration tests run one at a time against target/ci/hermit with --backend liteinst --strict, their number pinned by NEXTEST_EXPECTED_EXECUTED. Coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert; the node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, or a test added or removed without updating the count, makes it red.",
+      "description": "Exercises the LiteInst backend on real programs: the liteinst_advanced and external_signal_interrupt integration tests run one at a time against target/ci/hermit, their number pinned by NEXTEST_EXPECTED_EXECUTED. In liteinst_advanced, which runs with --backend liteinst --strict, coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert. In external_signal_interrupt, the tests/c/external_signal_interrupt.c guest runs under both --backend ptrace and --backend liteinst: a signal that Linux would deliver must end a blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. The node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, a blocked wait that a deliverable signal no longer ends or that an undeliverable signal ends, or a test added or removed without updating the count, makes it red. REGISTRATION 2026-09-29 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt joins liteinst_advanced here because it needs exactly this node's setup: every cell runs both the ptrace and LiteInst backends through HERMIT_LITEINST_TEST_BINARY, so it needs the staged release runtime that liteinst-strict-node.sh pre-checks. MEASURED 2026-10-04 at hermit@f5dda2204d (branch claude/external-signal-interrupt-3146-20260928 rebased on main 7e2fc5cfd6; devbig014, 316 CPUs; validate cargo profile, nice -n 10, the node command run alone): 90 tests ran and 90 passed in each of two runs. With the test binaries already built (1-minute load 30.8 at the start and 30.1 at the end) the node took 430.9 s of wall time, nextest 356.2 s, and 335.7 s of test CPU in total. A run that also compiled hermit-detcore, detcore-dbt and hermit (1 min 56 s of its total; load 45.9 at the start and 51.6 at the end) took 575.8 s, nextest 391.2 s, and 371.9 s of test CPU. The busiest test, liteinst_readiness_waits_are_interrupted_by_internal_signals, used 15.40 s and 15.67 s of the 22 s per-test CPU bound, and liteinst_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs used 14.63 s and 15.26 s. The margin is smaller on a loaded host: at a 1-minute load of 231 to 241 an earlier head of the same branch took 411 s, and the readiness test was killed once at 22.32 s of CPU with its system time doubled and its user time at the usual 7.1 to 7.7 s; its rerun used 15.16 s. The 22 s bound and the 900 s node timeout are unchanged; the slower of the two runs above used 64% of the timeout. MEMORY SAMPLED in the run with built test binaries by walking the node's process tree every 0.5 s, reading each process's parent from /proc/<pid>/stat and summing VmRSS and RssAnon from /proc/<pid>/status: the sum peaked at 276836352 bytes of VmRSS and 136200192 bytes of RssAnon, in the test phase, with at most 13 processes. VmRSS counts shared pages once per process, so the sum over-counts, and a peak shorter than 0.5 s can be missed. The 1-GiB baseline and the 3-GiB hard cap stay above that sample and are unchanged. On 2026-09-29, at hermit@7752765b8e with 38 tests, a cold run that also compiled the test binaries peaked at 3009363968 bytes of cgroup memory; that build work belongs to the prepared-build producer, not to this node, and it was not remeasured at this head.",
       "labels": [
         "full",
         "portable"
       ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit HERMIT_LITEINST_STAGE_DIR=$PWD/target/validate ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1'",
+      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit HERMIT_LITEINST_STAGE_DIR=$PWD/target/validate ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced --test external_signal_interrupt -j 1'",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -14850,7 +14850,8 @@
         }
       ],
       "integration_test_binaries": [
-        "liteinst_advanced"
+        "liteinst_advanced",
+        "external_signal_interrupt"
       ],
       "deps": [
         "build.e2e_artifact_in_pinned_root",
@@ -14862,8 +14863,8 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "28",
-        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_advanced\"]"
+        "NEXTEST_EXPECTED_EXECUTED": "90",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_advanced\",\"--test\",\"external_signal_interrupt\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -14873,7 +14874,7 @@
       "jobs_env": null,
       "hint": {
         "resources": {},
-        "est_duration_s": 120.0,
+        "est_duration_s": 431.0,
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 3221225472,
         "classification": "latency-bound",
@@ -36133,7 +36134,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "818",
+        "NEXTEST_EXPECTED_EXECUTED": "819",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -36179,7 +36180,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "904",
+        "NEXTEST_EXPECTED_EXECUTED": "942",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -36492,11 +36493,11 @@
       "group": "test",
       "job": "liteinst_strict_on_host",
       "desc": "Portable LiteInst strict compatibility",
-      "description": "Exercises the LiteInst backend on real programs: the liteinst_advanced integration tests run one at a time against target/ci/hermit with --backend liteinst --strict, their number pinned by NEXTEST_EXPECTED_EXECUTED. Coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert; the node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, or a test added or removed without updating the count, makes it red.",
+      "description": "Exercises the LiteInst backend on real programs: the liteinst_advanced and external_signal_interrupt integration tests run one at a time against target/ci/hermit, their number pinned by NEXTEST_EXPECTED_EXECUTED. In liteinst_advanced, which runs with --backend liteinst --strict, coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert. In external_signal_interrupt, the tests/c/external_signal_interrupt.c guest runs under both --backend ptrace and --backend liteinst: a signal that Linux would deliver must end a blocked futex, poll, epoll, select or child wait, and an ignored, blocked or default-ignored signal must leave the wait running to its deadline. The node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, a blocked wait that a deliverable signal no longer ends or that an undeliverable signal ends, or a test added or removed without updating the count, makes it red. REGISTRATION 2026-09-29 (https://github.com/rrnewton/hermit/issues/3146): external_signal_interrupt joins liteinst_advanced here because it needs exactly this node's setup: every cell runs both the ptrace and LiteInst backends through HERMIT_LITEINST_TEST_BINARY, so it needs the staged release runtime that liteinst-strict-node.sh pre-checks. MEASURED 2026-10-04 at hermit@f5dda2204d (branch claude/external-signal-interrupt-3146-20260928 rebased on main 7e2fc5cfd6; devbig014, 316 CPUs; validate cargo profile, nice -n 10, the node command run alone): 90 tests ran and 90 passed in each of two runs. With the test binaries already built (1-minute load 30.8 at the start and 30.1 at the end) the node took 430.9 s of wall time, nextest 356.2 s, and 335.7 s of test CPU in total. A run that also compiled hermit-detcore, detcore-dbt and hermit (1 min 56 s of its total; load 45.9 at the start and 51.6 at the end) took 575.8 s, nextest 391.2 s, and 371.9 s of test CPU. The busiest test, liteinst_readiness_waits_are_interrupted_by_internal_signals, used 15.40 s and 15.67 s of the 22 s per-test CPU bound, and liteinst_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs used 14.63 s and 15.26 s. The margin is smaller on a loaded host: at a 1-minute load of 231 to 241 an earlier head of the same branch took 411 s, and the readiness test was killed once at 22.32 s of CPU with its system time doubled and its user time at the usual 7.1 to 7.7 s; its rerun used 15.16 s. The 22 s bound and the 900 s node timeout are unchanged; the slower of the two runs above used 64% of the timeout. MEMORY SAMPLED in the run with built test binaries by walking the node's process tree every 0.5 s, reading each process's parent from /proc/<pid>/stat and summing VmRSS and RssAnon from /proc/<pid>/status: the sum peaked at 276836352 bytes of VmRSS and 136200192 bytes of RssAnon, in the test phase, with at most 13 processes. VmRSS counts shared pages once per process, so the sum over-counts, and a peak shorter than 0.5 s can be missed. The 1-GiB baseline and the 3-GiB hard cap stay above that sample and are unchanged. On 2026-09-29, at hermit@7752765b8e with 38 tests, a cold run that also compiled the test binaries peaked at 3009363968 bytes of cgroup memory; that build work belongs to the prepared-build producer, not to this node, and it was not remeasured at this head.",
       "labels": [
         "hosted-portable"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit HERMIT_LITEINST_STAGE_DIR=$PWD/target/validate ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit HERMIT_LITEINST_STAGE_DIR=$PWD/target/validate ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced --test external_signal_interrupt -j 1",
       "result_manifests": [
         {
           "kind": "structured-test-results",
@@ -36506,7 +36507,8 @@
         }
       ],
       "integration_test_binaries": [
-        "liteinst_advanced"
+        "liteinst_advanced",
+        "external_signal_interrupt"
       ],
       "deps": [
         "build.e2e_artifact_on_host",
@@ -36516,8 +36518,8 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "28",
-        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_advanced\"]"
+        "NEXTEST_EXPECTED_EXECUTED": "90",
+        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_advanced\",\"--test\",\"external_signal_interrupt\"]"
       },
       "networkonly": false,
       "engine_only": false,
@@ -36527,7 +36529,7 @@
       "jobs_env": null,
       "hint": {
         "resources": {},
-        "est_duration_s": 120.0,
+        "est_duration_s": 431.0,
         "rss_baseline_bytes": 1073741824,
         "hard_mem_max_bytes": 3221225472,
         "classification": "latency-bound",

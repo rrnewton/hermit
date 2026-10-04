@@ -39,11 +39,13 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
+use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::signal::read_kernel_sigset;
+use crate::syscalls::threads::KernelSigset;
 use crate::tool_global::*;
 use crate::tool_local::Detcore;
 use crate::types::DetTid;
@@ -624,6 +626,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                 })
                 .cast()
         });
+        // Without a temporary mask, on a backend whose kernel reports the guest's
+        // signal state, only a signal that would end the wait natively does; the mask
+        // cell lets the wait block signals under the one scratch-stack guard
+        // (https://github.com/rrnewton/hermit/issues/3146). A restart resumes from
+        // the remaining time written back below, so a default stop ends the wait
+        // as on Linux. A `SIGCHLD` ends it once the scheduler makes it eligible
+        // (`eligible_pending_signals`).
+        let mut signals = (sigmask.is_none()
+            && self.cfg.backend_supports_blocked_wait_signal_interruption)
+            .then(|| KernelSignalWait::new(guest, 0, false, Errno::ERESTARTNOHAND));
+        let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         let _guard = stack.commit()?;
         let probe = call
             .with_readfds(readfds)
@@ -640,54 +653,115 @@ impl<T: RecordOrReplay> Detcore<T> {
         // checked against pselect6's snapshotted temporary mask and disposition.
         resources.set_signal_interrupt_errno(Errno::EINTR);
 
-        loop {
-            if matches!(
-                resource_request(guest, resources.clone()).await,
-                ResumeStatus::Signaled(_)
-            ) {
-                self.write_pselect6_remaining(guest, call, deadline).await?;
-                return Err(Errno::EINTR.into());
-            }
-            guest.memory().write_value(
-                probe_timeout,
-                &Timespec {
-                    tv_sec: 0,
-                    tv_nsec: 0,
-                },
-            )?;
-            write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
-            write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
-            write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
+        // Every exit, including a `?` on a guest-memory write, must reach the mask
+        // restore below, so the loop runs in its own async block.
+        let result: Result<i64, Error> = {
+            // Moved reborrows: a future holding a shared reference to a scratch
+            // address would not be `Send`.
+            let guest = &mut *guest;
+            let signals = &mut signals;
+            let resources = &mut resources;
+            async move {
+                loop {
+                    let signaled = matches!(
+                        resource_request(guest, resources.clone()).await,
+                        ResumeStatus::Signaled(_)
+                    );
+                    // The kernel's signal state that this turn's check read, which the
+                    // probe's injection below takes as its first read once every
+                    // blockable signal is blocked (`inject_absorbing_after`).
+                    let mut turn_state = None;
+                    if let Some(signals) = signals.as_ref() {
+                        // A scheduler `Signaled` answer is only a hint here; the kernel's
+                        // state decides. pselect6 returns ERESTARTNOHAND: EINTR after a
+                        // handler, a restart with the remaining timeout after a stop.
+                        match signals.interrupted_with_state(guest).await {
+                            Ok((false, state)) => turn_state = Some(state),
+                            Ok((true, _)) => {
+                                self.write_pselect6_remaining(guest, call, deadline).await?;
+                                break Err(Errno::ERESTARTNOHAND.into());
+                            }
+                            Err(error) => break Err(error),
+                        }
+                    } else if signaled {
+                        self.write_pselect6_remaining(guest, call, deadline).await?;
+                        return Err(Errno::EINTR.into());
+                    }
+                    guest.memory().write_value(
+                        probe_timeout,
+                        &Timespec {
+                            tv_sec: 0,
+                            tv_nsec: 0,
+                        },
+                    )?;
+                    write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
+                    write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
+                    write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
 
-            let result = pselect6_probe_result(guest.inject(probe).await);
-            if result != Ok(0) {
-                let copy_result = if result.is_ok() {
-                    self.copy_pselect6_results(guest, probe, call, len)
-                } else {
-                    Ok(())
-                };
-                self.write_pselect6_remaining(guest, call, deadline).await?;
-                copy_result?;
-                return result.map_err(Into::into);
-            }
+                    let raw_result = match signals.as_mut() {
+                        // A signal stop that does not end the wait is absorbed (see
+                        // `KernelSignalWait`). Only the guest memory writes above ran
+                        // since the turn's read, and they do not resume the thread.
+                        Some(signals) => {
+                            let injected = match turn_state {
+                                Some(state) => {
+                                    signals.inject_absorbing_after(guest, probe, state).await
+                                }
+                                None => signals.inject_absorbing(guest, probe).await,
+                            };
+                            match injected {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    self.write_pselect6_remaining(guest, call, deadline).await?;
+                                    break Err(error);
+                                }
+                            }
+                        }
+                        None => guest.inject(probe).await,
+                    };
+                    let result = pselect6_probe_result(raw_result);
+                    if result != Ok(0) {
+                        let copy_result = if result.is_ok() {
+                            self.copy_pselect6_results(guest, probe, call, len)
+                        } else {
+                            Ok(())
+                        };
+                        self.write_pselect6_remaining(guest, call, deadline).await?;
+                        copy_result?;
+                        break result.map_err(Into::into);
+                    }
+                    if let Some(signals) = signals.as_mut()
+                        && signals.needs_block()
+                        && let Err(error) = signals.block(guest, mask_cell).await
+                    {
+                        self.write_pselect6_remaining(guest, call, deadline).await?;
+                        break Err(error);
+                    }
 
-            resources.poll_attempt += 1;
-            if let Some(deadline) = deadline
-                && thread_observe_time(guest).await >= deadline
-            {
-                let copy_result = self.copy_pselect6_results(guest, probe, call, len);
-                self.write_pselect6_remaining(guest, call, Some(deadline))
-                    .await?;
-                copy_result?;
-                return Ok(0);
+                    resources.poll_attempt += 1;
+                    if let Some(deadline) = deadline
+                        && thread_observe_time(guest).await >= deadline
+                    {
+                        let copy_result = self.copy_pselect6_results(guest, probe, call, len);
+                        self.write_pselect6_remaining(guest, call, Some(deadline))
+                            .await?;
+                        copy_result?;
+                        break Ok(0);
+                    }
+                    trace!(
+                        "Retry #{} for syscall due to result Ok(0): {}",
+                        resources.poll_attempt,
+                        probe.display(&guest.memory())
+                    );
+                    record_retry_event(guest, probe).await;
+                }
             }
-            trace!(
-                "Retry #{} for syscall due to result Ok(0): {}",
-                resources.poll_attempt,
-                probe.display(&guest.memory())
-            );
-            record_retry_event(guest, probe).await;
+            .await
+        };
+        if let Some(signals) = &mut signals {
+            signals.restore(guest, mask_cell).await?;
         }
+        result
     }
 
     fn copy_pselect6_results<G: Guest<Self>>(
@@ -823,6 +897,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         // writable scratch cell. It is re-zeroed each iteration to keep every
         // probe a non-blocking poll (a NULL timeout would block indefinitely).
         let probe_timeout = stack.reserve::<libc::timeval>();
+        // On a backend whose kernel reports the guest's signal state, only a signal
+        // that would end the wait natively does; the mask cell lets the wait block
+        // signals under the one scratch-stack guard
+        // (https://github.com/rrnewton/hermit/issues/3146). A restart resumes from
+        // the remaining time written back below, so a default stop ends the wait
+        // as on Linux. A `SIGCHLD` ends it once the scheduler makes it eligible
+        // (`eligible_pending_signals`).
+        let mut signals = self
+            .cfg
+            .backend_supports_blocked_wait_signal_interruption
+            .then(|| KernelSignalWait::new(guest, 0, false, Errno::ERESTARTNOHAND));
+        let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         let _guard = stack.commit()?;
         let probe = call
             .with_readfds(readfds)
@@ -838,54 +924,114 @@ impl<T: RecordOrReplay> Detcore<T> {
         // side disposition check before this Signaled path can be used.
         resources.set_signal_interrupt_errno(Errno::EINTR);
 
-        loop {
-            if matches!(
-                resource_request(guest, resources.clone()).await,
-                ResumeStatus::Signaled(_)
-            ) {
-                self.write_select_remaining(guest, call, deadline).await?;
-                return Err(Errno::EINTR.into());
-            }
-            guest.memory().write_value(
-                probe_timeout,
-                &libc::timeval {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                },
-            )?;
-            write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
-            write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
-            write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
+        // Every exit, including a `?` on a guest-memory write, must reach the mask
+        // restore below, so the loop runs in its own async block.
+        let result: Result<i64, Error> = {
+            // Moved reborrows: a future holding a shared reference to a scratch
+            // address would not be `Send`.
+            let guest = &mut *guest;
+            let signals = &mut signals;
+            let resources = &mut resources;
+            async move {
+                loop {
+                    let signaled = matches!(
+                        resource_request(guest, resources.clone()).await,
+                        ResumeStatus::Signaled(_)
+                    );
+                    // The kernel's signal state that this turn's check read, which the
+                    // probe's injection below takes as its first read once every
+                    // blockable signal is blocked (`inject_absorbing_after`).
+                    let mut turn_state = None;
+                    if let Some(signals) = signals.as_ref() {
+                        // A scheduler `Signaled` answer is only a hint here; the kernel's
+                        // state decides. select returns ERESTARTNOHAND: EINTR after a
+                        // handler, a restart with the remaining timeout after a stop.
+                        match signals.interrupted_with_state(guest).await {
+                            Ok((false, state)) => turn_state = Some(state),
+                            Ok((true, _)) => {
+                                self.write_select_remaining(guest, call, deadline).await?;
+                                break Err(Errno::ERESTARTNOHAND.into());
+                            }
+                            Err(error) => break Err(error),
+                        }
+                    } else if signaled {
+                        self.write_select_remaining(guest, call, deadline).await?;
+                        return Err(Errno::EINTR.into());
+                    }
+                    guest.memory().write_value(
+                        probe_timeout,
+                        &libc::timeval {
+                            tv_sec: 0,
+                            tv_usec: 0,
+                        },
+                    )?;
+                    write_pselect6_fd_set(guest, probe.readfds(), &original_readfds)?;
+                    write_pselect6_fd_set(guest, probe.writefds(), &original_writefds)?;
+                    write_pselect6_fd_set(guest, probe.exceptfds(), &original_exceptfds)?;
 
-            let result = guest.inject(probe).await;
-            if result != Ok(0) {
-                let copy_result = if result.is_ok() {
-                    self.copy_select_results(guest, probe, call, len)
-                } else {
-                    Ok(())
-                };
-                self.write_select_remaining(guest, call, deadline).await?;
-                copy_result?;
-                return result.map_err(Into::into);
-            }
+                    let result = match signals.as_mut() {
+                        // A signal stop that does not end the wait is absorbed (see
+                        // `KernelSignalWait`). Only the guest memory writes above ran
+                        // since the turn's read, and they do not resume the thread.
+                        Some(signals) => {
+                            let injected = match turn_state {
+                                Some(state) => {
+                                    signals.inject_absorbing_after(guest, probe, state).await
+                                }
+                                None => signals.inject_absorbing(guest, probe).await,
+                            };
+                            match injected {
+                                Ok(result) => result,
+                                Err(error) => {
+                                    self.write_select_remaining(guest, call, deadline).await?;
+                                    break Err(error);
+                                }
+                            }
+                        }
+                        None => guest.inject(probe).await,
+                    };
+                    if result != Ok(0) {
+                        let copy_result = if result.is_ok() {
+                            self.copy_select_results(guest, probe, call, len)
+                        } else {
+                            Ok(())
+                        };
+                        self.write_select_remaining(guest, call, deadline).await?;
+                        copy_result?;
+                        break result.map_err(Into::into);
+                    }
+                    if let Some(signals) = signals.as_mut()
+                        && signals.needs_block()
+                        && let Err(error) = signals.block(guest, mask_cell).await
+                    {
+                        self.write_select_remaining(guest, call, deadline).await?;
+                        break Err(error);
+                    }
 
-            resources.poll_attempt += 1;
-            if let Some(deadline) = deadline
-                && thread_observe_time(guest).await >= deadline
-            {
-                let copy_result = self.copy_select_results(guest, probe, call, len);
-                self.write_select_remaining(guest, call, Some(deadline))
-                    .await?;
-                copy_result?;
-                return Ok(0);
+                    resources.poll_attempt += 1;
+                    if let Some(deadline) = deadline
+                        && thread_observe_time(guest).await >= deadline
+                    {
+                        let copy_result = self.copy_select_results(guest, probe, call, len);
+                        self.write_select_remaining(guest, call, Some(deadline))
+                            .await?;
+                        copy_result?;
+                        break Ok(0);
+                    }
+                    trace!(
+                        "Retry #{} for syscall due to result Ok(0): {}",
+                        resources.poll_attempt,
+                        probe.display(&guest.memory())
+                    );
+                    record_retry_event(guest, probe).await;
+                }
             }
-            trace!(
-                "Retry #{} for syscall due to result Ok(0): {}",
-                resources.poll_attempt,
-                probe.display(&guest.memory())
-            );
-            record_retry_event(guest, probe).await;
+            .await
+        };
+        if let Some(signals) = &mut signals {
+            signals.restore(guest, mask_cell).await?;
         }
+        result
     }
 
     fn copy_select_results<G: Guest<Self>>(
