@@ -212,5 +212,8 @@ decisions; at `--log=error` that log is empty and the comparison would prove
 nothing.
 
 Controls: `HERMIT_DEMO_MAX_TIMESLICE=disabled` turns off counter-based
-preemption for hosts without performance counters (the Python step may then be
-slow). `DEMO_SKIP_BUILD=1` reuses the already built test programs.
+preemption in the steps before `--verify`, for hosts without performance
+counters (the Python step may then be slow). It does not reach the `--verify`
+step, which keeps counter-based preemption because the race in `race.sh` is
+only reliably deterministic with it, so that step still needs the counters.
+`DEMO_SKIP_BUILD=1` reuses the already built test programs.
