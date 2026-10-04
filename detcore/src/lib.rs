@@ -1989,12 +1989,14 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Only the backend owns descriptor/captured-output provenance. Neither
         // Detcore's placeholder stdio types nor O_NONBLOCK prove admission.
         if guest.config().backend_is_kvm {
-            let admission = guest.parent_death_syscall_preflight(call).map_err(|error| {
-                Error::Tool(anyhow::Error::new(error).context(format!(
-                    "KVM parent-death signal unsupported syscall domain before {}",
-                    call.number()
-                )))
-            })?;
+            let admission = guest
+                .parent_death_syscall_preflight(call)
+                .map_err(|error| {
+                    Error::Tool(anyhow::Error::new(error).context(format!(
+                        "KVM parent-death signal unsupported syscall domain before {}",
+                        call.number()
+                    )))
+                })?;
             match admission {
                 reverie::ParentDeathSyscallAdmission::Admitted
                     if matches!(call, Syscall::Execve(_) | Syscall::Execveat(_))

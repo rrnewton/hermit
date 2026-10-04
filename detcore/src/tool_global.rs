@@ -1655,11 +1655,20 @@ impl GlobalTool for GlobalState {
                         return (None, R::ThreadExited);
                     }
                 }
-                R::FutexAction(self.recv_futex_action(
-                    RpcIncarnation { dettid, mm: request_mm },
-                    action, futexid, init_read, mask,
-                ).await)
-            },
+                R::FutexAction(
+                    self.recv_futex_action(
+                        RpcIncarnation {
+                            dettid,
+                            mm: request_mm,
+                        },
+                        action,
+                        futexid,
+                        init_read,
+                        mask,
+                    )
+                    .await,
+                )
+            }
             GlobalRequest::RobustListWakes(wakes) => {
                 R::RobustListWakes(self.recv_robust_list_wakes(wakes))
             }
@@ -1922,7 +1931,11 @@ impl GlobalState {
                 &dettid, &nextturn.req
             );
             if let Err(error) = sched.validate_parent_death_resource(dettid, &rs, capability) {
-                tracing::error!(?rs, ?capability, "parent-death recipient wait refused before resource publication");
+                tracing::error!(
+                    ?rs,
+                    ?capability,
+                    "parent-death recipient wait refused before resource publication"
+                );
                 sched.fail_parked(dettid, error);
                 return (SchedulerRpcResult::ThreadExited, None);
             }
@@ -3441,14 +3454,19 @@ where
     if !guest.config().backend_is_kvm {
         return Ok(());
     }
-    match send_and_update_time(guest, GlobalRequest::ParentDeathEnrollment).await.1 {
+    match send_and_update_time(guest, GlobalRequest::ParentDeathEnrollment)
+        .await
+        .1
+    {
         GlobalResponse::ParentDeathEnrollment(Ok(false)) => Ok(()),
-        GlobalResponse::ParentDeathEnrollment(Ok(true)) => Err(reverie::Error::Tool(anyhow::anyhow!(
-            "KVM parent-death signal unsupported wait: {operation}"
-        ))),
-        GlobalResponse::ParentDeathEnrollment(Err(error)) => Err(reverie::Error::Tool(anyhow::anyhow!(
-            "KVM parent-death signal enrollment query failed before {operation}: {error:?}"
-        ))),
+        GlobalResponse::ParentDeathEnrollment(Ok(true)) => Err(reverie::Error::Tool(
+            anyhow::anyhow!("KVM parent-death signal unsupported wait: {operation}"),
+        )),
+        GlobalResponse::ParentDeathEnrollment(Err(error)) => {
+            Err(reverie::Error::Tool(anyhow::anyhow!(
+                "KVM parent-death signal enrollment query failed before {operation}: {error:?}"
+            )))
+        }
         _ => unreachable!("parent-death enrollment RPC response"),
     }
 }

@@ -928,7 +928,128 @@ fn staging_directory(path: &Path) -> &Path {
     }
 }
 
+struct DeferredReportState {
+    path: PathBuf,
+    creator: (libc::pid_t, libc::pid_t),
+    report: Option<VerificationReport>,
+}
+
+thread_local! {
+    static DEFERRED_REPORT: std::cell::RefCell<Option<std::rc::Rc<std::cell::RefCell<DeferredReportState>>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Private original-main report ownership. No report file or environment value
+/// grants this authority. Rc makes the guard neither Send nor Sync; inherited
+/// fork state additionally fails the creator PID/TID check. Drop never publishes.
+#[must_use]
+pub(super) struct DeferredVerification {
+    state: std::rc::Rc<std::cell::RefCell<DeferredReportState>>,
+}
+
+fn report_creator() -> (libc::pid_t, libc::pid_t) {
+    // SAFETY: these identity-only native calls have no pointer operands.
+    unsafe {
+        (
+            libc::getpid(),
+            libc::syscall(libc::SYS_gettid) as libc::pid_t,
+        )
+    }
+}
+
+impl DeferredVerification {
+    /// Stamp no-result at the requested path before any bootstrap/guest effect.
+    /// An I/O error is returned: no alternate destination or silent fallback.
+    pub(super) fn begin(path: &Path) -> Result<Self, Error> {
+        DEFERRED_REPORT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            anyhow::ensure!(slot.is_none(), "verification publication already deferred");
+            publish_report_json(path, &VerificationReport::no_result())?;
+            let state = std::rc::Rc::new(std::cell::RefCell::new(DeferredReportState {
+                path: path.to_owned(),
+                creator: report_creator(),
+                report: None,
+            }));
+            *slot = Some(state.clone());
+            Ok(Self { state })
+        })
+    }
+
+    /// Only main, after the native wrapper reports actual normal settlement,
+    /// calls this method. Preserve a computed failure report on ordinary work
+    /// failure; do not publish a buffered success over a later primary error.
+    pub(super) fn finish(self, normally_settled: bool, work_succeeded: bool) -> Result<(), Error> {
+        self.check_current()?;
+        let mut state = self.state.borrow_mut();
+        if !normally_settled {
+            return Ok(());
+        }
+        let Some(report) = state.report.take() else {
+            return Ok(());
+        };
+        if !work_succeeded && report.verified {
+            return Ok(());
+        }
+        publish_report_json(&state.path, &report)
+    }
+
+    fn check_current(&self) -> Result<(), Error> {
+        anyhow::ensure!(
+            self.state.borrow().creator == report_creator(),
+            "verification publication moved from its original process/thread"
+        );
+        DEFERRED_REPORT.with(|slot| {
+            anyhow::ensure!(
+                slot.borrow()
+                    .as_ref()
+                    .is_some_and(|active| std::rc::Rc::ptr_eq(active, &self.state)),
+                "verification publication owner no longer active"
+            );
+            Ok(())
+        })
+    }
+}
+
+impl Drop for DeferredVerification {
+    fn drop(&mut self) {
+        DEFERRED_REPORT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|active| std::rc::Rc::ptr_eq(active, &self.state))
+            {
+                *slot = None;
+            }
+        });
+    }
+}
+
 pub fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
+    let deferred = DEFERRED_REPORT.with(|slot| -> Result<bool, Error> {
+        let slot = slot.borrow();
+        let Some(active) = slot.as_ref() else {
+            return Ok(false);
+        };
+        let mut state = active.borrow_mut();
+        if state.path != path {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            state.creator == report_creator(),
+            "verification writer is not the invocation's original process/thread"
+        );
+        state.report = Some(report.clone());
+        Ok(true)
+    })?;
+    if deferred {
+        return Ok(());
+    }
+    publish_report_json(path, report)
+}
+
+// Original atomic writer, unchanged. Only the invocation guard may bypass its
+// own deferral at the initial no-result stamp and after normal settlement.
+fn publish_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
     use std::io::Write as _;
 
     let json = serde_json::to_string(report)?;
@@ -4362,5 +4483,131 @@ mod tests {
         assert!(default.ignore_lines.is_empty());
         assert!(!default.skip_commit);
         assert!(!default.skip_detlog);
+    }
+
+    fn deferred_test_report(matches: bool) -> VerificationReport {
+        let left = output(0, b"hello\n", b"");
+        let right = output(if matches { 0 } else { 1 }, b"hello\n", b"");
+        let (log1, log2) = logs_with_identical_detlog();
+        verification_report(
+            &compare_with(&left, log1, &right, log2, LogCompareStrictness::Canonical).unwrap(),
+        )
+    }
+
+    #[test]
+    fn deferred_verification_replaces_stale_success_and_publishes_exact_settled_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verify.json");
+        let success = deferred_test_report(true);
+        assert!(success.verified);
+        write_report_json(&path, &success).unwrap();
+        let guard = DeferredVerification::begin(&path).unwrap();
+        let pending = fs::read(&path).unwrap();
+        assert!(
+            !VerificationReport::from_current_json_slice(&pending)
+                .unwrap()
+                .verified
+        );
+        write_report_json(&path, &success).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), pending);
+        guard.finish(true, true).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            format!("{}\n", serde_json::to_string(&success).unwrap()).as_bytes()
+        );
+    }
+
+    #[test]
+    fn deferred_verification_drop_and_unwind_never_publish_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verify.json");
+        let success = deferred_test_report(true);
+        {
+            let _guard = DeferredVerification::begin(&path).unwrap();
+            write_report_json(&path, &success).unwrap();
+        }
+        let pending = fs::read(&path).unwrap();
+        assert!(
+            !VerificationReport::from_current_json_slice(&pending)
+                .unwrap()
+                .verified
+        );
+        let panic = std::panic::catch_unwind(|| {
+            let _guard = DeferredVerification::begin(&path).unwrap();
+            write_report_json(&path, &success).unwrap();
+            panic!("planted invocation panic");
+        });
+        assert!(panic.is_err());
+        assert_eq!(fs::read(&path).unwrap(), pending);
+        assert!(DEFERRED_REPORT.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn deferred_verification_requires_settlement_and_no_late_primary_error() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verify.json");
+        let success = deferred_test_report(true);
+        for (settled, work_ok) in [(false, true), (false, false), (true, false)] {
+            let guard = DeferredVerification::begin(&path).unwrap();
+            let pending = fs::read(&path).unwrap();
+            write_report_json(&path, &success).unwrap();
+            guard.finish(settled, work_ok).unwrap();
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                pending,
+                "settled={settled} work_ok={work_ok}"
+            );
+        }
+    }
+
+    #[test]
+    fn deferred_verification_preserves_actual_failure_report_after_normal_settlement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verify.json");
+        let failure = deferred_test_report(false);
+        assert_eq!(failure.verdict, Verdict::Diverged);
+        let guard = DeferredVerification::begin(&path).unwrap();
+        write_report_json(&path, &failure).unwrap();
+        guard.finish(true, false).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            format!("{}\n", serde_json::to_string(&failure).unwrap()).as_bytes()
+        );
+    }
+
+    #[test]
+    fn deferred_verification_rejects_nested_and_changed_creator_before_publication() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verify.json");
+        let guard = DeferredVerification::begin(&path).unwrap();
+        let pending = fs::read(&path).unwrap();
+        assert!(DeferredVerification::begin(&path).is_err());
+        let creator = guard.state.borrow().creator;
+        // Planted invalid context, not a native process/thread execution claim.
+        guard.state.borrow_mut().creator = (-1, -1);
+        assert!(write_report_json(&path, &deferred_test_report(true)).is_err());
+        assert_eq!(fs::read(&path).unwrap(), pending);
+        guard.state.borrow_mut().creator = creator;
+        guard.finish(true, true).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), pending);
+    }
+
+    #[test]
+    fn deferred_verification_publication_io_error_has_no_alternate_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verify.json");
+        let saved = directory.path().join("saved-no-result.json");
+        let guard = DeferredVerification::begin(&path).unwrap();
+        let pending = fs::read(&path).unwrap();
+        write_report_json(&path, &deferred_test_report(true)).unwrap();
+        // Deterministic rename refusal, including when the runner is privileged.
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(guard.finish(true, true).is_err());
+        assert!(path.is_dir());
+        assert_eq!(fs::read(&saved).unwrap(), pending);
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
+        assert!(DeferredVerification::begin(&directory.path().join("absent/verify.json")).is_err());
+        assert!(DEFERRED_REPORT.with(|slot| slot.borrow().is_none()));
     }
 }

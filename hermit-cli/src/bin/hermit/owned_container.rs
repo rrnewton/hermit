@@ -110,11 +110,28 @@ static NEXT_OWNER: AtomicU64 = AtomicU64::new(1);
 pub(super) fn has_retained_owner() -> bool {
     RETAINED.load(Ordering::Acquire)
 }
+
+// Read-only fixture evidence from the actual retained record. This neither
+// changes retention nor grants authority to signal a numeric PID.
+pub(super) fn lifecycle_retained_native_wait(error: &Error) -> Option<(i32, ExitStatus)> {
+    let retained = error.downcast_ref::<ParentCleanupUnconfirmed>()?;
+    match &retained.observation {
+        ChildCleanupObservation::Reaped(status) => Some((retained.pid, *status)),
+        _ => None,
+    }
+}
 thread_local! {
     // Deliberate CLI retention, including on origin-thread exit. These owners
     // require process supervision; there is no detached reaper or generic exit.
     static OWNERS: RefCell<ManuallyDrop<Vec<Box<dyn Any>>>> =
         const { RefCell::new(ManuallyDrop::new(Vec::new())) };
+    // Display-only original-thread observations, never PID/signal authority or
+    // a complete descendant/worker census. Ownership remains in OWNERS.
+    static RETAINED_DIAGNOSTICS: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
+}
+
+pub(super) fn retained_owner_diagnostics() -> Vec<String> {
+    RETAINED_DIAGNOSTICS.with(|records| records.borrow().clone())
 }
 
 #[derive(Debug)]
@@ -233,6 +250,8 @@ fn retain_owned<T: 'static, F: 'static>(
     };
     RETAINED.store(true, Ordering::Release);
     OWNERS.with(|owners| owners.borrow_mut().push(Box::new((owner, factory))));
+    // Add display information only after the real owner is safely retained.
+    RETAINED_DIAGNOSTICS.with(|records| records.borrow_mut().push(diagnostic.to_string()));
     diagnostic
 }
 

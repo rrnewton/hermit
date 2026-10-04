@@ -904,8 +904,22 @@ fi
 # rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
 # CMAKE/CMAKE_GENERATOR selection policy, MAX_PARALLEL_JOBS=16 and the
 # existing 1050 effective-job-seconds budget are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 6b9529824d37ccebb7906637ab8723b3a63f1d00 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 6b9529824d37ccebb7906637ab8723b3a63f1d00 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 985789fb305af3be722909a523213d9731f55254 (2026-10-04): from
+# 6b9529824d37ccebb7906637ab8723b3a63f1d00; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The landed fatal-invocation-abort follow-up
+# https://github.com/rrnewton/reverie/pull/939 changes no DBT build input.
+# This is a source-identity carry, not a new timing or host-tooling sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR selection policy, MAX_PARALLEL_JOBS=16 and the
+# existing 1050 effective-job-seconds budget are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 985789fb305af3be722909a523213d9731f55254 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 985789fb305af3be722909a523213d9731f55254 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

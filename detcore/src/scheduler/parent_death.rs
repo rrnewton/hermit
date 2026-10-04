@@ -33,13 +33,25 @@ impl Scheduler {
         if !self.parked.parent_death_enabled {
             return Ok(false);
         }
-        let control = self.parked.control.as_ref().ok_or(ProtocolFailure::Identity)?;
-        let pid = self.registered_process(tid).ok_or(ProtocolFailure::Identity)?;
-        let (mm, identity) = self.real_timers.task_identity(pid, tid).ok_or(ProtocolFailure::Identity)?;
+        let control = self
+            .parked
+            .control
+            .as_ref()
+            .ok_or(ProtocolFailure::Identity)?;
+        let pid = self
+            .registered_process(tid)
+            .ok_or(ProtocolFailure::Identity)?;
+        let (mm, identity) = self
+            .real_timers
+            .task_identity(pid, tid)
+            .ok_or(ProtocolFailure::Identity)?;
         if !self.rpc_incarnation_matches(tid, mm) {
             return Err(ProtocolFailure::Identity);
         }
-        control.process.parent_death_enrolled(identity.process).map_err(|error| ProtocolFailure::ParentDeathQuery(error.into_raw()))
+        control
+            .process
+            .parent_death_enrolled(identity.process)
+            .map_err(|error| ProtocolFailure::ParentDeathQuery(error.into_raw()))
     }
 
     pub(crate) fn validate_parent_death_resource(
@@ -56,8 +68,15 @@ impl Scheduler {
                 ResourceID::SleepUntil(deadline) => {
                     resources.resources.len() == 1
                         && match capability {
-                            ControlCapability::ParkedWait { policy: ParkedWaitPolicy::PauseNoHandlerRestart, .. } => *deadline == LogicalTime::INDEFINITE,
-                            ControlCapability::ParkedWait { policy: ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline }, .. } => *deadline == absolute_deadline,
+                            ControlCapability::ParkedWait {
+                                policy: ParkedWaitPolicy::PauseNoHandlerRestart,
+                                ..
+                            } => *deadline == LogicalTime::INDEFINITE,
+                            ControlCapability::ParkedWait {
+                                policy:
+                                    ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline },
+                                ..
+                            } => *deadline == absolute_deadline,
                             _ => false,
                         }
                 }
@@ -108,7 +127,10 @@ impl Scheduler {
         boundary: SignalBoundaryReceipt,
     ) -> Result<(), reverie::Error> {
         if !self.parked.parent_death_enabled
-            || !matches!(boundary.outcome, SignalBoundaryOutcome::Terminated { .. } | SignalBoundaryOutcome::ImageReplaced)
+            || !matches!(
+                boundary.outcome,
+                SignalBoundaryOutcome::Terminated { .. } | SignalBoundaryOutcome::ImageReplaced
+            )
         {
             return Ok(());
         }
@@ -133,7 +155,10 @@ impl Scheduler {
         for effect in receipt.signals {
             if !effect.discarded {
                 self.parked.parent_death_pending.insert(
-                    (ProcessGeneration::from_backend(effect.process), effect.signal),
+                    (
+                        ProcessGeneration::from_backend(effect.process),
+                        effect.signal,
+                    ),
                     effect.pending_generation,
                 );
             }
@@ -156,49 +181,95 @@ impl Scheduler {
         // must use the timer registry's live-process inventory instead; an old
         // hint has no authority to turn ordinary retirement into a backend fault.
         let live_processes = self.real_timers.live_processes();
-        let pending = self.parked.parent_death_pending.keys().copied().collect::<Vec<_>>();
+        let pending = self
+            .parked
+            .parent_death_pending
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
         for (generation, signal) in pending {
             let pid = generation.pid;
-            let process = SignalProcessId { tgid: reverie::Pid::from_raw(pid.as_raw()), generation: generation.generation };
-            let fail = |failure| SelectionFailure { pid, tid: None, failure };
+            let process = SignalProcessId {
+                tgid: reverie::Pid::from_raw(pid.as_raw()),
+                generation: generation.generation,
+            };
+            let fail = |failure| SelectionFailure {
+                pid,
+                tid: None,
+                failure,
+            };
             if !live_processes.contains(&pid) {
-                self.parked.parent_death_pending.remove(&(generation, signal));
+                self.parked
+                    .parent_death_pending
+                    .remove(&(generation, signal));
                 continue;
             }
-            if self.real_timers.process_identity(pid).map_err(|failure| fail(failure.into()))? != process {
-                self.parked.parent_death_pending.remove(&(generation, signal));
+            if self
+                .real_timers
+                .process_identity(pid)
+                .map_err(|failure| fail(failure.into()))?
+                != process
+            {
+                self.parked
+                    .parent_death_pending
+                    .remove(&(generation, signal));
                 continue;
             }
-            if self.parked.permits.values().any(|permit| permit.task.process == process) {
+            if self
+                .parked
+                .permits
+                .values()
+                .any(|permit| permit.task.process == process)
+            {
                 continue;
             }
-            let recipients = control.process.signal_recipients(process, signal)
+            let recipients = control
+                .process
+                .signal_recipients(process, signal)
                 .map_err(|_| fail(ProtocolFailure::Identity))?;
             for recipient in recipients {
                 let tid = DetTid::from_raw(recipient.task.tid.as_raw());
-                let Some((mm, identity)) = self.real_timers.task_identity(pid, tid) else { continue; };
-                if identity != recipient.task || identity.process != process
+                let Some((mm, identity)) = self.real_timers.task_identity(pid, tid) else {
+                    continue;
+                };
+                if identity != recipient.task
+                    || identity.process != process
                     || !self.rpc_incarnation_matches(tid, mm)
                     || self.thread_is_logically_killed(tid)
                     || self.parked.permits.contains_key(&tid)
                 {
                     continue;
                 }
-                let Some(turn) = self.next_turns.get(&tid) else { continue; };
-                if turn.protocol.owner != NextTurnOwner::Ordinary { continue; }
-                let Some(origin) = turn.protocol.origin else { continue; };
+                let Some(turn) = self.next_turns.get(&tid) else {
+                    continue;
+                };
+                if turn.protocol.owner != NextTurnOwner::Ordinary {
+                    continue;
+                }
+                let Some(origin) = turn.protocol.origin else {
+                    continue;
+                };
                 let deadline = match origin.control {
                     ControlCapability::ParkedWait { policy, .. } => match policy {
-                        ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline } => absolute_deadline,
+                        ParkedWaitPolicy::NanosleepNoHandlerRestart { absolute_deadline } => {
+                            absolute_deadline
+                        }
                         ParkedWaitPolicy::PauseNoHandlerRestart => LogicalTime::INDEFINITE,
                     },
                     _ => continue,
                 };
-                if deadline <= self.committed_time || turn.req.try_read().is_none() || turn.resp.try_read().is_some() {
+                if deadline <= self.committed_time
+                    || turn.req.try_read().is_none()
+                    || turn.resp.try_read().is_some()
+                {
                     continue;
                 }
                 self.begin_pending_signal_observation(pid, tid, recipient.task)
-                    .map_err(|failure| SelectionFailure { pid, tid: Some(tid), failure })?;
+                    .map_err(|failure| SelectionFailure {
+                        pid,
+                        tid: Some(tid),
+                        failure,
+                    })?;
                 break;
             }
         }

@@ -98,9 +98,7 @@ impl ChildExitPublicationFuture {
             ProtocolFailure::Overflow => reverie::syscalls::Errno::EOVERFLOW,
             ProtocolFailure::Unsupported
             | ProtocolFailure::UnexpectedControl
-            | ProtocolFailure::ParentDeathUnsupportedWait => {
-                reverie::syscalls::Errno::ENOSYS
-            }
+            | ProtocolFailure::ParentDeathUnsupportedWait => reverie::syscalls::Errno::ENOSYS,
             ProtocolFailure::ParentDeathQuery(errno) => reverie::syscalls::Errno::new(errno),
             ProtocolFailure::Identity
             | ProtocolFailure::Phase

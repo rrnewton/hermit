@@ -6760,7 +6760,10 @@ mod inject_fstat_scratch {
         }
         fn memory(&self) -> Self::Memory {
             self.memory_accesses.fetch_add(1, Ordering::SeqCst);
-            assert!(!self.forbid_memory_access, "refused parent-death call reached guest memory");
+            assert!(
+                !self.forbid_memory_access,
+                "refused parent-death call reached guest memory"
+            );
             LocalMemory::new()
         }
         fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
@@ -6906,14 +6909,25 @@ mod inject_fstat_scratch {
         };
         assert_eq!(
             error.to_string(),
-            format!("KVM parent-death signal unsupported syscall domain before {}", call.number())
+            format!(
+                "KVM parent-death signal unsupported syscall domain before {}",
+                call.number()
+            )
         );
-        assert!(matches!(error.downcast_ref::<Error>(), Some(Error::Errno(errno)) if *errno == expected));
-        assert_eq!(guest.parent_death_queries.load(Ordering::SeqCst), queries + 1);
+        assert!(
+            matches!(error.downcast_ref::<Error>(), Some(Error::Errno(errno)) if *errno == expected)
+        );
+        assert_eq!(
+            guest.parent_death_queries.load(Ordering::SeqCst),
+            queries + 1
+        );
         assert_eq!(guest.memory_accesses.load(Ordering::SeqCst), memory);
         assert_eq!(guest.thread.stats.syscall_count, count);
         assert_eq!(guest.thread.thread_logical_time.as_nanos(), time);
-        assert_eq!(format!("{:?}", guest.thread.file_metadata.lock().unwrap()), metadata);
+        assert_eq!(
+            format!("{:?}", guest.thread.file_metadata.lock().unwrap()),
+            metadata
+        );
         assert_eq!(*guest.arena, arena);
         assert!(guest.injected.is_empty());
         assert!(guest.mapped.is_empty());
@@ -6935,14 +6949,26 @@ mod inject_fstat_scratch {
             (Sysno::read, SyscallArgs::new(3, 0x1234, 0, 0, 0, 0)),
             (Sysno::readv, SyscallArgs::new(3, 0x1234, 1, 0, 0, 0)),
             (Sysno::open, SyscallArgs::new(0x1234, 0, 0, 0, 0, 0)),
-            (Sysno::openat, SyscallArgs::new(libc::AT_FDCWD as usize, 0x1234, 0, 0, 0, 0)),
+            (
+                Sysno::openat,
+                SyscallArgs::new(libc::AT_FDCWD as usize, 0x1234, 0, 0, 0, 0),
+            ),
             (Sysno::creat, SyscallArgs::new(0x1234, 0o600, 0, 0, 0, 0)),
-            (Sysno::fcntl, SyscallArgs::new(3, libc::F_SETLKW as usize, 0x1234, 0, 0, 0)),
-            (Sysno::futex, SyscallArgs::new(0x1234, libc::FUTEX_WAIT as usize, 0, 0, 0, 0)),
+            (
+                Sysno::fcntl,
+                SyscallArgs::new(3, libc::F_SETLKW as usize, 0x1234, 0, 0, 0),
+            ),
+            (
+                Sysno::futex,
+                SyscallArgs::new(0x1234, libc::FUTEX_WAIT as usize, 0, 0, 0, 0),
+            ),
         ] {
             let call = Syscall::from_raw(number, args);
             let (tool, mut guest) = parent_death_guest(call, Some(Errno::ENOSYS));
-            guest.thread.add_fd(3, OFlag::O_NONBLOCK, FdType::Pipe, None).unwrap();
+            guest
+                .thread
+                .add_fd(3, OFlag::O_NONBLOCK, FdType::Pipe, None)
+                .unwrap();
             // stdfd 1 is the existing dummy Regular entry, and fd 3 appears
             // nonblocking. Neither overrides the backend's refusal. The path
             // address is deliberately unreadable: the guard must not try to
@@ -6982,7 +7008,10 @@ mod inject_fstat_scratch {
         for admitted in [false, true] {
             let (tool, mut guest) = parent_death_guest(call, None);
             guest.parent_death_admitted = admitted;
-            assert!(matches!(<Detcore as Tool>::handle_syscall_event(&tool, &mut guest, call).await, Ok(0)));
+            assert!(matches!(
+                <Detcore as Tool>::handle_syscall_event(&tool, &mut guest, call).await,
+                Ok(0)
+            ));
             assert_eq!(guest.parent_death_queries.load(Ordering::SeqCst), 1);
             assert_eq!(guest.thread.stats.syscall_count, 1);
             assert!(guest.injected.is_empty());
@@ -6990,7 +7019,10 @@ mod inject_fstat_scratch {
         let (_, mut guest) = parent_death_guest(call, Some(Errno::ENOSYS));
         guest.config.backend_is_kvm = false;
         let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
-        assert!(matches!(<Detcore as Tool>::handle_syscall_event(&tool, &mut guest, call).await, Ok(0)));
+        assert!(matches!(
+            <Detcore as Tool>::handle_syscall_event(&tool, &mut guest, call).await,
+            Ok(0)
+        ));
         assert_eq!(guest.parent_death_queries.load(Ordering::SeqCst), 0);
         assert_eq!(guest.thread.stats.syscall_count, 1);
     }

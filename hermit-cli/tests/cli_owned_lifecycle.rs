@@ -86,3 +86,20 @@ fn fixture_worker_exits_when_lifecycle_cli_asserts_before_stop() {
 fn fixture_worker_exits_when_lifecycle_cli_is_killed() {
     lifecycle("containment-cli-owner-death");
 }
+
+#[test]
+fn native_exit_normally_settled_verification_publishes_exact_report() {
+    lifecycle("native-exit-settled");
+}
+#[test]
+fn native_exit_fatal_primary_survives_actual_diagnostic_write_failure() {
+    lifecycle("native-exit-fatal-io");
+}
+#[test]
+fn native_exit_fatal_reporter_panic_retains_primary_factory_and_no_result() {
+    lifecycle("native-exit-fatal-panic");
+}
+#[test]
+fn native_exit_fatal_cleanup_does_not_drop_a_buffered_success_result() {
+    lifecycle("native-exit-fatal-success");
+}
