@@ -100,8 +100,11 @@ pub const PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT: usize = 4;
 /// Evidence SHA is the tree the measurement binary was built from. The
 /// result rows record `source_tree_dirty: true` only because the slot's
 /// `reverie` submodule checkout (51186070) differed from the pinned gitlink;
-/// Cargo builds Reverie from the pinned git rev in `Cargo.lock`
-/// (d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918), not from that checkout.
+/// Cargo builds Reverie from the pinned git rev in `Cargo.lock`, which at the
+/// measurement was d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918, not from that
+/// checkout. Later heads pin a newer Reverie (034ebf29 when this landed); its
+/// three intervening commits change KVM timestamp classes and launch-time
+/// descriptor allocation, not mount or procfs handling.
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_SHA: &str =
     "ab7f0dd15120aeecea647940feca712741ec214d";
 pub const PROCFS_MOUNTINFO_2026_09_25_EVIDENCE_COMPLETED_UTC: &str = "2026-10-04T09:41:42Z";
