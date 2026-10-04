@@ -251,6 +251,53 @@ impl From<syscalls::EpollPwait> for TimerWaitSet {
 /// defaults to 2^20.
 const POLL_TIMERFD_SCAN_MAX_NFDS: u64 = 1 << 20;
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+/// How long handing an expired timerfd to the kernel waits for its 1 ns
+/// arming to fire.
+const TIMERFD_HANDOFF_POLL_MS: libc::c_int = 1000;
+
+/// select and pselect6 descriptors above this are not checked for epolls
+/// whose timerfds must be handed to the kernel.
+const SELECT_EPOLL_SCAN_MAX_NFDS: i32 = 1 << 20;
+
+/// The guest's pollfd array, or nothing when it cannot be read (the real
+/// call then reports the fault) or is larger than any scan here covers.
+fn read_guest_pollfds<T, G>(guest: &mut G, fds_raw: Option<usize>, nfds: u64) -> Vec<libc::pollfd>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    let Some(fds_raw) = fds_raw else {
+        return Vec::new();
+    };
+    if nfds == 0 || nfds > POLL_TIMERFD_SCAN_MAX_NFDS {
+        return Vec::new();
+    }
+    let mut entries = vec![
+        libc::pollfd {
+            fd: -1,
+            events: 0,
+            revents: 0,
+        };
+        nfds as usize
+    ];
+    let Some(addr) = AddrMut::<u8>::from_raw(fds_raw) else {
+        return Vec::new();
+    };
+    // SAFETY: pollfd is plain old data; the byte view covers exactly `entries`.
+    let bytes = unsafe {
+        std::slice::from_raw_parts_mut(
+            entries.as_mut_ptr().cast::<u8>(),
+            entries.len() * std::mem::size_of::<libc::pollfd>(),
+        )
+    };
+    if guest.memory().read_exact(addr, bytes).is_err() {
+        return Vec::new();
+    }
+    entries
+}
+
 fn connect_result_allows_peer_classification(result: &Result<i64, Error>) -> bool {
     match result {
         Ok(_) => true,
@@ -698,6 +745,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         call: syscalls::Poll,
     ) -> Result<i64, Error> {
+        self.hand_polled_epoll_timerfds_to_kernel(
+            guest,
+            call.fds().map(|a| a.as_raw()),
+            call.nfds(),
+        )
+        .await?;
         if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
             // monopolize the guest between preemptions.
@@ -771,6 +824,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.nfds() < 0 {
             return Ok(guest.inject(call).await?);
         }
+        self.hand_selected_epoll_timerfds_to_kernel(
+            guest,
+            call.nfds(),
+            [
+                call.readfds().map(|set| set.as_raw()),
+                call.writefds().map(|set| set.as_raw()),
+                call.exceptfds().map(|set| set.as_raw()),
+            ],
+        )
+        .await?;
 
         // Linux copies pselect6's outer { sigmask, sigsetsize } wrapper before
         // validating the timeout. Copy only the wrapper here; validation of the
@@ -1119,6 +1182,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         if call.nfds() < 0 {
             return Ok(guest.inject(call).await?);
         }
+        self.hand_selected_epoll_timerfds_to_kernel(
+            guest,
+            call.nfds(),
+            [
+                call.readfds().map(|set| set.as_raw()),
+                call.writefds().map(|set| set.as_raw()),
+                call.exceptfds().map(|set| set.as_raw()),
+            ],
+        )
+        .await?;
 
         let raw_timeout = match call.timeout() {
             Some(timeout) => {
@@ -1358,6 +1431,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Ppoll,
     ) -> Result<i64, Error> {
+        self.hand_polled_epoll_timerfds_to_kernel(
+            guest,
+            call.fds().map(|a| a.as_raw()),
+            call.nfds(),
+        )
+        .await?;
         let timeout_address = call.timeout();
         let timeout = match timeout_address {
             Some(timeout) => Some(ppoll_timeout_duration(guest.memory().read_value(timeout)?)?),
@@ -1599,34 +1678,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // No descriptor can carry virtual timer state; skip reading the array.
             return timers;
         }
-        let Some(fds_raw) = fds_raw else {
-            return timers;
-        };
-        if nfds == 0 || nfds > POLL_TIMERFD_SCAN_MAX_NFDS {
-            return timers;
-        }
-        let mut entries = vec![
-            libc::pollfd {
-                fd: -1,
-                events: 0,
-                revents: 0,
-            };
-            nfds as usize
-        ];
-        let Some(addr) = AddrMut::<u8>::from_raw(fds_raw) else {
-            return timers;
-        };
-        // SAFETY: pollfd is plain old data; the byte view covers exactly `entries`.
-        let bytes = unsafe {
-            std::slice::from_raw_parts_mut(
-                entries.as_mut_ptr().cast::<u8>(),
-                entries.len() * std::mem::size_of::<libc::pollfd>(),
-            )
-        };
-        if guest.memory().read_exact(addr, bytes).is_err() {
-            return timers;
-        }
-        for entry in entries {
+        for entry in read_guest_pollfds(guest, fds_raw, nfds) {
             if entry.fd < 0 {
                 continue;
             }
@@ -1640,6 +1692,192 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
         timers
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+    /// Whether `fd` is a timerfd whose timer was handed to the kernel. Its
+    /// reads, settime and gettime then go to the kernel, as they do without
+    /// virtual timerfds.
+    pub(crate) fn timerfd_kernel_backed<G: Guest<Self>>(&self, guest: &mut G, fd: i32) -> bool {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.timerfd_kernel_backed())
+            .unwrap_or(false)
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+    /// Hand a virtual timerfd to the kernel, where base main keeps every
+    /// timerfd. The host vessel is armed with the virtual timer's remaining
+    /// time and interval, and the timer is marked kernel-backed, so every
+    /// later operation on it, through any alias, goes to the kernel. A timer
+    /// that has already expired is armed to fire after 1 ns, and the vessel
+    /// is polled until it fires, so it is readable when the guest next
+    /// looks; the kernel then counts one expiration, however many were
+    /// pending. If the vessel cannot be armed, the timer stays virtual.
+    async fn hand_timerfd_to_kernel<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+    ) -> Result<(), Error> {
+        let Some(state) = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.timerfd_state())
+            .ok()
+            .flatten()
+        else {
+            return Ok(());
+        };
+        let now = thread_observe_time(guest).await;
+        let pending = state.pending(now);
+        let value_ns = if pending > 0 {
+            1
+        } else {
+            state
+                .next_expiry(now)
+                .map_or(0, |next| next.as_nanos().saturating_sub(now.as_nanos()))
+        };
+        if value_ns != 0 {
+            let timespec = |ns: u64| libc::timespec {
+                tv_sec: (ns / 1_000_000_000) as libc::time_t,
+                tv_nsec: (ns % 1_000_000_000) as libc::c_long,
+            };
+            let spec = libc::itimerspec {
+                it_interval: timespec(state.interval.as_nanos()),
+                it_value: timespec(value_ns),
+            };
+            let mut stack = guest.stack().await;
+            let spec = stack.push(spec);
+            let pollfd = stack.reserve::<libc::pollfd>();
+            let _guard = stack.commit()?;
+            let settime = syscalls::TimerfdSettime::new()
+                .with_fd(fd)
+                .with_flags(0)
+                .with_new_value(Some(spec))
+                .with_old_value(None);
+            if let Err(errno) = guest.inject(settime).await {
+                debug!(
+                    fd,
+                    ?errno,
+                    "could not arm a timerfd vessel; the timer stays virtual"
+                );
+                return Ok(());
+            }
+            if pending > 0 {
+                guest.memory().write_value(
+                    pollfd,
+                    &libc::pollfd {
+                        fd,
+                        events: libc::POLLIN,
+                        revents: 0,
+                    },
+                )?;
+                let wait = syscalls::Poll::new()
+                    .with_fds(Some(pollfd.cast()))
+                    .with_nfds(1)
+                    .with_timeout(TIMERFD_HANDOFF_POLL_MS);
+                if let Err(errno) = guest.inject(wait).await {
+                    debug!(
+                        fd,
+                        ?errno,
+                        "waiting for a handed-off timerfd to fire failed"
+                    );
+                }
+            }
+        }
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.hand_timerfd_to_kernel())?;
+        Ok(())
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+    /// Hand every virtual timerfd that the epoll `epfd` watches to the
+    /// kernel. The shadow keys an interest by the fd number it was added
+    /// with; a timerfd no longer open under that number stays virtual.
+    async fn hand_epoll_timerfds_to_kernel<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        epfd: i32,
+    ) -> Result<(), Error> {
+        let interests = guest
+            .thread_state()
+            .with_detfd(epfd, |detfd| detfd.epoll_timer_interests())
+            .unwrap_or_default();
+        for ((fd, open_file), _) in interests {
+            let same_file = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.open_file_id() == open_file)
+                .unwrap_or(false);
+            if same_file {
+                self.hand_timerfd_to_kernel(guest, fd).await?;
+            }
+        }
+        Ok(())
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+    /// A poll of an epoll asks the kernel whether the epoll is ready, and
+    /// the kernel cannot see virtual timerfds. Hand the timerfds of every
+    /// epoll the pollfd array names to the kernel first.
+    async fn hand_polled_epoll_timerfds_to_kernel<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fds_raw: Option<usize>,
+        nfds: u64,
+    ) -> Result<(), Error> {
+        if !self.virtual_timerfds() || !self.cfg.sequentialize_threads {
+            return Ok(());
+        }
+        for entry in read_guest_pollfds(guest, fds_raw, nfds) {
+            if entry.fd >= 0 && self.epoll_has_timerfds(guest, entry.fd) {
+                self.hand_epoll_timerfds_to_kernel(guest, entry.fd).await?;
+            }
+        }
+        Ok(())
+    }
+
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+    /// select and pselect6 counterpart of
+    /// [`Self::hand_polled_epoll_timerfds_to_kernel`]: hand the timerfds of
+    /// every epoll named in any of the three sets to the kernel first.
+    async fn hand_selected_epoll_timerfds_to_kernel<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        nfds: i32,
+        sets: [Option<usize>; 3],
+    ) -> Result<(), Error> {
+        if !self.virtual_timerfds() || nfds <= 0 {
+            return Ok(());
+        }
+        let nfds = nfds.min(SELECT_EPOLL_SCAN_MAX_NFDS) as usize;
+        let mut named = vec![0u8; nfds.div_ceil(64) * 8];
+        for set in sets.into_iter().flatten() {
+            let mut bytes = vec![0u8; named.len()];
+            let Some(addr) = AddrMut::<u8>::from_raw(set) else {
+                continue;
+            };
+            // A set the kernel cannot read either fails the call itself.
+            if guest.memory().read_exact(addr, &mut bytes).is_ok() {
+                for (named, byte) in named.iter_mut().zip(bytes) {
+                    *named |= byte;
+                }
+            }
+        }
+        for (index, byte) in named.into_iter().enumerate() {
+            for bit in 0..8 {
+                let fd = index * 8 + bit;
+                if byte & (1 << bit) != 0 && fd < nfds && self.epoll_has_timerfds(guest, fd as i32)
+                {
+                    self.hand_epoll_timerfds_to_kernel(guest, fd as i32).await?;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Whether a pollfd array names any virtual timerfd.
@@ -1904,6 +2142,38 @@ impl<T: RecordOrReplay> Detcore<T> {
         let dettid = guest.thread_state().dettid;
         resource_request(guest, Resources::new(dettid)).await; // empty request
         let result = self.record_or_replay(guest, call).await?;
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+        // The shadow below cannot be seen through a nested epoll: an epoll
+        // that watches this one asks the kernel, and the host vessel never
+        // fires. Until the shadow models nesting, every timerfd a nested
+        // epoll watches goes back to the kernel, where base main keeps every
+        // timerfd: the ones it watches when another epoll first watches it,
+        // and the ones added to it later.
+        if result == 0
+            && self.virtual_timerfds()
+            && matches!(call.op(), libc::EPOLL_CTL_ADD | libc::EPOLL_CTL_MOD)
+        {
+            let (target_is_epoll, target_is_timerfd) = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| {
+                    (detfd.ty() == FdType::Epoll, detfd.is_timerfd())
+                })
+                .unwrap_or((false, false));
+            if target_is_epoll {
+                guest
+                    .thread_state()
+                    .with_detfd(call.fd(), |detfd| detfd.set_epoll_nested())?;
+                self.hand_epoll_timerfds_to_kernel(guest, call.fd()).await?;
+            } else if target_is_timerfd
+                && guest
+                    .thread_state()
+                    .with_detfd(call.epfd(), |detfd| detfd.is_epoll_nested())
+                    .unwrap_or(false)
+            {
+                self.hand_timerfd_to_kernel(guest, call.fd()).await?;
+            }
+        }
         // Mirror interests in virtual timerfds into the epoll fd's shadow:
         // host epoll can never report their (virtual) readiness. Linux keys an
         // interest by (fd, file) and drops it when the file's last reference
