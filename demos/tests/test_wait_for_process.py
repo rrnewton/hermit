@@ -676,6 +676,46 @@ class _FakeOs:
         return getattr(os, name)
 
 
+class _FakeProbe:
+    """The pidfd question about a process outside the fake group: may it be signalled?
+
+    ``refusal`` is None when signal 0 is accepted, or ``(call, error)``: the
+    call ("pidfd_open" or "pidfd_send_signal") that raises ``error``, as Linux
+    answers it. ``calls`` records every call in order, and ``opened`` counts
+    the pidfds handed out, which the caller must close.
+    """
+
+    # Never used for real: os.close is faked wherever a _FakeProbe is.
+    PIDFD = 1_000_001
+
+    def __init__(self, refusal=None):
+        self.refusal = refusal
+        self.calls: List[tuple] = []
+        self.opened = 0
+
+    def pidfd_open(self, pid: int, *rest) -> int:
+        self.calls.append(("pidfd_open", pid))
+        if self.refusal is not None and self.refusal[0] == "pidfd_open":
+            raise self.refusal[1]
+        self.opened += 1
+        return self.PIDFD
+
+    def pidfd_send_signal(self, pidfd: int, sig: int, *rest) -> None:
+        self.calls.append(("pidfd_send_signal", pidfd, sig))
+        if self.refusal is not None and self.refusal[0] == "pidfd_send_signal":
+            raise self.refusal[1]
+
+
+class _FakeSignal:
+    """The signal module, with pidfd_send_signal answered by a _FakeProbe."""
+
+    def __init__(self, probe: _FakeProbe):
+        self.pidfd_send_signal = probe.pidfd_send_signal
+
+    def __getattr__(self, name: str):
+        return getattr(signal, name)
+
+
 class _FakePopen:
     """What demo_common uses of subprocess.Popen, for a _FakeGroup child."""
 
@@ -821,26 +861,36 @@ class StopOrderTest(unittest.TestCase):
     def test_a_member_whose_stat_cannot_be_read_is_not_taken_as_gone(self):
         # /proc lists a second process, but reading its stat fails for a reason
         # other than its having exited, so whether it is in the child's group is
-        # unknown. It is, and it ignores SIGTERM.
+        # unknown. It is, and it ignores SIGTERM. A refusal (EACCES) is followed
+        # by the pidfd question, which answers that this process may signal it;
+        # any other failure counts without that question.
         descriptor = 1_000_000  # Never used for real: os.read and os.close are faked.
-        for failing in ("open", "read"):
-            with self.subTest(failing=failing):
+        for failing, error in (
+            ("open", PermissionError(errno.EACCES, "Permission denied", "/proc/4243/stat")),
+            ("open", OSError(errno.EMFILE, "Too many open files", "/proc/4243/stat")),
+            ("read", OSError(errno.EIO, "Input/output error")),
+        ):
+            with self.subTest(failing=failing, error=errno.errorcode[error.errno]):
                 fake = _FakeGroup(exited=True, status=7, others=[{signal.SIGKILL}])
+                probe = _FakeProbe()  # Signal 0 is accepted.
                 closed: List[int] = []
 
                 def open_stat(path, flags, *rest):
                     self.assertEqual(path, "/proc/4243/stat")
                     if failing == "open":
-                        raise PermissionError(errno.EACCES, "Permission denied", path)
+                        raise error
                     return descriptor
 
                 def read(fd, size):
                     self.assertEqual(fd, descriptor)
-                    raise OSError(errno.EIO, "Input/output error")
+                    raise error
 
                 fake.os.read = read
                 fake.os.close = closed.append
-                with self.faked_proc(fake, ["self", str(FAKE_PID), "4243"], open_stat):
+                fake.os.pidfd_open = probe.pidfd_open
+                with self.faked_proc(
+                    fake, ["self", str(FAKE_PID), "4243"], open_stat
+                ), mock.patch.object(dc, "signal", _FakeSignal(probe)):
                     self.assertTrue(
                         dc._other_group_members(FAKE_PID, FAKE_PID),
                         "a process whose stat could not be read was counted as gone",
@@ -857,9 +907,116 @@ class StopOrderTest(unittest.TestCase):
                 )
                 self.assertEqual(fake.others, [], "the member whose stat was unreadable was not stopped")
                 self.assertEqual(fake.process.returncode, 7)
+                if error.errno == errno.EACCES:
+                    self.assertTrue(
+                        probe.calls, "a refused stat was not followed by the pidfd question"
+                    )
+                    self.assertEqual(
+                        set(probe.calls),
+                        {("pidfd_open", 4243), ("pidfd_send_signal", _FakeProbe.PIDFD, 0)},
+                    )
+                    self.assertEqual(
+                        closed.count(_FakeProbe.PIDFD), probe.opened, "a pidfd was left open"
+                    )
+                else:
+                    self.assertEqual(probe.calls, [], "a failure other than a refusal was probed")
                 if failing == "read":
                     self.assertTrue(closed, "the stat descriptor was not closed")
                     self.assertEqual(set(closed), {descriptor})
+
+    def test_a_refused_stat_counts_only_a_process_this_process_may_signal(self):
+        # /proc mounted with hidepid=1 refuses another user's /proc/<pid>/stat
+        # with EPERM, and a security module refuses with EACCES, so that
+        # process's group cannot be read. The pidfd question decides instead: a
+        # process this process may not signal does not count, as when its stat
+        # is readable. Before, every refusal counted, so on such a host no scan
+        # found the group empty and each wait ran its full 10 seconds (review
+        # finding R7-5 on https://github.com/rrnewton/hermit/pull/3703). Only how
+        # long the waits last depends on this: the group's SIGKILL and the reap
+        # follow either way.
+        descriptor = 1_000_000  # Never used for real: os.read and os.close are faked.
+        probes = (
+            # (what the pidfd question answers, the refusal, whether it counts)
+            (
+                "signal 0 refused: EPERM",
+                ("pidfd_send_signal", PermissionError(errno.EPERM, "Operation not permitted")),
+                False,
+            ),
+            (
+                "gone: ESRCH from pidfd_open",
+                ("pidfd_open", ProcessLookupError(errno.ESRCH, "No such process")),
+                False,
+            ),
+            ("signal 0 accepted", None, True),
+            (
+                "cannot ask: EMFILE from pidfd_open",
+                ("pidfd_open", OSError(errno.EMFILE, "Too many open files")),
+                True,
+            ),
+        )
+        for failing in ("open", "read"):
+            for refused in (errno.EPERM, errno.EACCES):
+                for answer, refusal, counted in probes:
+                    with self.subTest(
+                        failing=failing, refused=errno.errorcode[refused], probe=answer
+                    ):
+                        # The child has exited, and nothing else is in its group.
+                        fake = _FakeGroup(exited=True, status=7)
+                        probe = _FakeProbe(refusal)
+                        closed: List[int] = []
+
+                        def open_stat(path, flags, *rest):
+                            self.assertEqual(path, "/proc/4243/stat")
+                            if failing == "open":
+                                raise PermissionError(refused, os.strerror(refused), path)
+                            return descriptor
+
+                        def read(fd, size):
+                            self.assertEqual(fd, descriptor)
+                            raise PermissionError(refused, os.strerror(refused))
+
+                        fake.os.read = read
+                        fake.os.close = closed.append
+                        fake.os.pidfd_open = probe.pidfd_open
+                        with self.faked_proc(
+                            fake, ["self", str(FAKE_PID), "4243"], open_stat
+                        ), mock.patch.object(dc, "signal", _FakeSignal(probe)):
+                            self.assertEqual(
+                                dc._other_group_members(FAKE_PID, FAKE_PID),
+                                counted,
+                                "a process whose stat was refused, and which the pidfd "
+                                "question answered {!r} about".format(answer),
+                            )
+                            dc.stop_process_group(fake.process)
+                        # The question was asked about that process, with signal 0 only.
+                        self.assertTrue(
+                            probe.calls, "a refused stat was not followed by the pidfd question"
+                        )
+                        self.assertEqual(
+                            {call[1] for call in probe.calls if call[0] == "pidfd_open"}, {4243}
+                        )
+                        self.assertLessEqual(
+                            {call[1:] for call in probe.calls if call[0] == "pidfd_send_signal"},
+                            {(_FakeProbe.PIDFD, 0)},
+                        )
+                        self.assertEqual(
+                            closed.count(_FakeProbe.PIDFD), probe.opened, "a pidfd was left open"
+                        )
+                        if failing == "read":
+                            self.assertIn(descriptor, closed, "the stat descriptor was not closed")
+                        # The SIGKILL and the reap follow whatever the scans answered.
+                        self.assert_killed_then_reaped(fake, 7)
+                        if counted:
+                            self.assertGreaterEqual(
+                                fake.now, 20, "a wait ended although a possible member was counted"
+                            )
+                        else:
+                            self.assertLess(
+                                fake.now,
+                                1,
+                                "the waits ran {}s although no process that could be signalled "
+                                "was left in the group".format(fake.now),
+                            )
 
     def assert_killed_then_reaped(self, fake: _FakeGroup, status: int, expected=None) -> None:
         """The group's SIGKILL was sent before the child was reaped, and the child was reaped."""
