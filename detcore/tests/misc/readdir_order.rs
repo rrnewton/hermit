@@ -479,11 +479,14 @@ fn received_descriptor_guest() {
 
     let mut names = drain_names(received);
     assert_eq!(names.len(), ENTRIES + 2, "received descriptor lost entries");
-    // Without a stream, each kernel buffer is sorted on its own, so only the
-    // set of names is fixed. Comparing sets only is a tolerance for a known
-    // regression, not the spec: an untracked descriptor that aliases a stream
-    // can repeat entries, which Linux never does
-    // (https://github.com/rrnewton/hermit/issues/3722).
+    // Without a stream, each kernel buffer is sorted on its own, as on main,
+    // so only the set of names is fixed. The length check above together with
+    // set equality still rules out any repeated entry. The per-buffer order
+    // is an older deviation of untracked descriptors, which an identity for
+    // received descriptors removes
+    // (https://github.com/rrnewton/hermit/issues/3387). No stream is shared
+    // here, because `dir` is closed before any read, so the repeats of
+    // https://github.com/rrnewton/hermit/issues/3722 cannot occur.
     names.sort();
     assert_eq!(names, expected);
     unsafe { libc::close(received) };
@@ -491,8 +494,9 @@ fn received_descriptor_guest() {
     println!("received descriptor ok");
 }
 
-/// Tolerates repeated entries on an untracked descriptor, a known regression
-/// tracked in https://github.com/rrnewton/hermit/issues/3722; see the guest.
+/// Compares only the set of names, because an untracked descriptor still sorts
+/// each buffer on its own (https://github.com/rrnewton/hermit/issues/3387);
+/// see the guest.
 #[test]
 fn received_descriptor_lists_whole_directory() {
     run_five_times(received_descriptor_guest);
@@ -731,7 +735,12 @@ fn passed_on_descriptor_guest() {
         missing.first()
     );
 
-    // The stream itself continues where it stopped.
+    // The stream itself continues where it stopped. This is NOT Linux
+    // behaviour: the two descriptors share one position, so after the
+    // passed-on descriptor read to the end, Linux returns nothing here. The
+    // stream does not see the alias's reads and returns those entries again,
+    // the second mechanism of https://github.com/rrnewton/hermit/issues/3722.
+    // Flip this assertion when that issue is fixed.
     let mut names = first;
     names.extend(drain_names(fd));
     assert_eq!(names, expected);
