@@ -4008,6 +4008,15 @@ report.write_bytes((root/'verification.json').read_bytes())
         const IMPORT_OUT: &str = "HERMIT_SKID_RETRY_FIXTURE_IMPORT_OUT";
         const TEST: &str =
             "tests::a_skid_overshoot_only_verify_attempt_earns_one_counted_skid_retry";
+        // The commit the fixture snapshot names. Each child runs against the
+        // fixture as a Git-less source snapshot (`--repo-root` plus
+        // `--source-sha`), never against this checkout: describing the
+        // checkout runs `git status` over every tracked file, and in the
+        // validation container (files owned by another uid, Git metadata
+        // mounted read-only) that rehashes the whole tree in each of this
+        // test's 28 child runs. That alone exhausted the test's 22 s CPU
+        // budget (https://github.com/rrnewton/hermit/issues/1845).
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
         if let Some(fixture) = std::env::var_os(CHILD) {
             let fixture = PathBuf::from(fixture);
             let out = std::env::var_os(IMPORT_OUT).map_or_else(|| fixture.clone(), PathBuf::from);
@@ -4016,6 +4025,10 @@ report.write_bytes((root/'verification.json').read_bytes())
                 "parity".into(),
                 "--ci-only".into(),
                 "--prebuilt".into(),
+                "--repo-root".into(),
+                fixture.display().to_string(),
+                "--source-sha".into(),
+                SHA.into(),
                 "--jobs".into(),
                 "1".into(),
                 "--results".into(),
@@ -4029,11 +4042,7 @@ report.write_bytes((root/'verification.json').read_bytes())
             let args = parse(values.into_iter());
             validate_args("run", &args);
             let manifests = ManifestSet::load(&fixture).unwrap();
-            let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("../..")
-                .canonicalize()
-                .unwrap();
-            let code = super::run(&root, &manifests, &args);
+            let code = super::run(&fixture, &manifests, &args);
             std::process::exit(if code == ExitCode::SUCCESS { 0 } else { 1 });
         }
 
@@ -4268,6 +4277,12 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             for (position, row) in rows.iter().enumerate() {
                 assert_eq!(row.attempt, position as u64 + 1, "{scenario}");
                 row.require_current_classification().unwrap();
+                // The child described the fixture snapshot, not this checkout.
+                assert_eq!(
+                    (row.hermit_sha.as_str(), row.source_tree_dirty),
+                    (SHA, false),
+                    "{scenario}"
+                );
             }
             let summary: serde_json::Value =
                 serde_json::from_slice(&fs::read(path.join("summary.json")).unwrap()).unwrap();

@@ -3449,7 +3449,7 @@ const HERMIT_INTERNAL_FAILURE_CLASS_PREFIX: &str = "HERMIT_INTERNAL_FAILURE clas
 ///   (that guest disposition and the Hermit status reporting it), or with
 ///   Hermit exit status 0 when the row records none;
 /// - the report carries the dispatch record a passing attempt of the row's
-///   backend must carry ([`dispatch_record_error`]).
+///   backend must carry (`dispatch_record_error`).
 ///
 /// The row records its comparator, backend and expected exit. It records its
 /// declared stdout only on an infrastructure row, so the caller passes the
