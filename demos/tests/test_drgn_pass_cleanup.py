@@ -22,6 +22,7 @@ with SIGSTOP, and QEMU outlived every pass, about 140 MB each.
 
 import contextlib
 import dataclasses
+import errno
 import io
 import os
 import shutil
@@ -549,9 +550,28 @@ class OwnedProcessKillTest(unittest.TestCase):
         _wait_for_state(self, child.pid, "T")
         return child, _stat_identity(child.pid)[1]
 
+    @contextlib.contextmanager
+    def _signals_by_pid(self):
+        """Record, without sending them, the signals sent by pid or by process group."""
+        sent = []
+        with mock.patch.object(
+            dh.os, "kill", side_effect=lambda *call: sent.append(("kill",) + call)
+        ), mock.patch.object(
+            dh.os, "killpg", side_effect=lambda *call: sent.append(("killpg",) + call)
+        ):
+            yield sent
+
+    @staticmethod
+    def _not_signalled_line(name: str, pid: int, reason: str) -> str:
+        return (
+            "Could not stop {} (pid {}): {}. It was sent no signal: a signal sent by pid "
+            "alone could reach another process given that pid.\n".format(name, pid, reason)
+        )
+
     def test_the_recorded_process_is_killed_and_its_exit_confirmed(self):
         child, start_time = self._stopped_sleep()
-        self.assertEqual(dh._kill_and_wait([("QEMU", child.pid, start_time)], 10), [])
+        # Nothing still running, and nothing that could not be signalled.
+        self.assertEqual(dh._kill_and_wait([("QEMU", child.pid, start_time)], 10), ([], []))
         # It has exited; its parent, this test, has not reaped it yet.
         self.assertEqual(_stat_identity(child.pid)[0], "Z")
         self.assertEqual(child.wait(timeout=10), -signal.SIGKILL)
@@ -601,6 +621,115 @@ class OwnedProcessKillTest(unittest.TestCase):
         self.assertIn(
             "Hermit's tracer (pid 4242) is still running 0.2 s after SIGKILL.", stderr.getvalue()
         )
+
+    def test_no_signal_is_sent_by_pid_when_a_pidfd_cannot_be_opened(self):
+        # QEMU and Hermit's tracer are not this process's children, so their
+        # pids can be reused at any moment; only a pidfd names the process
+        # that a signal reaches.
+        for error_number in (errno.EPERM, errno.ENOSYS):
+            with self.subTest(error=errno.errorcode[error_number]):
+                child, start_time = self._stopped_sleep()
+                program = dh.HermitGuestProgram(mock.Mock())
+                program._owned_processes = [("QEMU", child.pid, start_time)]
+                error = OSError(error_number, os.strerror(error_number))
+                stderr = io.StringIO()
+                with self._signals_by_pid() as sent, mock.patch.object(
+                    dh.os, "pidfd_open", side_effect=error
+                ), contextlib.redirect_stderr(stderr):
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(
+                        RuntimeError,
+                        r"^could not stop QEMU \(pid {}\) after the pass$".format(child.pid),
+                    ):
+                        program.close()
+                    elapsed = time.monotonic() - started
+                self.assertEqual(sent, [])
+                # Still the same stopped process: it was sent nothing.
+                self.assertEqual(_stat_identity(child.pid), ("T", start_time))
+                self.assertEqual(
+                    stderr.getvalue(),
+                    self._not_signalled_line(
+                        "QEMU", child.pid, "pidfd_open failed: {}".format(error)
+                    ),
+                )
+                self.assertEqual(program._owned_processes, [("QEMU", child.pid, start_time)])
+                # The wait for signalled processes to exit is not spent on it.
+                self.assertLess(elapsed, dh.OWNED_PROCESS_EXIT_SECONDS)
+
+    def test_no_signal_is_sent_by_pid_when_the_pidfd_refuses_the_signal(self):
+        child, start_time = self._stopped_sleep()
+        program = dh.HermitGuestProgram(mock.Mock())
+        program._owned_processes = [("Hermit's tracer", child.pid, start_time)]
+        error = PermissionError(errno.EPERM, os.strerror(errno.EPERM))
+        stderr = io.StringIO()
+        with self._signals_by_pid() as sent, mock.patch.object(
+            dh.signal, "pidfd_send_signal", side_effect=error
+        ), contextlib.redirect_stderr(stderr):
+            with self.assertRaisesRegex(
+                RuntimeError,
+                r"^could not stop Hermit's tracer \(pid {}\) after the pass$".format(child.pid),
+            ):
+                program.close()
+        self.assertEqual(sent, [])
+        self.assertEqual(_stat_identity(child.pid), ("T", start_time))
+        self.assertEqual(
+            stderr.getvalue(),
+            self._not_signalled_line(
+                "Hermit's tracer", child.pid, "pidfd_send_signal failed: {}".format(error)
+            ),
+        )
+
+    def test_a_failed_pass_names_only_the_processes_it_signalled(self):
+        tracer, tracer_start = self._stopped_sleep()
+        qemu, qemu_start = self._stopped_sleep()
+        program = dh.HermitGuestProgram(mock.Mock())
+        program._owned_processes = [
+            ("QEMU", qemu.pid, qemu_start),
+            ("Hermit's tracer", tracer.pid, tracer_start),
+        ]
+        error = OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+        real_pidfd_open = os.pidfd_open
+
+        def pidfd_open(pid, *arguments):
+            if pid == qemu.pid:
+                raise error
+            return real_pidfd_open(pid, *arguments)
+
+        stderr = io.StringIO()
+        with self._signals_by_pid() as sent, mock.patch.object(
+            dh.os, "pidfd_open", pidfd_open
+        ), mock.patch.object(program, "_report_failed_pass") as report, contextlib.redirect_stderr(
+            stderr
+        ):
+            program.close(failed=True)
+        self.assertEqual(sent, [])
+        self.assertEqual(_stat_identity(qemu.pid), ("T", qemu_start))
+        # The tracer was killed through its pidfd; this test has not reaped it.
+        self.assertEqual(_stat_identity(tracer.pid)[0], "Z")
+        self.assertEqual(tracer.wait(timeout=10), -signal.SIGKILL)
+        # Only the tracer may be named as stopped with SIGKILL by the demo.
+        report.assert_called_once_with(["Hermit's tracer"])
+        self.assertEqual(
+            stderr.getvalue(),
+            self._not_signalled_line("QEMU", qemu.pid, "pidfd_open failed: {}".format(error)),
+        )
+
+    def test_a_process_that_has_exited_needs_no_pidfd(self):
+        # Not a failure even where pidfds are unavailable: there is nothing to
+        # signal.
+        child, start_time = self._stopped_sleep()
+        child.kill()
+        child.wait(timeout=30)
+        program = dh.HermitGuestProgram(mock.Mock())
+        program._owned_processes = [("QEMU", child.pid, start_time)]
+        stderr = io.StringIO()
+        with self._signals_by_pid() as sent, mock.patch.object(
+            dh.os, "pidfd_open", side_effect=OSError(errno.ENOSYS, os.strerror(errno.ENOSYS))
+        ), contextlib.redirect_stderr(stderr):
+            program.close()
+        self.assertEqual(sent, [])
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual(program._owned_processes, [])
 
     def test_the_state_is_read_after_the_last_parenthesis(self):
         # A command name may contain ") S (", which a parse from the first ")"
