@@ -974,9 +974,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
         // Keep the guard until the buffer is no longer used. Backends whose
-        // scratch is a Tool-owned arena (DBT, SaBRe) free it when the guard
-        // drops, so dropping it before the injected fstat would let the kernel
-        // write into freed memory.
+        // scratch is a Tool-owned arena (DBT, SaBRe, LiteInst, e9patch) free
+        // it when the guard drops, so dropping it before the injected fstat
+        // would let the kernel write into freed memory.
         let _stack_guard = stack.commit()?;
         let copied = Self::inject_fstat_into(guest, raw_fd, statptr).await?;
         // clear stack memory used for fstat allocation
@@ -1074,8 +1074,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    executable and the ELF interpreter, which `execve` maps without a
     ///    system call Detcore sees, and files mapped through a descriptor
     ///    Detcore does not track, such as one received over `SCM_RIGHTS`.
+    /// 3. Otherwise, for a snapshot of the reader's own address space, the
+    ///    guest `stat`s `/proc/self/exe`. That link names the running
+    ///    executable even after it is unlinked or replaced (the line then
+    ///    reads ` (deleted)`, or its path names another inode), and `stat`
+    ///    follows it to the file, so this covers the executable where step 2
+    ///    cannot. `/proc/<pid>/map_files/<range>` would name every mapped
+    ///    file the same way, but following it needs `CAP_SYS_ADMIN` or
+    ///    `CAP_CHECKPOINT_RESTORE` in the initial user namespace
+    ///    (`proc_map_files_get_link`), so it is not used.
     ///
-    /// Either answer is accepted only if its inode is the one the header
+    /// Each answer is accepted only if its inode is the one the header
     /// reports. For the record that check is a guard against staleness: the
     /// record can outlive the mapping it describes, because `handle_mmap`,
     /// `handle_munmap` and `handle_mremap` update it only after a successful
@@ -1099,15 +1108,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// filesystem whose `st_dev` is its superblock device, such as ext4, xfs
     /// and tmpfs -- when metadata is not virtualized (record/replay, where
     /// `stat` is not determinized either and a resolution at replay time would
-    /// depend on the replay host), and when neither step names the file.
+    /// depend on the replay host), and when no step names the file.
     ///
     /// ⚠️ ON BTRFS AND OVERLAYFS THAT FALLBACK DISAGREES WITH `stat`. The maps
-    /// inode column then differs from `st_ino` for a file that is BOTH absent
-    /// from the record and unresolvable by path: the executable or the
-    /// interpreter after it is unlinked or replaced, a file mapped through an
-    /// untracked descriptor and then unlinked, or any unlinked file in another
-    /// process's maps (or in `/proc/<own pid>/maps`, which is not recognized
-    /// as the reader's own). A path that exists also goes unresolved when
+    /// inode column then differs from `st_ino` for a file that is absent from
+    /// the record, unresolvable by path, and not the reader's own executable:
+    /// the ELF interpreter after it is unlinked or replaced, a file mapped
+    /// through an untracked descriptor and then unlinked, or any unlinked file
+    /// in another process's maps, that process's executable included (the
+    /// subject's pid does not reach this function, so `/proc/<pid>/exe` is not
+    /// tried), or in `/proc/<own pid>/maps`, which is not recognized as the
+    /// reader's own. A path that exists also goes unresolved when
     /// `stat_guest_path` cannot map the transient page it falls back to,
     /// which is not always a function of guest state (see there).
     ///
@@ -1143,6 +1154,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 return Ok(RawFileId::new(stat.st_dev, stat.st_ino));
             }
+        }
+        // Step 3. `starts` is non-empty only for a snapshot of the reader's
+        // own address space (`GuestMappingMinter::stat_identity`), whose
+        // process is the one `/proc/self` names in the guest's `fstatat`.
+        if !starts.is_empty()
+            && key.pathname.starts_with('/')
+            && let Some(stat) = self.stat_guest_path(guest, b"/proc/self/exe").await?
+            && stat.st_ino == key.inode
+        {
+            return Ok(RawFileId::new(stat.st_dev, stat.st_ino));
         }
         Ok(header)
     }
@@ -8726,6 +8747,40 @@ pub(crate) mod inject_fstat_scratch {
 
         assert_eq!(result.expect("mapping_stat_identity failed"), recorded);
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    // Step 3 of `mapping_stat_identity`: the reader's own executable after it
+    // was unlinked -- ` (deleted)`, so no path candidate -- and with no record,
+    // as `execve` maps it, is keyed on the guest's `stat` of `/proc/self/exe`,
+    // not on the header's device. For another address space (no recorded
+    // starts) `/proc/self` is not that process, and the header decides.
+    #[tokio::test]
+    async fn mapping_stat_identity_keys_the_readers_deleted_executable_on_proc_self_exe() {
+        let exe = std::fs::metadata("/proc/self/exe").unwrap();
+        let identity = RawFileId::new(exe.dev(), exe.ino());
+        assert_ne!(identity.device, HEADER_DEVICE);
+        let key = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: identity.inode,
+            pathname: "/usr/bin/replaced-executable (deleted)".to_owned(),
+        };
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+        let own = tool
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START])
+            .await;
+        assert_eq!(own.expect("mapping_stat_identity failed"), identity);
+        assert_eq!(guest.injected, [Sysno::newfstatat]);
+        assert_eq!(guest.fstatat_paths, [b"/proc/self/exe".to_vec()]);
+
+        let other = tool.mapping_stat_identity(&mut guest, &key, &[]).await;
+        assert_eq!(
+            other.expect("mapping_stat_identity failed"),
+            RawFileId::new(HEADER_DEVICE, identity.inode),
+            "another address space's line must not borrow the reader's executable"
+        );
+        assert_eq!(guest.injected, [Sysno::newfstatat], "no second stat");
     }
 
     // The reader's mapping records describe only its own address space. For a
