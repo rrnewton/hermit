@@ -3,8 +3,13 @@
 [package]
 name = "hermit-run"
 description = "Hermit: a deterministic Linux execution engine for reproducible runs, record and replay, and concurrency-race search."
-version = "0.4.0"
+version = "0.4.1"
 edition = "2024"
+readme = "README.md"
+homepage = "https://hermetic-infra.org"
+documentation = "https://docs.rs/hermit-run"
+keywords = ["linux", "hermit", "determinism", "debugging"]
+categories = ["development-tools::debugging", "development-tools::testing"]
 repository = "https://github.com/facebookexperimental/hermit"
 license = "BSD-3-Clause"
 
@@ -12,19 +17,15 @@ license = "BSD-3-Clause"
 name = "hermit"
 crate-type = ["rlib", "cdylib"]
 
-# Third-party-dependency and experimental execution backends are OFF by default
-# so the shipped `hermit` binary is a single static binary with the ptrace and
-# kvm backends. `liteinst` adds reverie-liteinst (and through it liteinst2);
-# its constructor-enabled runtime must be built and staged separately.
-# `sabre` and `e9patch` only gate dispatch code for external artifacts at
-# runtime. Their vendor artifacts and the unpublished DBT crates are excluded
-# from the crates.io release. LiteInst remains opt-in because its architecture
-# is not settled (see the 2026-10-02 patching-backends architecture audit).
+# Plain registry installation builds ptrace and KVM. SaBRe RPC/statistics
+# support and LiteInst stay behind their explicit features; e9patch
+# dispatch also requires its feature and separate runtime artifacts.
+# The registry release omits the unpublished DBT dependencies.
 [features]
 default = []
 # Native controls exercise real KVM ownership/RPC helpers without a VM.
 kvm-native-test-support = ["reverie-kvm/native-test-support"]
-sabre = []
+sabre = ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"]
 e9patch = []
 liteinst = ["dep:reverie-liteinst"]
 third-party-backends = ["sabre", "e9patch", "liteinst"]
@@ -37,14 +38,13 @@ bincode = { version = "2", features = ["serde"] }
 addr2line = "0.26.1"
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 colored = "2.1.0"
-detcore = { package = "hermit-detcore", version = "0.4.0", path = "../detcore" }
-detcore-model = { version = "0.4.0", path = "../detcore-model" }
+detcore = { package = "hermit-detcore", version = "0.4.1", path = "../detcore" }
+detcore-model = { version = "0.4.1", path = "../detcore-model" }
 diff = "0.1.13"
 dirs = "6.0"
-fbinit = "0.2.0"
+fbinit = { version = "0.2.0" }
 goblin = { version = "0.10.7", features = ["elf32", "elf64", "endian_fd"] }
-hermit-resources = { version = "0.4.0", path = "../hermit-resources" }
-hermit-test-workdir = { version = "0.4.0", path = "../common/test-workdir" }
+hermit-resources = { version = "0.4.1", path = "../hermit-resources" }
 iced-x86 = { version = "1.21.0", default-features = false, features = ["std", "decoder"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
@@ -54,14 +54,14 @@ pretty_assertions = { version = "1.4.1", features = ["alloc"], default-features 
 rand = "0.10.2"
 rand_pcg = { version = "0.10.2", features = ["serde"] }
 regex = "1.13.1"
-# Published Reverie dependencies use one exact release version. Keep these
-# requirements synchronized across all published Hermit crates.
-reverie = { package = "reverie-core", version = "=0.4.0" }
-reverie-kvm = { version = "=0.4.0" }
-reverie-ptrace = { version = "=0.4.0" }
-reverie-liteinst = { version = "=0.4.0", default-features = false, optional = true }
-reverie-rpc-transport = { version = "=0.4.0" }
-reverie-sabre-stats = { version = "=0.4.0" }
+# Published Reverie dependencies use one exact release version.
+# Keep these requirements synchronized across published Hermit crates.
+reverie = { package = "reverie-core", version = "=0.4.1" }
+reverie-kvm = { version = "=0.4.1" }
+reverie-ptrace = { version = "=0.4.1" }
+reverie-liteinst = { version = "=0.4.1", default-features = false, optional = true }
+reverie-rpc-transport = { version = "=0.4.1", optional = true }
+reverie-sabre-stats = { version = "=0.4.1", optional = true }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"
@@ -82,6 +82,4 @@ sha2 = "0.10.9"
 syn = { version = "2.0.119", features = ["full", "visit"] }
 
 [lints.rust]
-# The release omits DBT, while source shared with development and Buck builds
-# retains its feature guards. Recognize only that dormant feature name.
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("dbt"))'] }
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(feature, values(\"dbt\"))"] }

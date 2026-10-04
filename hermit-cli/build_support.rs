@@ -22,7 +22,7 @@ use std::time::UNIX_EPOCH;
 pub const STAMP_GIT_SHA_ENV: &str = "HERMIT_STAMP_GIT_SHA";
 
 /// The revision a build embeds when it is not stamped.
-/// `src/bin/hermit/version.rs` prints `dev build` for this value.
+/// `src/bin/hermit/version.rs` says `source revision not embedded` for this value.
 pub const UNSTAMPED_GIT_SHA: &str = "unknown";
 
 /// The revision to embed for the given `HERMIT_STAMP_GIT_SHA` value: `None`

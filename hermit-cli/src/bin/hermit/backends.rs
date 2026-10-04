@@ -26,6 +26,7 @@ use std::env;
 #[cfg(feature = "dbt")]
 use std::ffi::OsStr;
 use std::ffi::OsString;
+#[cfg(any(feature = "sabre", feature = "dbt"))]
 use std::fs;
 #[cfg(feature = "dbt")]
 use std::io::IsTerminal as _;
@@ -41,12 +42,14 @@ use std::io::Write;
 use std::os::fd::AsRawFd;
 #[cfg(feature = "dbt")]
 use std::os::fd::FromRawFd;
+#[cfg(any(feature = "sabre", feature = "dbt"))]
 use std::os::unix::fs::PermissionsExt;
 #[cfg(any(feature = "dbt", test))]
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 #[cfg(feature = "dbt")]
 use std::path::PathBuf;
+#[cfg(any(feature = "sabre", feature = "dbt"))]
 use std::process::Command as StdCommand;
 #[cfg(any(feature = "dbt", test))]
 use std::process::Output;
@@ -1537,6 +1540,7 @@ fn output_status(output: &Output) -> ExitStatus {
     ExitStatus::from_raw(output.status.into_raw())
 }
 
+#[cfg(feature = "sabre")]
 fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result<OsString, Error> {
     let value = std::env::var_os(variable).ok_or_else(|| {
         Error::msg(format!(
@@ -1546,6 +1550,7 @@ fn sabre_artifact(variable: &str, description: &str, executable: bool) -> Result
     validate_sabre_artifact(Path::new(&value), variable, executable)
 }
 
+#[cfg(feature = "sabre")]
 fn validate_sabre_artifact(
     requested_path: &Path,
     variable: &str,
@@ -1578,8 +1583,10 @@ fn validate_sabre_artifact(
     Ok(path.into_os_string())
 }
 
+#[cfg(feature = "sabre")]
 const SABRE_QUIET_ENV: &str = "REVERIE_SABRE_STRACE_QUIET";
 
+#[cfg(feature = "sabre")]
 fn sabre_command(
     runner: &OsString,
     sabre: &OsString,
@@ -1607,6 +1614,7 @@ fn sabre_command(
     command
 }
 
+#[cfg(feature = "sabre")]
 fn sabre_artifacts() -> Result<(OsString, OsString, OsString), Error> {
     Ok((
         sabre_artifact("HERMIT_SABRE_RUNNER", "reverie-sabre-strace", true)?,
@@ -1630,6 +1638,7 @@ fn sabre_artifacts() -> Result<(OsString, OsString, OsString), Error> {
 /// * HERMIT_SABRE_PLUGIN: libreverie_sabre_strace_plugin.so.
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(#589): Review SaBRe CLI backend dispatch.
+#[cfg(feature = "sabre")]
 pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, Error> {
     let (runner, sabre, plugin) = sabre_artifacts()?;
 
@@ -1647,8 +1656,29 @@ pub fn run_sabre_strace(program: &Path, args: &[String]) -> Result<ExitStatus, E
     Ok(status.into())
 }
 
+#[cfg(not(feature = "sabre"))]
+pub fn run_sabre_strace(_program: &Path, _args: &[String]) -> Result<ExitStatus, Error> {
+    hermit::Backend::Sabre.ensure_available()?;
+    unreachable!("SaBRe availability must fail when the feature is disabled");
+}
+
 #[cfg(test)]
 mod tests {
+    #[cfg(not(feature = "sabre"))]
+    #[test]
+    fn disabled_sabre_strace_refuses_before_resolving_artifacts() {
+        let error = super::run_sabre_strace(
+            std::path::Path::new("/hermit-missing-disabled-sabre-program"),
+            &[],
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("the `sabre` feature is not enabled")
+        );
+    }
+
     #[cfg(feature = "dbt")]
     #[tokio::test]
     async fn dbt_abnormal_cleanup_ends_an_unregistered_scheduler() {
@@ -2765,6 +2795,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn sabre_artifact_returns_the_validated_absolute_path() {
         let file = tempfile::NamedTempFile::new_in(".").unwrap();
         let relative_path = file.path().file_name().unwrap();

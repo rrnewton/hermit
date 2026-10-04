@@ -845,8 +845,66 @@ fi
 # rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
 # CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
 # 1050 effective-job-seconds budget are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 6b037bcad73db1ad6f23597e4a3ee624994c37da (2026-10-04): from
+# d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The 1-commit range (the reverie-kvm carrier
+# timestamp-class fix-forward for https://github.com/rrnewton/reverie/issues/933) touches
+# no reverie-dbt input.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 2b7ad37be26698367fc6a3990760f972e9816dcb (2026-10-04): from
+# 6b037bcad73db1ad6f23597e4a3ee624994c37da; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The 1-commit range (the launch lock's descriptor
+# allocation retry of https://github.com/rrnewton/reverie/issues/930) changes
+# reverie-process and reverie-ptrace and touches no reverie-dbt input.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO 034ebf294e3e863805d2971d85499a0041f67e8b (2026-10-04): from
+# 2b7ad37be26698367fc6a3990760f972e9816dcb; all seven recorded DynamoRIO build inputs
+# below are byte-identical. The 1-commit range (the reverie-kvm carrier
+# timestamp-class fix-forward for https://github.com/rrnewton/reverie/issues/933) touches
+# no reverie-dbt input.
+# Source identity carries the calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+# CARRY TO b8ef6a829634d51e79ebc4c24e11c5dd5fac205c (2026-10-04): from 034ebf294e3e863805d2971d85499a0041f67e8b; all seven
+# recorded DynamoRIO build inputs are byte-identical. The 0.4.1 stable-build,
+# package-metadata and pidfd compatibility work touches no DBT build input.
+# Source identity carries the existing calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != b8ef6a829634d51e79ebc4c24e11c5dd5fac205c ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie b8ef6a829634d51e79ebc4c24e11c5dd5fac205c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 

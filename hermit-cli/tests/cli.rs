@@ -442,8 +442,8 @@ fn version_names_a_revision_only_when_the_build_was_stamped() {
             "a regular build embedded a revision"
         );
         assert!(
-            text.trim_end().ends_with(", dev build)"),
-            "--version of a regular build must say dev build: {text:?}"
+            text.trim_end().ends_with(", source revision not embedded)"),
+            "--version must disclose the missing source revision: {text:?}"
         );
         assert!(
             !text.contains(", g"),

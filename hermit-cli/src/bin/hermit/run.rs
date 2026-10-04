@@ -11,6 +11,7 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::fs::File;
+#[cfg(feature = "sabre")]
 use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -97,8 +98,10 @@ use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
+#[cfg(feature = "sabre")]
 const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
 
+#[cfg(feature = "sabre")]
 fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     haystack
         .windows(needle.len())
@@ -322,6 +325,7 @@ fn take_verify_summary_before_next_run(path: &Path) -> Result<Option<RunSummary>
     Ok(summary)
 }
 
+#[cfg(feature = "sabre")]
 fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
     let mut log = OpenOptions::new().append(true).open(path)?;
     let mut guest_stderr = Vec::with_capacity(stderr.len());
@@ -4831,7 +4835,7 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let (mut out1, skid_overshoots_run1) = match run_verification_execution(
+        let (out1, skid_overshoots_run1) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run1,
             || run1_options.run_verify(log1_file, global),
@@ -4863,6 +4867,9 @@ impl RunOpts {
                 return Err(error);
             }
         };
+        #[cfg(feature = "sabre")]
+        let mut out1 = out1;
+        #[cfg(feature = "sabre")]
         let sabre_syscalls1 = match (self.selected_backend() == Backend::Sabre)
             .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
             .transpose()
@@ -4992,7 +4999,7 @@ impl RunOpts {
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let (mut out2, skid_overshoots_run2) = match run_verification_execution(
+        let (out2, skid_overshoots_run2) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run2,
             || run2_options.run_verify(log2_file, global),
@@ -5026,6 +5033,9 @@ impl RunOpts {
                 return Err(error);
             }
         };
+        #[cfg(feature = "sabre")]
+        let mut out2 = out2;
+        #[cfg(feature = "sabre")]
         if let Some(sabre_syscalls1) = sabre_syscalls1 {
             let sabre_syscalls2 = match extract_sabre_detlogs(&log2_path, &mut out2.stderr) {
                 Ok(count) => count,
@@ -6256,6 +6266,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "sabre")]
     fn extracts_sabre_detlogs_and_preserves_guest_stderr() {
         let log = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(

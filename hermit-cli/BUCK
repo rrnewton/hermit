@@ -12,10 +12,10 @@ load("@fbsource//tools/build_defs:rust_library.bzl", "rust_library")
 oncall("hermit")
 
 hermit_build_env = {
-    "CARGO_PKG_VERSION": "0.4.0",
+    "CARGO_PKG_VERSION": "0.4.1",
     "HERMIT_BUILD_DATE": "unknown",
     "HERMIT_BUILD_GIT_SHA": "unknown",
-    "HERMIT_REVERIE_PIN": "d646498e4c5ec2fbdd48d9eb0cfc26dfb4468918",
+    "HERMIT_REVERIE_PIN": "b8ef6a829634d51e79ebc4c24e11c5dd5fac205c",
 }
 
 # The shadow release entrypoint supplies these values from Git/Cargo metadata
@@ -66,9 +66,48 @@ release_unwind_target = read_root_config(
 
 rust_library(
     name = "libhermit",
+    autocargo = {
+        "cargo_toml_dir": ".",
+        "cargo_toml_config": {
+            "package": {
+                "version": "0.4.1",
+                "readme": "README.md",
+                "homepage": "https://hermetic-infra.org",
+                "documentation": "https://docs.rs/hermit-run",
+                "keywords": [
+                    "linux",
+                    "hermit",
+                    "determinism",
+                    "debugging"
+                ],
+                "categories": [
+                    "development-tools::debugging",
+                    "development-tools::testing"
+                ]
+            },
+            "dependencies_override": {
+                "dependencies": {
+                    "hermit-test-workdir": {"optional": True},
+                    "reverie-rpc-transport": {"optional": True},
+                    "reverie-sabre-stats": {"optional": True},
+                },
+            },
+            "features": {
+                "default": [],
+                "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
+                "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
+                "e9patch": [],
+                "liteinst": ["dep:reverie-liteinst"],
+                "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
+                "kvm-native-test-support": ["reverie-kvm/native-test-support"],
+                "kvm-execution-tests": [],
+            },
+        },
+    },
     srcs = glob(
         [
             "src/**/*.rs",
+            "README.md",
         ],
         exclude = [
             "src/bin/**/*.rs",
@@ -115,6 +154,44 @@ rust_library(
 
 rust_binary(
     name = "hermit",
+    autocargo = {
+        "cargo_toml_dir": ".",
+        "cargo_toml_config": {
+            "package": {
+                "version": "0.4.1",
+                "readme": "README.md",
+                "homepage": "https://hermetic-infra.org",
+                "documentation": "https://docs.rs/hermit-run",
+                "keywords": [
+                    "linux",
+                    "hermit",
+                    "determinism",
+                    "debugging"
+                ],
+                "categories": [
+                    "development-tools::debugging",
+                    "development-tools::testing"
+                ]
+            },
+            "dependencies_override": {
+                "dependencies": {
+                    "hermit-test-workdir": {"optional": True},
+                    "reverie-rpc-transport": {"optional": True},
+                    "reverie-sabre-stats": {"optional": True},
+                },
+            },
+            "features": {
+                "default": [],
+                "dbt": ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"],
+                "sabre": ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"],
+                "e9patch": [],
+                "liteinst": ["dep:reverie-liteinst"],
+                "third-party-backends": ["dbt", "sabre", "e9patch", "liteinst"],
+                "kvm-native-test-support": ["reverie-kvm/native-test-support"],
+                "kvm-execution-tests": [],
+            },
+        },
+    },
     srcs = glob(["src/bin/**/*.rs"]),
     env = hermit_build_env,
     # Signal-handler messages intentionally live for the process lifetime.
@@ -123,6 +200,7 @@ rust_binary(
         "src/bin/**/*.rs",
         "test-resources/**/*.json",
         "tests/common/readonly_proc.rs",
+        "tests/fixtures/staged-summary.gitignore",
     ]),
     deps = [
         "fbsource//third-party/rust:anyhow",
@@ -163,6 +241,7 @@ rust_library(
     srcs = glob(
         [
             "src/**/*.rs",
+            "README.md",
         ],
         exclude = [
             "src/bin/**/*.rs",
