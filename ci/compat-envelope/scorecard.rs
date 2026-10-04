@@ -5808,18 +5808,31 @@ fn parity_store_shas(input: &ParityStoreInput) -> BTreeSet<String> {
         .collect()
 }
 
+/// This checkout's copy of the fork's `main`. A parity run whose Hermit commit
+/// it does not reach is a branch run, which never headlines over a main run
+/// ([`summarize_parity`]). A commit that lands after this copy was last
+/// fetched counts as a branch commit until it is fetched again.
+const PARITY_MAIN_REF: &str = "refs/remotes/origin/main";
+
 /// What the checkout at `root` records about the Hermit commits a parity
-/// store names: each commit's [`SourceDepth`], and the cells its
-/// [`PARITY_CELLS_PATH`] selects ([`committed_parity_cells`]).
+/// store names: each commit's [`SourceDepth`], whether [`PARITY_MAIN_REF`]
+/// reaches it, and the cells its [`PARITY_CELLS_PATH`] selects
+/// ([`committed_parity_cells`]).
 ///
-/// However many runs the store holds, this costs at most two Git processes --
-/// one `cat-file --batch` for the commits and their files, and one
-/// `rev-list --parents` for the ancestry both depths are counted over -- and
-/// none when the store names no commit.
+/// However many runs the store holds, this costs at most three Git processes
+/// -- one `cat-file --batch` for the commits and their files, one
+/// `rev-list --parents` for the ancestry both depths are counted over, and
+/// one `rev-list --not` for the commits main does not reach -- and none when
+/// the store names no commit.
 #[derive(Debug, Default)]
 struct ParityCommitFacts {
     /// Each named object that is a commit in this checkout, with its depth.
     depths: BTreeMap<String, SourceDepth>,
+    /// Each named object that is a commit in this checkout, and whether
+    /// [`PARITY_MAIN_REF`] reaches it, read now rather than taken from any
+    /// row: a branch head that lands later is a main commit from then on.
+    /// Empty when Git cannot say, so no run's place is guessed.
+    on_main: BTreeMap<String, bool>,
     /// Each name's selection. `Ok(None)` when this checkout cannot read
     /// [`PARITY_CELLS_PATH`] at that commit (it does not have the commit, or
     /// the commit has no such file), so the run's coverage is unknown rather
@@ -5838,6 +5851,7 @@ impl ParityCommitFacts {
             shas,
             git_cat_file_batch(root, &Self::batch_names(shas)),
             |commits| git_commit_depths(root, commits),
+            |commits| git_commits_off_main(root, commits),
         )
     }
 
@@ -5850,12 +5864,15 @@ impl ParityCommitFacts {
     }
 
     /// The facts from Git's answers: `objects` answers [`Self::batch_names`]
-    /// ([`git_cat_file_batch`]), and `depths_of` counts the depths of the
-    /// names that are commits ([`git_commit_depths`]).
+    /// ([`git_cat_file_batch`]). Of the names that are commits, `depths_of`
+    /// counts the depths ([`git_commit_depths`]), and `off_main_of` names
+    /// those [`PARITY_MAIN_REF`] does not reach, or is `None` when Git cannot
+    /// say ([`git_commits_off_main`]).
     fn from_answers(
         shas: &BTreeSet<String>,
         objects: Result<Option<Vec<Option<(String, Vec<u8>)>>>, String>,
         depths_of: impl FnOnce(&[&str]) -> BTreeMap<String, SourceDepth>,
+        off_main_of: impl FnOnce(&[&str]) -> Option<BTreeSet<String>>,
     ) -> Self {
         let mut facts = Self::default();
         let objects = match objects {
@@ -5893,11 +5910,21 @@ impl ParityCommitFacts {
             facts.committed.insert(sha.clone(), committed);
         }
         facts.depths = depths_of(&commits);
+        if let Some(off_main) = off_main_of(&commits) {
+            facts.on_main = commits
+                .iter()
+                .map(|&commit| (commit.to_string(), !off_main.contains(commit)))
+                .collect();
+        }
         facts
     }
 
     fn depth(&self, sha: &str) -> Option<SourceDepth> {
         self.depths.get(sha).copied()
+    }
+
+    fn on_main(&self, sha: &str) -> Option<bool> {
+        self.on_main.get(sha).copied()
     }
 
     fn committed(&self, sha: &str) -> Result<Option<CommittedParityCells>, String> {
@@ -6010,6 +6037,42 @@ fn git_commit_depths(root: &Path, commits: &[&str]) -> BTreeMap<String, SourceDe
         return BTreeMap::new();
     }
     commit_depths_from_parents(&text, commits)
+}
+
+/// The commits in `commits` that [`PARITY_MAIN_REF`] does not reach, from one
+/// `git rev-list <commits> --not PARITY_MAIN_REF`. Git lists every commit the
+/// named ones reach and main does not, and each named commit reaches itself,
+/// so a named commit is listed exactly when main does not reach it. `None`
+/// when Git cannot answer, as when this checkout has no [`PARITY_MAIN_REF`].
+/// The history is read from this clone's object store alone, as in
+/// [`git_local_rev_parse`], so a missing commit is never fetched from a
+/// promisor remote.
+fn git_commits_off_main(root: &Path, commits: &[&str]) -> Option<BTreeSet<String>> {
+    if commits.is_empty() {
+        return Some(BTreeSet::new());
+    }
+    let output = Command::new("git")
+        .arg("--no-replace-objects")
+        .arg("rev-list")
+        .args(commits)
+        .args(["--not", PARITY_MAIN_REF, "--"])
+        .env("GIT_NO_LAZY_FETCH", "1")
+        .current_dir(root)
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let listed = text.lines().collect::<BTreeSet<_>>();
+    Some(
+        commits
+            .iter()
+            .copied()
+            .filter(|commit| listed.contains(commit))
+            .map(str::to_string)
+            .collect(),
+    )
 }
 
 /// Each of `commits`' [`SourceDepth`] from `git rev-list --parents` output
@@ -6664,6 +6727,11 @@ struct ParityRunSummary {
     /// than one; none of those rows is admitted.
     conflicting_hermit_shas: Vec<String>,
     depth: Option<SourceDepth>,
+    /// Whether this checkout's [`PARITY_MAIN_REF`] reaches `hermit_sha`
+    /// ([`ParityCommitFacts`]); `None` when it cannot say. It only orders
+    /// headlines, so it is not written out.
+    #[serde(skip)]
+    on_main: Option<bool>,
     emitted_at: Option<String>,
     /// `emitted_at` as parsed, which orders runs; the text is kept verbatim.
     #[serde(skip)]
@@ -6985,7 +7053,9 @@ impl ParityRunAccumulator {
 /// `committed_of` reads the parity selection a Hermit commit committed to
 /// ([`ParityCommitFacts`]); each run is measured against its own
 /// commit's selection, so a partial run is marked partial and headlines only
-/// when no complete run exists.
+/// when no complete run exists. `on_main_of` says whether this checkout's
+/// [`PARITY_MAIN_REF`] reaches a Hermit commit, so a branch run never
+/// headlines over a main run, and `depth_of` places a commit in its history.
 ///
 /// Each line is also classified by its source tree state
 /// ([`classify_parity_row`]), by the rule of section 7 of the parity summary
@@ -7005,6 +7075,7 @@ fn summarize_parity(
     input: &ParityStoreInput,
     tracked: &TrackedCells,
     depth_of: &dyn Fn(&str) -> Option<SourceDepth>,
+    on_main_of: &dyn Fn(&str) -> Option<bool>,
     committed_of: &dyn Fn(&str) -> Result<Option<CommittedParityCells>, String>,
 ) -> ParitySummary {
     let mut refusals = input.refusals.clone();
@@ -7109,6 +7180,7 @@ fn summarize_parity(
                 .unwrap_or_default(),
         );
         let depth = run.hermit_sha.as_deref().and_then(depth_of);
+        let on_main = run.hermit_sha.as_deref().and_then(on_main_of);
         let cells = run.cells.into_values().collect::<Vec<_>>();
         let (committed, committed_unknown) = match run.hermit_sha.as_deref() {
             Some(sha) => match committed_of(sha) {
@@ -7165,6 +7237,7 @@ fn summarize_parity(
             hermit_sha: run.hermit_sha,
             conflicting_hermit_shas: run.conflicting_hermit_shas,
             depth,
+            on_main,
             emitted_at: run.emitted_at.as_ref().map(|(_, text)| text.clone()),
             emitted_instant: run.emitted_at.map(|(instant, _)| instant),
             source_tree_dirty,
@@ -7178,14 +7251,19 @@ fn summarize_parity(
         });
     }
     // Only a run whose source tree state is `false` can be a headline. Among
-    // a producer's such runs, the headline is its run that reported every
-    // cell its own commit's selection owes; a partial run headlines only when
-    // no complete run exists, the most complete first. Then the deepest
-    // Hermit commit this checkout can place, the latest emission, and the run
-    // id.
+    // a producer's such runs, a run at a Hermit commit this checkout's main
+    // does not reach ranks below every other, by the rule "last tested at"
+    // uses ([`should_replace_last_tested_at`]): a branch run is not main's
+    // result, however recent its base, and an unknown place ranks as main.
+    // Then the run that reported every cell its own commit's selection owes;
+    // a partial run headlines only when no complete run exists, the most
+    // complete first. Then the deepest Hermit commit this checkout can place,
+    // the latest emission, and the run id. Nothing ranks a run by how many
+    // cells it measured: a main run that measured none headlines with none.
     let headline_key = |run: &ParityRunSummary| {
         let complete = run.total.complete();
         (
+            run.on_main != Some(false),
             complete,
             if complete {
                 0
@@ -7473,15 +7551,19 @@ fn legacy_rerun_history(
 /// The parity summary of `tracked` with no store: what a ledger without a
 /// `parity/` directory reports, and all a catalogue-only tree can report.
 fn parity_summary_without_store(tracked: &TrackedCells) -> ParitySummary {
-    summarize_parity(&ParityStoreInput::default(), tracked, &|_| None, &|_| {
-        Ok(None)
-    })
+    summarize_parity(
+        &ParityStoreInput::default(),
+        tracked,
+        &|_| None,
+        &|_| None,
+        &|_| Ok(None),
+    )
 }
 
 /// Read the ledger's parity store and summarize it beside `tracked`.
 ///
 /// A ledger without parity rows runs no Git process here; one with rows runs
-/// at most three, however many runs it holds ([`ParityCommitFacts`], and the
+/// at most four, however many runs it holds ([`ParityCommitFacts`], and the
 /// tool's own commit, which only `scorecard/parity.json` records).
 ///
 /// The only error is the ledger's own location ([`ledger_root`]), which the
@@ -7491,9 +7573,13 @@ fn load_parity_summary(root: &Path, tracked: &TrackedCells) -> Result<ParitySumm
     let ledger = ledger_root(root, false)?;
     let input = parity_store_input(&ledger);
     let facts = ParityCommitFacts::read(root, &parity_store_shas(&input));
-    let mut summary = summarize_parity(&input, tracked, &|sha| facts.depth(sha), &|sha| {
-        facts.committed(sha)
-    });
+    let mut summary = summarize_parity(
+        &input,
+        tracked,
+        &|sha| facts.depth(sha),
+        &|sha| facts.on_main(sha),
+        &|sha| facts.committed(sha),
+    );
     if summary.store_present {
         summary.generated_from.tool_hermit_commit = git_head(root).ok();
     }
@@ -16079,6 +16165,52 @@ mod local_rev_parse_tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    #[test]
+    fn main_reachability_is_read_against_this_checkouts_copy_of_main() {
+        let repo = tempfile::tempdir().unwrap();
+        git(repo.path(), &["init", "--quiet"]);
+        let commit = |message: &str| {
+            git(
+                repo.path(),
+                &[
+                    "-c",
+                    "user.name=fixture",
+                    "-c",
+                    "user.email=fixture@example.invalid",
+                    "commit",
+                    "--quiet",
+                    "--allow-empty",
+                    "-m",
+                    message,
+                ],
+            );
+            git(repo.path(), &["rev-parse", "HEAD"])
+        };
+        let base = commit("base");
+        let landed = commit("landed");
+        let branch = commit("branch");
+        let named = [base.as_str(), landed.as_str(), branch.as_str()];
+        // Without a copy of main, Git cannot say, so nothing is guessed.
+        assert_eq!(git_commits_off_main(repo.path(), &named), None);
+        git(repo.path(), &["update-ref", PARITY_MAIN_REF, &landed]);
+        assert_eq!(
+            git_commits_off_main(repo.path(), &named),
+            Some(BTreeSet::from([branch.clone()]))
+        );
+        // The branch head lands by fast-forward: from then on main reaches
+        // it, whatever was recorded while it was a branch head.
+        git(repo.path(), &["update-ref", PARITY_MAIN_REF, &branch]);
+        assert_eq!(
+            git_commits_off_main(repo.path(), &named),
+            Some(BTreeSet::new())
+        );
+        // No commit to place runs no Git process.
+        assert_eq!(
+            git_commits_off_main(Path::new("/nonexistent"), &[]),
+            Some(BTreeSet::new())
+        );
     }
 
     #[test]
@@ -37430,7 +37562,7 @@ mod parity_summary_tests {
     /// readable, so every run's coverage is unknown.
     fn summarize_rows(rows: &[ParityLedgerRow], tracked: &TrackedCells) -> ParitySummary {
         let lines = rows.iter().map(line).collect::<Vec<_>>();
-        summarize_parity(&store(&lines), tracked, &|_| None, &|_| Ok(None))
+        summarize_parity(&store(&lines), tracked, &|_| None, &|_| None, &|_| Ok(None))
     }
 
     /// A committed selection naming exactly `cells`.
@@ -38118,7 +38250,7 @@ mod parity_summary_tests {
             b"\n",
             &mut Sha256::new(),
         );
-        let summary = summarize_parity(&input, &no_cells(), &|_| None, &|_| Ok(None));
+        let summary = summarize_parity(&input, &no_cells(), &|_| None, &|_| None, &|_| Ok(None));
         let messages = summary
             .refusals
             .iter()
@@ -38664,10 +38796,13 @@ mod parity_summary_tests {
         let rendered = layouts
             .iter()
             .map(|layout| {
-                let mut summary =
-                    summarize_parity(&store_of(layout), &no_cells(), &|_| None, &|sha| {
-                        Ok((sha == SHA).then(|| selection.clone()))
-                    });
+                let mut summary = summarize_parity(
+                    &store_of(layout),
+                    &no_cells(),
+                    &|_| None,
+                    &|_| None,
+                    &|sha| Ok((sha == SHA).then(|| selection.clone())),
+                );
                 assert_eq!((summary.refused_rows, summary.duplicate_rows), (0, 2));
                 let run = &summary.producers[0];
                 assert_eq!(run.run_id, RUN);
@@ -38718,7 +38853,8 @@ mod parity_summary_tests {
                 (SHARD, twelve_diverged()),
                 (stray_shard, vec![stray.clone()]),
             ]);
-            let summary = summarize_parity(&input, &no_cells(), &|_| None, &|_| Ok(None));
+            let summary =
+                summarize_parity(&input, &no_cells(), &|_| None, &|_| None, &|_| Ok(None));
             assert_eq!(summary.refused_rows, 13, "{stray_shard}");
             let run = only_run(&summary);
             assert_eq!(run.hermit_sha, None);
@@ -38777,7 +38913,13 @@ mod parity_summary_tests {
             let mut rows = complete.clone();
             rows.push(extra);
             let lines = rows.iter().map(line).collect::<Vec<_>>();
-            summarize_parity(&store(&lines), &no_cells(), &depth_of, &committed_of)
+            summarize_parity(
+                &store(&lines),
+                &no_cells(),
+                &depth_of,
+                &|_| None,
+                &committed_of,
+            )
         };
         let complete_line = "parity: 0/3 matched; selected 3 of 3 committed; mean 0.100 over 3 \
                              measured; floor 0.100 over 3 of 3 selected (excluded: 0 no golden; \
@@ -38859,10 +39001,109 @@ mod parity_summary_tests {
             .map(|(row, at)| rerun(row.clone(), "validate-half-second", SHA, at))
             .collect::<Vec<_>>();
         let lines = whole.iter().chain(&half).map(line).collect::<Vec<_>>();
-        let summary = summarize_parity(&store(&lines), &no_cells(), &depth_of, &committed_of);
+        let summary = summarize_parity(
+            &store(&lines),
+            &no_cells(),
+            &depth_of,
+            &|_| None,
+            &committed_of,
+        );
         let run = only_run(&summary);
         assert_eq!(run.run_id, "validate-half-second");
         assert_eq!(run.emitted_at.as_deref(), Some("2026-09-29T04:10:00.5Z"));
+    }
+
+    #[test]
+    fn a_branch_run_never_headlines_over_a_main_run() {
+        const BRANCH: &str = "89abcdef0123456789abcdef0123456789abcdef";
+        let main_rows = (1..=3)
+            .map(|n| row(diverged(&golden(n), KVM, 10, 100, 11, 12, false)))
+            .collect::<Vec<_>>();
+        // The branch run reported the same complete selection later, at a
+        // commit deeper than main's: every key but its place prefers it.
+        let branch_rows = main_rows
+            .iter()
+            .map(|row| {
+                rerun(
+                    row.clone(),
+                    "validate-branch-run",
+                    BRANCH,
+                    "2026-09-29T05:00:00Z",
+                )
+            })
+            .collect::<Vec<_>>();
+        let selection = committed_of_rows(&main_rows);
+        let depth_of = |sha: &str| {
+            Some(if sha == BRANCH {
+                SourceDepth {
+                    commits: 20,
+                    first_parent: 10,
+                }
+            } else {
+                SourceDepth {
+                    commits: 10,
+                    first_parent: 5,
+                }
+            })
+        };
+        let committed_of = |sha: &str| Ok((sha == SHA || sha == BRANCH).then(|| selection.clone()));
+        let summarize = |rows: &[&ParityLedgerRow], on_main_of: &dyn Fn(&str) -> Option<bool>| {
+            let lines = rows.iter().copied().map(line).collect::<Vec<_>>();
+            summarize_parity(
+                &store(&lines),
+                &no_cells(),
+                &depth_of,
+                on_main_of,
+                &committed_of,
+            )
+        };
+        let both = main_rows.iter().chain(&branch_rows).collect::<Vec<_>>();
+        // Placed by nothing, the later and deeper branch run headlines: the
+        // ranking this replaces.
+        let summary = summarize(&both, &|_| None);
+        assert_eq!(
+            (
+                only_run(&summary).run_id.as_str(),
+                only_run(&summary).on_main
+            ),
+            ("validate-branch-run", None)
+        );
+        // Placed against main, main's own run headlines and the branch run
+        // stays in `runs` with its own line.
+        let summary = summarize(&both, &|sha| Some(sha == SHA));
+        assert_eq!(
+            (
+                only_run(&summary).run_id.as_str(),
+                only_run(&summary).on_main
+            ),
+            (RUN, Some(true))
+        );
+        let brief = summary
+            .runs
+            .iter()
+            .find(|brief| brief.run_id == "validate-branch-run")
+            .unwrap();
+        assert!(!brief.headline, "{brief:#?}");
+        // A commit whose place is unknown ranks as main, above a branch run.
+        let summary = summarize(&both, &|sha| (sha == BRANCH).then_some(false));
+        assert_eq!(
+            (
+                only_run(&summary).run_id.as_str(),
+                only_run(&summary).on_main
+            ),
+            (RUN, None)
+        );
+        // With no main run, a branch run still headlines: the place orders
+        // runs, it never hides one.
+        let branch_only = branch_rows.iter().collect::<Vec<_>>();
+        let summary = summarize(&branch_only, &|_| Some(false));
+        assert_eq!(
+            (
+                only_run(&summary).run_id.as_str(),
+                only_run(&summary).on_main
+            ),
+            ("validate-branch-run", Some(false))
+        );
     }
 
     #[test]
@@ -38879,7 +39120,7 @@ mod parity_summary_tests {
             (&golden(1), SABRE),
         ]);
         let lines = rows.iter().map(line).collect::<Vec<_>>();
-        let summary = summarize_parity(&store(&lines), &no_cells(), &|_| None, &|sha| {
+        let summary = summarize_parity(&store(&lines), &no_cells(), &|_| None, &|_| None, &|sha| {
             Ok((sha == SHA).then(|| selection.clone()))
         });
         let run = only_run(&summary);
@@ -38928,9 +39169,13 @@ mod parity_summary_tests {
         let owed = (1..=31)
             .map(|n| (golden(n), KVM))
             .collect::<CommittedParityCells>();
-        let summary = summarize_parity(&store(&[line(&rows[0])]), &no_cells(), &|_| None, &|_| {
-            Ok(Some(owed.clone()))
-        });
+        let summary = summarize_parity(
+            &store(&[line(&rows[0])]),
+            &no_cells(),
+            &|_| None,
+            &|_| None,
+            &|_| Ok(Some(owed.clone())),
+        );
         let run = only_run(&summary);
         assert_eq!(run.committed_cells_without_row.len(), 30);
         let rendered = render_parity_section(&summary);
@@ -39057,11 +39302,43 @@ mod parity_summary_tests {
             "{directory} {broken}\n{broken} {merge}\n{merge} {good} {side}\n\
              {side} {without}\n{good} {without}\n{without}\n"
         );
-        let facts = ParityCommitFacts::from_answers(&shas, Ok(Some(objects)), |commits| {
-            // Only the names that are commits here are counted.
-            assert_eq!(commits, [&without, &good, &broken, &directory]);
-            commit_depths_from_parents(&parents, commits)
-        });
+        let facts = ParityCommitFacts::from_answers(
+            &shas,
+            Ok(Some(objects)),
+            |commits| {
+                // Only the names that are commits here are counted.
+                assert_eq!(commits, [&without, &good, &broken, &directory]);
+                commit_depths_from_parents(&parents, commits)
+            },
+            |commits| {
+                // Only they are placed against main: here `directory` is a
+                // branch head main does not reach yet.
+                assert_eq!(commits, [&without, &good, &broken, &directory]);
+                Some(BTreeSet::from([directory.clone()]))
+            },
+        );
+        assert_eq!(facts.on_main(&without), Some(true));
+        assert_eq!(facts.on_main(&good), Some(true));
+        assert_eq!(facts.on_main(&broken), Some(true));
+        assert_eq!(facts.on_main(&directory), Some(false));
+        // A name this checkout lacks is not placed.
+        assert_eq!(facts.on_main(absent), None);
+        // Git could not say where main is: no commit is placed, and the
+        // rest of the facts stand.
+        let unplaced = ParityCommitFacts::from_answers(
+            &shas,
+            Ok(Some(parse_cat_file_batch(&names, &stdout).unwrap())),
+            |commits| commit_depths_from_parents(&parents, commits),
+            |_| None,
+        );
+        for sha in &shas {
+            assert_eq!(unplaced.on_main(sha), None, "{sha}");
+        }
+        assert_eq!(
+            unplaced.committed(&good),
+            Ok(Some(committed(&[(&golden(1), KVM)])))
+        );
+        assert_eq!(unplaced.depth(&broken), facts.depth(&broken));
         assert_eq!(
             facts.committed(&good),
             Ok(Some(committed(&[(&golden(1), KVM)])))
@@ -39108,21 +39385,29 @@ mod parity_summary_tests {
         // Git could not read the checkout (a directory that is no checkout):
         // every selection is unknown and nothing is counted. Git could not be
         // asked at all: every selection carries the error.
-        let no_checkout = ParityCommitFacts::from_answers(&shas, Ok(None), |_| {
-            panic!("no depth is counted without a checkout")
-        });
-        let unasked_git = ParityCommitFacts::from_answers(&shas, Err("no git".into()), |_| {
-            panic!("no depth is counted without git")
-        });
+        let no_checkout = ParityCommitFacts::from_answers(
+            &shas,
+            Ok(None),
+            |_| panic!("no depth is counted without a checkout"),
+            |_| panic!("no commit is placed against main without a checkout"),
+        );
+        let unasked_git = ParityCommitFacts::from_answers(
+            &shas,
+            Err("no git".into()),
+            |_| panic!("no depth is counted without git"),
+            |_| panic!("no commit is placed against main without git"),
+        );
         for sha in &shas {
             assert_eq!(no_checkout.committed(sha), Ok(None), "{sha}");
             assert_eq!(no_checkout.depth(sha), None, "{sha}");
+            assert_eq!(no_checkout.on_main(sha), None, "{sha}");
             assert_eq!(
                 unasked_git.committed(sha),
                 Err("no git".to_string()),
                 "{sha}"
             );
             assert_eq!(unasked_git.depth(sha), None, "{sha}");
+            assert_eq!(unasked_git.on_main(sha), None, "{sha}");
         }
 
         // An answer that is short, overlong, names another object, or is
@@ -39295,7 +39580,7 @@ mod parity_summary_tests {
                 message: why.into(),
             };
             assert_eq!(input.refusals, [refusal.clone()]);
-            let summary = summarize_parity(&input, &cells, &|_| None, &|_| Ok(None));
+            let summary = summarize_parity(&input, &cells, &|_| None, &|_| None, &|_| Ok(None));
             assert!(summary.store_present);
             assert!(summary.producers.is_empty() && summary.runs.is_empty());
             assert_eq!((summary.rows_read, summary.refused_rows), (0, 0));
@@ -39376,7 +39661,7 @@ mod parity_summary_tests {
             committed_parity_cells(&fs::read_to_string(dir.join("committed-cells.json")).unwrap())
                 .unwrap();
         assert_eq!(committed_cells.len(), 192);
-        let summary = summarize_parity(&input, &no_cells(), &|_| None, &|sha| {
+        let summary = summarize_parity(&input, &no_cells(), &|_| None, &|_| None, &|sha| {
             Ok((sha == fixture_sha).then(|| committed_cells.clone()))
         });
         assert_eq!((summary.refused_rows, summary.duplicate_rows), (0, 0));
@@ -39662,7 +39947,9 @@ mod parity_summary_tests {
     /// The summary of `lines`, verbatim, in one shard, with no commit's parity
     /// selection readable.
     fn summarize_lines(lines: &[String]) -> ParitySummary {
-        summarize_parity(&store(lines), &no_cells(), &|_| None, &|_| Ok(None))
+        summarize_parity(&store(lines), &no_cells(), &|_| None, &|_| None, &|_| {
+            Ok(None)
+        })
     }
 
     /// The brief of a run whose commit this checkout cannot place.
