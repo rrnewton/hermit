@@ -2240,6 +2240,118 @@ fn result_identity(result: &DagManifest) -> String {
     )
 }
 
+/// The manifest-cell result selectors a step owns, borrowed.
+///
+/// The same population as `Step::effective_result_manifests`, which clones
+/// every selector on every call: the explicit `result_manifests` cells when
+/// the step declares them (an explicit empty list owns nothing), else its
+/// `manifest` selector.
+fn result_selectors(step: &Step) -> impl Iterator<Item = &DagManifest> + '_ {
+    let explicit = step.result_manifests.as_deref();
+    let fallback = if explicit.is_none() {
+        step.manifest.as_ref()
+    } else {
+        None
+    };
+    explicit
+        .into_iter()
+        .flatten()
+        .filter_map(|manifest| match manifest {
+            ResultManifest::ManifestCell(cell) => Some(cell),
+            ResultManifest::StructuredTestResults(_) => None,
+        })
+        .chain(fallback)
+}
+
+/// Selector fields in the order `DagManifest::matches_exact_result` compares
+/// them: lane, category, then test, mode and backend, where `None` matches
+/// any value.
+type SelectorKey<'a> = (
+    &'a str,
+    &'a str,
+    Option<&'a str>,
+    Option<&'a str>,
+    Option<&'a str>,
+);
+
+/// `result_manifest_owner` for many results against one step list.
+///
+/// `result_manifest_owner` scans every step and clones every step's
+/// selectors for each result, so checking a profile's results costs results
+/// times selectors, almost all of it allocation: 1,233 by 1,233 for the full
+/// profile, about seven million selector clones across the profiles and the
+/// Buck E2E selection, which made `generate` 80% of the scorecard self-test's
+/// CPU time. This indexes the borrowed selectors once by their
+/// exact fields. A selector matches an exact result exactly when its lane
+/// and category are equal and each of test, mode and backend is either unset
+/// or equal, so the owners of an exact result are precisely the steps under
+/// the eight keys that set each of those three fields to the result's value
+/// or leave it unset.
+///
+/// The index alone decides only the one-owner case. An inexact result, no
+/// owner, or several owners is handed to `result_manifest_owner` itself, so
+/// every refusal and its text are the library's own.
+struct ResultOwnerIndex<'a> {
+    steps: &'a [Step],
+    owners: BTreeMap<SelectorKey<'a>, Vec<usize>>,
+}
+
+impl<'a> ResultOwnerIndex<'a> {
+    fn new(steps: &'a [Step]) -> Self {
+        let mut owners = BTreeMap::<SelectorKey<'a>, Vec<usize>>::new();
+        for (index, step) in steps.iter().enumerate() {
+            for selector in result_selectors(step) {
+                let key = (
+                    selector.lane.as_str(),
+                    selector.category.as_str(),
+                    selector.test.as_deref(),
+                    selector.mode.as_deref(),
+                    selector.backend.as_deref(),
+                );
+                let steps = owners.entry(key).or_default();
+                if steps.last() != Some(&index) {
+                    steps.push(index);
+                }
+            }
+        }
+        Self { steps, owners }
+    }
+
+    fn owner(&self, result: &DagManifest) -> Result<&'a Step, String> {
+        let lane = result.lane.as_str();
+        let category = result.category.as_str();
+        let (Some(test), Some(mode), Some(backend)) = (
+            result.test.as_deref(),
+            result.mode.as_deref(),
+            result.backend.as_deref(),
+        ) else {
+            return result_manifest_owner(self.steps, result);
+        };
+        if [lane, category, test, mode, backend]
+            .iter()
+            .any(|field| field.is_empty())
+        {
+            return result_manifest_owner(self.steps, result);
+        }
+        let mut found = Vec::new();
+        for test in [Some(test), None] {
+            for mode in [Some(mode), None] {
+                for backend in [Some(backend), None] {
+                    if let Some(steps) = self.owners.get(&(lane, category, test, mode, backend)) {
+                        found.extend_from_slice(steps);
+                    }
+                }
+            }
+        }
+        found.sort_unstable();
+        found.dedup();
+        match found.as_slice() {
+            [owner] => Ok(&self.steps[*owner]),
+            _ => result_manifest_owner(self.steps, result),
+        }
+    }
+}
+
 /// Manifest categories the quick profile's pinned-root verify smoke
 /// (quick.e2e_verify) omits: the compatibility corpus runs programs installed
 /// on the validation host and reads fixtures compatprep.fixtures prepares,
@@ -2384,8 +2496,10 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
         }
     }
     let expected = expected_for_label("full", cells);
+    let owners = ResultOwnerIndex::new(&selected.steps);
     for result in &expected {
-        result_manifest_owner(&selected.steps, result)
+        owners
+            .owner(result)
             .map_err(|error| format!("Buck E2E result ownership failed: {error}"))?;
     }
     let expected_ids = expected
@@ -2395,8 +2509,8 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
     let actual_ids = selected
         .steps
         .iter()
-        .flat_map(|step| step.effective_result_manifests().into_owned())
-        .map(|result| result_identity(&result))
+        .flat_map(result_selectors)
+        .map(result_identity)
         .collect::<BTreeSet<_>>();
     if actual_ids != expected_ids {
         return Err(format!(
@@ -3270,8 +3384,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             ));
         }
         let expected_results = cells.for_label(profile.label);
+        let owners = ResultOwnerIndex::new(&selected.steps);
         for result in &expected_results {
-            result_manifest_owner(&selected.steps, result)
+            owners
+                .owner(result)
                 .map_err(|error| format!("{} result ownership failed: {error}", profile.label))?;
         }
         let expected_result_ids = expected_results
@@ -3281,8 +3397,8 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         let actual_result_ids = selected
             .steps
             .iter()
-            .flat_map(|step| step.effective_result_manifests().into_owned())
-            .map(|result| result_identity(&result))
+            .flat_map(result_selectors)
+            .map(result_identity)
             .collect::<BTreeSet<_>>();
         if actual_result_ids != expected_result_ids {
             return Err(format!(
@@ -4171,6 +4287,97 @@ sys.exit(37)
             result_manifest_owner(&[first, second], &result)
                 .unwrap_err()
                 .contains("multiple owning steps")
+        );
+    }
+
+    #[test]
+    fn result_owner_index_answers_exactly_what_result_manifest_owner_answers() {
+        let selector =
+            |category: &str, test: Option<&str>, mode: Option<&str>, backend: Option<&str>| {
+                DagManifest {
+                    lane: "portable".into(),
+                    category: category.into(),
+                    test: test.map(Into::into),
+                    mode: mode.map(Into::into),
+                    backend: backend.map(Into::into),
+                }
+            };
+        let named = |job: &str, result_manifests: Vec<DagManifest>| {
+            let mut step = owner(result_manifests);
+            step.job = job.into();
+            step
+        };
+        // Every wildcard shape, a duplicate selector inside one step, two
+        // steps that overlap, the `manifest` fallback, and an explicit empty
+        // list that must not fall back.
+        let exact_echo = selector("applications", Some("echo"), Some("verify"), Some("ptrace"));
+        let mut fallback = named("fallback", Vec::new());
+        fallback.result_manifests = None;
+        fallback.manifest = Some(selector("fallback", None, None, None));
+        let mut explicit_empty = named("explicit_empty", Vec::new());
+        explicit_empty.manifest = Some(selector("unowned", None, None, None));
+        let steps = vec![
+            named("exact", vec![exact_echo.clone(), exact_echo.clone()]),
+            named(
+                "any_test",
+                vec![selector("applications", None, Some("run"), Some("kvm"))],
+            ),
+            named(
+                "any_mode_backend",
+                vec![selector("applications", Some("cat"), None, None)],
+            ),
+            named(
+                "overlap",
+                vec![selector("applications", Some("echo"), None, Some("ptrace"))],
+            ),
+            named(
+                "any_mode",
+                vec![selector("tools", Some("ls"), None, Some("kvm"))],
+            ),
+            fallback,
+            explicit_empty,
+        ];
+        let mut results = Vec::new();
+        for category in ["applications", "tools", "fallback", "unowned", ""] {
+            for test in [Some("echo"), Some("cat"), Some("ls"), Some(""), None] {
+                for mode in [Some("verify"), Some("run"), None] {
+                    for backend in [Some("ptrace"), Some("kvm"), Some(""), None] {
+                        results.push(selector(category, test, mode, backend));
+                    }
+                }
+            }
+        }
+        let index = ResultOwnerIndex::new(&steps);
+        let mut outcomes = BTreeSet::new();
+        for result in &results {
+            match (index.owner(result), result_manifest_owner(&steps, result)) {
+                (Ok(indexed), Ok(scanned)) => {
+                    assert!(std::ptr::eq(indexed, scanned), "{result:?}");
+                    outcomes.insert("one owner");
+                }
+                (Err(indexed), Err(scanned)) => {
+                    assert_eq!(indexed, scanned, "{result:?}");
+                    for class in [
+                        "no owning step",
+                        "multiple owning steps",
+                        "not an exact identity",
+                    ] {
+                        if scanned.contains(class) {
+                            outcomes.insert(class);
+                        }
+                    }
+                }
+                (indexed, scanned) => panic!("{result:?}: index {indexed:?}, scan {scanned:?}"),
+            }
+        }
+        assert_eq!(
+            outcomes,
+            BTreeSet::from([
+                "one owner",
+                "no owning step",
+                "multiple owning steps",
+                "not an exact identity",
+            ])
         );
     }
 
