@@ -368,6 +368,14 @@ Selection and bounded-batch options (run and plan):
                            are omitted. Sampling draws only from cells whose
                            manifests provide executable commands. With --green
                            and --repetitions, sample cells selected by full.
+                           A sampled dbt, kvm, liteinst or sabre verify cell
+                           whose parity cell is applicable in
+                           ci/compat-envelope/parity-cells.json also runs its
+                           test's ptrace verify cell as a reference, once,
+                           unless the sample holds it, so the parity post-pass
+                           can score the pair. References are extra: COUNT
+                           stays the sampled cells, and run.json and
+                           summary.json list references apart.
   --green                  With --repetitions, select cells selected by full instead
                            of red cells. Exact --test/--mode/--backend, --mode,
                            and --sample filters are retained in run.json. A sample
@@ -411,10 +419,14 @@ Parity post-pass (run and summarize):
   Once DIR/summary.json is written, the same post-pass as test-harness compares
   each parity cell's candidate verify log with the ptrace verify log of the same
   series (first repetition of each) and writes one line per cell to
-  DIR/parity.jsonl. A verify cell whose first repetition the summary refused
-  makes its parity cells unavailable, with the summary's reason. Every cell of
-  a series is launched with one HERMIT_EPOCH, recorded in run.json. The
-  post-pass never changes summary.json or the exit status.
+  DIR/parity.jsonl. Its cells are those of tests/e2e/parity-selection.yaml,
+  --parity-select, and a sample's own parity candidates, each scored against
+  the ptrace reference the sample holds or runs beside it. A verify cell whose
+  first repetition the summary refused makes its parity cells unavailable,
+  with the summary's reason; a reference that left no result row makes its
+  pair reference-missing. Every cell of a series is launched with one
+  HERMIT_EPOCH, recorded in run.json. The post-pass never changes summary.json
+  or the exit status.
 
 Examples:
   # Probe one cell with at most 600 seconds for its complete retry lifecycle.
@@ -645,9 +657,90 @@ struct PressureCells {
     eligible_cells: usize,
     preparation_by_test: BTreeMap<String, CellId>,
     cells_file_sha256: Option<String>,
-    /// The manifest facts of every selected cell and every preparation cell,
+    /// The manifest facts of every selected, reference and preparation cell,
     /// keyed by (test, mode, backend).
     manifest_facts: BTreeMap<(String, String, String), ManifestCellFacts>,
+    /// [`parity_references`] of a sample: run beside `selected`, never in it.
+    references: Vec<TrackedCell>,
+    /// The parity cells of the sampled candidates, `<test-id>@<backend>`.
+    parity_pairs: Vec<String>,
+}
+
+/// A sample's parity references (owner ruling: one parity mechanism in
+/// validation and the pressure test, scored after determinism). For every
+/// sampled verify cell on a backend parity compares with ptrace whose parity
+/// cell the committed snapshot [`parity::PARITY_CELLS_PATH`] lists as
+/// applicable, the pair is scored by the post-pass, and the test's ptrace
+/// verify cell is run as the reference unless the sample already holds it.
+/// Returns the references, in identity order and each once, and the pairs as
+/// canonical `<test-id>@<backend>` strings.
+fn parity_references(
+    root: &Path,
+    sampled: &[TrackedCell],
+    tracked_by_id: &BTreeMap<CellId, TrackedCell>,
+) -> Result<(Vec<TrackedCell>, Vec<String>), String> {
+    let path = root.join(parity::PARITY_CELLS_PATH);
+    let snapshot: parity::ParityCells = serde_json::from_slice(
+        &fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+    )
+    .map_err(|e| format!("invalid {}: {e}", path.display()))?;
+    let applicable: BTreeMap<(String, parity::ParityBackend), bool> = snapshot
+        .cells
+        .iter()
+        .map(|cell| ((cell.test_id.clone(), cell.backend), cell.applicable))
+        .collect();
+    let sampled_ids: BTreeSet<&CellId> = sampled.iter().map(|cell| &cell.id).collect();
+    let mut references = BTreeMap::new();
+    let mut pairs = BTreeSet::new();
+    for cell in sampled {
+        if cell.id.mode != parity::PARITY_MODE {
+            continue;
+        }
+        let Ok(backend) = parity::ParityBackend::parse(&cell.id.backend) else {
+            continue;
+        };
+        let pair = applicable
+            .get(&(cell.id.test.clone(), backend))
+            .copied()
+            .ok_or_else(|| {
+                format!(
+                    "{} has no parity cell {}@{backend}; regenerate it with {}",
+                    parity::PARITY_CELLS_PATH,
+                    cell.id.test,
+                    parity::PARITY_CELLS_REGENERATE
+                )
+            })?;
+        if !pair {
+            continue;
+        }
+        pairs.insert(
+            parity::ParityCellId {
+                test_id: cell.id.test.clone(),
+                backend,
+            }
+            .to_string(),
+        );
+        let reference = CellId {
+            mode: parity::PARITY_MODE.into(),
+            backend: parity::PARITY_REFERENCE_BACKEND.into(),
+            ..cell.id.clone()
+        };
+        if sampled_ids.contains(&reference) || references.contains_key(&reference) {
+            continue;
+        }
+        let tracked = tracked_by_id.get(&reference).ok_or_else(|| {
+            format!(
+                "parity candidate {} has no tracked reference cell {}",
+                display_id(&cell.id),
+                display_id(&reference)
+            )
+        })?;
+        references.insert(reference, tracked.clone());
+    }
+    Ok((
+        references.into_values().collect(),
+        pairs.into_iter().collect(),
+    ))
 }
 
 /// What the manifest says about one cell that a generated `test-harness`
@@ -1800,6 +1893,18 @@ struct RunMetadata {
     /// `--parity-select`, as retained for the post-pass and a re-summary.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     parity_select: Vec<String>,
+    /// The ptrace verify reference of every sampled parity candidate that the
+    /// sample does not itself hold, run as an extra cell so the post-pass can
+    /// score the pair ([`parity_references`]). Not part of `cells`:
+    /// `--sample N` keeps meaning N sampled cells. Empty for runs planned
+    /// before references existed, and for every unsampled selection.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    reference_cells: Vec<CellId>,
+    /// The parity cells (`<test-id>@<backend>`) of the sampled candidates, in
+    /// canonical order. The post-pass reports them besides the committed
+    /// selection and `--parity-select`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    parity_pairs: Vec<String>,
     cells: Vec<CellId>,
 }
 
@@ -3852,6 +3957,11 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     let mut selected_cells = Vec::new();
     let mut unavailable = Vec::new();
     let mut applicable_by_test = BTreeMap::new();
+    let tracked_by_id: BTreeMap<CellId, TrackedCell> = tracked
+        .cells
+        .iter()
+        .map(|cell| (cell.id.clone(), cell.clone()))
+        .collect();
     for cell in tracked.cells {
         if !seen.insert(cell.id.clone()) {
             return Err("tracked cells contain a duplicate identity".into());
@@ -4097,8 +4207,33 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         selected_cells.truncate(count);
         selected_cells.sort_by(|left, right| left.id.cmp(&right.id));
     }
+    let (references, parity_pairs) = if selection.sample.is_some() {
+        parity_references(root, &selected_cells, &tracked_by_id)?
+    } else {
+        (Vec::new(), Vec::new())
+    };
+    for reference in &references {
+        let budget = budgets
+            .get(&(
+                reference.id.test.clone(),
+                reference.id.mode.clone(),
+                reference.id.backend.clone(),
+            ))
+            .ok_or_else(|| {
+                format!(
+                    "no manifest execution budget for {}",
+                    display_id(&reference.id)
+                )
+            })?;
+        if budget.attempts.is_none() || !reference.is_applicable() {
+            return Err(format!(
+                "parity reference {} is not an executable applicable cell",
+                display_id(&reference.id)
+            ));
+        }
+    }
     let mut preparation_by_test = BTreeMap::new();
-    for cell in &selected_cells {
+    for cell in selected_cells.iter().chain(&references) {
         let prepared_with = applicable_by_test.get(&cell.id.test).ok_or_else(|| {
             format!(
                 "{} has no applicable manifest mode available to build its fixture",
@@ -4116,6 +4251,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     let mut manifest_facts = BTreeMap::new();
     for (id, applicable) in selected_cells
         .iter()
+        .chain(&references)
         .map(|cell| (&cell.id, cell.is_applicable()))
         .chain(preparation_by_test.values().map(|id| (id, true)))
     {
@@ -4131,6 +4267,8 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         preparation_by_test,
         cells_file_sha256,
         manifest_facts,
+        references,
+        parity_pairs,
     })
 }
 
@@ -5121,13 +5259,19 @@ fn write_plan_after_scorecard_check(
     // clocks. An inherited HERMIT_EPOCH is kept verbatim.
     let hermit_epoch = run_epoch_from_env()?;
     let PressureCells {
-        selected: cells,
+        selected: sampled,
         unavailable,
         eligible_cells,
         preparation_by_test: all_preparations,
         cells_file_sha256,
         manifest_facts,
+        references,
+        parity_pairs,
     } = pressure_cells(root, selection)?;
+    // Every cell the graph runs: the selected population and, for a sample,
+    // its parity references. Only `sampled` is the run's selected population.
+    let mut cells: Vec<TrackedCell> = sampled.iter().chain(&references).cloned().collect();
+    cells.sort_by(|left, right| left.id.cmp(&right.id));
     let facts_of = |cell: &CellId| -> Result<&ManifestCellFacts, String> {
         manifest_facts
             .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
@@ -5666,7 +5810,8 @@ fn write_plan_after_scorecard_check(
         ));
     }
 
-    let selected_cells: Vec<_> = cells.into_iter().map(|cell| cell.id).collect();
+    let selected_cells: Vec<_> = sampled.into_iter().map(|cell| cell.id).collect();
+    let reference_cells: Vec<_> = references.into_iter().map(|cell| cell.id).collect();
     let selected_population_sha256 = selection
         .cells_file
         .as_ref()
@@ -5716,6 +5861,8 @@ fn write_plan_after_scorecard_check(
         selected_population_sha256,
         hermit_epoch: Some(hermit_epoch),
         parity_select: selection.parity_select.clone(),
+        reference_cells,
+        parity_pairs,
         cells: selected_cells,
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
@@ -5978,7 +6125,13 @@ fn validate_run_contract(
         retained_cells_file_cells: metadata.cells_file.as_ref().map(|_| metadata.cells.clone()),
     };
     let pressure_cells = pressure_cells(root, &selection)?;
-    validate_guest_caps_against_selected_demand(&pressure_cells.selected, &selection)?;
+    let planned: Vec<TrackedCell> = pressure_cells
+        .selected
+        .iter()
+        .chain(&pressure_cells.references)
+        .cloned()
+        .collect();
+    validate_guest_caps_against_selected_demand(&planned, &selection)?;
     if metadata.repetitions.is_some() && metadata.eligible_cells == 0 {
         return Err("repeated run metadata does not record its eligible-cell count".into());
     }
@@ -6014,6 +6167,8 @@ fn validate_run_contract(
         ));
     }
     let expected_cells = pressure_cells.selected;
+    let expected_references = pressure_cells.references;
+    let expected_pairs = pressure_cells.parity_pairs;
     let mut expected = BTreeMap::new();
     for tracked in expected_cells {
         let applicable = tracked.is_applicable();
@@ -6047,6 +6202,30 @@ fn validate_run_contract(
             missing,
             extra
         ));
+    }
+    // A sample's parity references and pairs are derived from its selected
+    // population, so a retained run must record exactly what that derivation
+    // gives now. The references then join the cells the graph must run.
+    let reference_ids: Vec<CellId> = expected_references
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    if metadata.reference_cells != reference_ids || metadata.parity_pairs != expected_pairs {
+        return Err(format!(
+            "run metadata records parity references {:?} and pairs {:?}, but its selected population derives {:?} and {:?}",
+            metadata.reference_cells, metadata.parity_pairs, reference_ids, expected_pairs
+        ));
+    }
+    for tracked in expected_references {
+        if expected
+            .insert(tracked.id.clone(), tracked.is_applicable())
+            .is_some()
+        {
+            return Err(format!(
+                "parity reference {} is also a selected cell",
+                display_id(&tracked.id)
+            ));
+        }
     }
 
     let dag_path = results.join("dag.json");
@@ -7923,6 +8102,41 @@ fn verify_repetition_summary_json(
     if summary.get("attempted").and_then(JsonValue::as_u64) != Some(attempted as u64) {
         return Err("summary JSON lost the retained harness-attempt count".into());
     }
+    // Parity references are reported apart from the sampled cells: each is a
+    // ptrace verify cell, none is also a sampled row, and none is counted in
+    // `selected_cells`. `summarize` always writes the array; an accounting
+    // fixture without one has no references.
+    let no_references = Vec::new();
+    let references = match summary.get("reference_cells") {
+        None => &no_references,
+        Some(value) => value
+            .as_array()
+            .ok_or("summary JSON parity references are not an array")?,
+    };
+    let sampled: BTreeSet<CellId> = summary
+        .get("rows")
+        .and_then(JsonValue::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|row| serde_json::from_value(row.get("cell")?.clone()).ok())
+        .collect();
+    for reference in references {
+        let cell: CellId = reference
+            .get("cell")
+            .cloned()
+            .and_then(|cell| serde_json::from_value(cell).ok())
+            .ok_or("summary JSON has a parity reference without a cell identity")?;
+        if cell.mode != parity::PARITY_MODE
+            || cell.backend != parity::PARITY_REFERENCE_BACKEND
+            || sampled.contains(&cell)
+        {
+            return Err(format!(
+                "summary JSON reports {} as a parity reference; a reference is a ptrace verify cell the sample does not hold",
+                display_id(&cell)
+            ));
+        }
+    }
     if summary
         .get("retried_repetitions")
         .and_then(JsonValue::as_u64)
@@ -8383,6 +8597,7 @@ fn summarize(
     let expected_runner_tags: BTreeSet<String> = metadata
         .cells
         .iter()
+        .chain(&metadata.reference_cells)
         .flat_map(|cell| {
             repetition_numbers(metadata.repetitions)
                 .map(move |repetition| format!("cell.{}", cell_run_slug(cell, repetition)))
@@ -8437,7 +8652,16 @@ fn summarize(
     let mut parity_rows: Vec<CellResult> = Vec::new();
     let mut parity_rejected: BTreeMap<(String, String), parity::ParityRejection> = BTreeMap::new();
     let mut parity_nondeterministic: BTreeMap<(String, String), String> = BTreeMap::new();
-    for cell in &metadata.cells {
+    // A sample's parity references are summarized like its cells, for the
+    // post-pass, but reported apart: their rows go to `reference_rows`, and
+    // they add nothing to the sample's counts, tallies or exit status.
+    let mut reference_rows = Vec::new();
+    let planned_cells = metadata
+        .cells
+        .iter()
+        .map(|cell| (cell, false))
+        .chain(metadata.reference_cells.iter().map(|cell| (cell, true)));
+    for (cell, is_reference) in planned_cells {
         for repetition in repetition_numbers(metadata.repetitions) {
             let slug = cell_run_slug(cell, repetition);
             let evidence_run_id =
@@ -8871,15 +9095,17 @@ fn summarize(
                 runner,
                 harness_status,
             )?;
-            attempted = attempted
-                .checked_add(retained_attempts)
-                .ok_or("pressure attempt count overflowed usize")?;
-            *by_backend
-                .entry(cell.backend.clone())
-                .or_default()
-                .entry(result.to_string())
-                .or_default() += 1;
-            if metadata.repetitions.is_some() {
+            if !is_reference {
+                attempted = attempted
+                    .checked_add(retained_attempts)
+                    .ok_or("pressure attempt count overflowed usize")?;
+                *by_backend
+                    .entry(cell.backend.clone())
+                    .or_default()
+                    .entry(result.to_string())
+                    .or_default() += 1;
+            }
+            if metadata.repetitions.is_some() && !is_reference {
                 fold_repetition(
                     repeated.entry(cell.clone()).or_default(),
                     &RepetitionSample {
@@ -8904,9 +9130,14 @@ fn summarize(
                         .ok_or("pressure retried-repetition count overflowed usize")?;
                 }
             }
-            if result == "pass" && metadata.repetitions.is_none() {
+            if result == "pass" && metadata.repetitions.is_none() && !is_reference {
                 passing.push(display_id(cell));
             }
+            let output_rows = if is_reference {
+                &mut reference_rows
+            } else {
+                &mut rows
+            };
             // ⚠️ AN EARLIER ATTEMPT THAT DIVERGED IS STILL AN OBSERVATION.
             // The row above reports the framework-selected cell result: a passing
             // retry is green, while a product failure stays red if every retry
@@ -8992,7 +9223,7 @@ fn summarize(
                             Some(recorded) => recorded,
                             None => expected_result,
                         };
-                        rows.push(json!({
+                        output_rows.push(json!({
                             "cell": cell,
                             "repetition": repetition,
                             "attempt": earlier_row.attempt,
@@ -9023,7 +9254,7 @@ fn summarize(
                     }
                 }
             }
-            rows.push(json!({
+            output_rows.push(json!({
                 "cell": cell,
                 "repetition": repetition,
                 "attempt": attempt,
@@ -9239,6 +9470,24 @@ fn summarize(
         None
     };
 
+    if !metadata.reference_cells.is_empty() {
+        println!(
+            "Parity references: {} ptrace verify cell(s) run beside the {} sampled cell(s) so the post-pass can score {} sampled pair(s); they are reported apart in summary.json and do not count above.",
+            metadata.reference_cells.len(),
+            metadata.cells.len(),
+            metadata.parity_pairs.len()
+        );
+        for row in &reference_rows {
+            if let (Some(cell), Some(result)) = (
+                row.get("cell")
+                    .and_then(|cell| serde_json::from_value::<CellId>(cell.clone()).ok()),
+                row.get("result").and_then(JsonValue::as_str),
+            ) {
+                println!("  REFERENCE {} {result}", display_id(&cell));
+            }
+        }
+        println!();
+    }
     let summary = json!({
         "schema": SUMMARY_SCHEMA,
         "hermit_sha": metadata.hermit_sha,
@@ -9265,6 +9514,8 @@ fn summarize(
         "attempted": attempted,
         "pass_candidates": passing,
         "rows": rows,
+        "parity_pairs": metadata.parity_pairs,
+        "reference_cells": reference_rows,
     });
     verify_repetition_summary_json(&summary, attempted, retried_repetitions)?;
     let mut text = serde_json::to_string_pretty(&summary)
@@ -9508,8 +9759,8 @@ fn pressure_parity(
     parity::post_pass(config, &scope.cells, rows).map(Some)
 }
 
-/// [`parity::resolve_scope`] over the verify cells of one series and its
-/// `--parity-select` cells.
+/// [`parity::resolve_scope`] over the verify cells of one series, including
+/// its parity references, and its `--parity-select` cells and sampled pairs.
 fn series_parity_scope(
     root: &Path,
     metadata: &RunMetadata,
@@ -9518,10 +9769,17 @@ fn series_parity_scope(
     let planned = metadata
         .cells
         .iter()
+        .chain(&metadata.reference_cells)
         .filter(|cell| cell.mode == parity::PARITY_MODE)
         .map(|cell| (cell.test.clone(), cell.backend.clone()))
         .collect();
-    let explicit = metadata.parity_select.join(",");
+    let explicit = metadata
+        .parity_select
+        .iter()
+        .chain(&metadata.parity_pairs)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(",");
     parity::resolve_scope(root, &manifests, Some(&explicit), &planned)
 }
 
@@ -12170,6 +12428,195 @@ fn compat_fixture_step_refusal_self_test(root: &Path) -> Result<(), String> {
     }
 }
 
+/// The parity candidates of a sampled population: its verify cells on a
+/// backend parity compares with ptrace, whose parity cell the committed
+/// snapshot ([`parity::PARITY_CELLS_PATH`]) lists as applicable. Read from the
+/// snapshot's JSON, independently of the planner.
+fn snapshot_parity_pairs(root: &Path) -> Result<BTreeSet<(String, String)>, String> {
+    let path = root.join(parity::PARITY_CELLS_PATH);
+    let snapshot: JsonValue = serde_json::from_slice(
+        &fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+    )
+    .map_err(|e| format!("invalid {}: {e}", path.display()))?;
+    let cells = snapshot["cells"]
+        .as_array()
+        .ok_or_else(|| format!("{} has no cells array", path.display()))?;
+    Ok(cells
+        .iter()
+        .filter(|cell| cell["applicable"] == json!(true))
+        .filter_map(|cell| {
+            Some((
+                cell["test_id"].as_str()?.to_string(),
+                cell["backend"].as_str()?.to_string(),
+            ))
+        })
+        .collect())
+}
+
+/// The ptrace verify reference of a parity candidate.
+fn reference_of(cell: &CellId) -> CellId {
+    CellId {
+        mode: parity::PARITY_MODE.into(),
+        backend: parity::PARITY_REFERENCE_BACKEND.into(),
+        ..cell.clone()
+    }
+}
+
+/// A seeded red sample adds, for every sampled parity candidate, its test's
+/// ptrace verify cell as an extra reference cell, once, and only when the
+/// sample does not already hold it. `--sample N` still selects N cells; the
+/// references are retained apart in run.json, run as their own nodes, and
+/// their pairs enter the parity scope. A sampled cell that is not a verify
+/// candidate with an applicable pair adds nothing.
+fn parity_reference_sample_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
+    const SAMPLE: usize = 40;
+    let pairs = snapshot_parity_pairs(root)?;
+    let candidate = |cell: &CellId| {
+        cell.mode == parity::PARITY_MODE
+            && parity::ParityBackend::parse(&cell.backend).is_ok()
+            && pairs.contains(&(cell.test.clone(), cell.backend.clone()))
+    };
+    let unpaired_candidate = |cell: &CellId| {
+        cell.mode == parity::PARITY_MODE
+            && parity::ParityBackend::parse(&cell.backend).is_ok()
+            && !pairs.contains(&(cell.test.clone(), cell.backend.clone()))
+    };
+    let population: Vec<CellId> = pressure_cells(root, &CellSelection::default())?
+        .selected
+        .into_iter()
+        .map(|cell| cell.id)
+        .filter(|cell| matches!(cell.mode.as_str(), "verify" | "replay" | "chaos"))
+        .collect();
+    let sample_of = |seed: u64| -> BTreeSet<CellId> {
+        let mut scored: Vec<(u64, &CellId)> = population
+            .iter()
+            .map(|cell| (sample_score(cell, seed), cell))
+            .collect();
+        scored.sort();
+        scored
+            .into_iter()
+            .take(SAMPLE)
+            .map(|(_, cell)| cell.clone())
+            .collect()
+    };
+    // The first seed whose sample adds a reference, already holds another
+    // candidate's reference, holds a candidate without an applicable pair,
+    // and holds a cell that is not in verify mode.
+    let (seed, sampled) = (0..1_000_000u64)
+        .map(|seed| (seed, sample_of(seed)))
+        .find(|(_, sampled)| {
+            let references: BTreeSet<CellId> = sampled
+                .iter()
+                .filter(|cell| candidate(cell))
+                .map(reference_of)
+                .collect();
+            references.iter().any(|cell| !sampled.contains(cell))
+                && references.iter().any(|cell| sampled.contains(cell))
+                && sampled.iter().any(|cell| unpaired_candidate(cell))
+                && sampled.iter().any(|cell| cell.mode != parity::PARITY_MODE)
+        })
+        .ok_or("no seed below 1000000 samples every parity-reference case")?;
+    let candidates: Vec<&CellId> = sampled.iter().filter(|cell| candidate(cell)).collect();
+    let expected_references: BTreeSet<CellId> = candidates
+        .iter()
+        .map(|cell| reference_of(cell))
+        .filter(|cell| !sampled.contains(cell))
+        .collect();
+    let expected_pairs: BTreeSet<String> = candidates
+        .iter()
+        .map(|cell| format!("{}@{}", cell.test, cell.backend))
+        .collect();
+    let checked = CheckedScorecard {
+        root,
+        enforce_host_capabilities: false,
+        memory_budget_override: Some(i64::MAX),
+    };
+    let plan = scratch.join("parity-reference-sample-plan");
+    let selection = CellSelection {
+        sample: Some(SAMPLE),
+        seed: Some(seed),
+        run_timeout_seconds: Some(1_000_000),
+        ..CellSelection::default()
+    };
+    let (_, dag) =
+        write_plan_after_scorecard_check(&checked, &plan, &plan.join("dag.json"), &selection)?;
+    let run: JsonValue = serde_json::from_slice(
+        &fs::read(plan.join("run.json")).map_err(|e| format!("cannot read run.json: {e}"))?,
+    )
+    .map_err(|e| format!("invalid run.json: {e}"))?;
+    let ids = |key: &str| -> Result<Vec<CellId>, String> {
+        serde_json::from_value(run.get(key).cloned().unwrap_or_else(|| json!([])))
+            .map_err(|e| format!("run.json {key}: {e}"))
+    };
+    let retained_cells = ids("cells")?;
+    let retained_references = ids("reference_cells")?;
+    let retained_pairs: Vec<String> = serde_json::from_value(
+        run.get("parity_pairs")
+            .cloned()
+            .unwrap_or_else(|| json!([])),
+    )
+    .map_err(|e| format!("run.json parity_pairs: {e}"))?;
+    if retained_cells.len() != SAMPLE
+        || retained_cells.iter().cloned().collect::<BTreeSet<_>>() != sampled
+    {
+        return Err(format!(
+            "seed {seed}: run.json does not retain exactly the {SAMPLE} sampled cells: {retained_cells:?}"
+        ));
+    }
+    if retained_references.iter().cloned().collect::<BTreeSet<_>>() != expected_references
+        || retained_references.len() != expected_references.len()
+    {
+        return Err(format!(
+            "seed {seed}: run.json reference cells {retained_references:?}, expected {expected_references:?}"
+        ));
+    }
+    if retained_pairs.iter().cloned().collect::<BTreeSet<_>>() != expected_pairs
+        || retained_pairs.len() != expected_pairs.len()
+    {
+        return Err(format!(
+            "seed {seed}: run.json parity pairs {retained_pairs:?}, expected {expected_pairs:?}"
+        ));
+    }
+    let nodes: Vec<&Step> = dag
+        .steps
+        .iter()
+        .filter(|step| step.group == "cell")
+        .collect();
+    let expected_nodes: BTreeSet<String> = sampled
+        .iter()
+        .chain(&expected_references)
+        .map(|cell| cell_run_slug(cell, None))
+        .collect();
+    let node_jobs: BTreeSet<String> = nodes.iter().map(|step| step.job.clone()).collect();
+    if nodes.len() != SAMPLE + expected_references.len() || node_jobs != expected_nodes {
+        return Err(format!(
+            "seed {seed}: the plan runs {} cell node(s), expected the {SAMPLE} sampled cells and {} reference(s), each once",
+            nodes.len(),
+            expected_references.len()
+        ));
+    }
+    for reference in &expected_references {
+        let slug = cell_run_slug(reference, None);
+        let step = nodes
+            .iter()
+            .find(|step| step.job == slug)
+            .ok_or_else(|| format!("seed {seed}: no node for reference {slug}"))?;
+        let words = format!(
+            "--test {} --mode {} --backend {}",
+            shell_quote(&reference.test),
+            shell_quote(parity::PARITY_MODE),
+            shell_quote(parity::PARITY_REFERENCE_BACKEND)
+        );
+        if !step.cmd.contains(&words) {
+            return Err(format!(
+                "seed {seed}: reference node {slug} does not run its ptrace verify cell: {}",
+                step.cmd
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Result<(), String> {
     let git_dir = source.join(".git");
     let git_dir_text = git_dir.to_string_lossy().into_owned();
@@ -14141,6 +14588,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     disabled_cells_file_self_test(root, &scratch)?;
     focused_run_type_selection_self_test(root, &scratch)?;
     validate_run_state_self_test(root, &scratch)?;
+    parity_reference_sample_self_test(root, &scratch)?;
 
     let cells_file_results = scratch.join("cells-file-plan");
     let cells_file_budget_keys = cells_file_ids
@@ -16025,6 +16473,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         selected_population_sha256: None,
         hermit_epoch: None,
         parity_select: Vec::new(),
+        reference_cells: Vec::new(),
+        parity_pairs: Vec::new(),
         cells: vec![sample_a.clone()],
     };
     if current_result_policy(&sample_metadata, false)?
@@ -18825,6 +19275,40 @@ fn self_test(root: &Path) -> Result<(), String> {
     let mut forged_promotion = summary_accounting.clone();
     forged_promotion["repeated_cells"][0]["classification"] = json!("promotion-candidate");
     forged_promotion["repeated_cells"][0]["promotion_candidate"] = json!(true);
+    // Parity references stay apart from the sampled rows: a ptrace verify
+    // reference beside its candidate is accepted, while a reference that is
+    // not a ptrace verify cell, that is also a sampled row, that has no cell,
+    // or a reference list that is not an array, is refused.
+    let reference_cell = sample_a.clone();
+    let candidate_cell = CellId {
+        backend: "sabre".into(),
+        ..sample_a.clone()
+    };
+    let mut with_reference = summary_accounting.clone();
+    with_reference["rows"] = json!([{"cell": candidate_cell}]);
+    with_reference["reference_cells"] = json!([{"cell": reference_cell, "result": "pass"}]);
+    verify_repetition_summary_json(&with_reference, 3, 1)
+        .map_err(|e| format!("a summary with a parity reference was refused: {e}"))?;
+    let mut candidate_as_reference = with_reference.clone();
+    candidate_as_reference["reference_cells"][0]["cell"]["backend"] = json!("sabre");
+    let mut sampled_reference = with_reference.clone();
+    sampled_reference["rows"] = json!([{"cell": reference_cell}]);
+    let mut anonymous_reference = with_reference.clone();
+    anonymous_reference["reference_cells"] = json!([{"result": "pass"}]);
+    let mut scalar_references = with_reference.clone();
+    scalar_references["reference_cells"] = json!(1);
+    for (label, forged) in [
+        ("candidate backend", &candidate_as_reference),
+        ("sampled row", &sampled_reference),
+        ("missing cell", &anonymous_reference),
+        ("non-array", &scalar_references),
+    ] {
+        if verify_repetition_summary_json(forged, 3, 1).is_ok() {
+            return Err(format!(
+                "summary JSON with a {label} parity reference was accepted"
+            ));
+        }
+    }
     if verify_repetition_summary_json(&missing_population_identity, 3, 1).is_ok()
         || verify_repetition_summary_json(&missing_retry_count, 3, 1).is_ok()
         || verify_repetition_summary_json(&wrong_attempt_count, 3, 1).is_ok()
@@ -19444,7 +19928,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, run-type harness selection, VALIDATE_RUN_STATE and fixture preparation, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, run-type harness selection, VALIDATE_RUN_STATE and fixture preparation, sampled parity references, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
     );
     Ok(())
 }
@@ -23288,6 +23772,182 @@ mod pressure_sample_tests {
         assert!(retained_host_inapplicable(&path, &cell).is_err());
         guard.remove().unwrap();
     }
+
+    /// A one-cell red sample whose cell is a parity candidate runs its test's
+    /// ptrace verify cell as a reference. The summary lists the reference
+    /// apart from the sampled cells, so the selected count, the rows and the
+    /// attempt count stay the sample's, and a reference that left no result
+    /// row is neither an infrastructure error of the sample nor dropped: the
+    /// post-pass reports the pair `reference-missing`.
+    #[test]
+    fn a_failed_reference_is_summarized_apart_and_its_pair_is_reference_missing() {
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let pairs = snapshot_parity_pairs(&root).unwrap();
+        let population: Vec<CellId> = pressure_cells(&root, &CellSelection::default())
+            .unwrap()
+            .selected
+            .into_iter()
+            .map(|cell| cell.id)
+            .filter(|cell| matches!(cell.mode.as_str(), "verify" | "replay" | "chaos"))
+            .collect();
+        // The first seed whose one-cell sample is a comparable parity
+        // candidate.
+        let (seed, candidate) = (0..1_000_000u64)
+            .find_map(|seed| {
+                let sampled = population
+                    .iter()
+                    .min_by_key(|cell| (sample_score(cell, seed), (*cell).clone()))?;
+                let comparable = parity::ParityBackend::parse(&sampled.backend)
+                    .is_ok_and(|backend| backend.inputs_not_equalizable().is_none());
+                (sampled.mode == parity::PARITY_MODE
+                    && comparable
+                    && pairs.contains(&(sampled.test.clone(), sampled.backend.clone())))
+                .then(|| (seed, sampled.clone()))
+            })
+            .expect("a seed samples a comparable parity candidate");
+        let reference = reference_of(&candidate);
+        let (results, cleanup) = parity_self_test_results("reference-missing");
+        let selection = CellSelection {
+            sample: Some(1),
+            seed: Some(seed),
+            run_timeout_seconds: Some(1_000_000),
+            ..CellSelection::default()
+        };
+        let (mut metadata, dag) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &selection,
+        )
+        .unwrap();
+        assert_eq!(metadata.cells, vec![candidate.clone()]);
+        let reference_slug = cell_run_slug(&reference, None);
+        assert!(
+            dag.steps
+                .iter()
+                .any(|step| step.group == "cell" && step.job == reference_slug),
+            "the plan does not run the reference {reference_slug}"
+        );
+        metadata.source_tree_dirty = false;
+        fs::write(
+            results.join("run.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        // The candidate's verify cell matched canonically and retained its
+        // golden log: a deterministic operand, so only the reference decides
+        // the pair.
+        let epoch = metadata
+            .hermit_epoch
+            .clone()
+            .expect("a planned series records its epoch");
+        let candidate_slug = cell_run_slug(&candidate, None);
+        let run_id = cell_evidence_run_id(&candidate, None, metadata.run_id_prefix.as_deref());
+        let cell_dir = results.join("cells").join(&candidate_slug);
+        fs::create_dir_all(&cell_dir).unwrap();
+        fs::write(cell_dir.join("harness-status"), "0\n").unwrap();
+        let artifact = results.join("runs").join(&run_id).join("attempt-1");
+        let logs = artifact.join("verify-logs/verify-1");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("run1_log_fixture.log"),
+            "INFO detcore a\nINFO detcore b\n",
+        )
+        .unwrap();
+        let mut inner = comparison_attempt("verify", 0);
+        inner.argv = vec![
+            "hermit".into(),
+            "--verify-log-dir".into(),
+            logs.to_string_lossy().into_owned(),
+        ];
+        inner.env = BTreeMap::from([
+            ("HERMIT_EPOCH".into(), epoch),
+            ("LC_ALL".into(), "C".into()),
+        ]);
+        inner.shell_command = literal_shell_command(&inner.cwd, &inner.env, &inner.argv);
+        fs::write(
+            verification_report_path(&artifact),
+            inner.verification_report.as_ref().unwrap(),
+        )
+        .unwrap();
+        let mut row = history_row("verify", "PASS", 1, vec![inner.clone()]);
+        row.run_id = run_id;
+        row.run_index = Some(0);
+        row.hermit_sha = metadata.hermit_sha.clone();
+        row.test = candidate.test.clone();
+        row.category = candidate.category.clone();
+        row.lane = candidate.lane.clone();
+        row.backend = Some(candidate.backend.clone());
+        row.classification = "required".into();
+        row.argv = inner.argv.clone();
+        row.guest_argv = inner.guest_argv.clone();
+        row.env = inner.env.clone();
+        row.cwd = inner.cwd.clone();
+        row.shell_command = inner.shell_command.clone();
+        row.timeout_seconds = 57;
+        row.execution_cpu_timeout_seconds = Some(22);
+        row.execution_wall_timeout_seconds = Some(57);
+        row.artifact_dir = artifact.to_string_lossy().into_owned();
+        fs::write(
+            cell_dir.join("results.jsonl"),
+            format!("{}\n", serde_json::to_string(&row).unwrap()),
+        )
+        .unwrap();
+        // The reference's node ran and exited nonzero without a result row.
+        let reference_dir = results.join("cells").join(&reference_slug);
+        fs::create_dir_all(&reference_dir).unwrap();
+        fs::write(reference_dir.join("harness-status"), "1\n").unwrap();
+        let evidence: BTreeMap<String, RunnerEvidence> =
+            [(&candidate_slug, true), (&reference_slug, false)]
+                .into_iter()
+                .map(|(slug, ok)| {
+                    (
+                        format!("cell.{slug}"),
+                        RunnerEvidence {
+                            seen: true,
+                            ok,
+                            ..RunnerEvidence::default()
+                        },
+                    )
+                })
+                .collect();
+
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        let summary: JsonValue =
+            serde_json::from_slice(&fs::read(results.join("summary.json")).unwrap()).unwrap();
+        assert_eq!(summary["selected_cells"], json!(1), "{summary}");
+        assert_eq!(summary["attempted"], json!(1), "{summary}");
+        let rows = summary["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1, "{summary}");
+        assert_eq!(rows[0]["cell"], json!(candidate));
+        assert_eq!(rows[0]["result"], json!("pass"), "{summary}");
+        let references = summary["reference_cells"].as_array().unwrap();
+        assert_eq!(references.len(), 1, "{summary}");
+        assert_eq!(references[0]["cell"], json!(reference));
+        assert_eq!(references[0]["result"], json!("infrastructure-error"));
+        let cell = parity::ParityCellId {
+            test_id: candidate.test.clone(),
+            backend: parity::ParityBackend::parse(&candidate.backend).unwrap(),
+        };
+        let records = read_parity_records(&results.join(parity::PARITY_JSONL));
+        let record = parity_record(&records, &cell);
+        assert_eq!(
+            (record.verdict, record.unavailable_class, record.operand),
+            (
+                parity::ParityVerdict::ReferenceMissing,
+                Some(parity::UnavailableClass::NoResultRow),
+                Some(parity::ParityOperand::Reference)
+            ),
+            "{record:?}"
+        );
+        record.validate().unwrap();
+        cleanup.remove().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -24693,6 +25353,36 @@ mod validate_run_state_tests {
             false,
         )
         .unwrap();
+        cleanup.remove().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod parity_reference_tests {
+    //! A seeded sample runs each sampled parity candidate's ptrace verify
+    //! reference as an extra cell, once, and scores the pair in the post-pass.
+    use super::*;
+
+    #[test]
+    fn a_sample_adds_each_candidates_reference_once_and_nothing_else() {
+        let root = Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf();
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-parity-reference-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let cleanup = SelfTestDirectory::new(path.clone());
+        parity_reference_sample_self_test(&root, &path).unwrap();
         cleanup.remove().unwrap();
     }
 }
