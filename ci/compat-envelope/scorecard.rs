@@ -12978,6 +12978,50 @@ fn typed_event_digest(row: &SeriesRow) -> Result<String, String> {
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+/// Validate V3 series rows grouped by the three identity fields
+/// [`binding_matches_event`] compares for equality: resolved cell, tree and
+/// run id. Built once per append instead of scanning every snapshot row,
+/// with a freshly formatted cell key per row, once for each candidate.
+struct AttemptEventIndex<'a> {
+    by_run: BTreeMap<(String, String, String), Vec<&'a SeriesRow>>,
+}
+
+impl<'a> AttemptEventIndex<'a> {
+    fn new(events: &'a [SeriesRow]) -> Self {
+        let mut by_run = BTreeMap::<_, Vec<&'a SeriesRow>>::new();
+        for row in events {
+            if row.producer == SeriesProducer::Validate && row.schema == SeriesSchema::V3 {
+                by_run
+                    .entry((
+                        series_row_cell(row).into_owned(),
+                        row.series.tree.clone(),
+                        row.run_id.clone(),
+                    ))
+                    .or_default()
+                    .push(row);
+            }
+        }
+        Self { by_run }
+    }
+
+    /// Exactly the rows [`binding_matches_event`] accepts, in snapshot order.
+    fn matching(&self, binding: &ComparisonAttemptBinding) -> Vec<&'a SeriesRow> {
+        let key = (
+            series_cell_key(&binding.cell),
+            binding.hermit_sha.clone(),
+            binding.run_id.clone(),
+        );
+        self.by_run
+            .get(&key)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+            .iter()
+            .copied()
+            .filter(|row| binding_matches_event(binding, row))
+            .collect()
+    }
+}
+
 fn binding_matches_event(binding: &ComparisonAttemptBinding, row: &SeriesRow) -> bool {
     row.producer == SeriesProducer::Validate
         && row.schema == SeriesSchema::V3
@@ -13041,13 +13085,26 @@ fn validate_attempt_bindings(
     {
         return Err("comparison-attempt bindings have unknown or empty authority".into());
     }
-    if envelope
+    let keys = envelope
         .bindings
-        .windows(2)
-        .any(|pair| binding_key(&pair[0]) >= binding_key(&pair[1]))
-    {
+        .iter()
+        .map(binding_key)
+        .collect::<Vec<_>>();
+    if keys.windows(2).any(|pair| pair[0] >= pair[1]) {
         return Err("comparison-attempt bindings must have unique canonical ordering".into());
     }
+    // The ordering check above makes every key unique, so this holds each
+    // binding's cell under its own key and nothing else.
+    let binding_cells = keys
+        .iter()
+        .zip(&envelope.bindings)
+        .map(|(key, binding)| (key, &binding.cell))
+        .collect::<BTreeMap<_, _>>();
+    let bound_to_cell = |key: &(DirectEvidenceBase, String), cell: &CellId| {
+        binding_cells
+            .get(key)
+            .is_some_and(|bound_cell| *bound_cell == cell)
+    };
     if envelope
         .retired_canonical_comparisons
         .windows(2)
@@ -13058,10 +13115,7 @@ fn validate_attempt_bindings(
     let mut retired = BTreeMap::new();
     for comparison in &envelope.retired_canonical_comparisons {
         let key = retired_comparison_key(comparison);
-        if !envelope
-            .bindings
-            .iter()
-            .any(|binding| binding_key(binding) == key && binding.cell == comparison.cell)
+        if !bound_to_cell(&key, &comparison.cell)
             || comparison.typed_comparison_sha256
                 != typed_comparison_digest(&comparison.comparison)?
         {
@@ -13082,10 +13136,7 @@ fn validate_attempt_bindings(
     for comparison in &envelope.retired_backend_parity_comparisons {
         let key = retired_parity_key(comparison);
         if retired.contains_key(&key)
-            || !envelope
-                .bindings
-                .iter()
-                .any(|binding| binding_key(binding) == key && binding.cell == comparison.cell)
+            || !bound_to_cell(&key, &comparison.cell)
             || comparison.typed_comparison_sha256
                 != typed_comparison_digest(&comparison.comparison)?
         {
@@ -13096,9 +13147,18 @@ fn validate_attempt_bindings(
         }
         retired_parity.insert(key, comparison);
     }
+    // Every event a binding names is found by lookup; scanning all snapshot
+    // rows once per bound event cost 9,568 scans of 241,357 rows per call.
+    let rows_by_event = rows.map(|rows| {
+        let mut index = BTreeMap::<&str, Vec<&SeriesRow>>::new();
+        for row in rows {
+            index.entry(row.event_id.as_str()).or_default().push(row);
+        }
+        index
+    });
     let mut attempts = ValidatedComparisonAttempts::new();
     let mut unique_attempts = BTreeSet::new();
-    for binding in &envelope.bindings {
+    for (binding, key) in envelope.bindings.iter().zip(&keys) {
         if binding.provenance != ObservationProvenance::Validate
             || !is_object_id(&binding.hermit_sha)
             || !is_object_id(&binding.detcore_tree)
@@ -13127,8 +13187,8 @@ fn validate_attempt_bindings(
                     && *digest == binding.evidence_sha256
             })
             .collect::<Vec<_>>();
-        let archived = retired.get(&binding_key(binding));
-        let archived_parity = retired_parity.get(&binding_key(binding));
+        let archived = retired.get(key);
+        let archived_parity = retired_parity.get(key);
         if live.len() > 1
             || live
                 .iter()
@@ -13179,12 +13239,12 @@ fn validate_attempt_bindings(
             {
                 return Err("comparison-attempt binding repeats or corrupts an event".into());
             }
-            if let Some(rows) = rows {
-                let matching = rows
-                    .iter()
-                    .filter(|row| row.event_id == event.event_id)
-                    .collect::<Vec<_>>();
-                let [row] = matching.as_slice() else {
+            if let Some(rows_by_event) = &rows_by_event {
+                let matching = rows_by_event
+                    .get(event.event_id.as_str())
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[]);
+                let [row] = matching else {
                     return Err("comparison-attempt binding requires its original event".into());
                 };
                 if !binding_matches_event(binding, row)
@@ -13739,6 +13799,13 @@ fn append_attempt_bindings(
         )?;
     }
     let representation = direct_representation(tracked, events, &combined)?;
+    // Built once per append: the per-candidate scans of every tracked cell
+    // and every snapshot row were the cost here, not the bindings themselves.
+    let mut cells_by_id = BTreeMap::<&CellId, Vec<&TrackedCell>>::new();
+    for cell in &tracked.cells {
+        cells_by_id.entry(&cell.id).or_default().push(cell);
+    }
+    let events_by_run = AttemptEventIndex::new(events);
     let mut additions = Vec::new();
     let mut staged_current_keys = BTreeSet::new();
     for source in sources {
@@ -13755,10 +13822,11 @@ fn append_attempt_bindings(
                 };
                 let key = (base, candidate.evidence_identity.clone());
                 // Only existing, typed direct comparisons receive these bindings.
-                let results = tracked
-                    .cells
+                let results = cells_by_id
+                    .get(id)
+                    .map(Vec::as_slice)
+                    .unwrap_or(&[])
                     .iter()
-                    .filter(|cell| &cell.id == id)
                     .flat_map(|cell| &cell.observations)
                     .filter(|observation| {
                         observation.event_ids.is_empty()
@@ -13816,10 +13884,7 @@ fn append_attempt_bindings(
                     snapshot: snapshot.clone(),
                     events: Vec::new(),
                 };
-                let matching_events = events
-                    .iter()
-                    .filter(|event| binding_matches_event(&binding, event))
-                    .collect::<Vec<_>>();
+                let matching_events = events_by_run.matching(&binding);
                 for event in matching_events {
                     if !representation
                         .represented_event_ids
@@ -14046,19 +14111,43 @@ fn direct_evidence_keys(
     Ok((counts, opaque))
 }
 
+/// Tracked cells grouped by their series-store key ([`series_cell_key`]).
+///
+/// Built once per pass. Matching each series row to its cell by scanning every
+/// tracked cell and formatting that cell's key made one pass over a 241,357-row
+/// snapshot and 14,800 cells allocate 3.6 billion strings (about 330 s), and a
+/// combined write-back makes four such passes.
+struct SeriesCellIndex<'a> {
+    by_key: BTreeMap<String, Vec<&'a TrackedCell>>,
+}
+
+impl<'a> SeriesCellIndex<'a> {
+    fn new(tracked: &'a TrackedCells) -> Self {
+        let mut by_key = BTreeMap::<String, Vec<&'a TrackedCell>>::new();
+        for cell in &tracked.cells {
+            by_key
+                .entry(series_cell_key(&cell.id))
+                .or_default()
+                .push(cell);
+        }
+        Self { by_key }
+    }
+
+    /// Every tracked cell whose series-store key is `key`, in catalogue order.
+    fn matching(&self, key: &str) -> &[&'a TrackedCell] {
+        self.by_key.get(key).map(Vec::as_slice).unwrap_or(&[])
+    }
+}
+
 fn source_direct_evidence_key(
     row: &SeriesRow,
-    tracked: &TrackedCells,
+    cells: &SeriesCellIndex<'_>,
 ) -> Result<Option<(DirectEvidenceBase, Option<DirectEvidenceKey>)>, String> {
     if row.validate_for_projection().is_err() {
         return Ok(None);
     }
     let row_cell = series_row_cell(row);
-    let matches = tracked
-        .cells
-        .iter()
-        .filter(|cell| series_cell_key(&cell.id) == row_cell)
-        .collect::<Vec<_>>();
+    let matches = cells.matching(&row_cell);
     if matches.len() != 1 {
         return Ok(None);
     }
@@ -14142,6 +14231,21 @@ fn current_comparison_representation(
             }
         }
     }
+    // Each event looks up the validate bases sharing its cell, source and
+    // run, in `bound`'s order, instead of rescanning every bound base.
+    let mut bound_by_run = BTreeMap::<(&str, &str, &str), Vec<_>>::new();
+    for (base, attempts) in &bound {
+        if base.provenance == ObservationProvenance::Validate {
+            bound_by_run
+                .entry((
+                    base.cell.as_str(),
+                    base.hermit_sha.as_str(),
+                    base.run_id.as_str(),
+                ))
+                .or_default()
+                .push((base, attempts));
+        }
+    }
     let mut events = BTreeSet::new();
     let mut covered = BTreeSet::new();
     let mut represented_counts = BTreeMap::<DirectEvidenceKey, usize>::new();
@@ -14150,19 +14254,18 @@ fn current_comparison_representation(
             continue;
         }
         let row_cell = series_row_cell(row);
-        let matches = bound
-            .iter()
-            .filter(|(base, _)| {
-                base.provenance == ObservationProvenance::Validate
-                    && base.cell == row_cell
-                    && base.hermit_sha == row.series.tree
-                    && base.run_id == row.run_id
-            })
-            .collect::<Vec<_>>();
+        let matches = bound_by_run
+            .get(&(
+                row_cell.as_ref(),
+                row.series.tree.as_str(),
+                row.run_id.as_str(),
+            ))
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
         if matches.is_empty() {
             continue;
         }
-        let [(base, attempts)] = matches.as_slice() else {
+        let [(base, attempts)] = matches else {
             return Err("current series event has ambiguous bound source identity".into());
         };
         row.validate_for_projection()?;
@@ -14245,6 +14348,7 @@ fn direct_representation(
     let (mut represented_event_ids, mut represented_direct) =
         current_comparison_representation(tracked, rows, current_attempts, &direct)?;
     let bound_attempts = bound_direct_attempts(tracked, current_attempts)?;
+    let cells = SeriesCellIndex::new(tracked);
     let mut source = BTreeMap::<
         DirectEvidenceBase,
         Vec<(Option<DirectEvidenceKey>, String, Option<u64>, u64)>,
@@ -14253,7 +14357,7 @@ fn direct_representation(
         if represented_event_ids.contains(&row.event_id) {
             continue;
         }
-        let Some((base, key)) = source_direct_evidence_key(row, tracked)? else {
+        let Some((base, key)) = source_direct_evidence_key(row, &cells)? else {
             continue;
         };
         source.entry(base).or_default().push((
@@ -36121,6 +36225,195 @@ mod attempt_binding_tests {
             !String::from_utf8(saved)
                 .unwrap()
                 .contains("verification_report")
+        );
+    }
+}
+
+/// The per-pass indexes that replaced linear scans in the attempt-binding and
+/// direct-representation paths must answer exactly what the scans answered:
+/// the same items, in the same order, for unique, ambiguous, missing,
+/// retired-name and malformed keys.
+#[cfg(test)]
+mod lookup_index_tests {
+    use super::*;
+
+    fn cell(lane: &str, category: &str, test: &str, backend: &str) -> CellId {
+        CellId {
+            lane: lane.into(),
+            category: category.into(),
+            test: test.into(),
+            mode: "verify".into(),
+            backend: backend.into(),
+        }
+    }
+
+    fn tracked_with(ids: &[CellId]) -> TrackedCells {
+        serde_json::from_value(serde_json::json!({
+            "schema": 8,
+            "cells": ids.iter().map(|id| serde_json::json!({
+                "lane": id.lane, "category": id.category, "test": id.test,
+                "mode": id.mode, "backend": id.backend, "status": "red", "observations": []
+            })).collect::<Vec<_>>()
+        }))
+        .unwrap()
+    }
+
+    /// The scan `SeriesCellIndex` replaced in `source_direct_evidence_key`.
+    fn cells_by_scan<'a>(tracked: &'a TrackedCells, key: &str) -> Vec<*const TrackedCell> {
+        tracked
+            .cells
+            .iter()
+            .filter(|cell| series_cell_key(&cell.id) == key)
+            .map(|cell| cell as *const TrackedCell)
+            .collect()
+    }
+
+    /// The attempt-binding fixture: one cell, one run, two bound attempts.
+    fn fixture() -> (TrackedCells, Vec<SeriesRow>) {
+        super::attempt_binding_tests::fixture_for(cell(
+            "portable",
+            "fixture",
+            "fixture/retry",
+            "ptrace",
+        ))
+    }
+
+    fn pointers<T>(items: &[&T]) -> Vec<*const T> {
+        items.iter().map(|item| *item as *const T).collect()
+    }
+
+    #[test]
+    fn series_cell_index_answers_what_the_cell_scan_answered() {
+        let retired = cell(
+            "portable",
+            "backend-parity-c",
+            "backend-parity-c/pidfd-open-self",
+            "ptrace",
+        );
+        let successor = cell(
+            "portable",
+            "c-programs",
+            "c-programs/pidfd-open-self-pair",
+            "ptrace",
+        );
+        let tracked = tracked_with(&[
+            cell(
+                "portable",
+                "c-programs",
+                "c-programs/epoll-readiness",
+                "ptrace",
+            ),
+            // Two cells that differ only outside the series key: ambiguous.
+            cell("portable", "c-programs", "c-programs/futex-wake", "kvm"),
+            cell("privileged", "c-programs", "c-programs/futex-wake", "kvm"),
+            cell("privileged", "other", "c-programs/futex-wake", "kvm"),
+            retired.clone(),
+            successor.clone(),
+        ]);
+        let index = SeriesCellIndex::new(&tracked);
+        let mut keys = tracked
+            .cells
+            .iter()
+            .map(|cell| series_cell_key(&cell.id))
+            .collect::<Vec<_>>();
+        keys.extend(
+            [
+                "c-programs/absent/verify/ptrace",
+                "c-programs/epoll-readiness/verify/kvm",
+                "malformed",
+                "",
+            ]
+            .map(String::from),
+        );
+        // Rows reach the index through the retired-id resolution.
+        let resolved = keys
+            .iter()
+            .map(|key| resolve_series_cell(key).into_owned())
+            .collect::<Vec<_>>();
+        assert!(resolved.contains(&series_cell_key(&successor)));
+        assert_ne!(series_cell_key(&retired), series_cell_key(&successor));
+        let mut seen = BTreeSet::new();
+        for key in keys.iter().chain(&resolved) {
+            let expected = cells_by_scan(&tracked, key);
+            assert_eq!(pointers(index.matching(key)), expected, "{key:?}");
+            seen.insert(expected.len());
+        }
+        // The cases above exercise none, one and several matches.
+        assert_eq!(seen, BTreeSet::from([0, 1, 3]));
+    }
+
+    #[test]
+    fn source_direct_evidence_key_still_refuses_an_ambiguous_cell() {
+        let (tracked, events) = fixture();
+        let one = SeriesCellIndex::new(&tracked);
+        for row in &events {
+            assert!(source_direct_evidence_key(row, &one).unwrap().is_some());
+        }
+        let mut doubled = tracked.clone();
+        let mut twin = doubled.cells[0].clone();
+        twin.id.lane = "privileged".into();
+        doubled.cells.push(twin);
+        let two = SeriesCellIndex::new(&doubled);
+        for row in &events {
+            assert!(source_direct_evidence_key(row, &two).unwrap().is_none());
+        }
+    }
+
+    #[test]
+    fn attempt_event_index_answers_what_the_event_scan_answered() {
+        let (tracked, base) = fixture();
+        let bindings = comparison_attempt_bindings(&tracked)
+            .unwrap()
+            .bindings
+            .clone();
+        let mut events = Vec::new();
+        for (variant, row) in base.iter().cycle().take(base.len() * 9).enumerate() {
+            let mut row = row.clone();
+            row.event_id = format!("{}-{variant}", row.event_id);
+            match variant / base.len() {
+                0 | 1 => {}
+                2 => row.producer = SeriesProducer::PressureTest,
+                3 => row.schema = SeriesSchema::V2,
+                4 => row.series.tree = "9".repeat(40),
+                5 => row.run_id = "other-run".into(),
+                6 => row.series.run_index += 5,
+                7 => row.series.cell = "fixture/retry/verify/kvm".into(),
+                8 => {
+                    row.series.run_index = 1;
+                    row.series.num_runs = 3;
+                }
+                _ => unreachable!(),
+            }
+            events.push(row);
+        }
+        let index = AttemptEventIndex::new(&events);
+        let mut probes = bindings.clone();
+        for binding in &bindings {
+            for attempt in [0, 3, 4] {
+                let mut probe = binding.clone();
+                probe.attempt = attempt;
+                probes.push(probe);
+            }
+            let mut probe = binding.clone();
+            probe.run_id = "other-run".into();
+            probes.push(probe);
+            let mut probe = binding.clone();
+            probe.cell.backend = "kvm".into();
+            probes.push(probe);
+        }
+        let mut seen = BTreeSet::new();
+        for binding in &probes {
+            let expected = events
+                .iter()
+                .filter(|event| binding_matches_event(binding, event))
+                .map(|event| event as *const SeriesRow)
+                .collect::<Vec<_>>();
+            assert_eq!(pointers(&index.matching(binding)), expected, "{binding:?}");
+            seen.insert(expected.len());
+        }
+        assert!(
+            seen.contains(&0) && seen.iter().any(|count| *count > 1),
+            "{seen:?}"
         );
     }
 }
