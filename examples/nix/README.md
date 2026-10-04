@@ -42,7 +42,7 @@ The derivation is unchanged, so the output path is the same store path a
 native build would produce, and a Hermit build can be checked against the
 binary cache or against a native build directly.
 
-Two details matter for reproducibility:
+Three details matter for reproducibility:
 
 - **The build directory has a random name.** Nix 2.35 names it
   `/nix/var/nix/builds/nix-<pid>-<random u32>`, and that path appears in `PWD`,
@@ -67,7 +67,8 @@ that re-executes the original builder under Hermit. It works with any Nix
 version, and `hermitize`, `hermitizeIfNeeded` and `overlayFor` let you opt in
 one package at a time. The override is part of the derivation, so the output
 path changes: compare a wrapped build with another wrapped build, never with
-the native one.
+the native one. It does not set `TZ`, so a wrapped build applies the host's
+`/etc/localtime`, unlike the external builder.
 
 ## Usage
 
@@ -100,30 +101,42 @@ nix-build \
   run, and every timestamp differs.
 - `--native-fixed-output` builds fixed-output derivations (source downloads)
   without Hermit. Nix checks their hash anyway, and they need the network.
+  Untested: every source in the runs below was already in the store, so no
+  download has gone through this path, and whether Nix's build description
+  carries a derivation's impure variables (proxy settings, certificate file)
+  has not been checked.
 - `--launcher PROGRAM` runs `PROGRAM HERMIT ...` instead of `HERMIT ...`, for a
   site wrapper that bounds the run.
-- The script needs `jq` on `PATH` or named by `$JQ`.
+- The script needs bash 4.4 or later, and `jq` on `PATH` or named by `$JQ`.
 
 To check a build, rebuild it and compare: `nix-build --check ...` reports a
 differing output.
 
-What has been tested, on one x86_64 host with Nix 2.35.1, the ptrace backend
-and Hermit with both pull requests above: four small derivations that write
+What has been tested, on one x86_64 host with Nix 2.35.1 and the ptrace
+backend. No Nix build has yet gone through the current script; each number
+below names the version that produced it.
+
+An earlier version of this script (no option parsing, the host's `HOME`, no
+`TZ`), with Hermit including both pull requests above: four small derivations that write
 the clock, `/dev/urandom`, `$RANDOM` and a UUID into their output, one of them
 a full stdenv build including fixupPhase. Through `external-builders`, each
 gave one output hash in 20 builds with `run` and with `run --strict`, and in
 10 builds with `--no-rcb-time`. The same derivations built natively gave a
 different hash on every build.
 
-Real nixpkgs packages, built through `external-builders` with
-`--native-fixed-output --no-rcb-time --max-timeslice=disabled`: `hello` and
+Real nixpkgs packages, built through this script as it was before `TZ=UTC`
+was added, with `--native-fixed-output --no-rcb-time --max-timeslice=disabled`
+and Hermit including https://github.com/rrnewton/hermit/pull/3554: `hello` and
 `duktape` gave the same output as a native build, byte for byte. Five packages
 whose two sandboxed native builds differ (chibi, sagittarius-scheme, aichat,
 rav1e, gdbHostCpuOnly) each gave one output in two Hermit builds, but not the
-native output. Known reasons a Hermit output differs from a native one: the
-build directory is `/tmp/build`, not `/build`, and Hermit gives a file it has
-not seen before an mtime of `--epoch`, which moves stdenv's
-`SOURCE_DATE_EPOCH` (https://github.com/rrnewton/hermit/issues/3639).
+native output. Known reasons a Hermit output differs from a native one:
+- The build directory is `/tmp/build`, not `/build`, and a package that
+  records it (in `__FILE__` strings, for example) keeps that path.
+- Hermit sorts every `getdents64` batch by name so that directory listings are
+  reproducible, while a native build sees the filesystem's order. A package
+  that records a listing without sorting it (chibi's `.chibi.meta`) differs
+  from native but not between Hermit builds.
 
 With `hermit-wrap.nix`:
 
@@ -142,4 +155,7 @@ hw.hermitize pkgs.hello
 - Hermit does not make a changing filesystem or the network deterministic. A
   builder that reads host state outside the store and the build directory can
   still differ between builds.
+- The script rewrites an environment value that is exactly `/build` or starts
+  with `/build/`. A value with `/build` elsewhere in it, such as
+  `x:/build/y`, is passed unchanged and names a path the guest does not have.
 - `external-builders` is experimental in Nix and its interface may change.

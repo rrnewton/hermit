@@ -24,6 +24,10 @@ while [ "$#" -gt 1 ]; do
     *) break ;;
   esac
 done
+if [ "$#" -lt 2 ]; then
+  echo "usage: $0 [--launcher PROGRAM] [--native-fixed-output] HERMIT [HERMIT RUN ARGS...] DESCRIPTION" >&2
+  exit 2
+fi
 desc="${@: -1}"
 hermit_bin="$1"
 hermit_args=("${@:2:$#-2}")
