@@ -1418,7 +1418,7 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
 /// Every enabled cell that is not required (a `ci: false` cell), one
 /// `<test> <mode> <backend>` line each, sorted. No other derived file names
 /// these cells, so this inventory is what makes disabling one show up as a
-/// diff (https://github.com/rrnewton/hermit/issues/3606).
+/// diff (<https://github.com/rrnewton/hermit/issues/3606>).
 fn optional_cells_document(manifests: &ManifestSet) -> Result<String, String> {
     let select = |population| {
         manifests.select(&Selection {
