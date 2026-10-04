@@ -681,6 +681,10 @@ mod tests {
             libc::WNOHANG,
             libc::WUNTRACED,
             libc::WNOHANG | libc::WUNTRACED,
+            libc::__WNOTHREAD,
+            libc::WNOHANG | libc::__WNOTHREAD,
+            libc::WUNTRACED | libc::__WNOTHREAD,
+            libc::WNOHANG | libc::WUNTRACED | libc::__WNOTHREAD,
         ] {
             for result in [Ok(7), Err(Errno::EFAULT)] {
                 for prepublished in [false, true] {
@@ -707,7 +711,14 @@ mod tests {
                     assert!(guest.injected.is_empty());
                     assert_eq!(guest.injected_wait4.len(), 1);
                     assert_eq!(guest.injected_wait4[0].pid(), 7);
-                    assert_eq!(guest.injected_wait4[0].options().bits(), options);
+                    // Selection already enforced `__WNOTHREAD` through the
+                    // owner filter. The backend's raw wait4 accepts only
+                    // WNOHANG and WUNTRACED, so completion forwards exactly
+                    // those caller bits and nothing else.
+                    assert_eq!(
+                        guest.injected_wait4[0].options().bits(),
+                        options & (libc::WNOHANG | libc::WUNTRACED)
+                    );
                     assert_eq!(*guest.consumed.lock().unwrap(), [child]);
                     assert_eq!(
                         guest.thread.process_cpu_time().children_system,
@@ -810,24 +821,36 @@ mod tests {
         use syscalls::WaitPidFlag;
 
         use super::super::wait4_uses_terminal_selector;
+        // Serial KVM selects every terminal wait4 form Linux accepts from a
+        // WNOHANG/WUNTRACED/__WNOTHREAD caller: the owner filter applies
+        // `__WNOTHREAD`, and completion forwards only WNOHANG/WUNTRACED.
         for bits in [
             0,
             libc::WNOHANG,
             libc::WUNTRACED,
             libc::WNOHANG | libc::WUNTRACED,
+            libc::__WNOTHREAD,
+            libc::WNOHANG | libc::__WNOTHREAD,
+            libc::WUNTRACED | libc::__WNOTHREAD,
+            libc::WNOHANG | libc::WUNTRACED | libc::__WNOTHREAD,
         ] {
             assert!(wait4_uses_terminal_selector(
                 WaitPidFlag::from_bits_retain(bits),
                 true
             ));
         }
+        // Every other bit, alone or carried beside `__WNOTHREAD`, stays on the
+        // backend's prevalidation path and never selects a logical child.
         for bits in [
             libc::WCONTINUED,
             libc::__WCLONE,
             libc::__WALL,
-            libc::__WNOTHREAD,
             0x100,
             -1,
+            libc::__WNOTHREAD | libc::WCONTINUED,
+            libc::__WNOTHREAD | libc::__WCLONE,
+            libc::__WNOTHREAD | libc::__WALL,
+            libc::__WNOTHREAD | 0x100,
         ] {
             let options = WaitPidFlag::from_bits_retain(bits);
             assert_eq!(options.bits(), bits);

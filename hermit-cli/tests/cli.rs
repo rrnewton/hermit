@@ -13572,3 +13572,8 @@ fn run_kvm_wait4_fault_consumption_preserves_waitid_and_children_cpu() {
 fn run_kvm_wait4_int_min_preserves_errno_and_arenas() {
     kvm_waitid_copyout::run_wait4_int_min();
 }
+
+#[test]
+fn run_kvm_wait4_nothread_admits_only_the_creating_thread() {
+    kvm_waitid_copyout::run_wait4_nothread();
+}
