@@ -153,8 +153,13 @@ fn documented_roots(metadata: &serde_json::Value) -> Result<Vec<(PathBuf, Kind)>
 /// cannot delimit is matched as written, so a declaration after one is still
 /// seen.
 fn declares_a_module_file(line: &str) -> bool {
-    let code = without_literals(line).unwrap_or_else(|| line.to_string());
-    let mut rest = code.as_str();
+    declares_a_module_file_as_written(&without_literals(line).unwrap_or_else(|| line.to_string()))
+}
+
+/// [`declares_a_module_file`] without blanking literals first: a declaration
+/// inside a string or comment counts too.
+fn declares_a_module_file_as_written(code: &str) -> bool {
+    let mut rest = code;
     while let Some(at) = rest.find("mod") {
         let before = rest[..at].chars().next_back();
         let after = &rest[at + 3..];
@@ -337,9 +342,22 @@ fn module_tree(root_file: &Path) -> Result<Vec<PathBuf>, String> {
                         file.display()
                     )
                 })?;
+                // A string or comment that spans lines opens on a line whose
+                // literals cannot be delimited. Every later line of the body is
+                // then matched as written: a quote on it may close the earlier
+                // literal, and pairing quotes within one line would blank a
+                // real declaration between two of them.
+                let mut undelimited = false;
                 for (offset, body_line) in lines[index..index - 1 + span].iter().enumerate() {
                     let body = without_line_comment(body_line.trim());
-                    if declares_a_module_file(body) {
+                    let code = match without_literals(body) {
+                        Some(code) if !undelimited => code,
+                        code => {
+                            undelimited |= code.is_none();
+                            body.to_string()
+                        }
+                    };
+                    if declares_a_module_file_as_written(&code) {
                         return Err(format!(
                             "{}:{}: `{body}` in a `macro_rules!` body declares a file \
                              that depends on where the macro is invoked, which this \
@@ -1544,9 +1562,15 @@ pub fn g() {}
         .unwrap();
         let tree: Vec<PathBuf> = module_tree(&directory.join("lib.rs")).unwrap();
         assert_eq!(tree, [directory.join("lib.rs")]);
+        // After a string closes on a later line, quotes in the rest of that
+        // line or a later one no longer pair as written (second review of
+        // the same pull request).
         for body in [
             "const S: &str = r#\"a\"b\"#; mod $n;",
             "const S: &str = \"one\nline\"; mod $n;",
+            "const S: &str = \"one\nline\"; mod $n; const C: char = '\"';",
+            "const S: &str = \"one\nline\"; mod $n; const U: &str = \"https://example.com\";",
+            "const S: &str = \"one\nline\"; mod $n; const T: &str = \"a\\\"b\";",
         ] {
             fs::write(
                 directory.join("lib.rs"),
