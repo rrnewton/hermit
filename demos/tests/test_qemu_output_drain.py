@@ -349,6 +349,8 @@ class Demo5OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
     function_name = "boot_once"
 
     def replacements(self) -> dict:
+        # Demo 5 records the initramfs it boots before it starts Hermit.
+        (self.assets / "initramfs.cpio.gz").write_bytes(b"stand-in for the initramfs")
         return {
             "check_qemu_dependencies": lambda root: "QEMU dependency check replaced by the test",
             "check_dependencies": lambda root: "dependency check replaced by the test",
@@ -435,8 +437,16 @@ class Demo6OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
     function_name = "resume_once"
 
     def replacements(self) -> dict:
+        # The stand-in for demo 5's snapshot, with the record demo 5 writes for
+        # a snapshot of the current initramfs.
         boot_disk = self.assets / "hermit-boot.qcow2"
         boot_disk.write_bytes(b"stand-in for the demo 5 boot snapshot")
+        (self.assets / "initramfs.cpio.gz").write_bytes(b"stand-in for the initramfs")
+        dc.write_boot_snapshot_record(
+            boot_disk,
+            dc.hash_file(boot_disk),
+            dc.initramfs_producer(self.namespace["ROOT"], self.assets),
+        )
         return {
             "SNAPSHOT_DISK": self.assets / "hermit-snapshot.qcow2",
             "BOOT_SNAPSHOT_DISK": boot_disk,

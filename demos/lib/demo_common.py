@@ -889,6 +889,150 @@ def publish_file_atomic(src: Path, dst: Path) -> None:
     os.replace(str(temporary), str(dst))
 
 
+# Demo 6 restores demo 5's boot snapshot instead of booting, and the snapshot's
+# memory holds the guest's /init, which reads demo 6's command, runs it (as
+# which user, with which standard input) and frames its output. That /init came
+# from the initramfs demo 5 booted, so a snapshot saved before an /init change
+# keeps running the old /init after demos/lib/qemu-assets.sh builds a new
+# initramfs. Demo 5 therefore writes a record next to each boot snapshot it
+# saves, naming the snapshot's SHA-256 and the INITRAMFS_VERSION and SHA-256 of
+# the initramfs it booted, and demo 6 restores a snapshot only when that record
+# matches the snapshot and the initramfs it would use now (verify_boot_snapshot).
+BOOT_SNAPSHOT_RECORD_FORMAT = 1
+INITRAMFS_VERSION_RE = re.compile(r"^INITRAMFS_VERSION=([0-9]+)$", re.MULTILINE)
+SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
+class BootSnapshotMismatch(RuntimeError):
+    """A boot snapshot has no record that matches it and the current initramfs."""
+
+
+def boot_snapshot_record_path(snapshot: Path) -> Path:
+    """The record demo 5 writes next to the boot snapshot ``snapshot``."""
+    snapshot = Path(snapshot)
+    return snapshot.with_name(snapshot.name + ".producer.json")
+
+
+def current_initramfs_version(root: Path) -> int:
+    """The INITRAMFS_VERSION that demos/lib/qemu-assets.sh builds now."""
+    script = Path(root) / "demos/lib/qemu-assets.sh"
+    versions = INITRAMFS_VERSION_RE.findall(script.read_text(encoding="utf-8"))
+    if len(versions) != 1:
+        raise RuntimeError(
+            "expected one INITRAMFS_VERSION= line in {}, found {}".format(
+                script, len(versions)
+            )
+        )
+    return int(versions[0])
+
+
+def initramfs_producer(root: Path, assets: Path) -> Dict[str, Any]:
+    """The initramfs a boot uses now: the version qemu-assets.sh builds, and the
+    SHA-256 of ``assets``/initramfs.cpio.gz."""
+    return {
+        "initramfs_version": current_initramfs_version(root),
+        "initramfs_sha256": hash_file(Path(assets) / "initramfs.cpio.gz"),
+    }
+
+
+def write_boot_snapshot_record(
+    snapshot: Path, snapshot_sha256: str, producer: Mapping[str, Any]
+) -> Path:
+    """Record, next to ``snapshot``, its SHA-256 and the initramfs it booted.
+
+    ``producer`` is what initramfs_producer returned before the boot. The record
+    is renamed into place whole.
+    """
+    record = boot_snapshot_record_path(snapshot)
+    _write_json(
+        record,
+        {
+            "format": BOOT_SNAPSHOT_RECORD_FORMAT,
+            "snapshot_sha256": snapshot_sha256,
+            "initramfs_version": producer["initramfs_version"],
+            "initramfs_sha256": producer["initramfs_sha256"],
+        },
+    )
+    return record
+
+
+def _boot_snapshot_record_problem(record: Any) -> Optional[str]:
+    """Why ``record`` is not a record write_boot_snapshot_record writes, or None."""
+    if not isinstance(record, dict):
+        return "it is not a JSON object"
+    record_format = record.get("format")
+    if type(record_format) is not int or record_format != BOOT_SNAPSHOT_RECORD_FORMAT:
+        return "its format is {!r}, not {}".format(record_format, BOOT_SNAPSHOT_RECORD_FORMAT)
+    if type(record.get("initramfs_version")) is not int:
+        return "its initramfs_version {!r} is not a whole number".format(
+            record.get("initramfs_version")
+        )
+    for key in ("initramfs_sha256", "snapshot_sha256"):
+        value = record.get(key)
+        if not isinstance(value, str) or SHA256_RE.fullmatch(value) is None:
+            return "its {} {!r} is not a SHA-256 digest".format(key, value)
+    return None
+
+
+def verify_boot_snapshot(
+    snapshot: Path, root: Path, assets: Path, disk: Optional[Path] = None
+) -> None:
+    """Raise BootSnapshotMismatch unless demo 5's record of ``snapshot`` matches.
+
+    The record must name the INITRAMFS_VERSION that qemu-assets.sh under
+    ``root`` builds now, the SHA-256 that ``assets``/initramfs.cpio.gz has now,
+    and the SHA-256 of ``disk``: ``snapshot`` itself, or the copy of it that
+    QEMU will restore. The message says what did not match.
+    """
+    snapshot = Path(snapshot)
+    disk = snapshot if disk is None else Path(disk)
+    initramfs = Path(assets) / "initramfs.cpio.gz"
+    if not initramfs.is_file():
+        raise BootSnapshotMismatch(
+            "there is no initramfs at {} to compare it with".format(initramfs)
+        )
+    record_path = boot_snapshot_record_path(snapshot)
+    try:
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise BootSnapshotMismatch(
+            "it has no record of the initramfs it was booted from ({} is missing): "
+            "demo 5 saved it before it wrote such records, or demo 5 did not save "
+            "it".format(record_path)
+        ) from None
+    except (OSError, ValueError) as error:
+        raise BootSnapshotMismatch(
+            "its record {} cannot be read: {}".format(record_path, error)
+        ) from None
+    problem = _boot_snapshot_record_problem(record)
+    if problem is not None:
+        raise BootSnapshotMismatch(
+            "its record {} is not one demo 5 wrote: {}".format(record_path, problem)
+        )
+    current = initramfs_producer(root, assets)
+    if record["initramfs_version"] != current["initramfs_version"]:
+        raise BootSnapshotMismatch(
+            "it was booted from initramfs version {}, and demos/lib/qemu-assets.sh "
+            "now builds version {}".format(
+                record["initramfs_version"], current["initramfs_version"]
+            )
+        )
+    if record["initramfs_sha256"] != current["initramfs_sha256"]:
+        raise BootSnapshotMismatch(
+            "it was booted from an initramfs with SHA-256 {}, and {} now has "
+            "SHA-256 {}".format(
+                record["initramfs_sha256"], initramfs, current["initramfs_sha256"]
+            )
+        )
+    disk_sha256 = hash_file(disk)
+    if disk_sha256 != record["snapshot_sha256"]:
+        raise BootSnapshotMismatch(
+            "{} has SHA-256 {}, not the {} that demo 5 recorded for it".format(
+                disk, disk_sha256, record["snapshot_sha256"]
+            )
+        )
+
+
 def canonicalize_qemu_runtime_paths_in_file(
     path: Path, run_dir: Path, qmp_socket: Path
 ) -> None:
