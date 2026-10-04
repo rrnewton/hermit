@@ -150,8 +150,16 @@ struct OpenFileDescription {
     /// position lock covers only one of them; without this, two unsequentialized
     /// threads could interleave their reads and each keep part of the
     /// directory. Sequentialized threads never contend for it.
+    ///
+    /// This must stay a runtime-agnostic lock that uses no thread-locals.
+    /// The DBT backend polls these handlers on DynamoRIO application
+    /// threads, outside any Tokio runtime. Tokio's own locks charge each
+    /// poll to a per-thread budget kept in a thread-local that has a
+    /// destructor, and registering a thread-local destructor on a DynamoRIO
+    /// application thread crashes DynamoRIO: the run exits with status 255
+    /// and loses its evidence FINAL frames.
     #[serde(skip)]
-    directory_lock: Arc<tokio::sync::Mutex<()>>,
+    directory_lock: Arc<futures::lock::Mutex<()>>,
     /// Logical timestamp of the last packet delivered through this socket.
     socket_receive_timestamp: Option<LogicalTime>,
     /// True when this open file is an `AF_NETLINK`/`NETLINK_SOCK_DIAG` socket,
@@ -551,7 +559,7 @@ impl DetFd {
 
     /// The lock serializing `getdents` and `lseek` on this open file
     /// description across every alias of it.
-    pub(crate) fn directory_lock(&self) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn directory_lock(&self) -> Arc<futures::lock::Mutex<()>> {
         Arc::clone(&self.description().directory_lock)
     }
 
