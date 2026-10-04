@@ -935,6 +935,62 @@ def initramfs_producer(root: Path, assets: Path) -> Dict[str, Any]:
     }
 
 
+# The build record demos/lib/qemu-assets.sh writes next to the initramfs it
+# builds: one line, "<INITRAMFS_VERSION> <SHA-256>", naming the archive it built
+# by its SHA-256 and the version it built it at.
+INITRAMFS_BUILD_RECORD = ".initramfs-build"
+
+
+def stage_boot_assets(assets: Path, destination: Path) -> Path:
+    """Copy the kernel and initramfs from ``assets`` into ``destination``.
+
+    ``destination`` is a new directory private to one boot. Checkouts of
+    different versions share ``assets`` and replace its initramfs.cpio.gz when
+    they build theirs, so a boot that QEMU starts from the shared file can read
+    bytes other than the ones that were hashed for its record. Demo 5 boots the
+    copy, hashes the copy, and records that hash.
+    """
+    destination = Path(destination)
+    destination.mkdir(parents=True)
+    for name in ("bzImage", "initramfs.cpio.gz"):
+        shutil.copy2(str(Path(assets) / name), str(destination / name))
+    return destination
+
+
+def booted_initramfs_producer(
+    root: Path, assets: Path, initramfs: Path
+) -> Dict[str, Any]:
+    """The initramfs a boot runs: ``initramfs``, the private copy QEMU boots.
+
+    Returns the SHA-256 of that copy, and the INITRAMFS_VERSION that
+    qemu-assets.sh under ``root`` builds, but only when the build record in
+    ``assets`` names exactly that version and that SHA-256. qemu-assets.sh
+    writes the record after it builds an archive, naming the SHA-256 of the
+    archive it built and the version it built it at, so a record is true of the
+    bytes it names however old it is; requiring its SHA-256 to be the copy's
+    binds the version to the bytes booted. Raises RuntimeError otherwise: the
+    shared initramfs was replaced after qemu-assets.sh ran, by another checkout
+    or by a version of qemu-assets.sh that writes no record.
+    """
+    sha256 = hash_file(initramfs)
+    version = current_initramfs_version(root)
+    record_path = Path(assets) / INITRAMFS_BUILD_RECORD
+    try:
+        record = record_path.read_text(encoding="utf-8")
+    except OSError as error:
+        record = "unreadable ({})".format(error)
+    if record.split() != [str(version), sha256]:
+        raise RuntimeError(
+            "the initramfs copied for this boot (SHA-256 {}) is not one that "
+            "demos/lib/qemu-assets.sh built at INITRAMFS_VERSION {}: its build "
+            "record {} says {!r}. Another checkout replaced the shared initramfs "
+            "after qemu-assets.sh ran; run demo 5 again.".format(
+                sha256, version, record_path, record.strip()
+            )
+        )
+    return {"initramfs_version": version, "initramfs_sha256": sha256}
+
+
 def write_boot_snapshot_record(
     snapshot: Path, snapshot_sha256: str, producer: Mapping[str, Any]
 ) -> Path:

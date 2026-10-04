@@ -80,6 +80,7 @@ provisioned=(
   "vmlinux"                    # demo 7's kernel image with type information
   "initramfs.cpio.gz"          # BusyBox initramfs built by lib/qemu-assets.sh
   ".initramfs-version"         # initramfs cache version
+  ".initramfs-build"           # the version and SHA-256 of the initramfs built
 )
 
 # Temporary files an interrupted run may leave behind. Each pattern is quoted
@@ -94,6 +95,7 @@ transient_globs=(
   ".bzImage.*"
   ".initramfs.cpio.gz.*"
   ".initramfs-version.*"
+  ".initramfs-build.*"
   ".vmlinux.*"
   ".vmlinux-types.*"
 )

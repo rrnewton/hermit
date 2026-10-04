@@ -10,6 +10,7 @@ no network. They do run the host's cpio and gzip, which the script requires.
 import gzip
 import hashlib
 import os
+import re
 import stat
 import subprocess
 import sys
@@ -129,16 +130,21 @@ class InitramfsBuildTest(unittest.TestCase):
             QEMU_BIN=str(fake_bin / "qemu-system-x86_64"),
             QEMU_DEMO_PYTHON=sys.executable,
         )
-        result = subprocess.run(
+        self._scratch = scratch
+        self._env = env
+        return self._run_again(umask), assets
+
+    def _run_again(self, umask: int = 0o022) -> subprocess.CompletedProcess:
+        """Run qemu-assets.sh again with the scratch of the last _run_script."""
+        return subprocess.run(
             ["bash", str(QEMU_ASSETS_SCRIPT)],
-            env=env,
-            cwd=scratch,
+            env=self._env,
+            cwd=self._scratch,
             umask=umask,
             capture_output=True,
             text=True,
             timeout=120,
         )
-        return result, assets
 
     def _build(self, umask: int, busybox_mode: int = 0o755) -> bytes:
         """Run qemu-assets.sh under `umask` and return the initramfs bytes."""
@@ -177,6 +183,36 @@ class InitramfsBuildTest(unittest.TestCase):
             self.assertEqual(oct(DATA_FILE_MODE), oct(modes[name]), "/" + name)
         for name in APPLETS:
             self.assertEqual(oct(SYMLINK_MODE), oct(modes[name]), "/" + name)
+
+    def test_the_build_record_names_the_archive_built_and_its_version(self):
+        # Demo 5 records an initramfs's version only when this record names
+        # the SHA-256 of the copy it boots (booted_initramfs_producer).
+        result, assets = self._run_script(0o022)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        version = re.search(
+            r"^INITRAMFS_VERSION=([0-9]+)$", QEMU_ASSETS_SCRIPT.read_text(), re.MULTILINE
+        ).group(1)
+        archive = (assets / "initramfs.cpio.gz").read_bytes()
+        self.assertEqual(
+            (assets / ".initramfs-build").read_text(),
+            "{} {}\n".format(version, hashlib.sha256(archive).hexdigest()),
+        )
+
+    def test_a_cached_archive_its_build_record_does_not_name_is_rebuilt(self):
+        # Another checkout replaced the archive and left .initramfs-version as
+        # it was: the build record names other bytes, so the archive is rebuilt.
+        result, assets = self._run_script(0o022)
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        archive = assets / "initramfs.cpio.gz"
+        built = archive.read_bytes()
+        archive.write_bytes(b"an initramfs another checkout built")
+        result = self._run_again()
+        self.assertEqual(0, result.returncode, result.stdout + result.stderr)
+        self.assertEqual(archive.read_bytes(), built)
+        self.assertEqual(
+            (assets / ".initramfs-build").read_text().split()[1],
+            hashlib.sha256(built).hexdigest(),
+        )
 
     def test_a_restrictive_umask_does_not_change_the_stored_modes(self):
         self._assert_fixed_modes(parse_newc(self._build(umask=0o077)))
