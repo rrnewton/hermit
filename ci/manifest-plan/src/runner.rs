@@ -64,13 +64,9 @@ use crate::stress_series::HostCapability;
 #[cfg(test)]
 use crate::stress_series::HostCapabilityVerdict;
 #[cfg(test)]
-use crate::timeouts::CALIBRATED_CI_CELL_COUNT;
-#[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS;
 #[cfg(test)]
 use crate::timeouts::DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS;
-#[cfg(test)]
-use crate::timeouts::DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::DEFAULT_TEST_CPU_TIMEOUT_SECONDS;
 #[cfg(test)]
@@ -79,39 +75,15 @@ use crate::timeouts::DEFAULTS_FILE;
 #[cfg(test)]
 use crate::timeouts::EXPLICIT_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
-use crate::timeouts::IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::KVM_2026_09_08_SELECTED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::KVM_NEXT40_QUALIFIED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::KVM_PINNED_IMAGE_QUALIFIED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::KVM_RATCHET_CI_CELL_COUNT;
-#[cfg(test)]
 use crate::timeouts::KVM_RATCHET_TIMEOUT_CALIBRATIONS;
-#[cfg(test)]
-use crate::timeouts::KVM_RUN_1709_CI_REMOVAL_COUNT;
-#[cfg(test)]
-use crate::timeouts::LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS;
 #[cfg(test)]
-use crate::timeouts::LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT;
-#[cfg(test)]
 use crate::timeouts::LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS;
 use crate::timeouts::MANIFEST_SCHEMA;
-#[cfg(test)]
-use crate::timeouts::NON_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT;
 use crate::timeouts::ResolvedTestTimeouts;
 #[cfg(test)]
 use crate::timeouts::SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS;
-#[cfg(test)]
-use crate::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT;
-#[cfg(test)]
-use crate::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT;
 #[cfg(test)]
 use crate::timeouts::SELECT_REPLAY_2026_10_03_TESTS;
 #[cfg(test)]
@@ -9192,39 +9164,11 @@ mod tests {
                 assert_eq!(replay[0].timeout_seconds, DEFAULT_TEST_WALL_TIMEOUT_SECONDS);
             }
         }
-        assert_eq!(
-            required.len(),
-            CALIBRATED_CI_CELL_COUNT + KVM_RATCHET_CI_CELL_COUNT - KVM_RUN_1709_CI_REMOVAL_COUNT
-                + KVM_PINNED_IMAGE_QUALIFIED_CI_CELL_COUNT
-                + KVM_NEXT40_QUALIFIED_CI_CELL_COUNT
-                + 2
-                + KVM_2026_09_08_SELECTED_CI_CELL_COUNT
-                + IPC_DETERMINISM_CHAOS_SELECTED_CI_CELL_COUNT
-                + LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
-                + LITEINST_2026_09_17_SELECTED_CI_CELL_COUNT
-                + PTRACE_2026_09_24_SELECTED_CI_CELL_COUNT
-                + 3 // the exact RNG identities asserted above
-                + DBT_MATRIX_2026_09_29_SELECTED_CI_CELL_COUNT
-                + STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
-                + SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT
-                // Six KVM verify selections; the frozen calibration stays unchanged.
-                // https://github.com/rrnewton/reverie/issues/891
-                + 6
-                // Three socket KVM verify selections from the same issue; assertions stay exact.
-                // https://github.com/rrnewton/reverie/issues/891
-                + 3
-                // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
-                + 1
-                // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
-                + 1
-                // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-                + 1
-                // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-                + 1
-                // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-                + 1
-                + SABRE_2026_10_03_SELECTED_CI_CELL_COUNT
-        );
+        // How many cells are required is not pinned: the committed plan
+        // records it, the manifest gate holds the plan to the manifests, and
+        // a cell flip shows up as a diff of that plan
+        // (https://github.com/rrnewton/hermit/issues/3606). The checks here
+        // are of the named batches' bounds.
         // The SaBRe verify selections of 2026-10-03 have the ordinary bounds,
         // and the ones that were enabled with ci:false are now required.
         fn sabre_verify<'a>(
@@ -9269,15 +9213,6 @@ mod tests {
                 "{test} verify/dbt is required"
             );
         }
-        assert_eq!(
-            enabled.len() - required.len(),
-            NON_CI_CELL_COUNT
-                - LITEINST_2026_09_16_SELECTED_CI_CELL_COUNT
-                - DBT_MATRIX_2026_09_29_PROMOTED_CI_FALSE_TESTS.len()
-                + DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS.len()
-                - SABRE_2026_10_03_PROMOTED_CI_FALSE_TESTS.len(),
-            "the current manifest census records every enabled ci:false cell"
-        );
 
         // The earlier group was already enabled; the later disabled group adds
         // equally to enabled and required, preserving enabled-minus-required.
@@ -13555,37 +13490,10 @@ exit "$(cat "$PWD/exit-status")"
             .filter(|cell| folded.contains(&cell.id.test))
             .filter(|cell| cell.id.mode == "verify" && cell.id.backend.as_deref() != Some("ptrace"))
             .collect::<Vec<_>>();
-        // Pin the selected population and per-backend split, and check every
-        // candidate's arguments.
-        // S13 of https://github.com/rrnewton/hermit/issues/3301 enabled dbt on
-        // pid-probe, which adds the one portable dbt candidate.
-        // Six more portable KVM verify cells preserve the same parity argument contract.
-        // https://github.com/rrnewton/reverie/issues/891
-        // The three socket candidates join the six earlier KVM selections.
-        // https://github.com/rrnewton/reverie/issues/891
-        // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
-        // One epoll-pwait2 KVM candidate: https://github.com/rrnewton/reverie/issues/905.
-        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        // 89 SaBRe candidates from the 2026-10-03 selection of ten-for-ten
-        // SaBRe verify cells (timeouts::SABRE_2026_10_03_EVIDENCE_SHA).
-        assert_eq!(candidates.len(), 174 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89);
-        let mut by_backend = BTreeMap::new();
-        for cell in &candidates {
-            *by_backend
-                .entry(cell.id.backend.as_deref().unwrap())
-                .or_insert(0) += 1;
-        }
-        assert_eq!(
-            by_backend,
-            BTreeMap::from([
-                ("dbt", 1),
-                ("kvm", 75 + 6 + 3 + 1 + 1 + 1 + 1 + 1),
-                ("liteinst", 97),
-                ("sabre", 1 + 89)
-            ])
-        );
+        // Check every candidate's arguments. The population itself is the
+        // committed plan's, which the manifest gate holds to the manifests
+        // (https://github.com/rrnewton/hermit/issues/3606).
+        assert!(!candidates.is_empty());
         assert!(
             candidates
                 .iter()
@@ -13613,8 +13521,7 @@ exit "$(cat "$PWD/exit-status")"
         }
     }
 
-    /// The kvm, liteinst and sabre candidates pinned above (75 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-    /// 97 and 1 + 89) used to add a ptrace reference run and a `hermit log-diff` comparison, and the
+    /// The kvm, liteinst and sabre candidates checked above used to add a ptrace reference run and a `hermit log-diff` comparison, and the
     /// comparison could overwrite their outcome. Since
     /// https://github.com/rrnewton/hermit/issues/3301 each one runs only its own
     /// backend's strict verification, even when its log differs from ptrace's.

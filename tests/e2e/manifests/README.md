@@ -536,6 +536,16 @@ inventory is mechanically complete.
 or reclassifying a `ci=true` cell fails validation until the expected plan is
 updated in the same review.
 
+To flip a cell (make an existing manifest cell required, or stop requiring it),
+edit only the manifest, then run `ci/sync-cell-config.sh`. It regenerates every
+file derived from the manifests: `ci/expected-e2e-plan.json`,
+`tests/e2e/parity-selection.yaml`, `ci/compat-envelope/parity-cells.json`,
+`SCORECARD.md`, `ci/compat-envelope/cells.json` and `ci/dag/validate.json`.
+Commit them with the manifest; the diff of the expected plan is the record of
+the change. `ci/sync-cell-config.sh --check` writes nothing and fails on any
+drift, and validation runs the same checks
+(https://github.com/rrnewton/hermit/issues/3606).
+
 A `ci = false` cell is never executed **and never compiled** by ordinary
 validation, so its guest can
 rot without any node noticing. Two mechanisms bound that. `manifest-plan`

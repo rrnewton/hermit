@@ -144,6 +144,7 @@ fn every_test_harness_subcommand_has_conventional_help() {
         "audit-compile",
         "run",
         "parity",
+        "sync-cells",
         "selftest",
     ];
 
@@ -798,4 +799,59 @@ fn manifest_plan_no_arguments_remains_the_default_text_plan() {
         String::from_utf8_lossy(&output.stderr).contains("manifest(s)"),
         "default plan omitted its validation summary: {output:?}"
     );
+}
+
+/// `sync-cells` refuses a missing, repeated or unknown flag with exit 2 and a
+/// pointer to its help, and `--check` passes on the committed tree
+/// (https://github.com/rrnewton/hermit/issues/3606).
+#[test]
+fn sync_cells_refuses_bad_flags_and_checks_the_committed_tree() {
+    let harness = env!("CARGO_BIN_EXE_test-harness");
+    for (arguments, message) in [
+        (&[][..], "sync-cells needs --check or --write"),
+        (
+            &["--check", "--write"][..],
+            "takes one of --check and --write, once",
+        ),
+        (
+            &["--check", "--check"][..],
+            "takes one of --check and --write, once",
+        ),
+        (&["--check", "--force"][..], "does not accept --force"),
+        (
+            &["--check", "--repo-root"][..],
+            "--repo-root needs a directory",
+        ),
+    ] {
+        let mut command = vec!["sync-cells"];
+        command.extend_from_slice(arguments);
+        let output = run(harness, &command);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.code(), Some(2), "{command:?}: {stderr}");
+        assert!(stderr.contains(message), "{command:?}: {stderr}");
+        assert!(output.stdout.is_empty(), "{command:?} wrote stdout");
+    }
+
+    let missing = non_repository_dir("sync-cells-missing");
+    let output = run(
+        harness,
+        &[
+            "sync-cells",
+            "--check",
+            "--repo-root",
+            missing.to_str().unwrap(),
+        ],
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(2), "{stderr}");
+    assert!(stderr.contains("nothing was written"), "{stderr}");
+    std::fs::remove_dir_all(&missing).expect("remove non-repository working directory");
+
+    let output = run(harness, &["sync-cells", "--check"]);
+    assert!(
+        output.status.success(),
+        "the committed plan or parity selection is stale: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("are current"));
 }

@@ -1017,6 +1017,109 @@ impl ParitySelection {
     }
 }
 
+/// The cells [`PARITY_SELECTION_PATH`]'s written rule derives: every applicable
+/// candidate cell of a test folded from the retired backend-parity-c bucket
+/// whose ptrace verify cell full validation selects.
+pub fn rule_selection(
+    root: &Path,
+    manifests: &ManifestSet,
+    matrix: &ParityMatrix,
+) -> Result<BTreeSet<ParityCellId>, String> {
+    // The folded tests are the ids of the retirement in retired-ids.json; they
+    // now live in c-programs.
+    let folded = crate::retired_ids::RetiredIds::load(root)?.successors_of("backend-parity-c")?;
+    let reference_selected: BTreeSet<String> = manifests
+        .select(&Selection {
+            population: Some(Population::Required),
+            category: Some("c-programs".to_string()),
+            mode: Some(PARITY_MODE.to_string()),
+            backend: Some(PARITY_REFERENCE_BACKEND.to_string()),
+            ..Selection::default()
+        })?
+        .into_iter()
+        .map(|cell| cell.id.test)
+        .filter(|test| folded.contains(test))
+        .collect();
+    Ok(matrix
+        .cells()
+        .filter(|(id, availability)| {
+            availability.applicable() && reference_selected.contains(&id.test_id)
+        })
+        .map(|(id, _)| id.clone())
+        .collect())
+}
+
+/// `current`, the text of a selection file, with its `cells:` list replaced by
+/// `cells`. Everything up to the list is kept verbatim, and so is each comment
+/// line inside it, which stays above the entry it preceded; a comment above a
+/// test that leaves the selection leaves with it. `test-harness sync-cells`
+/// writes [`PARITY_SELECTION_PATH`] with this.
+pub fn render_selection(current: &str, cells: &BTreeSet<ParityCellId>) -> Result<String, String> {
+    const ENTRY: &str = "  - test: ";
+    const BACKENDS: &str = "    backends: [";
+    let lines: Vec<&str> = current.lines().collect();
+    let list = lines
+        .iter()
+        .position(|line| *line == "cells:")
+        .ok_or("the selection has no top-level `cells:` line")?
+        + 1;
+    let mut out = String::new();
+    for line in &lines[..list] {
+        out.push_str(line);
+        out.push('\n');
+    }
+    // Comments inside the list, keyed by the test they precede.
+    let mut comments = BTreeMap::<&str, Vec<&str>>::new();
+    let mut pending = Vec::new();
+    let mut index = list;
+    while index < lines.len() {
+        let line = lines[index];
+        if line.trim_start().starts_with('#') {
+            pending.push(line);
+        } else if let Some(test) = line.strip_prefix(ENTRY) {
+            if !lines
+                .get(index + 1)
+                .is_some_and(|next| next.starts_with(BACKENDS) && next.ends_with(']'))
+            {
+                return Err(format!(
+                    "line {}: {test} is not followed by a one-line `backends: [...]` list",
+                    index + 1
+                ));
+            }
+            comments.insert(test, std::mem::take(&mut pending));
+            index += 1;
+        } else {
+            return Err(format!(
+                "line {}: expected a comment or `{}<test>` entry in the cells list, got {line:?}",
+                index + 1,
+                ENTRY.trim_start()
+            ));
+        }
+        index += 1;
+    }
+    if !pending.is_empty() {
+        return Err("a comment follows the last entry of the cells list".into());
+    }
+    let mut by_test = BTreeMap::<&str, Vec<&str>>::new();
+    for cell in cells {
+        by_test
+            .entry(cell.test_id.as_str())
+            .or_default()
+            .push(cell.backend.as_str());
+    }
+    for (test, backends) in by_test {
+        for comment in comments.get(test).into_iter().flatten() {
+            out.push_str(comment);
+            out.push('\n');
+        }
+        out.push_str(&format!(
+            "{ENTRY}{test}\n{BACKENDS}{}]\n",
+            backends.join(", ")
+        ));
+    }
+    Ok(out)
+}
+
 fn refuse_manifest_directory(root: &Path, relative: &Path) -> Result<(), String> {
     if !relative
         .components()
@@ -5120,89 +5223,30 @@ mod tests {
         );
     }
 
-    /// Counts recorded in https://github.com/rrnewton/hermit/issues/3301.
-    /// If a manifest change moves them on purpose, update these numbers in
-    /// the same commit and regenerate the snapshot.
+    /// The census is consistent with itself. Its values are not pinned here:
+    /// they are recorded in parity-cells.json, which the freshness test above
+    /// holds to the manifests, so a manifest change that moves them shows up
+    /// as a diff of that file (https://github.com/rrnewton/hermit/issues/3606).
     #[test]
-    fn the_shipped_manifests_give_the_recorded_parity_counts() {
+    fn the_parity_census_is_self_consistent() {
         let counts = generate(&repo_root()).unwrap().counts;
-        let row = |count: &ParityCount| {
-            (
-                count.cells,
-                count.applicable,
-                count.selectable,
-                count.selected,
-                count.selected_selectable,
-            )
-        };
-        // 2252 cells (563 per backend) since fold 1 of
-        // https://github.com/rrnewton/hermit/issues/3448 moved the 189
-        // strict compatibility programs into the manifest: each declares its
-        // verify cell disabled on the four non-ptrace backends, so the census
-        // gains 756 cells and no applicable, selectable or selected one.
-        // 2360 (590 per backend) since fold 3 added the 27 rows only the
-        // sabre-compat-only run type runs, and 212 more applicable SaBRe
-        // cells: that run type's verify cells, none selectable or selected.
-        // 2372 (593 per backend) and 3 more applicable SaBRe cells since the
-        // rows lua-direct, perl-direct and df-direct kept the SaBRe corpus's
-        // single-image argv.
-        // 3144 (786 per backend) since fold 4 added the strict-compat-only
-        // run type's 193 variant tests, each declaring its verify cell
-        // disabled on the four non-ptrace backends like the rows it repeats:
-        // 772 more cells and no applicable, selectable or selected one.
-        // 3700 (925 per backend) since fold 5 added the rr-compat-only run
-        // type's 139 replay variant tests, whose cells on the four non-ptrace
-        // backends are all off: 556 more cells and no applicable, selectable
-        // or selected one.
-        // Six earlier and three socket KVM verify enables add applicable,
-        // selectable and selected cells without adding candidate identities.
-        // https://github.com/rrnewton/reverie/issues/891
-        // The poll-readiness KVM verify enable adds one more:
-        // https://github.com/rrnewton/reverie/issues/620
-        // One epoll-pwait2 KVM candidate adds exactly one to the same counters:
-        // https://github.com/rrnewton/reverie/issues/905
-        // One ordinary syncfs KVM candidate adds one to each live counter:
-        // https://github.com/rrnewton/reverie/issues/838
-        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*)
-        // enables 120 verify cells that were not applicable and turns 8
-        // more on in CI: 120 more applicable, 128 more selectable, and 89
-        // more selected (the promoted folded backend-parity-c tests).
-        assert_eq!(
-            row(&counts.all),
-            (
-                3700,
-                843 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 120,
-                527 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 128,
-                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89,
-                177 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89
-            )
-        );
-        let by_backend: Vec<_> = counts
-            .by_backend
-            .iter()
-            .map(|(backend, count)| (backend.as_str(), row(count)))
-            .collect();
-        assert_eq!(
-            by_backend,
-            [
-                ("dbt", (925, 85, 26, 16, 2)),
-                (
-                    "kvm",
-                    (
-                        925,
-                        250 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-                        243 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-                        77 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-                        76 + 6 + 3 + 1 + 1 + 1 + 1 + 1
-                    )
-                ),
-                ("liteinst", (925, 149, 146, 99, 98)),
-                // The same 120, 128 and 89 SaBRe cells as above.
-                ("sabre", (925, 359 + 120, 112 + 128, 2 + 89, 1 + 89)),
-            ]
-        );
+        let mut sum = ParityCount::default();
+        for (backend, count) in &counts.by_backend {
+            // Every test has exactly one cell per backend.
+            assert_eq!(
+                count.cells * counts.by_backend.len(),
+                counts.all.cells,
+                "{backend:?}"
+            );
+            assert!(count.selected_selectable <= count.selected.min(count.selectable));
+            sum.cells += count.cells;
+            sum.applicable += count.applicable;
+            sum.selectable += count.selectable;
+            sum.selected += count.selected;
+            sum.selected_selectable += count.selected_selectable;
+        }
+        assert_eq!(sum, counts.all);
+        assert!(counts.all.selected_selectable > 0);
     }
 
     /// The committed selection is exactly what its written rule derives, so
@@ -5215,32 +5259,13 @@ mod tests {
         let selection = ParitySelection::load(&root, &matrix).unwrap();
         // The rule names the tests folded from the retired backend-parity-c
         // bucket, which retired-ids.json records; they now live in c-programs.
-        let folded = crate::retired_ids::RetiredIds::load(&root)
-            .unwrap()
-            .successors_of("backend-parity-c")
-            .unwrap();
-        let reference_selected: BTreeSet<String> = manifests
-            .select(&Selection {
-                population: Some(Population::Required),
-                category: Some("c-programs".to_string()),
-                mode: Some(PARITY_MODE.to_string()),
-                backend: Some(PARITY_REFERENCE_BACKEND.to_string()),
-                ..Selection::default()
-            })
-            .unwrap()
-            .into_iter()
-            .map(|cell| cell.id.test)
-            .filter(|test| folded.contains(test))
-            .collect();
-        assert!(!reference_selected.is_empty());
-        let derived: BTreeSet<ParityCellId> = matrix
-            .cells()
-            .filter(|(id, availability)| {
-                availability.applicable() && reference_selected.contains(&id.test_id)
-            })
-            .map(|(id, _)| id.clone())
-            .collect();
+        let derived = rule_selection(&root, &manifests, &matrix).unwrap();
+        assert!(!derived.is_empty());
         assert_eq!(selection.cells, derived);
+        // And the file is exactly what `test-harness sync-cells` writes for it,
+        // so a flip regenerates it byte for byte.
+        let text = fs::read_to_string(root.join(PARITY_SELECTION_PATH)).unwrap();
+        assert_eq!(render_selection(&text, &derived).unwrap(), text);
         assert!(selection.rule.contains("retired backend-parity-c bucket"));
         assert!(
             selection

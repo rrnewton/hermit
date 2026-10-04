@@ -21,8 +21,9 @@
 # So does poll-readiness's KVM entry, enabled for
 # https://github.com/rrnewton/reverie/issues/620.
 #
-# After editing this file, regenerate the snapshot with:
-#   cargo run -p hermit-manifest-plan --bin generate-parity-cells -- --write
+# The cells list is generated from the rule below: edit the manifests, not the
+# list, and run ci/sync-cell-config.sh, which rewrites the list and the
+# snapshot. Comments above an entry are kept.
 schema: 1
 rule: >-
   Every candidate-backend (dbt, kvm, liteinst, sabre) verify cell of a test

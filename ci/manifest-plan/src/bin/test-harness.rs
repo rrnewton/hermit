@@ -63,6 +63,7 @@ use serde_json::Value as JsonValue;
 use serde_yaml::Value as YamlValue;
 
 const EXPECTED_PLAN_SCHEMA: u64 = 1;
+const EXPECTED_PLAN_PATH: &str = "ci/expected-e2e-plan.json";
 const DEFAULT_BUILD_JOBS: usize = 16;
 const DEFAULT_VALIDATE_AUDIT_JOBS: usize = 2;
 const PREBUILT_RUST_SCRIPTS_REQUIRED: &str = "HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED";
@@ -86,6 +87,7 @@ Commands:
   audit-compile                    Compile selected C test programs
   run                              Execute selected cells
   parity <compare|export>          Measure parity from retained logs, or export ledger rows
+  sync-cells <--check|--write>     Regenerate the expected plan and parity selection
   selftest <NAME>                  Run one repository tool's self-test
 
 Selection options:
@@ -149,6 +151,34 @@ const RUN_ENVIRONMENT: &str =
   E2E_IMPORT_RESULTS=<ROOT>              Run no cell: publish the rows another run left in
                                          ROOT/<lane>/manifest_<category>/; a selected cell
                                          with no row is an ERROR";
+
+const SYNC_CELLS_HELP: &str = "\
+Usage: test-harness sync-cells <--check|--write> [--repo-root <DIR>]
+
+Regenerate the two manifest-derived files that the scorecard and parity census
+are generated from:
+
+  ci/expected-e2e-plan.json        the required plan, rows in their committed order
+  tests/e2e/parity-selection.yaml  the cells its written rule selects
+
+A cell flip makes one existing manifest cell required: its backend joins the
+mode's `backends_enabled` and `ci`, or its `ci: false` becomes true. The diff of
+ci/expected-e2e-plan.json is the record of every change to the required cells.
+`test-harness validate` refuses a tree where either file differs from this
+output.
+
+ci/sync-cell-config.sh runs this and then every generator downstream of it;
+run that rather than this alone.
+
+Options:
+  --check                          Exit 1 naming each stale file; write nothing
+  --write                          Rewrite the stale files
+  --repo-root <DIR>                Read and write DIR (default: the checkout this
+                                   binary was built in)
+  -h, --help                       Print this help
+
+Exit status: 0 when the files match (--check) or were written (--write), 1 when
+--check finds a stale file, 2 for an unreadable input or a usage error.";
 
 const PARITY_HELP: &str = "\
 Usage: test-harness parity compare --artifacts <DIR> --cell <TEST@BACKEND> [OPTIONS]
@@ -312,6 +342,10 @@ fn print_command_help(command: &str) -> bool {
         ),
         "parity" => {
             println!("{PARITY_HELP}");
+            return true;
+        }
+        "sync-cells" => {
+            println!("{SYNC_CELLS_HELP}");
             return true;
         }
         "selftest" => {
@@ -898,6 +932,9 @@ fn main() -> ExitCode {
         .next()
         .unwrap_or_else(|| fail("missing command; try `test-harness --help`"));
     let values = values.collect::<Vec<_>>();
+    if command == "sync-cells" {
+        return sync_cells(&values);
+    }
     if command == "parity" {
         let request = match parse_parity(values) {
             ParityRequest::Compare(request) => request,
@@ -983,6 +1020,16 @@ fn validate(root: &Path, manifests: &ManifestSet) -> ExitCode {
     );
     audit_cli_brackets(root);
     let cells = audit_expected_plan(root, manifests);
+    // Byte for byte, so a hand edit that `sync-cells` would undo is refused
+    // here rather than at the next flip.
+    let synced = synced_cell_files(root).unwrap_or_else(|error| fail(error));
+    let stale = stale_files(root, &synced);
+    if !stale.is_empty() {
+        fail(format!(
+            "not what the manifests derive: {}; run ci/sync-cell-config.sh",
+            stale.join(", ")
+        ));
+    }
     println!(
         "PASS: {} YAML manifests, {} required cells",
         manifests.documents.len(),
@@ -1356,9 +1403,91 @@ fn audit_expected_plan(root: &Path, manifests: &ManifestSet) -> usize {
     let expected =
         unique_plan_rows("ci/expected-e2e-plan.json", expected).unwrap_or_else(|error| fail(error));
     if actual != expected {
-        fail("required E2E plan changed; update ci/expected-e2e-plan.json in the same review");
+        fail(
+            "required E2E plan changed; regenerate ci/expected-e2e-plan.json with \
+             ci/sync-cell-config.sh and commit it in the same review",
+        );
     }
     cell_count
+}
+
+/// The files `sync-cells` derives, each with the text the manifests now give
+/// it, in the order it reports them.
+fn synced_cell_files(root: &Path) -> Result<Vec<(&'static str, String)>, String> {
+    let read = |relative: &str| {
+        fs::read_to_string(root.join(relative))
+            .map_err(|error| format!("cannot read {relative}: {error}"))
+    };
+    let manifests = ManifestSet::load(root)?;
+    let generated = expected_plan_document(root, &manifests);
+    let matrix = parity::ParityMatrix::derive(&manifests)?;
+    let selection = parity::render_selection(
+        &read(parity::PARITY_SELECTION_PATH)?,
+        &parity::rule_selection(root, &manifests, &matrix)?,
+    )?;
+    // `expected-plan` prints the same document with println!.
+    let plan = serde_json::to_string_pretty(&generated).map_err(|error| error.to_string())? + "\n";
+    Ok(vec![
+        (EXPECTED_PLAN_PATH, plan),
+        (parity::PARITY_SELECTION_PATH, selection),
+    ])
+}
+
+/// The files whose committed bytes differ from `files`.
+fn stale_files(root: &Path, files: &[(&'static str, String)]) -> Vec<&'static str> {
+    files
+        .iter()
+        .filter(|(relative, text)| {
+            fs::read(root.join(relative)).ok().as_deref() != Some(text.as_bytes())
+        })
+        .map(|(relative, _)| *relative)
+        .collect()
+}
+
+fn sync_cells(values: &[String]) -> ExitCode {
+    let mut write = None;
+    let mut repo_root = None;
+    let mut values = values.iter();
+    while let Some(flag) = values.next() {
+        match flag.as_str() {
+            "--check" | "--write" if write.is_none() => write = Some(flag == "--write"),
+            "--check" | "--write" => fail("sync-cells takes one of --check and --write, once"),
+            "--repo-root" => {
+                let dir = values
+                    .next()
+                    .unwrap_or_else(|| fail("--repo-root needs a directory"));
+                repo_root = Some(PathBuf::from(dir));
+            }
+            other => fail(format!(
+                "sync-cells does not accept {other}; see `test-harness sync-cells --help`"
+            )),
+        }
+    }
+    let Some(write) = write else {
+        fail("sync-cells needs --check or --write; see `test-harness sync-cells --help`")
+    };
+    let root = root(repo_root.as_deref());
+    let files = synced_cell_files(&root)
+        .unwrap_or_else(|error| fail(format!("sync-cells: {error}; nothing was written")));
+    let stale = stale_files(&root, &files);
+    if write {
+        for (relative, text) in files.iter().filter(|(path, _)| stale.contains(path)) {
+            fs::write(root.join(relative), text)
+                .unwrap_or_else(|error| fail(format!("cannot write {relative}: {error}")));
+        }
+    }
+    match (stale.is_empty(), write) {
+        (true, _) => println!("sync-cells: the expected plan and parity selection are current"),
+        (false, true) => println!("sync-cells: wrote {}", stale.join(", ")),
+        (false, false) => {
+            eprintln!(
+                "sync-cells: stale: {}; run ci/sync-cell-config.sh to regenerate them",
+                stale.join(", ")
+            );
+            return ExitCode::FAILURE;
+        }
+    }
+    ExitCode::SUCCESS
 }
 
 /// Read by ci/compat-envelope/scorecard.rs: a prepared `hermit-manifest-plan`
@@ -3689,6 +3818,7 @@ mod tests {
     use std::sync::atomic::Ordering;
     use std::time::Duration;
 
+    use hermit_manifest_plan::parity;
     use hermit_manifest_plan::runner::FailureClass;
     use hermit_manifest_plan::runner::ManifestSet;
     use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
@@ -6793,23 +6923,12 @@ sys.exit(1 if failed else 0)
         // https://github.com/rrnewton/hermit/issues/3448); it plans no parity
         // cell, so the selected cells and their reports are unchanged.
         assert_eq!(nodes, 16);
+        // The size of the selection is not pinned here: parity.rs derives it
+        // from its written rule and `validate` refuses a stale file. This pins
+        // what no generator checks: each selected cell is reported by exactly
+        // one full node.
         let lines = reported.values().map(Vec::len).sum::<usize>();
-        // Six earlier and three socket KVM verify candidates satisfy the unchanged selection rule.
-        // https://github.com/rrnewton/reverie/issues/891
-        // So does the poll-readiness KVM candidate: https://github.com/rrnewton/reverie/issues/620
-        // The epoll-pwait2 candidate adds one: https://github.com/rrnewton/reverie/issues/905
-        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*)
-        // selects 89 folded SaBRe verify candidates under the same rule.
-        assert_eq!(
-            (selection.len(), lines),
-            (
-                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89,
-                194 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 89
-            )
-        );
+        assert_eq!(lines, selection.len());
         assert_eq!(reported.keys().cloned().collect::<BTreeSet<_>>(), selection);
         let duplicated = reported
             .iter()
@@ -6826,33 +6945,18 @@ sys.exit(1 if failed else 0)
             .filter(|cell| !explicitly.contains_key(*cell))
             .map(ToString::to_string)
             .collect::<Vec<_>>();
-        // 628 applicable, 624 reported and 4 not until fold 3 of
+        // 4 applicable cells were unreported until fold 3 of
         // https://github.com/rrnewton/hermit/issues/3448 gave 212 compat rows a
         // SaBRe verify cell, which makes their SaBRe parity cell applicable.
         // e2e.manifest_compat plans the ptrace side of 185 of them. The other
         // 27 are the rows only the SaBRe run type runs, so no full node plans
         // either side of their cell; so are the 3 single-image rows
         // lua-direct, perl-direct and df-direct.
-        assert_eq!(
-            (applicable.len(), explicitly.len(), unreported.len()),
-            // The six earlier and three socket KVM verify enables add nine
-            // applicable cells, all reported.
-            // https://github.com/rrnewton/reverie/issues/891
-            // The poll-readiness KVM cell is reported too: https://github.com/rrnewton/reverie/issues/620
-            // The epoll-pwait2 candidate is reported too: https://github.com/rrnewton/reverie/issues/905
-            // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-            // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-            // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-            // The 2026-10-03 SaBRe promotion makes 120 more cells applicable,
-            // each reported by the node that plans its ptrace side; its 8
-            // red-to-green cells were already applicable and reported.
-            (
-                628 + 6 + 3 + 1 + 215 + 1 + 1 + 1 + 1 + 120,
-                624 + 6 + 3 + 1 + 185 + 1 + 1 + 1 + 1 + 120,
-                4 + 30,
-            ),
-            "{unreported:?}"
-        );
+        // How many cells are applicable is the parity census's count, which
+        // ci/compat-envelope/parity-cells.json records and a test keeps
+        // current. This pins what the census does not show: which applicable
+        // cells no full node reports.
+        assert_eq!(unreported.len(), 4 + 30, "{unreported:?}");
         let sabre_only = unreported
             .iter()
             .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
@@ -6896,15 +7000,9 @@ sys.exit(1 if failed else 0)
             .iter()
             .filter(|row| row["backend"] == "kvm")
             .collect::<Vec<_>>();
-        // Six additional KVM verify selections retain the same host-capability contract.
-        // https://github.com/rrnewton/reverie/issues/891
-        // Three socket selections: https://github.com/rrnewton/reverie/issues/891.
-        // One poll-readiness selection: https://github.com/rrnewton/reverie/issues/620.
-        // One epoll-pwait2 selection: https://github.com/rrnewton/reverie/issues/905.
-        // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-        // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-        // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-        assert_eq!(kvm.len(), 244 + 6 + 3 + 1 + 1 + 1 + 1 + 1);
+        // How many there are is the plan's to say; ci/expected-e2e-plan.json
+        // records it and `validate` refuses a stale copy.
+        assert!(!kvm.is_empty());
         let missing = kvm
             .iter()
             .filter(|row| !capabilities(row).contains(&"kvm".to_string()))
@@ -8995,5 +9093,208 @@ sys.exit(1 if failed else 0)
         ] {
             assert!(command_jobs(command).is_err(), "accepted {command}");
         }
+    }
+
+    /// A fresh temporary root holding a copy of tests/e2e and the expected
+    /// plan, the files `sync-cells` reads and writes, with every other entry of
+    /// the checkout, tests and ci linked in for the programs the manifests name.
+    fn sync_cells_fixture(label: &str) -> std::path::PathBuf {
+        fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), &target).unwrap();
+                }
+            }
+        }
+        let checkout = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-sync-cells-{label}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&fixture);
+        let link_except = |dir: &str, own: &[&str]| {
+            fs::create_dir_all(fixture.join(dir)).unwrap();
+            for entry in fs::read_dir(checkout.join(dir)).unwrap() {
+                let name = entry.unwrap().file_name();
+                if !own.iter().any(|own| name == *own) {
+                    std::os::unix::fs::symlink(
+                        checkout.join(dir).join(&name),
+                        fixture.join(dir).join(&name),
+                    )
+                    .unwrap();
+                }
+            }
+        };
+        // Not .git: the fixture is no checkout.
+        link_except("", &["tests", ".git"]);
+        fs::remove_file(fixture.join("ci")).unwrap();
+        link_except("ci", &["expected-e2e-plan.json"]);
+        link_except("tests", &["e2e"]);
+        copy_tree(&checkout.join("tests/e2e"), &fixture.join("tests/e2e"));
+        fs::copy(
+            checkout.join(super::EXPECTED_PLAN_PATH),
+            fixture.join(super::EXPECTED_PLAN_PATH),
+        )
+        .unwrap();
+        fixture
+    }
+
+    /// `source`, a manifest file, with `backend` taken out of `test`'s `mode`:
+    /// the reverse of a cell flip. Returns the edited YAML.
+    fn unflip(source: &str, test: &str, mode: &str, backend: &str) -> String {
+        use serde_yaml::Value;
+        let mut manifest: Value = serde_yaml::from_str(source).unwrap();
+        let entry = manifest["test"]
+            .as_sequence_mut()
+            .unwrap()
+            .iter_mut()
+            .find(|entry| entry["id"].as_str() == Some(test))
+            .unwrap_or_else(|| panic!("{test} is not in its manifest"));
+        let mode = entry["modes"][mode].as_mapping_mut().unwrap();
+        let enabled = mode
+            .get_mut("backends_enabled")
+            .and_then(Value::as_sequence_mut)
+            .unwrap();
+        let before = enabled.len();
+        enabled.retain(|name| name.as_str() != Some(backend));
+        assert_eq!(
+            enabled.len() + 1,
+            before,
+            "{test} does not enable {backend}"
+        );
+        for per_backend in ["ci", "expected_stdout"] {
+            if let Some(map) = mode.get_mut(per_backend).and_then(Value::as_mapping_mut) {
+                map.remove(backend);
+            }
+        }
+        let disabled = mode
+            .entry("backends_disabled".into())
+            .or_insert_with(|| Value::Mapping(Default::default()));
+        disabled.as_mapping_mut().unwrap().insert(
+            backend.into(),
+            "un-flipped by the sync-cells round-trip test".into(),
+        );
+        serde_yaml::to_string(&manifest).unwrap()
+    }
+
+    fn sync(root: &std::path::Path) -> Vec<&'static str> {
+        let files = super::synced_cell_files(root).unwrap();
+        let stale = super::stale_files(root, &files);
+        for (relative, text) in &files {
+            fs::write(root.join(relative), text).unwrap();
+        }
+        stale
+    }
+
+    /// Un-flipping a required cell and flipping it back with `sync-cells`
+    /// gives back the committed files byte for byte
+    /// (https://github.com/rrnewton/hermit/issues/3606).
+    ///
+    /// The subject is the plan's last row because the generator keeps the
+    /// committed order and appends new rows, so a re-flipped row returns to the
+    /// end of the plan: the order a hand flip by the generator gives too.
+    #[test]
+    fn sync_cells_round_trips_an_unflip_and_reflip_byte_for_byte() {
+        let root = sync_cells_fixture("tail");
+        let committed_plan = fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap();
+        let committed_selection = fs::read(root.join(parity::PARITY_SELECTION_PATH)).unwrap();
+        assert!(
+            sync(&root).is_empty(),
+            "the committed plan and selection are stale; run ci/sync-cell-config.sh"
+        );
+
+        let plan: serde_json::Value = serde_json::from_slice(&committed_plan).unwrap();
+        let tail = plan["cells"].as_array().unwrap().last().unwrap().clone();
+        let field = |name: &str| tail[name].as_str().unwrap().to_owned();
+        let (test, mode, backend) = (field("test"), field("mode"), field("backend"));
+        let manifest = root.join(format!("tests/e2e/manifests/{}.yaml", field("category")));
+        let original = fs::read_to_string(&manifest).unwrap();
+
+        fs::write(&manifest, unflip(&original, &test, &mode, &backend)).unwrap();
+        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        let unflipped: serde_json::Value =
+            serde_json::from_slice(&fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap())
+                .unwrap();
+        let cells = unflipped["cells"].as_array().unwrap();
+        assert_eq!(cells.len() + 1, plan["cells"].as_array().unwrap().len());
+        assert!(
+            !cells.contains(&tail),
+            "the un-flipped row stayed in the plan"
+        );
+
+        fs::write(&manifest, &original).unwrap();
+        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        assert_eq!(
+            fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap(),
+            committed_plan
+        );
+        assert_eq!(
+            fs::read(root.join(parity::PARITY_SELECTION_PATH)).unwrap(),
+            committed_selection
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The same round trip through a parity-selected KVM cell: the selection
+    /// file returns byte for byte, and the plan returns with the same rows,
+    /// the re-flipped one now last.
+    #[test]
+    fn sync_cells_round_trips_a_parity_selected_kvm_cell() {
+        let root = sync_cells_fixture("kvm");
+        let committed_plan = fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap();
+        let committed_selection =
+            fs::read_to_string(root.join(parity::PARITY_SELECTION_PATH)).unwrap();
+        // A selected test with another backend beside kvm, so its entry and any
+        // comment above it stay in the file while kvm is out.
+        let test = committed_selection
+            .lines()
+            .zip(committed_selection.lines().skip(1))
+            .find_map(|(entry, backends)| {
+                let test = entry.strip_prefix("  - test: ")?;
+                (backends.contains("kvm, ") || backends.contains(", kvm")).then_some(test)
+            })
+            .unwrap()
+            .to_owned();
+        let category = test.split('/').next().unwrap();
+        let manifest = root.join(format!("tests/e2e/manifests/{category}.yaml"));
+        let original = fs::read_to_string(&manifest).unwrap();
+
+        fs::write(&manifest, unflip(&original, &test, "verify", "kvm")).unwrap();
+        let mut stale = sync(&root);
+        stale.sort_unstable();
+        assert_eq!(
+            stale,
+            [super::EXPECTED_PLAN_PATH, parity::PARITY_SELECTION_PATH]
+        );
+
+        fs::write(&manifest, &original).unwrap();
+        sync(&root);
+        assert_eq!(
+            fs::read_to_string(root.join(parity::PARITY_SELECTION_PATH)).unwrap(),
+            committed_selection
+        );
+        let rows = |bytes: &[u8]| {
+            let plan: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+            let mut rows = plan["cells"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row.to_string())
+                .collect::<Vec<_>>();
+            let last = rows.last().cloned().unwrap();
+            rows.sort_unstable();
+            (rows, last)
+        };
+        let (committed_rows, _) = rows(&committed_plan);
+        let (reflipped_rows, last) = rows(&fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap());
+        assert_eq!(reflipped_rows, committed_rows);
+        assert!(last.contains(&format!("\"test\":\"{test}\"")) && last.contains("\"kvm\""));
+        fs::remove_dir_all(&root).unwrap();
     }
 }

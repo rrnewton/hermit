@@ -15113,6 +15113,63 @@ fn node_vacuity_bracket(root: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// (kvm-backend rows, all rows) of each (lane, category) manifest bucket of
+/// `ci/expected-e2e-plan.json`, counted by each row's `backend`. The brackets
+/// below compare the capability accounting, which reads each row's
+/// `requires_host_capabilities` instead, against these counts. Reading them
+/// from the plan, not pinning them, lets a cell flip touch only the manifest
+/// and the files generated from it (https://github.com/rrnewton/hermit/issues/3606).
+fn plan_kvm_buckets(root: &Path) -> Result<BTreeMap<(String, String), (usize, usize)>, String> {
+    let path = root.join("ci/expected-e2e-plan.json");
+    let document: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e}", path.display()))?,
+    )
+    .map_err(|e| format!("invalid JSON in {}: {e}", path.display()))?;
+    let cells = document
+        .get("cells")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| format!("{} has no cells array", path.display()))?;
+    let mut buckets = BTreeMap::<(String, String), (usize, usize)>::new();
+    for cell in cells {
+        let field = |name: &str| {
+            cell.get(name)
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| format!("{} contains a cell without a {name}", path.display()))
+        };
+        let bucket = buckets
+            .entry((field("lane")?.to_string(), field("category")?.to_string()))
+            .or_default();
+        bucket.0 += usize::from(field("backend")? == "kvm");
+        bucket.1 += 1;
+    }
+    Ok(buckets)
+}
+
+/// (tag, kvm cells, selected cells) of each `lane` bucket with a kvm cell, for
+/// the bucket nodes named `<prefix>e2e.manifest_<category>`; `whole` picks the
+/// buckets whose every cell is kvm, otherwise those that also run other cells.
+fn kvm_bucket_rows(
+    buckets: &BTreeMap<(String, String), (usize, usize)>,
+    lane: &str,
+    prefix: &str,
+    whole: Option<bool>,
+) -> Vec<(String, usize, usize)> {
+    buckets
+        .iter()
+        .filter(|((bucket_lane, _), (kvm, all))| {
+            bucket_lane == lane && *kvm > 0 && whole.is_none_or(|whole| whole == (kvm == all))
+        })
+        .map(|((_, category), (kvm, all))| {
+            (
+                format!("{prefix}e2e.manifest_{}", category.replace('-', "_")),
+                *kvm,
+                *all,
+            )
+        })
+        .collect()
+}
+
 /// Two-sided bracket for kvm cells inside buckets that also run other cells.
 ///
 /// The harness withholds every kvm cell where KVM is proven absent, and most
@@ -15130,36 +15187,29 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         (HostCapability::Kvm, "planted absence".to_string()),
         (HostCapability::CpuidFaulting, "planted absence".to_string()),
     ]);
-    // (tag, withheld, selected), measured from ci/expected-e2e-plan.json: the
-    // kvm-backend rows of each bucket against all of its rows.
-    // https://github.com/rrnewton/reverie/issues/891 adds six portable KVM
-    // verify cells to both populations; three socket cells add another explicit +3.
-    // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
-    // One epoll-pwait2 KVM verification row: https://github.com/rrnewton/reverie/issues/905.
-    // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-    // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-    // The 2026-10-03 SaBRe promotion (timeouts::SABRE_2026_10_03_*) adds 128
-    // portable SaBRe verify cells, none of them kvm: 116 c-programs, 10
-    // system-utils, 1 determinism-stress-c and 1 language-runtimes.
-    let portable_partial: &[(&str, usize, usize)] = &[
-        ("e2e.manifest_applications", 1, 4),
-        (
-            "e2e.manifest_c_programs",
-            195 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-            744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116,
-        ),
-        ("e2e.manifest_data_handling", 1, 7),
-        ("e2e.manifest_debugger_c", 1, 4),
-        ("e2e.manifest_determinism_stress", 2, 8),
-        ("e2e.manifest_determinism_stress_c", 2, 14 + 1),
-        ("e2e.manifest_language_runtimes", 14, 33 + 1),
-        ("e2e.manifest_system_utils", 25, 74 + 10),
-    ];
-    let privileged_partial: &[(&str, usize, usize)] = &[
-        ("privileged-e2e.manifest_c_programs", 1, 4),
-        ("privileged-e2e.manifest_system_utils", 1, 2),
-    ];
+    // (tag, withheld, selected): the kvm-backend rows of each bucket against
+    // all of its rows.
+    let buckets = plan_kvm_buckets(root)?;
+    let portable_partial = kvm_bucket_rows(&buckets, "portable", "", Some(false));
+    let privileged_partial = kvm_bucket_rows(&buckets, "privileged", "privileged-", Some(false));
+    let mut full_whole = kvm_bucket_rows(&buckets, "portable", "", Some(true));
+    full_whole.extend(kvm_bucket_rows(
+        &buckets,
+        "privileged",
+        "privileged-",
+        Some(true),
+    ));
+    let portable_whole = kvm_bucket_rows(&buckets, "portable", "", Some(true));
+    let tags_of = |rows: &[(String, usize, usize)]| {
+        let mut tags = rows.iter().map(|(tag, ..)| tag.clone()).collect::<Vec<_>>();
+        tags.sort();
+        tags
+    };
+    let (c_programs_kvm, c_programs_all) = buckets
+        .get(&("portable".to_string(), "c-programs".to_string()))
+        .copied()
+        .ok_or("host-inapplicable cells: required plan lost portable/c-programs")?;
+    let kvm_total: usize = buckets.values().map(|(kvm, _)| kvm).sum();
     let plan_for = |label: &str| -> Result<Plan, String> {
         Ok(Plan {
             cfg: DagConfig {
@@ -15189,11 +15239,11 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
             })
             .collect::<BTreeSet<_>>()
     };
-    let expect = |rows: &[&[(&str, usize, usize)]]| {
+    let expect = |rows: &[&[(String, usize, usize)]]| {
         rows.iter()
             .flat_map(|rows| rows.iter())
             .map(|(tag, withheld, selected)| {
-                (tag.to_string(), HostCapability::Kvm, *withheld, *selected)
+                (tag.clone(), HostCapability::Kvm, *withheld, *selected)
             })
             .collect::<BTreeSet<_>>()
     };
@@ -15217,37 +15267,41 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
 
     // The plan rows themselves: every kvm cell names kvm, so the accounting
     // counts them in their buckets with KVM present and withholds them with it
-    // absent. One epoll-pwait2 KVM row is added by https://github.com/rrnewton/reverie/issues/905.
+    // absent.
     let present = read_bucket_cells(root, &BTreeMap::new())?;
     let c_programs = present
         .iter()
         .find(|b| b.lane == "portable" && b.category == "c-programs")
         .ok_or("host-inapplicable cells: required plan lost portable/c-programs")?;
-    if c_programs.selected != 744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116 || c_programs.withheld != 0 {
+    if c_programs.selected != c_programs_all || c_programs.withheld != 0 {
         return Err(format!(
-            "host-inapplicable cells: with KVM present all 874 portable/c-programs cells must be \
-             counted and none withheld: {c_programs:?}"
+            "host-inapplicable cells: with KVM present all {c_programs_all} portable/c-programs \
+             cells must be counted and none withheld: {c_programs:?}"
         ));
     }
     let absent = read_bucket_cells(root, &kvm_absent)?;
     let withheld: usize = absent.iter().map(|b| b.withheld).sum();
-    if withheld != 244 + 6 + 3 + 1 + 1 + 1 + 1 + 1
+    if withheld != kvm_total
         || absent
             .iter()
             .any(|b| b.withheld > 0 && b.capabilities != ["kvm"])
     {
         return Err(format!(
-            "host-inapplicable cells: with KVM absent exactly the 258 kvm cells must be withheld, \
-             by kvm alone; got {withheld}: {absent:?}"
+            "host-inapplicable cells: with KVM absent exactly the {kvm_total} kvm cells must be \
+             withheld, by kvm alone; got {withheld}: {absent:?}"
         ));
     }
 
     for (label, partial, whole) in [
-        ("portable", vec![portable_partial], Vec::<&str>::new()),
+        (
+            "portable",
+            vec![&portable_partial[..]],
+            tags_of(&portable_whole),
+        ),
         (
             "full",
-            vec![portable_partial, privileged_partial],
-            vec!["privileged-e2e.manifest_applications"],
+            vec![&portable_partial[..], &privileged_partial[..]],
+            tags_of(&full_whole),
         ),
     ] {
         // QUALIFYING — KVM present. The kvm cells must still be asked about,
@@ -15301,9 +15355,9 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
         let (complete, exit, result) = judge(&plan, "e2e.manifest_c_programs");
         if complete || exit != NO_RESULT_EXIT_CODE as u8 || result != "no_result" {
             return Err(format!(
-                "host-inapplicable cells: a passing {label} node whose 205 kvm cells were \
-                 withheld must leave the run incomplete; got complete={complete} exit={exit} \
-                 result={result}"
+                "host-inapplicable cells: a passing {label} node whose {c_programs_kvm} kvm cells \
+                 were withheld must leave the run incomplete; got complete={complete} \
+                 exit={exit} result={result}"
             ));
         }
         let summary = host_inapplicable_plan_summary(&plan.host_inapplicable);
@@ -15365,9 +15419,14 @@ fn host_inapplicable_cells_bracket(root: &Path) -> Result<(), String> {
     }
 
     println!(
-        "  host-inapplicable cells: plan rows 258 kvm withheld / 874 portable c-programs counted, \
-         portable 8 running recorded / 0 withheld, full 10 running recorded / 1 withheld, \
-         qualifying 2 complete / violating 2 NO_RESULT, attribution 1 shared / 2 refused"
+        "  host-inapplicable cells: plan rows {kvm_total} kvm withheld / {c_programs_all} portable \
+         c-programs counted, portable {} running recorded / {} withheld, full {} running \
+         recorded / {} withheld, qualifying 2 complete / violating 2 NO_RESULT, attribution 1 \
+         shared / 2 refused",
+        portable_partial.len(),
+        portable_whole.len(),
+        portable_partial.len() + privileged_partial.len(),
+        full_whole.len(),
     );
     Ok(())
 }
@@ -15440,80 +15499,52 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         require_committed_scheduler_input(plan)
     };
 
-    // (tag, kvm cells, selected cells), measured from ci/expected-e2e-plan.json.
-    // The +6 earlier and +3 socket KVM verify selections are documented at
-    // https://github.com/rrnewton/reverie/issues/891.
-    // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
-    // One epoll-pwait2 KVM verification row: https://github.com/rrnewton/reverie/issues/905.
-    // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-    // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-    // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-    // The 128 SaBRe verify cells of 2026-10-03 add only selected cells, as above.
-    let portable: &[(&str, usize, usize)] = &[
-        ("e2e.manifest_applications", 1, 4),
-        (
-            "e2e.manifest_c_programs",
-            195 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-            744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116,
-        ),
-        ("e2e.manifest_data_handling", 1, 7),
-        ("e2e.manifest_debugger_c", 1, 4),
-        ("e2e.manifest_determinism_stress", 2, 8),
-        ("e2e.manifest_determinism_stress_c", 2, 14 + 1),
-        ("e2e.manifest_language_runtimes", 14, 33 + 1),
-        ("e2e.manifest_system_utils", 25, 74 + 10),
-    ];
-    let full_privileged: &[(&str, usize, usize)] = &[
-        ("privileged-e2e.manifest_applications", 1, 1),
-        ("privileged-e2e.manifest_c_programs", 1, 4),
-        ("privileged-e2e.manifest_system_utils", 1, 2),
-    ];
-    let privileged_only: &[(&str, usize, usize)] = &[
-        ("privileged-only-e2e.manifest_applications", 1, 1),
-        ("privileged-only-e2e.manifest_c_programs", 1, 4),
-        ("privileged-only-e2e.manifest_system_utils", 1, 2),
-    ];
-    let c_programs: &[(&str, usize, usize)] = &[(
-        "e2e.manifest_c_programs",
-        195 + 6 + 3 + 1 + 1 + 1 + 1 + 1,
-        744 + 6 + 3 + 1 + 1 + 1 + 1 + 1 + 116,
-    )];
+    // (tag, kvm cells, selected cells), counted from ci/expected-e2e-plan.json.
+    let buckets = plan_kvm_buckets(root)?;
+    let portable = kvm_bucket_rows(&buckets, "portable", "", None);
+    let full_privileged = kvm_bucket_rows(&buckets, "privileged", "privileged-", None);
+    let privileged_only = kvm_bucket_rows(&buckets, "privileged", "privileged-only-", None);
+    let c_programs = portable
+        .iter()
+        .filter(|(tag, ..)| tag == "e2e.manifest_c_programs")
+        .cloned()
+        .collect::<Vec<_>>();
     // (label, argv, expected (tag, kvm cells, selected cells) rows, node-level kvm tag)
     type RefusedCase<'a> = (
         &'a str,
         Vec<&'a str>,
-        Vec<&'a [(&'a str, usize, usize)]>,
+        Vec<&'a [(String, usize, usize)]>,
         Option<&'a str>,
     );
     let refused_cases: [RefusedCase<'_>; 5] = [
         (
             "portable profile",
             vec!["portable-only"],
-            vec![portable],
+            vec![&portable[..]],
             None,
         ),
         (
             "--only full e2e.manifest_c_programs",
             vec!["--only", "full", "e2e.manifest_c_programs"],
-            vec![c_programs],
+            vec![&c_programs[..]],
             None,
         ),
         (
             "--only portable e2e.manifest_c_programs",
             vec!["--only", "portable", "e2e.manifest_c_programs"],
-            vec![c_programs],
+            vec![&c_programs[..]],
             None,
         ),
         (
             "full profile",
             vec!["full"],
-            vec![portable, full_privileged],
+            vec![&portable[..], &full_privileged[..]],
             Some("privileged-test.cli_kvm"),
         ),
         (
             "privileged profile",
             vec!["--privileged-only"],
-            vec![privileged_only],
+            vec![&privileged_only[..]],
             Some("privileged-only-test.cli_kvm"),
         ),
     ];
@@ -15521,7 +15552,7 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         let expected: BTreeSet<(String, usize, usize)> = rows
             .iter()
             .flat_map(|rows| rows.iter())
-            .map(|(tag, kvm, selected)| (tag.to_string(), *kvm, *selected))
+            .map(|(tag, kvm, selected)| (tag.clone(), *kvm, *selected))
             .collect();
 
         // The accounting the step consumes, exactly.
@@ -15665,11 +15696,20 @@ fn committed_cell_capability_bracket(root: &Path) -> Result<(), String> {
         ));
     }
 
+    let (c_programs_kvm, c_programs_all) = c_programs
+        .first()
+        .map(|(_, kvm, all)| (*kvm, *all))
+        .unwrap_or_default();
     println!(
-        "  committed cell capability: KVM absent refuses 5 selections (portable 8 nodes / 255 \
-         kvm cells, --only full and --only portable c-programs 209 of 874, full 11 nodes, \
-         privileged 3 nodes) with the graph unchanged; every capability present admits all 5 \
-         unchanged; 3 kvm-free selections admitted with KVM absent; unreadable plan refused"
+        "  committed cell capability: KVM absent refuses 5 selections (portable {} nodes / {} \
+         kvm cells, --only full and --only portable c-programs {c_programs_kvm} of \
+         {c_programs_all}, full {} nodes, privileged {} nodes) with the graph unchanged; every \
+         capability present admits all 5 unchanged; 3 kvm-free selections admitted with KVM \
+         absent; unreadable plan refused",
+        portable.len(),
+        portable.iter().map(|(_, kvm, _)| kvm).sum::<usize>(),
+        portable.len() + full_privileged.len(),
+        privileged_only.len(),
     );
     Ok(())
 }
@@ -17439,28 +17479,15 @@ mod nextest_timeout_tests {
                 })
                 .unwrap()
                 .len(),
-            // 900 before the strict compatibility corpus moved into
-            // compat.yaml (fold 1 of https://github.com/rrnewton/hermit/issues/3448),
-            // plus the select replay cells of
-            // https://github.com/rrnewton/hermit/pull/3580, plus the six KVM verify cells of
-            // https://github.com/rrnewton/reverie/issues/891.
-            900 + hermit_manifest_plan::timeouts::STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT
-                + hermit_manifest_plan::timeouts::SELECT_REPLAY_2026_10_03_SELECTED_CI_CELL_COUNT
-                + 6
-                // Three socket selections: https://github.com/rrnewton/reverie/issues/891.
-                + 3
-                // One zero-time poll-readiness KVM verify selection: https://github.com/rrnewton/reverie/issues/620.
-                + 1
-                // One zero-time epoll-pwait2 KVM verify selection: https://github.com/rrnewton/reverie/issues/905.
-                + 1
-                // One ordinary syncfs KVM selection: https://github.com/rrnewton/reverie/issues/838.
-                + 1
-                // One pipe owner/signal KVM selection: https://github.com/rrnewton/reverie/pull/910.
-                + 1
-                // One msync writeback KVM selection: https://github.com/rrnewton/reverie/issues/891.
-                + 1
-                // The 128 SaBRe verify cells promoted on 2026-10-03.
-                + hermit_manifest_plan::timeouts::SABRE_2026_10_03_SELECTED_CI_CELL_COUNT,
+            // The committed plan's population, which the manifest gate holds to
+            // the manifests (https://github.com/rrnewton/hermit/issues/3606).
+            serde_json::from_str::<serde_json::Value>(
+                &std::fs::read_to_string(root.join("ci/expected-e2e-plan.json")).unwrap()
+            )
+            .unwrap()["cells"]
+                .as_array()
+                .unwrap()
+                .len(),
             "timeout accounting must not change the shipped required-cell population"
         );
         let selection = Selection {
