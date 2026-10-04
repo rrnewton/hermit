@@ -75,6 +75,12 @@
  *   read_fault_consumes
  *       A read into an unmapped buffer faults after taking the expirations,
  *       so the next read finds none.
+ *   read_across_close / read_across_reuse / readv_across_close /
+ *   readv_across_reuse
+ *       A read or readv blocked on a timer keeps that timer when another
+ *       thread closes the descriptor, and when a new timerfd then takes the
+ *       freed number: it returns the old timer's count, not EBADF, and leaves
+ *       the new timer's expiration unread.
  *   create_errors / gettime_errors / settime_errors
  *       Linux's argument-checking order: bad flags or clock are EINVAL (even
  *       for an alarm clock); gettime checks the descriptor before the output
@@ -790,6 +796,52 @@ static void check_read_fault_consumes(void) {
     else ok(name);
 }
 
+/* Closes the timerfd another thread is blocked reading. With reuse it then
+ * creates a nonblocking timerfd, which takes the freed number, and lets that
+ * one expire once while the read still waits. */
+struct close_job {
+    int tfd;
+    int reuse;
+    int new_fd; /* out: the replacement, or -1 */
+};
+
+static void *close_later(void *arg) {
+    struct close_job *job = arg;
+    sleep_ns(20 * MS);
+    close(job->tfd);
+    job->new_fd = -1;
+    if (job->reuse) {
+        job->new_fd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, 5 * MS, 0, 0);
+        sleep_ns(20 * MS);
+    }
+    return NULL;
+}
+
+/* A blocked read holds the open file, not the descriptor number: Linux keeps
+ * reading the timer it started on after another thread closes the number,
+ * and after a new timerfd takes it. */
+static void check_read_across_close(const char *name, int vectored, int reuse) {
+    int tfd = armed_tfd(CLOCK_MONOTONIC, 0, 80 * MS, 0, 0);
+    struct close_job job = {tfd, reuse, -1};
+    pthread_t thread;
+    pthread_create(&thread, NULL, close_later, &job);
+    uint64_t count = 0;
+    struct iovec whole = {&count, sizeof count};
+    errno = 0;
+    ssize_t r = vectored ? readv(tfd, &whole, 1) : read(tfd, &count, sizeof count);
+    int err = errno;
+    pthread_join(thread, NULL);
+    uint64_t left = 0;
+    ssize_t again = -2;
+    if (reuse && job.new_fd == tfd) again = read(job.new_fd, &left, sizeof left);
+    if (job.new_fd >= 0) close(job.new_fd);
+    if (r != 8 || count != 1)
+        fail(name, "r=%ld errno=%ld", (long)r, r == 8 ? (long)count : err);
+    else if (reuse && (again != 8 || left != 1))
+        fail(name, "replacement_r=%ld left=%ld", (long)again, (long)left);
+    else ok(name);
+}
+
 static void check_create_errors(void) {
     const char *name = "create_errors";
     struct { int clock; int flags; } cases[] = {
@@ -986,6 +1038,10 @@ int main(void) {
     check_vectored_reads();
     check_readv_faults();
     check_read_fault_consumes();
+    check_read_across_close("read_across_close", 0, 0);
+    check_read_across_close("read_across_reuse", 0, 1);
+    check_read_across_close("readv_across_close", 1, 0);
+    check_read_across_close("readv_across_reuse", 1, 1);
     check_create_errors();
     check_gettime_errors();
     check_settime_errors();
