@@ -155,6 +155,8 @@ use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::run_dag_boxed_deadline;
 use dagrun::scheduler::steps_violating_run_timeout;
 use hermit_manifest_plan::host_capability::CapabilityVerdict;
+use hermit_manifest_plan::invocation_cgroup::ALLOW_PROCESS_GROUP_CPU_SCAN_ENV;
+use hermit_manifest_plan::invocation_cgroup::process_group_scan_allowed;
 use hermit_manifest_plan::ledger::HistoryRow;
 use hermit_manifest_plan::runner::E2E_KERNEL_VERSION_ENV;
 use hermit_manifest_plan::runner::E2E_MACHINE_SHORTNAME_ENV;
@@ -2968,6 +2970,7 @@ fn self_test() -> Result<(), String> {
         committed_validation_execution_bracket(&repo_root())?
     );
     println!("  {}", raw_run_dag_strict_compat_bracket(&repo_root())?);
+    println!("  {}", raw_run_dag_scan_marker_bracket(&repo_root())?);
     println!("  {}", raw_run_dag_engine_bracket(&repo_root())?);
     shard_coverage_resource_policy_bracket(&repo_root())?;
 
@@ -4135,6 +4138,7 @@ fn self_test() -> Result<(), String> {
         nested_scope_self_test()?,
         retry_timeout_bound_bracket(&root)?,
         scheduler_accounting_bracket()?,
+        process_group_scan_marker_bracket()?,
         budget_reason_bracket()?,
         summary_listing_bracket()?,
         validate_super::self_test(&root)?,
@@ -6538,6 +6542,79 @@ fn resolve_cgroups(
         safe_ci_scope::resolve_cgroups("validate", allow_failure, scope_runtime_s, owns_request);
     std::env::remove_var(VALIDATE_SERVICE_RESULT_PATH_ENV);
     safe_ci_scope::propagate_result(result)
+}
+
+/// The value of `ALLOW_PROCESS_GROUP_CPU_SCAN_ENV` this run's E2E cells
+/// inherit, given whether the run is boxed and the caller's own value. Each
+/// budgeted cell measures its live CPU in a cgroup of its own. A boxed run
+/// passes no marker, so a cell whose cgroup cannot be created is stopped, and
+/// it refuses to start when the caller set the marker, so a boxed run never
+/// measures with the scan. Only a run let go unboxed on purpose
+/// (`--allow-cgroup-failure`) lets such a cell fall back to the agent-utils
+/// process-group CPU scan, which its rows then name as their source. That run
+/// sets the marker itself, whatever the caller passed.
+fn process_group_scan_marker(
+    boxed: bool,
+    caller: Option<&OsStr>,
+) -> Result<Option<&'static str>, String> {
+    match (boxed, caller) {
+        (false, _) => Ok(Some("1")),
+        (true, None) => Ok(None),
+        (true, Some(value)) => Err(format!(
+            "this run is boxed, and a boxed run refuses the caller's {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}={value:?}: its E2E cells measure live CPU from cgroups of their own and stop when one cannot be created, never falling back to the process-group CPU scan"
+        )),
+    }
+}
+
+fn process_group_scan_marker_bracket() -> Result<String, String> {
+    match process_group_scan_marker(true, None) {
+        Ok(None) => {}
+        other => {
+            return Err(format!(
+                "a boxed run without a caller marker handed its E2E cells {other:?} instead of no marker"
+            ));
+        }
+    }
+    for caller in ["1", "0", ""] {
+        match process_group_scan_marker(true, Some(OsStr::new(caller))) {
+            Err(reason) if reason.contains(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV) => {}
+            other => {
+                return Err(format!(
+                    "a boxed run did not refuse the caller's {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}={caller:?}: {other:?}"
+                ));
+            }
+        }
+    }
+    for caller in [None, Some("0"), Some("1")] {
+        let unboxed = process_group_scan_marker(false, caller.map(OsStr::new))?
+            .ok_or("an unboxed run would give its E2E cells no live CPU source")?;
+        if process_group_scan_allowed(Some(OsStr::new(unboxed))) != Ok(true) {
+            return Err(format!(
+                "with caller marker {caller:?}, the E2E runner does not accept the unboxed marker {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}={unboxed:?}"
+            ));
+        }
+    }
+    Ok(format!(
+        "process-group CPU scan marker: a boxed run passes none and refuses a caller's; an unboxed run sets {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}=1"
+    ))
+}
+
+#[cfg(test)]
+mod process_group_scan_marker_tests {
+    #[test]
+    fn a_boxed_run_refuses_a_callers_process_group_scan_marker() {
+        super::process_group_scan_marker_bracket().unwrap();
+    }
+
+    #[test]
+    fn run_dag_exports_the_process_group_scan_marker_only_for_unsafe_no_cgroups() {
+        // A rust-script test runs in its cache project, outside the checkout.
+        let root = std::path::Path::new(file!())
+            .parent()
+            .and_then(std::path::Path::parent)
+            .unwrap();
+        super::raw_run_dag_scan_marker_bracket(root).unwrap();
+    }
 }
 
 // --------------------------------------------------------------------------- durable log
@@ -13455,6 +13532,94 @@ fn raw_run_dag_strict_compat_bracket(root: &Path) -> Result<String, String> {
     Ok(format!(
         "raw run-dag: public launcher passed the {}-node committed superset plus exact hosted portable/privileged labels; non-selection controls forwarded; alternate DAG and label overrides refused before runner invocation; no nested scheduler command",
         cfg.steps.len(),
+    ))
+}
+
+/// The public launcher decides whether the E2E cells of a raw DAG run may fall
+/// back to the process-group CPU scan. Run a private copy of it against a
+/// runner that only records the marker it inherits: `--unsafe-no-cgroups` must
+/// export exactly `1`, and every other run, `--allow-cgroup-failure` included,
+/// must reach the runner without the marker even when its caller set one.
+fn raw_run_dag_scan_marker_bracket(root: &Path) -> Result<String, String> {
+    let fixture = tempfile::Builder::new()
+        .prefix("validate-run-dag-scan-marker-")
+        .tempdir()
+        .map_err(|error| format!("run-dag scan marker: cannot create fixture: {error}"))?;
+    let fixture_root = fixture.path();
+    std::fs::create_dir_all(fixture_root.join("ci"))
+        .map_err(|error| format!("run-dag scan marker: cannot create ci directory: {error}"))?;
+    // The copy resolves its ROOT_DIR inside this private tree, so the run state
+    // it creates is removed with the fixture.
+    for relative in ["ci/run-dag.sh", "ci/configure-build-jobs.sh"] {
+        exec_safe_fs::copy(root.join(relative), fixture_root.join(relative))
+            .map_err(|error| format!("run-dag scan marker: cannot copy {relative}: {error}"))?;
+    }
+    let captured = fixture_root.join("captured-marker");
+    let runner = fixture_root.join("capture-runner");
+    std::fs::write(
+        &runner,
+        format!(
+            "#!/bin/sh\nset -eu\nprintf '%s\\n' \"${{{ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}-unset}}\" >\"$RUN_DAG_MARKER_CAPTURE\"\n"
+        ),
+    )
+    .map_err(|error| format!("run-dag scan marker: cannot write capture runner: {error}"))?;
+    exec_safe_fs::set_executable(&runner, 0o755)
+        .map_err(|error| format!("run-dag scan marker: cannot chmod capture runner: {error}"))?;
+
+    let cases: [(&[&str], Option<&str>, &str); 5] = [
+        (&["portable"], None, "unset"),
+        (&["portable"], Some("1"), "unset"),
+        (&["portable", "--allow-cgroup-failure"], Some("1"), "unset"),
+        (&["privileged", "--unsafe-no-cgroups"], None, "1"),
+        (&["privileged", "--unsafe-no-cgroups"], Some("0"), "1"),
+    ];
+    for (args, ambient, expected) in cases {
+        match std::fs::remove_file(&captured) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(format!(
+                    "run-dag scan marker: cannot reset the captured marker: {error}"
+                ));
+            }
+        }
+        let mut command = Command::new(fixture_root.join("ci/run-dag.sh"));
+        command
+            .args(args)
+            .current_dir(fixture_root)
+            .env("DAGRUN_BIN", &runner)
+            .env("RUN_DAG_MARKER_CAPTURE", &captured)
+            .env_remove("RUN_DAG_FILE_OVERRIDE")
+            .env_remove("VALIDATE_RUN_STATE")
+            .env_remove("E2E_RESULT_ROOT")
+            .env_remove("E2E_BUILD_ROOT");
+        match ambient {
+            Some(value) => command.env(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV, value),
+            None => command.env_remove(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV),
+        };
+        let output = command
+            .output()
+            .map_err(|error| format!("run-dag scan marker: cannot launch {args:?}: {error}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "run-dag scan marker: {args:?} failed with {}: {}{}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            ));
+        }
+        let seen = std::fs::read_to_string(&captured).map_err(|error| {
+            format!("run-dag scan marker: {args:?} never reached the runner: {error}")
+        })?;
+        if seen != format!("{expected}\n") {
+            return Err(format!(
+                "run-dag scan marker: {args:?} with caller marker {ambient:?} handed the runner {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}={:?}, expected {expected}",
+                seen.trim_end()
+            ));
+        }
+    }
+    Ok(format!(
+        "run-dag scan marker: only --unsafe-no-cgroups exports {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}=1; portable and --allow-cgroup-failure runs drop a caller's marker"
     ))
 }
 
@@ -26156,6 +26321,28 @@ fn run(
             );
         }
     };
+    // Settle the marker before any DAG node starts, so every E2E cell
+    // inherits this run's answer and never one from the caller's environment.
+    match process_group_scan_marker(
+        cgroups.is_some(),
+        std::env::var_os(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV).as_deref(),
+    ) {
+        Ok(Some(value)) => std::env::set_var(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV, value),
+        Ok(None) => std::env::remove_var(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV),
+        Err(reason) => {
+            return RunSummary::refused(
+                2,
+                &plan.profile,
+                "process-group CPU scan marker",
+                vec![
+                    reason,
+                    format!(
+                        "unset {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}; only a run let go unboxed with --allow-cgroup-failure sets it, for its own cells"
+                    ),
+                ],
+            );
+        }
+    }
 
     let commit = git_sha();
     let git_depth = match measure_git_depth(&commit) {

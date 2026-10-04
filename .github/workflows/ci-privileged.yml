@@ -133,9 +133,13 @@ jobs:
     - name: Run non-gating occasional KVM probes
       id: kvm_occasional
       continue-on-error: true
+      # Like the DAG step above, these probes run without cgroups on purpose.
+      # The marker lets a budgeted cell whose invocation cgroup cannot be
+      # created here measure its CPU with the process-group scan, which its
+      # row names as the CPU source, instead of stopping.
       run: |
         timeout --foreground --kill-after=10s 210s \
-          env HERMIT_BIN="$PWD/target/debug/hermit" \
+          env HERMIT_BIN="$PWD/target/debug/hermit" HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1 \
           bash -euo pipefail -c '
             target/debug/test-harness build --lane privileged --category applications \
               --ci-only --include-occasional

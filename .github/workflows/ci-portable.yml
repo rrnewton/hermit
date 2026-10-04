@@ -1454,6 +1454,12 @@ jobs:
       - name: Run known-red SaBRe exec probes
         run: |
           set -euo pipefail
+          # Each budgeted E2E invocation measures its CPU in a cgroup the
+          # runner creates below its own, which the root-owned hosted job
+          # cgroup refuses. Move this shell into a runner-owned child first, as
+          # the preflight step does for nextest-cpu-wrapper; without it every
+          # probe would stop on unmeasurable CPU instead of reaching SaBRe.
+          ./ci/delegate-hosted-cgroup.sh "$$"
           failures=0
           probe() {
             test_id=$1
