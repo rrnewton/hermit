@@ -584,7 +584,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test-harness's sync_cells_records_disabling_an_optional_cell, added in
     // 6166181d8f (the same issue) without a pin change, retains all 847 prior
     // identities (`cargo nextest list --profile ci` measured 848).
-    ("test.regular_crates", 848),
+    // hermit-manifest-plan's
+    // result_owner_index_answers_exactly_what_result_manifest_owner_answers
+    // (76521affca) and the two imported-Buck-log parity tests
+    // an_imported_row_is_measured_only_from_its_restored_logs and
+    // an_imported_log_index_is_trusted_whole_or_not_at_all (9fd0c01a39), both
+    // landed without a pin change, retain all 848 prior identities
+    // (`cargo nextest list --profile ci` measured 851).
+    ("test.regular_crates", 851),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -768,7 +775,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // snapshot_initializer_excludes_host_seed_mounts_at_both_captures,
     // https://github.com/rrnewton/hermit/pull/3219) retain all 878 prior
     // identities: 878 + 3 = 881 (`cargo nextest list --profile ci` measured 881).
-    ("test.detcore_unit", 881),
+    // The 23 directory-stream tests (eleven dirents::test, one
+    // io_buffers::tests and eleven syscalls::files::test, among them
+    // a_copy_error_other_than_a_fault_is_returned and
+    // a_fault_of_the_whole_copy_copies_nothing;
+    // https://github.com/rrnewton/hermit/pull/3226) retain all 881 prior
+    // identities: 881 + 23 = 904 (`cargo nextest list --profile ci` measured 904).
+    ("test.detcore_unit", 904),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -989,7 +1002,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // identities.
     // The three ephemeral host seed mount tests listed for test.detcore_unit
     // retain all 878 prior identities: 878 + 3 = 881.
-    ("test.detcore_unit_on_host", 881),
+    // The host twin selects the same 23 directory-stream tests
+    // (https://github.com/rrnewton/hermit/pull/3226): 881 + 23 = 904.
+    ("test.detcore_unit_on_host", 904),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1063,8 +1078,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 843 prior identities.
     // The three sync-cells tests of 32053b6d listed for test.regular_crates
     // bring the measured count to 847, and the optional-cell sync test of
-    // 6166181d8f listed there to 848.
-    ("test.regular_crates_on_host", 848),
+    // 6166181d8f listed there to 848, and the three tests of 76521affca and
+    // 9fd0c01a39 listed there to 851.
+    ("test.regular_crates_on_host", 851),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
