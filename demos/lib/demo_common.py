@@ -2094,13 +2094,19 @@ def stop_process(process: Optional[subprocess.Popen]) -> None:
 
 
 def _other_group_members(group: int, leader: int) -> bool:
-    """Whether a process other than ``leader`` is in process group ``group``.
+    """Whether a process other than ``leader`` may be in process group ``group``.
 
     Reads the group ID of every process in /proc. A member that has exited but
     has not been reaped counts, as it does for kill(). A member this process may
     not signal does not count: nothing more can be done about it from here.
     Permission is asked through a pidfd with signal 0, which delivers nothing.
+    A process whose stat cannot be read counts, unless the read failed because
+    the process no longer exists: a failed observation is not an absence.
+
+    The answer is a sample of a moment: it only bounds a wait, and never decides
+    whether a signal is sent (see stop_process_group).
     """
+    gone = (errno.ENOENT, errno.ESRCH)
     wanted = str(group).encode()
     for entry in os.scandir("/proc"):
         name = entry.name
@@ -2108,12 +2114,16 @@ def _other_group_members(group: int, leader: int) -> bool:
             continue
         try:
             descriptor = os.open("/proc/{}/stat".format(name), os.O_RDONLY)
-        except OSError:
-            continue
+        except OSError as error:
+            if error.errno in gone:
+                continue
+            return True  # Cannot tell; count it.
         try:
             data = os.read(descriptor, 4096)
-        except OSError:
-            continue
+        except OSError as error:
+            if error.errno in gone:
+                continue
+            return True  # Cannot tell; count it.
         finally:
             os.close(descriptor)
         # The command name (field 2) is in parentheses and may contain spaces
@@ -2165,7 +2175,10 @@ def stop_process_group(process: Optional[subprocess.Popen]) -> None:
     child started stay in its group and can keep running, still writing to the
     output they inherited from it. This stops the child if it is still running
     (as stop_process does), then signals the group itself: SIGTERM, up to 10
-    seconds for the group to empty, then SIGKILL and up to 10 more.
+    seconds for the group to empty, then SIGKILL and up to 10 more. The
+    SIGKILL is sent whenever the child is still unreaped, whatever the wait
+    saw: the wait reads /proc, which is a sample and can miss a member, so it
+    only shortens the wait. ESRCH from the SIGKILL means the group was empty.
 
     It is meant for children started with ``start_new_session=True``, whose
     group ID is the child's PID. Linux gives that number to no other process
@@ -2182,14 +2195,18 @@ def stop_process_group(process: Optional[subprocess.Popen]) -> None:
     group = process.pid
     if group != os.getpgrp():
         for sig in (signal.SIGTERM, signal.SIGKILL):
+            # Learns whether the child was reaped elsewhere meanwhile, after
+            # which its group ID may be another process's: nothing more is sent.
+            _exit_status_without_reaping(process)
             if process.returncode is not None:
-                break  # Reaped elsewhere meanwhile.
+                break
             try:
                 os.killpg(group, sig)
-            except (ProcessLookupError, PermissionError):
-                break
-            if _group_empty(process, group, 10):
-                break
+            except ProcessLookupError:
+                pass  # ESRCH: nothing is left in the group.
+            except PermissionError:
+                pass  # No member may be signalled from here.
+            _group_empty(process, group, 10)
     process.poll()
 
 
