@@ -5342,13 +5342,15 @@ fn read_records(
     let mut bytes = vec![0; len];
     let readable = match memory.read_exact(buf, &mut bytes) {
         Ok(()) => len,
-        Err(_) => read_guest_prefix(memory, buf, &mut bytes),
+        Err(_) => read_guest_prefix(memory, buf, &mut bytes)?,
     };
     format.parse_written(&mut bytes, readable)
 }
 
 /// Read the start of the guest's buffer into `bytes`, up to the first page the
-/// guest cannot read, and return how many bytes were read.
+/// guest cannot read, and return how many bytes were read. Only a fault
+/// (`EFAULT`) ends the copy short; any other error of the copy, such as
+/// `ESRCH` for a thread that is gone or `EIO` from the backend, is returned.
 ///
 /// This and [`write_guest_pieces`] use only vectored copies, one page per
 /// piece, which respect the guest's page protection. Reverie's `read` and
@@ -5359,7 +5361,7 @@ pub(crate) fn read_guest_prefix(
     memory: &impl MemoryAccess,
     buf: AddrMut<u8>,
     bytes: &mut [u8],
-) -> usize {
+) -> Result<usize, Errno> {
     let mut done = 0;
     for pages in guest_pages(buf.as_raw(), bytes.len()).chunks(PAGES_PER_COPY) {
         let from = pages[0].0;
@@ -5373,24 +5375,28 @@ pub(crate) fn read_guest_prefix(
             .map(|piece| unsafe { piece.as_ioslice() })
             .collect();
         let mut local = [std::io::IoSliceMut::new(&mut bytes[from..from + len])];
-        let copied = memory.read_vectored(&remote, &mut local).unwrap_or(0);
+        let copied = match memory.read_vectored(&remote, &mut local) {
+            Err(Errno::EFAULT) => 0,
+            copied => copied?,
+        };
         done += copied;
         if copied < len {
             break;
         }
     }
-    done
+    Ok(done)
 }
 
 /// Write each of `pieces`, an offset in the guest's buffer and the bytes to
 /// store there, within one page, in the order given, up to the first the
 /// guest cannot write. Return how many bytes of the pieces were written,
-/// counted in that order.
+/// counted in that order. As in [`read_guest_prefix`], only a fault ends the
+/// copy short, and any other error is returned.
 fn write_guest_pieces(
     memory: &mut impl MemoryAccess,
     buf: AddrMut<u8>,
     pieces: &[(usize, &[u8])],
-) -> usize {
+) -> Result<usize, Errno> {
     let mut done = 0;
     for pieces in pieces.chunks(PAGES_PER_COPY) {
         let len: usize = pieces.iter().map(|(_, bytes)| bytes.len()).sum();
@@ -5406,13 +5412,16 @@ fn write_guest_pieces(
             .iter()
             .map(|&(_, bytes)| std::io::IoSlice::new(bytes))
             .collect();
-        let copied = memory.write_vectored(&local, &mut remote).unwrap_or(0);
+        let copied = match memory.write_vectored(&local, &mut remote) {
+            Err(Errno::EFAULT) => 0,
+            copied => copied?,
+        };
         done += copied;
         if copied < len {
             break;
         }
     }
-    done
+    Ok(done)
 }
 
 /// One store that Linux makes into the guest's buffer to copy directory
@@ -5493,6 +5502,8 @@ fn dirent_stores(
 /// Return how many entries the call passes, and its result: the bytes of the
 /// records whose `filldir` completed. It is `EFAULT` if none did, or if the
 /// fault hit a `d_off`, which the call's last store would then write again.
+/// A copy that fails with any error other than a fault passes no entry and
+/// returns that error, as the call did before directory streams.
 ///
 /// Each store within one page is written whole or not at all, as Linux's
 /// are. A single store that crosses into another page, a field of a buffer
@@ -5536,13 +5547,18 @@ fn copy_records(
     for (index, store) in stores.iter().enumerate() {
         let mut split = guest_pages(buf.as_raw() + store.at, store.from.len());
         if store.single && split.len() > 1 {
-            let mut readable: Vec<bool> = split
+            let readable: Result<Vec<bool>, Errno> = split
                 .iter()
                 .map(|&(at, len)| {
                     let mut bytes = vec![0; len];
-                    read_guest_prefix(memory, unsafe { buf.add(store.at + at) }, &mut bytes) == len
+                    let addr = unsafe { buf.add(store.at + at) };
+                    Ok(read_guest_prefix(memory, addr, &mut bytes)? == len)
                 })
                 .collect();
+            let mut readable = match readable {
+                Ok(readable) => readable,
+                Err(errno) => return (0, Err(errno)),
+            };
             if readable[1] || !readable[0] {
                 split.reverse();
                 readable.reverse();
@@ -5564,7 +5580,10 @@ fn copy_records(
     let mut failed = None;
     for &(stop, readable) in crossing.iter().chain([(pieces.len(), false)].iter()) {
         let segment = &pieces[next..stop];
-        let written = write_guest_pieces(memory, buf, segment);
+        let written = match write_guest_pieces(memory, buf, segment) {
+            Ok(written) => written,
+            Err(errno) => return (0, Err(errno)),
+        };
         let mut end = 0;
         if let Some(at) = segment.iter().position(|(_, bytes)| {
             end += bytes.len();
@@ -5580,7 +5599,10 @@ fn copy_records(
         let addr = unsafe { buf.add(at) };
         let mut before = vec![0; bytes.len()];
         let read = if readable {
-            read_guest_prefix(memory, addr, &mut before) == before.len()
+            match read_guest_prefix(memory, addr, &mut before) {
+                Ok(read) => read == before.len(),
+                Err(errno) => return (0, Err(errno)),
+            }
         } else {
             // The part in the second page, at its start, which no vectored copy
             // can read. Reverie's `read` of at most 8 bytes can on the ptrace
@@ -5599,8 +5621,10 @@ fn copy_records(
         && owner[failed - 1] == store
         && let Some((first, before)) = &saved
         && *first == failed - 1
+        && let Err(errno) =
+            write_guest_pieces(memory, buf, &[(pieces[*first].0, before.as_slice())])
     {
-        write_guest_pieces(memory, buf, &[(pieces[*first].0, before.as_slice())]);
+        return (0, Err(errno));
     }
     // The entry whose `filldir` made the store, or all of them for the call's
     // last store, and the first store of that `filldir`.
@@ -6206,6 +6230,62 @@ mod test {
                     pages.contents().iter().all(|&byte| byte == Pages::FILL),
                     "{format:?} after a page with protection {protection}: bytes changed"
                 );
+            }
+        }
+    }
+
+    /// Guest memory whose every vectored copy fails with one error that is
+    /// not a fault, as when the guest's thread is gone or the backend fails.
+    struct FailingMemory(Errno);
+
+    impl reverie::syscalls::MemoryAccess for FailingMemory {
+        fn read_vectored(
+            &self,
+            _: &[std::io::IoSlice],
+            _: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            Err(self.0)
+        }
+
+        fn write_vectored(
+            &mut self,
+            _: &[std::io::IoSlice],
+            _: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            Err(self.0)
+        }
+    }
+
+    /// Only a fault ends a copy of directory records short. Any other error
+    /// of the copy is the call's error, as it was before directory streams,
+    /// and not `EFAULT`: reading the records back, copying them out (through
+    /// a buffer whose first store crosses a page, and through one where none
+    /// does), and reading the prefix the `getdents64` observer hashes.
+    #[test]
+    fn a_copy_error_other_than_a_fault_is_returned() {
+        let buf = |offset| reverie::syscalls::AddrMut::<u8>::from_raw(16 * PAGE + offset).unwrap();
+        for errno in [Errno::ESRCH, Errno::EIO] {
+            let mut bytes = [0; 32];
+            assert_eq!(
+                super::read_guest_prefix(&FailingMemory(errno), buf(0), &mut bytes),
+                Err(errno)
+            );
+            for format in FORMATS {
+                let (records, names) = directory_records(format, &TEN);
+                for offset in [0, PAGE - 4] {
+                    let copied = super::copy_records(
+                        &mut FailingMemory(errno),
+                        buf(offset),
+                        format,
+                        &records,
+                        &names,
+                        0,
+                    );
+                    assert_eq!(copied, (0, Err(errno)), "{format:?} at {offset}");
+                }
+                let read =
+                    super::read_records(&FailingMemory(errno), buf(0), records.len(), format);
+                assert_eq!(read.err(), Some(errno), "{format:?}");
             }
         }
     }

@@ -542,7 +542,7 @@ fn read_extent<M: MemoryAccess>(
     if !records {
         return Err(error.into());
     }
-    let readable = crate::syscalls::read_guest_prefix(memory, start, &mut buf);
+    let readable = crate::syscalls::read_guest_prefix(memory, start, &mut buf)?;
     // Zeroes what was not read, and checks that it is only that padding.
     if DirentFormat::Dirent64
         .parse_written(&mut buf, readable)
