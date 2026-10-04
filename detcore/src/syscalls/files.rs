@@ -1976,7 +1976,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             // AUTONOMOUS-BOT-IMPLEMENTED
-            FdType::Timerfd if self.virtual_timerfds() => {
+            FdType::Timerfd
+                if self.virtual_timerfds() && !self.timerfd_kernel_backed(guest, call.fd()) =>
+            {
                 let iovec = TimerSlackIovec {
                     base: call.buf().map_or(0, |buf| buf.as_raw()),
                     len: call.len(),
@@ -2799,7 +2801,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 },
                 rng_output,
             )
-        } else if fd_type == FdType::Timerfd && self.virtual_timerfds() {
+        } else if fd_type == FdType::Timerfd
+            && self.virtual_timerfds()
+            && !self.timerfd_kernel_backed(guest, call.fd())
+        {
             // AUTONOMOUS-BOT-IMPLEMENTED
             match read_iovecs(&guest.memory(), call.iov(), call.len()) {
                 Ok(iovecs) => {
@@ -2933,6 +2938,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if vectored_offset(call.pos_l(), call.pos_h()) == -1
             && call.flags() == 0
             && self.virtual_timerfds()
+            && !self.timerfd_kernel_backed(guest, call.fd())
         {
             let timer = guest.thread_state().with_detfd(call.fd(), |detfd| {
                 (detfd.ty() == FdType::Timerfd).then(|| detfd.clone())
@@ -4761,7 +4767,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::TimerfdSettime,
     ) -> Result<i64, Error> {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        if !self.virtual_timerfds() {
+        if !self.virtual_timerfds() || self.timerfd_kernel_backed(guest, call.fd()) {
             return self.notification_fd_control(guest, call.into()).await;
         }
         let fd = call.fd();
@@ -4932,7 +4938,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::TimerfdGettime,
     ) -> Result<i64, Error> {
         // AUTONOMOUS-BOT-IMPLEMENTED
-        if !self.virtual_timerfds() {
+        if !self.virtual_timerfds() || self.timerfd_kernel_backed(guest, call.fd()) {
             return self.notification_fd_control(guest, call.into()).await;
         }
         // fs/timerfd.c resolves the descriptor (EBADF, or EINVAL for a

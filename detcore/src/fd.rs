@@ -218,6 +218,13 @@ struct OpenFileDescription {
     /// neither can starve the other.
     #[serde(default)]
     epoll_timers_first: bool,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+    /// Whether another epoll watches this epoll (FdType::Epoll only). The
+    /// virtual timerfd shadow cannot be seen through a nested epoll, so a
+    /// timerfd added to a nested epoll is handed to the kernel instead.
+    #[serde(default)]
+    epoll_nested: bool,
     /// Whether Detcore has EVER known this description's lock state.
     ///
     /// This separates two different unknowns that `flock_mode_known == false`
@@ -260,10 +267,16 @@ impl TimerFdLink {
         self.file.strong_count() > 0
     }
 
-    /// Snapshot of the timer state, or None once the timerfd was released.
+    /// Snapshot of the timer state, or None once the timerfd was released
+    /// or handed to the kernel.
     pub(crate) fn state(&self) -> Option<TimerFdState> {
-        self.is_live()
-            .then(|| *self.state.lock().expect("timerfd state mutex poisoned"))
+        if !self.is_live() {
+            return None;
+        }
+        let state = *self.state.lock().expect("timerfd state mutex poisoned");
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+        (!state.kernel_backed).then_some(state)
     }
 }
 
@@ -326,6 +339,14 @@ pub struct TimerFdState {
     /// the two events after which Linux's hrtimer raises a fresh wakeup.
     #[serde(default)]
     pub generation: u64,
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+    /// The timer was handed to the host kernel: its vessel is armed on the
+    /// host clock and every later operation on it goes to the kernel, as
+    /// without virtual timerfds. Set once, when a nested epoll or a poll of
+    /// an epoll would otherwise have to see virtual readiness.
+    #[serde(default)]
+    pub kernel_backed: bool,
 }
 
 impl TimerFdState {
@@ -337,6 +358,7 @@ impl TimerFdState {
             consumed: 0,
             cancel_on_set: false,
             generation: 0,
+            kernel_backed: false,
         }
     }
 
@@ -438,6 +460,7 @@ impl DetFd {
                 epoll_timerfds: Default::default(),
                 epoll_timer_deliveries: 0,
                 epoll_timers_first: false,
+                epoll_nested: false,
                 // By default, we assume it matches the flags we were given:
                 physically_nonblocking: oflags_nonblocking(bits),
             })),
@@ -879,27 +902,74 @@ impl DetFd {
         self.description().timerfd = Some(Arc::new(Mutex::new(TimerFdState::new(clockid))));
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+    /// The shared timer state, unless this is not a managed timerfd or its
+    /// timer was handed to the kernel.
+    fn virtual_timerfd(&self) -> Option<Arc<Mutex<TimerFdState>>> {
+        let state = self.description().timerfd.clone()?;
+        let kernel_backed = state
+            .lock()
+            .expect("timerfd state mutex poisoned")
+            .kernel_backed;
+        (!kernel_backed).then_some(state)
+    }
+
     /// Whether this fd is a managed virtual timerfd.
     pub(crate) fn is_timerfd(&self) -> bool {
-        self.description().timerfd.is_some()
+        self.virtual_timerfd().is_some()
     }
 
     /// Snapshot of the virtual timerfd state, if this fd is a managed timerfd.
     pub(crate) fn timerfd_state(&self) -> Option<TimerFdState> {
-        let state = self.description().timerfd.clone()?;
+        let state = self.virtual_timerfd()?;
         Some(*state.lock().expect("timerfd state mutex poisoned"))
     }
 
     /// Mutate the virtual timerfd state; returns None for non-timerfds.
     pub(crate) fn with_timerfd_mut<R>(&self, f: impl FnOnce(&mut TimerFdState) -> R) -> Option<R> {
-        let state = self.description().timerfd.clone()?;
+        let state = self.virtual_timerfd()?;
         let mut state = state.lock().expect("timerfd state mutex poisoned");
         Some(f(&mut state))
     }
 
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3229): nested epoll hands timerfds to the kernel.
+    /// Whether this fd is a timerfd whose timer was handed to the kernel.
+    /// Every alias of the open file description shares the answer.
+    pub(crate) fn timerfd_kernel_backed(&self) -> bool {
+        self.description().timerfd.as_ref().is_some_and(|state| {
+            state
+                .lock()
+                .expect("timerfd state mutex poisoned")
+                .kernel_backed
+        })
+    }
+
+    /// Hand this timerfd's timer to the kernel for good. The caller has
+    /// already armed the host vessel to match the virtual timer.
+    pub(crate) fn hand_timerfd_to_kernel(&self) {
+        if let Some(state) = self.description().timerfd.clone() {
+            state
+                .lock()
+                .expect("timerfd state mutex poisoned")
+                .kernel_backed = true;
+        }
+    }
+
+    /// Record that another epoll watches this epoll.
+    pub(crate) fn set_epoll_nested(&self) {
+        self.description().epoll_nested = true;
+    }
+
+    /// Whether another epoll has watched this epoll.
+    pub(crate) fn is_epoll_nested(&self) -> bool {
+        self.description().epoll_nested
+    }
+
     /// A link an epoll interest can hold without keeping this timerfd alive.
     pub(crate) fn timerfd_link(&self) -> Option<TimerFdLink> {
-        let state = self.description().timerfd.clone()?;
+        let state = self.virtual_timerfd()?;
         Some(TimerFdLink {
             file: Arc::downgrade(&self.open_file),
             state,
@@ -938,12 +1008,13 @@ impl DetFd {
     /// This epoll instance's live virtual timerfd interests, in ready order:
     /// by [`EpollTimerInterest::ready_rank`], then by key. Interests whose
     /// timerfd was released are dropped first, as Linux does when the
-    /// watched file's last reference closes.
+    /// watched file's last reference closes. So are interests whose timerfd
+    /// was handed to the kernel: the host epoll reports those itself.
     pub(crate) fn epoll_timer_interests(&self) -> Vec<((i32, OpenFileId), EpollTimerInterest)> {
         let mut description = self.description();
         description
             .epoll_timerfds
-            .retain(|_, interest| interest.target.is_live());
+            .retain(|_, interest| interest.target.state().is_some());
         let mut interests: Vec<_> = description
             .epoll_timerfds
             .iter()

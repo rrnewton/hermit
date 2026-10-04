@@ -1721,6 +1721,130 @@ static void wait_form_wide_timeout(int use_pselect) {
     else ok(name);
 }
 
+/* T8: a timerfd behind a nested epoll. The outer epoll, poll or select asks
+ * the kernel about the inner epoll, so the inner epoll's timerfd must be
+ * visible there, as on Linux. */
+static int wait_form_watch(int epfd, int fd, uint64_t data) {
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof ev);
+    ev.events = EPOLLIN;
+    ev.data.u64 = data;
+    return epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+}
+
+/* After a nested wait reported the timer: the inner epoll reports it too, a
+ * read takes one expiration and quiets both epolls, and the timer can be
+ * re-armed and disarmed. Returns 0, or fails `name` and returns -1. */
+static int wait_form_nested_after(const char *name, int tfd, int inner, int outer) {
+    struct epoll_event ev[4];
+    memset(ev, 0, sizeof ev);
+    int n = epoll_wait(inner, ev, 4, 0);
+    if (n != 1 || ev[0].data.u64 != 7) {
+        fail(name, "inner_n=%ld inner_data=%ld", n, n > 0 ? (long)ev[0].data.u64 : 0);
+        return -1;
+    }
+    uint64_t count = 0;
+    ssize_t r = read(tfd, &count, sizeof count);
+    if (r != 8 || count != 1) {
+        fail(name, "read=%ld count=%ld", (long)r, (long)count);
+        return -1;
+    }
+    n = epoll_wait(inner, ev, 4, 0);
+    long outer_n = outer >= 0 ? epoll_wait(outer, ev, 4, 0) : 0;
+    if (n != 0 || outer_n != 0) {
+        fail(name, "after_read inner_n=%ld outer_n=%ld", n, outer_n);
+        return -1;
+    }
+    struct itimerspec its, cur;
+    memset(&its, 0, sizeof its);
+    its.it_value = ns_ts(10000 * MS);
+    if (timerfd_settime(tfd, 0, &its, NULL) != 0 || timerfd_gettime(tfd, &cur) != 0) {
+        fail(name, "rearm errno=%ld%ld", errno, 0);
+        return -1;
+    }
+    int64_t left = (int64_t)cur.it_value.tv_sec * 1000000000LL + cur.it_value.tv_nsec;
+    if (left <= 5000 * MS || left > 10000 * MS) {
+        fail(name, "rearm_left_ms=%ld%ld", (long)(left / MS), 0);
+        return -1;
+    }
+    memset(&its, 0, sizeof its);
+    if (timerfd_settime(tfd, 0, &its, NULL) != 0 || timerfd_gettime(tfd, &cur) != 0) {
+        fail(name, "disarm errno=%ld%ld", errno, 0);
+        return -1;
+    }
+    if (cur.it_value.tv_sec != 0 || cur.it_value.tv_nsec != 0) {
+        fail(name, "disarm_left_ns=%ld%ld", (long)cur.it_value.tv_nsec, 0);
+        return -1;
+    }
+    return 0;
+}
+
+/* An outer epoll watches an inner epoll that watches a timerfd. The timer
+ * expires before the outer epoll first watches the inner one, or before it
+ * is added to the inner epoll that the outer one already watches. */
+static void wait_form_epoll_nested(int add_later) {
+    const char *name =
+        add_later ? "wait_form_epoll_nested_add_later" : "wait_form_epoll_nested_expired";
+    int tfd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, 1 * MS, 0, 0);
+    int inner = epoll_create1(0);
+    int outer = epoll_create1(0);
+    int rc = tfd < 0 || inner < 0 || outer < 0 ? -1 : 0;
+    if (rc == 0 && add_later) {
+        rc = wait_form_watch(outer, inner, 0x1234);
+        sleep_ns(5 * MS);
+        if (rc == 0) rc = wait_form_watch(inner, tfd, 7);
+    } else if (rc == 0) {
+        rc = wait_form_watch(inner, tfd, 7);
+        sleep_ns(5 * MS);
+        if (rc == 0) rc = wait_form_watch(outer, inner, 0x1234);
+    }
+    struct epoll_event ev[4];
+    memset(ev, 0, sizeof ev);
+    errno = 0;
+    long n = rc == 0 ? epoll_wait(outer, ev, 4, 0) : -1;
+    if (rc != 0) fail(name, "setup errno=%ld%ld", errno, 0);
+    else if (n != 1 || ev[0].events != EPOLLIN || ev[0].data.u64 != 0x1234)
+        fail(name, "n=%ld data=%ld", n, n > 0 ? (long)ev[0].data.u64 : 0);
+    else if (wait_form_nested_after(name, tfd, inner, outer) == 0) ok(name);
+    if (outer >= 0) close(outer);
+    if (inner >= 0) close(inner);
+    if (tfd >= 0) close(tfd);
+}
+
+/* poll, ppoll, select and pselect6 on an epoll that watches an expired
+ * timerfd. */
+static void wait_form_wait_on_epoll(int form) {
+    static const char *names[] = {"wait_form_poll_on_epoll", "wait_form_ppoll_on_epoll",
+                                  "wait_form_select_on_epoll", "wait_form_pselect6_on_epoll"};
+    const char *name = names[form];
+    int tfd = armed_tfd(CLOCK_MONOTONIC, TFD_NONBLOCK, 1 * MS, 0, 0);
+    int inner = epoll_create1(0);
+    if (tfd < 0 || inner < 0 || wait_form_watch(inner, tfd, 7) != 0) {
+        fail(name, "setup errno=%ld%ld", errno, 0);
+        if (inner >= 0) close(inner);
+        if (tfd >= 0) close(tfd);
+        return;
+    }
+    sleep_ns(5 * MS);
+    struct pollfd p = {inner, POLLIN, 0};
+    struct timespec second = ns_ts(1000 * MS);
+    struct timeval zero = {0, 0};
+    fd_set rd;
+    FD_ZERO(&rd);
+    FD_SET(inner, &rd);
+    long n, ready;
+    errno = 0;
+    if (form == 0) n = poll(&p, 1, 0);
+    else if (form == 1) n = ppoll(&p, 1, &second, NULL);
+    else if (form == 2) n = select(inner + 1, &rd, NULL, NULL, &zero);
+    else n = pselect(inner + 1, &rd, NULL, NULL, &second, NULL);
+    ready = form < 2 ? p.revents == POLLIN : FD_ISSET(inner, &rd) != 0;
+    if (n != 1 || !ready) fail(name, "n=%ld ready=%ld", n, ready);
+    else if (wait_form_nested_after(name, tfd, inner, -1) == 0) ok(name);
+    close(inner);
+    close(tfd);
+}
+
 /* The fork and ppoll cases that check sharing and readiness only, never the
  * guest's clock; the `sharing` argument runs only these. */
 static void check_sharing_cases(void) {
@@ -1801,6 +1925,12 @@ int main(int argc, char **argv) {
     wait_form_wide_block(1);
     wait_form_wide_timeout(0);
     wait_form_wide_timeout(1);
+    wait_form_epoll_nested(0);
+    wait_form_epoll_nested(1);
+    wait_form_wait_on_epoll(0);
+    wait_form_wait_on_epoll(1);
+    wait_form_wait_on_epoll(2);
+    wait_form_wait_on_epoll(3);
     check_sharing_cases();
     printf("failures=%d\n", failures);
     return failures == 0 ? 0 : 1;
