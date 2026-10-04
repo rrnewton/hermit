@@ -916,7 +916,7 @@ fi
 # rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
 # CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
 # 1050 effective-job-seconds budget are unchanged.
-# CARRY TO bcdf426a5f006e0d45705c7ca2a633526c7b388c (2026-10-04): from a11a42836893fb7aa7ade69e6b9c723777e70c95; all seven
+# CARRY TO 7b3168b7af405ca0f4af25fba73afa913e47d90c (2026-10-04): from a11a42836893fb7aa7ade69e6b9c723777e70c95; all seven
 # recorded DynamoRIO build inputs are byte-identical. The SDK stack and
 # post-exec owner fixes touch no DBT build input; no new timing sample is claimed.
 # reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
@@ -928,8 +928,8 @@ fi
 # rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
 # CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
 # 1050 effective-job-seconds budget are unchanged.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != bcdf426a5f006e0d45705c7ca2a633526c7b388c ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie bcdf426a5f006e0d45705c7ca2a633526c7b388c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7b3168b7af405ca0f4af25fba73afa913e47d90c ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 7b3168b7af405ca0f4af25fba73afa913e47d90c (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
