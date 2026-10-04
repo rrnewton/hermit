@@ -12069,6 +12069,9 @@ where
     )?;
     let preview_representation =
         direct_representation(&preview, &snapshot.rows, &current_attempts)?;
+    // Both results above are owned. Release the preview, a whole copy of the
+    // history, before each projection below clones `tracked` once more.
+    drop(preview);
     remove_replaceable_projected_observations(
         &mut tracked,
         &snapshot.rows,
@@ -12091,6 +12094,8 @@ where
         &initial_rows,
         Some(&snapshot.snapshot.source.path),
     )?;
+    drop(initial_rows);
+    drop(preview_representation);
     let rows_read = snapshot.snapshot.rows_read;
     tracked.schema = SCHEMA;
     tracked.projection = Some(ObservationProjection {
@@ -12177,6 +12182,7 @@ where
         &projected_rows,
         Some(&snapshot.snapshot.source.path),
     )?;
+    drop(projected_rows);
     for cell in &mut tracked.cells {
         if let Some(stamp) = current_stamps.get(&cell.id) {
             cell.last_tested = stamp.clone();
