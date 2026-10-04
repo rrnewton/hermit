@@ -636,7 +636,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // five interp::tests::startup_* ELF-reader tests, two
     // script::test::kernel_script_* #! parser tests, and eight
     // tests::in_guest_liteinst_* / tests::liteinst_runtime_selector_* tests.
-    ("test.hermit_unit", 815),
+    // tests::kvm_reports_stored_metadata_timestamps_only_for_sequential_tool_threads,
+    // added with KVM's stored host file timestamps (562b7dd7a635), retains
+    // all 815 prior identities.
+    ("test.hermit_unit", 816),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -948,7 +951,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3603 test.
     // The host twin selects the same eighteen
     // https://github.com/rrnewton/hermit/pull/3635 tests.
-    ("test.hermit_unit_on_host", 815),
+    // The host twin selects the same 562b7dd7a635 test.
+    ("test.hermit_unit_on_host", 816),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
