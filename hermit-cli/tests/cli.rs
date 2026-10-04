@@ -96,6 +96,8 @@ static STDIO_LSEEK_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static STDIO_INODE_IDENTITY_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static REPLAY_EPOCH_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static FORK_CHILD_GETRANDOM_GUEST: OnceLock<PathBuf> = OnceLock::new();
+#[cfg(feature = "liteinst")]
+static LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 
 const ISOLATED_WORKDIR_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
@@ -612,6 +614,37 @@ stdout:
 {}
 stderr:
 {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+#[cfg(feature = "liteinst")]
+fn liteinst_in_guest_wait_signals_guest() -> &'static Path {
+    LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST.get_or_init(|| {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/liteinst_in_guest_wait_signals.c");
+        // One directory per test process: two test binaries running at once
+        // must not write, or run, the same executable.
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
+            .join("liteinst-in-guest-wait-signals")
+            .join("build")
+            .join(std::process::id().to_string());
+        fs::create_dir_all(&build_root)
+            .expect("failed to create the in-guest wait-signals guest directory");
+        let guest = build_root.join("liteinst_in_guest_wait_signals");
+        let output = Command::new("cc")
+            .args(["-O0", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the in-guest wait-signals guest");
+        assert!(
+            output.status.success(),
+            "in-guest wait-signals guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -12459,6 +12492,792 @@ fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
         in_guest.runtime_mapped,
         "the in-guest Detcore runtime {IN_GUEST_RUNTIME} is not mapped into the guest"
     );
+}
+
+/// Signals that arrive while Detcore is blocked in a guest's `wait4`, under the
+/// ptrace backend and in-guest LiteInst
+/// (guest `hermit-cli/tests/fixtures/liteinst_in_guest_wait_signals.c`).
+///
+/// Around a blocking `wait4`, Detcore replaces the guest's signal mask with one
+/// that blocks every signal except 16, 32 and 33, and restores the guest's mask
+/// afterwards. Under in-guest LiteInst both are real `rt_sigprocmask` calls
+/// made by the guest preload. Before
+/// https://github.com/rrnewton/reverie/pull/913 the preload refused, with
+/// EPERM, any set that blocked its own SIGSYS, so a guest that forked and
+/// waited failed at its first `wait4`.
+///
+/// Each mode runs natively, once under the ptrace backend and three times
+/// under in-guest LiteInst. Every run must print the mode's expected lines, end
+/// with its expected status and write no line starting with `FAIL ` to stderr.
+/// The native run shows that the expected lines are what Linux does. In
+/// handler-after-reap, the native run's child also waits until Linux reports
+/// the parent asleep in `wait4` (`wait-for-parent-asleep`, see the guest).
+/// That report means asleep only on Linux 5.16 or later, so on an older kernel
+/// the guest fails that run rather than relying on it.
+/// When the guest is killed by a signal, `hermit` raises the same signal on
+/// itself (`ExitStatus::raise_or_exit`), so every runner must end in that
+/// signal death.
+///
+/// The guest cannot tell by itself whether a signal reached it inside
+/// Detcore's wait, so each Hermit run also writes an INFO log, and the test
+/// checks Detcore's scheduler records in it. The records name processes by
+/// dettid. The parent's first commit is on `ParentContinue` naming itself, and
+/// each `fork` it makes commits one naming the new child, in fork order, so the
+/// test reads every dettid from those. Under ptrace the log also has a line for
+/// each system call the parent finishes; in-guest logs have none.
+///
+/// The parent commits on `WaitidSignals([SigWrapper(N)])` when it is parked in
+/// a wait with signal N pending. Detcore uses that resource for interrupted
+/// writes as well, so the test binds it to the parent's dettid and orders it
+/// against the children's `Exit` commits:
+/// - sigchld-during-wait: the parent parks on the slow child, and its first
+///   commit after that is on SIGCHLD. The fast child's `Exit` comes before that
+///   commit and the slow child's after it, and the parent parks on the slow
+///   child again before the slow child exits. Under ptrace the interrupted
+///   `wait4` ends in ERESTARTSYS. So SIGCHLD reached the parent while the child
+///   it waited for was not ready, and the wait went on.
+/// - ignored-then-restart: the parent's `WaitidSignals` commit comes before the
+///   waited child's `Exit`, and the parent parks on the waited child after the
+///   signal commit, before that `Exit`. Under ptrace the interrupted `wait4`
+///   ends in ERESTARTSYS.
+/// - terminate-during-wait (ptrace only, see below): no `Exit` of the child
+///   comes before the parent's `WaitidSignals` commit. The `wait4` ends in
+///   ERESTARTSYS, the parent commits the delivery of SIGUSR1
+///   (`InboundSignal(SigWrapper(10))`), and the default action kills it.
+/// - ignored-during-wait, terminate-then-exit, guest-blocked and block-all:
+///   the signal is pending when the reap succeeds. The child's `Exit` comes
+///   before the parent's `WaitidSignals` commit. Under ptrace the parent's next
+///   `wait4` returns that child, and for ignored-during-wait and
+///   terminate-then-exit the parent's next commit is the delivery of SIGUSR1,
+///   which kills terminate-then-exit's parent. In-guest, the guest's own
+///   `child=5` line shows the reap. terminate-then-exit's parent dies before it
+///   prints one, so its guest gives `wait4` a status word mapped from a file,
+///   which outlives the parent, after setting the word to a value `wait4` never
+///   stores. Under both Hermit runners the word must hold the child's exit
+///   status 5, which shows the reap came before the parent's death. Natively the
+///   parent usually dies first and the word keeps its first value (299 of 300
+///   native runs on Linux 7.1.3), so either value is accepted there.
+/// - handler-after-reap (ptrace only, see below): the parent parks on the
+///   child; after the child's `Exit`, Detcore queues SIGCHLD for the parent
+///   (its "Alarm fired" line), and the parent's first commit after parking is
+///   the reap (`WaitChild`), after both, not SIGCHLD. Its `wait4` returns the
+///   child, and its next commit is the delivery of SIGCHLD to the handler.
+///
+/// Every mode that prints `mask-after` or `mask-kept` reads the mask after the
+/// wait, not during it: during the wait, Detcore unblocks signals 32 and 33 even
+/// when the guest blocked them (https://github.com/rrnewton/hermit/issues/3697).
+/// terminate-during-wait and terminate-then-exit print only their first line,
+/// so they check no mask.
+///
+/// block-all prints the mask the guest gets when it asks to block all 64
+/// signals. Linux never blocks SIGKILL or SIGSTOP, and each backend keeps a few
+/// more signals for itself, so that one line is expected per backend. The masks
+/// below name every signal each backend leaves unblocked.
+///
+/// Three modes do not yet pass in-guest. They still run natively and under
+/// ptrace, so their expected lines stay checked:
+/// - terminate-during-wait is not run in-guest: a guest process killed by a
+///   signal is never reported to the Detcore scheduler, so instead of the
+///   guest's SIGUSR1 death the run fails with an internal error after 30 s
+///   (https://github.com/rrnewton/hermit/issues/3688).
+/// - write-only-set runs in-guest and must fail exactly as
+///   https://github.com/rrnewton/reverie/issues/921 describes: in-guest Detcore
+///   cannot read a system-call argument from a page mapped write-only.
+/// - handler-after-reap runs in-guest and must fail exactly as
+///   https://github.com/rrnewton/reverie/issues/243 describes: the guest
+///   runtime refuses, with EPERM, every guest signal handler other than
+///   `SIG_DFL` and `SIG_IGN`.
+///
+/// "Exactly" means the run exits with status 1, prints nothing, and writes to
+/// stderr only Hermit's in-guest selection line and the one `FAIL ` line the
+/// issue describes. When either issue is fixed this test fails, and the mode
+/// joins the others.
+///
+/// In-guest runs are compared by output, exit status and scheduler records
+/// only. In-guest LiteInst refuses `--verify` until it forwards guest records
+/// (landing 4b of https://github.com/rrnewton/hermit/issues/3520), so the
+/// schedule itself is not compared here.
+///
+/// This test is ignored, and no validate node runs it, so it runs only when
+/// someone runs it by hand, ptrace legs included
+/// (https://github.com/rrnewton/hermit/issues/3698).
+#[test]
+#[cfg(feature = "liteinst")]
+#[ignore = "needs the in-guest Detcore runtime from `cargo build -p detcore-liteinst`"]
+fn liteinst_in_guest_signals_during_a_blocking_wait4_match_ptrace() {
+    use std::io::Read;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+    use std::sync::mpsc;
+
+    const DEADLINE: Duration = Duration::from_secs(60);
+    const IN_GUEST_RUNS: usize = 3;
+
+    #[derive(Clone, Copy)]
+    enum Exit {
+        Code(i32),
+        Signal(i32),
+    }
+
+    // How in-guest LiteInst is checked for a mode.
+    #[derive(Clone, Copy)]
+    enum InGuest {
+        // Like the native and ptrace runs.
+        Same,
+        // Not run, until the linked issue is fixed.
+        Skipped(&'static str),
+        // Run, and must fail exactly as the linked issue describes: exit with
+        // `code`, print nothing and write `stderr` to stderr.
+        KnownBad {
+            issue: &'static str,
+            code: i32,
+            stderr: &'static str,
+        },
+    }
+
+    let bit = |signal: i32| 1_u64 << (signal - 1);
+    let all_but = |unblocked: &[i32]| {
+        unblocked
+            .iter()
+            .fold(u64::MAX, |mask, &signal| mask & !bit(signal))
+    };
+    // Linux never blocks these two.
+    let native_mask = all_but(&[libc::SIGKILL, libc::SIGSTOP]);
+    // The ptrace backend also leaves these two unblocked:
+    // - SIGSTKFLT, reverie's perf-event timer signal (`reverie::PERF_EVENT_SIGNAL`).
+    //   Detcore removes it from every mask a guest installs
+    //   (`without_perf_event_signal` in `detcore/src/syscalls/signal.rs`).
+    // - SIGTRAP. Detcore does not pass the guest's own blocking
+    //   `rt_sigprocmask` through: it injects a copy with the adjusted set
+    //   (`handle_rt_sigprocmask` in `detcore/src/syscalls/signal.rs`). Reverie's
+    //   ptrace backend single-steps every injected call that is not the
+    //   guest's original system call (`step_private_syscall`), and a step trap
+    //   the guest has blocked is forced through, which unblocks SIGTRAP and
+    //   resets its handler (https://github.com/rrnewton/reverie/issues/682,
+    //   https://github.com/rrnewton/reverie/issues/879). Linux keeps it blocked.
+    let ptrace_mask = all_but(&[libc::SIGKILL, libc::SIGSTOP, libc::SIGSTKFLT, libc::SIGTRAP]);
+    // In-guest LiteInst has no tracer and leaves SIGTRAP blocked. It leaves
+    // these three unblocked:
+    // - SIGSTKFLT, for the same Detcore reason.
+    // - SIGSYS and SIGSEGV. The guest runtime keeps both for itself and removes
+    //   them from any set the guest installs
+    //   (https://github.com/rrnewton/reverie/pull/913). SIGSYS is the seccomp
+    //   trap for system calls that are not patched. SIGSEGV is how the kernel
+    //   reports a trapped RDTSC or CPUID instruction. The runtime keeps it
+    //   while either is trapped, and Detcore's default configuration traps
+    //   RDTSC. So a guest that blocks either signal reads back a mask that
+    //   differs from Linux (https://github.com/rrnewton/reverie/issues/915).
+    let in_guest_mask = all_but(&[
+        libc::SIGKILL,
+        libc::SIGSTOP,
+        libc::SIGSTKFLT,
+        libc::SIGSYS,
+        libc::SIGSEGV,
+    ]);
+
+    let expected_stdout = |mode: &str, block_all_mask: u64| -> String {
+        match mode {
+            "sigchld-during-wait" => "sigchld-during-wait slow=5 fast=3\nmask-after=0\n".to_owned(),
+            "ignored-during-wait" => "ignored-during-wait child=5\nmask-after=0\n".to_owned(),
+            "ignored-then-restart" => {
+                "ignored-then-restart waited=5 signaller=7\nmask-after=0\n".to_owned()
+            }
+            "terminate-during-wait" => "terminate-during-wait waiting\n".to_owned(),
+            "terminate-then-exit" => "terminate-then-exit waiting\n".to_owned(),
+            "guest-blocked" => {
+                "guest-blocked child=5 pending=1 taken=12 pending-after=0\nmask-after=0x800\n"
+                    .to_owned()
+            }
+            "block-all" => format!(
+                "how=-1 without a set: result=0 old-matches=1\n\
+                 how=-1 with a set: result=-1 errno=EINVAL\n\
+                 mask unchanged by the refused call=1\n\
+                 block-all mask={block_all_mask:#x}\n\
+                 block-all child=5 mask-kept=1\n\
+                 block-all SIGUSR1 pending=1 SIGCHLD pending=1\n\
+                 block-all taken=10\n"
+            ),
+            "write-only-set" => "write-only-set SIGUSR2 blocked=1\n".to_owned(),
+            "handler-after-reap" => {
+                "handler-after-reap child=5 before=0 handled=1\nmask-after=0\n".to_owned()
+            }
+            _ => panic!("no expected output for mode {mode}"),
+        }
+    };
+    // Each mode, how it ends, and how in-guest LiteInst is checked.
+    let modes = [
+        ("sigchld-during-wait", Exit::Code(0), InGuest::Same),
+        ("ignored-during-wait", Exit::Code(0), InGuest::Same),
+        ("ignored-then-restart", Exit::Code(0), InGuest::Same),
+        (
+            "terminate-during-wait",
+            Exit::Signal(libc::SIGUSR1),
+            InGuest::Skipped("https://github.com/rrnewton/hermit/issues/3688"),
+        ),
+        (
+            "terminate-then-exit",
+            Exit::Signal(libc::SIGUSR1),
+            InGuest::Same,
+        ),
+        ("guest-blocked", Exit::Code(0), InGuest::Same),
+        ("block-all", Exit::Code(0), InGuest::Same),
+        (
+            "write-only-set",
+            Exit::Code(0),
+            InGuest::KnownBad {
+                issue: "https://github.com/rrnewton/reverie/issues/921",
+                code: 1,
+                stderr: "FAIL block SIGUSR2 from a write-only page: Bad address\n",
+            },
+        ),
+        (
+            "handler-after-reap",
+            Exit::Code(0),
+            InGuest::KnownBad {
+                issue: "https://github.com/rrnewton/reverie/issues/243",
+                code: 1,
+                stderr: "FAIL sigaction: Operation not permitted\n",
+            },
+        ),
+    ];
+
+    // One directory per test process, so two processes running this test at
+    // once cannot overwrite each other's logs and status files; the Hermit
+    // run lock serializes runs only within one process.
+    let log_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(format!(
+        "liteinst-in-guest-wait-signals/logs/{}",
+        std::process::id()
+    ));
+    fs::create_dir_all(&log_root).expect("failed to create the wait-signals log directory");
+
+    let remove_stale = |path: &Path| match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("failed to remove {}: {error}", path.display()),
+    };
+
+    // One run of `mode`, with the Hermit INFO log written to `log` (Hermit
+    // runners only) and, for terminate-then-exit, the guest's status word in
+    // `status_file`.
+    let run = |runner: &str,
+               mode: &str,
+               log: Option<&Path>,
+               status_file: Option<&Path>|
+     -> (ExitStatus, String, String) {
+        let guest = liteinst_in_guest_wait_signals_guest()
+            .to_str()
+            .expect("guest path is not UTF-8");
+        let mut guest_args = vec![mode];
+        if let Some(status_file) = status_file {
+            remove_stale(status_file);
+            guest_args.push(status_file.to_str().expect("status path is not UTF-8"));
+        }
+        // Natively, nothing makes handler-after-reap's child exit after its
+        // parent is asleep in `wait4`, so the child also waits until Linux
+        // reports that (see the guest; it needs Linux 5.16 or later and fails
+        // on an older kernel).
+        if runner == "native" && mode == "handler-after-reap" {
+            guest_args.push("wait-for-parent-asleep");
+        }
+        let log_args = log.map(|log| {
+            remove_stale(log);
+            [
+                "--log=info".to_owned(),
+                format!("--log-file={}", log.display()),
+            ]
+        });
+        let hermit = |backend: &str| {
+            let log_args = log_args
+                .as_ref()
+                .unwrap_or_else(|| panic!("{runner} {mode}: a Hermit run needs a log path"));
+            let mut args: Vec<&str> = log_args.iter().map(String::as_str).collect();
+            args.extend([
+                "--backend",
+                backend,
+                "run",
+                "--max-timeslice=disabled",
+                "--",
+                guest,
+            ]);
+            args.extend(&guest_args);
+            hermit_command(&args)
+        };
+        let mut command = match runner {
+            "native" => {
+                let mut command = Command::new(guest);
+                command.args(&guest_args);
+                command
+            }
+            "ptrace" => hermit("ptrace"),
+            "in-guest" => {
+                let mut command = hermit("liteinst");
+                command.env("HERMIT_LITEINST_IN_GUEST", "1");
+                command
+            }
+            _ => panic!("unknown runner {runner}"),
+        };
+        let mut child = command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .process_group(0)
+            .spawn()
+            .unwrap_or_else(|error| panic!("{runner} {mode}: failed to spawn: {error}"));
+        // Read both pipes on their own threads, so a full pipe cannot stall the
+        // run and an open one cannot stall the test past its deadline.
+        let (sender, receiver) = mpsc::channel();
+        let pipes: [Box<dyn Read + Send>; 2] = [
+            Box::new(child.stdout.take().expect("piped stdout")),
+            Box::new(child.stderr.take().expect("piped stderr")),
+        ];
+        for (stream, mut pipe) in pipes.into_iter().enumerate() {
+            let sender = sender.clone();
+            thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let result = pipe.read_to_end(&mut bytes).map(|_| bytes);
+                let _ = sender.send((stream, result));
+            });
+        }
+        drop(sender);
+        let deadline = Instant::now() + DEADLINE;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("failed to poll the run") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                // SAFETY: `killpg` has no memory-safety preconditions; the group
+                // was created for this run by `process_group(0)`, and its leader
+                // has not been reaped.
+                unsafe { libc::killpg(child.id() as libc::pid_t, libc::SIGKILL) };
+                let _ = child.wait();
+                panic!(
+                    "{runner} {mode}: still running after {DEADLINE:?}; killed its process group"
+                );
+            }
+            thread::sleep(Duration::from_millis(20));
+        };
+        let mut outputs = [String::new(), String::new()];
+        for _ in 0..2 {
+            let (stream, result) = receiver
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap_or_else(|_| {
+                    panic!("{runner} {mode}: output still open 10 s after exit {status:?}")
+                });
+            let bytes = result.unwrap_or_else(|error| panic!("{runner} {mode}: read: {error}"));
+            outputs[stream] = String::from_utf8_lossy(&bytes).into_owned();
+        }
+        let [stdout, stderr] = outputs;
+        (status, stdout, stderr)
+    };
+
+    // The number that follows `marker` in `line`.
+    let number_after = |line: &str, marker: &str| -> String {
+        let start = line.find(marker).expect("marker is in the line") + marker.len();
+        line[start..]
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect()
+    };
+    // Detcore's scheduler records that place each signal inside the parent's
+    // wait. See the test's documentation.
+    let check_log = |runner: &str, mode: &str, log: &str, context: &str| {
+        let lines: Vec<&str> = log.lines().collect();
+        // The first line at or after `from` that contains every one of `parts`.
+        let find = |from: usize, parts: &[&str]| -> Option<usize> {
+            (from..lines.len()).find(|&index| parts.iter().all(|part| lines[index].contains(part)))
+        };
+        // The first commit at or after `from` by `dettid` on a resource that
+        // starts with `resource`; an empty `resource` matches any commit.
+        let commit = |from: usize, dettid: &str, resource: &str| {
+            let by = format!(", dettid {dettid} using resources {{{resource}");
+            find(from, &[" COMMIT turn ", &by])
+        };
+        let parked = |from: usize, dettid: &str, child: &str| {
+            let parking = format!(
+                "parking dettid {dettid} for child ChildWaitSpec {{ selector: \
+                 Exact(DetPid({child}))"
+            );
+            find(from, &[&parking])
+        };
+        let found = |line: Option<usize>, what: &str| -> usize {
+            line.unwrap_or_else(|| panic!("{context}\n{what}"))
+        };
+
+        let first = found(
+            find(
+                0,
+                &[
+                    " COMMIT turn ",
+                    "using resources {ParentContinue { parent: DetPid(",
+                ],
+            ),
+            "no ParentContinue commit",
+        );
+        let parent = number_after(lines[first], ", dettid ");
+        assert!(
+            lines[first].contains(&format!(
+                "ParentContinue {{ parent: DetPid({parent}), child: DetPid({parent}) }}"
+            )),
+            "{context}\nthe first ParentContinue commit is not the parent's own"
+        );
+        let forked =
+            format!("using resources {{ParentContinue {{ parent: DetPid({parent}), child: DetPid(");
+        let children: Vec<String> = lines[first + 1..]
+            .iter()
+            .filter(|line| line.contains(" COMMIT turn ") && line.contains(&forked))
+            .map(|line| number_after(line, "child: DetPid("))
+            .collect();
+        let forks = |count: usize| {
+            assert_eq!(
+                children.len(),
+                count,
+                "{context}\nthe parent forks children {children:?}"
+            );
+        };
+        let exited = |child: &str| {
+            commit(
+                0,
+                child,
+                &format!("Exit {{ group: true, process: DetPid({child}),"),
+            )
+        };
+        // The parent's first finished `wait4` at or after `from`. Only ptrace
+        // logs have system-call lines.
+        let wait4_finished = |from: usize| {
+            let by = format!("[detcore, dtid {parent}] finish syscall #");
+            find(from, &[&by, ": wait4("])
+        };
+        let ended = |line: Option<usize>, child: &str, result: &str| {
+            line.is_some_and(|line| {
+                lines[line].contains(&format!(": wait4({child}, "))
+                    && lines[line].contains(&format!(" = {result}"))
+            })
+        };
+        let is_on = |line: Option<usize>, resource: &str| {
+            line.is_some_and(|line| lines[line].contains(&format!("using resources {{{resource}")))
+        };
+        let died = format!("guest terminated by signal tid={parent} pid={parent} signal=SIGUSR1");
+
+        match mode {
+            // Neither waits nor signals.
+            "write-only-set" => {}
+            "sigchld-during-wait" => {
+                forks(2);
+                let (fast, slow) = (&children[0], &children[1]);
+                let parked_on_slow = found(
+                    parked(0, &parent, slow),
+                    "the parent never parks on the slow child",
+                );
+                let sigchld = commit(parked_on_slow + 1, &parent, "");
+                assert!(
+                    is_on(sigchld, "InboundSignal(SigWrapper(17)): W}"),
+                    "{context}\nafter parking on the slow child, the parent's first commit is \
+                     not on SIGCHLD"
+                );
+                let sigchld = found(sigchld, "no SIGCHLD commit");
+                let fast_exit = found(exited(fast), "the fast child never exits");
+                let slow_exit = found(exited(slow), "the slow child never exits");
+                assert!(
+                    fast_exit < sigchld && sigchld < slow_exit,
+                    "{context}\nthe SIGCHLD commit (line {sigchld}) is not after the fast \
+                     child's Exit (line {fast_exit}) and before the slow child's (line \
+                     {slow_exit})"
+                );
+                let parked_again = found(
+                    parked(sigchld + 1, &parent, slow).filter(|&line| line < slow_exit),
+                    "the parent does not park on the slow child again before it exits",
+                );
+                if runner == "ptrace" {
+                    assert!(
+                        ended(
+                            wait4_finished(sigchld).filter(|&line| line < parked_again),
+                            slow,
+                            "Err(Errno(ERESTARTSYS))"
+                        ),
+                        "{context}\nthe interrupted wait4 does not end in ERESTARTSYS"
+                    );
+                }
+            }
+            "ignored-then-restart" => {
+                forks(2);
+                let waited = &children[0];
+                let pending = found(
+                    commit(0, &parent, "WaitidSignals([SigWrapper(10)]): W}"),
+                    "no commit on SIGUSR1 pending in the wait",
+                );
+                let waited_exit = found(
+                    exited(waited).filter(|&line| line > pending),
+                    "the waited child does not exit after the parent's WaitidSignals commit",
+                );
+                let parked_after = found(
+                    parked(pending + 1, &parent, waited).filter(|&line| line < waited_exit),
+                    "the parent does not park on the waited child after the signal commit, \
+                     before the child exits",
+                );
+                if runner == "ptrace" {
+                    assert!(
+                        ended(
+                            wait4_finished(pending).filter(|&line| line < parked_after),
+                            waited,
+                            "Err(Errno(ERESTARTSYS))"
+                        ),
+                        "{context}\nthe interrupted wait4 does not end in ERESTARTSYS"
+                    );
+                }
+            }
+            "terminate-during-wait" => {
+                forks(1);
+                let child = &children[0];
+                let pending = found(
+                    commit(0, &parent, "WaitidSignals([SigWrapper(10)]): W}"),
+                    "no commit on SIGUSR1 pending in the wait",
+                );
+                assert!(
+                    exited(child).is_none_or(|line| line > pending),
+                    "{context}\nthe child exits before the parent's WaitidSignals commit"
+                );
+                if runner == "ptrace" {
+                    let finished = wait4_finished(pending);
+                    assert!(
+                        ended(finished, child, "Err(Errno(ERESTARTSYS))"),
+                        "{context}\nthe interrupted wait4 does not end in ERESTARTSYS"
+                    );
+                    let delivered = finished.and_then(|line| {
+                        commit(line, &parent, "InboundSignal(SigWrapper(10)): RW}")
+                    });
+                    assert!(
+                        delivered.and_then(|line| find(line, &[&died])).is_some(),
+                        "{context}\nthe parent is not delivered SIGUSR1 and killed by it after \
+                         the wait4"
+                    );
+                }
+            }
+            "handler-after-reap" => {
+                forks(1);
+                let child = &children[0];
+                let parked_on_child = found(
+                    parked(0, &parent, child),
+                    "the parent never parks on the child",
+                );
+                let child_exit = found(
+                    exited(child).filter(|&line| line > parked_on_child),
+                    "the child does not exit after the parent parks on it",
+                );
+                let queued = found(
+                    find(
+                        child_exit,
+                        &[&format!(
+                            "[dtid {parent}] Alarm fired, delivering signal SIGCHLD"
+                        )],
+                    ),
+                    "SIGCHLD is never queued for the parent after the child's Exit",
+                );
+                let reaped = commit(parked_on_child + 1, &parent, "");
+                assert!(
+                    reaped.is_some_and(|line| line > queued)
+                        && is_on(
+                            reaped,
+                            &format!(
+                                "WaitChild {{ parent: DetPid({parent}), spec: ChildWaitSpec {{ \
+                                 selector: Exact(DetPid({child})),"
+                            )
+                        ),
+                    "{context}\nafter parking, the parent's first commit is not the reap after \
+                     the child's Exit and the queued SIGCHLD"
+                );
+                if runner == "ptrace" {
+                    let finished = wait4_finished(found(reaped, "no reap"));
+                    assert!(
+                        ended(finished, child, &format!("Ok({child})")),
+                        "{context}\nthe wait4 does not return the child"
+                    );
+                    assert!(
+                        is_on(
+                            finished.and_then(|line| commit(line, &parent, "")),
+                            "InboundSignal(SigWrapper(17)): RW}"
+                        ),
+                        "{context}\nafter the wait4, the parent's next commit is not the delivery \
+                         of SIGCHLD"
+                    );
+                }
+            }
+            "ignored-during-wait" | "terminate-then-exit" | "guest-blocked" | "block-all" => {
+                forks(1);
+                let child = &children[0];
+                let signal = if mode == "guest-blocked" {
+                    libc::SIGUSR2
+                } else {
+                    libc::SIGUSR1
+                };
+                let pending = found(
+                    commit(
+                        0,
+                        &parent,
+                        &format!("WaitidSignals([SigWrapper({signal})]): W}}"),
+                    ),
+                    &format!("no commit on signal {signal} pending in the wait"),
+                );
+                assert!(
+                    exited(child).is_some_and(|line| line < pending),
+                    "{context}\nthe child does not exit before the parent's commit on signal \
+                     {signal} pending in the wait"
+                );
+                if runner == "ptrace" {
+                    let finished = wait4_finished(pending);
+                    assert!(
+                        ended(finished, child, &format!("Ok({child})")),
+                        "{context}\nthe wait4 does not return the child"
+                    );
+                    if matches!(mode, "ignored-during-wait" | "terminate-then-exit") {
+                        let delivered = finished.and_then(|line| commit(line, &parent, ""));
+                        assert!(
+                            is_on(
+                                delivered,
+                                &format!("InboundSignal(SigWrapper({signal})): RW}}")
+                            ),
+                            "{context}\nafter the wait4, the parent's next commit is not the \
+                             delivery of signal {signal}"
+                        );
+                        if mode == "terminate-then-exit" {
+                            assert!(
+                                delivered.and_then(|line| find(line, &[&died])).is_some(),
+                                "{context}\nthe parent is not killed by SIGUSR1"
+                            );
+                        }
+                    }
+                }
+            }
+            _ => panic!("no scheduler records to check for mode {mode}"),
+        }
+    };
+
+    // An in-guest run's stderr must show that the guest preload, not the host
+    // hybrid, hosted Detcore.
+    const IN_GUEST_SELECTED: &str = "hermit: [liteinst in-guest] selected: the guest preload is \
+                                     to host the Detcore Tool; the host-hybrid activation probe \
+                                     does not apply";
+    let check_in_guest_selected = |stderr: &str, context: &str| {
+        assert!(
+            stderr.lines().any(|line| line == IN_GUEST_SELECTED),
+            "{context}\nno line of stderr is Hermit's in-guest selection line"
+        );
+        assert!(!stderr.contains("[liteinst host hybrid]"), "{context}");
+    };
+
+    // terminate-then-exit's guest sets its status word to this before its
+    // `wait4`; `wait4` never stores it.
+    const STATUS_UNWRITTEN: i32 = 0x5a5a_5a5a;
+    // The status `wait4` stores for a child that exited with 5.
+    const EXITED_5: i32 = 5 << 8;
+    let check_reaped = |runner: &str, status_file: &Path, context: &str| {
+        let bytes = fs::read(status_file).unwrap_or_else(|error| {
+            panic!(
+                "{context}\nfailed to read {}: {error}",
+                status_file.display()
+            )
+        });
+        let word = i32::from_ne_bytes(bytes.as_slice().try_into().unwrap_or_else(|_| {
+            panic!(
+                "{context}\n{} holds {} bytes, not 4",
+                status_file.display(),
+                bytes.len()
+            )
+        }));
+        if runner == "native" {
+            assert!(
+                word == EXITED_5 || word == STATUS_UNWRITTEN,
+                "{context}\nthe status word is {word:#x}"
+            );
+        } else {
+            assert_eq!(
+                word, EXITED_5,
+                "{context}\nthe parent died before its wait4 stored the child's status \
+                 ({STATUS_UNWRITTEN:#x} means wait4 never wrote the word)"
+            );
+        }
+    };
+
+    let check = |runner: &str, mode: &str, exit: Exit, block_all_mask: u64, attempt: usize| {
+        let log =
+            (runner != "native").then(|| log_root.join(format!("{runner}-{mode}-{attempt}.log")));
+        let status_file = (mode == "terminate-then-exit")
+            .then(|| log_root.join(format!("{runner}-{mode}-{attempt}.status")));
+        let (status, stdout, stderr) = run(runner, mode, log.as_deref(), status_file.as_deref());
+        let mut context = format!(
+            "{runner} run {attempt} of {mode}: status {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+        );
+        if let Some(log) = &log {
+            context.push_str(&format!("\nHermit log: {}", log.display()));
+        }
+        match exit {
+            Exit::Signal(signal) => assert_eq!(status.signal(), Some(signal), "{context}"),
+            Exit::Code(code) => assert_eq!(status.code(), Some(code), "{context}"),
+        }
+        assert_eq!(stdout, expected_stdout(mode, block_all_mask), "{context}");
+        assert!(
+            !stderr.lines().any(|line| line.starts_with("FAIL ")),
+            "{context}\nthe guest reported a failure"
+        );
+        if runner == "in-guest" {
+            check_in_guest_selected(&stderr, &context);
+        }
+        if let Some(status_file) = &status_file {
+            check_reaped(runner, status_file, &context);
+        }
+        if let Some(log) = &log {
+            let text = fs::read_to_string(log)
+                .unwrap_or_else(|error| panic!("{context}\nfailed to read the log: {error}"));
+            check_log(runner, mode, &text, &context);
+        }
+    };
+
+    let _lock = HERMIT_RUN_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    for (mode, exit, in_guest) in modes {
+        check("native", mode, exit, native_mask, 1);
+        check("ptrace", mode, exit, ptrace_mask, 1);
+        match in_guest {
+            InGuest::Same => {
+                for attempt in 1..=IN_GUEST_RUNS {
+                    check("in-guest", mode, exit, in_guest_mask, attempt);
+                }
+            }
+            InGuest::Skipped(issue) => eprintln!("{mode}: not run in-guest until {issue} is fixed"),
+            InGuest::KnownBad {
+                issue,
+                code,
+                stderr: expected_stderr,
+            } => {
+                for attempt in 1..=IN_GUEST_RUNS {
+                    let log = log_root.join(format!("in-guest-{mode}-{attempt}.log"));
+                    let (status, stdout, stderr) = run("in-guest", mode, Some(&log), None);
+                    let context = format!(
+                        "in-guest run {attempt} of {mode}, expected to fail as {issue} \
+                         describes; if it is fixed, check this mode like the others: status \
+                         {status:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                    );
+                    assert_eq!(status.code(), Some(code), "{context}");
+                    assert_eq!(stdout, "", "{context}");
+                    check_in_guest_selected(&stderr, &context);
+                    // Hermit's selection line, then only the failure the issue
+                    // describes.
+                    let (selected, failure) = stderr.split_once('\n').unwrap_or((&stderr, ""));
+                    assert_eq!(
+                        selected, IN_GUEST_SELECTED,
+                        "{context}\nthe first stderr line is not Hermit's selection line"
+                    );
+                    assert_eq!(failure, expected_stderr, "{context}");
+                }
+            }
+        }
+    }
+
+    // Every run passed; a failing one panics above and keeps its files. Remove
+    // this process's logs and guest build so passing runs leave nothing behind.
+    fs::remove_dir_all(&log_root).expect("failed to remove the wait-signals log directory");
+    let build_root = liteinst_in_guest_wait_signals_guest()
+        .parent()
+        .expect("the wait-signals guest has no directory");
+    fs::remove_dir_all(build_root).expect("failed to remove the wait-signals guest directory");
 }
 
 /// `--timeout` qualification is a static policy fact, so an UNAVAILABLE
