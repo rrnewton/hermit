@@ -242,6 +242,21 @@ impl Default for InodePool {
     }
 }
 
+/// Names the host file behind each minted number, so a run pair whose
+/// deterministic inodes diverge can be traced to the host files involved
+/// (<https://github.com/rrnewton/hermit/issues/2397>). DEBUG, not INFO: strict
+/// verification compares every INFO record exactly, and host inode numbers
+/// differ between runs (a new pipe or socket gets a fresh one each time).
+///
+/// Called after the pool's lock is released, so formatting and writing the
+/// record never makes another thread's inode lookup wait on the subscriber.
+fn log_minted_inode(det: DetInode, raw: RawFileId) {
+    debug!(
+        "minted deterministic inode {} for host device {:#x} inode {}",
+        det, raw.device, raw.inode
+    );
+}
+
 impl InodePool {
     fn new() -> Self {
         InodePool {
@@ -249,6 +264,13 @@ impl InodePool {
             detinodes_info: HashMap::new(),
             next_inode: 1,
         }
+    }
+
+    /// Whether `add_inode` or `touch_inode` would mint a new deterministic
+    /// inode for this raw identity, rather than return an existing one. Ask
+    /// under the same lock as the call it predicts.
+    fn would_mint(&self, raw_inode: &RawFileId) -> bool {
+        !self.inodes.contains_key(raw_inode)
     }
 
     // Allocate the next deterministic inode.  This takes the raw file
@@ -284,16 +306,8 @@ impl InodePool {
                     },
                 );
                 assert!(prev.is_none()); // Should not have been previously used.
-                // Names the host file behind each minted number, so a run pair
-                // whose deterministic inodes diverge can be traced to the host
-                // files involved (https://github.com/rrnewton/hermit/issues/2397).
-                // DEBUG, not INFO: strict verification compares every INFO
-                // record exactly, and host inode numbers differ between runs
-                // (a new pipe or socket gets a fresh one each time).
-                debug!(
-                    "minted deterministic inode {} for host device {:#x} inode {}",
-                    new, raw_inode.device, raw_inode.inode
-                );
+                // The mint is logged by the caller once the pool's lock is
+                // released; see `log_minted_inode`.
                 new
             }
         };
@@ -2654,7 +2668,15 @@ impl GlobalState {
         // the epoch, unless its host mtime is one of the canonical values in
         // `CANONICAL_FILE_MTIME_SECONDS`, which it keeps.
         let epoch = self.epoch_logical_time();
-        let (dino, ns) = self.inodes.lock().unwrap().add_inode(ino, observed, epoch);
+        let (dino, ns, minted) = {
+            let mut pool = self.inodes.lock().unwrap();
+            let minted = pool.would_mint(&ino);
+            let (dino, ns) = pool.add_inode(ino, observed, epoch);
+            (dino, ns, minted)
+        };
+        if minted {
+            log_minted_inode(dino, ino);
+        }
         trace!(
             "[detcore, dtid {}] resolved (raw) inode {:?} to {:?}, mtime {}",
             from, ino, dino, ns
@@ -2749,7 +2771,14 @@ impl GlobalState {
 
     fn set_inode_mtime(&self, ino: RawFileId, mtime: LogicalTime) {
         let epoch = self.epoch_logical_time();
-        self.inodes.lock().unwrap().touch_inode(ino, epoch, mtime);
+        let (dino, minted) = {
+            let mut pool = self.inodes.lock().unwrap();
+            let minted = pool.would_mint(&ino);
+            (pool.touch_inode(ino, epoch, mtime), minted)
+        };
+        if minted {
+            log_minted_inode(dino, ino);
+        }
     }
 
     async fn recv_trace_schedevent(
@@ -7253,6 +7282,42 @@ mod tests {
         // Re-determinizing the same host inode is stable, not a fresh mint.
         let (a_again, _) = pool.add_inode(RawFileId::new(0x32, host_a), seen, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+
+    /// The RPC handlers ask `would_mint` under the pool's lock and log the
+    /// mint only after releasing it, so the answer must match exactly the
+    /// calls that advance the counter: a first `add_inode` or `touch_inode`
+    /// for an identity, and never a repeat.
+    #[test]
+    fn would_mint_predicts_exactly_the_calls_that_mint() {
+        use crate::types::RawFileId;
+
+        let mut pool = super::InodePool::new();
+        let t = LogicalTime::from_nanos(0);
+        let written = LogicalTime::from_nanos(5_000);
+        let seen = super::ObservedMtime::Unobserved;
+        let a = RawFileId::new(0x32, 7);
+        // The same inode number on another device is another identity.
+        let b = RawFileId::new(0x33, 7);
+
+        let mut check = |raw: RawFileId, touch: bool, expect_mint: bool| {
+            let predicted = pool.would_mint(&raw);
+            let before = pool.next_inode;
+            if touch {
+                pool.touch_inode(raw, t, written);
+            } else {
+                pool.add_inode(raw, seen, t);
+            }
+            let minted = pool.next_inode != before;
+            assert_eq!(predicted, minted, "would_mint disagreed for {raw:?}");
+            assert_eq!(minted, expect_mint, "unexpected mint outcome for {raw:?}");
+        };
+        check(a, false, true);
+        check(a, false, false);
+        check(b, true, true);
+        check(b, true, false);
+        check(b, false, false);
+        check(a, true, false);
     }
 
     /// Only an exact whole-second 0 or 1 host mtime is canonical
