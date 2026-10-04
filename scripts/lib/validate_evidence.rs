@@ -581,7 +581,7 @@ mod tests {
             "--requalify-cell".into(),
             "c-programs/pid-probe".into(),
             "verify".into(),
-            "liteinst".into(),
+            "sabre".into(),
             "--no-label-pr".into(),
         ])
         .unwrap();
@@ -596,7 +596,7 @@ mod tests {
             category: "c-programs".into(),
             test: Some("c-programs/pid-probe".into()),
             mode: Some("verify".into()),
-            backend: Some("liteinst".into()),
+            backend: Some("sabre".into()),
         };
         let committed = super::super::validate_plan::validation_config(root).unwrap();
         let lane =
@@ -626,9 +626,11 @@ mod tests {
                 .unwrap();
         expected.sort();
         assert_eq!(prepared.plan.planned_cells().unwrap(), expected);
-        // The requalified liteinst verify cell runs ordinary same-backend
+        // The requalified SaBRe verify cell runs ordinary same-backend
         // verification; no ptrace reference relation is selected
-        // (https://github.com/rrnewton/hermit/issues/3301).
+        // (https://github.com/rrnewton/hermit/issues/3301). This test used the
+        // liteinst cell until every liteinst cell was switched off for the
+        // in-guest reset (https://github.com/rrnewton/hermit/issues/3520).
         assert_eq!(
             prepared.plan.planned_backend_parity_relations().unwrap(),
             Vec::new()
