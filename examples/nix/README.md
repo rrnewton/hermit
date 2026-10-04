@@ -113,8 +113,8 @@ To check a build, rebuild it and compare: `nix-build --check ...` reports a
 differing output.
 
 What has been tested, on one x86_64 host with Nix 2.35.1 and the ptrace
-backend. No Nix build has yet gone through the current script; each number
-below names the version that produced it.
+backend. Each number below names the version of this script that produced
+it.
 
 An earlier version of this script (no option parsing, the host's `HOME`, no
 `TZ`), with Hermit including both pull requests above: four small derivations that write
@@ -126,11 +126,19 @@ different hash on every build.
 
 Real nixpkgs packages, built through this script as it was before `TZ=UTC`
 was added, with `--native-fixed-output --no-rcb-time --max-timeslice=disabled`
-and Hermit including https://github.com/rrnewton/hermit/pull/3554: `hello` and
-`duktape` gave the same output as a native build, byte for byte. Five packages
-whose two sandboxed native builds differ (chibi, sagittarius-scheme, aichat,
-rav1e, gdbHostCpuOnly) each gave one output in two Hermit builds, but not the
-native output. Known reasons a Hermit output differs from a native one:
+and Hermit commit 2e59e12ce8cb, which combines
+https://github.com/rrnewton/hermit/pull/3554,
+https://github.com/rrnewton/hermit/pull/3566 and
+https://github.com/rrnewton/hermit/pull/3570: `hello` and `duktape` gave the
+same output as a native build, byte for byte. Five packages whose two
+sandboxed native builds differ (chibi, sagittarius-scheme, aichat, rav1e,
+gdbHostCpuOnly) each gave one output in two Hermit builds, but not the native
+output. Two causes seen in those runs are fixed since: the host timezone
+(sagittarius-scheme's manual showed `-0800`), now set to UTC by this script,
+and a `SOURCE_DATE_EPOCH` that moved to `--epoch`
+(https://github.com/rrnewton/hermit/issues/3639), fixed on main. With the
+current script and the same Hermit, `hello` again gave the native output.
+Known reasons a Hermit output still differs from a native one:
 - The build directory is `/tmp/build`, not `/build`, and a package that
   records it (in `__FILE__` strings, for example) keeps that path.
 - Hermit sorts every `getdents64` batch by name so that directory listings are
