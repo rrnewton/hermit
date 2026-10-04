@@ -996,8 +996,10 @@ def write_boot_snapshot_record(
 ) -> Path:
     """Record, next to ``snapshot``, its SHA-256 and the initramfs it booted.
 
-    ``producer`` is what initramfs_producer returned before the boot. The record
-    is renamed into place whole.
+    ``producer`` gives the initramfs_version and initramfs_sha256 to record.
+    Demo 5 passes what booted_initramfs_producer returned before the boot for
+    the private copy of the initramfs that QEMU boots, and checks after the boot
+    that the copy is unchanged. The record is renamed into place whole.
     """
     record = boot_snapshot_record_path(snapshot)
     _write_json(
