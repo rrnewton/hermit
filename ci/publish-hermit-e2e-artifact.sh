@@ -68,8 +68,10 @@ function require_runtime_closure {
 # libc that guest already has (https://github.com/rrnewton/hermit/issues/3652).
 # It may need only libraries every glibc provides, may name no build-root
 # directory to find them in, and may require no glibc symbol version newer than
-# the oldest supported host's: glibc 2.34 (devbig030). detcore-sabre/build.rs
-# and detcore-sabre/src/glibc_compat.rs build it that way.
+# the oldest supported host's: glibc 2.34, measured on the host recorded for
+# SABRE_PLUGIN_GLIBC_MINOR_FLOOR in docs/TESTING_ENVIRONMENTS.md under "Named
+# measurement hosts". detcore-sabre/build.rs and
+# detcore-sabre/src/glibc_compat.rs build it that way.
 SABRE_PLUGIN_GLIBC_MINOR_FLOOR=34
 
 function require_portable_sabre_plugin {
