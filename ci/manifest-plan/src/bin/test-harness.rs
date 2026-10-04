@@ -9639,6 +9639,15 @@ sys.exit(1 if failed else 0)
 
     /// `source`, a manifest file, with `backend` taken out of `test`'s `mode`:
     /// the reverse of a cell flip. Returns the edited YAML.
+    ///
+    /// When `backend` is the mode's only enabled backend and the mode carries
+    /// the boolean `ci: true`, the mode's `ci` becomes `false` as well. That is
+    /// the edit a real un-flip of a mode's last cell has to make: the
+    /// generator refuses `ci: true` on a mode that enables no backend ("ci=true
+    /// requires at least one enabled backend", `CiSelection::validate` in
+    /// ci_selection.rs), so without it the edited manifest would not load at
+    /// all. A mode that still enables another backend keeps its `ci`, and a
+    /// per-backend `ci` map only loses `backend`'s entry, as before.
     fn unflip(source: &str, test: &str, mode: &str, backend: &str) -> String {
         use serde_yaml::Value;
         let mut manifest: Value = serde_yaml::from_str(source).unwrap();
@@ -9660,10 +9669,17 @@ sys.exit(1 if failed else 0)
             before,
             "{test} does not enable {backend}"
         );
+        let last_enabled_backend = enabled.is_empty();
         for per_backend in ["ci", "expected_stdout"] {
             if let Some(map) = mode.get_mut(per_backend).and_then(Value::as_mapping_mut) {
                 map.remove(backend);
             }
+        }
+        if let Some(ci) = mode
+            .get_mut("ci")
+            .filter(|ci| last_enabled_backend && ci.as_bool() == Some(true))
+        {
+            *ci = Value::Bool(false);
         }
         let disabled = mode
             .entry("backends_disabled".into())
@@ -9673,6 +9689,118 @@ sys.exit(1 if failed else 0)
             "un-flipped by the sync-cells round-trip test".into(),
         );
         serde_yaml::to_string(&manifest).unwrap()
+    }
+
+    /// Un-flipping a mode's only enabled backend turns that mode's boolean
+    /// `ci: true` off, which is what lets the generator accept the edited
+    /// manifest; keeping `ci: true` there is refused. A mode that still enables
+    /// another backend, and a per-backend `ci` map, keep their selection.
+    #[test]
+    fn unflip_of_a_modes_only_backend_turns_its_ci_off() {
+        use hermit_manifest_plan::ci_selection::CiSelection;
+        use hermit_manifest_plan::ci_selection::CiSelectionSpec;
+        use serde_yaml::Value;
+        let source = "\
+test:
+  - id: family/one-backend
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: not measured
+  - id: family/two-backends
+    modes:
+      verify:
+        ci: true
+        backends_enabled:
+          - ptrace
+          - kvm
+        backends_disabled: {}
+  - id: family/per-backend
+    modes:
+      verify:
+        ci:
+          ptrace: true
+        backends_enabled:
+          - ptrace
+        backends_disabled: {}
+";
+        let verify = |yaml: &str, test: &str| -> Value {
+            let manifest: Value = serde_yaml::from_str(yaml).unwrap();
+            manifest["test"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .find(|entry| entry["id"].as_str() == Some(test))
+                .unwrap()["modes"]["verify"]
+                .clone()
+        };
+        // The generator's own check of one mode's `ci` selection.
+        let generator_check = |mode: &Value| -> Result<(), String> {
+            let enabled: BTreeSet<String> = mode["backends_enabled"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|name| name.as_str().unwrap().to_owned())
+                .collect();
+            let disabled: BTreeSet<String> = mode["backends_disabled"]
+                .as_mapping()
+                .unwrap()
+                .keys()
+                .map(|name| name.as_str().unwrap().to_owned())
+                .collect();
+            let selection: CiSelectionSpec = serde_yaml::from_value(mode["ci"].clone()).unwrap();
+            CiSelection::validate(&enabled, &disabled, &selection, None).map(|_| ())
+        };
+        for test in [
+            "family/one-backend",
+            "family/two-backends",
+            "family/per-backend",
+        ] {
+            assert_eq!(generator_check(&verify(source, test)), Ok(()), "{test}");
+        }
+
+        let unflipped = unflip(source, "family/one-backend", "verify", "ptrace");
+        let mode = verify(&unflipped, "family/one-backend");
+        assert_eq!(mode["backends_enabled"], Value::Sequence(Vec::new()));
+        assert_eq!(mode["ci"], Value::Bool(false));
+        assert_eq!(
+            mode["backends_disabled"]["ptrace"].as_str(),
+            Some("un-flipped by the sync-cells round-trip test")
+        );
+        assert_eq!(
+            mode["backends_disabled"]["dbt"].as_str(),
+            Some("not measured")
+        );
+        assert_eq!(generator_check(&mode), Ok(()));
+        let mut kept_selected = mode.clone();
+        kept_selected["ci"] = Value::Bool(true);
+        assert_eq!(
+            generator_check(&kept_selected),
+            Err("ci=true requires at least one enabled backend".to_owned())
+        );
+        // Only the named test's mode changes.
+        assert_eq!(
+            verify(&unflipped, "family/two-backends"),
+            verify(source, "family/two-backends")
+        );
+
+        let unflipped = unflip(source, "family/two-backends", "verify", "kvm");
+        let mode = verify(&unflipped, "family/two-backends");
+        assert_eq!(
+            mode["backends_enabled"],
+            Value::Sequence(vec!["ptrace".into()])
+        );
+        assert_eq!(mode["ci"], Value::Bool(true));
+        assert_eq!(generator_check(&mode), Ok(()));
+
+        let unflipped = unflip(source, "family/per-backend", "verify", "ptrace");
+        let mode = verify(&unflipped, "family/per-backend");
+        assert_eq!(mode["backends_enabled"], Value::Sequence(Vec::new()));
+        assert_eq!(mode["ci"], Value::Mapping(Default::default()));
+        assert_eq!(generator_check(&mode), Ok(()));
     }
 
     fn sync(root: &std::path::Path) -> Vec<&'static str> {
