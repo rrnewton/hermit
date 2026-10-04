@@ -742,7 +742,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // bootstrap_syscall_marks_its_resource_requests_only_while_it_is_uncharged,
     // https://github.com/rrnewton/hermit/issues/3517) retain all 876 prior
     // identities: 876 + 2 = 878.
-    ("test.detcore_unit", 878),
+    // Four ephemeral host seed mount tests (procfs::tests::
+    // ephemeral_host_seed_mount_class_is_precise,
+    // seed_churn_does_not_change_guest_mountinfo_membership,
+    // mounts_format_seed_rows_are_excluded_legitimate_rows_kept and
+    // retained_row_with_seed_parent_still_snapshots) retain all 878 prior
+    // identities: 878 + 4 = 882.
+    ("test.detcore_unit", 882),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -958,7 +964,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two bootstrap-turn scheduler-time tests listed for test.detcore_unit
     // (https://github.com/rrnewton/hermit/issues/3517) retain all 876 prior
     // identities.
-    ("test.detcore_unit_on_host", 878),
+    // The four ephemeral host seed mount tests listed for test.detcore_unit
+    // retain all 878 prior identities: 878 + 4 = 882.
+    ("test.detcore_unit_on_host", 882),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
