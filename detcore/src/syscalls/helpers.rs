@@ -122,18 +122,42 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
-        let dettid = guest.thread_state().dettid;
-        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
-        self.record_or_replay_blocking_resource(guest, call, ResourceID::BlockingExternalIO(op_id))
+        self.record_or_replay_blocking_with_mask(guest, call, None)
             .await
     }
 
+    /// `record_or_replay_blocking` for a call that sleeps under its own
+    /// temporary signal mask (`ppoll`, `pselect6`, or an `rt_sigsuspend` that
+    /// finds a signal already pending): `blocked_signal_mask` is the mask the
+    /// kernel installs for the call, read in this thread's turn
+    /// (`Resources::blocked_signal_mask`). `None` means the call sleeps under
+    /// the thread's own mask.
+    pub async fn record_or_replay_blocking_with_mask<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        blocked_signal_mask: Option<u64>,
+    ) -> Result<i64, Error> {
+        let dettid = guest.thread_state().dettid;
+        let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
+        self.record_or_replay_blocking_resource(
+            guest,
+            call,
+            ResourceID::BlockingExternalIO(op_id),
+            blocked_signal_mask,
+        )
+        .await
+    }
+
     /// Execute the real `rt_sigsuspend` outside the runnable set while preserving
-    /// its signal-only completion condition for the scheduler.
+    /// its signal-only completion condition for the scheduler. `temporary_mask`
+    /// is the mask the call sleeps under, as `Resources::blocked_signal_mask`
+    /// describes.
     pub async fn record_or_replay_rt_sigsuspend<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::RtSigsuspend,
+        temporary_mask: u64,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
@@ -141,6 +165,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest,
             call.into(),
             ResourceID::BlockingRtSigsuspend(op_id),
+            Some(temporary_mask),
         )
         .await
     }
@@ -150,6 +175,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
         blocking_resource: ResourceID,
+        blocked_signal_mask: Option<u64>,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = match &blocking_resource {
@@ -182,6 +208,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // Without it, resource_request is a no-op and internal fds may block directly.
             rsrcs.insert(blocking_resource, Permission::RW);
             rsrcs.fyi(call.name());
+            rsrcs.blocked_signal_mask = blocked_signal_mask;
             resource_request(guest, rsrcs).await;
         }
         tracing::trace!(
