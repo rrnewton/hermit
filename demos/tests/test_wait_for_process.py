@@ -11,6 +11,12 @@ launch a real child that leads its own process group and has a descendant,
 so they check what a demo depends on: the error names the bound that fired,
 and the whole group, descendant included, is gone when the error arrives.
 
+Each function checks the size once more before it returns: wait_for_process
+once the child has exited, drain_output once the copy has ended. Output that
+is all written between two checks is otherwise never checked. The tests for
+that use finite writers and wait until all of the output is in the log before
+calling the function, so that only this last check can see it.
+
 The child's PID, and the group ID it leads, stay its own until it is reaped,
 even after it has exited; once it is reaped, Linux can give the number to a
 new process. So the helpers that stop a group must send every signal before
@@ -62,8 +68,9 @@ while True:
 # A child that starts a descendant on its own standard output, records the
 # descendant's PID, and exits with the status in argv[3] while the descendant
 # keeps running. Depending on argv[2], the descendant keeps writing to the
-# output (1 KiB about every millisecond), holds it open writing nothing, or
-# writes 1,500 bytes half a second later and exits.
+# output (1 KiB about every millisecond), holds it open writing nothing,
+# writes 1,500 bytes half a second later and exits, or writes 4,096 or 8,192
+# bytes at once and exits.
 LEAVER = r"""
 import subprocess, sys
 from pathlib import Path
@@ -71,6 +78,8 @@ descendants = {
     "write": "import os, time\ntry:\n    while True:\n        os.write(1, b'x' * 1024)\n        time.sleep(0.001)\nexcept BrokenPipeError:\n    pass\n",
     "hold": "import time\ntime.sleep(1000)\n",
     "late": "import os, time\ntime.sleep(0.5)\nos.write(1, b'late output\\n' * 125)\n",
+    "burst-4096": "import os\nos.write(1, b'x' * 4096)\n",
+    "burst-8192": "import os\nos.write(1, b'x' * 8192)\n",
 }
 descendant = subprocess.Popen([sys.executable, "-c", descendants[sys.argv[2]]])
 Path(sys.argv[1]).write_text(str(descendant.pid))
@@ -91,6 +100,18 @@ member = (
 )
 subprocess.Popen([sys.executable, "-c", member, sys.argv[1]])
 time.sleep(1000)
+"""
+
+# A child that starts a descendant in its own process group, records the
+# descendant's PID, writes argv[3] bytes to the log argv[2] at once, and exits
+# with status 5 while the descendant keeps running.
+BURST = r"""
+import subprocess, sys
+from pathlib import Path
+descendant = subprocess.Popen(["sleep", "1000"])
+Path(sys.argv[1]).write_text(str(descendant.pid))
+Path(sys.argv[2]).write_bytes(b"x" * int(sys.argv[3]))
+sys.exit(5)
 """
 
 
@@ -257,6 +278,90 @@ class WaitForProcessBoundsTest(unittest.TestCase):
         dc.drain_output(copier, process, 30, log_path=log, max_log_bytes=4096)
         self.assertFalse(copier.is_alive())
         self.assertEqual(log.read_bytes(), b"late output\n" * 125)
+        self._assert_descendant_stops(descendant)
+
+    def _wait_until_exited(self, process: subprocess.Popen) -> None:
+        """Wait for ``process`` to exit, leaving it unreaped as wait_for_process expects."""
+        deadline = time.monotonic() + 30
+        while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+            self.assertLess(time.monotonic(), deadline, "the child never exited")
+            time.sleep(0.01)
+
+    def test_a_finite_burst_past_the_cap_is_caught_once_the_child_has_exited(self):
+        # The child writes 8,192 bytes to the log and exits before
+        # wait_for_process first looks, so only the check made after the exit
+        # can see the log past the cap.
+        log = self.directory / "hermit-info.log"
+        process, descendant = self._launch(str(log), "8192", script=BURST)
+        self._wait_until_exited(process)
+        self.assertEqual(log.stat().st_size, 8192)
+        with self.assertRaises(dc.LogCapExceeded) as caught:
+            dc.wait_for_process(process, timeout=60, log_path=log, max_log_bytes=4096)
+        error = caught.exception
+        self.assertEqual(error.log_path, log)
+        self.assertEqual(error.log_size, 8192)
+        self.assertEqual(error.max_log_bytes, 4096)
+        self.assertEqual(error.exit_status, 5)
+        self.assertTrue(error.final_check)
+        self.assertLess(error.elapsed, 60)
+        self.assertEqual(
+            str(error),
+            "{} was 8192 bytes, past the 4096-byte log cap, when checked after the "
+            "launched process exited with status 5; anything left in its process "
+            "group was stopped".format(log),
+        )
+        self.assertEqual(
+            process.returncode, 5, "the child was not reaped after its group was stopped"
+        )
+        self._assert_descendant_stopped(descendant)
+
+    def test_a_child_that_exits_with_its_log_at_the_cap_is_not_stopped(self):
+        # Positive control: the log may reach the cap; only a log past it fails.
+        log = self.directory / "hermit-info.log"
+        process, descendant = self._launch(str(log), "4096", script=BURST)
+        self._wait_until_exited(process)
+        status = dc.wait_for_process(process, timeout=60, log_path=log, max_log_bytes=4096)
+        self.assertEqual(status, 5)
+        self.assertIsNone(process.returncode, "wait_for_process reaped the child")
+        self.assertFalse(_gone(descendant), "wait_for_process stopped the child's group")
+
+    def test_finite_output_past_the_cap_copied_before_the_drain_is_caught(self):
+        # The descendant writes 8,192 bytes to the output and exits, and the
+        # copy reaches the end of the output before drain_output first looks,
+        # so only the check made after the copy ended can see the log past
+        # the cap.
+        process, descendant, copier, log = self._leave_behind("burst-8192", 3)
+        copier.join(30)
+        self.assertFalse(copier.is_alive(), "the copy never reached the end of the output")
+        self.assertEqual(log.stat().st_size, 8192)
+        with self.assertRaises(dc.LogCapExceeded) as caught:
+            dc.drain_output(copier, process, 60, log_path=log, max_log_bytes=4096)
+        error = caught.exception
+        self.assertEqual(error.log_path, log)
+        self.assertEqual(error.log_size, 8192)
+        self.assertEqual(error.max_log_bytes, 4096)
+        self.assertEqual(error.exit_status, 3)
+        self.assertTrue(error.final_check)
+        self.assertLess(error.elapsed, 60)
+        self.assertEqual(
+            str(error),
+            "{} was 8192 bytes, past the 4096-byte log cap, when checked after the "
+            "launched process exited with status 3; anything left in its process "
+            "group was stopped".format(log),
+        )
+        self.assertEqual(
+            process.returncode, 3, "the child was not reaped after its group was stopped"
+        )
+        self._assert_descendant_stops(descendant)
+
+    def test_output_that_ends_at_the_cap_passes_the_drain(self):
+        # Positive control: the log may reach the cap; only a log past it fails.
+        process, descendant, copier, log = self._leave_behind("burst-4096", 0)
+        copier.join(30)
+        self.assertFalse(copier.is_alive(), "the copy never reached the end of the output")
+        self.assertIsNone(dc.drain_output(copier, process, 60, log_path=log, max_log_bytes=4096))
+        self.assertEqual(log.read_bytes(), b"x" * 4096)
+        self.assertIsNone(process.returncode, "drain_output reaped the child")
         self._assert_descendant_stops(descendant)
 
     def _record_signals(self, leader: int) -> List[Tuple[str, int, int, Optional[str]]]:
