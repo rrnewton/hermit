@@ -3771,21 +3771,17 @@ impl HermitData {
 /// Capture the current mount namespace's raw IDs in the exact row/parent order
 /// used by Detcore's canonical mountinfo mapping.
 pub fn capture_mountinfo_identity_order() -> Result<Vec<u64>, Error> {
-    let raw = fs::read("/proc/self/mountinfo")?;
-    // Producer provenance follows the guest mount model: ephemeral host
-    // seed rows (other processes' squashfuse mounts) are not namespace
-    // members and must not enter the captured identity order.
-    let filtered: Vec<u8> = raw
-        .split_inclusive(|byte| *byte == b'\n')
-        .filter(|line| {
-            !detcore_model::procfs::is_ephemeral_host_seed_mount(
-                line.strip_suffix(b"\n").unwrap_or(line),
-            )
-        })
-        .flatten()
-        .copied()
-        .collect();
-    mountinfo_identity_order_from(&filtered)
+    mountinfo_identity_order_from_raw(&fs::read("/proc/self/mountinfo")?)
+}
+
+/// Producer provenance follows the guest mount model: ephemeral host seed rows
+/// (other processes' squashfuse mounts) are not namespace members and must not
+/// enter the captured identity order. Detcore drops the same rows with the same
+/// filter when it captures the guest's mountinfo.
+fn mountinfo_identity_order_from_raw(raw: &[u8]) -> Result<Vec<u64>, Error> {
+    mountinfo_identity_order_from(&detcore_model::procfs::exclude_ephemeral_host_seed_mounts(
+        raw,
+    ))
 }
 
 fn mountinfo_identity_order_from(contents: &[u8]) -> Result<Vec<u64>, Error> {
@@ -3997,6 +3993,25 @@ mod tests {
     use super::*;
 
     static SKID_OVERSHOOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// The launch-time capture drops ephemeral host seed rows before ordering,
+    /// so a seed's raw ID never enters the provenance Detcore checks guest
+    /// views against, and every retained row keeps its place.
+    #[test]
+    fn identity_capture_excludes_host_seed_mounts_and_keeps_order() {
+        let raw = b"10 1 8:1 / / rw - ext4 /dev/root rw\n\
+                    76 10 0:50 / /mnt/xarfuse/uid-1/e62a203d-seed-nspid4026531836_cgpid16161-ns-4026531832 rw - fuse.squashfuse_ll squashfuse_ll rw\n\
+                    20 10 0:7 / /test rw - tmpfs tmpfs rw\n\
+                    30 10 0:51 / /mnt/xarfuse/stable-release rw - fuse.squashfuse_ll squashfuse_ll rw\n";
+        let order = mountinfo_identity_order_from_raw(raw).unwrap();
+        assert!(!order.contains(&76), "seed mount ID captured: {order:?}");
+        assert_eq!(order, [10, 20, 30, 1]);
+        assert_eq!(
+            mountinfo_identity_order_from(raw).unwrap(),
+            [10, 76, 20, 30, 1],
+            "control: without the filter the seed ID is captured"
+        );
+    }
 
     #[test]
     fn kvm_mountinfo_config_preserves_captured_provenance() {
