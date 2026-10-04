@@ -10325,6 +10325,153 @@ mod tests {
     }
 
     #[test]
+    fn a_cell_whose_command_leaves_empty_nested_cgroups_passes_and_leaves_nothing_behind() {
+        use crate::invocation_cgroup::tests::OWN_CGROUP_SH;
+        use crate::invocation_cgroup::tests::RemoveLeftoverCgroup;
+        let test =
+            "a_cell_whose_command_leaves_empty_nested_cgroups_passes_and_leaves_nothing_behind";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let root = cpu_reader_test_root("nested-empty-cgroups");
+        let saved = root.join("leader.cgroup");
+        let _leftovers = RemoveLeftoverCgroup(saved.clone());
+        let context = run_context(&root);
+        // A nested runner makes cgroups of its own below the one it runs in;
+        // this command does the same and leaves them empty when it succeeds.
+        let cell = native_cpu_cell(
+            &format!(
+                r#"cat /proc/self/cgroup > '{}'; {OWN_CGROUP_SH}mkdir "$cg/nested" "$cg/nested/deeper""#,
+                saved.display()
+            ),
+            1,
+        );
+        let row = run_cell(&context, &cell)
+            .unwrap_or_else(|failure| panic!("the successful command's cell failed: {failure}"));
+        assert_eq!(row.error_kind, None, "{row:?}");
+        assert_eq!(row.attempts.len(), 1, "{row:?}");
+        assert_eq!(row.attempts[0].outcome, "PASS", "{row:?}");
+        row.require_cpu_observations().unwrap();
+        let invocation = &row.cpu_observations.as_ref().unwrap().invocations[0];
+        assert_eq!(invocation.termination, TerminationPath::CompletedWait4);
+        assert_eq!(
+            enabled_cpu(invocation).source,
+            LiveCpuSource::CgroupV2InvocationCpuStatV1
+        );
+        let directory = saved_cgroup_directory(&saved);
+        assert!(
+            directory
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with("hermit-e2e-invocation-"),
+            "{}",
+            directory.display()
+        );
+        assert!(
+            !directory.exists(),
+            "{} is left behind",
+            directory.display()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn a_populated_nested_cgroup_is_killed_and_removed_when_the_wall_budget_stops_the_command() {
+        use crate::invocation_cgroup::tests::KillPidFile;
+        use crate::invocation_cgroup::tests::OWN_CGROUP_SH;
+        use crate::invocation_cgroup::tests::RemoveLeftoverCgroup;
+        let test = "a_populated_nested_cgroup_is_killed_and_removed_when_the_wall_budget_stops_the_command";
+        let Some(probe) = crate::invocation_cgroup::tests::real_cgroup_or_declared_absent(test)
+        else {
+            return;
+        };
+        drop(probe);
+        let _plan = LiveCpuPlanOverride::set(Ok(false), None);
+        let root = cpu_reader_test_root("nested-populated-cgroup");
+        let saved = root.join("leader.cgroup");
+        let pid_file = root.join("nested.pid");
+        let _leftovers = RemoveLeftoverCgroup(saved.clone());
+        let _sleeper = KillPidFile(pid_file.clone());
+        // The leader starts a child in a session of its own, beyond the stop's
+        // process-group signals, which moves into a nested cgroup and sleeps.
+        // The leader then sleeps past its wall budget.
+        let script = format!(
+            r#"cat /proc/self/cgroup > '{saved}'; {OWN_CGROUP_SH}mkdir "$cg/nested" && setsid /bin/sh -c 'echo $$ > "$1/cgroup.procs" && echo $$ > "$2" && exec sleep 60' sh "$cg/nested" '{pid}' & while [ ! -s '{pid}' ]; do sleep 0.05; done; exec sleep 60"#,
+            saved = saved.display(),
+            pid = pid_file.display()
+        );
+        let request = ProcessRequest::new(
+            InvocationRole::Execution {
+                attempt_index: "1".into(),
+                backend: RequiredNullable::Null,
+            },
+            &root,
+            "/bin/sh",
+            &["-c".into(), script],
+            &BTreeMap::new(),
+            &root.join("leader.stdout"),
+            &root.join("leader.stderr"),
+        );
+        let mut observations = Vec::new();
+        let output = execute_process_with_cpu_poll_interval(
+            request,
+            ProcessLimits {
+                deadline: Instant::now() + Duration::from_secs(3),
+                cpu_budget_usec: Some(60_000_000),
+                cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
+            },
+            &mut observations,
+        )
+        .unwrap_or_else(|error| panic!("the wall stop must return its outcome: {error}"));
+        assert_eq!(
+            output.timeout,
+            Some(ProcessTimeout::Wall),
+            "{observations:?}"
+        );
+        let observation = &observations[0];
+        assert_eq!(observation.termination, TerminationPath::WallBudgetStop);
+        assert_eq!(
+            enabled_cpu(observation).source,
+            LiveCpuSource::CgroupV2InvocationCpuStatV1
+        );
+        let directory = saved_cgroup_directory(&saved);
+        let name = directory
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .into_owned();
+        assert!(name.starts_with("hermit-e2e-invocation-"), "{name}");
+        assert!(
+            !directory.exists(),
+            "{} is left behind",
+            directory.display()
+        );
+        let sleeper: libc::pid_t = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{sleeper}/stat")) {
+            let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+            // A zombie waiting for its new parent is dead; a live process with
+            // this PID must be a later one outside the removed cgroup.
+            if state != Some(Some('Z')) {
+                let membership =
+                    fs::read_to_string(format!("/proc/{sleeper}/cgroup")).unwrap_or_default();
+                assert!(
+                    !membership.contains(&name),
+                    "sleeper {sleeper} survived: {stat}"
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn failed_later_launch_retains_prior_attempt_and_cpu_observations() {
         let root = cpu_reader_test_root("prior-work-before-spawn-failure");
         let context = run_context(&root);

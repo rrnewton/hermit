@@ -101,8 +101,10 @@ own cgroup, and the harness reads that child's `cpu.stat` `usage_usec` every
 `setsid`, stays charged. The final charge is still the leader's `wait4` usage,
 raised to the triggering live sample when the CPU budget stopped it. Once the
 leader is reaped, whatever is left in the cgroup is killed there and the cgroup
-is removed. A wall or CPU stop sends `SIGTERM` to the process group and waits
-up to 10 s for the leader to exit; it then sends `SIGKILL` to the process group,
+is removed, together with any cgroups the command made below it (as a nested
+runner does), deepest first. A wall or CPU stop sends `SIGTERM` to the process
+group and waits up to 10 s for the leader to exit; it then sends `SIGKILL` to
+the process group,
 kills the whole cgroup through `cgroup.kill`, and sends `SIGKILL` to the leader
 through a pidfd before it waits for the leader, so a leader that moved to
 another process group cannot hold the stop open. A sample that cannot be read,

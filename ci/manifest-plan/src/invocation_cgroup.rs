@@ -11,6 +11,7 @@
 //! the same bounded control-file parsing. They are copied rather than shared
 //! because the wrapper is a separate binary; sharing them is a follow-up.
 
+use std::ffi::CStr;
 use std::ffi::CString;
 use std::ffi::OsStr;
 use std::fs;
@@ -44,6 +45,10 @@ pub const ALLOW_PROCESS_GROUP_CPU_SCAN_ENV: &str = "HERMIT_E2E_ALLOW_PROCESS_GRO
 /// to exit after `cgroup.kill`. Matches the runner's SIGTERM-to-SIGKILL grace.
 const LEFTOVER_KILL_GRACE: Duration = Duration::from_secs(10);
 const LEFTOVER_POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// How many levels of cgroups the command may leave below its invocation
+/// cgroup. A nested runner adds one level for each invocation it runs, so a
+/// real tree is a few levels deep; a deeper one is refused, not walked.
+const MAX_NESTED_CGROUP_DEPTH: usize = 32;
 const CGROUP2_SUPER_MAGIC: libc::c_long = 0x6367_7270;
 const CGROUP_ROOT: &str = "/sys/fs/cgroup";
 
@@ -176,6 +181,167 @@ fn openat_file(directory: &File, name: &str, flags: i32) -> io::Result<File> {
         return Err(io::Error::last_os_error());
     }
     Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+fn open_directory_at(directory: &File, name: &CStr) -> io::Result<File> {
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY | libc::O_NOFOLLOW,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// The identity of the entry `name` in `directory`, without following a link,
+/// and whether it is a directory.
+fn entry_identity(directory: &File, name: &CStr) -> io::Result<(FileIdentity, bool)> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe {
+        libc::fstatat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((
+        FileIdentity {
+            device: stat.st_dev,
+            inode: stat.st_ino,
+        },
+        stat.st_mode & libc::S_IFMT == libc::S_IFDIR,
+    ))
+}
+
+/// The names of the cgroups directly below `directory`, which are its
+/// subdirectories; its control files are skipped.
+fn nested_cgroup_names(directory: &File) -> io::Result<Vec<CString>> {
+    // fdopendir owns the descriptor it is given and moves its offset, so it
+    // gets a fresh descriptor for the same directory.
+    let fd = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c".".as_ptr(),
+            libc::O_RDONLY | libc::O_CLOEXEC | libc::O_DIRECTORY,
+            0,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(fd) };
+    if stream.is_null() {
+        let error = io::Error::last_os_error();
+        unsafe {
+            libc::close(fd);
+        }
+        return Err(error);
+    }
+    let mut names = Vec::new();
+    let outcome = loop {
+        // readdir reports an error only through errno.
+        unsafe {
+            *libc::__errno_location() = 0;
+        }
+        let entry = unsafe { libc::readdir(stream) };
+        if entry.is_null() {
+            let error = io::Error::last_os_error();
+            break match error.raw_os_error() {
+                Some(0) => Ok(()),
+                _ => Err(error),
+            };
+        }
+        // SAFETY: a non-null readdir result stays valid until the next
+        // readdir or closedir on this stream, and its name is NUL-terminated.
+        let (name, kind) = unsafe { (CStr::from_ptr((*entry).d_name.as_ptr()), (*entry).d_type) };
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let is_directory = match kind {
+            libc::DT_DIR => true,
+            libc::DT_UNKNOWN => match entry_identity(directory, name) {
+                Ok((_, is_directory)) => is_directory,
+                Err(error) => break Err(error),
+            },
+            _ => false,
+        };
+        if is_directory {
+            names.push(name.to_owned());
+        }
+    };
+    unsafe {
+        libc::closedir(stream);
+    }
+    outcome.map(|()| names)
+}
+
+/// Remove every cgroup below `directory`, deepest first. `level` is how far
+/// below the invocation cgroup the entries of `directory` are. Each nested
+/// cgroup is opened through its parent's descriptor without following a link
+/// and must be on the invocation cgroup's filesystem, and its name is removed
+/// only while it still names the directory that was just emptied.
+fn remove_nested_cgroups(
+    directory: &File,
+    path: &Path,
+    device: u64,
+    level: usize,
+) -> Result<(), String> {
+    let names = nested_cgroup_names(directory)
+        .map_err(|error| format!("cannot list cgroup {}: {error}", path.display()))?;
+    for name in names {
+        let nested_path = path.join(OsStr::from_bytes(name.to_bytes()));
+        if level > MAX_NESTED_CGROUP_DEPTH {
+            return Err(format!(
+                "nested cgroup {} is more than {MAX_NESTED_CGROUP_DEPTH} levels below the invocation cgroup",
+                nested_path.display()
+            ));
+        }
+        let nested = open_directory_at(directory, &name).map_err(|error| {
+            format!(
+                "cannot open nested cgroup {}: {error}",
+                nested_path.display()
+            )
+        })?;
+        let identity = file_identity(&nested, "nested cgroup")?;
+        if identity.device != device {
+            return Err(format!(
+                "nested cgroup {} is on device {}, expected {device}",
+                nested_path.display(),
+                identity.device
+            ));
+        }
+        remove_nested_cgroups(&nested, &nested_path, device, level + 1)?;
+        let (named, is_directory) = entry_identity(directory, &name).map_err(|error| {
+            format!(
+                "cannot authenticate nested cgroup {}: {error}",
+                nested_path.display()
+            )
+        })?;
+        if named != identity || !is_directory {
+            return Err(format!(
+                "nested cgroup {} was replaced",
+                nested_path.display()
+            ));
+        }
+        if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0
+        {
+            return Err(format!(
+                "cannot remove nested cgroup {}: {}",
+                nested_path.display(),
+                io::Error::last_os_error()
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Map the unified (`0::`) line of `/proc/self/cgroup` to its directory under
@@ -519,6 +685,12 @@ impl InvocationCgroup {
         if !self.empty()? {
             return Err("it is still populated".into());
         }
+        // The command may have made cgroups of its own below this one, as a
+        // nested runner does, and rmdir refuses a cgroup that still has a
+        // child. `populated` covers the whole subtree, so nothing is alive
+        // anywhere below here and each nested cgroup can go, deepest first.
+        remove_nested_cgroups(&self.child, &self.path, self.identity.device, 1)?;
+        self.verify_identity()?;
         if unsafe {
             libc::unlinkat(
                 self.parent.as_raw_fd(),
@@ -533,8 +705,9 @@ impl InvocationCgroup {
     }
 
     /// Kill whatever is left in the cgroup, wait up to 10 s for it to exit, and
-    /// remove the cgroup. Called once its leader has been reaped (or could not
-    /// be); later calls return the first outcome.
+    /// remove the cgroup together with any cgroups the command made below it.
+    /// Called once its leader has been reaped (or could not be), and by Drop;
+    /// later calls return the first outcome.
     pub fn finish(&mut self) -> Result<(), String> {
         if let Some(outcome) = &self.finished {
             return outcome.clone();
@@ -777,5 +950,161 @@ pub(crate) mod tests {
         assert!(migration.fallback_eligible, "{migration:?}");
         assert!(migration.message.contains("cgroup.procs"), "{migration:?}");
         assert!(!parent_path.exists());
+    }
+
+    /// Shell text that sets `cg` to the directory of the cgroup the shell runs
+    /// in, from the unified line of its own `/proc/self/cgroup`.
+    pub(crate) const OWN_CGROUP_SH: &str = "while IFS= read -r line; do case $line in 0::*) cg=/sys/fs/cgroup${line#0::};; esac; done < /proc/self/cgroup; ";
+
+    /// When dropped, removes what a failed test left of an invocation cgroup
+    /// this test process created: the cgroups nested in it, deepest first, and
+    /// then the cgroup itself. The location is the cgroup directory, or a file
+    /// holding a copy of a member's `/proc/<pid>/cgroup`. Any other directory
+    /// is left alone.
+    pub(crate) struct RemoveLeftoverCgroup(pub(crate) PathBuf);
+
+    impl Drop for RemoveLeftoverCgroup {
+        fn drop(&mut self) {
+            fn remove_tree(directory: &Path) {
+                if let Ok(entries) = fs::read_dir(directory) {
+                    for entry in entries.flatten() {
+                        if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+                            remove_tree(&entry.path());
+                        }
+                    }
+                }
+                let _ = fs::remove_dir(directory);
+            }
+            let directory = if self.0.starts_with(CGROUP_ROOT) {
+                self.0.clone()
+            } else {
+                let Some(relative) = fs::read_to_string(&self.0).ok().and_then(|text| {
+                    text.lines()
+                        .find_map(|line| line.strip_prefix("0::").map(str::to_owned))
+                }) else {
+                    return;
+                };
+                Path::new(CGROUP_ROOT).join(relative.trim_start_matches('/'))
+            };
+            let ours = format!("hermit-e2e-invocation-{}-", std::process::id());
+            if directory
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with(&ours))
+            {
+                remove_tree(&directory);
+            }
+        }
+    }
+
+    /// When dropped, SIGKILLs the process whose PID a test script wrote to the
+    /// file, so a failed assertion cannot leave it running.
+    pub(crate) struct KillPidFile(pub(crate) PathBuf);
+
+    impl Drop for KillPidFile {
+        fn drop(&mut self) {
+            if let Some(pid) = fs::read_to_string(&self.0)
+                .ok()
+                .and_then(|text| text.trim().parse::<libc::pid_t>().ok())
+            {
+                unsafe {
+                    libc::kill(pid, libc::SIGKILL);
+                }
+            }
+        }
+    }
+
+    /// Run `script` with /bin/sh as a member of `cgroup` and wait for it.
+    fn run_enrolled(cgroup: &InvocationCgroup, script: &str) -> std::process::ExitStatus {
+        let enrollment_fd = cgroup.enrollment_fd();
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::write(enrollment_fd, b"0\n".as_ptr().cast(), 2) == 2 {
+                    Ok(())
+                } else {
+                    Err(io::Error::last_os_error())
+                }
+            });
+        }
+        command.status().unwrap()
+    }
+
+    #[test]
+    fn empty_cgroups_nested_by_the_command_are_removed_by_finish_and_by_drop() {
+        let test = "empty_cgroups_nested_by_the_command_are_removed_by_finish_and_by_drop";
+        for removed_by_drop in [false, true] {
+            let Some(mut cgroup) = real_cgroup_or_declared_absent(test) else {
+                return;
+            };
+            let path = cgroup.path().to_owned();
+            let _leftovers = RemoveLeftoverCgroup(path.clone());
+            // The command makes cgroups of its own below the one it runs in,
+            // as a nested runner does, and leaves them empty.
+            let status = run_enrolled(
+                &cgroup,
+                &format!(r#"{OWN_CGROUP_SH}mkdir "$cg/nested" "$cg/nested/deeper" "$cg/sibling""#),
+            );
+            assert!(status.success(), "{status:?}");
+            assert!(path.join("nested/deeper").is_dir());
+            assert!(path.join("sibling").is_dir());
+            if removed_by_drop {
+                drop(cgroup);
+            } else {
+                assert_eq!(cgroup.finish(), Ok(()));
+            }
+            assert!(
+                !path.exists(),
+                "removed by drop: {removed_by_drop}: {} is left behind",
+                path.display()
+            );
+        }
+    }
+
+    #[test]
+    fn a_populated_nested_cgroup_is_killed_and_removed_by_finish() {
+        let test = "a_populated_nested_cgroup_is_killed_and_removed_by_finish";
+        let Some(mut cgroup) = real_cgroup_or_declared_absent(test) else {
+            return;
+        };
+        let path = cgroup.path().to_owned();
+        let _leftovers = RemoveLeftoverCgroup(path.clone());
+        let root = scratch("populated-nested");
+        let pid_file = root.join("nested.pid");
+        let _sleeper = KillPidFile(pid_file.clone());
+        // The command starts a child in a session of its own, which moves into
+        // a nested cgroup and sleeps, and then exits without waiting for it.
+        let status = run_enrolled(
+            &cgroup,
+            &format!(
+                r#"{OWN_CGROUP_SH}mkdir "$cg/nested" && setsid /bin/sh -c 'echo $$ > "$1/cgroup.procs" && echo $$ > "$2" && exec sleep 60' sh "$cg/nested" '{pid}' & while [ ! -s '{pid}' ]; do sleep 0.05; done"#,
+                pid = pid_file.display()
+            ),
+        );
+        assert!(status.success(), "{status:?}");
+        let sleeper: libc::pid_t = fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let membership = fs::read_to_string(format!("/proc/{sleeper}/cgroup")).unwrap();
+        assert!(membership.trim_end().ends_with("/nested"), "{membership:?}");
+        assert_eq!(cgroup.populated(), Ok(true));
+        assert_eq!(cgroup.finish(), Ok(()));
+        assert!(!path.exists(), "{} is left behind", path.display());
+        if let Ok(stat) = fs::read_to_string(format!("/proc/{sleeper}/stat")) {
+            let state = stat.rsplit_once(") ").map(|(_, rest)| rest.chars().next());
+            // A zombie waiting for its new parent is dead; a live process with
+            // this PID must be a later one outside the removed cgroup.
+            if state != Some(Some('Z')) {
+                let membership =
+                    fs::read_to_string(format!("/proc/{sleeper}/cgroup")).unwrap_or_default();
+                assert!(
+                    !membership.contains("/nested"),
+                    "sleeper {sleeper} survived: {stat}"
+                );
+            }
+        }
+        fs::remove_dir_all(root).unwrap();
     }
 }
