@@ -10370,9 +10370,9 @@ fn committed_dagrun_prepare_boundary(root: &Path) -> Result<(String, i64), Strin
             producer.cmd
         )
     })?;
-    if prepare != DAGRUN_PREPARE_BODY || producer.timeout != 900 {
+    if prepare != DAGRUN_PREPARE_BODY || producer.timeout != 1200 {
         return Err(format!(
-            "committed {RUST_SCRIPT_PRODUCER_TAG} changed its exact dagrun preparation or 900-second wall bound: {producer:?}"
+            "committed {RUST_SCRIPT_PRODUCER_TAG} changed its exact dagrun preparation or 1200-second wall bound: {producer:?}"
         ));
     }
     Ok((prepare.to_string(), producer.timeout))
@@ -10674,7 +10674,7 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
         ));
     }
     let committed = committed_rust_script_producer(root)?;
-    if committed.timeout != 900
+    if committed.timeout != 1200
         || committed.cpu_timeout != 7200
         || committed.hint.rss_baseline_bytes != Some(4 * 1024 * 1024 * 1024)
         || committed.hint.hard_mem_max_bytes != Some(6 * 1024 * 1024 * 1024)

@@ -399,9 +399,11 @@ mod tests {
         let expected = vec![
             ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
             ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
+            // 1200 s wall since be7f2dc15590: 1.5 x the 644.496 s peak wall
+            // across 22 full local validations, rounded up to a 300 s bucket.
             (
                 "build.rust_scripts".to_string(),
-                900,
+                1200,
                 7200,
                 Some(6_442_450_944),
             ),
