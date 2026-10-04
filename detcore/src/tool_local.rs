@@ -2517,6 +2517,7 @@ impl<T> ThreadState<T> {
             fyi: String::new(),
             signal_interrupt_errno: None,
             backend_runtime_bootstrap: false,
+            blocked_signal_mask: None,
         }
     }
 
