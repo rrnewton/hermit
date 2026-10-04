@@ -2380,6 +2380,26 @@ impl NetworkReplayEngine {
 
 #[cfg(test)]
 impl NetworkReplayEngine {
+    /// Negative component premise: profile enrollment without an original
+    /// Socket's fresh-send observation. This cannot mint SNDTIMEO authority.
+    pub(crate) fn controlled_profile_without_fresh_send(
+        &mut self,
+        open_file: OpenFileId,
+        profile: FreshStreamSocketProfileV3,
+    ) -> Result<NetworkStreamSocketState, NetworkReplayError> {
+        assert!(self.uses_shared_mm_attempts());
+        assert_eq!(self.mode(), NetworkEngineMode::Record);
+        self.register_stream_socket_profile(
+            open_file,
+            profile.key,
+            NetworkStreamNamespace {
+                device: 7,
+                inode: 11,
+            },
+            Some(profile),
+        )
+    }
+
     /// Controlled original-socket creation premise for Connect publication
     /// controls. The OFD is the actual admitted logical binding; this helper
     /// supplies no entry, provider, backend-return or retirement authority.

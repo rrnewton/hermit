@@ -5007,6 +5007,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             ))),
         }
     }
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-3464): shared V4 retains the original setter result
+    // through the existing socket-control transaction, just as accepted V3.
+    // https://github.com/rrnewton/hermit/pull/3464
+    // https://github.com/rrnewton/hermit/issues/3692
+    async fn modeled_send_timeout<G: Guest<Self>>(&self, guest: &mut G) -> Result<bool, Error> {
+        Ok(self.accepted_model_mode(guest).await?
+            || guest
+                .local_global_state()
+                .is_some_and(|global| global.shared_mm_attempts_active()))
+    }
     /// Record Connect admission follows the actual engine capability. V3 binds
     /// it to the accepted runtime; V4 binds it to admitted descriptor tracking
     /// in a V4 Record engine, whose global entry is the native Connect join.
@@ -5899,7 +5910,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<Option<i64>, Error> {
         if call.level() == libc::SOL_SOCKET
             && call.optname() == libc::SO_SNDTIMEO
-            && !self.accepted_model_mode(guest).await?
+            && !self.modeled_send_timeout(guest).await?
         {
             return Ok(None);
         }
@@ -6097,7 +6108,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             return Ok(None);
         }
-        if call.optname() == libc::SO_SNDTIMEO && !self.accepted_model_mode(guest).await? {
+        if call.optname() == libc::SO_SNDTIMEO && !self.modeled_send_timeout(guest).await? {
             return Ok(None);
         }
         let Some(open_file) = self.network_open_file(guest, call.fd()) else {

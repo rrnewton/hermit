@@ -4,6 +4,7 @@
 //! production Stopped implementation and target-PKRU check. No BPF/E2E claim.
 mod fd_identity;
 mod scalar_recvfrom;
+mod send_timeout;
 mod raw_poll;
 mod sendto_entry;
 mod native_source_read;
@@ -2117,6 +2118,17 @@ impl ReplayIssuerFixture {
         trace: detcore_model::network_trace::NetworkTraceV4,
         release_bytes: bool,
     ) -> (Self, Resources) {
+        Self::new_trace_profile(record, trace, release_bytes, false, true).await
+    }
+    // Opt-in only for timeout caller controls. The closed policy is selected
+    // before initialization/census/effects; existing entry points stay legacy.
+    async fn new_trace_profile(
+        record: bool,
+        trace: detcore_model::network_trace::NetworkTraceV4,
+        release_bytes: bool,
+        shared: bool,
+        retain_fresh_timeout: bool,
+    ) -> (Self, Resources) {
         let raw = unsafe { libc::syscall(libc::SYS_gettid) } as i32;
         let tid = Tid::from_raw(raw);
         let (runtime, root, metadata, memory, claim) =
@@ -2138,6 +2150,9 @@ impl ReplayIssuerFixture {
         } else {
             NetworkPolicy::Replay
         };
+        if record && shared {
+            config.network_record_profile = Some(crate::config::NetworkRecordProfile::SharedMmV1);
+        }
         let mut state = GlobalState::initialize(&config, false);
         state.network_runtime = Some(runtime);
         let tool: Detcore = Detcore::new(tid, &config);
@@ -2159,7 +2174,7 @@ impl ReplayIssuerFixture {
             .controlled_foreground_store_grant(&root);
         {
             let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
-            if record {
+            if record && !shared {
                 *engine = NetworkReplayEngine::record_native_receive(config.epoch);
             }
             engine.fd_table_fixture_enable();
@@ -2201,7 +2216,17 @@ impl ReplayIssuerFixture {
         {
             let mut engine = state.network_engine.as_ref().unwrap().lock().unwrap();
             if record {
-                engine.controlled_connect_socket_premise(binding.open_file);
+                if retain_fresh_timeout {
+                    engine.controlled_connect_socket_premise(binding.open_file);
+                } else {
+                    // Negative timeout control: a profile alone cannot mint the
+                    // original Socket's authenticated fresh SNDTIMEO fact.
+                    assert!(shared);
+                    let profile = trace.fresh_stream_profiles[0].clone();
+                    engine
+                        .controlled_profile_without_fresh_send(binding.open_file, profile)
+                        .unwrap();
+                }
                 // Controlled original-installed identity/profile premise. This
                 // supplies no native capture, successful Connect or entry.
                 guest.thread.file_metadata.lock().unwrap().bind_native_installation(binding,
