@@ -13808,6 +13808,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/procfs-sanitized-paths",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/ps-proc-table",
           "mode": "verify",
           "backend": "ptrace"
@@ -14394,7 +14401,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "878",
+        "NEXTEST_EXPECTED_EXECUTED": "882",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -18495,6 +18502,13 @@
           "lane": "portable",
           "category": "system-utils",
           "test": "system-utils/proc-uptime",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
+          "test": "system-utils/procfs-sanitized-paths",
           "mode": "verify",
           "backend": "ptrace"
         },
@@ -28440,6 +28454,13 @@
         {
           "lane": "portable",
           "category": "system-utils",
+          "test": "system-utils/procfs-sanitized-paths",
+          "mode": "verify",
+          "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "system-utils",
           "test": "system-utils/ps-proc-table",
           "mode": "verify",
           "backend": "ptrace"
@@ -36158,7 +36179,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "878",
+        "NEXTEST_EXPECTED_EXECUTED": "882",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit-detcore\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
