@@ -17,10 +17,22 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::tool_global::GlobalState;
 
-/// Helper trait.
-pub trait RecordOrReplay: Tool<GlobalState = GlobalState> {}
+/// Record/replay subtools have static identities so admission can distinguish
+/// the exact no-op injector from wrappers that inspect or materialize exec.
+pub trait RecordOrReplay: Tool<GlobalState = GlobalState> + 'static {
+    /// Whether this is exactly the no-op subtool for retained-image exec.
+    /// This does not grant backend executable authority or admit other calls.
+    fn supports_parent_death_retained_exec() -> bool;
+}
 
-impl<T> RecordOrReplay for T where T: Tool<GlobalState = GlobalState> {}
+impl<T> RecordOrReplay for T
+where
+    T: Tool<GlobalState = GlobalState> + 'static,
+{
+    fn supports_parent_death_retained_exec() -> bool {
+        std::any::TypeId::of::<T>() == std::any::TypeId::of::<NoopTool>()
+    }
+}
 
 /// A tool that only injects the syscall it receives.
 #[derive(Debug, Default, Serialize, Deserialize)]

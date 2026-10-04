@@ -1461,6 +1461,10 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    // Parent-death recipients initially support only pause/nanosleep parking.
+    // A PolledRead site exists only after its first probe; it cannot authorize
+    // that probe or a transformation before the unsupported-domain decision.
+    crate::tool_global::require_parent_death_wait_supported(guest, call0.name()).await?;
     // The stack-allocated memory here needs to live across the loop, which means
     // surviving multiple syscall injections:
     let (call, _maybe_stackguard) = call0.into_nonblocking(guest).await;

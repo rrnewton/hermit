@@ -244,7 +244,16 @@ impl Scheduler {
         if self.parked.control.is_some() || !self.next_turns.is_empty() {
             return Err(reverie::syscalls::Errno::EINVAL.into());
         }
-        self.parked.control = Some(control.ok_or(reverie::syscalls::Errno::ENOSYS)?);
+        let control = control.ok_or(reverie::syscalls::Errno::ENOSYS)?;
+        let parent_death_enabled = match control.process.enable_parent_death_control() {
+            Ok(()) => true,
+            // Older backends keep nonzero SET refused; their absence is not a
+            // successful opt-in and their ordinary signal protocol is unchanged.
+            Err(reverie::syscalls::Errno::ENOSYS) => false,
+            Err(error) => return Err(error.into()),
+        };
+        self.parked.parent_death_enabled = parent_death_enabled;
+        self.parked.control = Some(control);
         Ok(BackendSignalControlMode::ToolControlled)
     }
 
@@ -913,7 +922,7 @@ impl Scheduler {
         // not a new scheduling input. Validate the complete target set before
         // changing any membership or consuming the permit.
         let mut retire = Vec::new();
-        let mut final_transition = None;
+        let mut terminal_transition = None;
         if let SignalBoundaryOutcome::Terminated { group, wait_status } = receipt.outcome {
             let pid = DetPid::from_raw(receipt.permit.task.process.tgid.as_raw());
             let current = self.real_timers.task_identity(pid, tid);
@@ -946,16 +955,15 @@ impl Scheduler {
                 }
                 retire.push((target, pid, mm));
             }
-            final_transition = self
-                .record_final_process_transition(
-                    tid,
-                    pid,
-                    group,
-                    receipt.permit.task.process,
-                    ExitStatus::from_raw(wait_status),
-                )
-                .map_err(|_| reverie::syscalls::Errno::EINVAL)?;
+            terminal_transition = Some((pid, group, ExitStatus::from_raw(wait_status)));
         }
+        self.publish_parent_death_boundary(receipt)?;
+        let final_transition = match terminal_transition {
+            Some((pid, group, status)) => self
+                .record_final_process_transition(tid, pid, group, receipt.permit.task.process, status)
+                .map_err(|_| reverie::syscalls::Errno::EINVAL)?,
+            None => None,
+        };
         // Cleanup/failure may already have logically killed the task. Exact
         // duplicates remain recognizable after timer/task retirement. No turn
         // or membership is created by this consuming notification.
@@ -996,15 +1004,19 @@ impl Scheduler {
 /// its GlobalTool notification takes this same mutex. Mark terminal first, then
 /// transfer the retained committed receipt, then notify blocked scheduler waits.
 pub(crate) fn flush_signal_failures(sched: &Arc<Mutex<Scheduler>>) {
-    let (control, failures, wakes) = {
+    let (control, failures, parent_death_failures, wakes) = {
         let mut s = sched.lock().unwrap();
         (
             s.parked.control.clone(),
             std::mem::take(&mut s.parked.failures),
+            std::mem::take(&mut s.parked.parent_death_failures),
             std::mem::take(&mut s.parked.failure_wakes),
         )
     };
     if let Some(control) = control {
+        for receipt in parent_death_failures {
+            let _ = control.process.finish_parent_death_failure(&receipt);
+        }
         for process in failures {
             // The backend retains its typed receipt even if forwarding discovers
             // an already-closed owner. No publication or delivery is retried.
