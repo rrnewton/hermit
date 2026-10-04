@@ -1154,6 +1154,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     fn new(pid: Pid, cfg: &Config) -> Self {
         let detpid = DetPid::from_raw(pid.into()); // TODO(T78538674): virtualize pid.
         cfg.validate_invariants();
+        // Every backend constructs the tool before the process can run a
+        // second guest thread, so on the in-guest backends this is the last
+        // point at which the probe's descriptors cannot interleave with the
+        // guest's own; see `init_anonymous_object_devices`.
+        syscalls::init_anonymous_object_devices();
         Self {
             detpid,
             cfg: cfg.clone(),

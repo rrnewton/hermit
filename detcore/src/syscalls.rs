@@ -19,6 +19,9 @@ mod io;
 mod memory;
 mod misc;
 mod namespace;
+/// Re-exported so `Tool::new` can probe the pipefs and sockfs devices before
+/// the guest runs, rather than while one of its system calls is handled.
+pub(crate) use namespace::init_anonymous_object_devices;
 pub(crate) mod robust_list;
 mod signal;
 pub(crate) mod socket_timestamp_ioctl;
