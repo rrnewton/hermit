@@ -144,20 +144,44 @@ fn documented_roots(metadata: &serde_json::Value) -> Result<Vec<(PathBuf, Kind)>
     Ok(roots)
 }
 
-/// Whether `line`, from a `macro_rules!` body, contains a `mod NAME;`
-/// declaration: a file module, whose path depends on where the macro is
-/// invoked. NAME may be a metavariable (`mod $name;`) and the declaration may
-/// sit inside a repetition (`$(mod $name;)*`) or follow a `{` on the same line.
-/// `mod NAME {` declares no file, and neither does text in a string literal or
-/// a `/* */` comment that closes on the same line. A line whose literals this
-/// cannot delimit is matched as written, so a declaration after one is still
-/// seen.
-fn declares_a_module_file(line: &str) -> bool {
-    declares_a_module_file_as_written(&without_literals(line).unwrap_or_else(|| line.to_string()))
+/// The first line of a `macro_rules!` body that contains a `mod NAME;`
+/// declaration, as its offset in `body` and its text: a file module, whose
+/// path depends on where the macro is invoked. NAME may be a metavariable
+/// (`mod $name;`) and the declaration may sit inside a repetition
+/// (`$(mod $name;)*`) or follow a `{` on the same line. `mod NAME {` declares
+/// no file, and neither does text in a string literal or a comment that closes
+/// on the same line.
+fn macro_body_module_declaration<'a>(body: &[&'a str]) -> Option<(usize, &'a str)> {
+    // A string or comment that spans lines usually opens on a line whose
+    // literals cannot be delimited. (A nested `/* /* */` comment, or a
+    // non-ASCII char literal next to a quote, can defeat that.) Every later
+    // line of the body is then matched as written, `//` included: a quote on
+    // it may close the earlier literal, pairing quotes within one line would
+    // blank a real declaration between two of them, and a `//` may sit inside
+    // the literal rather than start a comment.
+    let mut undelimited = false;
+    for (offset, line) in body.iter().enumerate() {
+        let line = if undelimited {
+            line.trim()
+        } else {
+            without_line_comment(line.trim())
+        };
+        let code = match without_literals(line) {
+            Some(code) if !undelimited => code,
+            code => {
+                undelimited |= code.is_none();
+                line.to_string()
+            }
+        };
+        if declares_a_module_file_as_written(&code) {
+            return Some((offset, line));
+        }
+    }
+    None
 }
 
-/// [`declares_a_module_file`] without blanking literals first: a declaration
-/// inside a string or comment counts too.
+/// Whether `code` contains a `mod NAME;` declaration, without blanking
+/// literals first: a declaration inside a string or comment counts too.
 fn declares_a_module_file_as_written(code: &str) -> bool {
     let mut rest = code;
     while let Some(at) = rest.find("mod") {
@@ -342,30 +366,16 @@ fn module_tree(root_file: &Path) -> Result<Vec<PathBuf>, String> {
                         file.display()
                     )
                 })?;
-                // A string or comment that spans lines opens on a line whose
-                // literals cannot be delimited. Every later line of the body is
-                // then matched as written: a quote on it may close the earlier
-                // literal, and pairing quotes within one line would blank a
-                // real declaration between two of them.
-                let mut undelimited = false;
-                for (offset, body_line) in lines[index..index - 1 + span].iter().enumerate() {
-                    let body = without_line_comment(body_line.trim());
-                    let code = match without_literals(body) {
-                        Some(code) if !undelimited => code,
-                        code => {
-                            undelimited |= code.is_none();
-                            body.to_string()
-                        }
-                    };
-                    if declares_a_module_file_as_written(&code) {
-                        return Err(format!(
-                            "{}:{}: `{body}` in a `macro_rules!` body declares a file \
-                             that depends on where the macro is invoked, which this \
-                             checker cannot follow",
-                            file.display(),
-                            index + offset + 1
-                        ));
-                    }
+                if let Some((offset, body)) =
+                    macro_body_module_declaration(&lines[index..index - 1 + span])
+                {
+                    return Err(format!(
+                        "{}:{}: `{body}` in a `macro_rules!` body declares a file \
+                         that depends on where the macro is invoked, which this \
+                         checker cannot follow",
+                        file.display(),
+                        index + offset + 1
+                    ));
                 }
                 index += span - 1;
                 path_attribute = None;
@@ -1439,8 +1449,14 @@ pub fn g() {}
             "let s = r\"\\\"; mod x; let c = '\"';",
             "f(/* open; mod x;",
         ] {
-            assert!(declares_a_module_file(line), "{line}");
+            assert!(macro_body_module_declaration(&[line]).is_some(), "{line}");
         }
+        // On the line that closes a string opened earlier, a `//` inside the
+        // string starts no comment.
+        assert_eq!(
+            macro_body_module_declaration(&["let s = \"a", "b // c\"; mod x;"]),
+            Some((1, "b // c\"; mod x;"))
+        );
         for line in [
             "mod $n {",
             "$(mod $n { })*",
@@ -1454,7 +1470,7 @@ pub fn g() {}
             "let c = '\"'; let d = \"mod x;\";",
             "é mod é {",
         ] {
-            assert!(!declares_a_module_file(line), "{line}");
+            assert!(macro_body_module_declaration(&[line]).is_none(), "{line}");
         }
     }
 
@@ -1571,6 +1587,11 @@ pub fn g() {}
             "const S: &str = \"one\nline\"; mod $n; const C: char = '\"';",
             "const S: &str = \"one\nline\"; mod $n; const U: &str = \"https://example.com\";",
             "const S: &str = \"one\nline\"; mod $n; const T: &str = \"a\\\"b\";",
+            // A `//` inside the string, on the line that closes it, starts no
+            // comment (third review of the same pull request).
+            "const S: &str = \"see\nhttps://example.com\"; mod $n;",
+            "const S: &str = \"a\nb // c\"; mod $n;",
+            "const S: &str = r#\"see\nhttps://example.com\"#; mod $n;",
         ] {
             fs::write(
                 directory.join("lib.rs"),
