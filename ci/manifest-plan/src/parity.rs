@@ -3054,8 +3054,9 @@ fn evaluate_history(
 /// Each entry also names the route the execution that recorded the
 /// directory ran on, as `ci/buck-e2e/cell.sh` wrote it in that execution's
 /// `result.json`. Two cells whose launches match may still have run in
-/// different places, and only a pair whose routes are both recorded and
-/// equal ([`ImportedLogs::shares_route`]) can have equalized inputs.
+/// different places, and only a pair whose routes are both recorded, both
+/// ones the generated Buck targets give, and equal
+/// ([`ImportedLogs::shares_route`]) can have equalized inputs.
 #[derive(Clone, Debug)]
 pub struct ImportedLogs {
     /// Recorded verify-log directory to its entry.
@@ -3071,20 +3072,30 @@ struct ImportedLogDir {
     /// The directory its logs were restored into, or why none were.
     restored: Result<PathBuf, String>,
     /// Where the execution that recorded it ran, when that execution
-    /// recorded all of it.
+    /// recorded all of it and every part is one the generated targets give.
     route: Option<ImportedRoute>,
 }
 
 /// Where an imported cell's execution ran, from its `result.json`.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ImportedRoute {
-    /// `local` or `re` (remote execution).
+    /// One of [`IMPORTED_ROUTES`].
     route: String,
-    /// `pinned-root`, or empty for the host's own root.
+    /// One of [`IMPORTED_CONTAINERS`].
     container: String,
-    /// The execution platform; `local` when not remote.
+    /// The execution platform; `local` when not remote. Never empty.
     re_platform: String,
 }
+
+/// The routes `ci/buck-e2e/defs.bzl` gives a generated cell: local execution
+/// and remote execution. `cell.sh` records whatever `HERMIT_E2E_ROUTE` it was
+/// given, so a cell run by hand can record any other label, which says
+/// nothing about where it ran.
+const IMPORTED_ROUTES: [&str; 2] = ["local", "re"];
+
+/// The roots `ci/buck-e2e/cell.sh` runs a cell in: the host's own (empty)
+/// and the pinned root.
+const IMPORTED_CONTAINERS: [&str; 2] = ["", "pinned-root"];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3190,10 +3201,15 @@ impl ImportedLogs {
                     ));
                 }
             };
-            // An empty route is a cell run outside the generated Buck
-            // targets, which say nothing about where it ran.
+            // A route the generated Buck targets never give (an empty or
+            // hand-set label, another container, no platform) is a cell run
+            // outside them, which says nothing about where it ran.
             let route = match (entry.route, entry.container, entry.re_platform) {
-                (Some(route), Some(container), Some(re_platform)) if !route.is_empty() => {
+                (Some(route), Some(container), Some(re_platform))
+                    if IMPORTED_ROUTES.contains(&route.as_str())
+                        && IMPORTED_CONTAINERS.contains(&container.as_str())
+                        && !re_platform.is_empty() =>
+                {
                     Some(ImportedRoute {
                         route,
                         container,
@@ -3217,7 +3233,7 @@ impl ImportedLogs {
 
     /// The directory the logs of the recorded verify-log directory
     /// `recorded` were restored into, or why there is none.
-    fn restored(&self, recorded: &str) -> Result<&Path, String> {
+    pub fn restored(&self, recorded: &str) -> Result<&Path, String> {
         if let Some(reason) = &self.unusable {
             return Err(reason.clone());
         }
@@ -3229,7 +3245,7 @@ impl ImportedLogs {
     }
 
     /// Where the verify cell of `row` ran, when its logs were restored and
-    /// its execution recorded its whole route.
+    /// its execution recorded a whole route the generated targets give.
     fn route(&self, row: &CellResult) -> Option<&ImportedRoute> {
         let dir = self.dirs.get(recorded_log_dir(row)?)?;
         dir.restored.as_ref().ok()?;
@@ -3238,7 +3254,8 @@ impl ImportedLogs {
 
     /// Whether the verify cells of `reference` and `candidate` are both
     /// recorded to have run on the same route. False when either route is
-    /// unknown, so an unrecorded route never earns clean credit.
+    /// unknown, so an unrecorded route, or one the generated targets never
+    /// give, never earns clean credit, even when both cells record it.
     pub fn shares_route(&self, reference: &CellResult, candidate: &CellResult) -> bool {
         matches!(
             (self.route(reference), self.route(candidate)),
@@ -9052,9 +9069,10 @@ mod tests {
     /// places, which their rows do not record: one locally and one by remote
     /// execution, or one in the pinned-root container and one on the host. A
     /// pair earns clean credit only when the import's log index records the
-    /// same route, container and platform for both cells; any other pair
-    /// keeps its measurement in `unequalized_credit`, as a pair launched with
-    /// different inputs does (<https://github.com/rrnewton/hermit/issues/3687>).
+    /// same route, container and platform for both cells, and that route is
+    /// one the generated Buck targets give; any other pair keeps its
+    /// measurement in `unequalized_credit`, as a pair launched with different
+    /// inputs does (<https://github.com/rrnewton/hermit/issues/3687>).
     #[test]
     fn an_imported_pair_earns_clean_credit_only_when_both_cells_ran_alike() {
         let fixture = Fixture::new("imported-route");
@@ -9069,6 +9087,10 @@ mod tests {
         let local = route(Some("local"), Some(""), Some("local"));
         let remote = route(Some("re"), Some(""), Some("linux-re"));
         let outside = route(Some(""), Some(""), Some("local"));
+        // What cell.sh records when run by hand with a label of its own.
+        let by_hand = route(Some("unknown"), Some(""), Some("local"));
+        let other_root = route(Some("local"), Some("chroot"), Some("local"));
+        let no_platform = route(Some("re"), Some(""), Some(""));
         // (test, where its ptrace reference ran, where its kvm candidate ran,
         // whether those are known to be alike)
         let cases = [
@@ -9093,8 +9115,22 @@ mod tests {
                 route(None, None, None),
                 false,
             ),
-            // Both ran outside the generated targets, so where is unknown.
+            // Both ran outside the generated targets, so where is unknown,
+            // even though both recorded the same thing.
             ("fx/outside", outside.clone(), outside.clone(), false),
+            ("fx/by-hand", by_hand.clone(), by_hand.clone(), false),
+            (
+                "fx/other-root",
+                other_root.clone(),
+                other_root.clone(),
+                false,
+            ),
+            (
+                "fx/no-platform",
+                no_platform.clone(),
+                no_platform.clone(),
+                false,
+            ),
         ];
         let mut rows = Vec::new();
         let mut index = Vec::new();
