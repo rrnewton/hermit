@@ -97,7 +97,6 @@ impl StructuredResultProducerKind {
 pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.isolated_dbt_workdir",
     "test.isolated_detcore_workdir",
-    "liteinst.strict",
     "privileged-only-test.cli_kvm",
     "privileged-only-test.cli_kvm_on_host",
     "privileged-only-test.pmu_buck_chaos_cases",
@@ -116,7 +115,6 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "super.dbt_unsupported_syscall_aggregation_diagnostic",
     "super.full_leveldb_strict_determinism",
     "super.ipc_determinism_diagnostic",
-    "super.liteinst_python3_verify_diagnostics",
     "super.managed_jvm_strict_verify_diagnostics",
     "super.network_syscall_determinism_diagnostic",
     "super.pmu_analyze_hello_race_stress_calibrated_skid",
@@ -149,7 +147,6 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.hermit_modes_on_host",
     "test.hermit_unit",
     "test.ignored_syscall_regressions",
-    "test.liteinst_strict",
     "test.regular_crates",
     "test.rr_suite_contract",
     "test.sabre_examples",
@@ -163,7 +160,6 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.hermit_integration_on_host",
     "test.hermit_unit_on_host",
     "test.ignored_syscall_regressions_on_host",
-    "test.liteinst_strict_on_host",
     "test.regular_crates_on_host",
     "test.rr_suite_contract_on_host",
     "test.sabre_examples_on_host",
@@ -787,7 +783,24 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3219) retains all 817 prior
     // identities (`cargo nextest list --profile ci` lists 823 = 818 plus the
     // five real_random_ PMU cases this node skips).
-    ("test.hermit_unit", 818),
+    // Making LiteInst in-guest only
+    // (https://github.com/rrnewton/hermit/issues/3520) deletes the
+    // ptrace-hosted hybrid and eight unit tests whose subject it was:
+    // tests::liteinst_pin_guard::{a_runtime_with_no_recorded_revision_is_refused,
+    // a_runtime_from_another_revision_is_refused_naming_both,
+    // a_matching_runtime_is_accepted,
+    // the_loader_consults_the_guard_before_anything_else,
+    // a_versioned_soname_finds_its_marker},
+    // tests::liteinst_runtime_selector_accepts_only_unset_or_one,
+    // run::skid_margin_override_is_available_to_liteinst_host_hybrid and
+    // run::liteinst_host_hybrid_is_not_subject_to_the_in_guest_refusals. It
+    // renames liteinst_host_backend_preserves_ptrace_rcb_timeslices to
+    // liteinst_backend_config_preserves_the_requested_timeslice and
+    // liteinst_public_dispatch_runs_ptrace_host_hybrid to
+    // liteinst_public_dispatch_runs_in_guest_detcore, and retains the other
+    // 808 identities unchanged (`cargo nextest list --profile ci` with this
+    // node's filters lists 810, the two renamed tests included).
+    ("test.hermit_unit", 810),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1013,14 +1026,44 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // selected CLI identities (`cargo nextest list --profile ci` measured +3).
     // Its two other CLI tests are #[ignore]d: they need the in-guest runtime
     // library, which this selection does not build.
-    ("test.cli", 125),
-    // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
-    // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
-    // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
-    // identities.
-    // liteinst_dispatch_record_reports_patched_sites retains all 27 prior
-    // identities.
-    ("test.liteinst_strict", 28),
+    // Making LiteInst in-guest only
+    // (https://github.com/rrnewton/hermit/issues/3520) deletes
+    // run_liteinst_verifies_detcore_backend,
+    // liteinst_backend_stats_report_the_guests_own_dispatch_paths and
+    // liteinst_in_guest_selector_rejects_unknown_values, which drove the
+    // deleted ptrace-hosted hybrid or its selector. It renames
+    // run_liteinst_rejects_a_non_runtime_override_before_activation_claim and
+    // run_liteinst_rejects_an_inert_dso_before_activation_claim to
+    // ..._before_dispatch and retains the other 118 identities unchanged
+    // (`cargo nextest list --profile ci` with this node's skips lists 120,
+    // the two renamed tests included). Three
+    // in-guest CLI tests are #[ignore]d at this point, for the reason above.
+    // The same change moves the liteinst_advanced tests that in-guest LiteInst
+    // can run into this binary, as the 23 tests of
+    // liteinst_in_guest_programs:: (hermit-cli/tests/common/
+    // liteinst_in_guest_programs.rs; python_random_example is not among them,
+    // because in-guest LiteInst crashes on Python's hashlib), and restores
+    // liteinst_backend_stats_report_the_guests_own_dispatch_paths retargeted to
+    // in-guest LiteInst: 144 = 120 + 23 + 1 (`cargo nextest list --profile ci`
+    // with this node's skips lists 144 non-ignored matches). They load the
+    // libdetcore_liteinst.so that build.workspace_in_pinned_root's
+    // `cargo build --profile validate --workspace --all-targets` writes beside
+    // target/validate/hermit, the CARGO_BIN_EXE_hermit they run.
+    // run_liteinst_finds_the_runtime_staged_as_an_installed_resource, which
+    // checks that an installation's packaged rsrcs/libdetcore_liteinst.so is
+    // found and is consulted before the Cargo artifact directory, retains all
+    // 144 prior identities (`cargo nextest list --profile ci` with this node's
+    // skips lists 145).
+    // liteinst_in_guest_programs::liteinst_in_guest_python_random_example
+    // (restored as an ordinary test) and
+    // liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs
+    // retain all 145 prior identities: 147. Both need the pinned Reverie to
+    // emulate CPUID in code mapped after the in-guest runtime started.
+    // run_dbt_verifies_queued_self_signals and run_dbt_verifies_self_prlimit,
+    // which this node stopped skipping when DBT kept a guest's own pid and tid
+    // virtual, add 2: `cargo nextest list --profile ci` with this node's skips
+    // lists 149.
+    ("test.cli", 149),
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops retains all 6
     // prior identities.
     ("test.sabre_examples", 7),
@@ -1071,7 +1114,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // prior identities retained.
     // The three https://github.com/rrnewton/hermit/pull/3635 in-guest LiteInst
     // refusal tests, as in test.cli; all 120 prior identities retained.
-    ("test.cli_on_host", 125),
+    // The host twin loses the same three
+    // https://github.com/rrnewton/hermit/issues/3520 tests as test.cli, and
+    // gains the same 24 in-guest LiteInst tests (120 + 24 = 144), whose runtime
+    // build.workspace_on_host builds beside target/validate/hermit.
+    // The same installed-resource test as test.cli; all 144 prior identities
+    // retained. The same two late-mapped-CPUID tests as test.cli; all 145
+    // prior identities retained. The same two un-skipped DBT tests as
+    // test.cli: 149.
+    ("test.cli_on_host", 149),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
@@ -1139,14 +1190,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/issues/1845 test.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3219 test.
-    ("test.hermit_unit_on_host", 818),
+    // The host twin drops the same eight
+    // https://github.com/rrnewton/hermit/issues/3520 tests.
+    ("test.hermit_unit_on_host", 810),
     ("test.ignored_syscall_regressions_on_host", 4),
-    // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
-    // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
-    // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
-    // identities. The host twin also selects
-    // liteinst_dispatch_record_reports_patched_sites.
-    ("test.liteinst_strict_on_host", 28),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // The fold-2 resolver test retains all 764 prior identities.
@@ -2407,7 +2454,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"build"########,
         job: r########"e2e_artifact"########,
         desc: r########"Publish the one Hermit binary at target/ci/hermit and as a verified content-addressed bundle with its backend resources"########,
-        description: r########"This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.liteinst_strict, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30."########,
+        description: r########"This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,
@@ -3785,7 +3832,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"cli"########,
         desc: r########"Portable CLI cases (skips KVM/DBT-backend-only cases)"########,
-        description: r########"Three exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
+        description: r########"Three exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. They include real programs (coreutils, sqlite3, Python, jq, perl and the tests/c guests) run under in-guest LiteInst with --max-timeslice=disabled and without --verify, which in-guest LiteInst refuses (liteinst_in_guest_programs::, formerly the liteinst_advanced binary); those load the libdetcore_liteinst.so that the workspace build writes beside target/validate/hermit, so a missing runtime fails them with Hermit's refusal naming `cargo build -p detcore-liteinst`. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch"########,
         cmdtype: CmdType::Unknown,
@@ -3831,7 +3878,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"cli_on_host"########,
         desc: r########"Portable CLI cases (skips KVM/DBT-backend-only cases)"########,
-        description: r########"Three exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
+        description: r########"Three exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. They include real programs (coreutils, sqlite3, Python, jq, perl and the tests/c guests) run under in-guest LiteInst with --max-timeslice=disabled and without --verify, which in-guest LiteInst refuses (liteinst_in_guest_programs::, formerly the liteinst_advanced binary); those load the libdetcore_liteinst.so that the workspace build writes beside target/validate/hermit, so a missing runtime fails them with Hermit's refusal naming `cargo build -p detcore-liteinst`. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
         labels: &[r########"hosted-portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch"########,
         cmdtype: CmdType::Unknown,
@@ -3850,42 +3897,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             est_duration_s: 150.0,
             rss_baseline_bytes: Some(4294967296),
             hard_mem_max_bytes: Some(6442450944),
-            classification: StepClass::LatencyBound,
-            preferred_inner_jobs: None,
-            measured_effective_cores: None,
-            measured_cpu_utilization: None,
-        },
-        networkonly: false,
-        engine_only: false,
-        timeout: 900,
-        cpu_timeout: 7200,
-        jobs_flag: None,
-        jobs_env: None,
-    },
-    StaticStepSpec {
-        group: r########"test"########,
-        job: r########"liteinst_strict"########,
-        desc: r########"Portable LiteInst strict compatibility"########,
-        description: r########"Exercises the LiteInst backend on real programs: the liteinst_advanced integration tests run one at a time against target/ci/hermit with --backend liteinst --strict, their number pinned by NEXTEST_EXPECTED_EXECUTED. Coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert; the node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, or a test added or removed without updating the count, makes it red."########,
-        labels: &[
-            r########"full"########,
-            r########"hosted-portable"########,
-            r########"portable"########,
-        ],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit HERMIT_LITEINST_STAGE_DIR=$PWD/target/validate ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1"########,
-        cmdtype: CmdType::Unknown,
-        manifest: None,
-        integration_test_binaries: Some(&[r########"liteinst_advanced"########]),
-        deps: &[
-            r########"build.e2e_artifact"########,
-            r########"setup.nextest"########,
-        ],
-        env: &[],
-        hint: HintSpec {
-            resources: &[],
-            est_duration_s: 120.0,
-            rss_baseline_bytes: Some(1073741824),
-            hard_mem_max_bytes: Some(3221225472),
             classification: StepClass::LatencyBound,
             preferred_inner_jobs: None,
             measured_effective_cores: None,
@@ -5347,35 +5358,6 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     },
     StaticStepSpec {
         group: r########"super"########,
-        job: r########"liteinst_python3_verify_diagnostics"########,
-        desc: r########"LiteInst python3 verify diagnostics"########,
-        description: r########"Runs the cli integration binary (Hermit built with third-party-backends) on one thread with the substring filters run_liteinst_rejects_non_fork_clone, run_liteinst_handles_inherited_ignored_sigchld, run_liteinst_verifies_forked_guest and run_liteinst_verifies_raw_fork_guest. None of these tests exists in hermit-cli/tests/cli.rs at fe6670ebf: commit 138922c76 ("Run Detcore through the LiteInst backend", https://github.com/rrnewton/hermit/pull/736, 2026-07-26) removed them, so the filters select no test, and nothing in the command involves python3. The portable test.cli and test.cli_on_host nodes still --skip the same four names. As written the node checks nothing about LiteInst. With nextest's default handling of an empty selection the run exits non-zero instead of passing, which would fail the node; its filters need current LiteInst test names, or the node should be removed. A failure is blocking for the super validation."########,
-        labels: &[r########"super"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test cli -j 1 -- run_liteinst_rejects_non_fork_clone run_liteinst_handles_inherited_ignored_sigchld run_liteinst_verifies_forked_guest run_liteinst_verifies_raw_fork_guest"########,
-        cmdtype: CmdType::Unknown,
-        manifest: None,
-        integration_test_binaries: None,
-        deps: &[r########"super.build_workspace"########],
-        env: &[],
-        hint: HintSpec {
-            resources: &[],
-            est_duration_s: 0.0,
-            rss_baseline_bytes: Some(8589934592),
-            hard_mem_max_bytes: Some(8589934592),
-            classification: StepClass::Light,
-            preferred_inner_jobs: None,
-            measured_effective_cores: None,
-            measured_cpu_utilization: None,
-        },
-        networkonly: false,
-        engine_only: false,
-        timeout: 300,
-        cpu_timeout: 600,
-        jobs_flag: None,
-        jobs_env: None,
-    },
-    StaticStepSpec {
-        group: r########"super"########,
         job: r########"chaos_hello_race_verification_diagnostic"########,
         desc: r########"Chaos hello-race verification diagnostic"########,
         description: r########"Runs hello_race_chaos_verify from hermit-cli/tests/hermit_modes.rs. It compiles flaky-tests/hello_race.rs, a deliberately racy two-thread program, and runs `hermit run --verify --verify-allow=both --chaos --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --env=HERMIT_MODE=chaos` on it with the default ptrace backend. --verify-allow=both accepts any guest exit status, so the property under test is that the chaos-mode run repeats itself: stderr must contain "Success: deterministic." and Hermit must exit with a status code, not a signal. It protects reproducibility of chaos scheduling without PMU preemption. If chaos scheduling drew on host timing so the two verify runs took different interleavings, Hermit would report nondeterminism and the test fails with "chaos verification for hello_race failed". A failure is blocking for the super validation."########,
@@ -6154,99 +6136,6 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         engine_only: false,
         timeout: 420,
         cpu_timeout: 840,
-        jobs_flag: None,
-        jobs_env: None,
-    },
-    StaticStepSpec {
-        group: r########"liteinst"########,
-        job: r########"hermit_release"########,
-        desc: r########"Release Hermit for LiteInst compatibility"########,
-        description: r########"In the pinned root, runs `cargo build --release --locked -p hermit --features third-party-backends` and then `./ci/nextest-binaries.rs prepare liteinst-compat-only`, which builds and records the liteinst_advanced test executable that liteinst.strict runs (its one prepared selection: -p hermit --features third-party-backends --test liteinst_advanced). It is the first node of the liteinst-compat-only focused profile; liteinst.runtime then stages the LiteInst runtime next to the release binary. A release-mode compile error, a Cargo.lock that --locked would have to change, or a liteinst_advanced test target that no longer builds stops the profile here."########,
-        labels: &[r########"liteinst-compat-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release --locked -p hermit --features third-party-backends && ./ci/nextest-binaries.rs prepare liteinst-compat-only"########,
-        cmdtype: CmdType::Unknown,
-        manifest: None,
-        integration_test_binaries: None,
-        deps: &[
-            r########"gate.manifest"########,
-            r########"setup.nextest"########,
-        ],
-        env: &[],
-        hint: HintSpec {
-            resources: &[],
-            est_duration_s: 0.0,
-            rss_baseline_bytes: Some(17179869184),
-            hard_mem_max_bytes: Some(17179869184),
-            classification: StepClass::Light,
-            preferred_inner_jobs: None,
-            measured_effective_cores: None,
-            measured_cpu_utilization: None,
-        },
-        networkonly: false,
-        engine_only: false,
-        timeout: 1200,
-        cpu_timeout: 3600,
-        jobs_flag: None,
-        jobs_env: None,
-    },
-    StaticStepSpec {
-        group: r########"liteinst"########,
-        job: r########"runtime"########,
-        desc: r########"Release LiteInst runtime"########,
-        description: r########"In the pinned root, runs `./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build`. The script resolves the Reverie pin with `ci/run-reverie-pin-check.sh --print-pin`, builds liteinst-runtime-build/Cargo.toml in the release profile into a target directory suffixed with the pin's first eight hex digits, and installs the runtime DSO and a sibling .revision file naming that pin, renaming the DSO first so a new library is never paired with an old marker. Hermit refuses to load a LiteInst runtime without a matching marker, so liteinst.strict depends on this. A runtime build failure, or a build that stages an empty file, exits nonzero with "LiteInst runtime build did not stage a non-empty regular file"."########,
-        labels: &[r########"liteinst-compat-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build"########,
-        cmdtype: CmdType::Unknown,
-        manifest: None,
-        integration_test_binaries: None,
-        deps: &[r########"liteinst.hermit_release"########],
-        env: &[],
-        hint: HintSpec {
-            resources: &[],
-            est_duration_s: 0.0,
-            rss_baseline_bytes: Some(8589934592),
-            hard_mem_max_bytes: Some(8589934592),
-            classification: StepClass::Light,
-            preferred_inner_jobs: None,
-            measured_effective_cores: None,
-            measured_cpu_utilization: None,
-        },
-        networkonly: false,
-        engine_only: false,
-        timeout: 900,
-        cpu_timeout: 1800,
-        jobs_flag: None,
-        jobs_env: None,
-    },
-    StaticStepSpec {
-        group: r########"liteinst"########,
-        job: r########"strict"########,
-        desc: r########"Portable CI liteinst_strict"########,
-        description: r########"In the pinned root, runs `HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1` from the executable liteinst.hermit_release prepared, against the release Hermit and the runtime liteinst.runtime staged. These are the tests test.liteinst_strict runs in the full profile: coreutils, sqlite3, Python and tests/c/liteinst_advanced.c under --backend liteinst --strict --verify with activation verified, threads and fork without SIGSYS, a prompt self-SIGKILL, and an inert bare LD_PRELOAD of the runtime. Counts are written as schema-2 structured results. A LiteInst change that kills thread creation with SIGSYS turns it red; a missing staged runtime or revision file makes it report no result (exit 75)."########,
-        labels: &[r########"liteinst-compat-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1"########,
-        cmdtype: CmdType::Unknown,
-        manifest: None,
-        integration_test_binaries: Some(&[r########"liteinst_advanced"########]),
-        deps: &[
-            r########"liteinst.runtime"########,
-            r########"setup.nextest"########,
-        ],
-        env: &[],
-        hint: HintSpec {
-            resources: &[],
-            est_duration_s: 0.0,
-            rss_baseline_bytes: Some(8589934592),
-            hard_mem_max_bytes: Some(8589934592),
-            classification: StepClass::Light,
-            preferred_inner_jobs: None,
-            measured_effective_cores: None,
-            measured_cpu_utilization: None,
-        },
-        networkonly: false,
-        engine_only: false,
-        timeout: 900,
-        cpu_timeout: 1800,
         jobs_flag: None,
         jobs_env: None,
     },
