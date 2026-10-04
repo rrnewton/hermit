@@ -113,6 +113,7 @@ jobs:
     - name: Dependencies
       run: sudo apt-get install -y libunwind-dev liblzma-dev
     - name: Prepare only the builder's public source dependencies
+      id: website-deps
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
       timeout-minutes: 15
       run: |
@@ -124,7 +125,48 @@ jobs:
         git -C _website_source/hermit fetch --no-tags origin main:refs/remotes/origin/main
         channel=$(python3 -c 'import pathlib,tomllib; print(tomllib.loads(pathlib.Path("_website_source/hermit/rust-toolchain.toml").read_text())["toolchain"]["channel"])')
         rustup toolchain install "$channel" --profile minimal
-        RUSTUP_TOOLCHAIN="$channel" cargo install rust-script --version 0.36.0 --locked
+        printf 'channel=%s\n' "$channel" >> "$GITHUB_OUTPUT"
+    # The rebuild compiles two Rust programs: manifest-metadata (cargo run, into
+    # CARGO_TARGET_DIR) and the ci-hub.rs projection (rust-script, into
+    # ~/.cache/rust-script). Cold, they cost about 77 s and 150 s of the rebuild
+    # step on https://github.com/rrnewton/hermit/actions/runs/37208221642.
+    # The cache only supplies earlier build outputs: Cargo's own fingerprints
+    # decide what is fresh, and CARGO_UNSTABLE_CHECKSUM_FRESHNESS (rebuild step)
+    # makes that decision by source content, because checkout gives every source
+    # file a new modification time. An outdated cache can cost a rebuild, never
+    # a wrong binary. The key names the exact sources (the reviewed builder
+    # commit, whose gitlink fixes the Hermit sources too) and this workflow
+    # file (the build settings), so any change to either saves its build
+    # again; restore-keys reuses the newest earlier build. A key computed from
+    # file patterns missed sources reached through #[path] and include files.
+    - name: Restore the website builder's Rust build outputs
+      id: website-rust-cache
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      uses: actions/cache/restore@v4
+      with:
+        path: |
+          ~/.cache/rust-script
+          ~/.cargo/bin/rust-script
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          ${{ runner.temp }}/compatibility-target
+        key: compatibility-rust-${{ runner.os }}-${{ steps.website-deps.outputs.channel }}-${{ steps.website-source.outputs.parent_commit }}-${{ hashFiles('.github/workflows/docs.yml') }}
+        restore-keys: |
+          compatibility-rust-${{ runner.os }}-${{ steps.website-deps.outputs.channel }}-
+    - name: Install rust-script
+      if: github.event_name == 'schedule' || inputs.rebuild_compatibility
+      timeout-minutes: 10
+      env:
+        CHANNEL: ${{ steps.website-deps.outputs.channel }}
+      run: |
+        set -euo pipefail
+        # A restored rust-script is reused only at the exact pinned version.
+        if [[ "$(rust-script --version 2>/dev/null || true)" == "rust-script 0.36.0" ]]; then
+          echo "rust-script 0.36.0 restored from cache"
+        else
+          RUSTUP_TOOLCHAIN="$CHANNEL" cargo install rust-script --version 0.36.0 --locked --force
+        fi
     - name: Add swap for the compatibility rebuild
       if: github.event_name == 'schedule' || inputs.rebuild_compatibility
       timeout-minutes: 5
@@ -174,6 +216,14 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
         CARGO_TARGET_DIR: ${{ runner.temp }}/compatibility-target
+        # Decide Rust build freshness by source content, not modification time
+        # (see "Restore the website builder's Rust build outputs").
+        CARGO_UNSTABLE_CHECKSUM_FRESHNESS: "true"
+        # Incremental state and debug info only grow the cached target
+        # directory (1.2 GB with debug info, 567 MB without, for
+        # manifest-metadata, measured locally).
+        CARGO_INCREMENTAL: "0"
+        CARGO_PROFILE_DEV_DEBUG: "0"
         RUSTUP_AUTO_INSTALL: "0"
         PYTHONDONTWRITEBYTECODE: "1"
         # Print one wall/CPU line per build phase to this step's log, so the
@@ -198,6 +248,21 @@ jobs:
           jq -r '"Cell ledger: `" + .ledger_commit + "`", "Built identity: `" + .identity + "`", "Canonical validation history: `" + .validation_history_commit + "`"' "$RUNNER_TEMP/compatibility-rebuild.json"
           echo 'No Hermit tests ran. Measurement timestamps and unavailable evidence remain unchanged. Pages byte verification follows deployment.'
         } >> "$GITHUB_STEP_SUMMARY"
+    - name: Save the website builder's Rust build outputs
+      if: >-
+        (github.event_name == 'schedule' || inputs.rebuild_compatibility) &&
+        steps.website-rebuild.outcome == 'success' &&
+        steps.website-rust-cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v4
+      with:
+        path: |
+          ~/.cache/rust-script
+          ~/.cargo/bin/rust-script
+          ~/.cargo/registry/index
+          ~/.cargo/registry/cache
+          ~/.cargo/git/db
+          ${{ runner.temp }}/compatibility-target
+        key: ${{ steps.website-rust-cache.outputs.cache-primary-key }}
     - name: Record swap use by the compatibility rebuild
       if: always() && (github.event_name == 'schedule' || inputs.rebuild_compatibility)
       # The rebuild's resource receipt does not count swapped-out pages, so its
