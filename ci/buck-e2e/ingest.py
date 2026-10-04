@@ -35,6 +35,21 @@ a cell outside the plan. Executions of one cell that end in the same second are 
 their order is unknown, and testx addresses an artifact as RUN.TEST.END. Prints one
 JSON summary line.
 
+Import mode's parity post-pass compares each verify cell's first-run log (the one hermit
+keeps as the golden copy) with ptrace's. A row records the --verify-log-dir its cell ran
+with, in scratch space that is gone; cell.sh returned that directory's files as
+artifacts (cell__<path below the row's artifact_dir, / as __>__<file>, .zst when
+compressed). Every run1_log_ file directly in it is checked byte-exact against the
+sha256 its result.json recorded, decompressed, and written to
+
+    IMPORT_DIR/retained-verify-logs/<run id>/<path below the row's artifact_dir>/
+
+IMPORT_DIR/retained-verify-logs/index.jsonl maps each recorded directory to the
+directory below IMPORT_DIR its logs were restored to, or to why none were (no such log
+among the artifacts, a failed fetch, no recorded or a different sha256). A directory is
+restored whole or not at all. A log that is not restored leaves only its parity cell
+unmeasured: it never fails the ingest.
+
 --local-artifacts: Buck materializes each test's artifact directory locally
 (buck-out/v2/test/execution/<cell>/<target hash>/<config hash>/default/artifacts_directory),
 keeping the newest execution per target. cell.sh writes an artifact named run_id.<run id>,
@@ -42,18 +57,31 @@ which the testx listing shows without a fetch. An execution is read from the one
 directory holding its marker; every other execution, including one whose marker is in
 no local directory or in several, is fetched with testx.
 """
-import argparse, collections, concurrent.futures as cf, json, os, re, subprocess, sys, tempfile, time
+import argparse, collections, concurrent.futures as cf, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
 
 TESTX = os.environ.get("TESTX", "testx")
 MARKER = "run_id."  # cell.sh: an artifact named run_id.<run id>
+VERIFY_LOG_DIR = "--verify-log-dir"  # the harness's flag naming where hermit --verify keeps its logs
+RUN1_LOG = "run1_log_"  # hermit's first-run log; parity.rs RETAINED_LOG_PREFIX
+LOGS_DIR = "retained-verify-logs"  # parity.rs IMPORTED_LOGS_DIR
+LOGS_INDEX = "index.jsonl"  # parity.rs IMPORTED_LOGS_INDEX
+LOGS_SCHEMA = 1  # parity.rs IMPORTED_LOGS_SCHEMA
+SAFE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")  # a path component, never . or ..
 
-def testx(*args, tries=4):
+def try_testx(*args, tries=4):
+    """(testx's stdout, None), or (None, why it failed)."""
     for i in range(tries):
         p = subprocess.run([TESTX, *args], capture_output=True, text=True)
         if p.returncode == 0:
-            return p.stdout
+            return p.stdout, None
         time.sleep(5 * (i + 1))  # TestX answers 500 transiently
-    sys.exit(f"ingest: testx {' '.join(args[:3])} failed: {p.stderr[-500:]}")
+    return None, f"testx {' '.join(args[:3])} failed: {p.stderr[-500:]}"
+
+def testx(*args, tries=4):
+    stdout, error = try_testx(*args, tries=tries)
+    if error is not None:
+        sys.exit(f"ingest: {error}")
+    return stdout
 
 def rows_of(path):
     if path.endswith(".zst"):
@@ -70,6 +98,103 @@ def cell_of(entry):
 
 def claims_host_inapplicable(cell, summary):
     return any(cell_of(h) == cell for h in (summary or {}).get("host_inapplicable_cells", []))
+
+def run1_log_name(name, prefix):
+    """The name hermit gave the first-run log that cell.sh stored as artifact NAME,
+    when NAME is PREFIX + that name (+ .zst for a log cell.sh compressed), else None."""
+    if not name.startswith(prefix):
+        return None
+    base = name[len(prefix):]
+    base = base[:-len(".zst")] if base.endswith(".zst") else base
+    # A name with __ in it was in a subdirectory, which hermit never writes logs to.
+    return base if base.startswith(RUN1_LOG) and "__" not in base and SAFE.fullmatch(base) else None
+
+def verify_logs(rows, names):
+    """{recorded verify-log directory: (its path below the row's artifact_dir, prefix,
+    [artifact name of each first-run log in it])} for every row run with --verify-log-dir,
+    or a reason in place of the tuple when its logs cannot be among the artifacts NAMES.
+    cell.sh stores the file <artifact_dir>/A/B as the artifact cell__A__B."""
+    found = {}
+    for row in rows:
+        argv = row.get("argv") or []
+        flag = argv.index(VERIFY_LOG_DIR) if VERIFY_LOG_DIR in argv else None
+        if flag is None or flag + 1 >= len(argv):
+            continue
+        recorded, adir = argv[flag + 1], row.get("artifact_dir") or ""
+        if not adir or not recorded.startswith(adir.rstrip("/") + "/"):
+            found[recorded] = f"it is not below the row's artifact directory {adir!r}, the only one cell.sh returns"
+            continue
+        parts = recorded[len(adir.rstrip("/")) + 1:].split("/")
+        if not all(SAFE.fullmatch(part) and "__" not in part for part in parts):
+            found[recorded] = f"its path below the artifact directory, {'/'.join(parts)!r}, has no cell.sh artifact name"
+            continue
+        prefix = "cell__" + "__".join(parts) + "__"
+        found[recorded] = ("/".join(parts), prefix, sorted(n for n in names if run1_log_name(n, prefix)))
+    return found
+
+def restore(out, run_id, result, logs, log_dir, fetch_error):
+    """Copy each first-run log LOGS (see verify_logs) names out of LOG_DIR into
+    OUT/LOGS_DIR/RUN_ID/<its path below the artifact_dir>, decompressed, after checking
+    the bytes against the sha256 cell.sh recorded in the execution's RESULT. Returns
+    {recorded verify-log directory: (restored directory relative to OUT, None) or
+    (None, why none)}. A directory is restored whole or not at all."""
+    hashes = (result or {}).get("artifact_sha256")
+    entries = {}
+    for recorded, found in sorted(logs.items()):
+        if isinstance(found, str):
+            entries[recorded] = (None, found)
+            continue
+        rel, prefix, names = found
+        if not names:
+            entries[recorded] = (None, f"the execution's artifacts hold no {RUN1_LOG}* log from it")
+            continue
+        if fetch_error is not None:
+            entries[recorded] = (None, f"its logs could not be fetched: {fetch_error}")
+            continue
+        if not isinstance(run_id, str) or not SAFE.fullmatch(run_id):
+            entries[recorded] = (None, f"the execution's run id {run_id!r} cannot name a directory")
+            continue
+        if not isinstance(hashes, dict):
+            entries[recorded] = (None, "the execution's result.json records no artifact_sha256, "
+                                       "so its logs cannot be checked byte-exact")
+            continue
+        restored, reason = {}, None
+        for name in names:
+            try:
+                with open(os.path.join(log_dir, name), "rb") as f:
+                    blob = f.read()
+            except OSError as error:
+                reason = f"{name} cannot be read: {error}"
+                break
+            if hashes.get(name) != hashlib.sha256(blob).hexdigest():
+                reason = f"{name} does not have the sha256 its cell recorded"
+                break
+            if name.endswith(".zst"):
+                try:
+                    p = subprocess.run(["zstd", "-q", "-d", "-c"], input=blob, capture_output=True)
+                    failure = p.stderr[-300:].decode(errors="replace") if p.returncode != 0 else None
+                except OSError as error:
+                    failure = str(error)
+                if failure is not None:
+                    reason = f"{name} cannot be decompressed: {failure}"
+                    break
+                blob = p.stdout
+            log = run1_log_name(name, prefix)
+            if log in restored:
+                reason = f"two artifacts restore to {log}"
+                break
+            restored[log] = blob
+        if reason is None:
+            target = os.path.join(LOGS_DIR, run_id, *rel.split("/"))
+            try:
+                os.makedirs(os.path.join(out, target))
+                for log, blob in sorted(restored.items()):
+                    with open(os.path.join(out, target, log), "wb") as f:
+                        f.write(blob)
+            except OSError as error:
+                reason = f"its logs cannot be written below {out}: {error}"
+        entries[recorded] = (target, None) if reason is None else (None, reason)
+    return entries
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -131,7 +256,17 @@ def main():
         rows = rows_of(os.path.join(d, rows_name)) if rows_name else []
         summary = json.load(open(os.path.join(d, "summary.json"))) if "summary.json" in wanted else None
         result = json.load(open(os.path.join(d, "result.json"))) if "result.json" in wanted else None
-        return cell, end, marker, source, rows, summary, result
+        # The logs only feed the parity post-pass, so failing to fetch them never fails the ingest.
+        logs, log_dir, fetch_error = verify_logs(rows, names), d, None
+        log_names = sorted({n for found in logs.values() if not isinstance(found, str) for n in found[2]})
+        if source == "testx" and log_names:
+            log_dir = d + "__verify-logs"
+            if not all(os.path.exists(os.path.join(log_dir, n)) for n in log_names):
+                args = ["artifacts", "get", f"{rid}.{tid}.{end}", "--output-dir", log_dir]
+                for n in log_names:
+                    args += ["--artifact-names", n]
+                _, fetch_error = try_testx(*args)
+        return cell, end, marker, source, rows, summary, result, (logs, log_dir, fetch_error)
 
     with cf.ThreadPoolExecutor(a.j) as ex:
         fetched = list(ex.map(fetch, executions))
@@ -139,7 +274,8 @@ def main():
     per_cell = collections.defaultdict(list)  # cell -> [(rows, summary)] in Tpx order
     complete_runs = collections.defaultdict(list)  # cell -> run ids of evidence-complete executions
     run_cells = {}
-    for cell, end, marker, source, rows, summary, result in sorted(fetched, key=lambda x: (x[0], x[1])):
+    log_sources = []  # (run id, result, (logs, log_dir, fetch_error)) of each execution
+    for cell, end, marker, source, rows, summary, result, logs in sorted(fetched, key=lambda x: (x[0], x[1])):
         where = f"the execution of {cell} that ended at {end}"
         if result is not None and result.get("cell") != cell:
             sys.exit(f"ingest: {where} has a result.json for {result.get('cell')}")
@@ -159,6 +295,7 @@ def main():
         if result is not None and result.get("evidence_complete") is True:
             complete_runs[cell].append(run_id)
         per_cell[cell].append((rows, summary))
+        log_sources.append((run_id, result, logs))
 
     def covered(cell):
         runs = per_cell.get(cell, [])
@@ -213,10 +350,26 @@ def main():
         with open(os.path.join(d, "summary.json"), "w") as f:
             json.dump(total, f, indent=2, sort_keys=True)
             f.write("\n")
+    logs_root = os.path.join(a.out, LOGS_DIR)
+    shutil.rmtree(logs_root, ignore_errors=True)
+    os.makedirs(logs_root)  # fails if a previous ingest's logs could not all be removed
+    recorded = collections.Counter(r for _, _, (logs, _, _) in log_sources for r in logs)
+    index = {}  # recorded verify-log directory -> (restored directory, None) or (None, why none)
+    for run_id, result, (logs, log_dir, fetch_error) in log_sources:
+        shared = {r for r in logs if recorded[r] > 1}
+        index.update((r, (None, f"{recorded[r]} executions recorded it, so their logs cannot be told apart")) for r in shared)
+        index.update(restore(a.out, run_id, result, {r: v for r, v in logs.items() if r not in shared}, log_dir, fetch_error))
+    with open(os.path.join(logs_root, LOGS_INDEX), "w") as f:
+        for r, (restored, reason) in sorted(index.items()):
+            f.write(json.dumps({"schema": LOGS_SCHEMA, "verify_log_dir": r, "restored": restored, "reason": reason},
+                               sort_keys=True) + "\n")
+    unrestored = sorted(f"{r}: {reason}" for r, (_, reason) in index.items() if reason is not None)
     print(json.dumps({"sources": dict(sources), "cells": len(per_cell), "buckets": len(set(buckets) | set(summaries)), "rows": sum(attempts.values()),
                       "attempts": dict(attempts), "final_outcomes": dict(final),
                       "no_row_executions": len(no_row), "no_row_examples": sorted(no_row)[:20],
-                      "evidence_complete_executions": sum(len(v) for v in evidence_complete.values())}))
+                      "evidence_complete_executions": sum(len(v) for v in evidence_complete.values()),
+                      "verify_logs_restored": len(index) - len(unrestored), "verify_logs_unrestored": len(unrestored),
+                      "verify_logs_unrestored_examples": unrestored[:5]}))
 
 if __name__ == "__main__":
     main()

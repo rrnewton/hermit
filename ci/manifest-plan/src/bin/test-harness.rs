@@ -151,7 +151,9 @@ const RUN_ENVIRONMENT: &str =
   E2E_PARITY_POST_PASS=0                 Skip the parity post-pass (default: 1)
   E2E_IMPORT_RESULTS=<ROOT>              Run no cell: publish the rows another run left in
                                          ROOT/<lane>/manifest_<category>/; a selected cell
-                                         with no row is an ERROR";
+                                         with no row is an ERROR. The parity post-pass
+                                         reads the verify logs restored in
+                                         ROOT/retained-verify-logs/";
 
 const SYNC_CELLS_HELP: &str = "\
 Usage: test-harness sync-cells <--check|--write> [--repo-root <DIR>]
@@ -2977,19 +2979,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let capacity = scheduled_worker_capacity(args);
     let import_root = std::env::var_os(IMPORT_RESULTS_ENV).map(PathBuf::from);
     let planned_verify = planned_verify(&cells);
-    // An imported run has no verify logs of its own to compare.
-    let parity_scope = if import_root.is_some() {
-        if std::env::var_os("E2E_PARITY_SELECT").is_some()
-            || std::env::var_os("E2E_PARITY_POST_PASS").is_some()
-        {
-            eprintln!(
-                "test-harness: {IMPORT_RESULTS_ENV} is set: the parity post-pass and E2E_PARITY_SELECT are ignored"
-            );
-        }
-        BTreeSet::new()
-    } else {
-        parity_scope(root, manifests, &planned_verify)
-    };
+    // An imported run measures the same scope from the verify logs its
+    // producer retained, which the ingest restored below the import root
+    // (`parity::ImportedLogs`).
+    let parity_scope = parity_scope(root, manifests, &planned_verify);
     let context = if import_root.is_some() {
         RunContext::for_import(root.to_path_buf(), args.source_sha.as_deref())
     } else {
@@ -3416,6 +3409,7 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
         &results_path,
         capacity,
         &attempt_results,
+        import_root.as_deref(),
     );
     exit
 }
@@ -3608,13 +3602,16 @@ fn mark_parity_running(scope: &BTreeSet<ParityCellId>, context: &RunContext, res
 /// `parity.status.json` and `parity/` beside them, inside the enclosing
 /// dagrun step's wall bound, and returns nothing: an error, or even a panic,
 /// is reported and the exit status stays what determinism made it. With no
-/// cell in scope it only removes an earlier run's parity outputs.
+/// cell in scope it only removes an earlier run's parity outputs. For an
+/// imported run (`import_root`) the logs are the ones the ingest restored
+/// below that root ([`parity::ImportedLogs`]).
 fn report_parity(
     scope: &BTreeSet<ParityCellId>,
     context: &RunContext,
     results_path: &Path,
     capacity: ScheduledWorkerCapacity,
     attempt_results: &[Vec<CellResult>],
+    import_root: Option<&Path>,
 ) {
     let Some(artifacts) = results_path.parent() else {
         eprintln!("test-harness: parity post-pass skipped: results path has no directory");
@@ -3628,6 +3625,7 @@ fn report_parity(
     );
     config.jobs = capacity.workers_for(scope.len());
     config.outer_deadline = parity::dagrun_step_deadline();
+    config.imported_logs = import_root.map(parity::ImportedLogs::load);
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         #[cfg(test)]
         if std::env::var_os("HERMIT_PARITY_POST_PASS_PANIC").is_some() {
