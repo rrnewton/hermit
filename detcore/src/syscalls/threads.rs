@@ -989,8 +989,10 @@ where
 /// later turn once the scheduler makes it eligible. If the wait ends first, it
 /// is delivered after the call returns, once the guest's mask is put back. A
 /// `SIGCHLD` sent from outside the container to a process that has had a child
-/// is not made eligible by its arrival, so it ends the wait only together with
-/// one that the scheduler makes eligible.
+/// is not made eligible by its arrival, so it ends a gated wait only together
+/// with one that the scheduler makes eligible. The waits of `select` and
+/// `pselect6` are not gated and do not call this: any pending `SIGCHLD` that
+/// could interrupt them does, as on Linux (`KernelSignalWait::for_select`).
 ///
 /// The scheduler is asked whenever `SIGCHLD` could interrupt the wait, pending or
 /// not, so whether the question is asked depends only on the guest's mask and
