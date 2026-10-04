@@ -449,6 +449,54 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(Some(target.len() as i64))
     }
 
+    /// The kind and raw identity of the object behind one of the guest's OWN
+    /// descriptors, for its `/proc/self/fd/<fd>` link or its own numeric
+    /// `/proc/<pid>/fd/<fd>`, given the target bytes the guest's readlink
+    /// returned; `None` when the object is neither a pipe nor a socket.
+    ///
+    /// The identity is in the same namespace as the one
+    /// `canonicalize_other_proc_fd_target` uses for another process's link to
+    /// the same object, so the two aliases of one pipe or socket name one
+    /// deterministic inode. With `virtualize_metadata` both are the object's
+    /// device and inode, here from an `fstat` of the descriptor. Without it
+    /// -- `hermit record` and `hermit replay` -- both are the inode the link
+    /// target names, on device 0. At replay the target is the RECORDED one,
+    /// while an `fstat` describes whatever the replayer holds at that
+    /// descriptor (a placeholder where it does not recreate the object), so
+    /// keying on the target is what keeps the replayed name equal to the
+    /// recorded one and to the other alias.
+    ///
+    /// ⚠️ A TARGET TRUNCATED BY A SHORT BUFFER DOES NOT PARSE, and then the
+    /// `fstat` decides without `virtualize_metadata` too, keyed on its inode
+    /// on device 0. Under `hermit record` that is the inode the target names.
+    /// At replay it is the replayer's descriptor, as it was before the pool
+    /// was keyed on devices (<https://github.com/rrnewton/hermit/issues/3307>),
+    /// so a truncated read of the guest's own link can still name a different
+    /// inode at replay than in the recording.
+    async fn own_proc_fd_link_identity<G>(
+        &self,
+        guest: &mut G,
+        fd: i32,
+        observed_target: &[u8],
+    ) -> Result<Option<(&'static str, RawFileId)>, Error>
+    where
+        G: Guest<Self>,
+    {
+        let virtualize_metadata = guest.config().virtualize_metadata;
+        if !virtualize_metadata && let Some(identity) = anonymous_proc_fd_identity(observed_target)
+        {
+            return Ok(Some((identity.kind, RawFileId::new(0, identity.raw_inode))));
+        }
+        let stat = self.inject_fstat(guest, fd).await?;
+        let kind = match stat.st_mode & libc::S_IFMT {
+            libc::S_IFIFO => "pipe",
+            libc::S_IFSOCK => "socket",
+            _ => return Ok(None),
+        };
+        let device = if virtualize_metadata { stat.st_dev } else { 0 };
+        Ok(Some((kind, RawFileId::new(device, stat.st_ino))))
+    }
+
     /// Canonicalize a pipe/socket link belonging to another virtual process.
     /// The target descriptor is not in the caller's table, so its raw readlink
     /// bytes are the only safe identity evidence available here.
@@ -508,11 +556,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
 
-            let stat = self.inject_fstat(guest, fd).await?;
-            let kind = match stat.st_mode & libc::S_IFMT {
-                libc::S_IFIFO => "pipe",
-                libc::S_IFSOCK => "socket",
-                _ => return Ok(result),
+            let buffer = buffer.expect("a successful readlink requires a non-null buffer");
+            let observed_len = usize::try_from(result)
+                .expect("a positive readlink result must fit usize")
+                .min(buffer_len);
+            let mut observed = vec![0; observed_len];
+            guest.memory().read_exact(buffer.cast(), &mut observed)?;
+            let Some((kind, raw_file)) =
+                self.own_proc_fd_link_identity(guest, fd, &observed).await?
+            else {
+                return Ok(result);
             };
             let inode_override = guest
                 .thread_state()
@@ -523,11 +576,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .flatten();
             let inode = match inode_override {
                 Some(inode) => inode,
-                None => {
-                    determinize_inode(guest, RawFileId::new(stat.st_dev, stat.st_ino))
-                        .await
-                        .0
-                }
+                None => determinize_inode(guest, raw_file).await.0,
             };
             format!("{kind}:[{inode}]").into_bytes()
         } else {
@@ -1151,6 +1200,172 @@ mod tests {
             assert_eq!(
                 rewritten,
                 format!("pipe:[{}]", deterministic_stdio_inode(0).unwrap()).into_bytes()
+            );
+        }
+
+        /// Rewrite `raw_target`, truncated to `buffer_len` as the kernel (or
+        /// the replayer) would have placed it, as the target of the guest's
+        /// OWN `/proc/self/fd/<fd>`, returning the rewritten bytes.
+        async fn rewrite_own(
+            tool: &Detcore,
+            guest: &mut ScriptedGuest,
+            fd: i32,
+            raw_target: &[u8],
+            buffer_len: usize,
+        ) -> Vec<u8> {
+            let mut buffer = vec![0u8; buffer_len];
+            let placed = raw_target.len().min(buffer_len);
+            buffer[..placed].copy_from_slice(&raw_target[..placed]);
+            let address = AddrMut::<libc::c_char>::from_raw(buffer.as_mut_ptr() as usize);
+            let written = tool
+                .canonicalize_namespace_readlink_result(
+                    guest,
+                    PathBuf::from(format!("/proc/self/fd/{fd}")),
+                    address,
+                    buffer_len,
+                    i64::try_from(placed).unwrap(),
+                )
+                .await
+                .unwrap();
+            buffer.truncate(usize::try_from(written).unwrap());
+            buffer
+        }
+
+        /// `hermit record`: a child's readlink of its own pipe and its
+        /// readlink of its parent's numeric-pid link to the same pipe name
+        /// one deterministic inode, because both aliases are keyed on the
+        /// inode alone, on device 0.
+        #[tokio::test]
+        async fn without_virtualized_metadata_own_and_other_links_name_one_inode() {
+            let (reader, _, inode) = pipe_reader();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.config.virtualize_metadata = false;
+            assert_ne!(
+                inode,
+                cached_stdin_inode(&guest),
+                "precondition: the pipe must not share the cached stdio inode number"
+            );
+            let target = format!("pipe:[{inode}]");
+
+            let own =
+                rewrite_own(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes(), 64).await;
+            let other = rewrite(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes()).await;
+
+            assert_eq!(own, format!("pipe:[{FIRST_SCRIPTED_INODE}]").into_bytes());
+            assert_eq!(
+                other, own,
+                "the two aliases of one pipe must name one deterministic inode"
+            );
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [RawFileId::new(0, inode), RawFileId::new(0, inode)],
+                "both aliases must be keyed in one identity namespace"
+            );
+            assert_eq!(
+                guest.injected,
+                [],
+                "a complete target must not be confirmed by an fstat that replay cannot repeat"
+            );
+        }
+
+        /// `hermit replay`: the replayer hands the guest the RECORDED target,
+        /// while its descriptor holds a different object (here a pipe whose
+        /// inode is not the recorded one). Both aliases still follow the
+        /// recorded inode, so they agree with each other and with the
+        /// recording.
+        #[tokio::test]
+        async fn at_replay_own_and_other_links_follow_the_recorded_target() {
+            let (replay_descriptor, _, replay_inode) = pipe_reader();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.config.virtualize_metadata = false;
+            let recorded_inode = replay_inode + 1_000_003;
+            assert_ne!(recorded_inode, cached_stdin_inode(&guest));
+            let recorded_target = format!("pipe:[{recorded_inode}]");
+
+            let own = rewrite_own(
+                &tool,
+                &mut guest,
+                replay_descriptor.as_raw_fd(),
+                recorded_target.as_bytes(),
+                64,
+            )
+            .await;
+            let other = rewrite(
+                &tool,
+                &mut guest,
+                replay_descriptor.as_raw_fd(),
+                recorded_target.as_bytes(),
+            )
+            .await;
+
+            assert_eq!(own, format!("pipe:[{FIRST_SCRIPTED_INODE}]").into_bytes());
+            assert_eq!(other, own);
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [
+                    RawFileId::new(0, recorded_inode),
+                    RawFileId::new(0, recorded_inode)
+                ],
+                "replay must key the guest's own link on the recorded inode, not on the \
+                 replay descriptor's"
+            );
+            assert_eq!(guest.injected, []);
+        }
+
+        /// With `virtualize_metadata` both aliases are keyed on the object's
+        /// device and inode: the guest's own link from an `fstat` of the
+        /// descriptor, the other process's from a `stat` of its link.
+        #[tokio::test]
+        async fn with_virtualized_metadata_own_and_other_links_name_one_inode() {
+            let (reader, device, inode) = pipe_reader();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            assert!(guest.config.virtualize_metadata);
+            let target = format!("pipe:[{inode}]");
+
+            let own =
+                rewrite_own(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes(), 64).await;
+            let other = rewrite(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes()).await;
+
+            assert_eq!(own, format!("pipe:[{FIRST_SCRIPTED_INODE}]").into_bytes());
+            assert_eq!(other, own);
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [RawFileId::new(device, inode), RawFileId::new(device, inode)]
+            );
+            assert_eq!(guest.injected, [Sysno::fstat, Sysno::newfstatat]);
+        }
+
+        /// A target truncated by a short buffer does not parse, so without
+        /// `virtualize_metadata` the guest's own link falls back to an
+        /// `fstat` of the descriptor, still keyed on its inode alone on
+        /// device 0 -- under `hermit record`, the inode the target names.
+        #[tokio::test]
+        async fn without_virtualized_metadata_a_truncated_own_link_is_keyed_on_the_fstat_inode() {
+            let (reader, _, inode) = pipe_reader();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.config.virtualize_metadata = false;
+            assert_ne!(inode, cached_stdin_inode(&guest));
+            let target = format!("pipe:[{inode}]");
+
+            let own =
+                rewrite_own(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes(), 8).await;
+
+            assert_eq!(
+                own,
+                format!("pipe:[{FIRST_SCRIPTED_INODE}]").as_bytes()[..8].to_vec()
+            );
+            assert_eq!(guest.injected, [Sysno::fstat]);
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [RawFileId::new(0, inode)]
             );
         }
     }

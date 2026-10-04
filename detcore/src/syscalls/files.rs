@@ -7553,8 +7553,9 @@ pub(crate) mod inject_fstat_scratch {
         /// Whether `send_rpc` answers `DeterminizeInode`. Off by default, so
         /// a test that expects no RPC still fails on one.
         pub(crate) answers_determinize_inode: bool,
-        /// Raw identity of each `DeterminizeInode` request, in order. The
-        /// `n`th (from 0) is answered with deterministic inode
+        /// Raw identity of each `DeterminizeInode` request, in order. As the
+        /// real pool does, every request for the `n`th DISTINCT identity
+        /// (from 0) is answered with the same deterministic inode,
         /// `FIRST_SCRIPTED_INODE + n`.
         pub(crate) determinized: std::sync::Mutex<Vec<RawFileId>>,
     }
@@ -7631,7 +7632,17 @@ pub(crate) mod inject_fstat_scratch {
                 GlobalRequest::DeterminizeInode(raw, _) if self.answers_determinize_inode => {
                     let mut determinized = self.determinized.lock().unwrap();
                     determinized.push(raw);
-                    let inode = FIRST_SCRIPTED_INODE + determinized.len() as u64 - 1;
+                    let mut distinct: Vec<RawFileId> = Vec::new();
+                    for seen in determinized.iter() {
+                        if !distinct.contains(seen) {
+                            distinct.push(*seen);
+                        }
+                    }
+                    let index = distinct
+                        .iter()
+                        .position(|seen| *seen == raw)
+                        .expect("the request was just recorded");
+                    let inode = FIRST_SCRIPTED_INODE + index as u64;
                     (
                         None,
                         GlobalResponse::DeterminizeInode((
