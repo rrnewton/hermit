@@ -46,7 +46,9 @@ use serde_json::Value;
 use crate::unix_guard_terminal::process;
 
 mod failed_abi12;
+mod incomplete_abi12;
 pub(crate) use failed_abi12::failed_abi12_resource_source;
+pub(crate) use incomplete_abi12::incomplete_abi12_resource_source;
 
 const LOG_BYTES: u64 = 1_048_576;
 const QUERY_BYTES: u64 = 8192;
