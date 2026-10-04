@@ -18258,10 +18258,18 @@ struct CandidateAdmission {
 /// comparison domain. Otherwise a terminal stripped pass would stand for a
 /// run whose earlier attempt holds a canonical failure, or a refused
 /// canonical report, that the terminal attempt never resolved.
+///
+/// Only the comparing modes (verify, replay and chaos) are read this way. A
+/// custom invocation compares nothing: the runner writes no verification
+/// report for it, so its attempts have no comparator or domain to agree on,
+/// and its terminal attempt is judged by its outcome alone.
 fn require_one_fresh_comparison_across_attempts(
     id: &CellId,
     rows: &[ResultCandidate],
 ) -> Result<(), String> {
+    if !matches!(id.mode.as_str(), "verify" | "replay" | "chaos") {
+        return Ok(());
+    }
     let Some(first) = rows.first() else {
         return Ok(());
     };
@@ -38105,6 +38113,112 @@ mod post_verdict_transaction_tests {
                 assert!(error.contains(expected), "{label}: {error}");
             }
         }
+    }
+
+    /// verify-results admits every selected custom cell's passing run. The
+    /// runner writes no verification report for a custom invocation (the
+    /// attempt records a null report and a null report identity), so a custom
+    /// attempt has no comparator and no comparison domain. Reading it as a
+    /// comparison refused the whole fresh result set, and with it the
+    /// scorecard.compatibility and full-scorecard.compatibility validate
+    /// nodes. A custom run whose command failed stays non-passing.
+    #[test]
+    fn verify_results_accepts_a_fresh_custom_pass_without_a_comparison_report() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let selected = derive(&fixture.root).unwrap().selected_custom;
+        assert!(
+            !selected.is_empty(),
+            "the selected plan declares no custom row, so nothing is checked"
+        );
+        // A passing verify cell in the same run, so the custom cells are
+        // admitted beside a comparison and not only on their own.
+        let (verify_id, verify_pass) = stripped_row(&measured);
+        let run = verify_pass["run_id"].clone();
+        let custom = |id: &CellId| {
+            let mut row = result_row(&measured);
+            row["run_id"] = run.clone();
+            for (key, value) in [
+                ("lane", &id.lane),
+                ("category", &id.category),
+                ("test", &id.test),
+                ("mode", &id.mode),
+                ("backend", &id.backend),
+            ] {
+                row[key] = value.clone().into();
+            }
+            // The runner's custom invocation: `run` with no record, replay or
+            // verify step, so nothing is compared and no report is written.
+            let argv = vec![
+                "hermit",
+                "--log",
+                "info",
+                "--backend",
+                id.backend.as_str(),
+                "run",
+                "--",
+                "fixture",
+            ];
+            row["argv"] = serde_json::json!(argv);
+            row["effective_args"] = serde_json::json!(&argv[1..]);
+            row["shell_command"] = literal_shell_command(
+                "/repo",
+                &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+                &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+            )
+            .into();
+            for key in ["argv", "guest_argv", "env", "cwd", "shell_command"] {
+                row["attempts"][0][key] = row[key].clone();
+            }
+            row["attempts"][0]["verification_report"] = JsonValue::Null;
+            row["attempts"][0]["verification_report_sha256"] = JsonValue::Null;
+            row
+        };
+        let mut expected = selected.clone();
+        expected.insert(verify_id);
+        let mut rows = vec![verify_pass.clone()];
+        rows.extend(selected.iter().map(custom));
+        fixture.publish_rows(&rows);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        let admission = verify_candidate_set(&expected, candidates)
+            .expect("a custom PASS without a comparison report is the cell's pass");
+        assert_eq!(
+            admission,
+            CandidateAdmission {
+                passed: expected.len(),
+                stripped: 1,
+                diagnostic_failures: Vec::new(),
+            }
+        );
+
+        // Control: a custom run whose command failed is non-passing. Having
+        // no comparison does not excuse it.
+        let failing = selected.first().unwrap();
+        let mut failed = custom(failing);
+        failed["outcome"] = "FAIL".into();
+        failed["result"] = "crash-error".into();
+        failed["failure_class"] = "product_failure".into();
+        failed["attempts"][0]["outcome"] = "FAIL".into();
+        failed["attempts"][0]["status"] = 1.into();
+        let mut rows = vec![verify_pass];
+        rows.extend(selected.iter().map(|id| {
+            if id == failing {
+                failed.clone()
+            } else {
+                custom(id)
+            }
+        }));
+        fixture.publish_rows(&rows);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        let error = verify_candidate_set(&expected, candidates)
+            .map(|_| ())
+            .expect_err("a failed custom run was admitted");
+        assert!(
+            error.starts_with("fresh result set refused: 0 missing, 1 non-passing")
+                && error.contains(&display_id(failing)),
+            "{error}"
+        );
     }
 
     fn review3655_has_canonical_failure(cell: &TrackedCell) -> bool {
