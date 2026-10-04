@@ -1258,7 +1258,7 @@
       "disposition": "manifest-test",
       "path": "tests/c/readdir_order_identity.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI)",
-      "why": "tests/c/readdir_order_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): pins directory-enumeration order across a double strict run, asserting via --require-small-determinized and --require-large-determinized that both the small (single-buffer) and large (multi-buffer) cases enumerate identically across creation orders, the large one as a single globally sorted stream; the 90s budget is set from four measured 7.59-7.99s verify runs"
+      "why": "tests/c/readdir_order_identity.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (portable CI): pins directory-enumeration order across a double strict run, asserting via --require-small-determinized and --require-large-determinized that both the small (single-buffer) and large (multi-buffer) cases enumerate identically across creation orders, the large one as a single globally sorted stream; it runs under the default 22s CPU and 57s wall bounds (ci/manifest-plan/src/timeouts.rs), not the 90s budget it had before timeouts became manifest-driven, and measured walls are 7.56-17.13s over nine verify runs across ptrace, kvm and liteinst at 2d9b43c4 and 5.1s (4.3s CPU) for one ptrace run at 064da669; the liteinst calibration p90 is 9.5s CPU and 12.4s wall"
     },
     {
       "disposition": "manifest-test",

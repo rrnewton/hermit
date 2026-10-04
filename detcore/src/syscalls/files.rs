@@ -2049,7 +2049,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // `DirectoryStream`), not host cookies. The kernel position only
             // follows the stream, for descriptors Detcore does not track. Like
             // tmpfs's `dcache_dir_lseek`, only SEEK_SET and SEEK_CUR are
-            // accepted.
+            // accepted; SEEK_END, SEEK_DATA and SEEK_HOLE get `EINVAL`, where
+            // ext4 and btrfs accept SEEK_END
+            // (https://github.com/rrnewton/hermit/issues/3724).
             let current = guest.thread_state().with_detfd(call.fd(), |detfd| {
                 detfd.with_directory_stream(|stream| stream.position())
             })??;
@@ -5017,7 +5019,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// [`Self::snapshot_directory_privately`]). If the directory must be
     /// read in host order instead, the kernel's answer from the start is
     /// returned, which is `EINVAL` even at or past the end; if no mapping can
-    /// be made for the snapshot, the call fails with `ENOMEM`.
+    /// be made for the snapshot, the call fails with `ENOMEM`
+    /// (https://github.com/rrnewton/hermit/issues/3723).
     async fn serve_negative_count<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -5192,7 +5195,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// with `ENOMEM` before anything is read, and the stream stays without a
     /// snapshot, so a later call tries again. Linux's `getdents` does not
     /// fail so; serving the directory in host order would make the order
-    /// depend on the host.
+    /// depend on the host. This divergence is tracked in
+    /// https://github.com/rrnewton/hermit/issues/3723.
     async fn snapshot_directory_privately<G: Guest<Self>>(
         &self,
         guest: &mut G,

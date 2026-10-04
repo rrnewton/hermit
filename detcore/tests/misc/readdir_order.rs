@@ -480,7 +480,10 @@ fn received_descriptor_guest() {
     let mut names = drain_names(received);
     assert_eq!(names.len(), ENTRIES + 2, "received descriptor lost entries");
     // Without a stream, each kernel buffer is sorted on its own, so only the
-    // set of names is fixed.
+    // set of names is fixed. Comparing sets only is a tolerance for a known
+    // regression, not the spec: an untracked descriptor that aliases a stream
+    // can repeat entries, which Linux never does
+    // (https://github.com/rrnewton/hermit/issues/3722).
     names.sort();
     assert_eq!(names, expected);
     unsafe { libc::close(received) };
@@ -488,6 +491,8 @@ fn received_descriptor_guest() {
     println!("received descriptor ok");
 }
 
+/// Tolerates repeated entries on an untracked descriptor, a known regression
+/// tracked in https://github.com/rrnewton/hermit/issues/3722; see the guest.
 #[test]
 fn received_descriptor_lists_whole_directory() {
     run_five_times(received_descriptor_guest);
@@ -702,7 +707,8 @@ fn passed_on_descriptor_guest() {
     // Read part of the directory, then hand the open file to a descriptor
     // Detcore does not track. On Linux it reads the entries not yet returned;
     // it may also repeat some here, because the host order differs, but it
-    // must not miss any.
+    // must not miss any. The repeats are a known regression, not the spec:
+    // https://github.com/rrnewton/hermit/issues/3722.
     let dir = File::open(root.path()).unwrap();
     let fd = dir.as_raw_fd();
     let mut buf = [0u8; 512];
@@ -742,6 +748,8 @@ fn passed_on_descriptor_guest() {
     println!("passed-on descriptor ok");
 }
 
+/// Tolerates repeated entries on an untracked descriptor, a known regression
+/// tracked in https://github.com/rrnewton/hermit/issues/3722; see the guest.
 #[test]
 fn passed_on_descriptor_misses_no_entry() {
     run_five_times(passed_on_descriptor_guest);
@@ -945,7 +953,9 @@ fn listing_of(count: usize) -> Vec<String> {
 }
 
 /// Panic unless `names` contains every name in `expected` that is not in
-/// `returned`.
+/// `returned`. Extra names, including repeats of returned ones, pass: Linux
+/// never repeats an entry, so this tolerates a known regression rather than
+/// stating the spec (https://github.com/rrnewton/hermit/issues/3722).
 fn assert_contains_rest(names: &[String], expected: &[String], returned: &[String], context: &str) {
     let names: BTreeSet<&String> = names.iter().collect();
     let wanted: Vec<&String> = expected
@@ -1034,6 +1044,9 @@ fn alias_after_rewinds_guest() {
     println!("alias after rewinds ok");
 }
 
+/// Tolerates repeated entries on an untracked descriptor, a known regression
+/// tracked in https://github.com/rrnewton/hermit/issues/3722; see
+/// `assert_contains_rest`.
 #[test]
 fn passed_on_descriptor_follows_repeated_seeks() {
     run_five_times(alias_after_rewinds_guest);

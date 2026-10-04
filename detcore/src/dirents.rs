@@ -384,7 +384,10 @@ fn compare_dir_entries(a: &DirEntry, b: &DirEntry) -> std::cmp::Ordering {
 /// A descriptor Detcore does not track (one received through `SCM_RIGHTS`, for
 /// example) can alias the same open file and read it from the kernel position.
 /// The stream keeps that position where such a reader gets every entry the
-/// stream has not returned (see [`DirectoryStream::kernel_target`]).
+/// stream has not returned (see [`DirectoryStream::kernel_target`]). Such a
+/// reader can also get entries the stream already returned, which Linux never
+/// repeats: a known regression, not the intended behaviour, tracked in
+/// https://github.com/rrnewton/hermit/issues/3722.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct DirectoryStream {
     /// Sorted entries, or `None` when the next `getdents` must take a fresh
@@ -448,8 +451,10 @@ impl DirectoryStream {
 
     /// The host position to move the kernel to. Reading from it returns every
     /// entry the stream has not returned, but may also repeat some that it
-    /// has, because the host order differs. At the end of the stream it is the
-    /// end of the directory; without a snapshot, it is the start.
+    /// has, because the host order differs (a known regression, tracked in
+    /// https://github.com/rrnewton/hermit/issues/3722). At the end of the
+    /// stream it is the end of the directory; without a snapshot, it is the
+    /// start.
     ///
     /// There is no "already there": a descriptor Detcore does not track moves
     /// the kernel position with its own reads, so the kernel must be moved

@@ -570,8 +570,11 @@ impl DetFd {
 
     /// Read this open file's directory one kernel buffer at a time until it
     /// is seeked back to 0: its position was moved before the first
-    /// `getdents`, or the guest's buffer cannot take every entry. Any stream
-    /// is dropped, so `lseek` reaches the kernel again.
+    /// `getdents`, or a read of the host directory after the first failed, so
+    /// no snapshot of the whole directory could be taken. A guest buffer too
+    /// small for the next entry does not land here: the stream answers it
+    /// with `EINVAL`, as Linux does. Any stream is dropped, so `lseek`
+    /// reaches the kernel again.
     pub(crate) fn use_host_directory_order(&self) {
         let mut description = self.description();
         description.directory_host_order = true;
