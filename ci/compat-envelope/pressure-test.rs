@@ -2874,6 +2874,7 @@ fn run() -> Result<(), String> {
             for name in GIT_REPOSITORY_LOCATION_VARIABLES {
                 env::remove_var(name);
             }
+            REUSE_BUDGETS.store(true, std::sync::atomic::Ordering::Relaxed);
             self_test(&root)?;
         }
         _ => return Err(format!("unknown command `{command}`\n\n{USAGE}")),
@@ -4593,7 +4594,34 @@ fn sample_score(cell: &CellId, seed: u64) -> u64 {
     value ^ (value >> 31)
 }
 
-fn load_budgets(root: &Path) -> Result<BTreeMap<(String, String, String), CellBudget>, String> {
+type Budgets = BTreeMap<(String, String, String), CellBudget>;
+
+/// Set only by `self-test`, which then reuses each root's budgets instead of
+/// running `hermit-manifest-plan` again. Its cases call [`load_budgets`] on the
+/// same unchanged checkout 110 times, at about a second each: 87% of its 127
+/// seconds in a run measured on 2026-10-04. Every other command leaves this
+/// off, so a `summarize` that checks `run.json` against the tree reads the
+/// tree as it is then, not as an earlier step in the same process saw it.
+static REUSE_BUDGETS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static LOADED_BUDGETS: std::sync::Mutex<BTreeMap<PathBuf, Budgets>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+fn load_budgets(root: &Path) -> Result<Budgets, String> {
+    if !REUSE_BUDGETS.load(std::sync::atomic::Ordering::Relaxed) {
+        return run_manifest_plan_for_budgets(root);
+    }
+    let mut loaded = LOADED_BUDGETS
+        .lock()
+        .map_err(|_| "a thread panicked while loading execution budgets")?;
+    if let Some(budgets) = loaded.get(root) {
+        return Ok(budgets.clone());
+    }
+    let budgets = run_manifest_plan_for_budgets(root)?;
+    loaded.insert(root.to_path_buf(), budgets.clone());
+    Ok(budgets)
+}
+
+fn run_manifest_plan_for_budgets(root: &Path) -> Result<Budgets, String> {
     let output = Command::new("cargo")
         .args([
             "run",
