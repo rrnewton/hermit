@@ -3627,8 +3627,27 @@ impl ResultCandidate {
     }
 }
 
+/// The comparison a retained result measured. Each domain is ranked by source
+/// revision on its own: a newer result in one domain neither supersedes nor
+/// covers a result in another.
+///
+/// A stripped pass is the runner's below-L2 pass. It is retained as ordinary
+/// evidence, but it is not a canonical comparison, so it cannot establish
+/// canonical coverage, retire an older canonical failure as stale, or replace
+/// the canonical relation at its source revision. Retained import folds the
+/// domains of one cell in this declaration order, so a canonical or parity
+/// stamp on the same cell is applied after, and therefore kept over, a stripped
+/// one.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+enum RetainedComparisonDomain {
+    Stripped,
+    Canonical,
+    Parity,
+}
+
 struct RetainedCellResults {
     id: CellId,
+    domain: RetainedComparisonDomain,
     hermit_sha: String,
     detcore_tree: String,
     depth: BTreeMap<String, SourceDepth>,
@@ -10176,6 +10195,7 @@ fn apply_validate_results_from(
                 && row.first_divergent_record.is_none()
                 && row.first_divergent_syscall.is_none();
             let mut expected_output_failures = BTreeMap::new();
+            let stripped_pass = matches!(evidence, ValidateRowEvidence::StrippedMatched);
             let (result, comparison, backend_parity, unavailable_reason) = match evidence {
                 ValidateRowEvidence::Matched {
                     left_info_messages,
@@ -10416,14 +10436,18 @@ fn apply_validate_results_from(
             // it a validate-sourced bound would have strictly WORSE provenance
             // than a pressure-sourced one: no per-run record, no run_id, and no
             // pasteable command to reproduce the divergence it reports.
-            let inserted = if store_invocation || unavailable_reason.is_some() {
+            //
+            // A retained stripped pass has no canonical receipt to carry its
+            // binding, so it keeps its exact invocation: source, run, outer
+            // attempt and evidence digest. That record is what the next
+            // retained import finds and replaces as its own projection.
+            let exact = unavailable_reason.is_some() || (stripped_pass && !store_invocation);
+            let inserted = if store_invocation || exact {
                 observation.invocations.insert(ObservedInvocation {
                     hermit_sha: row.hermit_sha.clone(),
                     run_id: row.run_id.clone(),
-                    attempt: unavailable_reason.as_ref().map(|_| row.attempt),
-                    evidence_sha256: unavailable_reason
-                        .as_ref()
-                        .map(|_| candidate.evidence_identity.clone()),
+                    attempt: exact.then_some(row.attempt),
+                    evidence_sha256: exact.then(|| candidate.evidence_identity.clone()),
                     result,
                     argv: row.argv.clone(),
                     guest_argv: row.guest_argv.clone(),
@@ -10710,17 +10734,21 @@ fn import_results(
         stale_coordinate_cells,
         no_result_cells,
     } = read_retained_results(root, results, &import_cells)?;
+    // A stripped pass is not a canonical comparison, so it does not make a
+    // cell count as one with a retained comparison.
     let retained_cell_count = retained_cells
         .iter()
+        .filter(|cell| cell.domain != RetainedComparisonDomain::Stripped)
         .map(|cell| &cell.id)
         .collect::<BTreeSet<_>>()
         .len();
     let current = read_current_pressure_evidence(root, current_summaries, &before)?;
     let mut tracked = tracked_from(&derived, Some(before.clone()), None, false)?;
     // This command is a projection, not an append-only history store. Remove
-    // only ordinary canonical-comparison projections. Parity receipts measure
-    // another relation and survive even when only ordinary rows were supplied;
-    // series and pressure observations retain their existing ownership.
+    // only ordinary projections: canonical comparisons and the exact
+    // invocations of stripped passes. Parity receipts measure another relation
+    // and survive even when only ordinary rows were supplied; series and
+    // pressure observations retain their existing ownership.
     for cell in &mut tracked.cells {
         remove_imported_validate_projection(cell);
     }
@@ -10728,6 +10756,7 @@ fn import_results(
     let mut fold = ValidateFold::default();
     let mut parity_unavailable = Vec::new();
     let mut historical_without_coordinates = 0usize;
+    let mut retained_stripped_passes = 0usize;
     let mut outcome_counts: BTreeMap<RetainedComparisonState, usize> = BTreeMap::new();
     let mut outcome_rows = Vec::new();
     let mut retained_rows_imported = 0usize;
@@ -10775,7 +10804,11 @@ fn import_results(
         let decision = if has_coordinate {
             Some(retained_coordinate_decision(retained, &current))
         } else {
-            historical_without_coordinates += 1;
+            if retained.domain == RetainedComparisonDomain::Stripped {
+                retained_stripped_passes += 1;
+            } else {
+                historical_without_coordinates += 1;
+            }
             let rows = BTreeMap::from([(retained.id.clone(), retained.candidates.clone())]);
             let one = apply_validate_results_from(
                 &mut tracked,
@@ -10904,6 +10937,9 @@ fn import_results(
     println!(
         "  retained comparisons without a divergence coordinate: {historical_without_coordinates}; eligible cells with no retained canonical comparison: {}",
         no_result_cells.len()
+    );
+    println!(
+        "  retained below-L2 stripped pass(es), in their own comparison domain: {retained_stripped_passes}; they establish no canonical coverage and retire no canonical result"
     );
     println!(
         "  current canonical divergence row(s) imported from typed reports without retained run logs: {}",
@@ -16780,6 +16816,12 @@ struct RetainedImport {
 /// comparisons and complete measured parity attempt histories at the newest
 /// eligible SHA independently for each comparison relation, so disagreement at one revision remains visible instead of being
 /// resolved by file ordering or by a different comparison meaning.
+///
+/// A declared stripped pass is retained in its own
+/// [`RetainedComparisonDomain::Stripped`] domain. Canonical coverage, canonical
+/// supersession and the stale-coordinate exclusion read only the canonical and
+/// parity domains, so a stripped pass neither covers a cell nor retires a
+/// canonical failure.
 fn read_retained_results(
     root: &Path,
     result_root: &Path,
@@ -16868,10 +16910,13 @@ fn read_retained_results(
         }
     }
 
-    // Repeatability and ptrace-reference parity are different measurements.
-    // A newer result in one domain cannot supersede a result in the other.
-    let mut by_cell_and_rank: BTreeMap<(CellId, bool), BTreeMap<usize, Vec<ResultCandidate>>> =
-        BTreeMap::new();
+    // Repeatability, ptrace-reference parity and the below-L2 stripped pass
+    // are different measurements. A newer result in one domain cannot
+    // supersede a result in another.
+    let mut by_cell_and_rank: BTreeMap<
+        (CellId, RetainedComparisonDomain),
+        BTreeMap<usize, Vec<ResultCandidate>>,
+    > = BTreeMap::new();
     for ((id, sha, _run_id), candidates) in grouped {
         // Bind the complete sequence before classification or source-rank
         // filtering. A failed candidate can precede the first parity report.
@@ -16907,7 +16952,7 @@ fn read_retained_results(
         if measured_parity {
             let rank = *history.get(&sha).expect("history checked before grouping");
             by_cell_and_rank
-                .entry((id.clone(), true))
+                .entry((id.clone(), RetainedComparisonDomain::Parity))
                 .or_default()
                 .entry(rank)
                 .or_default()
@@ -16950,7 +16995,7 @@ fn read_retained_results(
             .into_values()
             .next()
             .expect("distinct terminal evidence is nonempty");
-        let is_parity = match candidate
+        let domain = match candidate
             .row
             .comparison_evidence_from(ResultInput::Retained)
             .map_err(|error| {
@@ -16965,26 +17010,34 @@ fn read_retained_results(
             | ValidateRowEvidence::ExpectedOutputFailed { .. } => {
                 continue;
             }
-            ValidateRowEvidence::Matched { .. }
-            | ValidateRowEvidence::Diverged { .. }
-            | ValidateRowEvidence::StrippedMatched => false,
+            ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => {
+                RetainedComparisonDomain::Canonical
+            }
+            ValidateRowEvidence::StrippedMatched => RetainedComparisonDomain::Stripped,
             ValidateRowEvidence::ParityMatched { .. }
-            | ValidateRowEvidence::ParityDiverged { .. } => true,
+            | ValidateRowEvidence::ParityDiverged { .. } => RetainedComparisonDomain::Parity,
         };
         let rank = *history
             .get(&sha)
             .expect("history membership checked before grouping");
         by_cell_and_rank
-            .entry((id, is_parity))
+            .entry((id, domain))
             .or_default()
             .entry(rank)
             .or_default()
             .push(candidate);
     }
 
+    // Coverage means a retained canonical or parity comparison. A stripped
+    // pass is retained below, but a cell that has only stripped passes still
+    // has no retained canonical comparison.
     let no_result_cells = eligible
         .iter()
-        .filter(|id| !by_cell_and_rank.keys().any(|(present, _)| present == *id))
+        .filter(|id| {
+            !by_cell_and_rank.keys().any(|(present, domain)| {
+                present == *id && *domain != RetainedComparisonDomain::Stripped
+            })
+        })
         .map(display_id)
         .collect::<BTreeSet<_>>();
 
@@ -16994,7 +17047,10 @@ fn read_retained_results(
     let mut stale_coordinate_rows = 0usize;
     let mut stale_coordinates = 0usize;
     let mut stale_coordinate_cells = BTreeSet::new();
-    for ((id, _is_parity), mut ranks) in by_cell_and_rank {
+    // Each domain is ranked on its own. A stripped domain holds only passes,
+    // so it never counts an older failure as stale; only a newer canonical
+    // pass excludes an older canonical divergence.
+    for ((id, domain), mut ranks) in by_cell_and_rank {
         let latest_rank = *ranks.keys().next().expect("cell has retained evidence");
         let latest_candidates = ranks.get(&latest_rank).expect("latest rank exists");
         let latest_is_pass = latest_candidates
@@ -17065,6 +17121,7 @@ fn read_retained_results(
         }
         cells.push(RetainedCellResults {
             id,
+            domain,
             hermit_sha: sha,
             detcore_tree,
             depth,
@@ -17469,11 +17526,32 @@ fn retained_coordinate_decision(
     }
 }
 
+/// An exact passing invocation in a direct validate observation is a stripped
+/// pass: the fold records no other passing row with its outer attempt and
+/// evidence digest, because a canonical or parity pass carries a receipt
+/// instead.
+fn is_imported_stripped_pass(observation: &Observation, invocation: &ObservedInvocation) -> bool {
+    observation.provenance == ObservationProvenance::Validate
+        && observation.event_ids.is_empty()
+        && invocation.attempt.is_some()
+        && invocation.evidence_sha256.is_some()
+        && invocation.result == Some(ObservedResult::Pass)
+}
+
 fn remove_imported_validate_projection(cell: &mut TrackedCell) {
     let mut removed_shas = BTreeSet::new();
     cell.observations.retain_mut(|observation| {
+        // A stripped pass is an ordinary projection like a canonical
+        // comparison, but it has no receipt. Its exact invocation identifies
+        // it, so a later import replaces it instead of leaving it behind.
+        let stripped_passes = observation
+            .invocations
+            .iter()
+            .filter(|invocation| is_imported_stripped_pass(observation, invocation))
+            .map(|invocation| invocation.hermit_sha.clone())
+            .collect::<BTreeSet<_>>();
         if observation.provenance != ObservationProvenance::Validate
-            || observation.canonical_comparisons.is_empty()
+            || (observation.canonical_comparisons.is_empty() && stripped_passes.is_empty())
         {
             return true;
         }
@@ -17483,6 +17561,7 @@ fn remove_imported_validate_projection(cell: &mut TrackedCell) {
                 .iter()
                 .map(|receipt| receipt.hermit_sha.clone()),
         );
+        removed_shas.extend(stripped_passes);
         if observation.backend_parity_comparisons.is_empty() {
             return false;
         }
@@ -21965,6 +22044,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     };
     let retained_cell = |candidates: Vec<ResultCandidate>| RetainedCellResults {
         id: validate_id.clone(),
+        domain: RetainedComparisonDomain::Canonical,
         hermit_sha: "sha-1".into(),
         detcore_tree: "tree-1".into(),
         depth: depth_fixture.clone(),
@@ -33902,6 +33982,369 @@ mod post_verdict_transaction_tests {
         assert!(
             error.contains("0 missing, 1 non-passing") && error.contains(&display_id(&id)),
             "{error}"
+        );
+    }
+
+    // https://github.com/rrnewton/hermit/issues/3655, review finding 1: a
+    // declared stripped pass is retained in its own comparison domain. It is
+    // ordinary, non-parity evidence, and it neither establishes canonical
+    // coverage nor supersedes or retires a canonical result.
+
+    fn goalpost_write_retained_rows(fixture: &Fixture, rows: &[JsonValue]) {
+        let mut bytes = Vec::new();
+        for row in rows {
+            bytes.extend(serde_json::to_vec(row).unwrap());
+            bytes.push(b'\n');
+        }
+        fs::write(fixture.options.results.join("results.jsonl"), bytes).unwrap();
+    }
+
+    #[test]
+    fn goalpost_stripped_only_does_not_count_as_retained_canonical_coverage() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        let (id, stripped) = stripped_row(&measured);
+        goalpost_write_retained_rows(&fixture, &[stripped]);
+        let retained = read_retained_results(
+            &fixture.root,
+            &fixture.options.results,
+            &BTreeSet::from([id.clone()]),
+        )
+        .unwrap();
+        assert_eq!(retained.cells.len(), 1, "retain the below-L2 pass");
+        assert_eq!(retained.terminal_comparisons, 0);
+        assert_eq!(
+            retained.no_result_cells,
+            BTreeSet::from([display_id(&id)]),
+            "a stripped-only cell still has no retained canonical comparison"
+        );
+    }
+
+    #[test]
+    fn goalpost_stripped_pass_does_not_retire_older_canonical_divergence() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        let older = fixture.options.results_head.clone().unwrap();
+        let newer = fixture.options.expected_head.clone();
+        let (id, stripped) = stripped_row(&newer);
+        let (_, old_template) = stripped_row(&older);
+        let mut report = verify_canonical_report(&older);
+        report["verdict"] = "diverged".into();
+        report["verified"] = false.into();
+        report["bitwise_parity"] = false.into();
+        report["first_divergent_record"] = 1.into();
+        let mut old = with_report(&old_template, &report);
+        old["relaxations"] = serde_json::json!([]);
+        let argv = vec![
+            "hermit",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            "fixture",
+        ];
+        old["argv"] = serde_json::json!(argv);
+        old["effective_args"] = serde_json::json!(&argv[1..]);
+        old["shell_command"] = literal_shell_command(
+            "/repo",
+            &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        )
+        .into();
+        for field in ["argv", "shell_command"] {
+            old["attempts"][0][field] = old[field].clone();
+        }
+        old["run_id"] = "older-canonical-divergence".into();
+        old["outcome"] = "FAIL".into();
+        old["result"] = "determinism-failure".into();
+        old["failure_class"] = "product_failure".into();
+        old["first_divergent_record"] = 1.into();
+        old["attempts"][0]["outcome"] = "FAIL".into();
+        old["attempts"][0]["status"] = 1.into();
+        old["attempts"][0]["first_divergent_record"] = 1.into();
+        let typed: ResultRow = serde_json::from_value(old.clone()).unwrap();
+        assert!(
+            matches!(
+                typed.comparison_evidence_from(ResultInput::Retained),
+                Ok(ValidateRowEvidence::Diverged { .. })
+            ),
+            "control must be a valid canonical divergence"
+        );
+        goalpost_write_retained_rows(&fixture, &[old, stripped]);
+        let retained = read_retained_results(
+            &fixture.root,
+            &fixture.options.results,
+            &BTreeSet::from([id]),
+        )
+        .unwrap();
+        assert!(
+            retained
+                .cells
+                .iter()
+                .flat_map(|cell| &cell.candidates)
+                .any(|candidate| candidate.row.run_id == "older-canonical-divergence"),
+            "a below-L2 pass cannot supersede the canonical relation"
+        );
+        assert_eq!(retained.stale_coordinate_rows, 0);
+        assert_eq!(retained.terminal_comparisons, 1);
+    }
+
+    /// The stripped compatibility cell's canonical `--verify-strict` row at
+    /// `measured`, whose canonical report diverged at record 1: a valid
+    /// canonical failure.
+    fn canonical_divergence_row(measured: &str, run_id: &str) -> JsonValue {
+        let (_, template) = stripped_row(measured);
+        let mut report = verify_canonical_report(measured);
+        report["verdict"] = "diverged".into();
+        report["verified"] = false.into();
+        report["bitwise_parity"] = false.into();
+        report["first_divergent_record"] = 1.into();
+        let mut row = with_report(&template, &report);
+        row["relaxations"] = serde_json::json!([]);
+        let argv = vec![
+            "hermit",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--",
+            "fixture",
+        ];
+        row["argv"] = serde_json::json!(argv);
+        row["effective_args"] = serde_json::json!(&argv[1..]);
+        row["shell_command"] = literal_shell_command(
+            "/repo",
+            &BTreeMap::from([("LC_ALL".into(), "C".into())]),
+            &argv.iter().map(|arg| (*arg).into()).collect::<Vec<_>>(),
+        )
+        .into();
+        for field in ["argv", "shell_command"] {
+            row["attempts"][0][field] = row[field].clone();
+        }
+        row["run_id"] = run_id.into();
+        row["outcome"] = "FAIL".into();
+        row["result"] = "determinism-failure".into();
+        row["failure_class"] = "product_failure".into();
+        row["first_divergent_record"] = 1.into();
+        row["attempts"][0]["outcome"] = "FAIL".into();
+        row["attempts"][0]["status"] = 1.into();
+        row["attempts"][0]["first_divergent_record"] = 1.into();
+        let typed: ResultRow = serde_json::from_value(row.clone()).unwrap();
+        assert!(
+            matches!(
+                typed.comparison_evidence_from(ResultInput::Retained),
+                Ok(ValidateRowEvidence::Diverged { .. })
+            ),
+            "control must be a valid canonical divergence"
+        );
+        row
+    }
+
+    /// Commit an empty series file to the fixture ledger, as the other import
+    /// fixtures do before their first import.
+    fn capture_empty_series(fixture: &Fixture) {
+        fs::create_dir_all(fixture.ledger.join("series/hermit/fixture")).unwrap();
+        fs::write(
+            fixture.ledger.join("series/hermit/fixture/2026-09.jsonl"),
+            b"",
+        )
+        .unwrap();
+        git(&fixture.ledger, &["add", "series", "scorecard"]);
+        commit(&fixture.ledger, "captured empty fixture series");
+    }
+
+    /// Import `rows` as the only retained results file, beside the one
+    /// current pressure row for the fixture's catalogue cell that
+    /// `import-results` requires.
+    fn import_retained_rows(fixture: &Fixture, rows: &[JsonValue]) -> Result<(), String> {
+        goalpost_write_retained_rows(fixture, rows);
+        let summary = fixture._directory.path().join("current-summary.json");
+        fs::write(
+            &summary,
+            serde_json::to_vec(&PressureSummary {
+                schema: PRESSURE_SUMMARY_SCHEMA,
+                hermit_sha: fixture.options.expected_head.clone(),
+                detcore_tree: git_rev_parse(&fixture.root, "HEAD:detcore").unwrap(),
+                source_tree_dirty: false,
+                rows: vec![PressureSummaryRow {
+                    cell: fixture.id.clone(),
+                    repetition: Some(1),
+                    attempt: 1,
+                    result: "pass".into(),
+                    verification: None,
+                    evidence_errors: Vec::new(),
+                    invocation: None,
+                }],
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        import_results(
+            &fixture.root,
+            &fixture.options.results,
+            std::slice::from_ref(&summary),
+        )
+    }
+
+    fn tracked_cell<'a>(tracked: &'a TrackedCells, id: &CellId) -> &'a TrackedCell {
+        tracked.cells.iter().find(|cell| &cell.id == id).unwrap()
+    }
+
+    /// `import-results` is a projection: it removes the ordinary rows it
+    /// imported before and folds the supplied ones. A retained stripped pass
+    /// has no canonical receipt, so it keeps its exact binding (source, run,
+    /// outer attempt and evidence digest), and that binding is what lets a
+    /// later import own it and replace it instead of leaving it behind. A
+    /// replacement must give the same bytes as importing it into the
+    /// untouched baseline, and re-importing it must change nothing.
+    #[test]
+    fn a_reimported_stripped_pass_replaces_its_own_projection() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        capture_empty_series(&fixture);
+        let older = fixture.options.results_head.clone().unwrap();
+        let newer = fixture.options.expected_head.clone();
+        let (id, first) = stripped_row(&older);
+        import_retained_rows(&fixture, &[first]).unwrap();
+        let imported = fixture.cells();
+        let cell = tracked_cell(&imported, &id);
+        assert_eq!(cell.observations.len(), 1, "{:?}", cell.observations);
+        assert_eq!(
+            cell.observations[0].results,
+            BTreeSet::from([ObservedResult::Pass])
+        );
+        assert_eq!(
+            cell.observations[0].hermit_shas,
+            BTreeSet::from([older.clone()])
+        );
+        assert!(
+            cell.observations[0].canonical_comparisons.is_empty()
+                && cell.observations[0].backend_parity_comparisons.is_empty(),
+            "a stripped pass recorded a canonical or parity comparison"
+        );
+
+        let (_, mut replacement) = stripped_row(&newer);
+        replacement["run_id"] = "replacement-import".into();
+        import_retained_rows(&fixture, std::slice::from_ref(&replacement)).unwrap();
+        let replaced_cells = fixture.cells();
+        let cell = tracked_cell(&replaced_cells, &id);
+        assert_eq!(
+            cell.observations
+                .iter()
+                .flat_map(|observation| observation.hermit_shas.iter().cloned())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([newer.clone()]),
+            "a re-import left the replaced stripped pass behind: {:?}",
+            cell.observations
+        );
+        let identity = read_retained_results(
+            &fixture.root,
+            &fixture.options.results,
+            &BTreeSet::from([id.clone()]),
+        )
+        .unwrap()
+        .cells[0]
+            .candidates[0]
+            .evidence_identity
+            .clone();
+        let invocations = cell
+            .observations
+            .iter()
+            .flat_map(|observation| observation.invocations.iter())
+            .collect::<Vec<_>>();
+        assert_eq!(invocations.len(), 1, "{invocations:?}");
+        assert_eq!(
+            (
+                invocations[0].hermit_sha.as_str(),
+                invocations[0].run_id.as_str(),
+                invocations[0].attempt,
+                invocations[0].evidence_sha256.as_deref(),
+                invocations[0].result,
+            ),
+            (
+                newer.as_str(),
+                "replacement-import",
+                Some(1),
+                Some(identity.as_str()),
+                Some(ObservedResult::Pass),
+            ),
+            "the retained stripped pass lost its exact binding"
+        );
+        let stamp = cell.last_tested.as_ref().unwrap();
+        assert_eq!(stamp.hermit_sha, newer);
+        assert!(
+            stamp.check.is_none() && stamp.comparison_verdict.is_none(),
+            "a stripped pass became a regression baseline"
+        );
+        let replaced = read_history_files(&fixture.root).unwrap();
+        import_retained_rows(&fixture, std::slice::from_ref(&replacement)).unwrap();
+        assert!(
+            read_history_files(&fixture.root).unwrap() == replaced,
+            "re-importing the same stripped pass changed the history"
+        );
+        fixture.restore();
+        import_retained_rows(&fixture, std::slice::from_ref(&replacement)).unwrap();
+        assert!(
+            read_history_files(&fixture.root).unwrap() == replaced,
+            "the replacing import kept bytes of the stripped pass it replaced"
+        );
+    }
+
+    /// A newer stripped pass does not retire an older canonical failure in
+    /// `import-results`. The canonical receipt and its divergence verdict
+    /// stay active, and the stripped pass is recorded beside them as an exact
+    /// invocation in its own domain.
+    #[test]
+    fn an_imported_stripped_pass_keeps_an_older_canonical_failure_active() {
+        let _fixture_lock = history_fixture_lock();
+        let fixture = Fixture::new();
+        capture_empty_series(&fixture);
+        let older = fixture.options.results_head.clone().unwrap();
+        let newer = fixture.options.expected_head.clone();
+        let (id, stripped) = stripped_row(&newer);
+        let failed = canonical_divergence_row(&older, "older-canonical-divergence");
+        import_retained_rows(&fixture, &[failed, stripped]).unwrap();
+        let tracked = fixture.cells();
+        let cell = tracked_cell(&tracked, &id);
+        assert_eq!(
+            cell.observations
+                .iter()
+                .flat_map(|observation| observation.canonical_comparisons.iter())
+                .map(|receipt| (
+                    receipt.hermit_sha.as_str(),
+                    receipt.run_id.as_str(),
+                    receipt.result
+                ))
+                .collect::<Vec<_>>(),
+            [(
+                older.as_str(),
+                "older-canonical-divergence",
+                ObservedResult::DeterminismFailure
+            )],
+            "a newer stripped pass retired the canonical failure"
+        );
+        assert_eq!(
+            cell.observations
+                .iter()
+                .flat_map(|observation| observation.invocations.iter())
+                .filter(|invocation| invocation.result == Some(ObservedResult::Pass))
+                .map(|invocation| (invocation.hermit_sha.as_str(), invocation.attempt))
+                .collect::<Vec<_>>(),
+            [(newer.as_str(), Some(1))],
+            "the stripped pass was not retained in its own domain"
+        );
+        assert!(
+            cell.observations
+                .iter()
+                .all(|observation| observation.backend_parity_comparisons.is_empty())
+        );
+        let stamp = cell.last_tested.as_ref().unwrap();
+        assert_eq!(
+            (stamp.hermit_sha.as_str(), stamp.comparison_verdict),
+            (older.as_str(), Some(StampComparisonVerdict::Diverged)),
+            "the stripped pass replaced the canonical stamp"
         );
     }
 

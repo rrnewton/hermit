@@ -301,6 +301,13 @@ history, and selects the newest such commit independently for every applicable
 cell. If several retained runs at that commit disagree, it imports every result
 instead of resolving the conflict by file order.
 
+A retained pass under a declared stripped comparator (the default `--verify`,
+below L2) is selected in its own comparison domain, so a cell's newest stripped
+pass and its newest canonical comparison are each imported. The stripped pass
+records a Pass bound to its exact run, outer attempt and evidence digest. It
+records no canonical comparison, establishes no canonical coverage, and retires
+no canonical result, so an older canonical failure stays active beside it.
+
 A retained comparison without a divergence position is imported as historical
 evidence with its own SHA. A retained position is handled only after a current
 pressure summary classifies it: FRESH imports the matching retained position;
