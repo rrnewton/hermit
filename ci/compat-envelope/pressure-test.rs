@@ -663,7 +663,17 @@ struct ManifestCellFacts {
     /// harness selects an enabled cell with `--include-manual`, whatever its
     /// `ci` flag says, and a disabled one only with `--probe-disabled`.
     enabled: bool,
+    /// The test's argv names the real-compat fixture root under
+    /// `{{VALIDATE_RUN_STATE}}`, which validation's [`VALIDATE_FIXTURE_STEP`]
+    /// fills before any such cell runs.
+    reads_compat_fixtures: bool,
 }
+
+/// The fixture root [`VALIDATE_FIXTURE_STEP`] fills, relative to
+/// VALIDATE_RUN_STATE.
+const COMPAT_FIXTURE_ROOT: &str = "strict-compat/real-compat-fixtures";
+/// The per-run VALIDATE_RUN_STATE directory, relative to the results directory.
+const VALIDATE_RUN_STATE_DIR: &str = "validate-run-state";
 
 /// Every manifest cell's [`ManifestCellFacts`], from the same manifest set and
 /// selection code `test-harness` uses: both populations, every run type,
@@ -673,6 +683,10 @@ fn manifest_cell_facts(
 ) -> Result<BTreeMap<(String, String, String), ManifestCellFacts>, String> {
     use hermit_manifest_plan::runner::Population;
     use hermit_manifest_plan::runner::Selection;
+    let fixture_root = format!(
+        "{}/{COMPAT_FIXTURE_ROOT}",
+        hermit_manifest_plan::manifest_corpus::VALIDATE_RUN_STATE_PLACEHOLDER
+    );
     let mut facts = BTreeMap::new();
     for population in [Population::Enabled, Population::Disabled] {
         let cells = manifests.select(&Selection {
@@ -697,6 +711,15 @@ fn manifest_cell_facts(
             .into_iter()
             .map(str::to_string)
             .collect();
+            let reads_compat_fixtures = match &cell.test.direct {
+                Some(hermit_manifest_plan::runner::DirectCommand::Argv(argv)) => {
+                    argv.iter().any(|arg| arg.contains(&fixture_root))
+                }
+                Some(hermit_manifest_plan::runner::DirectCommand::Shell(command)) => {
+                    command.contains(&fixture_root)
+                }
+                None => false,
+            };
             let key = (
                 cell.id.test.clone(),
                 cell.id.mode.clone(),
@@ -708,6 +731,7 @@ fn manifest_cell_facts(
                     ManifestCellFacts {
                         run_types,
                         enabled: cell.enabled,
+                        reads_compat_fixtures,
                     },
                 )
                 .is_some()
@@ -4329,7 +4353,9 @@ fn require_accounted_memory_phases(dag: &DagConfig) -> Result<(), String> {
         match step.group.as_str() {
             // Every build is initial: the LiteInst runtime is staged inside
             // build.workspace, so no build may overlap a preparation or cell.
-            "pre" | "gate" | "setup" | "build" => {
+            // Validation's fixture preparation runs after every build and
+            // before every preparation and cell that reads the fixtures.
+            "pre" | "gate" | "setup" | "build" | "compatprep" => {
                 early.insert(tag);
             }
             "prepare" => {
@@ -4429,7 +4455,12 @@ fn declared_memory_at_manifest_guest_cap(
     let early = checked_memory_sum(
         dag.steps
             .iter()
-            .filter(|step| matches!(step.group.as_str(), "pre" | "gate" | "setup" | "build"))
+            .filter(|step| {
+                matches!(
+                    step.group.as_str(),
+                    "pre" | "gate" | "setup" | "build" | "compatprep"
+                )
+            })
             .map(cap_of)
             .collect::<Result<Vec<_>, _>>()?
             .into_iter(),
@@ -4911,6 +4942,75 @@ fn retain_required_build_dependencies(
     Ok(())
 }
 
+/// Validation's [`VALIDATE_FIXTURE_STEP`], copied for the pressure graph. Its
+/// command, limits and resource hint are validation's, byte for byte. Three
+/// substitutions are documented here and checked by the self-test: the command
+/// is wrapped in the same completion marker as the copied build nodes, so a
+/// resumed run does not rebuild finished fixtures; its validation-only
+/// ordering prerequisites (lint, documentation and unit-test nodes this graph
+/// does not have) are replaced by every build node of this graph, the "after
+/// every non-guest Cargo node" ordering its description asks for; and the
+/// run's VALIDATE_RUN_STATE, which validation exports to every node, is set in
+/// the node's environment.
+fn compat_fixture_step(
+    canonical: &DagConfig,
+    results: &Path,
+    run_state: &Path,
+    required_builds: &BTreeSet<&str>,
+) -> Result<Step, String> {
+    let matches: Vec<&Step> = canonical
+        .steps
+        .iter()
+        .filter(|step| step.tag() == VALIDATE_FIXTURE_STEP)
+        .collect();
+    let [source] = matches.as_slice() else {
+        return Err(format!(
+            "{PORTABLE_DAG} has {} {VALIDATE_FIXTURE_STEP} node(s); the pressure graph copies exactly one",
+            matches.len()
+        ));
+    };
+    // Refuse a reshaped validation command rather than guess where it now
+    // writes: the fixture root the manifests name must be what it fills.
+    let expected_tail = format!(" $VALIDATE_RUN_STATE/{COMPAT_FIXTURE_ROOT}");
+    if !source.cmd.ends_with(&expected_tail) || source.cmd.contains(PINNED_ROOT_LAUNCHER) {
+        return Err(format!(
+            "{PORTABLE_DAG} {VALIDATE_FIXTURE_STEP} no longer runs on the host into $VALIDATE_RUN_STATE/{COMPAT_FIXTURE_ROOT}: {}",
+            source.cmd
+        ));
+    }
+    if source.env.contains_key("VALIDATE_RUN_STATE") {
+        return Err(format!(
+            "{PORTABLE_DAG} {VALIDATE_FIXTURE_STEP} sets its own VALIDATE_RUN_STATE"
+        ));
+    }
+    // The copied command expands $VALIDATE_RUN_STATE unquoted, as validation
+    // does, so the path must survive word splitting and globbing unchanged.
+    let state = run_state.to_string_lossy().into_owned();
+    if state
+        .chars()
+        .any(|ch| ch.is_whitespace() || matches!(ch, '*' | '?' | '[' | ']'))
+    {
+        return Err(format!(
+            "results directory {} gives a VALIDATE_RUN_STATE that {VALIDATE_FIXTURE_STEP}'s unquoted expansion would split",
+            results.display()
+        ));
+    }
+    let mut step = (*source).clone();
+    let marker = build_marker(results, VALIDATE_FIXTURE_STEP);
+    step.cmd = format!(
+        "mkdir -p {state_dir}; if test -f {marker}; then exit 0; fi; ( {command} ) && printf 'ok\\n' > {marker}",
+        state_dir = shell_quote(&marker.parent().unwrap().to_string_lossy()),
+        marker = shell_quote(&marker.to_string_lossy()),
+        command = source.cmd,
+    );
+    step.deps = required_builds
+        .iter()
+        .map(|tag| (*tag).to_string())
+        .collect();
+    step.env.insert("VALIDATE_RUN_STATE".into(), state);
+    Ok(step)
+}
+
 /// Clone the canonical steps with the host variants of the one-build producers
 /// under their base names, rewriting every dependency on them. A missing or
 /// ambiguous host variant, or one wrapped in the pinned-root launcher, refuses:
@@ -5028,12 +5128,19 @@ fn write_plan_after_scorecard_check(
         cells_file_sha256,
         manifest_facts,
     } = pressure_cells(root, selection)?;
-    let run_types_of = |cell: &CellId| -> Result<String, String> {
-        let facts = manifest_facts
+    let facts_of = |cell: &CellId| -> Result<&ManifestCellFacts, String> {
+        manifest_facts
             .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
-            .ok_or_else(|| format!("no manifest facts for {}", display_id(cell)))?;
-        run_type_filter(&facts.run_types)
+            .ok_or_else(|| format!("no manifest facts for {}", display_id(cell)))
     };
+    let run_types_of =
+        |cell: &CellId| -> Result<String, String> { run_type_filter(&facts_of(cell)?.run_types) };
+    // Validation fills the real-compat fixtures once per run, before the cells
+    // that read them; so does this graph, with validation's own node.
+    let mut reads_compat_fixtures = false;
+    for tracked in &cells {
+        reads_compat_fixtures |= facts_of(&tracked.id)?.reads_compat_fixtures;
+    }
     validate_guest_caps_against_selected_demand(&cells, selection)?;
     if checked_scorecard.enforce_host_capabilities {
         require_selected_kvm_capability(&cells, &strict_kvm_capability())?;
@@ -5057,7 +5164,7 @@ fn write_plan_after_scorecard_check(
         cells.len(),
         selection.run_count(),
         preparation_by_test.len(),
-        required_builds.len(),
+        required_builds.len() + usize::from(reads_compat_fixtures),
     )?;
     let timeout_policy = PressureTimeoutPolicy::from_env()?;
     let selected_budgets = cells
@@ -5081,6 +5188,10 @@ fn write_plan_after_scorecard_check(
         selection.kvm_guest_cap(),
     )?;
     fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
+    // Validation creates its VALIDATE_RUN_STATE before any node runs.
+    let run_state = results.join(VALIDATE_RUN_STATE_DIR);
+    fs::create_dir_all(&run_state)
+        .map_err(|e| format!("cannot create {}: {e}", run_state.display()))?;
     if let Some(parent) = output.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
@@ -5145,6 +5256,14 @@ fn write_plan_after_scorecard_check(
             required_builds.len()
         ));
     }
+    if reads_compat_fixtures {
+        steps.push(compat_fixture_step(
+            &canonical,
+            results,
+            &run_state,
+            &required_builds,
+        )?);
+    }
 
     let sha = git_output(root, &["rev-parse", "HEAD"])?;
     let detcore_tree = git_output(root, &["rev-parse", "HEAD:detcore"])?;
@@ -5174,12 +5293,14 @@ fn write_plan_after_scorecard_check(
              printf '{incomplete}\\n' > {status}; status=0; \
              timeout --kill-after=10s {pressure_seconds}s env \
              E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} \
+             VALIDATE_RUN_STATE={run_state} \
              target/debug/test-harness build --include-manual --include-occasional \
              --test {test} --mode {mode}{backend}{run_types} || status=$?; \
              printf '%s\\n' \"$status\" > {status}; exit 0",
             status_dir = shell_quote(&status_path.parent().unwrap().to_string_lossy()),
             results = shell_quote(&results.to_string_lossy()),
             build_root = shell_quote(&build_root.to_string_lossy()),
+            run_state = shell_quote(&run_state.to_string_lossy()),
             test = shell_quote(&test),
             mode = shell_quote(&cell.mode),
             backend = backend,
@@ -5188,11 +5309,14 @@ fn write_plan_after_scorecard_check(
             incomplete = INCOMPLETE_ATTEMPT_STATUS,
         );
         let wall = preparation_node_timeout(budget)?;
-        let preparation_deps = if selection.is_exact() {
+        let mut preparation_deps = if selection.is_exact() {
             selected_cell_dependencies(true, false, &cell.mode, &cell.backend, None)
         } else {
             vec!["setup.manifest_plan".into(), "build.e2e_artifact".into()]
         };
+        if reads_compat_fixtures {
+            preparation_deps.push(VALIDATE_FIXTURE_STEP.into());
+        }
         steps.push(Step {
             group: "prepare".into(),
             job,
@@ -5329,7 +5453,8 @@ fn write_plan_after_scorecard_check(
             let cmd = format!(
                 "mkdir -p {cell_dir}; if test -f {status_file}; then exit 0; fi; \
              printf '{incomplete}\\n' > {status_file}; {preparation_guard}status=0; \
-             env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} E2E_RUN_ID={run_id} \
+             env E2E_RESULT_ROOT={results} E2E_BUILD_ROOT={build_root} \
+             VALIDATE_RUN_STATE={run_state} E2E_RUN_ID={run_id} \
              {run_index_env}={run_index} HERMIT_EPOCH={hermit_epoch} E2E_KEEP_VERIFY_LOGS=1 \
              {post_pass_env}=0 {harness} \
              || status=$?; \
@@ -5339,6 +5464,7 @@ fn write_plan_after_scorecard_check(
                 cell_dir = shell_quote(&cell_dir.to_string_lossy()),
                 results = shell_quote(&results.to_string_lossy()),
                 build_root = shell_quote(&build_root.to_string_lossy()),
+                run_state = shell_quote(&run_state.to_string_lossy()),
                 run_id = shell_quote(&evidence_run_id),
                 run_index_env = E2E_RUN_INDEX_ENV,
                 run_index = run_index,
@@ -5367,13 +5493,16 @@ fn write_plan_after_scorecard_check(
             if let Some(resource) = dbt_host_tmp_resource(cell) {
                 resources.insert(resource, 1);
             }
-            let deps = selected_cell_dependencies(
+            let mut deps = selected_cell_dependencies(
                 selection.is_exact(),
                 selection.uses_shared_preparation(),
                 &cell.mode,
                 &cell.backend,
                 preparation_tags.get(&cell.test).map(String::as_str),
             );
+            if reads_compat_fixtures {
+                deps.push(VALIDATE_FIXTURE_STEP.into());
+            }
             steps.push(Step {
                 group: "cell".into(),
                 job: slug,
@@ -11832,6 +11961,215 @@ fn focused_run_type_selection_self_test(root: &Path, scratch: &Path) -> Result<(
     )
 }
 
+/// The validation node that fills `$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures`.
+const VALIDATE_FIXTURE_STEP: &str = "compatprep.fixtures";
+
+/// Plan `cells` under `scratch` and check how the plan provides
+/// VALIDATE_RUN_STATE: every preparation and cell node names the run's own
+/// state directory, and the fixture preparation copied from validation is
+/// present, byte-identical in its command and limits, ahead of every
+/// preparation and cell, exactly when `expect_fixtures`.
+fn validate_run_state_plan_check(
+    root: &Path,
+    scratch: &Path,
+    label: &str,
+    cells: &[(&str, &str, &str)],
+    expect_fixtures: bool,
+) -> Result<(), String> {
+    let ids: Vec<CellId> = cells
+        .iter()
+        .map(|(test, mode, backend)| CellId {
+            lane: "portable".into(),
+            category: test
+                .split_once('/')
+                .map_or("", |(category, _)| category)
+                .into(),
+            test: (*test).into(),
+            mode: (*mode).into(),
+            backend: (*backend).into(),
+        })
+        .collect();
+    let checked = CheckedScorecard {
+        root,
+        enforce_host_capabilities: false,
+        memory_budget_override: Some(i64::MAX),
+    };
+    let cells_file = scratch.join(format!("run-state-{label}.jsonl"));
+    fs::write(&cells_file, canonical_cells_jsonl(&ids)?)
+        .map_err(|error| format!("cannot write {}: {error}", cells_file.display()))?;
+    let plan = scratch.join(format!("run-state-{label}-plan"));
+    let selection = CellSelection {
+        cells_file: Some(cells_file),
+        repetitions: Some(1),
+        run_timeout_seconds: Some(1_000_000),
+        ..CellSelection::default()
+    };
+    let (_, dag) =
+        write_plan_after_scorecard_check(&checked, &plan, &plan.join("dag.json"), &selection)?;
+    let state = plan.join("validate-run-state");
+    let assignment = format!(
+        " VALIDATE_RUN_STATE={} ",
+        shell_quote(&state.to_string_lossy())
+    );
+    for step in dag
+        .steps
+        .iter()
+        .filter(|step| matches!(step.group.as_str(), "prepare" | "cell"))
+    {
+        if !step.cmd.contains(&assignment) {
+            return Err(format!(
+                "{label}: {} does not give the harness the run's VALIDATE_RUN_STATE: {}",
+                step.tag(),
+                step.cmd
+            ));
+        }
+        let waits = step.deps.iter().any(|dep| dep == VALIDATE_FIXTURE_STEP);
+        if waits != expect_fixtures {
+            return Err(format!(
+                "{label}: {} waits for {VALIDATE_FIXTURE_STEP}: {waits}, expected {expect_fixtures}",
+                step.tag()
+            ));
+        }
+    }
+    let copies: Vec<&Step> = dag
+        .steps
+        .iter()
+        .filter(|step| step.tag() == VALIDATE_FIXTURE_STEP)
+        .collect();
+    if !expect_fixtures {
+        return if copies.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "{label}: no selected cell reads the fixtures, but the plan prepares them"
+            ))
+        };
+    }
+    let [copy] = copies.as_slice() else {
+        return Err(format!(
+            "{label}: the plan has {} {VALIDATE_FIXTURE_STEP} node(s); a selected cell reads the fixtures",
+            copies.len()
+        ));
+    };
+    let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
+        .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
+    let canonical =
+        dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
+    let source = canonical
+        .steps
+        .iter()
+        .find(|step| step.tag() == VALIDATE_FIXTURE_STEP)
+        .ok_or_else(|| format!("{PORTABLE_DAG} has no {VALIDATE_FIXTURE_STEP}"))?;
+    let marker = build_marker(&plan, VALIDATE_FIXTURE_STEP);
+    let expected_cmd = format!(
+        "mkdir -p {state}; if test -f {marker}; then exit 0; fi; ( {command} ) && printf 'ok\\n' > {marker}",
+        state = shell_quote(&marker.parent().unwrap().to_string_lossy()),
+        marker = shell_quote(&marker.to_string_lossy()),
+        command = source.cmd,
+    );
+    let mut expected_deps: Vec<String> = required_build_tags(None)
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+    expected_deps.sort();
+    let mut deps = copy.deps.clone();
+    deps.sort();
+    if copy.cmd != expected_cmd
+        || copy.timeout != source.timeout
+        || copy.cpu_timeout != source.cpu_timeout
+        || copy.hint.hard_mem_max_bytes != source.hint.hard_mem_max_bytes
+        || copy.hint.rss_baseline_bytes != source.hint.rss_baseline_bytes
+        || copy.hint.resources != source.hint.resources
+        || copy.env.get("VALIDATE_RUN_STATE") != Some(&state.to_string_lossy().into_owned())
+        || copy.env.len() != source.env.len() + 1
+        || deps != expected_deps
+    {
+        return Err(format!(
+            "{label}: {VALIDATE_FIXTURE_STEP} is not validation's node with only the documented substitutions: cmd={} deps={:?} env={:?}",
+            copy.cmd, copy.deps, copy.env
+        ));
+    }
+    Ok(())
+}
+
+/// Every preparation and cell names the run's VALIDATE_RUN_STATE, and a plan
+/// whose cells read the real-compat fixtures prepares them first, as
+/// validation does.
+fn validate_run_state_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
+    validate_run_state_plan_check(
+        root,
+        scratch,
+        "fixtures",
+        &[
+            ("c-programs/prctl-identity", "verify", "dbt"),
+            ("compat/shuf", "verify", "sabre"),
+        ],
+        true,
+    )?;
+    validate_run_state_plan_check(
+        root,
+        scratch,
+        "no-fixtures",
+        &[("c-programs/prctl-identity", "verify", "dbt")],
+        false,
+    )?;
+    compat_fixture_step_refusal_self_test(root)
+}
+
+/// The copied fixture node refuses a validation node that no longer fills the
+/// fixture root the manifests name, a duplicated one, and a run state its
+/// unquoted expansion would split.
+fn compat_fixture_step_refusal_self_test(root: &Path) -> Result<(), String> {
+    let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
+        .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
+    let canonical =
+        dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
+    let builds = required_build_tags(None);
+    let results = Path::new("/results");
+    let state = results.join(VALIDATE_RUN_STATE_DIR);
+    compat_fixture_step(&canonical, results, &state, &builds)
+        .map_err(|e| format!("the current {VALIDATE_FIXTURE_STEP} was refused: {e}"))?;
+    let index = canonical
+        .steps
+        .iter()
+        .position(|step| step.tag() == VALIDATE_FIXTURE_STEP)
+        .ok_or_else(|| format!("{PORTABLE_DAG} has no {VALIDATE_FIXTURE_STEP}"))?;
+    let mut moved = canonical.clone();
+    moved.steps[index].cmd = moved.steps[index]
+        .cmd
+        .replace("strict-compat/real-compat-fixtures", "elsewhere/fixtures");
+    let mut duplicated = canonical.clone();
+    duplicated.steps.push(canonical.steps[index].clone());
+    let mut missing = canonical.clone();
+    missing.steps.remove(index);
+    for (label, dag, expected) in [
+        ("moved fixture root", &moved, "no longer runs on the host"),
+        ("duplicated node", &duplicated, "has 2"),
+        ("missing node", &missing, "has 0"),
+    ] {
+        match compat_fixture_step(dag, results, &state, &builds) {
+            Err(error) if error.contains(expected) => {}
+            other => {
+                return Err(format!(
+                    "{VALIDATE_FIXTURE_STEP} copy accepted a {label}: {other:?}"
+                ));
+            }
+        }
+    }
+    let spaced = Path::new("/results with space");
+    match compat_fixture_step(
+        &canonical,
+        spaced,
+        &spaced.join(VALIDATE_RUN_STATE_DIR),
+        &builds,
+    ) {
+        Err(error) if error.contains("would split") => Ok(()),
+        other => Err(format!(
+            "{VALIDATE_FIXTURE_STEP} copy accepted a run state with a space: {other:?}"
+        )),
+    }
+}
+
 fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Result<(), String> {
     let git_dir = source.join(".git");
     let git_dir_text = git_dir.to_string_lossy().into_owned();
@@ -13802,6 +14140,7 @@ fn self_test(root: &Path) -> Result<(), String> {
 
     disabled_cells_file_self_test(root, &scratch)?;
     focused_run_type_selection_self_test(root, &scratch)?;
+    validate_run_state_self_test(root, &scratch)?;
 
     let cells_file_results = scratch.join("cells-file-plan");
     let cells_file_budget_keys = cells_file_ids
@@ -15016,19 +15355,27 @@ fn self_test(root: &Path) -> Result<(), String> {
         .collect::<BTreeSet<_>>()
         .len();
     let expected_green_cell_runs = expected_green_ids.len() * green_batch_selection.run_count();
+    // Green compat cells read the real-compat fixtures, so the batch also
+    // carries validation's fixture node, and every preparation waits for it
+    // (validate_run_state_self_test checks when the node is present).
+    let mut expected_preparation_deps = vec![
+        "setup.manifest_plan".to_string(),
+        "build.e2e_artifact".to_string(),
+    ];
+    if green_batch_dag
+        .steps
+        .iter()
+        .any(|step| step.tag() == VALIDATE_FIXTURE_STEP)
+    {
+        expected_preparation_deps.push(VALIDATE_FIXTURE_STEP.to_string());
+    }
     if green_batch_cell_count != expected_green_cell_runs
         || green_batch_preparation_count != green_test_count
         || green_batch_dag
             .steps
             .iter()
             .filter(|step| step.group == "prepare")
-            .any(|step| {
-                step.deps
-                    != [
-                        "setup.manifest_plan".to_string(),
-                        "build.e2e_artifact".to_string(),
-                    ]
-            })
+            .any(|step| step.deps != expected_preparation_deps)
         || green_batch_dag
             .steps
             .iter()
@@ -19097,7 +19444,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, run-type harness selection, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, run-type harness selection, VALIDATE_RUN_STATE and fixture preparation, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
     );
     Ok(())
 }
@@ -24279,5 +24626,73 @@ mod harness_selection_tests {
         let unlabelled = labelled.replace(" --label 'sabre-compat-only'", "");
         let (_, selection) = harness_command_selection(&unlabelled).unwrap();
         assert!(manifests.select(&selection).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod validate_run_state_tests {
+    //! The pressure graph gives preparation and cells a per-run
+    //! VALIDATE_RUN_STATE and prepares the real-compat fixtures with
+    //! validation's own node when a selected cell reads them.
+    use super::*;
+
+    fn checkout_root() -> PathBuf {
+        Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf()
+    }
+
+    fn scratch(label: &str) -> (PathBuf, SelfTestDirectory) {
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-run-state-{label}-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let cleanup = SelfTestDirectory::new(path.clone());
+        (path, cleanup)
+    }
+
+    #[test]
+    fn a_cell_reading_the_fixtures_gets_validations_fixture_preparation() {
+        let (path, cleanup) = scratch("fixtures");
+        validate_run_state_plan_check(
+            &checkout_root(),
+            &path,
+            "fixtures",
+            &[
+                ("c-programs/prctl-identity", "verify", "dbt"),
+                ("compat/shuf", "verify", "sabre"),
+            ],
+            true,
+        )
+        .unwrap();
+        cleanup.remove().unwrap();
+    }
+
+    #[test]
+    fn the_fixture_copy_refuses_a_reshaped_validation_node() {
+        compat_fixture_step_refusal_self_test(&checkout_root()).unwrap();
+    }
+
+    #[test]
+    fn a_plan_without_fixture_readers_still_names_its_run_state() {
+        let (path, cleanup) = scratch("no-fixtures");
+        validate_run_state_plan_check(
+            &checkout_root(),
+            &path,
+            "no-fixtures",
+            &[("c-programs/prctl-identity", "verify", "dbt")],
+            false,
+        )
+        .unwrap();
+        cleanup.remove().unwrap();
     }
 }
