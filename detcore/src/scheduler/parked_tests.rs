@@ -2772,6 +2772,110 @@ fn parent_death_cancellation_does_not_publish_a_guest_death() {
 }
 
 #[test]
+fn parent_death_terminal_transition_rejection_precedes_publication() {
+    let (mut s, backend) = parent_death_fixture();
+    let (tid, mm, _) = add(&mut s, 100, 100);
+    s.reserve_exit_boundary(tid, tid, mm, true).unwrap();
+    let fence = s.parked.exit_fences[&tid];
+    let boundary = SignalBoundaryReceipt {
+        permit: fence.permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 7 << 8,
+        },
+    };
+    let key = ProcessGeneration::from_backend(boundary.permit.task.process);
+    let completed = reverie::BackendProcessRetirement {
+        process: boundary.permit.task.process,
+        status: ExitStatus::Exited(7),
+    };
+    // Plant a contradictory completed retirement only after obtaining the
+    // authentic exit fence. The transition must reject this protocol state
+    // before the backend is asked to publish any parent-death effects.
+    assert!(
+        s.parked
+            .completed_process_retirements
+            .insert(key, completed)
+            .is_none()
+    );
+    let result = s.consume_signal_boundary(boundary);
+    assert!(matches!(
+        result,
+        Err(reverie::Error::Errno(reverie::Errno::EINVAL))
+    ));
+    assert!(
+        backend.parent_death_boundaries.lock().unwrap().is_empty(),
+        "terminal transition rejection must precede parent-death publication"
+    );
+    assert!(s.parked.parent_death_pending.is_empty());
+    assert!(s.backend_failed());
+    assert_eq!(s.parked.failure, Some(ProtocolFailure::Phase));
+    assert_eq!(s.parked.permits[&tid], fence.permit);
+    assert_eq!(s.parked.exit_fences[&tid], fence);
+    assert!(s.parked.completed.is_empty());
+    assert_eq!(s.parked.completed_process_retirements[&key], completed);
+    assert!(s.parked.process_retirements.is_empty());
+    assert_eq!(s.next_turns[&tid].dettid, tid);
+    assert!(s.control_barrier());
+    assert_eq!(s.turn, 0);
+}
+
+#[test]
+fn parent_death_rejected_publication_retains_terminal_barriers() {
+    let (mut s, backend) = parent_death_fixture();
+    let (tid, mm, _) = add(&mut s, 100, 100);
+    s.reserve_exit_boundary(tid, tid, mm, true).unwrap();
+    let fence = s.parked.exit_fences[&tid];
+    let boundary = SignalBoundaryReceipt {
+        permit: fence.permit,
+        outcome: SignalBoundaryOutcome::Terminated {
+            group: true,
+            wait_status: 9 << 8,
+        },
+    };
+    *backend.parent_death_result.lock().unwrap() = Some(
+        reverie::ParentDeathPublicationResult::RejectedBeforeCommit(reverie::Errno::EBADF),
+    );
+    let result = s.consume_signal_boundary(boundary);
+    assert!(matches!(
+        result,
+        Err(reverie::Error::Errno(reverie::Errno::EBADF))
+    ));
+    assert_eq!(
+        backend.parent_death_boundaries.lock().unwrap().as_slice(),
+        &[boundary]
+    );
+    assert!(s.backend_failed());
+    assert_eq!(s.parked.failure, Some(ProtocolFailure::Identity));
+    assert!(s.parked.parent_death_pending.is_empty());
+    assert!(s.parked.parent_death_failures.is_empty());
+    assert!(backend.parent_death_failures.lock().unwrap().is_empty());
+    assert_eq!(s.parked.permits[&tid], fence.permit);
+    assert_eq!(s.parked.exit_fences[&tid], fence);
+    assert!(s.parked.completed.is_empty());
+    let key = ProcessGeneration::from_backend(boundary.permit.task.process);
+    assert_eq!(
+        s.parked.terminal_processes[&key],
+        TerminalProcess {
+            process: boundary.permit.task.process,
+            class: FinalProcessClass::Root,
+            status: ExitStatus::Exited(9),
+        }
+    );
+    assert_eq!(
+        s.parked.process_retirements[&key],
+        reverie::BackendProcessRetirement {
+            process: boundary.permit.task.process,
+            status: ExitStatus::Exited(9),
+        }
+    );
+    assert!(s.parked.completed_process_retirements.is_empty());
+    assert_eq!(s.next_turns[&tid].dettid, tid);
+    assert!(s.control_barrier());
+    assert_eq!(s.turn, 0);
+}
+
+#[test]
 fn parent_death_committed_failure_is_retained_and_forwarded_after_unlock() {
     let (mut s, backend) = parent_death_fixture();
     let (tid, _, _) = add(&mut s, 100, 100);

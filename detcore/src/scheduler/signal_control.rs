@@ -960,13 +960,26 @@ impl Scheduler {
             }
             terminal_transition = Some((pid, group, ExitStatus::from_raw(wait_status)));
         }
-        self.publish_parent_death_boundary(receipt)?;
+        // Keep the original permit and exit fence until the terminal
+        // transition is accepted. A rejected transition must not publish a
+        // parent-death signal or let another task observe its pending hint.
         let final_transition = match terminal_transition {
-            Some((pid, group, status)) => self
-                .record_final_process_transition(tid, pid, group, receipt.permit.task.process, status)
-                .map_err(|_| reverie::syscalls::Errno::EINVAL)?,
+            Some((pid, group, status)) => match self.record_final_process_transition(
+                tid,
+                pid,
+                group,
+                receipt.permit.task.process,
+                status,
+            ) {
+                Ok(transition) => transition,
+                Err(failure) => {
+                    self.fail_parked(tid, failure);
+                    return Err(reverie::syscalls::Errno::EINVAL.into());
+                }
+            },
             None => None,
         };
+        self.publish_parent_death_boundary(receipt)?;
         // Cleanup/failure may already have logically killed the task. Exact
         // duplicates remain recognizable after timer/task retirement. No turn
         // or membership is created by this consuming notification.
