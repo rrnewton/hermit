@@ -17704,6 +17704,35 @@ fn read_current_pressure_evidence(
     })
 }
 
+/// Whether one current pressure result is a sample of the canonical relation
+/// that a retained canonical divergence measured.
+///
+/// The pressure producer requires a canonical comparison and a canonical
+/// match, but this consumer reads summaries named on the command line, and
+/// the fold admits a `pass` row whatever its report says. So a pass counts as
+/// a canonical match only when its report is one (`require_canonical_match`:
+/// a canonical non-vacuous INFO comparison that is verified, matched and
+/// bitwise identical), and a divergence counts only when its report compared
+/// canonical evidence. Anything else, a below-L2 stripped match in
+/// particular, is evidence in another comparison domain: it cannot confirm,
+/// drift or retire a retained canonical result. A result without any report
+/// keeps its earlier treatment; the fold already refuses a divergence that
+/// has none.
+fn current_pressure_result_is_canonical(result: &CurrentPressureResult) -> bool {
+    let Some(report) = result.summary.rows[0].verification.as_ref() else {
+        return true;
+    };
+    if result.result == ObservedResult::Pass {
+        report.require_canonical_match().is_ok()
+    } else if result.result.carries_divergence_position() {
+        report.require_canonical_comparison().is_ok()
+    } else {
+        // A result without a verdict leaves the decision UNCHECKABLE in any
+        // comparison domain.
+        true
+    }
+}
+
 fn retained_coordinate_decision(
     retained: RetainedCellResults,
     current: &CurrentPressureEvidence,
@@ -17742,10 +17771,13 @@ fn retained_coordinate_decision(
         .unwrap_or_default();
     type CurrentResultsByRun = BTreeMap<
         (String, String, Option<u64>, String),
-        BTreeMap<(ObservedResult, DivergenceCoordinates), CurrentPressureResult>,
+        BTreeMap<(ObservedResult, DivergenceCoordinates, bool), CurrentPressureResult>,
     >;
     let mut current_by_run: CurrentResultsByRun = BTreeMap::new();
     for result in offered_current_results {
+        // A canonical and a non-canonical copy of one run are two different
+        // results for one identity, not one deduplicated sample.
+        let canonical = current_pressure_result_is_canonical(&result);
         let row = &result.summary.rows[0];
         let invocation = row
             .invocation
@@ -17765,7 +17797,7 @@ fn retained_coordinate_decision(
                 invocation.shell_command.clone(),
             ))
             .or_default()
-            .entry((result.result, result.coordinates))
+            .entry((result.result, result.coordinates, canonical))
             .or_insert(result);
     }
     if current_by_run.values().any(|values| values.len() != 1) {
@@ -17780,10 +17812,27 @@ fn retained_coordinate_decision(
             reason: "one current run identity carries conflicting results".into(),
         };
     }
-    let current_results = current_by_run
+    // Only canonical samples can confirm, drift or retire the retained
+    // canonical divergence. The others are counted apart and named in the
+    // reason; a below-canonical divergence still prevents WRONG below.
+    let (current_results, below_canonical): (Vec<_>, Vec<_>) = current_by_run
         .into_values()
         .map(|values| values.into_values().next().expect("one result per run"))
-        .collect::<Vec<_>>();
+        .partition(current_pressure_result_is_canonical);
+    let below_canonical_passes = below_canonical
+        .iter()
+        .filter(|result| result.result == ObservedResult::Pass)
+        .count();
+    let below_canonical_divergences = below_canonical.len() - below_canonical_passes;
+    let not_counted = if below_canonical.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "; {} run(s) without a canonical comparison were not counted \
+             ({below_canonical_passes} pass(es), {below_canonical_divergences} divergence(s))",
+            below_canonical.len()
+        )
+    };
     let current_coordinates = current_results
         .iter()
         .filter(|result| result.result.carries_divergence_position())
@@ -17804,6 +17853,15 @@ fn retained_coordinate_decision(
         };
     }
     if current_results.is_empty() {
+        let reason = if below_canonical.is_empty() {
+            "no current pressure summary row was supplied".to_string()
+        } else {
+            format!(
+                "no current run carries a canonical comparison{not_counted}; evidence in another \
+                 comparison domain, such as a below-L2 stripped match, cannot confirm, drift or \
+                 retire a retained canonical divergence"
+            )
+        };
         return RetainedDecision {
             state: RetainedComparisonState::Uncheckable,
             import: ImportEvidence::Retained {
@@ -17812,7 +17870,7 @@ fn retained_coordinate_decision(
             },
             retained_coordinates,
             current_coordinates,
-            reason: "no current pressure summary row was supplied".into(),
+            reason,
         };
     }
 
@@ -17836,11 +17894,27 @@ fn retained_coordinate_decision(
             retained_coordinates,
             current_coordinates,
             reason: format!(
-                "{sample_count} current run(s): {matched} matched, {diverged} diverged, {no_verdict} produced no verdict"
+                "{sample_count} current run(s): {matched} matched, {diverged} diverged, {no_verdict} produced no verdict{not_counted}"
             ),
         };
     }
     if diverged == 0 {
+        if below_canonical_divergences > 0 {
+            return RetainedDecision {
+                state: RetainedComparisonState::Uncheckable,
+                import: ImportEvidence::Retained {
+                    results: Box::new(retained),
+                    store_positions: false,
+                },
+                retained_coordinates,
+                current_coordinates,
+                reason: format!(
+                    "{sample_count} canonical current run(s) matched, but another current run \
+                     diverged under a comparison that is not canonical, so the retained \
+                     divergence is not shown to be gone{not_counted}"
+                ),
+            };
+        }
         if matched < 2 {
             return RetainedDecision {
                 state: RetainedComparisonState::Uncheckable,
@@ -17851,7 +17925,7 @@ fn retained_coordinate_decision(
                 retained_coordinates,
                 current_coordinates,
                 reason: format!(
-                    "{sample_count} current run matched; one matching run cannot establish that an intermittent divergence is gone"
+                    "{sample_count} current run matched; one matching run cannot establish that an intermittent divergence is gone{not_counted}"
                 ),
             };
         }
@@ -17860,7 +17934,7 @@ fn retained_coordinate_decision(
             import: ImportEvidence::None,
             retained_coordinates,
             current_coordinates,
-            reason: format!("{sample_count} current runs all matched"),
+            reason: format!("{sample_count} current runs all matched{not_counted}"),
         };
     }
     if current_coordinates.is_empty()
@@ -17877,7 +17951,7 @@ fn retained_coordinate_decision(
             retained_coordinates,
             current_coordinates,
             reason: format!(
-                "{sample_count} current run(s): {matched} matched and {diverged} diverged, but at least one divergence has no coordinate"
+                "{sample_count} current run(s): {matched} matched and {diverged} diverged, but at least one divergence has no coordinate{not_counted}"
             ),
         };
     }
@@ -17891,7 +17965,7 @@ fn retained_coordinate_decision(
             retained_coordinates,
             current_coordinates,
             reason: format!(
-                "{sample_count} current run(s): {matched} matched and {diverged} diverged; every current divergence coordinate equals the retained set"
+                "{sample_count} current run(s): {matched} matched and {diverged} diverged; every current divergence coordinate equals the retained set{not_counted}"
             ),
         }
     } else {
@@ -17901,7 +17975,7 @@ fn retained_coordinate_decision(
             retained_coordinates,
             current_coordinates,
             reason: format!(
-                "{sample_count} current run(s): {matched} matched and {diverged} diverged; the current divergence coordinate set differs from the retained set"
+                "{sample_count} current run(s): {matched} matched and {diverged} diverged; the current divergence coordinate set differs from the retained set{not_counted}"
             ),
         }
     }
@@ -22654,6 +22728,164 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
         return Err(
             "two distinct matching runs did not classify a retained divergence as WRONG".into(),
         );
+    }
+
+    // COMPARISON DOMAINS. A reported pass is a canonical match only when its
+    // report is one. Two distinct canonical matches still retire the retained
+    // divergence; two canonical-strictness matches without bitwise parity, or
+    // two below-L2 stripped matches, leave no canonical sample and keep the
+    // retained comparison without its positions.
+    let canonical_pass = pressure_at("pass", coordinates(None, None, None, None));
+    canonical_pass
+        .verification
+        .as_ref()
+        .expect("fixture pass has a report")
+        .require_canonical_match()
+        .map_err(|error| format!("fixture canonical pass is not a canonical match: {error}"))?;
+    let mut no_bitwise_pass = canonical_pass.clone();
+    no_bitwise_pass
+        .verification
+        .as_mut()
+        .expect("fixture pass has a report")
+        .bitwise_parity = false;
+    let as_stripped = |mut row: PressureSummaryRow| {
+        let report = row.verification.as_mut().expect("fixture row has a report");
+        report.bitwise_parity = false;
+        let comparison = report
+            .comparison
+            .as_mut()
+            .expect("fixture report has comparison");
+        comparison.strictness = canonical_verdict::LogCompareStrictness::Stripped;
+        comparison.display_name = Some("Stripped".into());
+        row
+    };
+    let stripped_pass = as_stripped(canonical_pass.clone());
+    let stripped_report = stripped_pass
+        .verification
+        .as_ref()
+        .expect("fixture pass has a report");
+    if require_stripped_comparison(stripped_report).is_err()
+        || !stripped_report.verified
+        || stripped_report.require_canonical_match().is_ok()
+    {
+        return Err("fixture stripped pass is not a valid below-L2 match".into());
+    }
+    let two_runs = |row: &PressureSummaryRow| {
+        retained_coordinate_decision(
+            retained_cell(vec![validate_candidate(
+                "domain-retained",
+                coordinates(Some(3), Some(30), Some(407), Some(7)),
+            )]),
+            &CurrentPressureEvidence {
+                results: BTreeMap::from([(
+                    validate_id.clone(),
+                    vec![
+                        current_run_at("domain-run", "/repo/domain-one", row.clone()),
+                        current_run_at("domain-run", "/repo/domain-two", row.clone()),
+                    ],
+                )]),
+                uncheckable: BTreeMap::new(),
+            },
+        )
+    };
+    let canonical_pair = two_runs(&canonical_pass);
+    if canonical_pair.state != RetainedComparisonState::Wrong
+        || !matches!(canonical_pair.import, ImportEvidence::None)
+    {
+        return Err(
+            "two distinct canonical matches did not classify a retained divergence as WRONG".into(),
+        );
+    }
+    for (label, row) in [
+        ("canonical matches without bitwise parity", &no_bitwise_pass),
+        ("below-L2 stripped matches", &stripped_pass),
+    ] {
+        let decision = two_runs(row);
+        if decision.state != RetainedComparisonState::Uncheckable
+            || !matches!(
+                decision.import,
+                ImportEvidence::Retained {
+                    store_positions: false,
+                    ..
+                }
+            )
+        {
+            return Err(format!(
+                "two {label} were counted as canonical matches: {} ({})",
+                decision.state.as_str(),
+                decision.reason
+            ));
+        }
+    }
+    // A canonical and a stripped copy of one run identity conflict, whichever
+    // comes first, instead of deduplicating to whichever was offered first.
+    for stripped_first in [true, false] {
+        let mut runs = vec![
+            current_run_at("mixed-run", "/repo/mixed", canonical_pass.clone()),
+            current_run_at("mixed-other", "/repo/mixed-other", canonical_pass.clone()),
+        ];
+        let stripped_copy = current_run_at("mixed-run", "/repo/mixed", stripped_pass.clone());
+        if stripped_first {
+            runs.insert(0, stripped_copy);
+        } else {
+            runs.push(stripped_copy);
+        }
+        let decision = retained_coordinate_decision(
+            retained_cell(vec![validate_candidate(
+                "mixed-retained",
+                coordinates(Some(3), Some(30), Some(407), Some(7)),
+            )]),
+            &CurrentPressureEvidence {
+                results: BTreeMap::from([(validate_id.clone(), runs)]),
+                uncheckable: BTreeMap::new(),
+            },
+        );
+        if decision.state != RetainedComparisonState::Uncheckable {
+            return Err(format!(
+                "a canonical and a stripped result for one run identity were not a conflict \
+                 (stripped first: {stripped_first}): {}",
+                decision.state.as_str()
+            ));
+        }
+    }
+    // A divergence under a non-canonical comparison is not a canonical
+    // coordinate, and it shows the cell is not deterministic, so two
+    // canonical matches beside it cannot retire the retained divergence.
+    let stripped_divergence = as_stripped(pressure_at(
+        "determinism-failure",
+        coordinates(Some(3), Some(30), Some(500), Some(7)),
+    ));
+    let beside_divergence = retained_coordinate_decision(
+        retained_cell(vec![validate_candidate(
+            "beside-retained",
+            coordinates(Some(3), Some(30), Some(407), Some(7)),
+        )]),
+        &CurrentPressureEvidence {
+            results: BTreeMap::from([(
+                validate_id.clone(),
+                vec![
+                    current_run_at("beside-run", "/repo/beside-one", canonical_pass.clone()),
+                    current_run_at("beside-run", "/repo/beside-two", canonical_pass.clone()),
+                    current_run_at("beside-run", "/repo/beside-three", stripped_divergence),
+                ],
+            )]),
+            uncheckable: BTreeMap::new(),
+        },
+    );
+    if beside_divergence.state != RetainedComparisonState::Uncheckable
+        || !beside_divergence.current_coordinates.is_empty()
+        || !matches!(
+            beside_divergence.import,
+            ImportEvidence::Retained {
+                store_positions: false,
+                ..
+            }
+        )
+    {
+        return Err(format!(
+            "a non-canonical divergence beside two canonical matches was decided as {}",
+            beside_divergence.state.as_str()
+        ));
     }
 
     let mut intermittent_pass = pressure_at("pass", coordinates(None, None, None, None));
