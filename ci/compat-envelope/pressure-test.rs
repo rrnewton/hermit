@@ -4556,6 +4556,9 @@ fn require_cell_occupancy_fits(
     })?;
     let mut all_seconds = 0_i64;
     let mut kvm_seconds = 0_i64;
+    // Every run of one DBT test, of any mode or repetition, holds that test's
+    // one `dbt_host_tmp_resource` unit, so those runs take turns.
+    let mut serial_seconds = BTreeMap::<String, i64>::new();
     for tracked in cells {
         let budget = budgets
             .get(&(
@@ -4583,20 +4586,42 @@ fn require_cell_occupancy_fits(
                 "the selected KVM cells exceed the supported occupancy range".to_string()
             })?;
         }
+        if let Some(resource) = dbt_host_tmp_resource(&tracked.id) {
+            let serial = serial_seconds.entry(resource).or_default();
+            *serial = serial.checked_add(seconds).ok_or_else(|| {
+                format!(
+                    "the selected cells of DBT test {} exceed the supported occupancy range",
+                    tracked.id.test
+                )
+            })?;
+        }
     }
     // The generated graph permits at most the retained manifest guest cap. If
     // every selected cell consumes its declared cap, this resource limit imposes
-    // this minimum wall time even before build and preparation work. Refuse an
-    // impossible public bound instead of printing a command which cannot satisfy
-    // its own contract.
+    // this minimum wall time even before build and preparation work. The runs
+    // of one DBT test hold one unit between them, so the largest such sum is a
+    // floor of its own however wide the guest caps are. Refuse an impossible
+    // public bound instead of printing a command which cannot satisfy its own
+    // contract.
     let guest_width = jobs.clamp(1, manifest_guest_cap);
     let guest_floor = all_seconds / guest_width + i64::from(all_seconds % guest_width != 0);
     let kvm_width = jobs.min(manifest_guest_cap).clamp(1, kvm_guest_cap);
     let kvm_floor = kvm_seconds / kvm_width + i64::from(kvm_seconds % kvm_width != 0);
-    let occupancy_floor = guest_floor.max(kvm_floor);
+    let (serial_resource, serial_floor) = serial_seconds
+        .iter()
+        .max_by_key(|(_, seconds)| **seconds)
+        .map_or(("", 0), |(resource, seconds)| (resource.as_str(), *seconds));
+    let occupancy_floor = guest_floor.max(kvm_floor).max(serial_floor);
     if occupancy_floor >= run_timeout_seconds {
+        let serial_note = if serial_floor >= run_timeout_seconds {
+            format!(
+                " (the cells of one DBT test run one at a time, and {serial_resource} alone declares {serial_floor}s)"
+            )
+        } else {
+            String::new()
+        };
         return Err(format!(
-            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs}, manifest_guest={manifest_guest_cap}, and kvm_guest={kvm_guest_cap}, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample, reduce --repetitions, adjust safe guest caps, or deliberately raise --run-timeout",
+            "selected {} cell run(s) have at least {occupancy_floor}s of declared worst-case cell occupancy at -j {jobs}, manifest_guest={manifest_guest_cap}, and kvm_guest={kvm_guest_cap}{serial_note}, which cannot fit the {run_timeout_seconds}s whole-run WALL bound; use --sample, reduce --repetitions, adjust safe guest caps, or deliberately raise --run-timeout",
             i64::try_from(cells.len())
                 .unwrap_or(i64::MAX)
                 .saturating_mul(repetitions)
@@ -5476,6 +5501,16 @@ fn audit_dag(
         }
         if tag == "pressure.summarize" {
             summaries += 1;
+        }
+    }
+    // The loop above checks the grants that steps demand. A grant no step
+    // demands is still part of the plan, so every DBT host /tmp grant must be
+    // exactly the one unit `dbt_host_tmp_resource` promises.
+    for (resource, capacity) in &dag.resource_caps {
+        if resource.starts_with(DBT_HOST_TMP_RESOURCE_PREFIX) && *capacity != 1 {
+            return Err(format!(
+                "the DAG grants {capacity} unit(s) of {resource}; one DBT test's host /tmp admits exactly one cell"
+            ));
         }
     }
     for (tag, dep) in deps {
@@ -11918,6 +11953,14 @@ fn self_test(root: &Path) -> Result<(), String> {
                 "a DBT test's host /tmp with a {label} of two units was accepted"
             ));
         }
+    }
+    // A grant no step demands is part of the plan too.
+    let mut unused_host_tmp = fixture.clone();
+    unused_host_tmp
+        .resource_caps
+        .insert(format!("{DBT_HOST_TMP_RESOURCE_PREFIX}unused"), 2);
+    if audit_dag(&unused_host_tmp, 1, 100, &fixture_timeouts).is_ok() {
+        return Err("a two-unit DBT host /tmp grant that no step demands was accepted".into());
     }
     let mut widened_cell_timeout = fixture.clone();
     widened_cell_timeout.steps[0].timeout = 21;
@@ -20053,6 +20096,156 @@ mod pressure_planning_tests {
         validate_guest_caps_against_selected_demand(std::slice::from_ref(&cell), &selection)
             .unwrap();
         assert!(USAGE.contains("identities of executable cells not selected by full"));
+    }
+
+    #[test]
+    fn occupancy_admission_runs_the_cells_of_one_dbt_test_one_at_a_time() {
+        // Every run of every DBT cell of one test holds that test's one-unit
+        // host /tmp grant, so those runs follow one another however many
+        // guest slots are free.
+        let cell = |test: &str, mode: &str, backend: &str| TrackedCell {
+            id: CellId {
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: test.into(),
+                mode: mode.into(),
+                backend: backend.into(),
+            },
+            status: "red".into(),
+            not_applicable_reason: None,
+        };
+        let same = vec![
+            cell("fixture/one", "verify", "dbt"),
+            cell("fixture/one", "replay", "dbt"),
+        ];
+        let split = vec![
+            cell("fixture/one", "verify", "dbt"),
+            cell("fixture/two", "replay", "dbt"),
+        ];
+        let ptrace = vec![
+            cell("fixture/one", "verify", "ptrace"),
+            cell("fixture/one", "replay", "ptrace"),
+        ];
+        let budget = CellBudget {
+            cpu_timeout_seconds: 1,
+            timeout_seconds: 2,
+            attempts: Some(1),
+        };
+        assert_eq!(pressure_timeout(&budget, None), Ok(58));
+        assert_eq!(PRESSURE_RUN_TIMEOUT_SECONDS, 7_200);
+        let budgets = same
+            .iter()
+            .chain(&split)
+            .chain(&ptrace)
+            .map(|tracked| {
+                (
+                    (
+                        tracked.id.test.clone(),
+                        tracked.id.mode.clone(),
+                        tracked.id.backend.clone(),
+                    ),
+                    budget.clone(),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
+        let fits = |cells: &[TrackedCell], run_timeout_seconds: i64| {
+            require_cell_occupancy_fits(cells, &budgets, None, run_timeout_seconds, 100, 4, 4, 4)
+        };
+        // Two DBT modes of one test, 100 repetitions each at 58s apiece, hold
+        // that test's grant for 11,600s, although four guest slots alone
+        // would take the 200 runs in 2,900s.
+        for run_timeout_seconds in [PRESSURE_RUN_TIMEOUT_SECONDS, 11_600] {
+            let Err(error) = fits(&same, run_timeout_seconds) else {
+                panic!(
+                    "admission accepted 11,600s of runs that take turns on one DBT test's host /tmp under a {run_timeout_seconds}s whole-run bound"
+                );
+            };
+            assert!(
+                error.contains("selected 200 cell run(s) have at least 11600s"),
+                "{error}"
+            );
+            assert!(
+                error.contains("dbt_host_tmp:fixture/one alone declares 11600s"),
+                "{error}"
+            );
+            assert!(
+                error.contains(&format!(
+                    "cannot fit the {run_timeout_seconds}s whole-run WALL bound"
+                )),
+                "{error}"
+            );
+        }
+        assert_eq!(fits(&same, 11_601), Ok(()));
+        // The same runs spread over two tests, or on a backend that gives each
+        // guest a private /tmp, share the four guest slots and fit.
+        assert_eq!(fits(&split, PRESSURE_RUN_TIMEOUT_SECONDS), Ok(()));
+        assert_eq!(fits(&ptrace, PRESSURE_RUN_TIMEOUT_SECONDS), Ok(()));
+    }
+
+    #[test]
+    fn audit_refuses_every_dbt_host_tmp_grant_that_is_not_one_unit() {
+        let cmd = "printf '125\\n' > harness-status; status=0; env HERMIT_BIN=\"$PWD/target/ci/hermit\" target/debug/test-harness run --include-manual --test fixture --mode verify --results results.in-progress.jsonl --junit junit.in-progress.xml || status=$?; mv -- results.in-progress.jsonl results.jsonl; exit \"$status\"";
+        let mut dag = dag_from_json(
+            &json!({
+                "resource_caps": {"manifest_guest": 1},
+                "steps": [
+                    {
+                        "group": "cell",
+                        "job": "fixture",
+                        "cmd": cmd,
+                        "deps": [],
+                        "timeout": 20,
+                        "cpu_timeout": 40,
+                        "hint": {"resources": {"manifest_guest": 1}, "hard_mem_max_bytes": 1024}
+                    },
+                    {
+                        "group": "pressure",
+                        "job": "summarize",
+                        "cmd": "true",
+                        "deps": ["cell.fixture"],
+                        "timeout": 10,
+                        "cpu_timeout": 10,
+                        "hint": {"hard_mem_max_bytes": 1024}
+                    }
+                ]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let times = BTreeMap::from([("cell.fixture".to_string(), 20)]);
+        assert_eq!(audit_dag(&dag, 1, 100, &times), Ok(()));
+        // A grant that a step demands: one unit granted, one unit demanded.
+        let active = format!("{DBT_HOST_TMP_RESOURCE_PREFIX}fixture");
+        dag.resource_caps.insert(active.clone(), 1);
+        dag.steps[0].hint.resources.insert(active.clone(), 1);
+        assert_eq!(audit_dag(&dag, 1, 100, &times), Ok(()));
+        for (demand, capacity) in [(0, 1), (-1, 1), (1, 0), (1, 2), (2, 2), (2, 1)] {
+            let mut bad = dag.clone();
+            bad.resource_caps.insert(active.clone(), capacity);
+            bad.steps[0].hint.resources.insert(active.clone(), demand);
+            assert!(
+                audit_dag(&bad, 1, 100, &times).is_err(),
+                "demand {demand}, capacity {capacity}"
+            );
+        }
+        let mut missing = dag.clone();
+        missing.resource_caps.remove(&active);
+        assert!(audit_dag(&missing, 1, 100, &times).is_err());
+        // A grant no step demands is part of the plan too.
+        let unused = format!("{DBT_HOST_TMP_RESOURCE_PREFIX}unused");
+        for capacity in [2, 0, -1] {
+            let mut bad = dag.clone();
+            bad.resource_caps.insert(unused.clone(), capacity);
+            let Err(error) = audit_dag(&bad, 1, 100, &times) else {
+                panic!("the audit accepted {capacity} unit(s) of {unused}, which no step demands");
+            };
+            assert!(
+                error.contains(&format!("the DAG grants {capacity} unit(s) of {unused}")),
+                "{error}"
+            );
+        }
+        dag.resource_caps.insert(unused, 1);
+        assert_eq!(audit_dag(&dag, 1, 100, &times), Ok(()));
     }
 }
 
