@@ -694,6 +694,13 @@ pub(super) fn maybe_run() -> Option<i32> {
             end,
             args.get(4).map(String::as_str),
         ))
+    } else if args[2].starts_with("native-exit-") {
+        Some(super::native_exit_lifecycle::run(
+            &args[2],
+            deadline,
+            end,
+            args.get(4).map(String::as_str),
+        ))
     } else {
         assert_eq!(args.len(), 4);
         Some(container_case(args[2].clone(), deadline, end))

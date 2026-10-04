@@ -6586,6 +6586,7 @@ mod inject_fstat_scratch {
     use std::os::unix::fs::MetadataExt;
     use std::sync::Arc;
     use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
     use reverie::GlobalRPC;
@@ -6655,6 +6656,12 @@ mod inject_fstat_scratch {
     struct ScriptedGuest {
         config: Config,
         thread: ThreadState<()>,
+        parent_death_original: Option<Syscall>,
+        parent_death_error: Option<Errno>,
+        parent_death_admitted: bool,
+        parent_death_queries: AtomicUsize,
+        memory_accesses: AtomicUsize,
+        forbid_memory_access: bool,
         stack_writable: bool,
         mmap_fails: bool,
         arena: Box<[u64; ARENA_WORDS]>,
@@ -6685,6 +6692,12 @@ mod inject_fstat_scratch {
             let guest = Self {
                 config,
                 thread,
+                parent_death_original: None,
+                parent_death_error: None,
+                parent_death_admitted: false,
+                parent_death_queries: AtomicUsize::new(0),
+                memory_accesses: AtomicUsize::new(0),
+                forbid_memory_access: false,
                 stack_writable,
                 mmap_fails,
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
@@ -6718,6 +6731,24 @@ mod inject_fstat_scratch {
         type Memory = LocalMemory;
         type Stack = ScriptedStack;
 
+        fn parent_death_syscall_preflight(
+            &self,
+            call: Syscall,
+        ) -> Result<reverie::ParentDeathSyscallAdmission, Error> {
+            self.parent_death_queries.fetch_add(1, Ordering::SeqCst);
+            if self.parent_death_original.map(SyscallInfo::into_parts) != Some(call.into_parts()) {
+                return Err(Errno::EINVAL.into());
+            }
+            if let Some(error) = self.parent_death_error {
+                return Err(error.into());
+            }
+            Ok(if self.parent_death_admitted {
+                reverie::ParentDeathSyscallAdmission::Admitted
+            } else {
+                reverie::ParentDeathSyscallAdmission::Unenrolled
+            })
+        }
+
         fn tid(&self) -> Pid {
             Pid::from_raw(1)
         }
@@ -6728,6 +6759,11 @@ mod inject_fstat_scratch {
             None
         }
         fn memory(&self) -> Self::Memory {
+            self.memory_accesses.fetch_add(1, Ordering::SeqCst);
+            assert!(
+                !self.forbid_memory_access,
+                "refused parent-death call reached guest memory"
+            );
             LocalMemory::new()
         }
         fn thread_state_mut(&mut self) -> &mut ThreadState<()> {
@@ -6838,6 +6874,157 @@ mod inject_fstat_scratch {
             .thread
             .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.inode))
             .unwrap()
+    }
+
+    fn parent_death_guest(call: Syscall, error: Option<Errno>) -> (Detcore, ScriptedGuest) {
+        let (_, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.backend_is_kvm = true;
+        guest.config.max_timeslice = None;
+        guest.config.sequentialize_threads = false;
+        guest.config.syscall_clobbers_virtualized_by_backend = true;
+        guest.thread = ThreadState::new(DetPid::from_raw(1), &guest.config, ());
+        guest.thread.detpid = Some(DetPid::from_raw(1));
+        guest.parent_death_original = Some(call);
+        guest.parent_death_error = error;
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        (tool, guest)
+    }
+
+    async fn assert_parent_death_refusal(
+        tool: &Detcore,
+        guest: &mut ScriptedGuest,
+        call: Syscall,
+        expected: Errno,
+    ) {
+        let metadata = format!("{:?}", guest.thread.file_metadata.lock().unwrap());
+        let time = guest.thread.thread_logical_time.as_nanos();
+        let count = guest.thread.stats.syscall_count;
+        let arena = *guest.arena;
+        let queries = guest.parent_death_queries.load(Ordering::SeqCst);
+        let memory = guest.memory_accesses.load(Ordering::SeqCst);
+        guest.forbid_memory_access = true;
+        let result = <Detcore as Tool>::handle_syscall_event(tool, guest, call).await;
+        let Err(Error::Tool(error)) = result else {
+            panic!("preflight refusal became a guest result: {result:?}");
+        };
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "KVM parent-death signal unsupported syscall domain before {}",
+                call.number()
+            )
+        );
+        assert!(
+            matches!(error.downcast_ref::<Error>(), Some(Error::Errno(errno)) if *errno == expected)
+        );
+        assert_eq!(
+            guest.parent_death_queries.load(Ordering::SeqCst),
+            queries + 1
+        );
+        assert_eq!(guest.memory_accesses.load(Ordering::SeqCst), memory);
+        assert_eq!(guest.thread.stats.syscall_count, count);
+        assert_eq!(guest.thread.thread_logical_time.as_nanos(), time);
+        assert_eq!(
+            format!("{:?}", guest.thread.file_metadata.lock().unwrap()),
+            metadata
+        );
+        assert_eq!(*guest.arena, arena);
+        assert!(guest.injected.is_empty());
+        assert!(guest.mapped.is_empty());
+        assert!(guest.unmapped.is_empty());
+        assert!(guest.closed.is_empty());
+        assert!(!guest.guard_live.load(Ordering::SeqCst));
+        // Any RPC (including touch_file), register/clock read or scratch
+        // allocation already fails in ScriptedGuest. This also covers the
+        // zero-read subtool path that acquires no Resources at all.
+    }
+
+    #[tokio::test]
+    async fn parent_death_first_handler_refuses_before_metadata_io_and_path_effects() {
+        use reverie::syscalls::SyscallArgs;
+
+        for (number, args) in [
+            (Sysno::write, SyscallArgs::new(1, 0x1234, 1, 0, 0, 0)),
+            (Sysno::writev, SyscallArgs::new(1, 0x1234, 1, 0, 0, 0)),
+            (Sysno::read, SyscallArgs::new(3, 0x1234, 0, 0, 0, 0)),
+            (Sysno::readv, SyscallArgs::new(3, 0x1234, 1, 0, 0, 0)),
+            (Sysno::open, SyscallArgs::new(0x1234, 0, 0, 0, 0, 0)),
+            (
+                Sysno::openat,
+                SyscallArgs::new(libc::AT_FDCWD as usize, 0x1234, 0, 0, 0, 0),
+            ),
+            (Sysno::creat, SyscallArgs::new(0x1234, 0o600, 0, 0, 0, 0)),
+            (
+                Sysno::fcntl,
+                SyscallArgs::new(3, libc::F_SETLKW as usize, 0x1234, 0, 0, 0),
+            ),
+            (
+                Sysno::futex,
+                SyscallArgs::new(0x1234, libc::FUTEX_WAIT as usize, 0, 0, 0, 0),
+            ),
+        ] {
+            let call = Syscall::from_raw(number, args);
+            let (tool, mut guest) = parent_death_guest(call, Some(Errno::ENOSYS));
+            guest
+                .thread
+                .add_fd(3, OFlag::O_NONBLOCK, FdType::Pipe, None)
+                .unwrap();
+            // stdfd 1 is the existing dummy Regular entry, and fd 3 appears
+            // nonblocking. Neither overrides the backend's refusal. The path
+            // address is deliberately unreadable: the guard must not try to
+            // classify a possible FIFO by reading/opening it first. The mock
+            // panics at memory() before LocalMemory could dereference it, so an
+            // omitted-guard mutant fails an assertion rather than faulting.
+            assert_parent_death_refusal(&tool, &mut guest, call, Errno::ENOSYS).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_death_first_handler_preserves_stale_and_changed_call_failures() {
+        use reverie::syscalls::SyscallArgs;
+
+        let args = SyscallArgs::new(1, 0x1234, 1, 0, 0, 0);
+        let original = Syscall::from_raw(Sysno::write, args);
+        for errno in [Errno::ESRCH, Errno::EINVAL, Errno::ENOSYS] {
+            let (tool, mut guest) = parent_death_guest(original, Some(errno));
+            assert_parent_death_refusal(&tool, &mut guest, original, errno).await;
+        }
+        let (tool, mut guest) = parent_death_guest(original, None);
+        guest.parent_death_admitted = true;
+        // Even an otherwise admitted descriptor does not authorize changed raw
+        // operands, including the unused sixth register, or a different call.
+        for changed in [
+            Syscall::from_raw(Sysno::write, SyscallArgs::new(1, 0x1234, 1, 0, 0, 1)),
+            Syscall::from_raw(Sysno::write, SyscallArgs::new(2, 0x1234, 1, 0, 0, 0)),
+            Syscall::from_raw(Sysno::read, args),
+        ] {
+            assert_parent_death_refusal(&tool, &mut guest, changed, Errno::EINVAL).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn parent_death_first_handler_allows_proven_calls_and_leaves_non_kvm_unchanged() {
+        let call = Syscall::Getuid(syscalls::Getuid::new());
+        for admitted in [false, true] {
+            let (tool, mut guest) = parent_death_guest(call, None);
+            guest.parent_death_admitted = admitted;
+            assert!(matches!(
+                <Detcore as Tool>::handle_syscall_event(&tool, &mut guest, call).await,
+                Ok(0)
+            ));
+            assert_eq!(guest.parent_death_queries.load(Ordering::SeqCst), 1);
+            assert_eq!(guest.thread.stats.syscall_count, 1);
+            assert!(guest.injected.is_empty());
+        }
+        let (_, mut guest) = parent_death_guest(call, Some(Errno::ENOSYS));
+        guest.config.backend_is_kvm = false;
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        assert!(matches!(
+            <Detcore as Tool>::handle_syscall_event(&tool, &mut guest, call).await,
+            Ok(0)
+        ));
+        assert_eq!(guest.parent_death_queries.load(Ordering::SeqCst), 0);
+        assert_eq!(guest.thread.stats.syscall_count, 1);
     }
 
     #[tokio::test]

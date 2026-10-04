@@ -1007,7 +1007,9 @@ impl GlobalTool for GlobalState {
         &self,
         receipt: reverie::SignalBoundaryReceipt,
     ) -> Result<(), reverie::Error> {
-        self.sched.lock().unwrap().consume_signal_boundary(receipt)
+        let result = self.sched.lock().unwrap().consume_signal_boundary(receipt);
+        crate::scheduler::signal_control::flush_signal_failures(&self.sched);
+        result
     }
 
     fn on_backend_process_retired(
@@ -1338,6 +1340,10 @@ impl GlobalTool for GlobalState {
                 }
                 R::FinishParkedObservation(ack.await)
             }
+            GlobalRequest::ParentDeathEnrollment => {
+                let sched = self.lock_rpc_scheduler(false).await;
+                R::ParentDeathEnrollment(sched.parent_death_enrolled(dtid))
+            }
             GlobalRequest::ParkedProtocolFailure(error) => {
                 self.sched.lock().unwrap().fail_parked(dtid, error);
                 return (None, R::ThreadExited);
@@ -1634,19 +1640,35 @@ impl GlobalTool for GlobalState {
                     R::ThreadExited
                 }
             }
-            GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => R::FutexAction(
-                self.recv_futex_action(
-                    RpcIncarnation {
-                        dettid,
-                        mm: request_mm,
-                    },
-                    action,
-                    futexid,
-                    init_read,
-                    mask,
+            GlobalRequest::FutexAction(dettid, action, futexid, init_read, mask) => {
+                if matches!(action, FutexAction::WaitRequest(_)) {
+                    let mut sched = self.lock_rpc_scheduler(false).await;
+                    let refusal = match sched.parent_death_enrolled(dettid) {
+                        Ok(false) => None,
+                        Ok(true) => Some(ProtocolFailure::ParentDeathUnsupportedWait),
+                        Err(error) => Some(error),
+                    };
+                    if let Some(error) = refusal {
+                        // Never encode this refusal as a futex value: the old
+                        // wait helper interprets a non-timeout value as success.
+                        sched.fail_parked(dettid, error);
+                        return (None, R::ThreadExited);
+                    }
+                }
+                R::FutexAction(
+                    self.recv_futex_action(
+                        RpcIncarnation {
+                            dettid,
+                            mm: request_mm,
+                        },
+                        action,
+                        futexid,
+                        init_read,
+                        mask,
+                    )
+                    .await,
                 )
-                .await,
-            ),
+            }
             GlobalRequest::RobustListWakes(wakes) => {
                 R::RobustListWakes(self.recv_robust_list_wakes(wakes))
             }
@@ -1908,6 +1930,15 @@ impl GlobalState {
                 "[detcore, dtid {}] ResourceRequest, filling request into {}",
                 &dettid, &nextturn.req
             );
+            if let Err(error) = sched.validate_parent_death_resource(dettid, &rs, capability) {
+                tracing::error!(
+                    ?rs,
+                    ?capability,
+                    "parent-death recipient wait refused before resource publication"
+                );
+                sched.fail_parked(dettid, error);
+                return (SchedulerRpcResult::ThreadExited, None);
+            }
             if let Some(mm) = request_mm
                 && let Err(error) = sched.install_resource_origin(
                     dettid,
@@ -2985,6 +3016,8 @@ pub enum GlobalRequest {
         finish: ObservationFinish,
     },
     ParkedProtocolFailure(ProtocolFailure),
+    /// Query exact-generation enrollment before transforming a potentially blocking call.
+    ParentDeathEnrollment,
     SignalDequeued {
         detpid: DetPid,
         identity: reverie::SignalTaskIdentity,
@@ -3184,6 +3217,7 @@ pub enum GlobalResponse {
     ParkedRequest(ResourceReply),
     ResumeParkedRequest(ResourceReply),
     FinishParkedObservation(Result<FinishAck, ProtocolFailure>),
+    ParentDeathEnrollment(Result<bool, ProtocolFailure>),
     SignalDequeued {
         ack: Result<DequeueAck, TimerFailure>,
         terminal: bool,
@@ -3405,6 +3439,36 @@ pub enum ResumeStatus {
 enum SchedulerRpcResult<T> {
     Continue(T),
     ThreadExited,
+}
+
+/// Refuse a wait outside the opted-in parent-death delivery domain before its
+/// syscall arguments, descriptor flags or scheduler membership are changed.
+pub(crate) async fn require_parent_death_wait_supported<G, T>(
+    guest: &mut G,
+    operation: &str,
+) -> Result<(), reverie::Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if !guest.config().backend_is_kvm {
+        return Ok(());
+    }
+    match send_and_update_time(guest, GlobalRequest::ParentDeathEnrollment)
+        .await
+        .1
+    {
+        GlobalResponse::ParentDeathEnrollment(Ok(false)) => Ok(()),
+        GlobalResponse::ParentDeathEnrollment(Ok(true)) => Err(reverie::Error::Tool(
+            anyhow::anyhow!("KVM parent-death signal unsupported wait: {operation}"),
+        )),
+        GlobalResponse::ParentDeathEnrollment(Err(error)) => {
+            Err(reverie::Error::Tool(anyhow::anyhow!(
+                "KVM parent-death signal enrollment query failed before {operation}: {error:?}"
+            )))
+        }
+        _ => unreachable!("parent-death enrollment RPC response"),
+    }
 }
 
 /// Global method RPC to request to control a resource.

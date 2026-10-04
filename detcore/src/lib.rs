@@ -1981,6 +1981,50 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         guest: &mut G,
         call: Syscall,
     ) -> Result<i64, Error> {
+        // AUTONOMOUS-BOT-IMPLEMENTED
+        // TODO-HUMAN-REVIEW(PR-pending): Parent-death consumer admission,
+        // https://github.com/rrnewton/reverie/issues/916.
+        // This must precede even the prehook: individual handlers may touch
+        // metadata, consume a logical buffer, or change flags before injection.
+        // Only the backend owns descriptor/captured-output provenance. Neither
+        // Detcore's placeholder stdio types nor O_NONBLOCK prove admission.
+        if guest.config().backend_is_kvm {
+            let admission = guest
+                .parent_death_syscall_preflight(call)
+                .map_err(|error| {
+                    Error::Tool(anyhow::Error::new(error).context(format!(
+                        "KVM parent-death signal unsupported syscall domain before {}",
+                        call.number()
+                    )))
+                })?;
+            match admission {
+                reverie::ParentDeathSyscallAdmission::Admitted
+                    if matches!(call, Syscall::RtSigtimedwait(_)) =>
+                {
+                    // The signal-wait handler reads guest memory and observes
+                    // logical time before its later parent-death refusal.
+                    // Reject this unsupported consumer operation before either.
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "KVM parent-death signal unsupported enrolled rt_sigtimedwait before {}",
+                        call.number()
+                    )));
+                }
+                reverie::ParentDeathSyscallAdmission::Admitted
+                    if matches!(call, Syscall::Execve(_) | Syscall::Execveat(_))
+                        && !T::supports_parent_death_retained_exec() =>
+                {
+                    // Recorder/Replayer can inspect or materialize paths before
+                    // injection. Backend retained-image admission cannot grant
+                    // authority for those effects, nor for an unknown wrapper.
+                    return Err(Error::Tool(anyhow::anyhow!(
+                        "KVM parent-death signal unsupported enrolled exec under record/replay or unknown subtool before {}",
+                        call.number()
+                    )));
+                }
+                reverie::ParentDeathSyscallAdmission::Unenrolled
+                | reverie::ParentDeathSyscallAdmission::Admitted => {}
+            }
+        }
         self.pre_handler_hook(guest, false).await;
 
         let dettid = guest.thread_state().dettid;

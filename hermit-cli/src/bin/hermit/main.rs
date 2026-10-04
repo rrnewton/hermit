@@ -31,6 +31,8 @@ mod image;
 mod instruction_map;
 mod list;
 mod logdiff;
+mod native_exit;
+mod native_exit_lifecycle;
 mod oci;
 mod owned_container;
 mod podman_store;
@@ -549,6 +551,14 @@ impl Subcommand {
     }
 
     fn main(&mut self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        self.main_with_native_exit_owner(global, None)
+    }
+
+    fn main_with_native_exit_owner(
+        &mut self,
+        global: &GlobalOpts,
+        owner: Option<&reverie_kvm::native_exit_broker::BrokerOwner>,
+    ) -> Result<ExitStatus, Error> {
         // Stamp the invocation-bound NO-RESULT record BEFORE the first fallible
         // statement of the whole program. This is the outermost point at which
         // `--verify-json` is known, and it is the only placement that dominates
@@ -577,7 +587,10 @@ impl Subcommand {
         match self {
             Subcommand::HostCapabilities(x) => x.main(),
             Subcommand::Version(x) => x.main(),
-            Subcommand::Run(x) => x.main(global),
+            Subcommand::Run(x) => match owner {
+                Some(owner) => x.main_with_native_exit_owner(global, Some(owner)),
+                None => x.main(global),
+            },
             Subcommand::Strace(x) => x.main(global),
             Subcommand::Record(x) => x.main(global),
             Subcommand::Replay(x) => x.main(global),
@@ -587,6 +600,41 @@ impl Subcommand {
             Subcommand::InstructionMap(x) => x.main(global),
             Subcommand::Oci(x) => x.main(global),
         }
+    }
+}
+
+// Shared by the ordinary CLI and its maintained early-main lifecycle fixture.
+// Keep one reporter: diagnostic failure cannot bypass native_exit's retention.
+fn report_fatal_native_invocation(
+    evidence: &std::cell::RefCell<Option<RunEvidenceSession>>,
+    fatal: native_exit::FatalInvocation<'_>,
+) {
+    // This callback itself is caught by native_exit. It never runs a
+    // normal owner destructor, publishes buffered verification success,
+    // or converts an unconfirmed descendant into a stopped one.
+    let fallback = anyhow::anyhow!("fatal invocation abort: {:#}", fatal.cleanup);
+    let primary = fatal.primary.unwrap_or(&fallback);
+    let evidence_error = evidence
+        .borrow_mut()
+        .take()
+        .and_then(|session| session.finish(Err(primary)).err());
+    eprintln!(
+        "HERMIT_FATAL_INVOCATION_ABORT: requested_exit=125 cleanup=unconfirmed descendants=unknown broker_pid={} primary={:#} cleanup_cause={:#}",
+        fatal.broker_pid, primary, fatal.cleanup
+    );
+    if let Some(payload) = fatal.panic {
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| payload.downcast_ref::<&str>().copied())
+            .unwrap_or("non-string panic payload retained; original panic hook already ran");
+        eprintln!("HERMIT_FATAL_INVOCATION_PANIC: {message}");
+    }
+    for known in owned_container::retained_owner_diagnostics() {
+        eprintln!("HERMIT_FATAL_RETAINED_OWNER: {known}");
+    }
+    if let Some(error) = evidence_error {
+        eprintln!("HERMIT_FATAL_EVIDENCE_FAILED: {error:#}");
     }
 }
 
@@ -629,36 +677,101 @@ fn main() {
     } = args_from_matches_with_clock(&matches, std::time::SystemTime::now)
         .unwrap_or_else(|error| error.exit());
 
-    // Claim the evidence destination before any fallible run preflight. The
-    // directory itself is the invocation boundary: it must not exist, so no
-    // stale success can survive and no concurrent invocation can share it.
-    let evidence = match command.run_evidence_request(global.backend) {
-        Some((directory, backend)) => match RunEvidenceSession::create(directory, backend) {
-            Ok(session) => Some(session),
-            Err(error) => {
-                display_error(error);
-                ExitStatus::Exited(HERMIT_INTERNAL_FAILURE_EXIT).raise_or_exit();
-            }
-        },
-        None => None,
+    let wants_native_exit =
+        matches!(&command, Subcommand::Run(run) if run.uses_early_native_exit(&global));
+    // Keep the requested report at no-result until original-main broker
+    // settlement. Only this private guard owns the buffered typed report; no
+    // guest-visible staging pathname or environment variable is an authority.
+    let verification = if wants_native_exit {
+        verify::DeferredVerification::begin_optional(command.verification_json_path()).map(Some)
+    } else {
+        Ok(None)
     };
-    if let Some(session) = &evidence {
-        global.set_run_evidence_log_handle(session.log_handle(), session.write_error_latch());
-    }
-
-    // Open --log-file HERE, in the host's filename namespace, before any container
-    // exists. This is the moment a shell would perform `> file`, and doing it later
-    // -- inside the container, where tracing must be initialized -- resolves the path
-    // against the guest's fresh /tmp and silently discards the log.
-    let result = global.open_log_file().and_then(|()| command.main(&global));
-
-    // The manifest is the commit marker and is published only after the run
-    // result and private log are final. Evidence failure is reported but cannot
-    // replace the guest's status; a consumer observes the absent/no-result
-    // manifest and fails closed independently of the public CLI channel.
-    let evidence_error = evidence.and_then(|session| session.finish(result.as_ref()).err());
+    let evidence: std::cell::RefCell<Option<RunEvidenceSession>> = std::cell::RefCell::new(None);
+    let mut evidence_setup_failed = false;
+    let mut announcement = None;
+    let result = verification.and_then(|verification| {
+        let normally_settled = std::cell::Cell::new(false);
+        let result = native_exit::with_early_owner_reporting(
+            wants_native_exit,
+            |owner| {
+                // Claim the evidence destination before any fallible run preflight. The
+                // directory itself is the invocation boundary: it must not exist, so no
+                // stale success can survive and no concurrent invocation can share it.
+                *evidence.borrow_mut() = match command.run_evidence_request(global.backend) {
+                    Some((directory, backend)) => {
+                        match RunEvidenceSession::create(directory, backend) {
+                            Ok(session) => Some(session),
+                            Err(error) => {
+                                evidence_setup_failed = true;
+                                return Err(error);
+                            }
+                        }
+                    }
+                    None => None,
+                };
+                if let Some(session) = &*evidence.borrow() {
+                    global.set_run_evidence_log_handle(
+                        session.log_handle(),
+                        session.write_error_latch(),
+                    );
+                }
+                // Open --log-file HERE, in the host's filename namespace, before any container
+                // exists. This is the moment a shell would perform `> file`, and doing it later
+                // -- inside the container, where tracing must be initialized -- resolves the path
+                // against the guest's fresh /tmp and silently discards the log.
+                global.open_log_file().and_then(|()| match owner {
+                    Some(owner) => command.main_with_native_exit_owner(&global, Some(owner)),
+                    None => command.main(&global),
+                })
+            },
+            |fatal| report_fatal_native_invocation(&evidence, fatal),
+            || normally_settled.set(true),
+        );
+        let publication = verification
+            .map(|guard| guard.publish(normally_settled.get(), result.is_ok()))
+            .transpose();
+        match (result, publication) {
+            (result, Ok(published)) => {
+                announcement = published;
+                result
+            }
+            (Ok(_), Err(error)) => Err(error.context("publishing settled verification report")),
+            (Err(primary), Err(error)) => Err(verify::retain_verification_error(
+                primary,
+                "publishing settled verification report",
+                error,
+            )),
+        }
+    });
+    // Includes actual broker settlement AND final requested report publication.
+    let evidence_error = evidence
+        .into_inner()
+        .and_then(|session| session.finish(result.as_ref()).err());
+    // The report and run evidence are separate atomic publications. A late
+    // evidence error retains its existing exit policy below, but must not be
+    // followed by a success announcement. Staging/identity errors never fall
+    // back to printing from an inherited or otherwise invalid owner.
+    let result = match announcement
+        .map(|published| published.emit(evidence_error.is_none()))
+        .transpose()
+    {
+        Ok(_) => result,
+        Err(error) => match result {
+            Ok(_) => Err(error.context("announcing settled verification result")),
+            Err(primary) => Err(verify::retain_verification_error(
+                primary,
+                "announcing settled verification result",
+                error,
+            )),
+        },
+    };
     let status = result.unwrap_or_else(|error| {
-        let status = ExitStatus::Exited(failure_exit_code(&error));
+        let status = ExitStatus::Exited(if evidence_setup_failed {
+            HERMIT_INTERNAL_FAILURE_EXIT
+        } else {
+            failure_exit_code(&error)
+        });
         display_error(error);
         status
     });
@@ -1336,7 +1449,7 @@ mod tests {
             hits[0]
         };
         let dbt_return = sole_offset("return super::backends::run_dbt(");
-        let generic_verify = sole_offset("self.verify(global)");
+        let generic_verify = sole_offset("self.verify(global, owner)");
         assert!(
             dbt_return < generic_verify,
             "RunOpts::main must return through the dedicated DBT adapter before the generic \
