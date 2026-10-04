@@ -851,7 +851,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::test::a_sigchld_target_sleeping_outside_the_scheduler_uses_the_mask_recorded_at_its_commit
     // (https://github.com/rrnewton/hermit/issues/3146) retains all 942 prior
     // identities: 942 + 1 = 943 (the filtered nextest run measured 943).
-    ("test.detcore_unit", 943),
+    // syscalls::helpers::kernel_signal_wait_failures::a_pending_caught_sigchld_ends_a_select_wait_before_the_injection
+    // and ::a_pending_caught_sigchld_ends_a_select_wait_without_asking_the_scheduler
+    // (https://github.com/rrnewton/hermit/issues/3146) retain all 943 prior
+    // identities: 943 + 2 = 945 (`cargo nextest list --profile ci` measured 945).
+    ("test.detcore_unit", 945),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1007,7 +1011,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // head of https://github.com/rrnewton/hermit/pull/3361;
     // https://github.com/rrnewton/hermit/issues/3146). Its tests are split per
     // backend so each stays inside the per-test wall and CPU bounds.
-    ("test.liteinst_strict", 90),
+    // ptrace_ and liteinst_selects_are_ended_by_an_external_sigchld_with_or_without_a_child
+    // (https://github.com/rrnewton/hermit/issues/3146) retain all 90 prior
+    // identities: 90 + 2 = 92 (`cargo nextest list --profile ci` measured 92).
+    ("test.liteinst_strict", 92),
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops retains all 6
     // prior identities.
     ("test.sabre_examples", 7),
@@ -1084,7 +1091,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same 38 blocked-wait signal tests
     // (https://github.com/rrnewton/hermit/issues/3146): 904 + 38 = 942.
     // The host twin selects the same recorded-mask SIGCHLD target test: 942 + 1 = 943.
-    ("test.detcore_unit_on_host", 943),
+    // The host twin selects the same two select SIGCHLD tests: 943 + 2 = 945.
+    ("test.detcore_unit_on_host", 945),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1130,7 +1138,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_dispatch_record_reports_patched_sites.
     // The host twin selects the same external_signal_interrupt binary
     // (https://github.com/rrnewton/hermit/issues/3146): 28 + 62 = 90.
-    ("test.liteinst_strict_on_host", 90),
+    // The host twin selects the same two external-SIGCHLD select tests: 90 + 2 = 92.
+    ("test.liteinst_strict_on_host", 92),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
     // The fold-2 resolver test retains all 764 prior identities.
