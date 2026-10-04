@@ -1434,9 +1434,57 @@ fn self_test() {
         "liteinst ⇒ liteinst shard",
         rp_lite.shards.contains(&"liteinst".to_string()),
     );
+    let expected_liteinst_cells = plan
+        .cells
+        .iter()
+        .filter(|cell| cell.backend == "liteinst")
+        .count();
     check(
-        "liteinst ⇒ only liteinst cells",
-        !rp_lite.cells.is_empty() && rp_lite.cells.iter().all(|c| c.backend == "liteinst"),
+        "liteinst ⇒ exactly the planned liteinst cells",
+        rp_lite.cells.len() == expected_liteinst_cells
+            && rp_lite.cells.iter().all(|c| c.backend == "liteinst"),
+    );
+    // Every LiteInst cell is switched off while in-guest Detcore replaces the
+    // hybrid (https://github.com/rrnewton/hermit/issues/3520), so the
+    // committed plan has none. Keep a positive control independent of that
+    // population so dropping every LiteInst cell cannot pass.
+    let mixed_liteinst_fixture = Plan {
+        cells: vec![
+            Cell {
+                category: "fixture-a".into(),
+                mode: "verify".into(),
+                backend: "liteinst".into(),
+            },
+            Cell {
+                category: "fixture-a".into(),
+                mode: "verify".into(),
+                backend: "ptrace".into(),
+            },
+            Cell {
+                category: "fixture-b".into(),
+                mode: "custom".into(),
+                backend: "liteinst".into(),
+            },
+            Cell {
+                category: "fixture-b".into(),
+                mode: "verify".into(),
+                backend: "sabre".into(),
+            },
+        ],
+    };
+    let selected_liteinst_fixture =
+        derive_run_plan(&liteinst, &shards, &mixed_liteinst_fixture, &dag);
+    check(
+        "liteinst fixture ⇒ both LiteInst identities and no other backend",
+        selected_liteinst_fixture
+            .cells
+            .iter()
+            .map(Plan::slug)
+            .collect::<Vec<_>>()
+            == vec![
+                "fixture-a__verify__liteinst".to_string(),
+                "fixture-b__custom__liteinst".to_string(),
+            ],
     );
 
     // Core change: all backends' cells (shared Detcore path).
