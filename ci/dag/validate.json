@@ -13344,7 +13344,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "828",
+        "NEXTEST_EXPECTED_EXECUTED": "820",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -13721,7 +13721,7 @@
       "group": "test",
       "job": "cli",
       "desc": "Portable CLI cases (skips KVM/DBT-backend-only cases)",
-      "description": "Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
+      "description": "Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. They include real programs (coreutils, sqlite3, Python, jq, perl and the tests/c guests) run under in-guest LiteInst with --max-timeslice=disabled and without --verify, which in-guest LiteInst refuses (liteinst_in_guest_programs::, formerly the liteinst_advanced binary); those load the libdetcore_liteinst.so that the workspace build writes beside target/validate/hermit, so a missing runtime fails them with Hermit's refusal naming `cargo build -p detcore-liteinst`. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
       "labels": [
         "full",
         "portable"
@@ -13750,7 +13750,7 @@
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
         "HERMIT_REQUIRE_DAP_GDB": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "123",
+        "NEXTEST_EXPECTED_EXECUTED": "147",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -13777,7 +13777,7 @@
       "group": "test",
       "job": "cli_on_host",
       "desc": "Portable CLI cases (skips KVM/DBT-backend-only cases)",
-      "description": "Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
+      "description": "Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. They include real programs (coreutils, sqlite3, Python, jq, perl and the tests/c guests) run under in-guest LiteInst with --max-timeslice=disabled and without --verify, which in-guest LiteInst refuses (liteinst_in_guest_programs::, formerly the liteinst_advanced binary); those load the libdetcore_liteinst.so that the workspace build writes beside target/validate/hermit, so a missing runtime fails them with Hermit's refusal naming `cargo build -p detcore-liteinst`. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md.",
       "labels": [
         "hosted-portable"
       ],
@@ -13802,7 +13802,7 @@
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
         "HERMIT_REQUIRE_DAP": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "123",
+        "NEXTEST_EXPECTED_EXECUTED": "147",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
       },
       "networkonly": false,
@@ -13822,58 +13822,6 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "test.cli_on_host"
-    },
-    {
-      "group": "test",
-      "job": "liteinst_strict",
-      "desc": "Portable LiteInst strict compatibility",
-      "description": "Exercises the LiteInst backend on real programs: the liteinst_advanced integration tests run one at a time against target/ci/hermit with --backend liteinst --strict, their number pinned by NEXTEST_EXPECTED_EXECUTED. Coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert; the node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, or a test added or removed without updating the count, makes it red.",
-      "labels": [
-        "full",
-        "portable"
-      ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_EXPECTED_EXECUTED --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit HERMIT_LITEINST_STAGE_DIR=$PWD/target/validate ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1'",
-      "result_manifests": [
-        {
-          "kind": "structured-test-results",
-          "schema": 2,
-          "path_env": "DAGRUN_TEST_COUNTS_PATH",
-          "owner": "test.liteinst_strict"
-        }
-      ],
-      "integration_test_binaries": [
-        "liteinst_advanced"
-      ],
-      "deps": [
-        "build.e2e_artifact_in_pinned_root",
-        "build.rust_scripts_in_pinned_root",
-        "gate.manifest",
-        "pre.reverie_pin",
-        "setup.pinned_root_fetch"
-      ],
-      "env": {
-        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
-        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "28",
-        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_advanced\"]"
-      },
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 900,
-      "cpu_timeout": 7200,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 120.0,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "test.liteinst_strict"
     },
     {
       "group": "test",
@@ -18441,50 +18389,6 @@
     },
     {
       "group": "super",
-      "job": "liteinst_python3_verify_diagnostics",
-      "desc": "LiteInst python3 verify diagnostics",
-      "description": "Runs the cli integration binary (Hermit built with third-party-backends) on one thread with the substring filters run_liteinst_rejects_non_fork_clone, run_liteinst_handles_inherited_ignored_sigchld, run_liteinst_verifies_forked_guest and run_liteinst_verifies_raw_fork_guest. None of these tests exists in hermit-cli/tests/cli.rs at fe6670ebf: commit 138922c76 (\"Run Detcore through the LiteInst backend\", https://github.com/rrnewton/hermit/pull/736, 2026-07-26) removed them, so the filters select no test, and nothing in the command involves python3. The portable test.cli and test.cli_on_host nodes still --skip the same four names. As written the node checks nothing about LiteInst. With nextest's default handling of an empty selection the run exits non-zero instead of passing, which would fail the node; its filters need current LiteInst test names, or the node should be removed. A failure is blocking for the super validation.",
-      "labels": [
-        "super"
-      ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; $PWD/ci/run-nextest-counted.sh -p hermit --features third-party-backends --test cli -j 1 -- run_liteinst_rejects_non_fork_clone run_liteinst_handles_inherited_ignored_sigchld run_liteinst_verifies_forked_guest run_liteinst_verifies_raw_fork_guest",
-      "result_manifests": [
-        {
-          "kind": "structured-test-results",
-          "schema": 2,
-          "path_env": "DAGRUN_TEST_COUNTS_PATH",
-          "owner": "super.liteinst_python3_verify_diagnostics"
-        }
-      ],
-      "deps": [
-        "pre.reverie_pin",
-        "quick-super-gate.manifest",
-        "super.build_workspace"
-      ],
-      "env": {
-        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"cli\"]"
-      },
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 300,
-      "cpu_timeout": 600,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 0.0,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 8589934592,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "super.liteinst_python3_verify_diagnostics"
-    },
-    {
-      "group": "super",
       "job": "chaos_hello_race_verification_diagnostic",
       "desc": "Chaos hello-race verification diagnostic",
       "description": "Runs hello_race_chaos_verify from hermit-cli/tests/hermit_modes.rs. It compiles flaky-tests/hello_race.rs, a deliberately racy two-thread program, and runs `hermit run --verify --verify-allow=both --chaos --base-env=minimal --no-virtualize-cpuid --max-timeslice=disabled --env=HERMIT_MODE=chaos` on it with the default ptrace backend. --verify-allow=both accepts any guest exit status, so the property under test is that the chaos-mode run repeats itself: stderr must contain \"Success: deterministic.\" and Hermit must exit with a status code, not a signal. It protects reproducibility of chaos scheduling without PMU preemption. If chaos scheduling drew on host timing so the two verify runs took different interleavings, Hermit would report nondeterminism and the test fails with \"chaos verification for hello_race failed\". A failure is blocking for the super validation.",
@@ -19542,126 +19446,6 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "compatprep.hermit_release"
-    },
-    {
-      "group": "liteinst",
-      "job": "hermit_release",
-      "desc": "Release Hermit for LiteInst compatibility",
-      "description": "In the pinned root, runs `cargo build --release --locked -p hermit --features third-party-backends` and then `./ci/nextest-binaries.rs prepare liteinst-compat-only`, which builds and records the liteinst_advanced test executable that liteinst.strict runs (its one prepared selection: -p hermit --features third-party-backends --test liteinst_advanced). It is the first node of the liteinst-compat-only focused profile; liteinst.runtime then stages the LiteInst runtime next to the release binary. A release-mode compile error, a Cargo.lock that --locked would have to change, or a liteinst_advanced test target that no longer builds stops the profile here.",
-      "labels": [
-        "liteinst-compat-only"
-      ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; cargo build --release --locked -p hermit --features third-party-backends && ./ci/nextest-binaries.rs prepare liteinst-compat-only'",
-      "result_manifests": [],
-      "deps": [
-        "build.rust_scripts_in_pinned_root",
-        "gate.manifest",
-        "setup.pinned_root_fetch"
-      ],
-      "env": {
-        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
-      },
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 1200,
-      "cpu_timeout": 3600,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 0.0,
-        "rss_baseline_bytes": 17179869184,
-        "hard_mem_max_bytes": 17179869184,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "liteinst.hermit_release"
-    },
-    {
-      "group": "liteinst",
-      "job": "runtime",
-      "desc": "Release LiteInst runtime",
-      "description": "In the pinned root, runs `./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build`. The script resolves the Reverie pin with `ci/run-reverie-pin-check.sh --print-pin`, builds liteinst-runtime-build/Cargo.toml in the release profile into a target directory suffixed with the pin's first eight hex digits, and installs the runtime DSO and a sibling .revision file naming that pin, renaming the DSO first so a new library is never paired with an old marker. Hermit refuses to load a LiteInst runtime without a matching marker, so liteinst.strict depends on this. A runtime build failure, or a build that stages an empty file, exits nonzero with \"LiteInst runtime build did not stage a non-empty regular file\".",
-      "labels": [
-        "liteinst-compat-only"
-      ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./scripts/stage-liteinst-runtime.sh release $PWD/target/release/libreverie_liteinst.so $PWD/target/liteinst-runtime-build'",
-      "result_manifests": [],
-      "deps": [
-        "build.rust_scripts_in_pinned_root",
-        "liteinst.hermit_release",
-        "setup.pinned_root_fetch"
-      ],
-      "env": {
-        "HERMIT_E2E_EMPTY_WORKDIR": "/test"
-      },
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 900,
-      "cpu_timeout": 1800,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 0.0,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 8589934592,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "liteinst.runtime"
-    },
-    {
-      "group": "liteinst",
-      "job": "strict",
-      "desc": "Portable CI liteinst_strict",
-      "description": "In the pinned root, runs `HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1` from the executable liteinst.hermit_release prepared, against the release Hermit and the runtime liteinst.runtime staged. These are the tests test.liteinst_strict runs in the full profile: coreutils, sqlite3, Python and tests/c/liteinst_advanced.c under --backend liteinst --strict --verify with activation verified, threads and fork without SIGSYS, a prompt self-SIGKILL, and an inert bare LD_PRELOAD of the runtime. Counts are written as schema-2 structured results. A LiteInst change that kills thread creation with SIGSYS turns it red; a missing staged runtime or revision file makes it report no result (exit 75).",
-      "labels": [
-        "liteinst-compat-only"
-      ],
-      "cmd": "./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env CI --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_PARITY_POST_PASS --env E2E_PARITY_SELECT --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_EPOCH --env HERMIT_PREPARED_NEXTEST_REQUIRED --env HERMIT_TEST_CPU_TIMEOUT_MULTIPLIER --env HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER --env HERMIT_VALIDATE_BUCK_DOTSLASH --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env HERMIT_VALIDATE_RELEASE_BUILD_MODE --env L4_REPS --env NEXTEST_PREPARED_BUILD_SELECTION --env NEXTEST_TEST_THREADS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_RUN_STATE --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && hermit_payload=$1 && shift && if [ \"$#\" -gt 0 ]; then printf -v hermit_extra '\\'' %q'\\'' \"$@\"; hermit_payload+=$hermit_extra; fi && exec bash -c \"$hermit_payload\"' bash 'export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/release/hermit ./ci/run-nextest-counted.sh -p hermit --features third-party-backends --test liteinst_advanced -j 1'",
-      "result_manifests": [
-        {
-          "kind": "structured-test-results",
-          "schema": 2,
-          "path_env": "DAGRUN_TEST_COUNTS_PATH",
-          "owner": "liteinst.strict"
-        }
-      ],
-      "integration_test_binaries": [
-        "liteinst_advanced"
-      ],
-      "deps": [
-        "build.rust_scripts_in_pinned_root",
-        "liteinst.runtime",
-        "setup.pinned_root_fetch"
-      ],
-      "env": {
-        "HERMIT_E2E_EMPTY_WORKDIR": "/test",
-        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_advanced\"]"
-      },
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 900,
-      "cpu_timeout": 1800,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 0.0,
-        "rss_baseline_bytes": 8589934592,
-        "hard_mem_max_bytes": 8589934592,
-        "classification": "light",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "liteinst.strict"
     },
     {
       "group": "qemu",
@@ -33865,7 +33649,7 @@
       "group": "build",
       "job": "e2e_artifact_on_host",
       "desc": "Publish the one Hermit binary at target/ci/hermit and as a verified content-addressed bundle with its backend resources",
-      "description": "This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.liteinst_strict, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30.",
+      "description": "This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30.",
       "labels": [
         "hosted-portable"
       ],
@@ -34110,7 +33894,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "828",
+        "NEXTEST_EXPECTED_EXECUTED": "820",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends,kvm-native-test-support\",\"--lib\",\"--bins\"]"
       },
       "networkonly": false,
@@ -34464,55 +34248,6 @@
         "measured_cpu_utilization": null
       },
       "fail_fast_family": "test.arbitrary_binaries_on_host"
-    },
-    {
-      "group": "test",
-      "job": "liteinst_strict_on_host",
-      "desc": "Portable LiteInst strict compatibility",
-      "description": "Exercises the LiteInst backend on real programs: the liteinst_advanced integration tests run one at a time against target/ci/hermit with --backend liteinst --strict, their number pinned by NEXTEST_EXPECTED_EXECUTED. Coreutils, sqlite3, Python and the tests/c/liteinst_advanced.c guest must exit 0 under --verify with LiteInst activation verified and determinism reported, threads and fork must finish without SIGSYS, a self-SIGKILL must return promptly, and a bare LD_PRELOAD of the runtime must stay inert; the node reports no result (exit 75) instead of running when the staged runtime or its revision file is missing. A LiteInst change that kills thread creation with SIGSYS, or a test added or removed without updating the count, makes it red.",
-      "labels": [
-        "hosted-portable"
-      ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit HERMIT_LITEINST_STAGE_DIR=$PWD/target/validate ./ci/liteinst-strict-node.sh -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test liteinst_advanced -j 1",
-      "result_manifests": [
-        {
-          "kind": "structured-test-results",
-          "schema": 2,
-          "path_env": "DAGRUN_TEST_COUNTS_PATH",
-          "owner": "test.liteinst_strict_on_host"
-        }
-      ],
-      "integration_test_binaries": [
-        "liteinst_advanced"
-      ],
-      "deps": [
-        "build.e2e_artifact_on_host",
-        "gate.manifest",
-        "pre.reverie_pin",
-        "setup.nextest"
-      ],
-      "env": {
-        "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "28",
-        "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"liteinst_advanced\"]"
-      },
-      "networkonly": false,
-      "engine_only": false,
-      "timeout": 900,
-      "cpu_timeout": 7200,
-      "jobs_flag": null,
-      "jobs_env": null,
-      "hint": {
-        "resources": {},
-        "est_duration_s": 120.0,
-        "rss_baseline_bytes": 1073741824,
-        "hard_mem_max_bytes": 3221225472,
-        "classification": "latency-bound",
-        "preferred_inner_jobs": null,
-        "measured_effective_cores": null,
-        "measured_cpu_utilization": null
-      },
-      "fail_fast_family": "test.liteinst_strict_on_host"
     },
     {
       "group": "test",
@@ -43442,7 +43177,7 @@
       "group": "build",
       "job": "e2e_artifact_in_pinned_root",
       "desc": "Publish the one Hermit binary at target/ci/hermit and as a verified content-addressed bundle with its backend resources",
-      "description": "This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.liteinst_strict, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30.",
+      "description": "This is the publication barrier between the one Hermit producer and every consumer. Cargo-default mode takes target/validate/hermit, the validate-profile binary (release optimisation with debug assertions and overflow checks), after `nextest-binaries.rs assert full` has proved without compiling that it is byte-for-byte the runtime file every prepared test selection recorded, i.e. the CARGO_BIN_EXE_hermit the nextest consumers run; the explicit Buck mode installs the reconciled Buck release candidate through build-buck-release.rs --validate-dag-install and takes its target/ci/hermit-strict copy. Either way the selected bytes are installed at target/ci/hermit, the ONE path every direct consumer names (compatibility cells, test.cli, test.sabre_examples, test.envelope_levels), with libdetcore_sabre.so copied beside it and hashed before and after the copy; resources resolve through target/install_pkg. The same bytes are then published as a unique content-addressed directory plus pointer: the publisher hashes the binary before and after copying, snapshots target/install_pkg with symlinks dereferenced, verifies the required DBT/SaBRe/LiteInst/e9patch resources and the complete resource hash manifest, and atomically updates the pointer that the E2E manifest runs and ci/run-with-hermit-e2e-artifact.sh consumers read. The validate ledger records the choice as release_builder and e2e_payload, and a Buck row is neither a Cargo cache hit nor a receipt. Cargo does not hash-suffix binary outputs, so each preparation selection that links the Hermit bin relinks target/validate/hermit; the preparation record hashes it after the last selection, and this node publishes exactly those bytes instead of rebuilding (a rebuild here recompiled Hermit and hit the 120-second cap in the first one-build validation, and would have diverged from the recorded runtime file). Cargo mode removes any Buck hermit-runtime closure left in target/install_pkg, as build.runtime_release did before it was merged into this node on 2026-09-30.",
       "labels": [
         "full",
         "portable"
