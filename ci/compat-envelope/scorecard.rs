@@ -18251,6 +18251,63 @@ struct CandidateAdmission {
     diagnostic_failures: Vec<String>,
 }
 
+/// Read every outer attempt of one fresh run once `verify_candidate_set` has
+/// admitted its terminal attempt, as the retained reader does. Every attempt
+/// must declare the same comparator, every attempt's evidence must be
+/// admissible, and the attempts that carry a comparison must share one
+/// comparison domain. Otherwise a terminal stripped pass would stand for a
+/// run whose earlier attempt holds a canonical failure, or a refused
+/// canonical report, that the terminal attempt never resolved.
+fn require_one_fresh_comparison_across_attempts(
+    id: &CellId,
+    rows: &[ResultCandidate],
+) -> Result<(), String> {
+    let Some(first) = rows.first() else {
+        return Ok(());
+    };
+    if let Some(switched) = rows.iter().find(|candidate| {
+        candidate.row.declares_stripped_comparator() != first.row.declares_stripped_comparator()
+    }) {
+        return Err(format!(
+            "fresh run {} of {} switches comparator between outer attempts {} and {}: a stripped comparison cannot resolve a canonical comparison, so neither attempt is the run's result",
+            first.row.run_id,
+            display_id(id),
+            first.row.attempt,
+            switched.row.attempt
+        ));
+    }
+    let mut domains = BTreeSet::new();
+    for candidate in rows {
+        let domain = match candidate.row.comparison_evidence().map_err(|error| {
+            format!(
+                "fresh result for {} in {}, outer attempt {}: {error}",
+                display_id(id),
+                candidate.path.display(),
+                candidate.row.attempt
+            )
+        })? {
+            ValidateRowEvidence::NotRun { .. }
+            | ValidateRowEvidence::Unavailable { .. }
+            | ValidateRowEvidence::ExpectedOutputFailed { .. } => None,
+            ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => {
+                Some(RetainedComparisonDomain::Canonical)
+            }
+            ValidateRowEvidence::StrippedMatched => Some(RetainedComparisonDomain::Stripped),
+            ValidateRowEvidence::ParityMatched { .. }
+            | ValidateRowEvidence::ParityDiverged { .. } => Some(RetainedComparisonDomain::Parity),
+        };
+        domains.extend(domain);
+    }
+    if domains.len() > 1 {
+        return Err(format!(
+            "fresh run {} of {} mixes the {domains:?} comparison domains between outer attempts; one run is measured by one comparator",
+            first.row.run_id,
+            display_id(id)
+        ));
+    }
+    Ok(())
+}
+
 fn verify_candidate_set(
     expected: &BTreeSet<CellId>,
     candidates: BTreeMap<CellId, Vec<ResultCandidate>>,
@@ -18330,6 +18387,9 @@ fn verify_candidate_set(
                     candidate.path.display()
                 )
             })?;
+        // After the terminal attempt's own checks, so a one-attempt run is
+        // judged exactly as before.
+        require_one_fresh_comparison_across_attempts(id, rows)?;
         binary_identities
             .entry(
                 candidate
@@ -37958,6 +38018,80 @@ mod post_verdict_transaction_tests {
             "ledger publication must not mutate Hermit's catalogue or page"
         );
     }
+
+    /// verify-results reads every outer attempt of a fresh run, as the retained
+    /// reader does. A stripped terminal attempt cannot stand for a run whose
+    /// earlier attempt holds a canonical failure, or a refused canonical match,
+    /// that it never resolved. A same-comparator retry that ends in a canonical
+    /// pass is still the run's pass.
+    #[test]
+    fn verify_results_reads_every_outer_attempt_of_a_fresh_run() {
+        let _fixture_lock = history_fixture_lock();
+        let mut fixture = Fixture::new();
+        let measured = fixture.options.results_head.clone().unwrap();
+        // The fixture's own run: a fresh result set is one run.
+        let (id, mut stripped) = stripped_row(&measured);
+        let run = stripped["run_id"].as_str().unwrap().to_string();
+        stripped["attempt"] = 2.into();
+        let failed = canonical_divergence_row(&measured, &run);
+        let canonical_match = |bitwise_parity: bool| {
+            let mut report = verify_canonical_report(&measured);
+            report["bitwise_parity"] = bitwise_parity.into();
+            let mut row = with_report(&failed, &report);
+            row["outcome"] = "PASS".into();
+            row["result"] = "pass".into();
+            row["failure_class"] = JsonValue::Null;
+            row["attempts"][0]["outcome"] = "PASS".into();
+            row["attempts"][0]["status"] = 0.into();
+            for field in [
+                "first_divergent_scheduler_turn",
+                "first_divergent_virtual_nanoseconds",
+                "first_divergent_record",
+                "first_divergent_syscall",
+            ] {
+                row[field] = JsonValue::Null;
+                row["attempts"][0][field] = JsonValue::Null;
+            }
+            row
+        };
+        let refused = canonical_match(false);
+        let mut canonical_pass = canonical_match(true);
+        canonical_pass["attempt"] = 2.into();
+
+        // Controls: the stripped terminal attempt alone is the runner's pass,
+        // and so is a canonical pass that retries a canonical failure.
+        fixture.publish_rows(std::slice::from_ref(&stripped));
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        verify_candidate_set(&BTreeSet::from([id.clone()]), candidates)
+            .expect("control: the stripped terminal attempt alone is a pass");
+        fixture.publish_rows(&[failed.clone(), canonical_pass]);
+        let candidates = read_result_candidates(&fixture.options.results, &measured).unwrap();
+        verify_candidate_set(&BTreeSet::from([id.clone()]), candidates)
+            .expect("control: a canonical pass that retries a canonical failure is a pass");
+
+        for (label, earlier, expected) in [
+            ("canonical failure", failed, "switches comparator"),
+            ("refused canonical match", refused, "switches comparator"),
+        ] {
+            for reverse in [false, true] {
+                let rows = if reverse {
+                    vec![stripped.clone(), earlier.clone()]
+                } else {
+                    vec![earlier.clone(), stripped.clone()]
+                };
+                fixture.publish_rows(&rows);
+                let candidates =
+                    read_result_candidates(&fixture.options.results, &measured).unwrap();
+                let error = verify_candidate_set(&BTreeSet::from([id.clone()]), candidates)
+                    .map(|_| ())
+                    .expect_err(&format!(
+                        "{label}: the stripped terminal attempt hid the earlier canonical attempt"
+                    ));
+                assert!(error.contains(expected), "{label}: {error}");
+            }
+        }
+    }
+
     // Expect FAIL at c900554692a6, PASS with the F2 storage/binding changes absent:
     // stress-series/v2 remains admitted for historical projection, but a correct
     // attempt-1 event with a Detcore tree has a Result key, while the pass now has
