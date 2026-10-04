@@ -1089,6 +1089,58 @@ def verify_boot_snapshot(
         )
 
 
+def accept_snapshot_after_failed_rebuild(
+    snapshot: Path,
+    root: Path,
+    assets: Path,
+    failure: subprocess.CalledProcessError,
+    demo: str,
+) -> None:
+    """Decide whether the default boot snapshot is usable after demo 5 failed.
+
+    Demo 6 and demo 7 run demo 5 to rebuild a default boot snapshot that was
+    booted from another initramfs. Demo 5 publishes the snapshot and its record
+    before it compares the boot with its saved reference run, and that reference
+    no longer applies once the initramfs has changed, so demo 5 can end PARTIAL
+    and exit non-zero although the snapshot it has just saved is current
+    (demos/05-qemu-boot/README.md). Its exit status therefore does not say
+    whether the snapshot is usable; demo 5's record does. Return, after a note,
+    when ``snapshot`` now matches its record and the current initramfs
+    (verify_boot_snapshot); otherwise raise a RuntimeError that says to run
+    demos/clean.sh and then ``demo`` again.
+    """
+    snapshot = Path(snapshot)
+    command = failure.cmd
+    if not isinstance(command, str):
+        command = " ".join(str(part) for part in command)
+    if not snapshot.is_file():
+        problem = "{} does not exist".format(snapshot)
+    else:
+        try:
+            verify_boot_snapshot(snapshot, root, assets)
+            problem = None
+        except BootSnapshotMismatch as mismatch:
+            problem = "{} does not match the current initramfs: {}".format(
+                snapshot, mismatch
+            )
+    if problem is not None:
+        raise RuntimeError(
+            "demo 5 failed while rebuilding the boot snapshot (`{}` exited with "
+            "status {}; its output is above), and {}. Run demos/clean.sh, then {} "
+            "again".format(command, failure.returncode, problem, demo)
+        ) from failure
+    print(
+        "NOTE: demo 5 failed (`{}` exited with status {}), but it saved {} with a "
+        "record that matches the current initramfs, so {} uses that snapshot. If "
+        "the initramfs changed since demo 5 saved its reference run, that "
+        "reference no longer applies and demo 5 ends PARTIAL against it until you "
+        "run demos/clean.sh; its WARN lines above say what differed.".format(
+            command, failure.returncode, snapshot, demo
+        ),
+        flush=True,
+    )
+
+
 def canonicalize_qemu_runtime_paths_in_file(
     path: Path, run_dir: Path, qmp_socket: Path
 ) -> None:

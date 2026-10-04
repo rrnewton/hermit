@@ -18,6 +18,7 @@ ROOT = DEMOS_DIR.parent
 sys.path.insert(0, str(DEMOS_DIR / "lib"))
 
 from demo_common import (  # noqa: E402
+    accept_snapshot_after_failed_rebuild,
     acquire_demo_lock,
     banner,
     BootSnapshotMismatch,
@@ -339,6 +340,7 @@ def ensure_boot_snapshot() -> None:
     """
     default_snapshot = ASSETS / "hermit-boot.qcow2"
     custom = BOOT_SNAPSHOT_DISK != default_snapshot
+    stale = False
     if not BOOT_SNAPSHOT_DISK.is_file():
         if custom:
             raise RuntimeError(
@@ -373,10 +375,23 @@ def ensure_boot_snapshot() -> None:
                 ),
                 flush=True,
             )
-    run_checked(
-        ["make", "--no-print-directory", "-C", str(DEMOS_DIR), "demo5"],
-        cwd=ROOT,
-    )
+            stale = True
+    try:
+        run_checked(
+            ["make", "--no-print-directory", "-C", str(DEMOS_DIR), "demo5"],
+            cwd=ROOT,
+        )
+    except subprocess.CalledProcessError as failure:
+        if not stale:
+            raise
+        # The snapshot did not match the current initramfs, so demo 5's saved
+        # reference run may not either, and demo 5 then exits non-zero after
+        # saving a current snapshot. Its record, not its exit status, is the
+        # verdict.
+        accept_snapshot_after_failed_rebuild(
+            BOOT_SNAPSHOT_DISK, ROOT, ASSETS, failure, "demo 6"
+        )
+        return
     if not BOOT_SNAPSHOT_DISK.is_file():
         raise RuntimeError("Demo 5 did not produce {}".format(BOOT_SNAPSHOT_DISK))
     try:

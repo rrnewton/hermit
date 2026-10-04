@@ -25,6 +25,7 @@ import time
 from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 from demo_common import (
+    accept_snapshot_after_failed_rebuild,
     BootSnapshotMismatch,
     hermit_tmp_args,
     make_socket_path,
@@ -205,6 +206,7 @@ def ensure_boot_snapshot(
     snapshot = Path(snapshot)
     default_snapshot = Path(assets) / "hermit-boot.qcow2"
     custom = snapshot != default_snapshot
+    stale = False
     if not snapshot.is_file():
         if custom:
             raise RuntimeError(
@@ -235,7 +237,17 @@ def ensure_boot_snapshot(
                 "running demo 5 again to rebuild it...".format(snapshot, mismatch),
                 flush=True,
             )
-    rebuild()
+            stale = True
+    try:
+        rebuild()
+    except subprocess.CalledProcessError as failure:
+        if not stale:
+            raise
+        # As in demo 6: demo 5 can exit non-zero after it saved a current
+        # snapshot, when its own reference run was made from an older
+        # initramfs. Its record, not its exit status, is the verdict.
+        accept_snapshot_after_failed_rebuild(snapshot, root, assets, failure, "demo 7")
+        return
     if not snapshot.is_file():
         raise RuntimeError("Demo 5 did not produce {}".format(snapshot))
     try:

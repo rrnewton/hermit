@@ -310,6 +310,84 @@ class Demo6EnsureBootSnapshotTest(_StandIns):
         self.assertEqual(self.commands, [])
         self.assertEqual(self.snapshot.read_bytes(), SNAPSHOT)
 
+    def demo5_fails(self, saves=None):
+        """A stand-in for demo 5 that runs ``saves``, then fails the way
+        run_checked does when demo 5 exits non-zero and make exits 2."""
+
+        def demo5():
+            if saves is not None:
+                saves()
+            raise subprocess.CalledProcessError(2, self.demo5_command)
+
+        return demo5
+
+    def test_a_rebuild_whose_demo5_fails_after_saving_a_current_snapshot_uses_it(self):
+        # Demo 5 publishes the snapshot and its record, then ends PARTIAL
+        # against its reference run from the old initramfs and exits non-zero.
+        self.snapshot.write_bytes(SNAPSHOT)
+        printed = self.ensure(self.snapshot, demo5=self.demo5_fails(self.demo5_saves()))
+        self.assertEqual(self.commands, [self.demo5_command])
+        self.assertIn(
+            "NOTE: demo 5 failed (`{}` exited with status 2), but it saved {} with a "
+            "record that matches the current initramfs, so demo 6 uses that "
+            "snapshot.".format(" ".join(self.demo5_command), self.snapshot),
+            printed,
+        )
+        self.assertIn(
+            "demo 5 ends PARTIAL against it until you run demos/clean.sh", printed
+        )
+        dc.verify_boot_snapshot(self.snapshot, self.root, self.assets)
+
+    def test_a_rebuild_whose_demo5_fails_without_a_current_snapshot_stops(self):
+        for name, saves, problem in (
+            (
+                "nothing saved",
+                None,
+                "{} does not match the current initramfs: it has no record".format(
+                    self.snapshot
+                ),
+            ),
+            (
+                "saved without a record",
+                lambda: self.snapshot.write_bytes(b"new bytes, no record"),
+                "{} does not match the current initramfs: it has no record".format(
+                    self.snapshot
+                ),
+            ),
+            (
+                "snapshot removed",
+                lambda: self.snapshot.unlink(),
+                "{} does not exist".format(self.snapshot),
+            ),
+        ):
+            with self.subTest(case=name):
+                self.snapshot.write_bytes(SNAPSHOT)
+                self.commands = []
+                with self.assertRaises(RuntimeError) as caught:
+                    self.ensure(self.snapshot, demo5=self.demo5_fails(saves))
+                message = str(caught.exception)
+                self.assertTrue(
+                    message.startswith(
+                        "demo 5 failed while rebuilding the boot snapshot (`{}` exited "
+                        "with status 2; its output is above), and {}".format(
+                            " ".join(self.demo5_command), problem
+                        )
+                    ),
+                    message,
+                )
+                self.assertTrue(
+                    message.endswith(". Run demos/clean.sh, then demo 6 again"), message
+                )
+                self.assertIsInstance(
+                    caught.exception.__cause__, subprocess.CalledProcessError
+                )
+
+    def test_a_missing_snapshot_whose_demo5_fails_still_fails(self):
+        # Only the rebuild of a snapshot from another initramfs is judged by the
+        # record; when there was no snapshot, demo 5's failure stays the verdict.
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.ensure(self.snapshot, demo5=self.demo5_fails(self.demo5_saves()))
+
     def test_a_default_snapshot_without_a_record_is_rebuilt(self):
         # A snapshot demo 5 saved before it wrote records may hold an /init of
         # an older frame format. Demo 6 used to restore it because it existed.
@@ -895,6 +973,53 @@ class Demo7EnsureBootSnapshotTest(_StandIns):
             "missing custom boot snapshot: {}; produce it before demo 7".format(custom),
         )
         self.assertEqual(self.rebuilds, 0)
+
+    def demo5_fails(self, saves=None):
+        """A stand-in for demo 5 that runs ``saves``, then fails the way
+        subprocess.run(check=True) does when make exits 2."""
+
+        def demo5():
+            if saves is not None:
+                saves()
+            raise subprocess.CalledProcessError(2, self.demo5_command)
+
+        return demo5
+
+    demo5_command = ["make", "--no-print-directory", "-C", str(DEMOS_DIR), "demo5"]
+
+    def test_a_rebuild_whose_demo5_fails_after_saving_a_current_snapshot_uses_it(self):
+        self.snapshot.write_bytes(SNAPSHOT)
+        printed = self.ensure(self.snapshot, demo5=self.demo5_fails(self.demo5_saves()))
+        self.assertEqual(self.rebuilds, 1)
+        self.assertIn(
+            "NOTE: demo 5 failed (`{}` exited with status 2), but it saved {} with a "
+            "record that matches the current initramfs, so demo 7 uses that "
+            "snapshot.".format(" ".join(self.demo5_command), self.snapshot),
+            printed,
+        )
+        dc.verify_boot_snapshot(self.snapshot, self.root, self.assets)
+
+    def test_a_rebuild_whose_demo5_fails_without_a_current_snapshot_stops(self):
+        self.snapshot.write_bytes(SNAPSHOT)
+        with self.assertRaises(RuntimeError) as caught:
+            self.ensure(self.snapshot, demo5=self.demo5_fails())
+        message = str(caught.exception)
+        self.assertTrue(
+            message.startswith(
+                "demo 5 failed while rebuilding the boot snapshot (`{}` exited with "
+                "status 2; its output is above), and {} does not match the current "
+                "initramfs: it has no record".format(
+                    " ".join(self.demo5_command), self.snapshot
+                )
+            ),
+            message,
+        )
+        self.assertTrue(message.endswith(". Run demos/clean.sh, then demo 7 again"), message)
+        self.assertIsInstance(caught.exception.__cause__, subprocess.CalledProcessError)
+
+    def test_a_missing_snapshot_whose_demo5_fails_still_fails(self):
+        with self.assertRaises(subprocess.CalledProcessError):
+            self.ensure(self.snapshot, demo5=self.demo5_fails(self.demo5_saves()))
 
 
 class Demo7RestoreCopyTest(_StandIns):
