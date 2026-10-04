@@ -679,13 +679,14 @@ fn main() {
 
     let wants_native_exit =
         matches!(&command, Subcommand::Run(run) if run.uses_early_native_exit(&global));
-    // Keep the requested report at no-result until original-main broker
-    // settlement. Only this private guard owns the buffered typed report; no
-    // guest-visible staging pathname or environment variable is an authority.
+    // Defer console verdicts until invocation work and evidence publication
+    // finish. Native runs additionally keep the requested report at no-result
+    // until original-main broker settlement. Only this private guard owns that
+    // buffered report; no staging pathname or environment value is an authority.
     let verification = if wants_native_exit {
         verify::DeferredVerification::begin_optional(command.verification_json_path()).map(Some)
     } else {
-        Ok(None)
+        verify::DeferredVerification::begin_optional(None).map(Some)
     };
     let evidence: std::cell::RefCell<Option<RunEvidenceSession>> = std::cell::RefCell::new(None);
     let mut evidence_setup_failed = false;

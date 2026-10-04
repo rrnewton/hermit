@@ -1003,8 +1003,9 @@ impl DeferredVerification {
         Self::begin_optional(Some(path))
     }
 
-    /// Native no-JSON invocations still defer their console verdict. An absent
-    /// path does not create a file and is not permission to announce early.
+    /// Defer console verdicts with or without a requested report. Without a path,
+    /// JSON writes keep their direct publication behavior; no file is created
+    /// here, and a direct report write is not permission to announce early.
     pub(super) fn begin_optional(path: Option<&Path>) -> Result<Self, Error> {
         DEFERRED_REPORT.with(|slot| {
             let mut slot = slot.borrow_mut();
@@ -1023,7 +1024,7 @@ impl DeferredVerification {
         })
     }
 
-    /// Only main, after the native wrapper reports actual normal settlement,
+    /// Only main, after the invocation wrapper reports actual normal settlement,
     /// calls this method. Preserve a computed failure report on ordinary work
     /// failure; do not publish a buffered success over a later primary error.
     pub(super) fn finish(self, normally_settled: bool, work_succeeded: bool) -> Result<(), Error> {
@@ -4856,6 +4857,43 @@ mod tests {
     }
 
     #[test]
+    fn deferred_console_none_preserves_direct_json_before_late_errors() {
+        for (work_ok, evidence_ok) in [(true, true), (false, true), (true, false)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("verify.json");
+            let outcome = deferred_console_outcome(true);
+            let report = verification_report(&outcome);
+            let expected_report = format!("{}\n", serde_json::to_string(&report).unwrap());
+            let guard = DeferredVerification::begin_optional(None).unwrap();
+            assert!(!path.exists());
+            write_report_json(&path, &report).unwrap();
+            // Non-native reports retain their direct-writer contract: the
+            // actual requested bytes are readable before console publication.
+            assert_eq!(fs::read(&path).unwrap(), expected_report.as_bytes());
+            assert!(guard.state.borrow().report.is_none());
+            let expected_console = stage_console(&outcome);
+            assert_eq!(
+                guard.state.borrow().announcement.as_ref().unwrap().bytes,
+                expected_console
+            );
+            let published = guard.publish(true, work_ok).unwrap();
+            assert_eq!(fs::read(&path).unwrap(), expected_report.as_bytes());
+            let mut output = Vec::new();
+            published.emit_to(&mut output, evidence_ok).unwrap();
+            assert_eq!(
+                output,
+                if work_ok && evidence_ok {
+                    expected_console
+                } else {
+                    Vec::new()
+                },
+                "work_ok={work_ok}, evidence_ok={evidence_ok}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), expected_report.as_bytes());
+        }
+    }
+
+    #[test]
     fn deferred_console_drop_unwind_and_invalid_creator_never_publish() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("verify.json");
@@ -4963,10 +5001,12 @@ mod tests {
         };
         let guard =
             unique("DeferredVerification::begin_optional(command.verification_json_path())");
+        let nonnative_guard = unique("DeferredVerification::begin_optional(None).map(Some)");
         let run = unique("native_exit::with_early_owner_reporting(");
         let report = unique("guard.publish(normally_settled.get(), result.is_ok())");
         let evidence = unique("session.finish(result.as_ref()).err()");
         let console = unique("published.emit(evidence_error.is_none())");
         assert!(guard < run && run < report && report < evidence && evidence < console);
+        assert!(guard < nonnative_guard && nonnative_guard < run);
     }
 }
