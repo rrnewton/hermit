@@ -215,10 +215,27 @@ esac
 # ci-hub/bin/gh-merge-verified in the DEV-HERMIT PARENT repository; this repository
 # has no ci-hub/ directory, so that path does not resolve from here.)
 
+# THE CHECKERS RUN CONCURRENTLY. lint-checks is one make target per checker, so
+# -j runs them side by side; serially the node's wall time was the sum of their
+# CPU time (about 366 s, measured 2026-10-04). The DAG sets HERMIT_LINT_CHECK_JOBS
+# to the node's CPU width; a bare run uses every core.
+#   -k        keep going, so every failing checker is reported, not only the first.
+#   -Otarget  print each checker's output in one piece when it finishes. This is
+#             what keeps a NO-RESULT-CASE marker at column 0 on its own line for
+#             classify_run; interleaved output could split it.
+# make names each failing target (`[Makefile:N: lint-check-<name>] Error 1`), and
+# its exit status is still nonzero when any checker fails.
+jobs=${HERMIT_LINT_CHECK_JOBS:-$(nproc)}
+if ! [[ "$jobs" =~ ^[1-9][0-9]*$ ]]; then
+    echo "lint-checks-node: HERMIT_LINT_CHECK_JOBS must be a positive integer, got '${jobs}'" >&2
+    exit 2
+fi
+echo "lint-checks: running the checkers with make -j${jobs} -k -Otarget"
+
 node_out=$(mktemp) || exit 1
 trap 'rm -f "$node_out"' EXIT
 set +e
-make lint-checks "${pin_args[@]}" 2>&1 | tee "$node_out"
+make -j"$jobs" -k -Otarget lint-checks "${pin_args[@]}" 2>&1 | tee "$node_out"
 pipeline_status=("${PIPESTATUS[@]}")
 set -e
 make_rc=${pipeline_status[0]}
