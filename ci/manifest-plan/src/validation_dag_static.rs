@@ -569,10 +569,21 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validation_dag::tests::committed_buck_e2e_selection_replaces_22_nodes_with_18,
     // added with the full-buck-e2e label (Buck as the E2E runner), retains all
     // 840 prior identities.
+    // 32053b6d46457b44d009ea8278fa94fe0970de6c (ci/sync-cell-config.sh)
+    // replaced three count tests (the parity census test
+    // the_shipped_manifests_give_the_recorded_parity_counts and the fold file's
+    // the_committed_plan_keeps_its_cell_counts and
+    // the_committed_cell_table_keeps_its_row_counts) with six (the parity
+    // census self-consistency test, the fold file's the_committed_plan_keeps_the_fold
+    // and the_committed_cell_table_keeps_no_retired_row, two test-harness
+    // sync_cells round trips and the cli_help sync-cells refusal test) and left
+    // this pin at 841: 838 of the 841 prior identities are retained, and
+    // `cargo nextest list --profile ci` over this node's selection measured 844
+    // on that commit.
     // One DBT signal-capability configuration control
     // (every_config_source_clears_the_ptrace_only_signal_capabilities;
-    // https://github.com/rrnewton/hermit/pull/3224) retains all 841 prior identities.
-    ("test.regular_crates", 842),
+    // https://github.com/rrnewton/hermit/pull/3224) retains all 844 prior identities.
+    ("test.regular_crates", 845),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1052,8 +1063,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 838, and the retained-PASS re-decision test listed there retains
     // all 839.
     // committed_buck_e2e_selection_replaces_22_nodes_with_18 retains all 840.
+    // The six sync-cells identities listed for test.regular_crates replace
+    // three of the 841 (measured 844).
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3224 test.
-    ("test.regular_crates_on_host", 842),
+    ("test.regular_crates_on_host", 845),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
