@@ -399,9 +399,12 @@ mod tests {
         let expected = vec![
             ("pre.submodules".to_string(), 900, 300, Some(2_147_483_648)),
             ("pre.reverie_pin".to_string(), 900, 300, Some(2_147_483_648)),
+            // 1200 s wall since 2026-10-04 (was 900): 1.5 x the 644.496 s
+            // peak producer wall across 22 full validations, rounded up to the
+            // next 300 s bucket. Its CPU and memory caps are unchanged.
             (
                 "build.rust_scripts".to_string(),
-                900,
+                1200,
                 7200,
                 Some(6_442_450_944),
             ),

@@ -10335,6 +10335,13 @@ const RUST_SCRIPT_COMMAND_PREFIX: &str = "export PATH=\"$PWD/ci/rust-script-bin:
 const DAGRUN_PREPARE_BODY: &str = "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun";
 const RUST_SCRIPT_PRODUCER_BODY: &str =
     "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && ./ci/prepare-rust-scripts.sh";
+/// The committed producer's exact wall bound, written out here rather than read
+/// from the DAG so that changing the committed bound needs a deliberate edit on
+/// this side too. It mirrors `RUST_SCRIPT_PRODUCER_WALL_SECONDS` in
+/// `ci/manifest-plan/src/validation_dag_static.rs`: 1200 seconds since
+/// 2026-10-04, the next 300-second bucket above 1.5 times the 644.496-second
+/// peak producer wall measured across 22 full validations (it was 900).
+const RUST_SCRIPT_PRODUCER_WALL_SECONDS: i64 = 1200;
 
 fn committed_rust_script_producer(root: &Path) -> Result<Step, String> {
     let cfg = validate_plan::validation_config(root)?;
@@ -10370,9 +10377,9 @@ fn committed_dagrun_prepare_boundary(root: &Path) -> Result<(String, i64), Strin
             producer.cmd
         )
     })?;
-    if prepare != DAGRUN_PREPARE_BODY || producer.timeout != 900 {
+    if prepare != DAGRUN_PREPARE_BODY || producer.timeout != RUST_SCRIPT_PRODUCER_WALL_SECONDS {
         return Err(format!(
-            "committed {RUST_SCRIPT_PRODUCER_TAG} changed its exact dagrun preparation or 900-second wall bound: {producer:?}"
+            "committed {RUST_SCRIPT_PRODUCER_TAG} changed its exact dagrun preparation or {RUST_SCRIPT_PRODUCER_WALL_SECONDS}-second wall bound: {producer:?}"
         ));
     }
     Ok((prepare.to_string(), producer.timeout))
@@ -10404,6 +10411,10 @@ fn rust_script_producer_step() -> Step {
         "Build every tracked rust-script before graph consumers run",
         RUST_SCRIPT_PRODUCER_BODY.into(),
         Vec::new(),
+        // Deliberately not RUST_SCRIPT_PRODUCER_WALL_SECONDS: the Nextest
+        // fixture runs this copy inside its own 1200-second envelope
+        // (FIXTURE_WALL_SECONDS), and the scheduler refuses a step whose wall
+        // is not below the remaining outer budget.
         900,  // wall-clock seconds
         7200, // CPU seconds: eight workers may consume this in 900 wall seconds
         6 * 1024 * 1024 * 1024,
@@ -10674,7 +10685,7 @@ fn prebuilt_rust_script_plan_bracket(root: &Path) -> Result<String, String> {
         ));
     }
     let committed = committed_rust_script_producer(root)?;
-    if committed.timeout != 900
+    if committed.timeout != RUST_SCRIPT_PRODUCER_WALL_SECONDS
         || committed.cpu_timeout != 7200
         || committed.hint.rss_baseline_bytes != Some(4 * 1024 * 1024 * 1024)
         || committed.hint.hard_mem_max_bytes != Some(6 * 1024 * 1024 * 1024)
