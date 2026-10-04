@@ -163,8 +163,9 @@ export PATH="$PWD/target/release:$PATH"
 hermit --version
 ```
 
-`hermit --version` prints `hermit 0.2.0 (<build date>, g<commit>)`. Every demo
-runs the `hermit` it finds on your `PATH`.
+`hermit --version` prints the version, build date, and commit, for example
+`hermit 0.4.0 (2026-10-03, gb82e83b510a6)`. Every demo runs the `hermit` it
+finds on your `PATH`.
 
 Each demo's README lists anything else it needs. To check the QEMU demos'
 requirements without running anything:
