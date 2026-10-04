@@ -17453,7 +17453,7 @@ mod nextest_timeout_tests {
             "privileged-only-test.cli_kvm_on_host",
         ] {
             let step = config.steps.iter().find(|step| step.tag() == tag).unwrap();
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "38");
+            assert!(!step.env.contains_key("NEXTEST_EXPECTED_EXECUTED"));
             // Unwrap the pinned-root shell argument when present, then exercise
             // the actual committed jq predicate without opening /dev/kvm.
             let mut words = shell_words::split(&step.cmd).unwrap();
@@ -18369,32 +18369,43 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         {
             return Err(format!(
                 "retry bounds: {tag} buffers or reparses run-nextest-counted output; test events \
-                 must remain live and exact counts must be checked by the wrapper"
+                 must remain live and the wrapper must compare the executed tests with its listing"
             ));
         }
         Ok(())
     }
 
-    fn require_expected_nextest_count(
+    // A node's population is the set `cargo nextest list` selects at the same
+    // head, and run-nextest-counted.sh refuses when the executed tests differ
+    // from it. A fixed count in the environment went stale with every added,
+    // removed, or renamed test, so it is refused rather than honoured.
+    fn require_listed_population(
         tag: &str,
+        command: &str,
         environment: &BTreeMap<String, String>,
-        expected: usize,
     ) -> Result<(), String> {
-        match environment.get("NEXTEST_EXPECTED_EXECUTED") {
-            Some(actual) if actual == &expected.to_string() => Ok(()),
-            Some(actual) => Err(format!(
-                "retry bounds: {tag} must require exactly {expected} executed tests through its typed environment, got {actual:?}"
-            )),
-            None => Err(format!(
-                "retry bounds: {tag} must require exactly {expected} executed tests through its typed environment"
-            )),
+        if environment.contains_key("NEXTEST_EXPECTED_EXECUTED") {
+            return Err(format!(
+                "retry bounds: {tag} declares the retired NEXTEST_EXPECTED_EXECUTED; its executed tests are compared with its listing instead"
+            ));
         }
+        if !command.contains("run-nextest-counted.sh") {
+            return Err(format!(
+                "retry bounds: {tag} no longer runs through run-nextest-counted.sh, so nothing compares its executed tests with its listing"
+            ));
+        }
+        Ok(())
     }
 
     let nextest = std::fs::read_to_string(root.join(".config/nextest.toml"))
         .map_err(|e| format!("retry bounds: cannot read nextest config: {e}"))?;
     let nextest_wrapper = std::fs::read_to_string(root.join("ci/run-nextest-counted.sh"))
         .map_err(|e| format!("retry bounds: cannot read nextest wrapper: {e}"))?;
+    if !nextest_wrapper.contains("--listed \"$inventory\" -- \"$@\"") {
+        return Err(
+            "retry bounds: nextest wrapper does not give the result writer its listing, so executed tests are not compared with listed tests".into(),
+        );
+    }
     if !nextest_wrapper.contains("${HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER-1}") {
         return Err(format!(
             "retry bounds: nextest wrapper does not read {TEST_WALL_TIMEOUT_MULTIPLIER_ENV} with an unset-only identity default"
@@ -18502,21 +18513,16 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
         .find(|(lane, _)| *lane == "privileged")
         .map(|(_, cfg)| cfg)
         .ok_or("retry bounds: privileged lane is absent")?;
-    for (tag, expected) in [
-        ("privileged-only-test.pmu_buck_chaos_cases", 6usize),
-        // The shipped KVM selection contains 37 run_kvm_ declarations (35
-        // plus the two gettimeofday EFAULT regressions) and the unchanged
-        // initialized-VM setup control. The eight-mode timer, two-role
-        // retirement and six-mode reparenting tests each count as one
-        // selected test.
-        ("privileged-only-test.cli_kvm", 38usize),
+    for tag in [
+        "privileged-only-test.pmu_buck_chaos_cases",
+        "privileged-only-test.cli_kvm",
     ] {
         let step = privileged
             .steps
             .iter()
             .find(|step| step.tag() == tag)
-            .ok_or_else(|| format!("retry bounds: exact-count node {tag} is absent"))?;
-        require_expected_nextest_count(tag, &step.env, expected)?;
+            .ok_or_else(|| format!("retry bounds: listed-population node {tag} is absent"))?;
+        require_listed_population(tag, &step.cmd, &step.env)?;
     }
     let buffered_mutation =
         "./ci/run-nextest-counted.sh -p fixture >\"$log\" 2>&1 || status=$?; cat \"$log\"";
@@ -18527,11 +18533,27 @@ fn retry_timeout_bound_bracket(root: &Path) -> Result<String, String> {
             "retry bounds: buffered-output mutation did not fail by node name: {buffered_error}"
         ));
     }
-    let count_error = require_expected_nextest_count("test.fixture", &BTreeMap::new(), 7)
-        .expect_err("missing exact-count declaration mutation must be refused");
-    if !count_error.contains("test.fixture") || !count_error.contains("exactly 7") {
+    let pinned = BTreeMap::from([("NEXTEST_EXPECTED_EXECUTED".to_string(), "7".to_string())]);
+    let count_error = require_listed_population(
+        "test.fixture",
+        "./ci/run-nextest-counted.sh -p fixture",
+        &pinned,
+    )
+    .expect_err("a reintroduced fixed-count declaration must be refused");
+    if !count_error.contains("test.fixture") || !count_error.contains("retired") {
         return Err(format!(
-            "retry bounds: exact-count mutation did not fail by node name: {count_error}"
+            "retry bounds: fixed-count mutation did not fail by node name: {count_error}"
+        ));
+    }
+    let unlisted_error = require_listed_population(
+        "test.fixture",
+        "cargo nextest run -p fixture",
+        &BTreeMap::new(),
+    )
+    .expect_err("a node that bypasses the listing comparison must be refused");
+    if !unlisted_error.contains("test.fixture") || !unlisted_error.contains("listing") {
+        return Err(format!(
+            "retry bounds: listing-bypass mutation did not fail by node name: {unlisted_error}"
         ));
     }
     let attempts = validate_runtime::MAX_ATTEMPTS_PER_CELL as u64;

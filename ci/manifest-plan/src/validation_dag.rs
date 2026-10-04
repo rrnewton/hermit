@@ -27,7 +27,6 @@ use serde::Deserialize;
 
 use crate::runner::E2E_KERNEL_VERSION_ENV;
 use crate::runner::E2E_MACHINE_SHORTNAME_ENV;
-use crate::validation_dag_static::NEXTEST_EXPECTED_COUNTS;
 use crate::validation_dag_static::StructuredResultProducerKind;
 
 pub const OUTPUT: &str = "ci/dag/validate.json";
@@ -2080,19 +2079,6 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
         ));
     }
 
-    let mut expected_counts = NEXTEST_EXPECTED_COUNTS
-        .iter()
-        .copied()
-        .collect::<BTreeMap<_, _>>();
-    // 43 since privileged-test.pmu_detcore_time_cases joined it
-    // (https://github.com/rrnewton/hermit/issues/3663).
-    if expected_counts.len() != 43 {
-        return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 43",
-            expected_counts.len()
-        ));
-    }
-
     let mut seen_by_kind = BTreeMap::<StructuredResultProducerKind, usize>::new();
     for step in &cfg.steps {
         let tag = step.tag();
@@ -2118,9 +2104,15 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
         };
         let command = crate::nextest_build_selections::execution_command(step)?;
-        if command.contains("NEXTEST_EXPECTED_EXECUTED") {
+        // A fixed count went stale whenever a test was added, removed, or
+        // renamed. The Nextest writer now compares the executed tests with the
+        // tests `cargo nextest list` selects at the same head, and refuses a
+        // count if one reappears.
+        if command.contains("NEXTEST_EXPECTED_EXECUTED")
+            || step.env.contains_key("NEXTEST_EXPECTED_EXECUTED")
+        {
             return Err(format!(
-                "{tag} declares NEXTEST_EXPECTED_EXECUTED in command text instead of typed step environment"
+                "{tag} declares the retired NEXTEST_EXPECTED_EXECUTED; the executed tests are compared with the listed tests instead"
             ));
         }
         if command_kind == Some(StructuredResultProducerKind::Nextest)
@@ -2168,44 +2160,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
             }
             (None, None, None) => {}
         }
-
-        match (
-            expected_counts.remove(tag.as_str()),
-            step.env.get("NEXTEST_EXPECTED_EXECUTED"),
-        ) {
-            (Some(expected_count), Some(actual)) if actual == &expected_count.to_string() => {}
-            (Some(expected_count), Some(actual)) => {
-                return Err(format!(
-                    "{tag} expects {expected_count} Nextest tests but declares {actual:?}"
-                ));
-            }
-            (Some(expected_count), None) => {
-                return Err(format!(
-                    "{tag} omits NEXTEST_EXPECTED_EXECUTED={expected_count}"
-                ));
-            }
-            (None, Some(actual)) => {
-                return Err(format!(
-                    "{tag} declares unexpected NEXTEST_EXPECTED_EXECUTED={actual:?}"
-                ));
-            }
-            (None, None) => {}
-        }
     }
     if !expected.is_empty() {
         return Err(format!(
             "registered structured result producers are absent from the DAG: {}",
             expected.keys().copied().collect::<Vec<_>>().join(", ")
-        ));
-    }
-    if !expected_counts.is_empty() {
-        return Err(format!(
-            "Nextest expected-count steps are absent from the DAG: {}",
-            expected_counts
-                .keys()
-                .copied()
-                .collect::<Vec<_>>()
-                .join(", ")
         ));
     }
     let actual_group_counts = StructuredResultProducerKind::ALL
@@ -5052,7 +5011,8 @@ sys.exit(37)
         for hosted in committed.steps.iter().filter(|step| {
             step.group == "test"
                 && step.job.ends_with(HOSTED_VARIANT_SUFFIX)
-                && step.env.contains_key("NEXTEST_EXPECTED_EXECUTED")
+                && crate::validation_dag_static::structured_result_producer_kind(&step.tag())
+                    == Some(StructuredResultProducerKind::Nextest)
         }) {
             let local_tag = hosted
                 .tag()
@@ -5103,17 +5063,13 @@ sys.exit(37)
                 "{} changed its CPU timeout",
                 hosted.tag()
             );
-            for key in [
-                "NEXTEST_EXPECTED_EXECUTED",
-                crate::nextest_binaries::SELECTION_ENV,
-            ] {
-                assert_eq!(
-                    hosted.env.get(key),
-                    local.env.get(key),
-                    "{} changed {key}",
-                    hosted.tag()
-                );
-            }
+            let key = crate::nextest_binaries::SELECTION_ENV;
+            assert_eq!(
+                hosted.env.get(key),
+                local.env.get(key),
+                "{} changed {key}",
+                hosted.tag()
+            );
         }
         assert_eq!(
             checked,
@@ -5790,29 +5746,39 @@ sys.exit(37)
     #[test]
     fn structured_result_counts_and_ownership_survive_generation_transforms() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
-        for (tag, mutation) in [
-            ("test.regular_crates", None),
-            ("test.cli", Some("999")),
-            ("quick.run_smoke", Some("1")),
-        ] {
+        // The executed tests are compared with the tests `cargo nextest list`
+        // selects at the same head, so a fixed count is refused on any step
+        // rather than left to go stale.
+        for tag in ["test.regular_crates", "test.cli", "quick.run_smoke"] {
             let mut changed = committed.clone();
-            let step = changed
+            changed
                 .steps
                 .iter_mut()
                 .find(|step| step.tag() == tag)
-                .unwrap();
-            match mutation {
-                Some(value) => {
-                    step.env
-                        .insert("NEXTEST_EXPECTED_EXECUTED".into(), value.into());
-                }
-                None => {
-                    step.env.remove("NEXTEST_EXPECTED_EXECUTED");
-                }
-            }
+                .unwrap()
+                .env
+                .insert("NEXTEST_EXPECTED_EXECUTED".into(), "999".into());
             let error = assert_structured_result_producers(&changed).unwrap_err();
-            assert!(error.contains(tag), "{error}");
+            assert!(error.contains(tag) && error.contains("retired"), "{error}");
         }
+
+        // A selection whose chosen test names cannot be read would make the
+        // writer refuse at run time; the audit refuses it first.
+        let mut unreadable = committed.clone();
+        let step = unreadable
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == "test.detcore_time_on_host")
+            .unwrap();
+        let exact = "test(=proc_stat_btime_is_fixed_for_a_fractional_epoch)";
+        assert_eq!(step.cmd.matches(exact).count(), 1);
+        step.cmd = step.cmd.replace(exact, "test(/proc_stat.*epoch/)");
+        let error = assert_structured_result_producers(&unreadable).unwrap_err();
+        assert!(
+            error.contains("test.detcore_time_on_host")
+                && error.contains("cannot be compared with its listing"),
+            "{error}"
+        );
 
         let mut inline_count = committed.clone();
         inline_count
@@ -5824,7 +5790,7 @@ sys.exit(37)
             .insert_str(0, "NEXTEST_EXPECTED_EXECUTED=71 ");
         let error = assert_structured_result_producers(&inline_count).unwrap_err();
         assert!(
-            error.contains("test.cli") && error.contains("command text"),
+            error.contains("test.cli") && error.contains("retired"),
             "{error}"
         );
 

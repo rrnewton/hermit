@@ -523,7 +523,7 @@ fn actual_nextest_results_and_publication_failures() {
             NodeClassification::ProductFailure,
         ),
         (
-            "count-before-publish",
+            "listing-before-publish",
             false,
             true,
             true,
@@ -540,12 +540,16 @@ fn actual_nextest_results_and_publication_failures() {
         } else {
             BTreeSet::from(["passes".into()])
         };
+        // The mismatch case names a test the crate does not have, as a
+        // selection left behind by a rename would: the executed and listed
+        // sets agree, and the dangling name alone must refuse publication.
         let filter = if failing {
             "test(=passes) | test(=fails)"
+        } else if mismatch {
+            "test(=passes) | test(=renamed_away)"
         } else {
             "test(=passes)"
         };
-        let expected = if failing || mismatch { 2 } else { 1 };
         let lock = if index == 0 {
             format!(
                 "cargo generate-lockfile --offline --manifest-path {} || exit $?; cargo --version; cargo nextest --version; rustc --version; ",
@@ -564,7 +568,7 @@ fn actual_nextest_results_and_publication_failures() {
              export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=1; \
              export CARGO_TARGET_DIR={} TMPDIR={}; unset HERMIT_PREPARED_NEXTEST_REQUIRED; \
              printf '%s\\n' \"$DAGRUN_TEST_COUNTS_PATH\" > {}; {lock}{fault}set +e; \
-             NEXTEST_EXPECTED_EXECUTED={expected} HERMIT_NEXTEST_CPU_REPORT_PATH={} \
+             HERMIT_NEXTEST_CPU_REPORT_PATH={} \
              {} --manifest-path {} --locked --offline \
              --profile ci --lib -j 1 --retries 0 --no-tests fail -E {} >{} 2>{}; \
              fixture_status=$?; cat {}; cat {} >&2; exit \"$fixture_status\"",
@@ -688,8 +692,8 @@ fn actual_nextest_results_and_publication_failures() {
                         && outcome.filtered_tests.is_none()
                 );
                 assert!(stderr.contains(
-                    "expected 2 tests to execute, saw 1, of which 1 passed and 0 failed"
-                ));
+                    "1 test(s) listed to run, 1 executed, of which 1 passed and 0 failed; 1 test name(s) the selection chooses by match no listed test: test(=renamed_away)"
+                ), "{stderr}");
                 assert!(!stderr.contains("structured-test-results-publish"));
             } else {
                 assert!(stderr.contains("structured-test-results-publish"));
@@ -705,7 +709,7 @@ fn actual_nextest_results_and_publication_failures() {
             }
             assert!(
                 !dagrun::structured_test_results_recovery_path(&path).exists(),
-                "scheduler must consume recovery, and count refusal must not create it"
+                "scheduler must consume recovery, and the listing refusal must not create it"
             );
             assert!(
                 !case.join("cpu.json").exists(),

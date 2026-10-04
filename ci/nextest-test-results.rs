@@ -10,6 +10,7 @@
 //! ```
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -23,10 +24,18 @@ use nextest_cpu::AttemptIdentity;
 use nextest_cpu::AttemptRecord;
 use nextest_cpu::BinaryMap;
 use nextest_cpu::CpuReport;
+use nextest_cpu::ListedInventory;
+use nextest_cpu::ListedTest;
+use nextest_cpu::listed_inventory;
 use nextest_cpu::read_attempt_records;
 use nextest_cpu::read_binary_map;
 use nextest_cpu::write_binary_map_atomic;
 use nextest_cpu::write_report_atomic;
+use nextest_selection::NameReference;
+use nextest_selection::TestIdentity;
+use nextest_selection::dangling_selections;
+use nextest_selection::selection_references;
+use nextest_selection::stale_exclusions;
 use serde_json::Value;
 
 #[path = "../scripts/lib/rust_script_prelude.rs"]
@@ -38,9 +47,12 @@ mod rust_script_prelude;
 #[allow(dead_code)]
 mod nextest_cpu;
 
+#[path = "manifest-plan/src/nextest_selection.rs"]
+mod nextest_selection;
+
 fn usage() {
     println!(
-        "usage: nextest-test-results.rs EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH]\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT"
+        "usage: nextest-test-results.rs EVENTS_JSONL NEXTEST_STATUS OUTPUT_OR_DASH [ATTEMPT_RECORD_DIR BINARY_MAP CPU_REPORT_OR_DASH] --listed NEXTEST_INVENTORY_JSON -- NEXTEST_ARGS...\n       nextest-test-results.rs --write-binary-map NEXTEST_INVENTORY_JSON OUTPUT\n\nNEXTEST_INVENTORY_JSON is `cargo nextest list --message-format json` output for\nthe same selection the run used, and NEXTEST_ARGS are that selection's\narguments. The tests that executed must be exactly the tests the listing\nselected, and every test name the arguments select by must name a listed test.\nWhen nextest itself reported success, a difference refuses with status 2 and\nwithholds the report; when nextest already failed, the difference is printed\nand the report of what did execute is still published."
     );
 }
 
@@ -523,6 +535,142 @@ fn parse_u64(value: String, name: &str) -> Result<u64, String> {
         .map_err(|error| format!("nextest-test-results {name}: {error}"))
 }
 
+/// How many identities one discrepancy names before counting the rest.
+const NAMED_IDENTITY_LIMIT: usize = 20;
+
+fn listed_display(test: &ListedTest) -> String {
+    displayed_test_id(
+        &test.package,
+        &test.binary_name,
+        &test.test,
+        &test.kind,
+        None,
+    )
+}
+
+fn named_sample(names: &[String]) -> String {
+    let mut sample = names
+        .iter()
+        .take(NAMED_IDENTITY_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join(", ");
+    if names.len() > NAMED_IDENTITY_LIMIT {
+        sample.push_str(&format!(
+            ", and {} more",
+            names.len() - NAMED_IDENTITY_LIMIT
+        ));
+    }
+    sample
+}
+
+/// What separates the tests that executed from the tests `cargo nextest list`
+/// selected with the same arguments at the same head.
+///
+/// The listing is the population; nothing is pinned. A test added to a
+/// selection appears in both sets and needs no edit here. A listed test that
+/// never reached a terminal result, or a result for a test the listing did not
+/// select, is a difference. A name the arguments select by must still choose
+/// a listed test: otherwise `test(=a) | test(=b)` silently becomes `test(=a)`
+/// when `b` is renamed, and both sets agree.
+#[derive(Debug, Default, Eq, PartialEq)]
+struct SelectionAudit {
+    listed: usize,
+    missing: Vec<String>,
+    unexpected: Vec<String>,
+    dangling: Vec<String>,
+    stale_exclusions: Vec<String>,
+}
+
+impl SelectionAudit {
+    fn new(parsed: &ParsedEvents, listed: &ListedInventory, references: &[NameReference]) -> Self {
+        // A stress run executes one listed test several times; the listing
+        // names the test once.
+        let executed = parsed
+            .expected_attempts
+            .iter()
+            .map(|attempt| ListedTest {
+                package: attempt.suite.package.clone(),
+                binary_name: attempt.suite.binary.clone(),
+                kind: attempt.suite.kind.clone(),
+                test: attempt.test.clone(),
+            })
+            .collect::<BTreeSet<_>>();
+        let selected = listed.selected.iter().cloned().collect::<BTreeSet<_>>();
+        // A name is judged with the rest of its conjunction, so the package,
+        // binary, and kind travel with each test name.
+        fn identities(tests: &[ListedTest]) -> Vec<TestIdentity<'_>> {
+            tests
+                .iter()
+                .map(|test| TestIdentity {
+                    package: &test.package,
+                    binary_name: &test.binary_name,
+                    kind: &test.kind,
+                    test: &test.test,
+                })
+                .collect()
+        }
+        let describe =
+            |reference: &NameReference| format!("{} ({})", reference.written, reference.matcher);
+        Self {
+            listed: selected.len(),
+            missing: selected.difference(&executed).map(listed_display).collect(),
+            unexpected: executed.difference(&selected).map(listed_display).collect(),
+            dangling: dangling_selections(references, &identities(&listed.selected))
+                .into_iter()
+                .map(describe)
+                .collect(),
+            stale_exclusions: stale_exclusions(references, &identities(&listed.universe))
+                .into_iter()
+                .map(describe)
+                .collect(),
+        }
+    }
+
+    fn agrees(&self) -> bool {
+        self.missing.is_empty() && self.unexpected.is_empty() && self.dangling.is_empty()
+    }
+
+    fn difference(&self, executed: u64, passed: u64, failed: u64) -> String {
+        let mut parts = vec![format!(
+            "{} test(s) listed to run, {executed} executed, of which {passed} passed and {failed} failed",
+            self.listed
+        )];
+        if !self.missing.is_empty() {
+            parts.push(format!(
+                "{} listed test(s) did not execute: {}",
+                self.missing.len(),
+                named_sample(&self.missing)
+            ));
+        }
+        if !self.unexpected.is_empty() {
+            parts.push(format!(
+                "{} executed test(s) were not listed: {}",
+                self.unexpected.len(),
+                named_sample(&self.unexpected)
+            ));
+        }
+        if !self.dangling.is_empty() {
+            parts.push(format!(
+                "{} test name(s) the selection chooses by match no listed test: {}",
+                self.dangling.len(),
+                named_sample(&self.dangling)
+            ));
+        }
+        parts.join("; ")
+    }
+
+    fn stale_note(&self) -> Option<String> {
+        (!self.stale_exclusions.is_empty()).then(|| {
+            format!(
+                "note: {} test name(s) the selection excludes by match no listed test, so they exclude nothing: {}",
+                self.stale_exclusions.len(),
+                named_sample(&self.stale_exclusions)
+            )
+        })
+    }
+}
+
 /// Only the atomic structured-result publication boundary may use the existing
 /// no-result status. Parse/schema/count/CPU errors remain ordinary refusals.
 #[derive(Debug)]
@@ -616,20 +764,56 @@ fn run() -> Result<(), ProducerError> {
         return write_binary_map_atomic(Path::new(&output), &map).map_err(ProducerError::from);
     }
     let events = first;
+    let mut positional = Vec::new();
+    let mut listing = None;
+    while let Some(arg) = args.next() {
+        if arg != "--listed" {
+            positional.push(arg);
+            continue;
+        }
+        let inventory = args.next().ok_or_else(|| {
+            "nextest-test-results --listed requires NEXTEST_INVENTORY_JSON".to_string()
+        })?;
+        if args.next().as_deref() != Some("--") {
+            return Err(
+                "nextest-test-results --listed NEXTEST_INVENTORY_JSON must be followed by -- and the run's Nextest arguments".into(),
+            );
+        }
+        listing = Some((inventory, args.by_ref().collect::<Vec<_>>()));
+    }
+    let Some((inventory, selection)) = listing else {
+        return Err(
+            "nextest-test-results requires --listed NEXTEST_INVENTORY_JSON -- NEXTEST_ARGS; without the listing there is no population to compare the executed tests with".into(),
+        );
+    };
+    if env::var_os("NEXTEST_EXPECTED_EXECUTED").is_some() {
+        return Err(
+            "nextest-test-results: NEXTEST_EXPECTED_EXECUTED is retired; the executed tests are compared with the tests `cargo nextest list` selected at this head, so a fixed count would only be ignored".into(),
+        );
+    }
+    let mut positional = positional.into_iter();
     let status = parse_u64(
-        args.next()
+        positional
+            .next()
             .ok_or_else(|| "nextest-test-results missing NEXTEST_STATUS".to_string())?,
         "nextest_status",
     )?;
-    let output = args
+    let output = positional
         .next()
         .ok_or_else(|| "nextest-test-results missing OUTPUT".to_string())?;
-    let attempt_records = args.next();
-    let binary_map = args.next();
-    let cpu_report = args.next();
-    if args.next().is_some() {
+    let attempt_records = positional.next();
+    let binary_map = positional.next();
+    let cpu_report = positional.next();
+    if positional.next().is_some() {
         return Err("nextest-test-results received too many arguments".into());
     }
+    let references = selection_references(&selection)
+        .map_err(|error| format!("nextest-test-results: {error}"))?;
+    let listed = listed_inventory(
+        &fs::read(&inventory)
+            .map_err(|error| format!("cannot read nextest inventory {inventory}: {error}"))?,
+    )
+    .map_err(|error| format!("nextest-test-results inventory {inventory}: {error}"))?;
     if attempt_records.is_some() != binary_map.is_some()
         || attempt_records.is_some() != cpu_report.is_some()
     {
@@ -658,31 +842,30 @@ fn run() -> Result<(), ProducerError> {
         (None, None, None) => None,
         _ => unreachable!("argument pairing was checked above"),
     };
+    let audit = SelectionAudit::new(&parsed, &listed, &references);
     let report =
         TestResults::current(parsed.executed_tests, parsed.filtered_tests, parsed.results)?;
-    if let Some(expected) = match env::var("NEXTEST_EXPECTED_EXECUTED") {
-        Ok(value) => Some(parse_u64(value, "NEXTEST_EXPECTED_EXECUTED")?),
-        Err(env::VarError::NotPresent) => None,
-        Err(env::VarError::NotUnicode(_)) => {
-            return Err("nextest-test-results NEXTEST_EXPECTED_EXECUTED is not UTF-8".into());
-        }
-    } {
-        if report.executed_tests != expected {
-            // Carry the outcome the refusal already knows. The typed report is
-            // deliberately NOT written here -- publishing it would record a test
-            // population nobody sanctioned, which is the whole point of this
-            // ratchet -- so this message is the only place the run can say what
-            // actually happened. Without the breakdown a node where every test
-            // passed and a node that was failing produce the same line, and the
-            // consumer records both as an unexplained failure with no test ids.
+    if let Some(note) = audit.stale_note() {
+        eprintln!("nextest-test-results: {note}");
+    }
+    if !audit.agrees() {
+        let difference = audit.difference(report.executed_tests, passed, failed);
+        if status == 0 {
+            // Nextest claimed success for a population other than the one
+            // the listing selected. Publishing would record that claim, so the
+            // typed report is withheld and this message is the only account
+            // of what ran; it names the tests on each side.
             return Err(format!(
-                "nextest-test-results: expected {expected} tests to execute, saw {}, \
-                 of which {passed} passed and {failed} failed; refusing because the \
-                 selected set changed",
-                report.executed_tests
+                "nextest-test-results: refusing because the tests that executed are not the tests `cargo nextest list` selected with the same arguments: {difference}"
             )
             .into());
         }
+        // Nextest already failed, and the wrapper returns its status, so the
+        // node fails either way. Keep the per-test results of what did
+        // execute, including the failures, and say what else went wrong.
+        eprintln!(
+            "nextest-test-results: nextest failed with status {status}, and the tests that executed are not the tests `cargo nextest list` selected with the same arguments: {difference}"
+        );
     }
     if output != "-" {
         publish_with_recovery(&report, Path::new(&output))?;
@@ -1559,5 +1742,285 @@ mod tests {
             .identity_for_executable(Path::new("/tmp/substituted-binary"))
             .unwrap_err();
         assert!(error.contains("absent from the typed inventory"), "{error}");
+    }
+
+    /// `cargo nextest list --message-format json` for one lib suite. Each case
+    /// is (test, ignored, filter status).
+    fn listing(cases: &[(&str, bool, &str)]) -> ListedInventory {
+        let testcases = cases
+            .iter()
+            .map(|(test, ignored, status)| {
+                (
+                    test.to_string(),
+                    serde_json::json!({"ignored": ignored, "filter-match": {"status": status}}),
+                )
+            })
+            .collect::<serde_json::Map<_, _>>();
+        let inventory = serde_json::json!({
+            "rust-suites": {
+                "suite": {
+                    "package-name": "suite",
+                    "binary-id": "suite",
+                    "binary-name": "suite",
+                    "kind": "lib",
+                    "binary-path": "/tmp/suite-binary",
+                    "testcases": testcases,
+                }
+            }
+        });
+        listed_inventory(&serde_json::to_vec(&inventory).unwrap()).unwrap()
+    }
+
+    fn selection(args: &[&str]) -> Vec<NameReference> {
+        selection_references(&args.iter().map(|arg| arg.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    fn lib_events(tests: &[&str]) -> ParsedEvents {
+        package_lib_events("suite", tests)
+    }
+
+    /// Passing results for tests of the lib suite of `package`.
+    fn package_lib_events(package: &str, tests: &[&str]) -> ParsedEvents {
+        let suite =
+            format!(r#""nextest":{{"crate":"{package}","test_binary":"{package}","kind":"lib"}}"#);
+        let mut text = format!(
+            "{{\"type\":\"suite\",\"event\":\"started\",\"test_count\":{},{suite}}}\n",
+            tests.len()
+        );
+        for test in tests {
+            text.push_str(&format!(
+                "{{\"type\":\"test\",\"event\":\"ok\",\"name\":\"{package}::{package}${test}\"}}\n"
+            ));
+        }
+        text.push_str(&format!(
+            "{{\"type\":\"suite\",\"event\":\"ok\",\"passed\":{},\"failed\":0,\"ignored\":0,\"filtered_out\":0,{suite}}}\n",
+            tests.len()
+        ));
+        parse_event_text(&text).unwrap()
+    }
+
+    #[test]
+    fn a_listed_test_that_does_not_execute_is_refused_by_name() {
+        let audit = SelectionAudit::new(
+            &parse_event_text(sample_events()).unwrap(),
+            &listing(&[
+                ("passes", false, "matches"),
+                ("recovers", false, "matches"),
+                ("never_ran", false, "matches"),
+            ]),
+            &selection(&["-p", "suite", "--lib"]),
+        );
+        assert!(!audit.agrees());
+        assert_eq!(audit.missing, ["suite$never_ran"]);
+        assert!(audit.unexpected.is_empty());
+        assert_eq!(
+            audit.difference(2, 2, 0),
+            "3 test(s) listed to run, 2 executed, of which 2 passed and 0 failed; \
+             1 listed test(s) did not execute: suite$never_ran"
+        );
+    }
+
+    #[test]
+    fn tests_added_with_no_other_edit_still_agree() {
+        let arguments = selection(&["-p", "suite", "--lib", "--", "--skip", "slow_"]);
+        let before = SelectionAudit::new(
+            &lib_events(&["passes", "recovers"]),
+            &listing(&[
+                ("passes", false, "matches"),
+                ("recovers", false, "matches"),
+                ("slow_case", false, "mismatch"),
+            ]),
+            &arguments,
+        );
+        assert!(before.agrees(), "{before:?}");
+        // Two tests appear in the source: the listing and the run both see
+        // them, the arguments are unchanged, and nothing records a count.
+        let after = SelectionAudit::new(
+            &lib_events(&["passes", "recovers", "added_one", "added_two"]),
+            &listing(&[
+                ("passes", false, "matches"),
+                ("recovers", false, "matches"),
+                ("added_one", false, "matches"),
+                ("added_two", false, "matches"),
+                ("slow_case", false, "mismatch"),
+            ]),
+            &arguments,
+        );
+        assert!(after.agrees(), "{after:?}");
+        assert_eq!(after.listed, 4);
+        assert_eq!(after.stale_note(), None);
+    }
+
+    #[test]
+    fn an_executed_test_the_listing_did_not_select_is_refused() {
+        let audit = SelectionAudit::new(
+            &lib_events(&["passes", "filtered"]),
+            &listing(&[
+                ("passes", false, "matches"),
+                ("filtered", false, "mismatch"),
+            ]),
+            &selection(&["-E", "test(=passes)"]),
+        );
+        assert!(!audit.agrees());
+        assert_eq!(audit.unexpected, ["suite$filtered"]);
+        assert!(audit.missing.is_empty());
+    }
+
+    #[test]
+    fn a_selecting_name_that_chooses_no_listed_test_is_refused() {
+        // Nextest lists and runs only `passes`, so the executed and listed sets
+        // agree; the renamed test is visible only in the arguments.
+        let audit = SelectionAudit::new(
+            &lib_events(&["passes"]),
+            &listing(&[("passes", false, "matches")]),
+            &selection(&["-E", "test(=passes) | test(=renamed_away)"]),
+        );
+        assert!(audit.missing.is_empty() && audit.unexpected.is_empty());
+        assert!(!audit.agrees());
+        assert_eq!(
+            audit.dangling,
+            ["test(=renamed_away) (named exactly \"renamed_away\")"]
+        );
+        let alternation = SelectionAudit::new(
+            &lib_events(&["passes"]),
+            &listing(&[("passes", false, "matches")]),
+            &selection(&["-E", "test(/^(passes|gone)$/)"]),
+        );
+        assert_eq!(
+            alternation.dangling,
+            ["test(/^(passes|gone)$/) (named exactly \"gone\")"]
+        );
+        let exact_positional = SelectionAudit::new(
+            &lib_events(&["passes"]),
+            &listing(&[("passes", false, "matches")]),
+            &selection(&["passes", "pass", "--", "--exact"]),
+        );
+        assert_eq!(exact_positional.dangling.len(), 1);
+        assert!(exact_positional.dangling[0].contains("\"pass\""));
+    }
+
+    #[test]
+    fn a_package_scoped_selector_is_not_satisfied_by_another_packages_test() {
+        // Package `a`'s `shared` test was renamed; package `b` still has one.
+        let suite = |package: &str, test: &str, status: &str| {
+            serde_json::json!({
+                "package-name": package,
+                "binary-id": package,
+                "binary-name": package,
+                "kind": "lib",
+                "binary-path": format!("/tmp/{package}-binary"),
+                "testcases": {test: {"ignored": false, "filter-match": {"status": status}}},
+            })
+        };
+        let inventory = serde_json::json!({
+            "rust-suites": {
+                "a": suite("a", "renamed", "mismatch"),
+                "b": suite("b", "shared", "matches"),
+            }
+        });
+        let listed = listed_inventory(&serde_json::to_vec(&inventory).unwrap()).unwrap();
+        let audit = SelectionAudit::new(
+            &package_lib_events("b", &["shared"]),
+            &listed,
+            &selection(&[
+                "-E",
+                "(package(=a) & test(=shared)) | (package(=b) & test(=shared))",
+            ]),
+        );
+        // Nextest lists and runs `b::shared` alone, so the sets agree.
+        assert!(
+            audit.missing.is_empty() && audit.unexpected.is_empty(),
+            "{audit:?}"
+        );
+        assert!(!audit.agrees());
+        assert_eq!(
+            audit.dangling,
+            ["test(=shared) with package(=a) (named exactly \"shared\")"]
+        );
+    }
+
+    #[test]
+    fn an_exclusion_matching_nothing_is_reported_not_refused() {
+        let audit = SelectionAudit::new(
+            &lib_events(&["passes"]),
+            &listing(&[("passes", false, "matches"), ("skipped", false, "mismatch")]),
+            &selection(&[
+                "-E",
+                "not test(=removed_long_ago)",
+                "--",
+                "--skip",
+                "skipped",
+                "--skip",
+                "no_such_test",
+            ]),
+        );
+        assert!(audit.agrees(), "{audit:?}");
+        let note = audit.stale_note().unwrap();
+        assert!(note.contains("2 test name(s)"), "{note}");
+        assert!(
+            note.contains("removed_long_ago") && note.contains("no_such_test"),
+            "{note}"
+        );
+        assert!(!note.contains("\"skipped\""), "{note}");
+    }
+
+    #[test]
+    fn ignored_tests_chosen_by_the_listing_must_execute() {
+        let listed = listing(&[
+            ("ordinary", false, "mismatch"),
+            ("expensive", true, "matches"),
+        ]);
+        let ran = SelectionAudit::new(
+            &lib_events(&["expensive"]),
+            &listed,
+            &selection(&["--", "--ignored"]),
+        );
+        assert!(ran.agrees(), "{ran:?}");
+        let skipped = SelectionAudit::new(
+            &lib_events(&["ordinary"]),
+            &listed,
+            &selection(&["--", "--ignored"]),
+        );
+        assert_eq!(skipped.missing, ["suite$expensive"]);
+        assert_eq!(skipped.unexpected, ["suite$ordinary"]);
+    }
+
+    #[test]
+    fn stress_repetitions_are_one_listed_test() {
+        let events = concat!(
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1,\"nextest\":{\"crate\":\"suite\",\"test_binary\":\"suite\",\"kind\":\"lib\",\"stress_index\":1}}\n",
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"suite::suite@stress-1$passes\"}\n",
+            "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"filtered_out\":0,\"nextest\":{\"crate\":\"suite\",\"test_binary\":\"suite\",\"kind\":\"lib\",\"stress_index\":1}}\n",
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1,\"nextest\":{\"crate\":\"suite\",\"test_binary\":\"suite\",\"kind\":\"lib\",\"stress_index\":2}}\n",
+            "{\"type\":\"test\",\"event\":\"ok\",\"name\":\"suite::suite@stress-2$passes\"}\n",
+            "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,\"ignored\":0,\"filtered_out\":0,\"nextest\":{\"crate\":\"suite\",\"test_binary\":\"suite\",\"kind\":\"lib\",\"stress_index\":2}}\n",
+        );
+        let audit = SelectionAudit::new(
+            &parse_event_text(events).unwrap(),
+            &listing(&[("passes", false, "matches")]),
+            &selection(&[]),
+        );
+        assert!(audit.agrees(), "{audit:?}");
+    }
+
+    #[test]
+    fn listing_refuses_unknown_filter_status() {
+        let unknown = br#"{"rust-suites":{"suite":{"package-name":"suite","binary-id":"suite","binary-name":"suite","kind":"lib","binary-path":"/tmp/s","testcases":{"t":{"ignored":false,"filter-match":{"status":"perhaps"}}}}}}"#;
+        assert!(
+            listed_inventory(unknown)
+                .unwrap_err()
+                .contains("unknown Nextest filter status")
+        );
+    }
+
+    #[test]
+    fn long_differences_name_a_bounded_sample() {
+        let names = (0..25)
+            .map(|index| format!("t{index:02}"))
+            .collect::<Vec<_>>();
+        let sample = named_sample(&names);
+        assert!(sample.starts_with("t00, t01"), "{sample}");
+        assert!(sample.contains("t19, and 5 more"), "{sample}");
+        assert!(!sample.contains("t20"), "{sample}");
     }
 }

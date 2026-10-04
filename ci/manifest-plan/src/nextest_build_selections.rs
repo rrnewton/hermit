@@ -447,6 +447,14 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
             }
         }
         let parsed = split_arguments(&arguments).map_err(|error| format!("{tag}: {error}"))?;
+        if marker == "run-nextest-counted.sh" {
+            // The Nextest writer extracts the test names this selection
+            // chooses and refuses at run time when it cannot; refuse here
+            // first, so an unreadable selection never reaches a run.
+            crate::nextest_selection::selection_references(&arguments).map_err(|error| {
+                format!("{tag}: its executed tests cannot be compared with its listing: {error}")
+            })?;
+        }
         if parsed.build != expected {
             return Err(format!(
                 "{tag} command has Cargo selection {:?}, declared {expected:?}",
@@ -610,7 +618,6 @@ mod tests {
                     .iter()
                     .any(|binary| binary == "child_time_rpc")
             );
-            assert_eq!(step.env["NEXTEST_EXPECTED_EXECUTED"], "195");
             // The explicit utimensat mtime regression
             // (https://github.com/rrnewton/hermit/issues/3565).
             assert!(

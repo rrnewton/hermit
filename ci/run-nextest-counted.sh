@@ -127,11 +127,27 @@ function nextest_inventory_args {
     done
 }
 
+# emit_libtest_count EVENTS STATUS INVENTORY ATTEMPTS BINARY_MAP CPU_REPORT [SELECTION_ARGS...]
+#
+# INVENTORY is `cargo nextest list --message-format json` output for the
+# selection, and SELECTION_ARGS are the arguments that listing used. The writer
+# compares the tests that executed with the tests that listing selected, so the
+# population is whatever the source defines at this head; nothing pins a count.
+# ATTEMPTS, BINARY_MAP, and CPU_REPORT are all empty or all supplied.
 function emit_libtest_count {
-    local events=$1 status=${2:-0} path=${DAGRUN_TEST_COUNTS_PATH:--}
-    local attempts=${3-} binary_map=${4-} cpu_report=${5-}
+    local events=$1 status=${2:-0} inventory=${3-} path=${DAGRUN_TEST_COUNTS_PATH:--}
+    local attempts=${4-} binary_map=${5-} cpu_report=${6-}
     local writer_status=0
     local -a cpu_args=()
+    if (($# >= 6)); then
+        shift 6
+    else
+        set --
+    fi
+    if [[ -z $inventory ]]; then
+        printf 'run-nextest-counted: the typed nextest inventory is required to compare executed tests with listed tests\n' >&2
+        return 2
+    fi
     if [[ ! -s $events ]]; then
         printf 'run-nextest-counted: typed nextest event stream is empty\n' >&2
         return 2
@@ -143,7 +159,8 @@ function emit_libtest_count {
         fi
         cpu_args=("$attempts" "$binary_map" "$cpu_report")
     fi
-    run_rust_script "$RESULT_WRITER" "$events" "$status" "$path" "${cpu_args[@]}" || writer_status=$?
+    run_rust_script "$RESULT_WRITER" "$events" "$status" "$path" "${cpu_args[@]}" \
+        --listed "$inventory" -- "$@" || writer_status=$?
     if ((writer_status != 0)); then
         printf 'run-nextest-counted: cannot derive typed test results from %s\n' "$events" >&2
         return "$writer_status"
@@ -232,8 +249,8 @@ function run_nextest {
     set -e
     cleanup_nextest_config
 
-    emit_libtest_count "$events_log" "$status" "$attempts" "$binary_map" \
-        "$cpu_report" || count_status=$?
+    emit_libtest_count "$events_log" "$status" "$inventory" "$attempts" "$binary_map" \
+        "$cpu_report" "${inventory_arguments[@]}" || count_status=$?
     # Publication cannot erase a failure that the actual test runner observed.
     if ((status != 0)); then
         return "$status"
@@ -249,6 +266,35 @@ function self_test {
 
     cpu_wrapper=$(build_cpu_wrapper) || return $?
     "$cpu_wrapper" --self-test || return $?
+    fixture_binary="$scratch/suite-0123456789abcdef"
+
+    # write_listing SELECTED... [-- NOT_SELECTED...] prints the
+    # `cargo nextest list --message-format json` inventory of one lib suite
+    # named "suite": the first names match the selection, the rest do not.
+    function write_listing {
+        local name status=matches
+        local -a cases=()
+        for name in "$@"; do
+            if [[ $name == -- ]]; then
+                status=mismatch
+                continue
+            fi
+            cases+=("$name" "$status")
+        done
+        jq -nc --arg executable "$fixture_binary" --args '
+            [range(0; $ARGS.positional | length; 2) as $i
+                | {key: $ARGS.positional[$i], value: {
+                    ignored: false,
+                    "filter-match": (if $ARGS.positional[$i + 1] == "matches"
+                        then {status: "matches"}
+                        else {status: "mismatch", reason: "string"} end)}}]
+            | from_entries as $cases
+            | {"rust-suites": {"suite": {
+                "package-name": "suite", "binary-id": "suite",
+                "binary-name": "suite", "kind": "lib",
+                "binary-path": $executable, testcases: $cases}}}' "${cases[@]}"
+    }
+    write_listing passes recovers -- skipme >"$scratch/listed.json" || return 1
 
     printf '%s\n' \
         '{"type":"suite","event":"started","test_count":2,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
@@ -259,7 +305,7 @@ function self_test {
         '{"type":"suite","event":"ok","passed":2,"failed":0,"ignored":0,"measured":0,"filtered_out":7,"exec_time":0.3,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
         >"$scratch/events.jsonl"
     got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/counts.json" \
-        emit_libtest_count "$scratch/events.jsonl" 0)
+        emit_libtest_count "$scratch/events.jsonl" 0 "$scratch/listed.json")
     expected=$'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 7 filtered out'
     [[ $got == "$expected" ]] || return 1
     python3 - "$scratch/counts.json" <<'PYEOF' || return 1
@@ -282,7 +328,7 @@ PYEOF
     sed 's/"filtered_out":7/"filtered_out":11/' \
         "$scratch/events.jsonl" >"$scratch/mutated-events.jsonl"
     got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/mutated-counts.json" \
-        emit_libtest_count "$scratch/mutated-events.jsonl" 0)
+        emit_libtest_count "$scratch/mutated-events.jsonl" 0 "$scratch/listed.json")
     expected=$'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 11 filtered out'
     [[ $got == "$expected" ]] || return 1
     python3 - "$scratch/mutated-counts.json" <<'PYEOF' || return 1
@@ -295,25 +341,62 @@ assert report["executed_tests"] == 2
 assert report["filtered_tests"] == 11
 PYEOF
 
-    got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/expected-counts.json" \
-        NEXTEST_EXPECTED_EXECUTED=2 emit_libtest_count "$scratch/events.jsonl" 0)
-    expected=$'running 2 tests\ntest result: ok. 2 passed; 0 failed; 0 ignored; 7 filtered out'
+    # The population is whatever `cargo nextest list` selects at this head.
+    # Tests added to the source with no other edit are listed and executed,
+    # so the node passes with nothing to update.
+    write_listing passes recovers added -- skipme >"$scratch/added-listed.json" || return 1
+    sed -e 's/"test_count":2/"test_count":3/' -e 's/"passed":2/"passed":3/' \
+        -e '/"suite::suite\$recovers#2"/a {"type":"test","event":"started","name":"suite::suite$added"}\n{"type":"test","event":"ok","name":"suite::suite$added","exec_time":0.1}' \
+        "$scratch/events.jsonl" >"$scratch/added-events.jsonl"
+    got=$(DAGRUN_TEST_COUNTS_PATH="$scratch/added-counts.json" \
+        emit_libtest_count "$scratch/added-events.jsonl" 0 "$scratch/added-listed.json")
+    expected=$'running 3 tests\ntest result: ok. 3 passed; 0 failed; 0 ignored; 7 filtered out'
     [[ $got == "$expected" ]] || return 1
-    cmp -s "$scratch/expected-counts.json" "$scratch/counts.json" || return 1
+    jq -e '.executed_tests == 3 and ([.results[].id] | index("suite$added") != null)' \
+        "$scratch/added-counts.json" >/dev/null || return 1
+
+    # A listed test that does not execute fails the node even though nextest
+    # reported success, and the refusal names it.
+    write_listing passes recovers never_ran -- skipme >"$scratch/unrun-listed.json" || return 1
+    status=0
+    DAGRUN_TEST_COUNTS_PATH="$scratch/unrun-counts.json" \
+        emit_libtest_count "$scratch/events.jsonl" 0 "$scratch/unrun-listed.json" \
+        >"$scratch/unrun.stdout" 2>"$scratch/unrun.stderr" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -Fq '1 listed test(s) did not execute: suite$never_ran' "$scratch/unrun.stderr" || return 1
+    # The typed report is withheld, so the refusal is the only place the run
+    # can say whether the tests it did run passed.
+    grep -Fq '3 test(s) listed to run, 2 executed, of which 2 passed and 0 failed' \
+        "$scratch/unrun.stderr" || return 1
+    [[ ! -e $scratch/unrun-counts.json ]] || return 1
+
+    # A test the selection names exactly must exist at this head; a rename
+    # would otherwise silently drop it while the two sets still agree.
+    status=0
+    DAGRUN_TEST_COUNTS_PATH="$scratch/dangling-counts.json" \
+        emit_libtest_count "$scratch/events.jsonl" 0 "$scratch/listed.json" "" "" "" \
+        -E 'test(=passes) | test(=recovers) | test(=renamed_away)' \
+        >/dev/null 2>"$scratch/dangling.stderr" || status=$?
+    [[ $status == 2 ]] || return 1
+    grep -Fq 'match no listed test: test(=renamed_away) (named exactly "renamed_away")' \
+        "$scratch/dangling.stderr" || return 1
+    [[ ! -e $scratch/dangling-counts.json ]] || return 1
 
     status=0
-    DAGRUN_TEST_COUNTS_PATH="$scratch/wrong-counts.json" \
-        NEXTEST_EXPECTED_EXECUTED=3 emit_libtest_count "$scratch/events.jsonl" 0 \
-        >"$scratch/wrong-count.stdout" 2>"$scratch/wrong-count.stderr" || status=$?
+    DAGRUN_TEST_COUNTS_PATH="$scratch/retired-counts.json" NEXTEST_EXPECTED_EXECUTED=2 \
+        emit_libtest_count "$scratch/events.jsonl" 0 "$scratch/listed.json" \
+        >/dev/null 2>"$scratch/retired.stderr" || status=$?
     [[ $status == 2 ]] || return 1
-    grep -q 'expected 3 tests to execute, saw 2' "$scratch/wrong-count.stderr" || return 1
-    [[ ! -e $scratch/wrong-counts.json ]] || return 1
+    grep -q 'NEXTEST_EXPECTED_EXECUTED is retired' "$scratch/retired.stderr" || return 1
+    [[ ! -e $scratch/retired-counts.json ]] || return 1
 
     status=0
-    NEXTEST_EXPECTED_EXECUTED=unknown emit_libtest_count "$scratch/events.jsonl" 0 \
-        >/dev/null 2>"$scratch/invalid-count.stderr" || status=$?
+    DAGRUN_TEST_COUNTS_PATH="$scratch/unlisted-counts.json" \
+        emit_libtest_count "$scratch/events.jsonl" 0 \
+        >/dev/null 2>"$scratch/unlisted.stderr" || status=$?
     [[ $status == 2 ]] || return 1
-    grep -q 'NEXTEST_EXPECTED_EXECUTED' "$scratch/invalid-count.stderr" || return 1
+    grep -q 'inventory is required' "$scratch/unlisted.stderr" || return 1
+    [[ ! -e $scratch/unlisted-counts.json ]] || return 1
 
     [[ $(configured_wall_timeout_multiplier) == 1 ]] || return 1
     wall_multiplier=$(HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER=1.5 \
@@ -326,8 +409,10 @@ PYEOF
         '{"type":"test","event":"failed","name":"suite::suite$fails","exec_time":0.2}' \
         '{"type":"suite","event":"failed","passed":0,"failed":1,"ignored":0,"measured":0,"filtered_out":3,"exec_time":0.2,"nextest":{"crate":"suite","test_binary":"suite","kind":"lib"}}' \
         >"$scratch/failed-events.jsonl"
+    write_listing fails >"$scratch/failed-listed.json" || return 1
     DAGRUN_TEST_COUNTS_PATH="$scratch/failed-counts.json" \
-        emit_libtest_count "$scratch/failed-events.jsonl" 100 >/dev/null || return 1
+        emit_libtest_count "$scratch/failed-events.jsonl" 100 "$scratch/failed-listed.json" \
+        >/dev/null || return 1
     python3 - "$scratch/failed-counts.json" <<'PYEOF' || return 1
 import json
 import sys
@@ -342,7 +427,6 @@ PYEOF
     # Exercise the generated config, the real per-execution wrapper, and the
     # typed reconciliation path. A valid failed run must still return nextest's
     # original nonzero status.
-    fixture_binary="$scratch/suite-0123456789abcdef"
     ln -s -- "$cpu_wrapper" "$fixture_binary"
     attempts="$scratch/wrapper-attempts"
     mkdir "$attempts"
@@ -353,17 +437,7 @@ PYEOF
         shift 4
         if [[ $operation == list ]]; then
             printf '%s\n' "$@" >"$scratch/list-arguments"
-            jq -nc --arg executable "$fixture_binary" '{
-                "rust-suites": {
-                    "suite": {
-                        "package-name": "suite",
-                        "binary-id": "suite",
-                        "binary-name": "suite",
-                        "kind": "lib",
-                        "binary-path": $executable
-                    }
-                }
-            }'
+            write_listing failure -- skipme
             return
         fi
         [[ $operation == run ]] || return 99
@@ -438,8 +512,14 @@ PYEOF
     got=$(TMPDIR="$scratch" DAGRUN_TEST_COUNTS_PATH="$scratch/launch-counts.json" \
         run_nextest "$scratch/launch-events" "$wall_multiplier" "$cpu_wrapper" \
         "$attempts" "$binary_map" "$inventory" "$scratch/launch-cpu.json" \
-        --profile ci -p suite -j 1 --retries 2 -- --skip skipme) || status=$?
+        --profile ci -p suite -j 1 --retries 2 -- --skip skipme \
+        2>"$scratch/launch.stderr") || status=$?
     [[ $status == 100 ]] || return 1
+    # Nextest already failed, so the zero-execution report is still published
+    # and the listed test that never ran is named beside nextest's status.
+    grep -Fq 'nextest failed with status 100, and the tests that executed are not the tests `cargo nextest list` selected' \
+        "$scratch/launch.stderr" || return 1
+    grep -Fq '1 listed test(s) did not execute: suite$failure' "$scratch/launch.stderr" || return 1
     [[ $got == *$'running 0 tests\ntest result: FAILED. 0 passed; 0 failed; 0 ignored; 0 filtered out' ]] || return 1
     [[ $got != *'test result: ok.'* ]] || return 1
     [[ $(<"$scratch/launch-counts.json") == \
@@ -448,47 +528,43 @@ PYEOF
     cmp -s "$scratch/expected-list-arguments" "$scratch/list-arguments" || return 1
     if compgen -G "$scratch/hermit-nextest-config.*.toml" >/dev/null; then return 1; fi
 
+    # A failed run whose population also differs from the listing keeps the
+    # results of what did execute, failures included, and names what did not.
+    write_listing failure also_listed -- skipme >"$scratch/failed-wrong-listed.json" || return 1
     status=0
-    DAGRUN_TEST_COUNTS_PATH="$scratch/launch-wrong-count.json" NEXTEST_EXPECTED_EXECUTED=1 \
-        emit_libtest_count "$scratch/launch-events" 100 "$attempts" "$binary_map" \
-        "$scratch/launch-wrong-cpu.json" >"$scratch/launch-wrong.stdout" 2>"$scratch/launch-wrong.stderr" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'expected 1 tests to execute, saw 0' "$scratch/launch-wrong.stderr" || return 1
-    # The refusal must carry the outcome it already knows. Withholding the typed
-    # report is deliberate and asserted on the next line, so this message is the
-    # only place the run can say whether the tests it DID run passed. Without it
-    # an all-green population drift and a failing one read identically.
-    grep -q 'of which 0 passed and 0 failed' "$scratch/launch-wrong.stderr" || return 1
-    [[ ! -e $scratch/launch-wrong-count.json && ! -e $scratch/launch-wrong-cpu.json ]] || return 1
-    status=0
-    DAGRUN_TEST_COUNTS_PATH="$scratch/failed-wrong-count.json" NEXTEST_EXPECTED_EXECUTED=2 \
-        emit_libtest_count "$scratch/wrapper-events" 100 "$ordinary_attempts" "$binary_map" \
-        "$scratch/failed-wrong-cpu.json" >"$scratch/failed-wrong.stdout" 2>"$scratch/failed-wrong.stderr" || status=$?
-    [[ $status == 2 ]] || return 1
-    grep -q 'expected 2 tests to execute, saw 1' "$scratch/failed-wrong.stderr" || return 1
-    grep -q 'of which 0 passed and 1 failed' "$scratch/failed-wrong.stderr" || return 1
-    [[ ! -e $scratch/failed-wrong-count.json && ! -e $scratch/failed-wrong-cpu.json ]] || return 1
+    DAGRUN_TEST_COUNTS_PATH="$scratch/failed-wrong-count.json" \
+        emit_libtest_count "$scratch/wrapper-events" 100 "$scratch/failed-wrong-listed.json" \
+        "$ordinary_attempts" "$binary_map" "$scratch/failed-wrong-cpu.json" \
+        -- --skip skipme \
+        >"$scratch/failed-wrong.stdout" 2>"$scratch/failed-wrong.stderr" || status=$?
+    [[ $status == 0 ]] || return 1
+    grep -Fq '2 test(s) listed to run, 1 executed, of which 0 passed and 1 failed; 1 listed test(s) did not execute: suite$also_listed' \
+        "$scratch/failed-wrong.stderr" || return 1
+    [[ $(<"$scratch/failed-wrong-count.json") == \
+        '{"executed_tests":1,"filtered_tests":0,"results":[{"attempts":1,"id":"suite$failure","result":"fail"}],"schema":2}' ]] || return 1
+    [[ -s $scratch/failed-wrong-cpu.json ]] || return 1
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/launch-stray-count.json" \
-        emit_libtest_count "$scratch/launch-events" 100 "$ordinary_attempts" "$binary_map" \
-        "$scratch/launch-stray-cpu.json" >"$scratch/launch-stray.stdout" 2>"$scratch/launch-stray.stderr" || status=$?
+        emit_libtest_count "$scratch/launch-events" 100 "$inventory" "$ordinary_attempts" \
+        "$binary_map" "$scratch/launch-stray-cpu.json" -- --skip skipme \
+        >"$scratch/launch-stray.stdout" 2>"$scratch/launch-stray.stderr" || status=$?
     [[ $status == 2 ]] || return 1
     grep -q 'unexpected=' "$scratch/launch-stray.stderr" || return 1
     [[ ! -e $scratch/launch-stray-count.json && ! -e $scratch/launch-stray-cpu.json ]] || return 1
-    unset -f cargo
+    unset -f cargo write_listing
 
     printf '%s\n' \
         '{"type":"test","event":"future","name":"suite::suite$case"}' \
         >"$scratch/unknown-event.jsonl"
     status=0
     DAGRUN_TEST_COUNTS_PATH="$scratch/refused.json" \
-        emit_libtest_count "$scratch/unknown-event.jsonl" 0 \
+        emit_libtest_count "$scratch/unknown-event.jsonl" 0 "$scratch/listed.json" \
         >/dev/null 2>"$scratch/refusal" || status=$?
     [[ $status == 2 ]] || return 1
     grep -q 'unsupported test event "future"' "$scratch/refusal" || return 1
     [[ ! -e $scratch/refused.json ]] || return 1
 
-    printf 'run-nextest-counted: self-test PASS (typed counts, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls)\n'
+    printf 'run-nextest-counted: self-test PASS (typed counts, executed tests equal listed tests, added tests need no edit, executed failure, zero-terminal launch failure, CPU reconciliation, refusal controls)\n'
 }
 
 if [[ ${1:-} == --help || ${1:-} == -h ]]; then

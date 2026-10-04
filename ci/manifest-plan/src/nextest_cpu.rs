@@ -101,6 +101,57 @@ pub fn selected_inventory(bytes: &[u8]) -> Result<Vec<AttemptIdentity>, String> 
     Ok(identities)
 }
 
+/// One test as `cargo nextest list` names it, in the terms Nextest's run events
+/// use: the package, the suite's binary name and kind, and the test name.
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct ListedTest {
+    pub package: String,
+    pub binary_name: String,
+    pub kind: String,
+    pub test: String,
+}
+
+/// What one `cargo nextest list` reported: the tests its filters chose to run
+/// and every test it enumerated.
+#[derive(Debug, Default)]
+pub struct ListedInventory {
+    /// Tests whose filter status is `matches`. Nextest runs exactly these,
+    /// including ignored tests when `--ignored` or `--include-ignored` chose
+    /// them.
+    pub selected: Vec<ListedTest>,
+    /// Every enumerated test, chosen or not.
+    pub universe: Vec<ListedTest>,
+}
+
+pub fn listed_inventory(bytes: &[u8]) -> Result<ListedInventory, String> {
+    BinaryMap::from_nextest_inventory(bytes)?;
+    let inventory: NextestInventory =
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())?;
+    let mut listed = ListedInventory::default();
+    for suite in inventory.rust_suites.into_values() {
+        for (test, case) in suite.testcases {
+            let identity = ListedTest {
+                package: suite.package.clone(),
+                binary_name: suite.binary_name.clone(),
+                kind: suite.kind.clone(),
+                test,
+            };
+            match case.filter_match.status.as_str() {
+                "matches" => listed.selected.push(identity.clone()),
+                "mismatch" => {}
+                status => return Err(format!("unknown Nextest filter status {status:?}")),
+            }
+            listed.universe.push(identity);
+        }
+    }
+    listed.selected.sort();
+    listed.universe.sort();
+    if listed.universe.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duplicate listed Nextest identity".into());
+    }
+    Ok(listed)
+}
+
 pub const BUDGET_SCHEMA: u64 = 1;
 pub const CALIBRATION_PATH: &str = ".config/nextest-budgets.json";
 
