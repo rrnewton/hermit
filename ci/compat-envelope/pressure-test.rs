@@ -6885,6 +6885,27 @@ fn repetition_passed_cleanly(terminal_result: &str, result_rows: &[CellResult]) 
         && result_rows.iter().all(|row| row.outcome == "PASS")
 }
 
+/// The first inner invocation that a PASS-labelled row retains but that did
+/// not pass, as an evidence error. The runner labels a row PASS only when
+/// every inner invocation it retains passed (`ci/manifest-plan/src/runner.rs`),
+/// so such a row contradicts its own label. A validated invocation's PASS
+/// outcome already means a completed pass with a matched comparison, or none
+/// in a noncomparison mode; a non-canonical match still counts, as the runner
+/// labels it PASS.
+fn pass_row_retaining_a_nonpassing_invocation(rows: &[CellResult]) -> Option<String> {
+    rows.iter().filter(|row| row.outcome == "PASS").find_map(|row| {
+        row.attempts
+            .iter()
+            .find(|attempt| attempt.outcome != "PASS")
+            .map(|attempt| {
+                format!(
+                    "outer attempt {} is labelled PASS but retains inner invocation {} with outcome {}: the runner labels a row PASS only when every inner invocation passed",
+                    row.attempt, attempt.index, attempt.outcome
+                )
+            })
+    })
+}
+
 /// Qualifying a sample is stricter than the retained legacy clean-pass count.
 /// One framework attempt may contain several declared seeds or subruns; every
 /// one must pass, and none may be an error or a timed-out observation.
@@ -7385,6 +7406,18 @@ fn fold_repetition(
     } else {
         Some(inner_pressure_history(rows))
     };
+    // A clean pass is credited from the outer PASS label alone. A history
+    // that would be credited so, but whose PASS row retains an invocation
+    // that did not pass, contradicts that label and cannot read CLEAN. Only
+    // such histories are checked: a retried history already cannot read
+    // CLEAN (`flake_verdict` requires no retried repetition), and inner
+    // evidence that does not validate is refused separately below.
+    let contradicted_pass = match &inner_history {
+        Some(Ok(_)) if repetition_passed_cleanly(result, rows) => {
+            pass_row_retaining_a_nonpassing_invocation(rows)
+        }
+        _ => None,
+    };
     // Skid-recovery credit is granted only to a history that passed the
     // inner-history validation above (every outer row's inner attempts
     // present, with nonempty distinct indices and retained reports whose
@@ -7420,10 +7453,14 @@ fn fold_repetition(
         inner_history
             .as_ref()
             .is_some_and(|history| history.is_err())
+            || contradicted_pass.is_some()
             || (row_valid && !sample_artifacts_valid),
     );
     if let Some(Err(error)) = &inner_history {
         sample_evidence_errors.push(error.clone());
+    }
+    if let Some(error) = contradicted_pass {
+        sample_evidence_errors.push(error);
     }
     if result == "pass" {
         counts.observed_repetitions += 1;
@@ -19232,6 +19269,277 @@ mod pressure_sample_tests {
                 credited,
                 "{label}"
             );
+        }
+        guard.remove().unwrap();
+    }
+
+    #[test]
+    fn rows_only_verdicts_refuse_a_pass_row_that_retains_an_invocation_that_did_not_pass() {
+        // The runner labels a row PASS only when every inner invocation it
+        // retains passed, and `verdicts` credits a clean pass from that label.
+        // A PASS row that retains a divergence, an infrastructure error or a
+        // comparison that never ran beside a declared-exit match contradicts
+        // itself and must not read CLEAN. The same invocations honestly
+        // labelled FAIL are a product failure; the match alone stays CLEAN.
+        let root = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-rows-contradicted-pass-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos(),
+        ));
+        fs::create_dir(&root).unwrap();
+        let guard = SelfTestDirectory::new(root.clone());
+        // A canonical match whose guest exits 23 as its cell declares, with
+        // Hermit's status, the report and both compared outputs naming it.
+        let mut matched = comparison_attempt("verify", 23);
+        matched.argv = [
+            "hermit",
+            "run",
+            "--strict",
+            "--verify",
+            "--verify-strict",
+            "--verify-allow=failure",
+            "--",
+            "fixture",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+        matched.shell_command = literal_shell_command(&matched.cwd, &matched.env, &matched.argv);
+        // Three invocations that did not pass, each retained under its own
+        // index with a report whose digest matches its bytes: a canonical
+        // divergence, a typed skid-overshoot infrastructure error, and a
+        // comparison that never ran.
+        let mut diverged = matched.clone();
+        diverged.index = "2".into();
+        diverged.outcome = "FAIL".into();
+        diverged.status = Some(1);
+        let mut report: JsonValue =
+            serde_json::from_str(diverged.verification_report.as_ref().unwrap()).unwrap();
+        report["verdict"] = json!("diverged");
+        report["verified"] = json!(false);
+        report["bitwise_parity"] = json!(false);
+        report["first_divergent_record"] = json!(93);
+        report["first_divergent_syscall"] = json!(37);
+        report["first_divergent_scheduler_turn"] = json!(68);
+        report["first_divergent_virtual_nanoseconds"] = json!(7);
+        report["first_divergent_left_message"] = json!("INFO detcore: left event");
+        report["first_divergent_right_message"] = json!("INFO detcore: right event");
+        replace_report(&mut diverged, report);
+        diverged.first_divergent_record = Some(93);
+        diverged.first_divergent_syscall = Some(37);
+        diverged.first_divergent_scheduler_turn = Some(68);
+        diverged.first_divergent_virtual_nanoseconds = Some(7);
+        diverged.first_divergent_left_message = Some("INFO detcore: left event".into());
+        diverged.first_divergent_right_message = Some("INFO detcore: right event".into());
+        let mut infrastructure = matched.clone();
+        infrastructure.index = "2".into();
+        infrastructure.outcome = "ERROR".into();
+        infrastructure.status = Some(125);
+        infrastructure.error_kind = Some("infrastructure".into());
+        let mut report = serde_json::to_value(VerificationReport::no_result()).unwrap();
+        report["verdict"] = json!("infrastructure_error");
+        report["no_result_reason"] = JsonValue::Null;
+        report["infrastructure_error"] = json!({"kind":"skid_overshoot","count":1});
+        replace_report(&mut infrastructure, report);
+        let mut not_run = matched.clone();
+        not_run.index = "2".into();
+        not_run.outcome = "ERROR".into();
+        not_run.status = Some(125);
+        not_run.error_kind = Some("incomplete-verification-evidence".into());
+        replace_report(
+            &mut not_run,
+            serde_json::to_value(VerificationReport::no_result()).unwrap(),
+        );
+        let refusal = |outcome: &str| {
+            format!(
+                "outer attempt 1 is labelled PASS but retains inner invocation 2 with outcome {outcome}: the runner labels a row PASS only when every inner invocation passed"
+            )
+        };
+        // (label, the row's outcome, its retained invocations, the verdict,
+        // and the refusal the reader must report, if any)
+        let cases = [
+            (
+                "a divergence beside the declared-exit match, labelled PASS",
+                "PASS",
+                vec![matched.clone(), diverged.clone()],
+                "INCOMPLETE",
+                Some(refusal("FAIL")),
+            ),
+            (
+                "an infrastructure error beside the declared-exit match, labelled PASS",
+                "PASS",
+                vec![matched.clone(), infrastructure],
+                "INCOMPLETE",
+                Some(refusal("ERROR")),
+            ),
+            (
+                "a comparison that never ran beside the declared-exit match, labelled PASS",
+                "PASS",
+                vec![matched.clone(), not_run],
+                "INCOMPLETE",
+                Some(refusal("ERROR")),
+            ),
+            (
+                "the declared-exit match alone, labelled PASS",
+                "PASS",
+                vec![matched.clone()],
+                "CLEAN",
+                None,
+            ),
+            (
+                "a divergence beside the declared-exit match, honestly labelled FAIL",
+                "FAIL",
+                vec![matched.clone(), diverged],
+                "FAILING",
+                None,
+            ),
+        ];
+        let mut judged = Vec::new();
+        for (index, (label, outcome, attempts, verdict, refusal)) in cases.into_iter().enumerate() {
+            let mut row = history_row("verify", outcome, 1, attempts);
+            row.hermit_sha = "0123456789abcdef0123456789abcdef01234567".into();
+            row.argv = matched.argv.clone();
+            row.guest_argv = matched.guest_argv.clone();
+            row.env = matched.env.clone();
+            row.cwd = matched.cwd.clone();
+            row.shell_command = matched.shell_command.clone();
+            row.timeout_seconds = 20;
+            row.execution_cpu_timeout_seconds = Some(10);
+            row.execution_wall_timeout_seconds = Some(20);
+            row.expected_guest_exit = Some(ExpectedGuestExit {
+                code: Some(23),
+                signal: None,
+                reason: "the fixture guest exits as declared".into(),
+            });
+            // Each retained invocation is valid evidence on its own and the
+            // match corroborates the declaration, so a refusal can come only
+            // from the label contradicting the invocations.
+            assert!(
+                inner_pressure_history(std::slice::from_ref(&row)).is_ok(),
+                "{label}"
+            );
+            assert!(matched_attempts_end_as_declared(&row), "{label}");
+            // Ten retained repetitions, read back through the real reader.
+            let case_root = root.join(format!("case-{index}"));
+            let slug = base_cell_slug(&CellId {
+                lane: row.lane.clone(),
+                category: row.category.clone(),
+                test: row.test.clone(),
+                mode: row.mode.clone(),
+                backend: row.backend.clone().unwrap(),
+            });
+            for number in 1..=PROMOTION_REPETITIONS {
+                row.run_id = format!("rows-contradicted-{index}-{number}");
+                row.run_index = Some(u64::try_from(number).unwrap());
+                let dir = case_root
+                    .join("cells")
+                    .join(format!("{slug}-repetition-{number:04}"));
+                fs::create_dir_all(&dir).unwrap();
+                row.artifact_dir = dir.join("artifacts").to_string_lossy().into_owned();
+                fs::write(
+                    dir.join("results.jsonl"),
+                    format!("{}\n", serde_json::to_string(&row).unwrap()),
+                )
+                .unwrap();
+                let sample = read_rows_repetition(&dir, &slug);
+                assert!(sample.row_valid, "{label}: {:?}", sample.evidence_errors);
+            }
+            let judgement = verdicts(&case_root, PROMOTION_REPETITIONS);
+            let written: JsonValue =
+                serde_json::from_str(&fs::read_to_string(case_root.join("verdicts.json")).unwrap())
+                    .unwrap();
+            judged.push((
+                label,
+                outcome,
+                verdict,
+                refusal,
+                judgement,
+                written["cells"][0].clone(),
+            ));
+        }
+        // Every case is judged before any is checked, so a failure names each
+        // history the reader misjudged.
+        let misjudged = judged
+            .iter()
+            .filter(|(_, _, verdict, _, _, summary)| summary["verdict"] != json!(verdict))
+            .map(|(label, ..)| *label)
+            .collect::<Vec<_>>();
+        assert!(
+            misjudged.is_empty(),
+            "the rows-only reader misjudged {misjudged:?}"
+        );
+        for (label, outcome, verdict, refusal, judgement, summary) in judged {
+            let labelled_pass = outcome == "PASS";
+            assert_eq!(
+                summary["passes"],
+                json!(if labelled_pass {
+                    PROMOTION_REPETITIONS
+                } else {
+                    0
+                }),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                summary["terminal_product_failures"],
+                json!(if labelled_pass {
+                    0
+                } else {
+                    PROMOTION_REPETITIONS
+                }),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                summary["unknown_history_repetitions"],
+                json!(if refusal.is_some() {
+                    PROMOTION_REPETITIONS
+                } else {
+                    0
+                }),
+                "{label}: {summary}"
+            );
+            assert_eq!(
+                summary["evidence_errors"],
+                json!(refusal.iter().collect::<Vec<_>>()),
+                "{label}: {summary}"
+            );
+            if verdict == "CLEAN" {
+                assert_eq!(judgement, Ok(()), "{label}: {summary}");
+                assert_eq!(
+                    summary["classification"],
+                    json!("promotion-candidate"),
+                    "{label}: {summary}"
+                );
+                assert_eq!(
+                    summary["qualifying_passes"],
+                    json!(PROMOTION_REPETITIONS),
+                    "{label}: {summary}"
+                );
+            } else {
+                let Err(error) = judgement else {
+                    panic!("{label}: the rows-only reader accepted a {verdict} cell: {summary}");
+                };
+                assert!(
+                    error.contains("1 of 1 cell(s) are not CLEAN")
+                        && error.contains(&format!("is {verdict}")),
+                    "{label}: {error}"
+                );
+                assert_eq!(
+                    summary["promotion_candidate"],
+                    json!(false),
+                    "{label}: {summary}"
+                );
+                assert_eq!(summary["qualifying_passes"], json!(0), "{label}: {summary}");
+            }
+            if verdict == "INCOMPLETE" {
+                assert_eq!(
+                    summary["classification"],
+                    json!("incomplete"),
+                    "{label}: {summary}"
+                );
+            }
         }
         guard.remove().unwrap();
     }
