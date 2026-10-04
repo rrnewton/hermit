@@ -1255,6 +1255,32 @@ impl<T: RecordOrReplay> Detcore<T> {
             .await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn controlled_shared_send_staging<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Sendto,
+    ) -> Result<i64, Error> {
+        self.network_shared_original_sendto(guest, call).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn controlled_ordinary_send_staging<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Sendto,
+    ) -> Result<crate::network_replay::original_connect::Arguments, Error> {
+        let (_, raw) = call.into_parts();
+        self.stage_original_call(
+            guest,
+            call.into(),
+            crate::network_replay::original_connect::Kind::Sendto,
+            (call.fd(), raw.arg1 as u64, call.flags() as i32),
+            crate::OriginalFileExecution::Native,
+        )
+        .await
+    }
+
     /// Install exact local cancellation custody before the first admission
     /// await. The binding here is only a preview until the selected grant.
     async fn stage_original_call<G: Guest<Self>>(
@@ -1262,11 +1288,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: Syscall,
         kind: crate::network_replay::original_connect::Kind,
-        (fd, address, length): (i32, u64, i32),
+        operands: (i32, u64, i32),
         source: crate::OriginalFileExecution,
     ) -> Result<crate::network_replay::original_connect::Arguments, Error> {
-        use crate::network_replay::original_connect::Arguments;
-        use crate::network_replay::original_connect::Local;
+        self.check_original_call_staging(guest, source)?;
+        if !kind.allocator() {
+            self.publish_network_fd_installations(guest).await?;
+        }
+        self.stage_original_call_local(guest, call, kind, operands)
+    }
+
+    fn check_original_call_staging<G: Guest<Self>>(
+        &self,
+        guest: &G,
+        source: crate::OriginalFileExecution,
+    ) -> Result<(), Error> {
         if source == crate::OriginalFileExecution::Native && !self.network_fd_tracking_active(guest)
         {
             return Err(engine_error(
@@ -1281,9 +1317,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 "original syscall requires actual backend preparation observation",
             ));
         }
-        if !kind.allocator() {
-            self.publish_network_fd_installations(guest).await?;
-        }
+        Ok(())
+    }
+
+    fn stage_original_call_local<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        kind: crate::network_replay::original_connect::Kind,
+        (fd, address, length): (i32, u64, i32),
+    ) -> Result<crate::network_replay::original_connect::Arguments, Error> {
+        use crate::network_replay::original_connect::Arguments;
+        use crate::network_replay::original_connect::Local;
         let (_, raw) = call.into_parts();
         let arguments = {
             let state = guest.thread_state();

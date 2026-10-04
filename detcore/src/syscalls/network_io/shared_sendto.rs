@@ -8,7 +8,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Sendto,
     ) -> Result<i64, Error> {
-        use crate::network_replay::original_connect::Kind;
         if !original_sendto_shape(call)
             || !(1..=512).contains(&call.size())
             || guest
@@ -22,26 +21,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         let read = self.begin_network_fd_read(guest, call.fd()).await?;
         let mut transferred = false;
         let result = async {
-            let timeout = guest
-                .local_global_state()
-                .ok_or_else(|| engine_error("shared send lacks local Global"))?
-                .shared_send_timeout(guest.tid(), guest.thread_state(), &read)
-                .map_err(engine_rpc_error)?;
+            let arguments = self.stage_shared_original_send_from_read(guest, call, &read)?;
             let (_, args) = Syscall::from(call).into_parts();
             let raw = [
                 args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
             ];
-            let arguments = self
-                .stage_original_call(
-                    guest,
-                    call.into(),
-                    Kind::BlockingSendto {
-                        timeout_ticks: timeout,
-                    },
-                    (call.fd(), args.arg1 as u64, call.flags() as i32),
-                    crate::OriginalFileExecution::Native,
-                )
-                .await?;
             // Only the dedicated genuine peer timers may be joined. This does
             // not run a peer continuation or replace this original Sendto frame.
             guest.join_followed_observation_timers(call.into()).await?;
@@ -114,5 +98,41 @@ impl<T: RecordOrReplay> Detcore<T> {
             .shadow_ack(guest, NetworkRequest::FinishFdRead { admission: read })
             .await;
         finish_shadow_operation(result, released)
+    }
+
+    /// The exact retained reader already owns publication custody. Reacquiring
+    /// it would conflict with that same lease; see
+    /// https://github.com/rrnewton/hermit/issues/3613 and
+    /// https://github.com/rrnewton/hermit/pull/3464.
+    fn stage_shared_original_send_from_read<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Sendto,
+        read: &crate::network_replay::NetworkFdReadAdmission,
+    ) -> Result<crate::network_replay::original_connect::Arguments, Error> {
+        // This existing Global borrower validates current shared Record mode,
+        // Normal/lineage, owner, table prefix, binding and descriptor control.
+        // It also derives the finite timeout from the same modeled socket.
+        let timeout = guest
+            .local_global_state()
+            .ok_or_else(|| engine_error("shared send lacks local Global"))?
+            .shared_send_timeout(guest.tid(), guest.thread_state(), read)
+            .map_err(engine_rpc_error)?;
+        if call.fd() != read.fd {
+            return Err(engine_error(
+                "shared Sendto changed its admitted descriptor",
+            ));
+        }
+        self.check_original_call_staging(guest, crate::OriginalFileExecution::Native)?;
+        let (_, args) = Syscall::from(call).into_parts();
+        // No await or reader release separates validation from Local staging.
+        self.stage_original_call_local(
+            guest,
+            call.into(),
+            crate::network_replay::original_connect::Kind::BlockingSendto {
+                timeout_ticks: timeout,
+            },
+            (call.fd(), args.arg1 as u64, call.flags() as i32),
+        )
     }
 }

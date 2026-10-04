@@ -5,6 +5,7 @@
 mod fd_identity;
 mod scalar_recvfrom;
 mod send_timeout;
+mod shared_send_staging;
 mod raw_poll;
 mod sendto_entry;
 mod native_source_read;
