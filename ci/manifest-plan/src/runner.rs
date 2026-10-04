@@ -9870,24 +9870,35 @@ mod tests {
             );
         }
 
-        // The earlier group was already enabled; the later disabled group adds
-        // equally to enabled and required, preserving enabled-minus-required.
-        // Both groups retain their separate evidence and ordinary bounds.
+        // The two dated LiteInst groups were qualified on the ptrace-owned
+        // hybrid. The owner reset of 2026-10-04 switched every LiteInst cell
+        // off while in-guest Detcore replaces it
+        // (https://github.com/rrnewton/hermit/issues/3745, step 1 of
+        // https://github.com/rrnewton/hermit/issues/3520), so none of them may
+        // be selected. A cell comes back only on the new architecture, with
+        // fresh evidence; delete the groups then rather than re-enabling them.
         for calibration in LITEINST_2026_09_16_TIMEOUT_CALIBRATIONS
             .iter()
             .chain(&LITEINST_2026_09_17_TIMEOUT_CALIBRATIONS)
         {
-            let cell = required
-                .iter()
-                .find(|cell| {
+            assert!(
+                !enabled.iter().any(|cell| {
                     cell.id.test == calibration.test
                         && cell.id.mode == calibration.mode
                         && cell.id.backend.as_deref() == Some(calibration.backend)
-                })
-                .expect("a newly qualified LiteInst cell is missing from required selection");
-            assert_eq!(cell.cpu_timeout_seconds, calibration.configured_cpu_seconds);
-            assert_eq!(cell.timeout_seconds, calibration.configured_wall_seconds);
+                }),
+                "{} {}/{} was switched off by the LiteInst reset",
+                calibration.test,
+                calibration.mode,
+                calibration.backend
+            );
         }
+        assert!(
+            !enabled
+                .iter()
+                .any(|cell| cell.id.backend.as_deref() == Some("liteinst")),
+            "the LiteInst reset leaves no LiteInst cell enabled"
+        );
 
         let observed = enabled
             .iter()

@@ -24,9 +24,9 @@ test:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
