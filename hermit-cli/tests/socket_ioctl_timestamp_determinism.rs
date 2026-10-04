@@ -9,6 +9,65 @@
 use std::path::Path;
 use std::process::Command;
 
+/// The line Hermit prints when it runs the guest under in-guest LiteInst.
+#[cfg(feature = "liteinst")]
+const IN_GUEST_SELECTED: &str =
+    "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool";
+
+/// Runs `guest` under in-guest LiteInst (https://github.com/rrnewton/hermit/issues/3520)
+/// twice and returns its stdout. In-guest LiteInst refuses `--verify` until it
+/// forwards guest records to Hermit, and a maximum timeslice until it can
+/// deliver Detcore's preemption timer, so these runs have neither. The guest
+/// checks its own timestamps against logical time and fails if one escapes;
+/// the second run must print the same output, which stands in for the
+/// determinism verdict that waits for guest-record forwarding. Both runs pin
+/// the same `--epoch`, as `--verify` pins one epoch for its two runs; without
+/// it each run starts its virtual clock at the host's current time.
+#[cfg(feature = "liteinst")]
+fn run_in_guest_liteinst_twice(guest: &Path, args: &[&str], label: &str) -> String {
+    let run = || {
+        let output = Command::new("timeout")
+            .args(["--kill-after", "5s", "90s"])
+            .arg(env!("CARGO_BIN_EXE_hermit"))
+            .args([
+                "--log=info",
+                "--backend=liteinst",
+                "run",
+                "--epoch=2026-01-01T00:00:00Z",
+            ])
+            .args([
+                "--strict",
+                "--max-timeslice=disabled",
+                "--base-env=minimal",
+                "--",
+            ])
+            .arg(guest)
+            .args(args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run liteinst/{label}: {error}"));
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "liteinst/{label} failed: {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        assert!(
+            stderr.lines().any(|line| line == IN_GUEST_SELECTED),
+            "liteinst/{label} did not run under in-guest LiteInst\nstderr:\n{stderr}"
+        );
+        stdout
+    };
+    let first = run();
+    assert!(!first.is_empty(), "liteinst/{label} printed nothing");
+    assert_eq!(
+        run(),
+        first,
+        "liteinst/{label} printed different output on its second run"
+    );
+    first
+}
+
 #[test]
 fn socket_timestamp_ioctls_use_logical_time() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -31,7 +90,7 @@ fn socket_timestamp_ioctls_use_logical_time() {
         String::from_utf8_lossy(&compile.stderr)
     );
 
-    for backend in ["ptrace", "dbt", "liteinst"] {
+    for backend in ["ptrace", "dbt"] {
         for mode in ["v4-us", "v4-ns", "v6-us"] {
             let verify = Command::new("timeout")
                 .args(["--kill-after", "5s", "90s"])
@@ -56,6 +115,11 @@ fn socket_timestamp_ioctls_use_logical_time() {
                 "{backend}/{mode} omitted Hermit's determinism marker\nstdout:\n{stdout}\nstderr:\n{stderr}"
             );
         }
+    }
+
+    #[cfg(feature = "liteinst")]
+    for mode in ["v4-us", "v4-ns", "v6-us"] {
+        run_in_guest_liteinst_twice(&guest, &[mode], mode);
     }
 
     let realtime = Command::new("timeout")
