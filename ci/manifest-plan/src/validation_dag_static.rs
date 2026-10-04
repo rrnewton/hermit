@@ -656,7 +656,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (every_config_source_clears_the_ptrace_only_signal_capabilities;
     // https://github.com/rrnewton/hermit/pull/3224) retains all 891 prior
     // identities (measured 892).
-    ("test.regular_crates", 892),
+    // One test-harness control of the sync-cells round-trip test's un-flip
+    // helper (tests::unflip_of_a_modes_only_backend_turns_its_ci_off;
+    // https://github.com/rrnewton/hermit/issues/3606) retains all 892 prior
+    // identities (measured 893).
+    ("test.regular_crates", 893),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1177,7 +1181,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retained-command-line test listed there retains all 889. The
     // main-ancestor floor admission test listed there retains all 890.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3224 test.
-    ("test.regular_crates_on_host", 892),
+    // It also selects the same un-flip helper control.
+    ("test.regular_crates_on_host", 893),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
