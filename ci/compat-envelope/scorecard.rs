@@ -17256,61 +17256,9 @@ fn read_retained_results(
         // An ordinary candidate comparison from a parity run still belongs
         // to the ordinary source ranking. A later ordinary measurement may
         // supersede it without superseding the independent cross comparison.
-        let candidates = ordinary;
-        if candidates.is_empty() {
+        let Some((candidate, domain)) = select_retained_ordinary_attempt(&id, &sha, ordinary)?
+        else {
             continue;
-        }
-        let terminal_attempt = candidates
-            .iter()
-            .map(|candidate| candidate.row.attempt)
-            .max()
-            .expect("retained candidate group is nonempty");
-        let mut distinct = BTreeMap::new();
-        for candidate in candidates
-            .into_iter()
-            .filter(|candidate| candidate.row.attempt == terminal_attempt)
-        {
-            distinct
-                .entry(candidate.evidence_identity.clone())
-                .or_insert(candidate);
-        }
-        if distinct.len() != 1 {
-            let details = distinct
-                .values()
-                .take(4)
-                .map(|candidate| candidate.path.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Err(format!(
-                "ambiguous terminal retained evidence for {} at {sha}: {details}",
-                display_id(&id)
-            ));
-        }
-        let candidate = distinct
-            .into_values()
-            .next()
-            .expect("distinct terminal evidence is nonempty");
-        let domain = match candidate
-            .row
-            .comparison_evidence_from(ResultInput::Retained)
-            .map_err(|error| {
-                format!(
-                    "malformed retained evidence for {} at {}: {error}",
-                    display_id(&id),
-                    candidate.path.display()
-                )
-            })? {
-            ValidateRowEvidence::NotRun { .. }
-            | ValidateRowEvidence::Unavailable { .. }
-            | ValidateRowEvidence::ExpectedOutputFailed { .. } => {
-                continue;
-            }
-            ValidateRowEvidence::Matched { .. } | ValidateRowEvidence::Diverged { .. } => {
-                RetainedComparisonDomain::Canonical
-            }
-            ValidateRowEvidence::StrippedMatched => RetainedComparisonDomain::Stripped,
-            ValidateRowEvidence::ParityMatched { .. }
-            | ValidateRowEvidence::ParityDiverged { .. } => RetainedComparisonDomain::Parity,
         };
         let rank = *history
             .get(&sha)
@@ -17433,6 +17381,141 @@ fn read_retained_results(
         stale_coordinate_cells,
         no_result_cells,
     })
+}
+
+/// Select the one ordinary result that a retained source/run attempt history
+/// contributes, within one comparison domain.
+///
+/// Every outer attempt is read before one is selected, not only the terminal
+/// one. Each attempt must have one distinct evidence identity and admissible
+/// evidence, so an earlier refused report, such as a canonical match without
+/// bitwise parity, refuses the import instead of hiding behind a later row.
+/// Every attempt must declare the same comparator, and the attempts that carry
+/// a comparison must all be in one comparison domain. A run that switches its
+/// comparator between outer attempts is refused: its stripped pass cannot
+/// resolve its canonical comparison, and neither attempt alone is the run's
+/// result.
+///
+/// The attempt numbers are not required to start at 1 or to stop after a
+/// pass: retained histories include partial runs and runs from validate
+/// revisions that executed a cell twice, and the source keeps the rows it
+/// retained.
+///
+/// The selected attempt is the latest one that carries a comparison, so only a
+/// later comparison, in the same domain, supersedes an earlier one. An attempt
+/// that produced no comparison, such as a retry that ended in an
+/// infrastructure error, does not erase an earlier failure: a canonical FAIL
+/// followed by an ERROR stays that canonical FAIL, as the runner's
+/// `outcome_after_retries` keeps the cell failed. Such an attempt does not
+/// promote an earlier pass either; that history contributes nothing, exactly
+/// as its terminal attempt alone did. A history in which no attempt carries a
+/// comparison contributes nothing.
+fn select_retained_ordinary_attempt(
+    id: &CellId,
+    sha: &str,
+    candidates: Vec<ResultCandidate>,
+) -> Result<Option<(ResultCandidate, RetainedComparisonDomain)>, String> {
+    let mut by_attempt = BTreeMap::<u64, BTreeMap<String, ResultCandidate>>::new();
+    for candidate in candidates {
+        by_attempt
+            .entry(candidate.row.attempt)
+            .or_default()
+            .entry(candidate.evidence_identity.clone())
+            .or_insert(candidate);
+    }
+    let mut attempts = Vec::with_capacity(by_attempt.len());
+    for (attempt, distinct) in by_attempt {
+        if distinct.len() != 1 {
+            let details = distinct
+                .values()
+                .take(4)
+                .map(|candidate| candidate.path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "ambiguous retained evidence for {} at {sha}, outer attempt {attempt}: {details}",
+                display_id(id)
+            ));
+        }
+        let candidate = distinct
+            .into_values()
+            .next()
+            .expect("distinct attempt evidence is nonempty");
+        // The domain of the comparison this attempt carries, and whether that
+        // comparison is a failure.
+        let comparison = match candidate
+            .row
+            .comparison_evidence_from(ResultInput::Retained)
+            .map_err(|error| {
+                format!(
+                    "malformed retained evidence for {} at {}, outer attempt {attempt}: {error}",
+                    display_id(id),
+                    candidate.path.display()
+                )
+            })? {
+            ValidateRowEvidence::NotRun { .. }
+            | ValidateRowEvidence::Unavailable { .. }
+            | ValidateRowEvidence::ExpectedOutputFailed { .. } => None,
+            ValidateRowEvidence::Matched { .. } => {
+                Some((RetainedComparisonDomain::Canonical, false))
+            }
+            ValidateRowEvidence::Diverged { .. } => {
+                Some((RetainedComparisonDomain::Canonical, true))
+            }
+            ValidateRowEvidence::StrippedMatched => {
+                Some((RetainedComparisonDomain::Stripped, false))
+            }
+            ValidateRowEvidence::ParityMatched { .. } => {
+                Some((RetainedComparisonDomain::Parity, false))
+            }
+            ValidateRowEvidence::ParityDiverged { .. } => {
+                Some((RetainedComparisonDomain::Parity, true))
+            }
+        };
+        attempts.push((candidate, comparison));
+    }
+    let Some((first, _)) = attempts.first() else {
+        return Ok(None);
+    };
+    if let Some((switched, _)) = attempts.iter().find(|(candidate, _)| {
+        candidate.row.declares_stripped_comparator() != first.row.declares_stripped_comparator()
+    }) {
+        return Err(format!(
+            "retained run {} of {} at {sha} switches comparator between outer attempts {} and {}: a stripped comparison cannot resolve a canonical comparison, so neither attempt is the run's result",
+            first.row.run_id,
+            display_id(id),
+            first.row.attempt,
+            switched.row.attempt
+        ));
+    }
+    let domains = attempts
+        .iter()
+        .filter_map(|(_, comparison)| comparison.map(|(domain, _)| domain))
+        .collect::<BTreeSet<_>>();
+    if domains.len() > 1 {
+        return Err(format!(
+            "retained run {} of {} at {sha} mixes the {domains:?} comparison domains between outer attempts; one run is measured by one comparator",
+            first.row.run_id,
+            display_id(id)
+        ));
+    }
+    let Some(selected) = attempts
+        .iter()
+        .rposition(|(_, comparison)| comparison.is_some())
+    else {
+        return Ok(None);
+    };
+    let terminal = attempts.len() - 1;
+    let (candidate, comparison) = attempts.swap_remove(selected);
+    let (domain, failed) = comparison.expect("selected attempt carries a comparison");
+    // Only a failure survives a later attempt that produced no comparison. A
+    // pass followed by such an attempt is not a history the runner writes,
+    // and crediting it would count a pass that the terminal attempt did not
+    // report, so it contributes nothing, as the terminal attempt alone did.
+    if selected != terminal && !failed {
+        return Ok(None);
+    }
+    Ok(Some((candidate, domain)))
 }
 
 /// Admit the one current DBT shape whose product result is present in the typed
