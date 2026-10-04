@@ -86,6 +86,7 @@ use hermit_manifest_plan::runner::skid_overshoot_only_reports;
 use hermit_manifest_plan::stress_series::SeriesNoVerdictKind;
 use hermit_manifest_plan::stress_series::SeriesPressureAttempt;
 use hermit_manifest_plan::stress_series::SeriesPressureComparison;
+use hermit_manifest_plan::stress_series::require_result_supported_by_timeout;
 use hermit_manifest_plan::timeouts::TimeoutMultipliers;
 use hermit_manifest_plan::timeouts::resolve_test_timeouts;
 use hermit_manifest_plan::timeouts::timeout_multipliers_from_env;
@@ -6981,7 +6982,10 @@ fn retained_pressure_attempt(
             };
             Some(SeriesPressureComparison {
                 verdict: report.verdict,
+                // A report from an attempt the runner timed out is that
+                // timeout's evidence, never a canonical verdict.
                 canonical: matches!(report.verdict, Verdict::Matched | Verdict::Diverged)
+                    && !attempt.timed_out
                     && canonical_pressure_comparison(mode, &report)
                     && (report.verdict != Verdict::Matched
                         || report
@@ -7080,33 +7084,108 @@ fn inner_pressure_category(attempt: &SeriesPressureAttempt) -> Option<Repetition
     }
 }
 
+/// Why a repetition's retained inner history was refused.
+enum InnerHistoryRejection {
+    /// The history is not one the runner writes: attempts missing, out of
+    /// order, unindexed, or with a report that does not match its digest.
+    Unreadable(String),
+    /// A row records, or is credited, a result that one of its own retained
+    /// attempts contradicts: it retains a timed-out attempt, which the runner
+    /// types as a timeout or no result, yet carries a pass or a failure. That
+    /// result is not evidence of either, so it earns neither credit.
+    ContradictedResult(String),
+}
+
+impl InnerHistoryRejection {
+    fn message(&self) -> &str {
+        match self {
+            Self::Unreadable(message) | Self::ContradictedResult(message) => message,
+        }
+    }
+}
+
 fn inner_pressure_history(
     rows: &[CellResult],
 ) -> Result<BTreeSet<RepetitionClassification>, String> {
+    checked_inner_pressure_history(rows, None).map_err(|rejection| rejection.message().to_owned())
+}
+
+/// The result a pressure summary label names, for the timeout rule. The two
+/// non-product labels are results the rule accepts over a timeout; any other
+/// label that names no framework result is no result, which it also accepts.
+fn credited_observed_result(label: &str) -> Option<ObservedResult> {
+    match label {
+        "sandbox-denied" => Some(ObservedResult::SandboxDenied),
+        "infrastructure-error" => Some(ObservedResult::InfrastructureError),
+        other => ObservedResult::parse(other).ok(),
+    }
+}
+
+/// `credited_result` is the result the caller credits for the
+/// framework-selected row, when it has one. It can differ from that row's
+/// recorded result: a legacy row records none, and `summarize` credits the
+/// result it derives from the row's outcome and report instead.
+fn checked_inner_pressure_history(
+    rows: &[CellResult],
+    credited_result: Option<&str>,
+) -> Result<BTreeSet<RepetitionClassification>, InnerHistoryRejection> {
+    // The series checker's rule, applied first and to the raw flags so that no
+    // other refusal can hide it: a row that retains a timed-out attempt is a
+    // timeout or has no result (or one refined to sandbox-denied or
+    // infrastructure-error), never a pass or a red.
+    for row in rows {
+        require_result_supported_by_timeout(
+            row.attempts.iter().any(|attempt| attempt.timed_out),
+            row.result,
+        )
+        .map_err(|error| {
+            InnerHistoryRejection::ContradictedResult(format!(
+                "outer attempt {} {error}",
+                row.attempt
+            ))
+        })?;
+    }
     // Keep the shared maximum, contiguous ordinals, terminal-PASS refusal and
     // framework-selected outcome. Inner declared subruns do not add retries.
-    cell_result_after_retries(rows)?;
+    let selected = cell_result_after_retries(rows).map_err(InnerHistoryRejection::Unreadable)?;
+    // The same rule for the result that will be credited, which is the one
+    // that matters. Only the selected row's attempts bear on it: an earlier
+    // retry may legitimately have timed out.
+    if let Some(credited) = credited_result {
+        require_result_supported_by_timeout(
+            selected.attempts.iter().any(|attempt| attempt.timed_out),
+            credited_observed_result(credited),
+        )
+        .map_err(|error| {
+            InnerHistoryRejection::ContradictedResult(format!(
+                "outer attempt {}, credited result {credited}, {error}",
+                selected.attempt
+            ))
+        })?;
+    }
     let mut categories = BTreeSet::new();
     for row in rows {
         if row.attempts.is_empty() {
-            return Err(format!(
+            return Err(InnerHistoryRejection::Unreadable(format!(
                 "outer attempt {} has no retained inner history",
                 row.attempt
-            ));
+            )));
         }
         let mut indices = BTreeSet::new();
+        let mut retained_attempts = Vec::with_capacity(row.attempts.len());
         for attempt in &row.attempts {
             if attempt.index.trim().is_empty() || !indices.insert(&attempt.index) {
-                return Err(format!(
+                return Err(InnerHistoryRejection::Unreadable(format!(
                     "outer attempt {} has empty or duplicate inner indices",
                     row.attempt
-                ));
+                )));
             }
-            let retained = retained_pressure_attempt(&row.mode, attempt)?;
-            if let Some(category) = inner_pressure_category(&retained) {
-                categories.insert(category);
-            }
+            retained_attempts.push(
+                retained_pressure_attempt(&row.mode, attempt)
+                    .map_err(InnerHistoryRejection::Unreadable)?,
+            );
         }
+        categories.extend(retained_attempts.iter().filter_map(inner_pressure_category));
     }
     Ok(categories)
 }
@@ -7157,6 +7236,11 @@ struct RepeatedCellTally {
     /// Passes recovered only from typed skid-overshoot refusals; like
     /// `infrastructure_errors`, they make the result incomplete.
     infrastructure_recovered: usize,
+    /// Repetitions whose recorded result a retained timed-out attempt
+    /// contradicts ([`InnerHistoryRejection::ContradictedResult`]). They earn
+    /// no pass or failure credit and, like `infrastructure_errors`, make the
+    /// result incomplete.
+    contradicted_results: usize,
     retried: usize,
     total: usize,
     counts: RepeatedOutcomeCounts,
@@ -7278,16 +7362,28 @@ fn fold_repetition(
         proven_oom,
         retained_prerequisite,
     } = *sample;
-    tally.total += 1;
-    tally.terminal_passes += usize::from(result == "pass");
-    tally.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
-    tally.infrastructure_errors +=
-        usize::from(matches!(result, "infrastructure-error" | "sandbox-denied"));
     let inner_history = if rows.is_empty() {
         None
     } else {
-        Some(inner_pressure_history(rows))
+        Some(checked_inner_pressure_history(rows, Some(result)))
     };
+    // A result that a retained timed-out attempt contradicts, whether the row
+    // records it or the reader derives it for a legacy row, is not evidence of
+    // a pass or of a failure: the runner would have typed the row a timeout or
+    // no result. It earns no credit either way and is counted as a mixed
+    // repetition, which keeps the cell incomplete.
+    let contradicted = matches!(
+        &inner_history,
+        Some(Err(InnerHistoryRejection::ContradictedResult(_)))
+    );
+    let passed = result == "pass" && !contradicted;
+    let passed_cleanly = !contradicted && repetition_passed_cleanly(result, rows);
+    tally.total += 1;
+    tally.terminal_passes += usize::from(passed);
+    tally.clean_passes += usize::from(passed_cleanly);
+    tally.contradicted_results += usize::from(contradicted);
+    tally.infrastructure_errors +=
+        usize::from(matches!(result, "infrastructure-error" | "sandbox-denied"));
     // Skid-recovery credit is granted only to a history that passed the
     // inner-history validation above (every outer row's inner attempts
     // present, with nonempty distinct indices and retained reports whose
@@ -7312,7 +7408,7 @@ fn fold_repetition(
     tally.retried += usize::from(retained_attempts > 1);
     let counts = &mut tally.counts;
     counts.expected_repetitions += 1;
-    counts.clean_passes += usize::from(repetition_passed_cleanly(result, rows));
+    counts.clean_passes += usize::from(passed_cleanly);
     counts.retried_repetitions += usize::from(retained_attempts > 1);
     // A typed NoResult stamp legitimately has no comparison. Only
     // that one verified reader refusal may be explained here; missing
@@ -7325,10 +7421,10 @@ fn fold_repetition(
             .is_some_and(|history| history.is_err())
             || (row_valid && !sample_artifacts_valid),
     );
-    if let Some(Err(error)) = &inner_history {
-        sample_evidence_errors.push(error.clone());
+    if let Some(Err(rejection)) = &inner_history {
+        sample_evidence_errors.push(rejection.message().to_owned());
     }
-    if result == "pass" {
+    if passed {
         counts.observed_repetitions += 1;
         counts.terminal_passes += 1;
         counts.infrastructure_recovered_passes += usize::from(recovered_from_infrastructure);
@@ -7340,6 +7436,8 @@ fn fold_repetition(
     } else {
         let classification = if !sample_evidence_errors.is_empty() && !row_valid {
             RepetitionClassification::Missing
+        } else if contradicted {
+            RepetitionClassification::Mixed
         } else {
             let outer = classify_nonpassing_repetition(
                 result,
@@ -7396,6 +7494,7 @@ fn print_repeated_cell_table(
             clean_passes,
             infrastructure_errors,
             infrastructure_recovered,
+            contradicted_results,
             retried,
             total,
             counts,
@@ -7403,7 +7502,7 @@ fn print_repeated_cell_table(
         let result = repeated_result_description(
             terminal_passes,
             clean_passes,
-            infrastructure_errors + infrastructure_recovered,
+            infrastructure_errors + infrastructure_recovered + contradicted_results,
             retried,
             total,
         );
@@ -8687,6 +8786,7 @@ fn summarize(
             clean_passes,
             infrastructure_errors,
             infrastructure_recovered,
+            contradicted_results,
             retried,
             total,
             counts,
@@ -8695,7 +8795,7 @@ fn summarize(
             &metadata,
             terminal_passes,
             clean_passes,
-            infrastructure_errors + infrastructure_recovered,
+            infrastructure_errors + infrastructure_recovered + contradicted_results,
             retried,
             total,
         );
@@ -8705,7 +8805,7 @@ fn summarize(
                 &metadata,
                 terminal_passes,
                 clean_passes,
-                infrastructure_errors,
+                infrastructure_errors + contradicted_results,
                 infrastructure_recovered,
                 retried,
                 total,
@@ -8730,7 +8830,12 @@ fn summarize(
                 "framework retry on; clean passes count first attempts"
             },
         );
-        let infrastructure_errors: usize = repeated.values().map(|t| t.infrastructure_errors).sum();
+        // A contradicted result has no trustworthy outcome, as an
+        // infrastructure error has none: both keep the result incomplete.
+        let infrastructure_errors: usize = repeated
+            .values()
+            .map(|t| t.infrastructure_errors + t.contradicted_results)
+            .sum();
         let infrastructure_recovered: usize =
             repeated.values().map(|t| t.infrastructure_recovered).sum();
         let result = top_level_repeated_result_description(
@@ -18342,6 +18447,493 @@ mod pressure_sample_tests {
             );
         }
         guard.remove().unwrap();
+    }
+
+    /// A matched report from an attempt the runner timed out is that timeout:
+    /// it is retained as a match that is not canonical and counts as no result,
+    /// instead of refusing the whole inner history.
+    #[test]
+    fn a_timed_out_match_is_retained_as_a_noncanonical_timeout() {
+        for (mode, status) in [("verify", 0), ("replay", 0), ("chaos", 0), ("chaos", 17)] {
+            let completed = comparison_attempt(mode, status);
+            assert!(
+                retained_pressure_attempt(mode, &completed)
+                    .unwrap()
+                    .comparison
+                    .unwrap()
+                    .canonical,
+                "{mode}: completed"
+            );
+            let mut timed_out = completed.clone();
+            timed_out.outcome = "FAIL".into();
+            timed_out.timed_out = true;
+            timed_out.error_kind = Some("cpu-timeout".into());
+            let retained = retained_pressure_attempt(mode, &timed_out)
+                .unwrap_or_else(|error| panic!("{mode}: {error}"));
+            let comparison = retained.comparison.as_ref().unwrap();
+            assert_eq!(comparison.verdict, Verdict::Matched, "{mode}");
+            assert!(!comparison.canonical, "{mode}");
+            assert_eq!(
+                inner_pressure_category(&retained),
+                Some(RepetitionClassification::NoResult),
+                "{mode}"
+            );
+            assert!(!qualifying_subruns(mode, std::slice::from_ref(&timed_out)));
+            // The runner types the row that retains it as a timeout, leaves it
+            // without a result when a non-product error kind decides it, or
+            // refines either to infrastructure-error for an environmental block.
+            let mut timeout_row = history_row(mode, "FAIL", 1, vec![timed_out.clone()]);
+            timeout_row.result = Some(ObservedResult::Timeout);
+            timeout_row.failure_class = Some(FailureClass::NoResult);
+            let no_result_row = history_row(mode, "ERROR", 1, vec![timed_out.clone()]);
+            let mut environmental_row = no_result_row.clone();
+            environmental_row.result = Some(ObservedResult::InfrastructureError);
+            environmental_row.failure_class = Some(FailureClass::UnderstoodInfrastructureFailure);
+            for row in [timeout_row, no_result_row, environmental_row] {
+                assert_eq!(
+                    inner_pressure_history(std::slice::from_ref(&row))
+                        .unwrap_or_else(|error| panic!("{mode} {:?}: {error}", row.result)),
+                    BTreeSet::from([RepetitionClassification::NoResult]),
+                    "{mode} {:?}",
+                    row.result
+                );
+            }
+            // A pass or a crash-error over the same attempt contradicts it.
+            for outcome in ["PASS", "FAIL"] {
+                let error = inner_pressure_history(&[history_row(
+                    mode,
+                    outcome,
+                    1,
+                    vec![timed_out.clone()],
+                )])
+                .expect_err(&format!("{mode} {outcome}"));
+                assert!(
+                    error.contains("retains a timed-out attempt"),
+                    "{mode} {outcome}: {error}"
+                );
+            }
+            // A timeout without the runner's timeout kind is not its shape.
+            let mut untyped = timed_out.clone();
+            untyped.error_kind = None;
+            assert!(retained_pressure_attempt(mode, &untyped).is_err(), "{mode}");
+            let mut passed = timed_out.clone();
+            passed.outcome = "PASS".into();
+            assert!(retained_pressure_attempt(mode, &passed).is_err(), "{mode}");
+        }
+    }
+
+    /// The raw `verdicts` reader credits a pass only from an intact inner
+    /// history. A PASS row that retains a timed-out attempt contradicts the
+    /// runner, which never passes such a cell, so the repetition is an unknown
+    /// history and the cell reads INCOMPLETE, never CLEAN. The same row
+    /// without the timed-out attempt is CLEAN.
+    #[test]
+    fn a_pass_retaining_a_timed_out_attempt_is_not_a_clean_repetition() {
+        for mode in ["verify", "replay", "chaos"] {
+            let completed = comparison_attempt(mode, 0);
+            let mut timed_out = completed.clone();
+            timed_out.index = format!("{}-timed-out", completed.index);
+            timed_out.outcome = "FAIL".into();
+            timed_out.timed_out = true;
+            timed_out.error_kind = Some("cpu-timeout".into());
+            for (attempts, verdict, unknown) in [
+                (vec![completed.clone()], "CLEAN", 0),
+                (vec![timed_out.clone()], "INCOMPLETE", 1),
+                (vec![completed.clone(), timed_out.clone()], "INCOMPLETE", 1),
+            ] {
+                let shape = attempts.len();
+                let rows = [history_row(mode, "PASS", 1, attempts)];
+                let mut tally = RepeatedCellTally::default();
+                let mut errors = Vec::new();
+                fold_repetition(
+                    &mut tally,
+                    &RepetitionSample {
+                        result: "pass",
+                        rows: &rows,
+                        retained_attempts: 1,
+                        row_valid: true,
+                        evidence_error_count: 0,
+                        typed_no_comparison_refusal: false,
+                        prepared_empty_result_file: false,
+                        initial_evidence_valid: true,
+                        rejected_result_history: false,
+                        proven_timeout: false,
+                        proven_oom: false,
+                        retained_prerequisite: false,
+                    },
+                    &mut errors,
+                );
+                assert_eq!(
+                    flake_verdict(tally.counts),
+                    verdict,
+                    "{mode} with {shape} attempts: {errors:?}"
+                );
+                assert_eq!(
+                    tally.counts.unknown_history_repetitions, unknown,
+                    "{mode} with {shape} attempts"
+                );
+                assert_eq!(errors.len(), unknown, "{mode} with {shape} attempts");
+            }
+        }
+    }
+
+    /// A row that retains a timed-out attempt under a pass or a product
+    /// result is not one the runner writes: it never records either over a
+    /// timeout. That recorded result earns no credit of any kind, neither a
+    /// terminal or clean pass nor a product failure. The repetition is an
+    /// observation whose outer result disagrees with its inner history
+    /// (mixed), with an unknown history, so its cell is INCOMPLETE and its
+    /// result "incomplete". Beside other repetitions it counts as no result.
+    #[test]
+    fn a_result_its_timed_out_attempt_contradicts_earns_no_credit() {
+        fn fold_one(
+            tally: &mut RepeatedCellTally,
+            result: &'static str,
+            rows: &[CellResult],
+        ) -> Vec<String> {
+            let mut errors = Vec::new();
+            fold_repetition(
+                tally,
+                &RepetitionSample {
+                    result,
+                    rows,
+                    retained_attempts: 1,
+                    row_valid: true,
+                    evidence_error_count: 0,
+                    typed_no_comparison_refusal: false,
+                    prepared_empty_result_file: false,
+                    initial_evidence_valid: true,
+                    rejected_result_history: false,
+                    proven_timeout: false,
+                    proven_oom: false,
+                    retained_prerequisite: false,
+                },
+                &mut errors,
+            );
+            errors
+        }
+        fn summary(cell: &CellId, tally: RepeatedCellTally) -> JsonValue {
+            let tallies = BTreeMap::from([(cell.clone(), tally)]);
+            let mut table = print_repeated_cell_table(std::slice::from_ref(cell), &tallies, "on");
+            assert_eq!(table.len(), 1);
+            table.remove(0)
+        }
+        for mode in ["verify", "replay", "chaos"] {
+            let cell = CellId {
+                lane: "portable".into(),
+                category: "fixture".into(),
+                test: "fixture/cell".into(),
+                mode: mode.into(),
+                backend: "ptrace".into(),
+            };
+            let completed = comparison_attempt(mode, 0);
+            let mut timed_out_match = completed.clone();
+            timed_out_match.index = "2".into();
+            timed_out_match.outcome = "FAIL".into();
+            timed_out_match.timed_out = true;
+            timed_out_match.error_kind = Some("cpu-timeout".into());
+            // Killed at its budget before it wrote a report.
+            let mut killed = timed_out_match.clone();
+            killed.outcome = "ERROR".into();
+            killed.status = None;
+            killed.signal = Some(9);
+            killed.verification_report = None;
+            killed.verification_report_sha256 = None;
+            let mut contradicted = Vec::new();
+            for timed_out in [&timed_out_match, &killed] {
+                let attempts = vec![completed.clone(), timed_out.clone()];
+                // The attempts are a readable timeout: as the runner records
+                // them, the repetition is a timeout with no unknown history.
+                let mut timeout_row = history_row(mode, "FAIL", 1, attempts.clone());
+                timeout_row.result = Some(ObservedResult::Timeout);
+                timeout_row.failure_class = Some(FailureClass::NoResult);
+                let mut tally = RepeatedCellTally::default();
+                let errors = fold_one(&mut tally, "timeout", std::slice::from_ref(&timeout_row));
+                assert!(errors.is_empty(), "{mode} timeout: {errors:?}");
+                assert_eq!(tally.counts.no_results, 1, "{mode} timeout");
+                assert_eq!(tally.counts.unknown_history_repetitions, 0, "{mode}");
+                // A legacy row records no result, so the reader credits one it
+                // derives. A credited result the timeout supports stands.
+                let mut legacy_timeout = timeout_row.clone();
+                legacy_timeout.result = None;
+                legacy_timeout.failure_class = None;
+                for credited in ["timeout", "infrastructure-error", "sandbox-denied"] {
+                    let mut tally = RepeatedCellTally::default();
+                    let errors =
+                        fold_one(&mut tally, credited, std::slice::from_ref(&legacy_timeout));
+                    assert!(errors.is_empty(), "{mode} legacy {credited}: {errors:?}");
+                    assert_eq!(tally.contradicted_results, 0, "{mode} legacy {credited}");
+                    assert_eq!(tally.counts.unknown_history_repetitions, 0, "{mode}");
+                }
+                // A credited pass it contradicts earns nothing, as a recorded one.
+                let mut legacy_pass = history_row(mode, "PASS", 1, attempts.clone());
+                legacy_pass.result = None;
+                legacy_pass.failure_class = None;
+                contradicted.push(("pass", legacy_pass));
+                contradicted.push(("pass", history_row(mode, "PASS", 1, attempts.clone())));
+                contradicted.push(("crash-error", history_row(mode, "FAIL", 1, attempts)));
+            }
+            if mode == "verify" {
+                let mut diverged = comparison_attempt(mode, 0);
+                diverged.outcome = "FAIL".into();
+                diverged.status = Some(1);
+                let mut report: JsonValue =
+                    serde_json::from_str(diverged.verification_report.as_ref().unwrap()).unwrap();
+                report["verdict"] = json!("diverged");
+                report["verified"] = json!(false);
+                report["bitwise_parity"] = json!(false);
+                replace_report(&mut diverged, report);
+                let mut row = history_row(mode, "FAIL", 1, vec![diverged, killed.clone()]);
+                row.result = Some(ObservedResult::DeterminismFailure);
+                contradicted.push(("determinism-failure", row));
+            }
+            let clean = history_row(mode, "PASS", 1, vec![completed.clone()]);
+            let product = history_row(mode, "FAIL", 1, vec![completed.clone()]);
+            for (result, row) in contradicted {
+                let shape = format!(
+                    "{mode} {}{result} over {}",
+                    if row.result.is_none() { "legacy " } else { "" },
+                    row.attempts[1].outcome
+                );
+                let mut tally = RepeatedCellTally::default();
+                let errors = fold_one(&mut tally, result, std::slice::from_ref(&row));
+                assert_eq!(errors.len(), 1, "{shape}: {errors:?}");
+                assert!(
+                    errors[0].contains("retains a timed-out attempt, which contradicts result"),
+                    "{shape}: {errors:?}"
+                );
+                assert_eq!(
+                    (tally.terminal_passes, tally.clean_passes),
+                    (0, 0),
+                    "{shape}"
+                );
+                let counts = tally.counts;
+                assert_eq!(
+                    (
+                        counts.terminal_passes,
+                        counts.clean_passes,
+                        counts.qualifying_passes,
+                        counts.product_failures,
+                        counts.mixed_repetitions,
+                        counts.observed_repetitions,
+                        counts.unknown_history_repetitions,
+                    ),
+                    (0, 0, 0, 0, 1, 1, 1),
+                    "{shape}"
+                );
+                assert_eq!(flake_verdict(counts), "INCOMPLETE", "{shape}");
+                let alone = summary(&cell, tally);
+                for (key, expected) in [
+                    ("passes", json!(0)),
+                    ("clean_passes", json!(0)),
+                    ("terminal_product_failures", json!(0)),
+                    ("mixed_repetitions", json!(1)),
+                    ("unknown_history_repetitions", json!(1)),
+                    ("result", json!("incomplete")),
+                    ("verdict", json!("INCOMPLETE")),
+                ] {
+                    assert_eq!(alone[key], expected, "{shape}: {key} in {alone}");
+                }
+                // Beside a clean pass it is not a product failure (FLAKY),
+                // and beside a product failure it is not a pass (FLAKY).
+                for (sibling_result, sibling, passes, failures, verdict) in [
+                    ("pass", &clean, 1, 0, "INCOMPLETE"),
+                    ("crash-error", &product, 0, 1, "FAILING"),
+                ] {
+                    let mut pair = RepeatedCellTally::default();
+                    assert!(
+                        fold_one(&mut pair, sibling_result, std::slice::from_ref(sibling))
+                            .is_empty()
+                    );
+                    assert_eq!(
+                        fold_one(&mut pair, result, std::slice::from_ref(&row)).len(),
+                        1
+                    );
+                    let both = summary(&cell, pair);
+                    for (key, expected) in [
+                        ("passes", json!(passes)),
+                        ("clean_passes", json!(passes)),
+                        ("terminal_product_failures", json!(failures)),
+                        ("result", json!("incomplete")),
+                        ("verdict", json!(verdict)),
+                    ] {
+                        assert_eq!(
+                            both[key], expected,
+                            "{shape} beside {sibling_result}: {key} in {both}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The same rule through `summarize`, for the result it credits rather
+    /// than the one a row records. A legacy row records no result, and
+    /// `summarize` derives "pass" from its PASS outcome and matched report; a
+    /// timed-out attempt beside them contradicts that pass exactly as it
+    /// contradicts a recorded one. Both earn no credit, read INCOMPLETE, and
+    /// make a green summary fail. The same legacy row without the timed-out
+    /// attempt keeps its pass.
+    #[test]
+    fn summarize_credits_no_pass_its_timed_out_attempt_contradicts() {
+        let root = Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let checked = check_scorecard(&root).unwrap();
+        let population = CellSelection {
+            green: true,
+            backend: Some("ptrace".into()),
+            repetitions: Some(1),
+            ..CellSelection::default()
+        };
+        let available = pressure_cells(&root, &population).unwrap();
+        let selected = available
+            .selected
+            .iter()
+            .find(|cell| cell.id.mode == "verify" && cell.id.backend == "ptrace")
+            .expect("fixture needs one selected green ptrace verify cell");
+        let results = env::temp_dir().join(format!(
+            "hermit-pressure-legacy-timeout-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&results).unwrap();
+        let _cleanup = SelfTestDirectory::new(results.clone());
+        let selection = CellSelection {
+            test: Some(selected.id.test.clone()),
+            mode: Some("verify".into()),
+            backend: Some("ptrace".into()),
+            repetitions: Some(1),
+            run_id_prefix: Some("legacy-timeout".into()),
+            run_timeout_seconds: Some(PRESSURE_RUN_TIMEOUT_SECONDS),
+            green: true,
+            ..CellSelection::default()
+        };
+        let (mut metadata, _) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &selection,
+        )
+        .unwrap();
+        metadata.source_tree_dirty = false;
+        fs::write(
+            results.join("run.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let slug = cell_run_slug(&selected.id, Some(1));
+        let run_id = cell_evidence_run_id(&selected.id, Some(1), metadata.run_id_prefix.as_deref());
+        let cell_dir = results.join("cells").join(&slug);
+        fs::create_dir_all(&cell_dir).unwrap();
+        fs::write(cell_dir.join("harness-status"), "0\n").unwrap();
+        let artifact = results.join("runs").join(&run_id).join("attempt-1");
+        let logs = artifact.join("verify-logs/verify-1");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(logs.join("run1_log_fixture.log"), "INFO first\n").unwrap();
+        let mut completed = comparison_attempt("verify", 0);
+        completed.shell_command =
+            literal_shell_command(&completed.cwd, &completed.env, &completed.argv);
+        fs::write(
+            verification_report_path(&artifact),
+            completed.verification_report.as_ref().unwrap(),
+        )
+        .unwrap();
+        let mut timed_out = completed.clone();
+        timed_out.index = "2".into();
+        timed_out.outcome = "FAIL".into();
+        timed_out.timed_out = true;
+        timed_out.error_kind = Some("cpu-timeout".into());
+        let evidence = BTreeMap::from([(
+            format!("cell.{slug}"),
+            RunnerEvidence {
+                seen: true,
+                ok: true,
+                ..RunnerEvidence::default()
+            },
+        )]);
+        let path = cell_dir.join("results.jsonl");
+        for (case, attempts, recorded, keeps_pass) in [
+            ("legacy", vec![completed.clone()], None, true),
+            (
+                "legacy over a timeout",
+                vec![completed.clone(), timed_out.clone()],
+                None,
+                false,
+            ),
+            (
+                "recorded over a timeout",
+                vec![completed.clone(), timed_out.clone()],
+                Some(ObservedResult::Pass),
+                false,
+            ),
+        ] {
+            let mut row = history_row("verify", "PASS", 1, attempts);
+            row.run_id = run_id.clone();
+            row.run_index = Some(1);
+            row.hermit_sha = metadata.hermit_sha.clone();
+            row.test = selected.id.test.clone();
+            row.category = selected.id.category.clone();
+            row.lane = selected.id.lane.clone();
+            row.classification = if selected.is_applicable() {
+                "required"
+            } else {
+                "disabled"
+            }
+            .into();
+            row.result = recorded;
+            row.failure_class = None;
+            row.argv = completed.argv.clone();
+            row.guest_argv = completed.guest_argv.clone();
+            row.env = completed.env.clone();
+            row.cwd = completed.cwd.clone();
+            row.shell_command = completed.shell_command.clone();
+            row.timeout_seconds = 57;
+            row.execution_cpu_timeout_seconds = Some(22);
+            row.execution_wall_timeout_seconds = Some(57);
+            row.artifact_dir = artifact.to_string_lossy().into_owned();
+            fs::write(&path, format!("{}\n", serde_json::to_string(&row).unwrap())).unwrap();
+            let outcome = summarize(&root, &results, false, Some(&evidence), true);
+            let summary: JsonValue =
+                serde_json::from_slice(&fs::read(results.join("summary.json")).unwrap()).unwrap();
+            let cell = &summary["repeated_cells"][0];
+            assert_eq!(outcome.is_ok(), keeps_pass, "{case}: {outcome:?} {cell}");
+            let expected = if keeps_pass {
+                [
+                    ("passes", json!(1)),
+                    ("clean_passes", json!(1)),
+                    ("terminal_product_failures", json!(0)),
+                    ("mixed_repetitions", json!(0)),
+                    ("unknown_history_repetitions", json!(0)),
+                    ("result", json!("passed every repetition")),
+                    ("verdict", json!("CLEAN")),
+                ]
+            } else {
+                [
+                    ("passes", json!(0)),
+                    ("clean_passes", json!(0)),
+                    ("terminal_product_failures", json!(0)),
+                    ("mixed_repetitions", json!(1)),
+                    ("unknown_history_repetitions", json!(1)),
+                    ("result", json!("incomplete")),
+                    ("verdict", json!("INCOMPLETE")),
+                ]
+            };
+            for (key, value) in expected {
+                assert_eq!(cell[key], value, "{case}: {key} in {cell}");
+            }
+            assert_eq!(cell["qualifying_passes"], json!(0), "{case}: {cell}");
+        }
     }
 
     #[test]
