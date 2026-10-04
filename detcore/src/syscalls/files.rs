@@ -1983,8 +1983,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                     base: call.buf().map_or(0, |buf| buf.as_raw()),
                     len: call.len(),
                 };
-                self.read_timerfd(guest, &detfd, &[iovec], TimerfdReadForm::Scalar)
-                    .await
+                match self
+                    .read_timerfd(guest, &detfd, &[iovec], TimerfdReadForm::Scalar)
+                    .await?
+                {
+                    Some(read) => Ok(read),
+                    // Handed to the kernel during the wait: read it there.
+                    None => self.execute_nonblockable_fd_syscall(guest, call).await,
+                }
             }
             FdType::Signalfd | FdType::Eventfd | FdType::Timerfd | FdType::Inotify => {
                 trace!(
@@ -2807,10 +2813,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             // AUTONOMOUS-BOT-IMPLEMENTED
             match read_iovecs(&guest.memory(), call.iov(), call.len()) {
-                Ok(iovecs) => {
-                    self.read_timerfd(guest, &detfd, &iovecs, TimerfdReadForm::Vectored)
-                        .await
-                }
+                Ok(iovecs) => match self
+                    .read_timerfd(guest, &detfd, &iovecs, TimerfdReadForm::Vectored)
+                    .await
+                {
+                    Ok(Some(read)) => Ok(read),
+                    // Handed to the kernel during the wait: read it there.
+                    Ok(None) => self.execute_nonblockable_fd_syscall(guest, call).await,
+                    Err(err) => Err(err),
+                },
                 Err(errno) => Err(errno.into()),
             }
         } else if physically_nonblocking
@@ -2952,14 +2963,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let count = usize::try_from(call.iov_len()).map_err(|_| Errno::EINVAL)?;
                 let iovecs = read_iovecs(&guest.memory(), call.iov(), count)?;
                 if call.flags() & !libc::RWF_HIPRI == 0 {
-                    return self
+                    // None: handed to the kernel during the wait, so the
+                    // read continues on the host path below.
+                    if let Some(read) = self
                         .read_timerfd(guest, &timer, &iovecs, TimerfdReadForm::Vectored)
-                        .await;
-                }
-                if iovecs.iter().all(|iovec| iovec.len == 0) {
+                        .await?
+                    {
+                        return Ok(read);
+                    }
+                } else if iovecs.iter().all(|iovec| iovec.len == 0) {
                     return Ok(0);
+                } else {
+                    self.hand_timerfd_to_kernel(guest, call.fd()).await?;
                 }
-                self.hand_timerfd_to_kernel(guest, call.fd()).await?;
             }
         }
 
@@ -4850,22 +4866,28 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Like the file reference Linux's read holds (fdget), it is never looked
     /// up by number again: a blocked read keeps reading this timer after
     /// another thread closes the descriptor, or a new file takes its number.
+    ///
+    /// Returns `Ok(None)` when the timer was handed to the kernel while the
+    /// read waited (another thread nested its epoll, polled or selected that
+    /// epoll, sent the timerfd over SCM_RIGHTS, or read it with a preadv2
+    /// flag). The kernel then holds the timer and its count, so the caller
+    /// sends the read to the kernel, as base main sends every timerfd read.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3229): virtual timerfd read counts, EAGAIN, and
     // blocking restart; the read holds its open file across the wait; a
     // zero-length vector read returns 0; the count is copied out with the
-    // caller's access rights.
+    // caller's access rights; a handoff during the wait forwards the read.
     async fn read_timerfd<G: Guest<Self>>(
         &self,
         guest: &mut G,
         timer: &DetFd,
         iovecs: &[TimerSlackIovec],
         form: TimerfdReadForm,
-    ) -> Result<i64, Error> {
+    ) -> Result<Option<i64>, Error> {
         // read_iovecs bounded the total by isize::MAX, so the sum cannot wrap.
         let total = iovecs.iter().map(|iovec| iovec.len).sum::<usize>();
         if total == 0 && form == TimerfdReadForm::Vectored {
-            return Ok(0);
+            return Ok(Some(0));
         }
         if total < 8 {
             return Err(Errno::EINVAL.into());
@@ -4873,6 +4895,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let nonblocking = timer.is_nonblocking();
         loop {
             let now = thread_observe_time(guest).await;
+            if timer.timerfd_kernel_backed() {
+                return Ok(None);
+            }
             let pending = timer
                 .timerfd_state()
                 .map(|s| s.pending(now))
@@ -4921,7 +4946,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return if copied == 0 {
                     Err(Errno::EFAULT.into())
                 } else {
-                    Ok(copied as i64)
+                    Ok(Some(copied as i64))
                 };
             }
             if nonblocking {

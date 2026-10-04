@@ -83,6 +83,10 @@
  *       thread closes the descriptor, and when a new timerfd then takes the
  *       freed number: it returns the old timer's count, not EBADF, and leaves
  *       the new timer's expiration unread.
+ *   read_across_handoff / readv_across_handoff
+ *       A read or readv blocked on a disarmed timer keeps waiting when
+ *       another thread adds the timer's epoll to a second epoll, and returns
+ *       the count once the timer is armed and fires.
  *   readv_empty / readv_zero_lengths / preadv2_zero_length /
  *   readv_zero_blocking / read_zero_einval
  *       A readv or preadv2 whose iovecs hold no bytes returns 0 without
@@ -972,6 +976,54 @@ static void check_read_across_close(const char *name, int vectored, int reuse) {
     else if (reuse && (again != 8 || left != 1))
         fail(name, "replacement_r=%ld left=%ld", (long)again, (long)left);
     else ok(name);
+}
+
+struct handoff_read {
+    int tfd;
+    int vectored;
+    ssize_t r;
+    int err;
+    uint64_t count;
+};
+
+static void *read_in_thread(void *arg) {
+    struct handoff_read *job = arg;
+    struct iovec whole = {&job->count, sizeof job->count};
+    errno = 0;
+    job->r = job->vectored ? readv(job->tfd, &whole, 1)
+                           : read(job->tfd, &job->count, sizeof job->count);
+    job->err = errno;
+    return NULL;
+}
+
+/* A read that is waiting when another thread adds the timer's epoll to a
+ * second epoll keeps waiting on the same timer and returns its count when
+ * the timer fires; on Linux the timer never changes hands. The timer is
+ * disarmed while the read starts and is armed only after the nesting, so
+ * the read is still waiting then. */
+static void check_read_across_handoff(const char *name, int vectored) {
+    int tfd = timerfd_create(CLOCK_MONOTONIC, 0);
+    struct handoff_read job = {tfd, vectored, -2, 0, 0};
+    pthread_t thread;
+    pthread_create(&thread, NULL, read_in_thread, &job);
+    sleep_ns(10 * MS);
+    int inner = epoll_with(tfd, EPOLLIN, 7);
+    int outer = inner >= 0 ? epoll_with(inner, EPOLLIN, 1) : -1;
+    sleep_ns(10 * MS);
+    struct itimerspec its;
+    memset(&its, 0, sizeof its);
+    its.it_value = ns_ts(1);
+    int armed = timerfd_settime(tfd, 0, &its, NULL);
+    pthread_join(thread, NULL);
+    if (inner < 0 || outer < 0 || armed != 0)
+        fail(name, "setup inner=%ld outer=%ld", (long)inner, (long)outer);
+    else if (job.r != 8 || job.count != 1)
+        fail(name, "r=%ld errno_or_count=%ld", (long)job.r,
+             job.r == 8 ? (long)job.count : (long)job.err);
+    else ok(name);
+    if (outer >= 0) close(outer);
+    if (inner >= 0) close(inner);
+    close(tfd);
 }
 
 /* vfs_readv returns 0 for a zero total before it reaches the timer, so a
@@ -2108,6 +2160,8 @@ int main(int argc, char **argv) {
     check_read_across_close("read_across_reuse", 0, 1);
     check_read_across_close("readv_across_close", 1, 0);
     check_read_across_close("readv_across_reuse", 1, 1);
+    check_read_across_handoff("read_across_handoff", 0);
+    check_read_across_handoff("readv_across_handoff", 1);
     check_zero_length_reads();
     check_readonly_buffers();
     check_create_errors();
