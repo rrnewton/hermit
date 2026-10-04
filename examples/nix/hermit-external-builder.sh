@@ -61,7 +61,11 @@ printf '\2\n' >&2
 # Hermit itself starts with a fixed minimal environment, so the first guest
 # process inherits nothing build-specific; `env -i` inside the guest installs
 # exactly the derivation's environment.
+# The guest sees the host's /etc, so glibc would apply the host's
+# /etc/localtime; Nix's sandbox has none and gives UTC. TZ=UTC comes first so
+# that a derivation which sets TZ itself still wins
+# (https://github.com/rrnewton/hermit/issues/3649).
 exec /usr/bin/env -i PATH=/usr/bin:/bin HOME=/homeless-shelter TMPDIR=/tmp \
   "${launcher[@]}" "$hermit_bin" "${hermit_args[@]}" \
   --bind "$tmp_dir:$canonical" --workdir "$canonical" -- \
-  /usr/bin/env -i "${guest_env[@]}" "${guest_argv[@]}"
+  /usr/bin/env -i TZ=UTC "${guest_env[@]}" "${guest_argv[@]}"
