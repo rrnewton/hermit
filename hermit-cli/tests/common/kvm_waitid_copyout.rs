@@ -23,6 +23,7 @@ use hermit::canonical_verdict::VerificationReport;
 
 use super::kvm_cancellation::bounded_command_with_timeout;
 use super::kvm_cancellation::bounded_read;
+use super::kvm_cancellation::bounded_verify_command;
 
 const MIB: u64 = 1024 * 1024;
 
@@ -659,7 +660,7 @@ fn run_fixture(
     let remaining = deadline
         .checked_duration_since(Instant::now())
         .expect("test deadline");
-    let status = bounded_command_with_timeout(&mut command, &directory, remaining);
+    let (status, run2_log) = bounded_verify_command(&mut command, &directory, remaining);
     assert_eq!(status.code(), Some(0), "both guests must actually succeed");
     let stdout = bounded_read(&directory.join("stdout"), 64 * MIB);
     check_stdout(&stdout);
@@ -707,8 +708,8 @@ fn run_fixture(
         assert_eq!(operand.stderr_bytes, 0);
         assert_eq!(operand.stderr_sha256, Digest::new(b"").to_string());
     }
-    for prefix in ["run1_log_", "run2_log_"] {
-        let paths: Vec<_> = fs::read_dir(&logs)
+    let retained = |prefix: &str| -> Vec<_> {
+        fs::read_dir(&logs)
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .filter(|path| {
@@ -717,12 +718,28 @@ fn run_fixture(
                     .to_string_lossy()
                     .starts_with(prefix)
             })
-            .collect();
-        assert_eq!(paths.len(), 1, "one retained full log per actual guest");
-        let full_log = bounded_read(&paths[0], 64 * MIB);
+            .collect()
+    };
+    // After a match `--keep-logs` keeps only run 1's log, the golden copy, and
+    // deletes run 2's, which matched it. Run 2's log was hard-linked while the
+    // command ran; that capture gets the same full-log checks as the golden log.
+    let golden = retained("run1_log_");
+    assert_eq!(
+        golden.len(),
+        1,
+        "one retained golden full log of the matched guest"
+    );
+    assert!(
+        retained("run2_log_").is_empty(),
+        "a matched verification must not retain run 2's log"
+    );
+    let run2_log = run2_log.expect("run 2's log, captured while the command ran");
+    for path in [&golden[0], &run2_log] {
+        let full_log = bounded_read(path, 64 * MIB);
         assert!(!full_log.is_empty());
         check_log(&full_log, &stdout);
     }
+    fs::remove_file(&run2_log).expect("remove run 2's checked log");
     assert!(
         Instant::now() < deadline,
         "complete test stays inside its shared bound"
