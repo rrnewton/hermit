@@ -1,7 +1,7 @@
 {
   "schema": 2,
   "parent_repository": "rrnewton/dev-hermit",
-  "parent_commit": "3660532469bf73fb0e937899e6240824b5646427",
+  "parent_commit": "7648ffd3d5c4529dcf9d752b650f32ad26cfc066",
   "hermit_commit": "32053b6d46457b44d009ea8278fa94fe0970de6c",
   "retention": {
     "rule": "Keep the newest N builds published at or after not_before, where N = min(max_builds, floor(budget_bytes / file_bytes of the latest build)), and at least 1. The latest build is always kept and counts toward N. Every build stays downloadable as its GitHub release asset.",
