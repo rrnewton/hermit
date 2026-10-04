@@ -826,7 +826,45 @@ fi
 # rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
 # CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
 # 1050 effective-job-seconds budget are unchanged.
-expected_pin=b8ef6a829634d51e79ebc4c24e11c5dd5fac205c
+# BOUND TO c8181d43a59a6d1ac602f2fad7615189f4996b41 (2026-10-04): from
+# b8ef6a829634d51e79ebc4c24e11c5dd5fac205c. reverie-dbt/build.rs CHANGED, so the
+# DynamoRIO SDK recipe key changes; the other six recorded inputs are
+# byte-identical:
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 -> e05db6238bf07c96d8a850c5635a8c48590f20b7
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# The build.rs change (Reverie "Cap the DynamoRIO build job count at the
+# available CPUs") makes the cmake job count
+# min(clamp(NUM_JOBS, 1, 16), std::thread::available_parallelism()). It can
+# change build time only where NUM_JOBS exceeds the CPUs the build may use.
+# Under this wrapper NUM_JOBS is the raw Cargo job count and the elapsed bound
+# uses min(raw, nproc, 16): where nproc equals available_parallelism (affinity
+# limits), cmake runs exactly the effective jobs the bound assumes. Where a
+# cgroup CPU quota makes available_parallelism smaller than nproc, cmake now
+# runs fewer jobs, but the quota already capped the CPU time the extra jobs
+# could get, so elapsed time is about unchanged. The compiled DynamoRIO tree
+# and cmake configuration are unchanged.
+# BOUNDED COLD SDK OBSERVATION AT c8181d43: a cold `cargo build -p reverie-dbt
+# -j 16` of the Reverie checkout with CI=true under `taskset -c 0-3`, default
+# cmake and CMAKE_GENERATOR unset, on a 316-CPU host at load average ~170,
+# reported MISS, then "completed in 38.18s (jobs=4, 152.73 job-seconds;
+# NUM_JOBS=16, available CPUs=4)", and PUBLISHED for
+#     key=sha256:f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# 152.73 effective-job-seconds is below 1050; at 4 effective jobs the elapsed
+# bound is ceil(1050/4)=263s. A second cold sample through this wrapper
+# (`CARGO_BUILD_JOBS=16 ci/run-with-reverie-dbt-budget.sh cargo check --locked
+# -p detcore-dbt`, child nproc=316, so min(16,316,16)=16 and a 66s bound)
+# reported the same key and "completed in 13.28s (jobs=16, 212.53
+# job-seconds; NUM_JOBS=16, available CPUs=316)".
+# Retain the conservative 1050 effective-job-second threshold and the 16-job
+# clamp. These two local samples do not replace the original n=3 hosted
+# calibration or satisfy the >=5-sample replacement rule, and they are not a
+# Hermit guest or replay result; fresh validation is required.
+expected_pin=c8181d43a59a6d1ac602f2fad7615189f4996b41
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -891,6 +929,6 @@ export REVERIE_DBT_BUDGET_BOUND_PIN
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
-echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:b0247764df7fba083f90538e12d3afcc8ffad5150c65bd321e689da5e57b74ed}" >&2
+echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21}" >&2
 
 exec "$@"
