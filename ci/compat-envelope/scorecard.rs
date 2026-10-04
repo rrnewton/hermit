@@ -2201,8 +2201,8 @@ impl ResultRow {
     }
 
     /// A PASS of a declared stripped-comparator cell: every attempt's report
-    /// holds the stripped comparison the runner requires, matched, from an
-    /// attempt that passed. It is admitted as below-L2 evidence, never as the
+    /// holds the stripped comparison the runner requires, verified and
+    /// matched without a bitwise parity claim, from an attempt that passed. It is admitted as below-L2 evidence, never as the
     /// canonical match `require_canonical_pass_evidence` demands of every other
     /// PASS.
     fn require_stripped_pass_evidence(&self) -> Result<(), String> {
@@ -2219,6 +2219,14 @@ impl ResultRow {
                     "attempt {} stripped report is not a verified match (verdict={})",
                     index + 1,
                     report.verdict
+                ));
+            }
+            // The owner's admitted stripped pass claims no bitwise parity; a
+            // stripped comparison cannot establish it.
+            if report.bitwise_parity {
+                return Err(format!(
+                    "attempt {} stripped match report claims bitwise parity, which a stripped comparison cannot establish",
+                    index + 1
                 ));
             }
             if Self::matched_report_names_divergence(&report, attempt) {
@@ -2899,13 +2907,31 @@ impl ResultRow {
                     // declares the stripped comparator, and nothing more: a
                     // canonical match without bitwise parity stays refused
                     // below as internally inconsistent.
-                    let stripped_match = report.verdict == canonical_verdict::Verdict::Matched
-                        && report.verified
-                        && !report.bitwise_parity
-                        && report.comparison.as_ref().is_some_and(|comparison| {
+                    let stripped_comparison =
+                        report.comparison.as_ref().is_some_and(|comparison| {
                             comparison.strictness
                                 == canonical_verdict::LogCompareStrictness::Stripped
                         });
+                    // A stripped comparison cannot establish bitwise parity,
+                    // so a stripped match that claims it is internally
+                    // inconsistent. Refuse it before either branch below can
+                    // reinterpret it: as a canonical match it would only be
+                    // downgraded to unavailable, which lets a valid canonical
+                    // divergence in another attempt of the same row escape
+                    // the one-comparator check.
+                    if report.verdict == canonical_verdict::Verdict::Matched
+                        && stripped_comparison
+                        && report.bitwise_parity
+                    {
+                        return Err(format!(
+                            "attempt {} stripped match report claims bitwise parity, which a stripped comparison cannot establish",
+                            index + 1
+                        ));
+                    }
+                    let stripped_match = report.verdict == canonical_verdict::Verdict::Matched
+                        && report.verified
+                        && !report.bitwise_parity
+                        && stripped_comparison;
                     saw_stripped_comparison |= stripped_match;
                     match report.verdict {
                         canonical_verdict::Verdict::Matched
@@ -20743,6 +20769,9 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     let mut report: JsonValue =
         serde_json::from_str(weak.attempts[0]["verification_report"].as_str().unwrap()).unwrap();
     report["comparison"]["strictness"] = JsonValue::String("stripped".into());
+    // A stripped comparison cannot establish bitwise parity, so the stripped
+    // report claims none, as the producer's stripped reports do.
+    report["bitwise_parity"] = JsonValue::Bool(false);
     let report = serde_json::to_string(&report).unwrap();
     weak.attempts[0]["verification_report_sha256"] =
         JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
@@ -20760,6 +20789,28 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
     declared
         .require_canonical_pass_evidence()
         .map_err(|e| format!("a declared stripped PASS was refused: {e}"))?;
+    // The same declared row whose stripped report claims bitwise parity is
+    // internally inconsistent and is refused.
+    let mut declared_bitwise = declared.clone();
+    let mut report: JsonValue = serde_json::from_str(
+        declared_bitwise.attempts[0]["verification_report"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    report["bitwise_parity"] = JsonValue::Bool(true);
+    let report = serde_json::to_string(&report).unwrap();
+    declared_bitwise.attempts[0]["verification_report_sha256"] =
+        JsonValue::String(format!("{:x}", Sha256::digest(report.as_bytes())));
+    declared_bitwise.attempts[0]["verification_report"] = JsonValue::String(report);
+    match declared_bitwise.require_canonical_pass_evidence() {
+        Err(error) if error.contains("stripped match report claims bitwise parity") => {}
+        other => {
+            return Err(format!(
+                "a declared stripped PASS claiming bitwise parity was not refused: {other:?}"
+            ));
+        }
+    }
     let mut declared_canonical = candidate("PASS").row;
     declared_canonical.relaxations = vec![stripped_relaxation.clone()];
     if declared_canonical.require_canonical_pass_evidence().is_ok() {
@@ -34787,6 +34838,66 @@ mod post_verdict_transaction_tests {
         }
     }
 
+    /// https://github.com/rrnewton/hermit/pull/3655, post-landing review
+    /// finding 6: a stripped match report that claims bitwise parity supplies
+    /// no pass. The ordinary evidence reader, the stripped-pass admission and
+    /// `verify-results` all refuse it. Control: the same row without the
+    /// claim is still admitted as a stripped pass.
+    #[test]
+    fn verify_results_refuses_a_stripped_match_that_claims_bitwise_parity() {
+        let measured = "a".repeat(40);
+        let (id, stripped) = stripped_row(&measured);
+        let read = |row: &JsonValue| {
+            let mut bytes = serde_json::to_vec(row).unwrap();
+            bytes.push(b'\n');
+            read_result_candidate_files(
+                &[(PathBuf::from("fixture/results.jsonl"), bytes.as_slice())],
+                &measured,
+            )
+            .unwrap()
+        };
+        let claiming = with_edited_report(&stripped, &|report| {
+            report["bitwise_parity"] = true.into();
+        });
+        let claim = "attempt 1 stripped match report claims bitwise parity, which a stripped comparison cannot establish";
+
+        let error = match verify_candidate_set(&BTreeSet::from([id.clone()]), read(&claiming)) {
+            Err(error) => error,
+            Ok(admission) => panic!(
+                "verify-results admitted a stripped match claiming bitwise parity: {admission:?}"
+            ),
+        };
+        assert!(error.contains(claim), "verify-results: {error}");
+        let typed: ResultRow = serde_json::from_value(claiming.clone()).unwrap();
+        let error = typed
+            .require_canonical_pass_evidence()
+            .expect_err("the stripped-pass admission accepted the claim");
+        assert!(
+            error.contains(claim),
+            "require_canonical_pass_evidence: {error}"
+        );
+        let error = typed
+            .comparison_evidence()
+            .expect_err("the evidence reader accepted the claim");
+        assert!(error.contains(claim), "comparison_evidence: {error}");
+        let candidates = read(&claiming);
+        let error = candidates[&id][0]
+            .evidence(&id, ResultInput::Current)
+            .err()
+            .expect("the candidate evidence accepted the claim");
+        assert!(error.contains(claim), "evidence: {error}");
+
+        assert_eq!(
+            verify_candidate_set(&BTreeSet::from([id.clone()]), read(&stripped)),
+            Ok(CandidateAdmission {
+                passed: 1,
+                stripped: 1,
+                diagnostic_failures: Vec::new(),
+            }),
+            "the stripped pass without the claim must still be admitted"
+        );
+    }
+
     /// A stripped match is the runner's pass only on a row that declares the
     /// stripped comparator with a reason. On any other row both readers
     /// refuse it, and the write-back leaves history untouched.
@@ -35453,6 +35564,84 @@ mod post_verdict_transaction_tests {
                 );
             }
         }
+    }
+
+    /// The refusal of a stripped match report that claims bitwise parity.
+    const STRIPPED_BITWISE_CLAIM: &str =
+        "stripped match report claims bitwise parity, which a stripped comparison cannot establish";
+
+    /// https://github.com/rrnewton/hermit/pull/3655, post-landing review
+    /// finding 6: a stripped match report that claims bitwise parity is
+    /// internally inconsistent, because a stripped comparison cannot
+    /// establish bitwise parity. On its own it is refused rather than read as
+    /// unavailable evidence, and beside a valid canonical divergence, in
+    /// either attempt order, the row is refused rather than admitted as that
+    /// canonical divergence.
+    #[test]
+    fn goalpost_a_stripped_match_claiming_bitwise_parity_cannot_credit_a_mixed_row() {
+        let measured = "a".repeat(40);
+        let (_, stripped) = stripped_row(&measured);
+        let canonical = canonical_divergence_row(&measured, "mixed-bitwise-claim");
+        let control: ResultRow = serde_json::from_value(canonical.clone()).unwrap();
+        assert!(
+            matches!(
+                control.comparison_evidence(),
+                Ok(ValidateRowEvidence::Diverged { .. })
+            ),
+            "control must be an admitted canonical divergence"
+        );
+        let claiming = with_edited_report(&stripped, &|report| {
+            report["bitwise_parity"] = true.into();
+        });
+        let report = canonical_verdict::VerificationReport::from_current_json_slice(
+            claiming["attempts"][0]["verification_report"]
+                .as_str()
+                .unwrap()
+                .as_bytes(),
+        )
+        .expect("the report parser admits the claim; the classifier must refuse it");
+        assert!(report.verified && report.bitwise_parity);
+        assert!(require_stripped_comparison(&report).is_ok());
+
+        let canonical_attempt = canonical["attempts"][0].clone();
+        let stripped_attempt = claiming["attempts"][0].clone();
+        for (label, first, second, claim_attempt) in [
+            ("stripped first", &stripped_attempt, &canonical_attempt, 1),
+            ("canonical first", &canonical_attempt, &stripped_attempt, 2),
+        ] {
+            let mut row = claiming.clone();
+            for field in ["argv", "guest_argv", "env", "cwd", "shell_command"] {
+                row[field] = first[field].clone();
+            }
+            row["effective_args"] = serde_json::json!(&first["argv"].as_array().unwrap()[1..]);
+            row["outcome"] = "FAIL".into();
+            row["result"] = "determinism-failure".into();
+            row["failure_class"] = "product_failure".into();
+            row["first_divergent_record"] = 1.into();
+            let mut second = second.clone();
+            second["index"] = "2".into();
+            row["attempts"] = serde_json::json!([first, second]);
+            let row: ResultRow = serde_json::from_value(row).unwrap();
+            let error = match row.comparison_evidence() {
+                Err(error) => error,
+                Ok(evidence) => panic!(
+                    "{label}: a stripped bitwise claim let the mixed row be admitted as {evidence:?}"
+                ),
+            };
+            assert!(
+                error.contains(&format!("attempt {claim_attempt} {STRIPPED_BITWISE_CLAIM}")),
+                "{label}: {error}"
+            );
+        }
+
+        let alone: ResultRow = serde_json::from_value(claiming.clone()).unwrap();
+        let error = alone
+            .comparison_evidence()
+            .expect_err("a stripped match claiming bitwise parity was read as evidence");
+        assert!(
+            error.contains(&format!("attempt 1 {STRIPPED_BITWISE_CLAIM}")),
+            "{error}"
+        );
     }
 
     /// The one-comparator rule also covers a stripped match the runner did
