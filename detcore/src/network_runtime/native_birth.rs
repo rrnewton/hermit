@@ -380,6 +380,50 @@ impl NetworkRuntimeResources {
         }
         tasks.retain_shared_final_wait(owner, projection, root)
     }
+    /// Join a pre-effect entry to the actual armed provider command. The caller
+    /// holds the scheduler and has checked the exact submitted FD reservation.
+    pub(crate) fn shared_birth_entry(
+        &self,
+        birth: &super::native_birth_outcome::NativeBirthOwner,
+        grant: &crate::scheduler::ordinary_fd::OrdinaryFdObservation<'_>,
+        entry: (i32, [usize; 6]),
+        observed: bool,
+    ) -> io::Result<()> {
+        let request = birth.request();
+        let permit = request
+            .permit
+            .ok_or_else(|| invalid("shared birth lacks FD reservation"))?;
+        let required = CloneFlags::CLONE_VM | CloneFlags::CLONE_FILES | CloneFlags::CLONE_THREAD;
+        if grant.owner() != request.owner
+            || grant.resume() != crate::scheduler::ordinary_fd::OrdinaryFdResume::Normal
+            || !request.flags.contains(required)
+            || request.flags.contains(CloneFlags::CLONE_VFORK)
+            || !matches!(entry.0, 56 | 435)
+        {
+            return Err(invalid(
+                "shared birth requires exact Normal shared-thread entry",
+            ));
+        }
+        let controller = self.accepted_controller()?;
+        let mut physical = self.shared.physical.lock().unwrap();
+        let lineage = physical.shared_foreground_lineage(request.owner)?;
+        let root = lineage.root().clone();
+        if root.logical_process() != request.process || root.files() != permit.files {
+            return Err(invalid("shared birth changed original parent root"));
+        }
+        let preparation = controller.native_birth_preparation(permit)?;
+        if preparation.2 != physical.native_table(request.owner)? || preparation.3 != entry.0 {
+            return Err(invalid("shared birth changed actual provider preparation"));
+        }
+        if observed {
+            birth.observe_shared_entry(&root, grant.epoch(), entry, preparation)?;
+            physical.lose_sole_foreground_lineage();
+        } else {
+            birth.retain_shared_entry(root, grant.epoch(), entry, preparation)?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn prepare_native_birth(
         &self,
         permit: NetworkFdPublicationPermit,

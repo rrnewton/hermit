@@ -968,7 +968,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             crate::tool_global::prepare_network_native_birth(
                 guest,
                 admission.publication.permit,
-                Syscall::from(clone_family).number() as i32,
+                Syscall::from(clone_family).into_parts(),
             )
             .await?;
         }

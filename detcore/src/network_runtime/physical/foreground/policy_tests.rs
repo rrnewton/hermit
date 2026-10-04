@@ -110,6 +110,37 @@ impl SharedBirthFixture {
             &crate::network_runtime::JoinedNativePrefix,
         ),
     ) -> Self {
+        Self::new_with_observer(
+            thread,
+            Some(libc::SYS_clone as i32),
+            |root, claim| {
+                setup(root, claim);
+                None
+            },
+            before,
+            |runtime, _, _| Some(runtime),
+        )
+        .await
+        .expect("default birth fixture continues after preparation")
+    }
+    pub(crate) async fn new_with_observer(
+        thread: i32,
+        syscall: Option<i32>,
+        setup: impl FnOnce(
+            &Arc<ForegroundRoot>,
+            &InitialTableClaim,
+        ) -> Option<NetworkFdPublicationPermit>,
+        before: impl FnOnce(
+            &NetworkRuntimeResources,
+            &Arc<ForegroundRoot>,
+            &crate::network_runtime::JoinedNativePrefix,
+        ),
+        observe: impl FnOnce(
+            NetworkRuntimeResources,
+            &Arc<ForegroundRoot>,
+            NetworkFdPublicationPermit,
+        ) -> Option<NetworkRuntimeResources>,
+    ) -> Option<Self> {
         let mut pair = [-1; 2];
         assert_eq!(
             unsafe {
@@ -141,7 +172,7 @@ impl SharedBirthFixture {
             .unwrap();
         let parent = tasks.foreground_root(parent_owner).unwrap();
         assert!(parent.is_sole_initial_root(parent_owner));
-        setup(&parent, &claim);
+        let selected_permit = setup(&parent, &claim);
         let task = tasks.tasks.remove(&parent_owner.thread).unwrap();
         let pin: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
         {
@@ -173,40 +204,53 @@ impl SharedBirthFixture {
             .await
             .unwrap();
         before(&runtime, &parent, &prefix);
-        let permit = NetworkFdPublicationPermit {
+        let permit = selected_permit.unwrap_or(NetworkFdPublicationPermit {
             owner: parent_owner,
             files: parent.files(),
             lease: NetworkStreamLeaseId::controlled_fixture(184),
-        };
+        });
         let child_thread = DetTid::from_raw(thread.checked_add(1).unwrap());
         let flags = CloneFlags::CLONE_VM
             | CloneFlags::CLONE_FILES
             | CloneFlags::CLONE_SIGHAND
             | CloneFlags::CLONE_THREAD;
         let command = permit.native_command_call() + 17;
-        let prepare = runtime.prepare_native_birth(permit, libc::SYS_clone as i32);
-        let respond = async {
-            let (sequence, request) = peer.receive().await;
-            assert!(
-                matches!(request, Request::PrepareNativeBirth { call, mm, table, syscall }
+        let prepared_request = if let Some(syscall) = syscall {
+            let prepare = runtime.prepare_native_birth(permit, syscall);
+            let self_syscall = syscall;
+            let respond = async {
+                let (sequence, request) = peer.receive().await;
+                assert!(
+                    matches!(request, Request::PrepareNativeBirth { call, mm, table, syscall }
                 if call == permit.native_command_call() && mm == parent_owner.mm.generation()
-                && table == parent.association().table() && syscall == libc::SYS_clone as i32)
-            );
-            peer.reply(
-                sequence,
-                Reply::Prepared(Observation {
-                    status: status("ap_prepare_native_birth"),
-                    raw: command,
-                }),
-            );
-            sequence
+                && table == parent.association().table() && syscall == self_syscall)
+                );
+                peer.reply(
+                    sequence,
+                    Reply::Prepared(Observation {
+                        status: status("ap_prepare_native_birth"),
+                        raw: command,
+                    }),
+                );
+                sequence
+            };
+            let (prepared, prepared_request) =
+                tokio::time::timeout(Duration::from_secs(2), async {
+                    tokio::join!(prepare, respond)
+                })
+                .await
+                .expect("bounded birth preparation");
+            prepared.unwrap();
+            prepared_request
+        } else {
+            0
         };
-        let (prepared, prepared_request) = tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::join!(prepare, respond)
-        })
-        .await
-        .expect("bounded birth preparation");
-        prepared.unwrap();
+        // Explicit negative-fixture stop: no child observation or ready claim.
+        let runtime = observe(runtime, &parent, permit)?;
+        assert!(
+            syscall.is_some(),
+            "an unprepared negative fixture cannot continue to child observation"
+        );
         let observe = runtime.observe_native_birth(
             permit,
             child_thread,
@@ -280,7 +324,7 @@ impl SharedBirthFixture {
         assert!(parent.same_memory_authority(&child));
         assert!(!parent.is_sole_initial_root(parent_owner));
         assert!(!child.is_sole_initial_root(child.owner()));
-        Self {
+        Some(Self {
             runtime,
             parent,
             child,
@@ -288,7 +332,7 @@ impl SharedBirthFixture {
             metadata,
             memory,
             _peer: peer,
-        }
+        })
     }
 }
 

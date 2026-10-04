@@ -63,6 +63,29 @@ impl ForegroundRoot {
     ) -> policy_tests::SharedBirthFixture {
         policy_tests::SharedBirthFixture::new_after_entry(thread, before).await
     }
+    #[cfg(test)]
+    pub(crate) async fn controlled_shared_birth_with_observer(
+        thread: i32,
+        syscall: Option<i32>,
+        setup: impl FnOnce(
+            &Arc<Self>,
+            &InitialTableClaim,
+        ) -> Option<crate::network_replay::NetworkFdPublicationPermit>,
+        observe: impl FnOnce(
+            crate::network_runtime::NetworkRuntimeResources,
+            &Arc<Self>,
+            crate::network_replay::NetworkFdPublicationPermit,
+        ) -> Option<crate::network_runtime::NetworkRuntimeResources>,
+    ) -> Option<policy_tests::SharedBirthFixture> {
+        policy_tests::SharedBirthFixture::new_with_observer(
+            thread,
+            syscall,
+            setup,
+            |_, _, _| {},
+            observe,
+        )
+        .await
+    }
     /// Controlled completed census plus an owned local accepted endpoint. No
     /// provider command is submitted; terminal retirement must still traverse
     /// the production accepted-runtime branch, not the guard-only early return.
@@ -214,6 +237,11 @@ impl<T> CustodyTasks<T> {
                 root.revoke();
             }
         }
+    }
+    /// A positively armed shared birth still destroys all sole-root authority.
+    /// The caller joins its exact original reservation and Prepared callback.
+    pub(in crate::network_runtime) fn lose_sole_foreground_lineage(&mut self) {
+        self.sole_initial_root_lost.store(true, Ordering::Release);
     }
     /// Called from the real state-ready observation after the same FD metadata
     /// was authenticated. Does not issue for a noninitial or partial census.

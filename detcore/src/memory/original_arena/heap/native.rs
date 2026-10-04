@@ -241,20 +241,26 @@ fn native_heap_observer_growth_bytes_and_shrink_with_controlled_root() {
     // test_fn has completed the original tracee and reaped it before acceptance.
     assert_eq!(output.status, ExitStatus::Exited(0));
     let observations = global.0.lock().unwrap();
-    assert_eq!(observations.brk.len(), 6, "{:?}", observations.brk);
+    assert_eq!(observations.brk.len(), 9, "{:?}", observations.brk);
     let [
         (query, Event::Prepared),
+        (query_entered, Event::Entered),
         (query_return, Event::Returned(old)),
         (growth, Event::Prepared),
+        (growth_entered, Event::Entered),
         (growth_return, Event::Returned(end)),
         (shrink, Event::Prepared),
+        (shrink_entered, Event::Entered),
         (shrink_return, Event::Returned(restored)),
     ] = observations.brk.as_slice()
     else {
         panic!("exact real brk phases required");
     };
+    assert_eq!(query, query_entered);
     assert_eq!(query, query_return);
+    assert_eq!(growth, growth_entered);
     assert_eq!(growth, growth_return);
+    assert_eq!(shrink, shrink_entered);
     assert_eq!(shrink, shrink_return);
     assert_eq!(query.arg0, 0);
     assert!(*old > 0);

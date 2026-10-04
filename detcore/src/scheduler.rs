@@ -1582,6 +1582,41 @@ impl ThreadTree {
         true
     }
 
+    /// The existing submitted birth reservation, before any child or result.
+    /// A historical request or numeric owner alone cannot issue this borrow.
+    pub(crate) fn active_native_birth(
+        &self,
+        permit: crate::network_replay::NetworkFdPublicationPermit,
+    ) -> std::io::Result<Arc<crate::network_runtime::native_birth_outcome::NativeBirthOwner>> {
+        let mut matches = self
+            .process_wait
+            .values()
+            .filter(|entry| !entry.reaped)
+            .flat_map(|entry| entry.births.values())
+            .filter(|state| state.birth.fd_permit == Some(permit));
+        let state = matches
+            .next()
+            .ok_or_else(|| std::io::Error::other("shared birth has no active reservation"))?;
+        if matches.next().is_some()
+            || state.owner_gone
+            || !state.birth.submitted
+            || state.birth.parent != permit.owner
+            || state.birth.child.is_some()
+            || state.completed_child.is_some()
+            || state.native.is_some()
+            || state.parent_completion.is_some()
+        {
+            return Err(std::io::Error::other(
+                "shared birth changed active reservation",
+            ));
+        }
+        state
+            .birth
+            .native_owner
+            .clone()
+            .ok_or_else(|| std::io::Error::other("shared birth lost private reservation owner"))
+    }
+
     pub(crate) fn pending_no_seq_birth_count(&self) -> usize {
         self.process_wait
             .values()
@@ -4025,6 +4060,29 @@ impl Scheduler {
     #[cfg(test)]
     pub(crate) fn install_test_vfork_barrier(&mut self, parent: DetTid, child: DetTid) {
         self.vfork_barriers.insert(parent, Some(child));
+    }
+
+    #[cfg(test)]
+    pub(crate) fn controlled_shared_birth_ready_projection(
+        &mut self,
+        parent: crate::network_replay::NetworkStreamOwner,
+        child: &crate::network_runtime::ForegroundRoot,
+    ) {
+        let owner = child.owner();
+        assert!(self.thread_tree.tree.contains_key(&owner.thread));
+        self.install_test_exec_incarnation(owner.thread, owner.mm);
+        let pin = self.physical_thread_pidfds[&parent.thread]
+            .3
+            .try_clone()
+            .unwrap();
+        assert!(
+            self.physical_thread_pidfds
+                .insert(
+                    owner.thread,
+                    (owner.mm, child.process(), child.thread(), pin, true)
+                )
+                .is_none()
+        );
     }
 
     #[cfg(test)]

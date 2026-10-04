@@ -255,6 +255,18 @@ struct Retained {
     outcome: Option<Arc<NativeChildOutcome>>,
     consumed: Option<NativeBirthDisposition>,
     failed: bool,
+    shared_entry: Option<SharedBirthEntry>,
+}
+
+/// Independently retained before the backend Prepared callback. This is an
+/// attachment to the original birth owner, not a child or completion issuer.
+#[derive(Debug)]
+struct SharedBirthEntry {
+    root: Arc<super::ForegroundRoot>,
+    epoch: u64,
+    entry: (i32, [usize; 6]),
+    preparation: (u64, u64, u64, i32),
+    observed: bool,
 }
 
 /// One attachment on the existing NoSeq birth owner. The serializable request
@@ -286,6 +298,61 @@ impl NativeBirthOwner {
     pub(crate) fn request(&self) -> &NativeBirthRequest {
         &self.request
     }
+    pub(in crate::network_runtime) fn retain_shared_entry(
+        &self,
+        root: Arc<super::ForegroundRoot>,
+        epoch: u64,
+        entry: (i32, [usize; 6]),
+        preparation: (u64, u64, u64, i32),
+    ) -> io::Result<()> {
+        let mut state = self.retained.lock().unwrap();
+        if state.failed
+            || state.outcome.is_some()
+            || state.consumed.is_some()
+            || state.shared_entry.is_some()
+        {
+            return Err(io::Error::other(
+                "shared birth entry changed original reservation",
+            ));
+        }
+        state.shared_entry = Some(SharedBirthEntry {
+            root,
+            epoch,
+            entry,
+            preparation,
+            observed: false,
+        });
+        Ok(())
+    }
+    pub(in crate::network_runtime) fn observe_shared_entry(
+        &self,
+        root: &Arc<super::ForegroundRoot>,
+        epoch: u64,
+        entry: (i32, [usize; 6]),
+        preparation: (u64, u64, u64, i32),
+    ) -> io::Result<()> {
+        let mut state = self.retained.lock().unwrap();
+        if state.failed || state.outcome.is_some() || state.consumed.is_some() {
+            return Err(io::Error::other("shared birth entry followed a result"));
+        }
+        let saved = state
+            .shared_entry
+            .as_mut()
+            .ok_or_else(|| io::Error::other("shared birth lacks independently retained entry"))?;
+        if saved.observed
+            || !Arc::ptr_eq(&saved.root, root)
+            || saved.epoch != epoch
+            || saved.entry != entry
+            || saved.preparation != preparation
+        {
+            return Err(io::Error::other(
+                "shared birth changed original entry or preparation",
+            ));
+        }
+        saved.observed = true;
+        Ok(())
+    }
+
     pub(crate) fn validate_projection(&self, projection: &NativeTaskProjection) -> io::Result<()> {
         let state = self.retained.lock().unwrap();
         if state.outcome.is_none()

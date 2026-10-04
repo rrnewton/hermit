@@ -6,7 +6,135 @@ use super::*;
 #[cfg(test)]
 mod terminal_lifecycle;
 
+#[cfg(test)]
+mod shared_birth;
+
 impl GlobalState {
+    pub(super) fn retain_shared_birth_entry(
+        &self,
+        permit: crate::network_replay::NetworkFdPublicationPermit,
+        entry: (i32, [usize; 6]),
+    ) -> std::io::Result<()> {
+        let scheduler = self.sched.lock().unwrap();
+        let engine = self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("native birth lost engine"))?
+            .lock()
+            .unwrap();
+        if !engine.uses_shared_mm_attempts() {
+            return Ok(());
+        }
+        let birth = scheduler.thread_tree.active_native_birth(permit)?;
+        let required = reverie::syscalls::CloneFlags::CLONE_VM
+            | reverie::syscalls::CloneFlags::CLONE_FILES
+            | reverie::syscalls::CloneFlags::CLONE_THREAD;
+        // Unsupported births retain their old full revocation at Prepared.
+        if !birth.request().flags.contains(required)
+            || birth
+                .request()
+                .flags
+                .contains(reverie::syscalls::CloneFlags::CLONE_VFORK)
+            || !matches!(entry.0, 56 | 435)
+        {
+            return Ok(());
+        }
+        engine
+            .validate_child_birth_permit(permit.owner, permit, birth.request().flags)
+            .map_err(std::io::Error::other)?;
+        drop(engine);
+        let grant = scheduler
+            .ordinary_fd_observation(permit.owner)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        self.network_runtime
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("native birth lost runtime"))?
+            .shared_birth_entry(&birth, &grant, entry, false)
+    }
+
+    fn observe_shared_birth_entry<T>(
+        &self,
+        tid: Tid,
+        process: DetPid,
+        state: &crate::tool_local::ThreadState<T>,
+        nr: reverie::syscalls::Sysno,
+        args: reverie::syscalls::SyscallArgs,
+    ) -> std::io::Result<()> {
+        let owner = NetworkStreamOwner {
+            thread: state.dettid,
+            mm: state.mm_id,
+        };
+        let scheduler = self.sched.lock().unwrap();
+        if !self.cfg.sequentialize_threads
+            || tid.as_raw() != owner.thread.as_raw()
+            || scheduler.registered_process(owner.thread) != Some(process)
+            || self.registered_exec_mms.lock().unwrap().get(&owner.thread) != Some(&owner.mm)
+            || !state.native_birth_required
+            || state.uninvoked_fd_clone.is_some()
+            || state.uninvoked_wait_call.is_some()
+        {
+            return Err(std::io::Error::other(
+                "shared birth changed actual parent entry",
+            ));
+        }
+        let permit = state
+            .pending_fd_clone
+            .ok_or_else(|| std::io::Error::other("shared birth lost local FD permit"))?;
+        let local = state
+            .pending_no_seq_birth
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("shared birth lost local reservation"))?;
+        let birth = scheduler.thread_tree.active_native_birth(permit)?;
+        if birth.request() != &local.request_identity()
+            || state.clone_flags != Some(birth.request().flags)
+        {
+            return Err(std::io::Error::other(
+                "shared birth changed original request",
+            ));
+        }
+        let runtime = self
+            .network_runtime
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("shared birth lost runtime"))?;
+        let root = runtime.foreground_root(owner)?;
+        if !root.matches_metadata(&state.file_metadata)
+            || !root.matches_memory(&state.memory_metadata)
+        {
+            return Err(std::io::Error::other(
+                "shared birth changed parent metadata",
+            ));
+        }
+        let engine = self
+            .network_engine
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("shared birth lost engine"))?
+            .lock()
+            .unwrap();
+        if !engine.uses_shared_mm_attempts() {
+            return Err(std::io::Error::other(
+                "shared birth requires selected shared policy",
+            ));
+        }
+        engine
+            .validate_child_birth_permit(owner, permit, birth.request().flags)
+            .map_err(std::io::Error::other)?;
+        drop(engine);
+        let grant = scheduler
+            .ordinary_fd_observation(owner)
+            .map_err(|error| std::io::Error::other(format!("{error:?}")))?;
+        runtime.shared_birth_entry(
+            &birth,
+            &grant,
+            (
+                nr as i32,
+                [
+                    args.arg0, args.arg1, args.arg2, args.arg3, args.arg4, args.arg5,
+                ],
+            ),
+            true,
+        )
+    }
+
     /// The synchronous final hook next closes exact physical task admission in
     /// settle_no_seq_terminal. Death revokes live memory/root authority without
     /// rewriting the recorder's retained history as an unsupported exposure.
@@ -79,7 +207,20 @@ impl GlobalState {
                 .lock()
                 .unwrap()
                 .invalidate_original_arena();
-            runtime.revoke_foreground_lineage();
+            // AUTONOMOUS-BOT-IMPLEMENTED
+            // https://github.com/rrnewton/hermit/pull/3464
+            // TODO-HUMAN-REVIEW(PR-3464): Only an independently retained, armed
+            // original shared-thread birth may preserve shared root history.
+            // It never preserves old arena/heap or sole-initial-root authority.
+            if !matches!(
+                nr,
+                reverie::syscalls::Sysno::clone | reverie::syscalls::Sysno::clone3
+            ) || self
+                .observe_shared_birth_entry(tid, process, state, nr, args)
+                .is_err()
+            {
+                runtime.revoke_foreground_lineage();
+            }
             return;
         }
         // Optional narrow capability: ordinary memory behavior still works

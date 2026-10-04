@@ -1797,10 +1797,12 @@ impl GlobalTool for GlobalState {
                     .ok_or_else(|| anyhow::anyhow!("native clone lost runtime"))
             })();
             let outcome = match preparation {
-                Ok(runtime) => runtime
-                    .prepare_native_birth(*permit, *syscall)
-                    .await
-                    .map_err(|e| e.to_string()),
+                Ok(runtime) => match runtime.prepare_native_birth(*permit, syscall.0).await {
+                    Ok(()) => self
+                        .retain_shared_birth_entry(*permit, *syscall)
+                        .map_err(|e| e.to_string()),
+                    Err(error) => Err(error.to_string()),
+                },
                 Err(error) => Err(error.to_string()),
             };
             return (None, R::NetworkNativeBirthPrepared(outcome));
@@ -7613,7 +7615,10 @@ pub enum GlobalRequest {
     },
     AdmitNetworkInitialTable(crate::network_runtime::InitialTableClaim),
     /// Arm exactly the already submitted clone permit before native invocation.
-    PrepareNetworkNativeBirth(crate::network_replay::NetworkFdPublicationPermit, i32),
+    PrepareNetworkNativeBirth(
+        crate::network_replay::NetworkFdPublicationPermit,
+        (i32, [usize; 6]),
+    ),
     /// Compare the actual original native return with the retained provider.
     CollectNetworkNativeBirth(
         crate::network_replay::NetworkFdPublicationPermit,
@@ -8254,7 +8259,7 @@ where
 pub(crate) async fn prepare_network_native_birth<G, T>(
     guest: &mut G,
     permit: crate::network_replay::NetworkFdPublicationPermit,
-    syscall: i32,
+    syscall: (reverie::syscalls::Sysno, reverie::syscalls::SyscallArgs),
 ) -> Result<(), Error>
 where
     G: Guest<Detcore<T>>,
@@ -8262,7 +8267,20 @@ where
 {
     match send_and_update_time(
         guest,
-        GlobalRequest::PrepareNetworkNativeBirth(permit, syscall),
+        GlobalRequest::PrepareNetworkNativeBirth(
+            permit,
+            (
+                syscall.0 as i32,
+                [
+                    syscall.1.arg0,
+                    syscall.1.arg1,
+                    syscall.1.arg2,
+                    syscall.1.arg3,
+                    syscall.1.arg4,
+                    syscall.1.arg5,
+                ],
+            ),
+        ),
     )
     .await
     .1
