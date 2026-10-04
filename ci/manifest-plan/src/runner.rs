@@ -4641,25 +4641,36 @@ fn process_group_members(pgid: u32) -> Result<Vec<u32>, String> {
         else {
             continue;
         };
-        let stat = match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // Bytes, not text: any process on the host may name itself with
+        // bytes that are not UTF-8, and one such name must not fail the scan.
+        let stat = match fs::read(format!("/proc/{pid}/stat")) {
             Ok(stat) => stat,
             Err(error) if matches!(error.raw_os_error(), Some(libc::ENOENT | libc::ESRCH)) => {
                 continue;
             }
             Err(error) => return Err(format!("/proc/{pid}/stat: {error}")),
         };
-        // The command name may hold spaces and parentheses; after its last
-        // ')' come the state, the parent PID and the process group.
-        let group = stat
-            .rsplit_once(')')
-            .and_then(|(_, fields)| fields.split_whitespace().nth(2))
-            .and_then(|group| group.parse::<u32>().ok())
-            .ok_or_else(|| format!("/proc/{pid}/stat is malformed"))?;
+        let group =
+            stat_process_group(&stat).ok_or_else(|| format!("/proc/{pid}/stat is malformed"))?;
         if group == pgid {
             members.push(pid);
         }
     }
     Ok(members)
+}
+
+/// The process group in the bytes of a `/proc/<pid>/stat` file, or `None`
+/// when they are malformed. The command name may hold any bytes, including
+/// spaces, parentheses and bytes that are not UTF-8; after its last ')' come
+/// the state, the parent PID and the process group, all ASCII.
+fn stat_process_group(stat: &[u8]) -> Option<u32> {
+    let close = stat.iter().rposition(|&byte| byte == b')')?;
+    std::str::from_utf8(&stat[close + 1..])
+        .ok()?
+        .split_whitespace()
+        .nth(2)?
+        .parse()
+        .ok()
 }
 
 /// Check that every process the process-group scan could see for this
@@ -10957,6 +10968,71 @@ mod tests {
         let reaped = child.id();
         child.wait().unwrap();
         assert_eq!(process_cgroup(reaped), Ok(None));
+    }
+
+    #[test]
+    fn the_process_group_is_read_after_the_last_parenthesis_of_any_command_name() {
+        // A command name holds up to 15 bytes of anything: parentheses,
+        // spaces and bytes that are not UTF-8.
+        assert_eq!(
+            stat_process_group(b"4124033 (a\xff) (\xfe b) S 1 4124001 4124001 0 -1"),
+            Some(4124001)
+        );
+        assert_eq!(stat_process_group(b"7 (sleep) S 1 7 7 0 -1"), Some(7));
+        for malformed in [
+            &b"7 sleep S 1 7 7 0 -1"[..],
+            b"7 (sleep) S 1",
+            b"7 (sleep) S 1 x 7",
+            b"7 (sleep) S 1 \xff 7",
+            b"",
+        ] {
+            assert_eq!(
+                stat_process_group(malformed),
+                None,
+                "{}",
+                String::from_utf8_lossy(malformed)
+            );
+        }
+    }
+
+    #[test]
+    fn a_process_named_with_bytes_that_are_not_utf8_does_not_fail_the_scan() {
+        use std::os::unix::ffi::OsStrExt;
+
+        // Exec names a process after the last component of the path it ran,
+        // so a child run through this symlink is named with bytes that are
+        // not UTF-8. The scan reads every process's stat, whichever group it
+        // looks for, so such a name anywhere on the host reaches it.
+        let base = std::env::temp_dir().join(format!("runner-non-utf8-{}", std::process::id()));
+        fs::create_dir_all(&base).unwrap();
+        let name = b"scan\xff) (\xfe";
+        let link = base.join(OsStr::from_bytes(name));
+        std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
+        let mut child = Command::new(&link)
+            .arg("30")
+            .process_group(0)
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        // Exec renames the process after the spawn has returned, so wait for
+        // the name before scanning.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let renamed = loop {
+            let comm = fs::read(format!("/proc/{pid}/comm")).unwrap_or_default();
+            if comm.strip_suffix(b"\n") == Some(&name[..]) {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                break false;
+            }
+            thread::sleep(Duration::from_millis(5));
+        };
+        let members = process_group_members(pid);
+        let _ = child.kill();
+        let _ = child.wait();
+        fs::remove_dir_all(&base).unwrap();
+        assert!(renamed, "the child never took the symlink's name");
+        assert_eq!(members, Ok(vec![pid]));
     }
 
     #[test]
