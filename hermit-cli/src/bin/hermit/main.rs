@@ -683,15 +683,13 @@ fn main() {
     // settlement. Only this private guard owns the buffered typed report; no
     // guest-visible staging pathname or environment variable is an authority.
     let verification = if wants_native_exit {
-        command
-            .verification_json_path()
-            .map(verify::DeferredVerification::begin)
-            .transpose()
+        verify::DeferredVerification::begin_optional(command.verification_json_path()).map(Some)
     } else {
         Ok(None)
     };
     let evidence: std::cell::RefCell<Option<RunEvidenceSession>> = std::cell::RefCell::new(None);
     let mut evidence_setup_failed = false;
+    let mut announcement = None;
     let result = verification.and_then(|verification| {
         let normally_settled = std::cell::Cell::new(false);
         let result = native_exit::with_early_owner_reporting(
@@ -731,10 +729,13 @@ fn main() {
             || normally_settled.set(true),
         );
         let publication = verification
-            .map(|guard| guard.finish(normally_settled.get(), result.is_ok()))
+            .map(|guard| guard.publish(normally_settled.get(), result.is_ok()))
             .transpose();
         match (result, publication) {
-            (result, Ok(_)) => result,
+            (result, Ok(published)) => {
+                announcement = published;
+                result
+            }
             (Ok(_), Err(error)) => Err(error.context("publishing settled verification report")),
             (Err(primary), Err(error)) => Err(verify::retain_verification_error(
                 primary,
@@ -747,6 +748,24 @@ fn main() {
     let evidence_error = evidence
         .into_inner()
         .and_then(|session| session.finish(result.as_ref()).err());
+    // The report and run evidence are separate atomic publications. A late
+    // evidence error retains its existing exit policy below, but must not be
+    // followed by a success announcement. Staging/identity errors never fall
+    // back to printing from an inherited or otherwise invalid owner.
+    let result = match announcement
+        .map(|published| published.emit(evidence_error.is_none()))
+        .transpose()
+    {
+        Ok(_) => result,
+        Err(error) => match result {
+            Ok(_) => Err(error.context("announcing settled verification result")),
+            Err(primary) => Err(verify::retain_verification_error(
+                primary,
+                "announcing settled verification result",
+                error,
+            )),
+        },
+    };
     let status = result.unwrap_or_else(|error| {
         let status = ExitStatus::Exited(if evidence_setup_failed {
             HERMIT_INTERNAL_FAILURE_EXIT

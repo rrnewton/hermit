@@ -670,7 +670,7 @@ impl StartOpts {
             SecondRun::Replay,
             "Success: replay matched recording.",
             "Recording output did not match replay output!",
-        );
+        )?;
         emit_compared_guest_output(outcome.verified(), &recording, &replay)?;
 
         outcome.into_exit_status()
@@ -890,7 +890,7 @@ mod tests {
         // The second half of record-mode verification is a replay, so its match
         // line must use the replay wording for the time note.
         let call = &verification[announce..];
-        let call = &call[..call.find(");").expect("end of announcement call")];
+        let call = &call[..call.find(")?;").expect("end of announcement call")];
         assert!(call.contains("SecondRun::Replay"), "{call}");
     }
 

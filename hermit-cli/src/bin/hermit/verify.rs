@@ -929,9 +929,10 @@ fn staging_directory(path: &Path) -> &Path {
 }
 
 struct DeferredReportState {
-    path: PathBuf,
+    path: Option<PathBuf>,
     creator: (libc::pid_t, libc::pid_t),
     report: Option<VerificationReport>,
+    announcement: Option<DeferredAnnouncement>,
 }
 
 thread_local! {
@@ -957,18 +958,65 @@ fn report_creator() -> (libc::pid_t, libc::pid_t) {
     }
 }
 
+struct DeferredAnnouncement {
+    bytes: Vec<u8>,
+    verdict: Verdict,
+}
+
+/// A report has been published (if requested), but final run-evidence I/O may
+/// still fail. Only the original thread may emit these bytes after that step.
+/// Drop, including unwinding, never prints. This is not multi-file atomicity.
+#[must_use]
+pub(super) struct PublishedVerification {
+    creator: (libc::pid_t, libc::pid_t),
+    announcement: Option<DeferredAnnouncement>,
+    _original_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl PublishedVerification {
+    pub(super) fn emit(self, evidence_succeeded: bool) -> Result<(), Error> {
+        anyhow::ensure!(
+            self.creator == report_creator(),
+            "verification announcement moved from its original process/thread"
+        );
+        self.emit_to(&mut io::stderr().lock(), evidence_succeeded)
+    }
+
+    fn emit_to(self, output: &mut impl io::Write, evidence_succeeded: bool) -> Result<(), Error> {
+        anyhow::ensure!(
+            self.creator == report_creator(),
+            "verification announcement moved from its original process/thread"
+        );
+        if evidence_succeeded && let Some(announcement) = self.announcement {
+            // Preserve the existing best-effort stderr policy. Staging/identity
+            // errors are failures; a console write error does not change exit policy.
+            let _ = output.write_all(&announcement.bytes);
+        }
+        Ok(())
+    }
+}
+
 impl DeferredVerification {
     /// Stamp no-result at the requested path before any bootstrap/guest effect.
     /// An I/O error is returned: no alternate destination or silent fallback.
     pub(super) fn begin(path: &Path) -> Result<Self, Error> {
+        Self::begin_optional(Some(path))
+    }
+
+    /// Native no-JSON invocations still defer their console verdict. An absent
+    /// path does not create a file and is not permission to announce early.
+    pub(super) fn begin_optional(path: Option<&Path>) -> Result<Self, Error> {
         DEFERRED_REPORT.with(|slot| {
             let mut slot = slot.borrow_mut();
             anyhow::ensure!(slot.is_none(), "verification publication already deferred");
-            publish_report_json(path, &VerificationReport::no_result())?;
+            if let Some(path) = path {
+                publish_report_json(path, &VerificationReport::no_result())?;
+            }
             let state = std::rc::Rc::new(std::cell::RefCell::new(DeferredReportState {
-                path: path.to_owned(),
+                path: path.map(Path::to_owned),
                 creator: report_creator(),
                 report: None,
+                announcement: None,
             }));
             *slot = Some(state.clone());
             Ok(Self { state })
@@ -979,18 +1027,51 @@ impl DeferredVerification {
     /// calls this method. Preserve a computed failure report on ordinary work
     /// failure; do not publish a buffered success over a later primary error.
     pub(super) fn finish(self, normally_settled: bool, work_succeeded: bool) -> Result<(), Error> {
+        self.publish(normally_settled, work_succeeded)?.emit(true)
+    }
+
+    /// Main uses the two-step form: first publish the report, then finish its
+    /// run-evidence artifact, and only then emit the console verdict. The two
+    /// requested files retain their existing separate atomic publication rules.
+    pub(super) fn publish(
+        self,
+        normally_settled: bool,
+        work_succeeded: bool,
+    ) -> Result<PublishedVerification, Error> {
         self.check_current()?;
         let mut state = self.state.borrow_mut();
-        if !normally_settled {
-            return Ok(());
-        }
-        let Some(report) = state.report.take() else {
-            return Ok(());
+        let mut published = PublishedVerification {
+            creator: state.creator,
+            announcement: None,
+            _original_thread: std::marker::PhantomData,
         };
-        if !work_succeeded && report.verified {
-            return Ok(());
+        if !normally_settled {
+            return Ok(published);
         }
-        publish_report_json(&state.path, &report)
+        if let Some(announcement) = &state.announcement
+            && state.path.is_some()
+        {
+            anyhow::ensure!(
+                state
+                    .report
+                    .as_ref()
+                    .is_some_and(|report| report.verdict == announcement.verdict),
+                "deferred announcement has no matching requested verification report"
+            );
+        }
+        if let Some(report) = state.report.take()
+            && (work_succeeded || !report.verified)
+        {
+            publish_report_json(
+                state.path.as_deref().expect("buffered requested report"),
+                &report,
+            )?;
+        }
+        published.announcement = state
+            .announcement
+            .take()
+            .filter(|announcement| work_succeeded || announcement.verdict != Verdict::Matched);
+        Ok(published)
     }
 
     fn check_current(&self) -> Result<(), Error> {
@@ -1031,7 +1112,7 @@ pub fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(),
             return Ok(false);
         };
         let mut state = active.borrow_mut();
-        if state.path != path {
+        if state.path.as_deref() != Some(path) {
             return Ok(false);
         }
         anyhow::ensure!(
@@ -1815,27 +1896,51 @@ fn comparison_evidence_line(comparison: &ComparisonSpec) -> Option<String> {
     })
 }
 
-/// Announce a verification verdict only after its machine-readable report has
-/// been published.
-///
-/// Keeping this outside [`compare_two_runs`] closes the interval in which the
-/// CLI previously printed `Success` and an outer bucket timeout could kill it
-/// before `write_verification_json` replaced the pending `no_result` report.
+/// Stage a native invocation's console verdict until its original-main owner
+/// has settled, the requested report has published, and final evidence I/O has
+/// succeeded. Callers without an active native guard retain immediate output.
 pub fn announce_verification_outcome(
     outcome: &VerificationOutcome,
     second_run: SecondRun,
     success_message: &str,
     failure_message: &str,
-) {
-    // Console output is best-effort, as it was with `eprintln!`; the verdict
-    // itself travels through the exit status and the published report.
-    let _ = write_verification_announcement(
-        &mut io::stderr().lock(),
+) -> Result<(), Error> {
+    // Use the same formatter once: wording, colors and comparison disclosure
+    // are identical whether emission is immediate or deferred.
+    let mut bytes = Vec::new();
+    write_verification_announcement(
+        &mut bytes,
         outcome,
         second_run,
         success_message,
         failure_message,
-    );
+    )?;
+    let mut announcement = Some(DeferredAnnouncement {
+        bytes,
+        verdict: outcome.verdict,
+    });
+    DEFERRED_REPORT.with(|slot| -> Result<(), Error> {
+        let slot = slot.borrow();
+        if let Some(active) = slot.as_ref() {
+            let mut state = active.borrow_mut();
+            anyhow::ensure!(
+                state.creator == report_creator(),
+                "verification announcer is not the invocation's original process/thread"
+            );
+            anyhow::ensure!(
+                state.announcement.is_none(),
+                "verification announcement already staged"
+            );
+            state.announcement = announcement.take();
+        }
+        Ok(())
+    })?;
+    if let Some(announcement) = announcement {
+        // Console output remains best-effort. Never use this branch as a
+        // fallback from a failed staging or creator-identity check above.
+        let _ = io::Write::write_all(&mut io::stderr().lock(), &announcement.bytes);
+    }
+    Ok(())
 }
 
 /// What the second half of a verification was, which decides what a match
@@ -4609,5 +4714,259 @@ mod tests {
         assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 2);
         assert!(DeferredVerification::begin(&directory.path().join("absent/verify.json")).is_err());
         assert!(DEFERRED_REPORT.with(|slot| slot.borrow().is_none()));
+    }
+
+    fn deferred_console_outcome(matches: bool) -> VerificationOutcome {
+        let left = output(0, b"hello\n", b"");
+        let right = output(if matches { 0 } else { 1 }, b"hello\n", b"");
+        let (log1, log2) = logs_with_identical_detlog();
+        compare_with(&left, log1, &right, log2, LogCompareStrictness::Canonical).unwrap()
+    }
+
+    fn stage_console(outcome: &VerificationOutcome) -> Vec<u8> {
+        let mut expected = Vec::new();
+        write_verification_announcement(
+            &mut expected,
+            outcome,
+            SecondRun::Rerun,
+            "Success: deterministic. Determinism verified.",
+            "Failure: nondeterministic.",
+        )
+        .unwrap();
+        announce_verification_outcome(
+            outcome,
+            SecondRun::Rerun,
+            "Success: deterministic. Determinism verified.",
+            "Failure: nondeterministic.",
+        )
+        .unwrap();
+        expected
+    }
+
+    #[test]
+    fn deferred_console_exact_bytes_follow_requested_report_publication() {
+        struct ObservePublication<'a> {
+            path: Option<&'a Path>,
+            report: &'a [u8],
+            bytes: Vec<u8>,
+        }
+        impl io::Write for ObservePublication<'_> {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                if let Some(path) = self.path {
+                    assert_eq!(
+                        fs::read(path).unwrap(),
+                        self.report,
+                        "announcement write preceded actual report publication"
+                    );
+                }
+                self.bytes.extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        for requested in [true, false] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("verify.json");
+            let outcome = deferred_console_outcome(true);
+            let report = verification_report(&outcome);
+            let expected_report = format!("{}\n", serde_json::to_string(&report).unwrap());
+            let guard =
+                DeferredVerification::begin_optional(requested.then_some(path.as_path())).unwrap();
+            let pending = requested.then(|| fs::read(&path).unwrap());
+            if requested {
+                write_report_json(&path, &report).unwrap();
+            }
+            let expected = stage_console(&outcome);
+            assert_eq!(
+                guard.state.borrow().announcement.as_ref().unwrap().bytes,
+                expected
+            );
+            if let Some(pending) = pending {
+                assert_eq!(fs::read(&path).unwrap(), pending);
+            }
+            let published = guard.publish(true, true).unwrap();
+            let mut output = ObservePublication {
+                path: requested.then_some(path.as_path()),
+                report: expected_report.as_bytes(),
+                bytes: Vec::new(),
+            };
+            published.emit_to(&mut output, true).unwrap();
+            assert_eq!(output.bytes, expected);
+            assert_eq!(path.exists(), requested);
+        }
+    }
+
+    #[test]
+    fn deferred_console_suppresses_unsettled_late_primary_and_evidence_errors() {
+        for (settled, work_ok, evidence_ok) in [
+            (false, true, true),
+            (false, false, true),
+            (true, false, true),
+            (true, true, false),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("verify.json");
+            let outcome = deferred_console_outcome(true);
+            let guard = DeferredVerification::begin(&path).unwrap();
+            let pending = fs::read(&path).unwrap();
+            write_report_json(&path, &verification_report(&outcome)).unwrap();
+            stage_console(&outcome);
+            let published = guard.publish(settled, work_ok).unwrap();
+            let evidence_error = if evidence_ok {
+                None
+            } else {
+                let evidence_path = directory.path().join("run-evidence");
+                let session = super::super::run_evidence::RunEvidenceSession::create(
+                    &evidence_path,
+                    hermit::Backend::Kvm,
+                )
+                .unwrap();
+                // Exercise the actual no-replace final manifest publication,
+                // including under privileged runners; no permission guess.
+                fs::write(
+                    evidence_path.join(hermit::run_evidence::RUN_EVIDENCE_MANIFEST),
+                    b"occupied manifest\n",
+                )
+                .unwrap();
+                session.finish(Ok(&ExitStatus::Exited(0))).err()
+            };
+            assert_eq!(evidence_error.is_none(), evidence_ok);
+            let mut output = Vec::new();
+            published
+                .emit_to(&mut output, evidence_error.is_none())
+                .unwrap();
+            assert!(
+                output.is_empty(),
+                "settled={settled}, work_ok={work_ok}, evidence_ok={evidence_ok}"
+            );
+            if !settled || !work_ok {
+                assert_eq!(fs::read(&path).unwrap(), pending);
+            } else {
+                // Separate artifacts are not a transaction: the report already
+                // published before a later evidence error suppressed console success.
+                assert!(
+                    VerificationReport::from_current_json_slice(&fs::read(&path).unwrap())
+                        .unwrap()
+                        .verified
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deferred_console_drop_unwind_and_invalid_creator_never_publish() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verify.json");
+        let outcome = deferred_console_outcome(true);
+        {
+            let guard = DeferredVerification::begin(&path).unwrap();
+            write_report_json(&path, &verification_report(&outcome)).unwrap();
+            stage_console(&outcome);
+            assert!(guard.state.borrow().announcement.is_some());
+        }
+        let pending = fs::read(&path).unwrap();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = DeferredVerification::begin(&path).unwrap();
+            write_report_json(&path, &verification_report(&outcome)).unwrap();
+            stage_console(&outcome);
+            panic!("planted verdict staging unwind");
+        }));
+        assert!(panic.is_err());
+        assert_eq!(fs::read(&path).unwrap(), pending);
+        assert!(DEFERRED_REPORT.with(|slot| slot.borrow().is_none()));
+        let guard = DeferredVerification::begin(&path).unwrap();
+        let creator = guard.state.borrow().creator;
+        guard.state.borrow_mut().creator = (-1, -1);
+        assert!(
+            announce_verification_outcome(&outcome, SecondRun::Rerun, "success", "failure")
+                .is_err()
+        );
+        assert!(guard.state.borrow().announcement.is_none());
+        guard.state.borrow_mut().creator = creator;
+        write_report_json(&path, &verification_report(&outcome)).unwrap();
+        stage_console(&outcome);
+        let mut published = guard.publish(true, true).unwrap();
+        published.creator = (-1, -1); // Planted invalid context, not a native fork claim.
+        let mut output = Vec::new();
+        assert!(published.emit_to(&mut output, true).is_err());
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn deferred_console_report_io_failure_has_no_ready_announcement() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verify.json");
+        let saved = directory.path().join("saved-no-result.json");
+        let guard = DeferredVerification::begin(&path).unwrap();
+        let pending = fs::read(&path).unwrap();
+        let outcome = deferred_console_outcome(true);
+        write_report_json(&path, &verification_report(&outcome)).unwrap();
+        stage_console(&outcome);
+        fs::rename(&path, &saved).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(guard.publish(true, true).is_err());
+        assert_eq!(fs::read(&saved).unwrap(), pending);
+        assert!(DEFERRED_REPORT.with(|slot| slot.borrow().is_none()));
+    }
+
+    #[test]
+    fn deferred_console_preserves_failure_text_and_best_effort_stderr() {
+        struct BrokenStderr {
+            writes: usize,
+        }
+        impl io::Write for BrokenStderr {
+            fn write(&mut self, _: &[u8]) -> io::Result<usize> {
+                self.writes += 1;
+                Err(io::Error::from_raw_os_error(libc::EPIPE))
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let outcome = deferred_console_outcome(false);
+        assert_eq!(outcome.verdict, Verdict::Diverged);
+        let guard = DeferredVerification::begin_optional(None).unwrap();
+        let expected = stage_console(&outcome);
+        let mut output = Vec::new();
+        guard
+            .publish(true, false)
+            .unwrap()
+            .emit_to(&mut output, true)
+            .unwrap();
+        assert_eq!(output, expected);
+        let guard = DeferredVerification::begin_optional(None).unwrap();
+        stage_console(&outcome);
+        let mut output = BrokenStderr { writes: 0 };
+        guard
+            .publish(true, false)
+            .unwrap()
+            .emit_to(&mut output, true)
+            .unwrap();
+        assert_eq!(output.writes, 1);
+    }
+
+    #[test]
+    fn native_console_main_waits_for_final_evidence_and_guards_no_json() {
+        let source = include_str!("main.rs");
+        let main = source
+            .split_once("#[fbinit::main]\nfn main() {")
+            .unwrap()
+            .1
+            .split_once("/// Machine-readable classification")
+            .unwrap()
+            .0;
+        let unique = |needle: &str| {
+            assert_eq!(main.matches(needle).count(), 1, "{needle}");
+            main.find(needle).unwrap()
+        };
+        let guard =
+            unique("DeferredVerification::begin_optional(command.verification_json_path())");
+        let run = unique("native_exit::with_early_owner_reporting(");
+        let report = unique("guard.publish(normally_settled.get(), result.is_ok())");
+        let evidence = unique("session.finish(result.as_ref()).err()");
+        let console = unique("published.emit(evidence_error.is_none())");
+        assert!(guard < run && run < report && report < evidence && evidence < console);
     }
 }
