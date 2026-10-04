@@ -103,3 +103,12 @@ fn native_exit_fatal_reporter_panic_retains_primary_factory_and_no_result() {
 fn native_exit_fatal_cleanup_does_not_drop_a_buffered_success_result() {
     lifecycle("native-exit-fatal-success");
 }
+
+#[test]
+fn native_exit_fatal_retention_never_announces_buffered_success() {
+    lifecycle("native-exit-fatal-success-announcement");
+}
+#[test]
+fn native_exit_settled_announcement_follows_publication_with_exact_bytes() {
+    lifecycle("native-exit-settled-announcement");
+}
