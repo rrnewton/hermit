@@ -37,6 +37,7 @@ Run directly (``python3 demos/tests/test_qemu_output_drain.py``) or via
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import io
 import json
 import os
@@ -362,8 +363,18 @@ class Demo5OutputDrainTest(_OutputDrainScenarios, unittest.TestCase):
     function_name = "boot_once"
 
     def replacements(self) -> dict:
-        # Demo 5 records the initramfs it boots before it starts Hermit.
-        (self.assets / "initramfs.cpio.gz").write_bytes(b"stand-in for the initramfs")
+        # Demo 5 records the initramfs it boots before it starts Hermit: it
+        # boots copies of the kernel and initramfs, and records the version
+        # that qemu-assets.sh's build record names for the copy's SHA-256.
+        initramfs = b"stand-in for the initramfs"
+        (self.assets / "initramfs.cpio.gz").write_bytes(initramfs)
+        (self.assets / "bzImage").write_bytes(b"stand-in for the kernel")
+        (self.assets / ".initramfs-build").write_text(
+            "{} {}\n".format(
+                dc.current_initramfs_version(self.namespace["ROOT"]),
+                hashlib.sha256(initramfs).hexdigest(),
+            )
+        )
         return {
             "check_qemu_dependencies": lambda root: "QEMU dependency check replaced by the test",
             "check_dependencies": lambda root: "dependency check replaced by the test",

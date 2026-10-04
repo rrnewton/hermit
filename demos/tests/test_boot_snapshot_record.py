@@ -552,6 +552,32 @@ class Demo5RecordTest(_StandIns):
     def setUpClass(cls):
         cls.demo5 = runpy.run_path(str(DEMOS_DIR / "05-qemu-boot" / "run.py"))
 
+    def setUp(self):
+        super().setUp()
+        (self.assets / "bzImage").write_bytes(b"stand-in for the kernel")
+        # The build record qemu-assets.sh writes after it builds the initramfs.
+        self.build_record = self.assets / ".initramfs-build"
+        self.build_record.write_text("9 {}\n".format(_sha256(INITRAMFS)))
+        # The Hermit command lines boot_once starts.
+        self.commands = []
+
+    def host_file_the_guest_reads(self, command, option: str) -> Path:
+        """The host file behind the guest path ``command`` gives the guest
+        controller after ``option``: the last --bind whose target covers it is
+        the mount the guest sees there."""
+        guest = Path(command[command.index(option) + 1])
+        host = None
+        for index, argument in enumerate(command[: command.index("--")]):
+            if argument != "--bind":
+                continue
+            source, target = command[index + 1].rsplit(":", 1)
+            try:
+                host = Path(source) / guest.relative_to(target)
+            except ValueError:
+                continue
+        self.assertIsNotNone(host, "no --bind covers {}".format(guest))
+        return host
+
     def boot(self, snapshot_disk_override=None, during_boot=None) -> None:
         """Run boot_once with QEMU and Hermit replaced, until it saves metadata.
 
@@ -587,7 +613,8 @@ class Demo5RecordTest(_StandIns):
             "stage_guest_controller": lambda destination: destination,
             "hermit_tmp_args": lambda root: [],
             "subprocess": types.SimpleNamespace(
-                Popen=lambda command, **keywords: mock.Mock(),
+                Popen=lambda command, **keywords: self.commands.append(command)
+                or mock.Mock(),
                 DEVNULL=subprocess.DEVNULL,
                 PIPE=subprocess.PIPE,
                 STDOUT=subprocess.STDOUT,
@@ -643,6 +670,74 @@ class Demo5RecordTest(_StandIns):
         self.assert_record(custom, INITRAMFS)
         dc.verify_boot_snapshot(custom, self.root, self.assets)
         self.assert_record(self.snapshot, INITRAMFS)
+
+    def test_the_record_names_the_bytes_qemu_boots(self):
+        # Another checkout replaces the shared initramfs with its version 8
+        # archive after this boot took its record of the initramfs and before
+        # QEMU reads -initrd, then puts version 9 back before the boot ends.
+        # The record must name the bytes QEMU read.
+        version_8 = b"stand-in for the version 8 initramfs"
+        booted = []
+
+        def replace_the_initramfs_while_qemu_reads_it():
+            self.initramfs.write_bytes(version_8)
+            command = self.commands[-1]
+            booted.append(self.host_file_the_guest_reads(command, "--initrd").read_bytes())
+            self.initramfs.write_bytes(INITRAMFS)
+
+        self.boot(during_boot=replace_the_initramfs_while_qemu_reads_it)
+        record = json.loads(dc.boot_snapshot_record_path(self.snapshot).read_text())
+        self.assertEqual(record["initramfs_sha256"], _sha256(booted[0]))
+        self.assert_record(self.snapshot, INITRAMFS)
+        # The copies QEMU booted are not kept with the run.
+        self.assertEqual(list(self.assets.glob(".work/*/boot-assets")), [])
+
+    def assert_refused_before_the_boot(self, expected: str) -> None:
+        with self.assertRaises(RuntimeError) as caught:
+            self.boot()
+        self.assertIn(expected, str(caught.exception))
+        self.assertEqual(self.commands, [])
+        self.assertFalse(dc.boot_snapshot_record_path(self.snapshot).exists())
+        self.assertEqual(list(self.assets.glob(".work/*/boot-assets")), [])
+
+    def test_a_build_record_of_other_bytes_is_refused_before_the_boot(self):
+        # The shared initramfs was replaced after qemu-assets.sh built it, by
+        # a checkout whose qemu-assets.sh writes no build record.
+        self.initramfs.write_bytes(b"stand-in for an initramfs built elsewhere")
+        self.assert_refused_before_the_boot(
+            "its build record {} says '9 {}'".format(self.build_record, _sha256(INITRAMFS))
+        )
+
+    def test_a_build_record_of_another_version_is_refused_before_the_boot(self):
+        self.build_record.write_text("8 {}\n".format(_sha256(INITRAMFS)))
+        self.assert_refused_before_the_boot(
+            "is not one that demos/lib/qemu-assets.sh built at INITRAMFS_VERSION 9"
+        )
+
+    def test_without_a_build_record_the_boot_is_refused(self):
+        self.build_record.unlink()
+        self.assert_refused_before_the_boot("its build record {} says".format(self.build_record))
+
+    def test_a_snapshot_disk_in_the_asset_directory_keeps_its_guest_path(self):
+        custom = self.assets / "custom-boot.qcow2"
+        seen = {}
+
+        def look_while_the_guest_runs():
+            command = self.commands[-1]
+            seen["disk"] = command[command.index("--disk") + 1]
+            seen["disk host file"] = self.host_file_the_guest_reads(command, "--disk")
+            seen["kernel"] = self.host_file_the_guest_reads(command, "--kernel").read_bytes()
+
+        self.boot(snapshot_disk_override=str(custom), during_boot=look_while_the_guest_runs)
+        self.assertEqual(
+            seen,
+            {
+                "disk": "/tmp/hermit-demo-assets/custom-boot.qcow2",
+                "disk host file": custom,
+                "kernel": b"stand-in for the kernel",
+            },
+        )
+        self.assert_record(custom, INITRAMFS)
 
 
 if __name__ == "__main__":

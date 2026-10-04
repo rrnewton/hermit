@@ -256,6 +256,14 @@ Archived snapshot: ignored/qemu-linux/boot-anchor/boot-snapshot.qcow2
   and the `INITRAMFS_VERSION` and SHA-256 of the initramfs this boot started
   from; demo 6 restores the snapshot only when that record matches the current
   initramfs. A snapshot saved at `QEMU_SNAPSHOT_DISK` gets the same record.
+  The boot runs a copy of the kernel and initramfs made in its working
+  directory, and the SHA-256 recorded is the copy's, so a checkout that
+  rebuilds the shared initramfs during the boot cannot change what the record
+  names. The version recorded is the one that `demos/lib/qemu-assets.sh`
+  names for exactly those bytes in its build record, `.initramfs-build` next
+  to the initramfs (`<INITRAMFS_VERSION> <SHA-256>`, written after each
+  build); when that record names other bytes or another version, the demo
+  stops before booting and asks you to run it again.
 
 ## How it works
 
@@ -289,8 +297,11 @@ them once made two boots write different Hermit logs:
 - The per-run working directory has a random name. It is bound into the guest
   at the fixed path `/tmp/hermit-demo5-run` with `--bind`, and the controller
   is given that path, so the random name never reaches a guest command line.
-- The kernel and initramfs directory is bound at `/tmp/hermit-demo-assets`,
-  and the controller runs from `/tmp/hermit-demo-controller`, a copy of its two
+- The run's copies of the kernel and initramfs are bound at
+  `/tmp/hermit-demo-assets`, the path at which the asset directory itself was
+  bound before (a `QEMU_SNAPSHOT_DISK` in the asset directory is bound at its
+  old path inside it), and the controller runs from
+  `/tmp/hermit-demo-controller`, a copy of its two
   source files made for each run with fixed file modes and modification times.
   Their host paths depend on where the checkout is, and they appear on the
   controller's and QEMU's command lines, whose lengths change how many branches

@@ -35,6 +35,7 @@ TRANSIENT_FILES = (
     ".bzImage.123",
     ".initramfs.cpio.gz.1",
     ".initramfs-version.2",
+    ".initramfs-build.5",
     ".vmlinux.3",
     ".vmlinux-types.4",
 )
@@ -45,6 +46,7 @@ KEPT_ASSET_FILES = (
     "bzImage",
     "initramfs.cpio.gz",
     ".initramfs-version",
+    ".initramfs-build",
     "vmlinux",
     "notes.txt",
 )

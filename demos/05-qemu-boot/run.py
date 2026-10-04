@@ -18,6 +18,7 @@ sys.path.insert(0, str(DEMOS_DIR / "lib"))
 from demo_common import (  # noqa: E402
     archive_result_dir,
     banner,
+    booted_initramfs_producer,
     canonicalize_qcow2_snapshot_timestamp,
     canonicalize_qemu_runtime_path,
     canonicalize_qemu_runtime_paths_in_file,
@@ -33,7 +34,6 @@ from demo_common import (  # noqa: E402
     hermit_binary,
     hermit_log_environment,
     hermit_tmp_args,
-    initramfs_producer,
     load_committed_anchor,
     make_temp_result_dir,
     print_comparison,
@@ -42,6 +42,7 @@ from demo_common import (  # noqa: E402
     publish_file_atomic,
     run_checked,
     save_metadata,
+    stage_boot_assets,
     stage_guest_controller,
     stop_process,
     stop_process_group,
@@ -193,16 +194,21 @@ def boot_once() -> str:
         raise RuntimeError("qemu-system-x86_64 is required")
 
     ASSETS.mkdir(parents=True, exist_ok=True)
-    # The initramfs this boot runs, recorded next to the snapshot it saves so
-    # that demo 6 can tell whether the /init in the snapshot's memory came from
-    # the initramfs that qemu-assets.sh builds now (see verify_boot_snapshot).
-    # Taken before QEMU reads the initramfs.
-    producer = initramfs_producer(ROOT, ASSETS)
     anchor_dir = ASSETS / "boot-anchor"
     # Everything for this run lives in a private working directory so any number
     # of runs can boot QEMU concurrently without sharing sockets, disks, or logs.
     run_dir = make_temp_result_dir(ASSETS, "boot")
     controller_dir = stage_guest_controller(run_dir / "controller")
+    # The kernel and initramfs this boot runs are private copies, bound at
+    # GUEST_ASSETS_DIR in place of the shared asset directory, so the guest
+    # paths QEMU is given do not change. Another checkout may replace the shared
+    # initramfs at any time, so QEMU must not read it: the record next to the
+    # snapshot names the SHA-256 of the copy QEMU boots, and the
+    # INITRAMFS_VERSION that qemu-assets.sh's build record names for exactly
+    # those bytes (booted_initramfs_producer), so demo 6 can tell whether the
+    # /init in the snapshot's memory came from the initramfs that qemu-assets.sh
+    # builds now (see verify_boot_snapshot).
+    boot_assets = run_dir / "boot-assets"
     # Only the guest uses the QMP socket, through GUEST_RUN_DIR, so its path is
     # always short enough for AF_UNIX; the host path is kept for cleanup.
     qmp_socket = run_dir / "qmp.sock"
@@ -218,8 +224,13 @@ def boot_once() -> str:
     )
 
     def guest_path(host_path: Path) -> Path:
-        """The path at which the guest sees a file in run_dir or in ASSETS."""
-        for host_dir, guest_dir in ((run_dir, GUEST_RUN_DIR), (ASSETS, GUEST_ASSETS_DIR)):
+        """The path at which the guest sees a file in boot_assets, run_dir or
+        ASSETS. boot_assets is inside run_dir, so it is matched first."""
+        for host_dir, guest_dir in (
+            (boot_assets, GUEST_ASSETS_DIR),
+            (run_dir, GUEST_RUN_DIR),
+            (ASSETS, GUEST_ASSETS_DIR),
+        ):
             try:
                 return guest_dir / Path(host_path).relative_to(host_dir)
             except ValueError:
@@ -229,6 +240,25 @@ def boot_once() -> str:
     process = None
 
     try:
+        stage_boot_assets(ASSETS, boot_assets)
+        booted_initramfs = boot_assets / "initramfs.cpio.gz"
+        # Refuses, before the boot, a copy that qemu-assets.sh did not build at
+        # the version this checkout builds.
+        producer = booted_initramfs_producer(ROOT, ASSETS, booted_initramfs)
+        # GUEST_ASSETS_DIR now shows boot_assets, so a QEMU_SNAPSHOT_DISK in the
+        # asset directory is bound at the guest path it had when the whole
+        # asset directory was bound there.
+        snapshot_disk_binds = []
+        if snapshot_disk.is_relative_to(ASSETS) and not snapshot_disk.is_relative_to(
+            run_dir
+        ):
+            mount_point = boot_assets / snapshot_disk.relative_to(ASSETS)
+            mount_point.parent.mkdir(parents=True, exist_ok=True)
+            mount_point.touch()
+            snapshot_disk_binds = [
+                "--bind",
+                "{}:{}".format(snapshot_disk, guest_path(snapshot_disk)),
+            ]
         run_checked(
             [
                 "qemu-img",
@@ -251,8 +281,8 @@ def boot_once() -> str:
             guest_path(qmp_socket),
             guest_path(serial_log),
             guest_path(snapshot_disk),
-            guest_path(ASSETS / "bzImage"),
-            guest_path(ASSETS / "initramfs.cpio.gz"),
+            guest_path(boot_assets / "bzImage"),
+            guest_path(booted_initramfs),
             None,
             guest_path(command_image),
         )
@@ -263,7 +293,8 @@ def boot_once() -> str:
             "--bind",
             "{}:{}".format(controller_dir, GUEST_CONTROLLER_DIR),
             "--bind",
-            "{}:{}".format(ASSETS, GUEST_ASSETS_DIR),
+            "{}:{}".format(boot_assets, GUEST_ASSETS_DIR),
+            *snapshot_disk_binds,
             "--bind",
             "{}:{}".format(run_dir, GUEST_RUN_DIR),
             # The guest would otherwise start in the checkout directory.
@@ -294,9 +325,9 @@ def boot_once() -> str:
             "--disk",
             str(guest_path(snapshot_disk)),
             "--kernel",
-            str(guest_path(ASSETS / "bzImage")),
+            str(guest_path(boot_assets / "bzImage")),
             "--initrd",
-            str(guest_path(ASSETS / "initramfs.cpio.gz")),
+            str(guest_path(booted_initramfs)),
             "--command-image",
             str(guest_path(command_image)),
             "--snapshot-name",
@@ -359,6 +390,12 @@ def boot_once() -> str:
                 copier.join(10)
         if return_code != 0:
             raise RuntimeError("Hermit/QEMU exited with status {}".format(return_code))
+        if hash_file(booted_initramfs) != producer["initramfs_sha256"]:
+            raise RuntimeError(
+                "the initramfs copy {} changed during the boot".format(booted_initramfs)
+            )
+        # The copies are not part of the run's results.
+        shutil.rmtree(str(boot_assets))
         if not snapshot_exists(snapshot_disk, SNAPSHOT_NAME):
             raise RuntimeError("snapshot {} was not saved".format(SNAPSHOT_NAME))
         canonicalize_qcow2_snapshot_timestamp(snapshot_disk, SNAPSHOT_NAME)
@@ -475,6 +512,7 @@ def boot_once() -> str:
     finally:
         stop_process(process)
         qmp_socket.unlink(missing_ok=True)
+        shutil.rmtree(str(boot_assets), ignore_errors=True)
 
 
 def main() -> int:
