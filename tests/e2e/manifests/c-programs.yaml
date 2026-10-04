@@ -144,14 +144,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -212,7 +211,6 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
@@ -220,8 +218,8 @@ test:
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -277,14 +275,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -403,14 +400,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -471,7 +467,6 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
@@ -479,8 +474,8 @@ test:
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -536,14 +531,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -612,11 +606,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -672,14 +666,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -739,14 +732,13 @@ test:
           ptrace: true
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -812,9 +804,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -938,9 +930,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
           - dbt
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         expected_stdout:
           ptrace: "dbt-mmap-exec-ok\n"
           dbt: "dbt-mmap-exec-ok\n"
@@ -1070,9 +1062,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -1127,14 +1119,13 @@ test:
           ptrace: true
           dbt: false
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
-          - liteinst
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
       naked:
@@ -1261,15 +1252,14 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           dbt: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - dbt
         backends_disabled:
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         expected_stdout:
           ptrace: "wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n"
           dbt: "wait4=7 waitid=9 sigchld=observed reaped=2 cpu=zero\n"
@@ -1337,12 +1327,10 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         guest_args:
           ptrace:
             - multi
@@ -1354,6 +1342,7 @@ test:
             - multi
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -1418,11 +1407,11 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -1537,14 +1526,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -1605,7 +1593,6 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
         backends_enabled:
@@ -1613,8 +1600,8 @@ test:
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -1670,14 +1657,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -1737,14 +1723,13 @@ test:
           ptrace: true
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -2474,7 +2459,6 @@ test:
           ptrace: true
           dbt: false
           sabre: true
-          liteinst: true
           kvm: true
         ci_disabled_reason:
           dbt: {"result": "infrastructure-error", "evidence": "d77c8d0b145b9ef1ca51f9a29b54214838f922dc and 90e46cba9ad83550205f3c9cd232ae222c6b6173 matched; 94dd9f445ab81607cad10279f3fa5f7f0ada88a0 log-name probe; task dbt-log-retention-hides-a-reproducible-divergence", "reason": "Three retained runs for this cell produced terminal canonical matched verdicts with bitwise parity, but their evidence was rejected because those runs used dbt-run1_log_* and dbt-run2_log_* while the evidence readers accepted run1_log_* and run2_log_*; keep ordinary validation disabled until a run retains both nonempty logs under accepted names."}
@@ -2482,9 +2466,9 @@ test:
           - ptrace
           - dbt
           - sabre
-          - liteinst
           - kvm
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -3761,13 +3745,11 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
           dbt: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
           - dbt
         guest_args:
           ptrace:
@@ -3780,7 +3762,8 @@ test:
             - multiple
           dbt:
             - multiple
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         expected_stdout_contains:
           ptrace: "multiple "
           dbt: "multiple "
@@ -3906,10 +3889,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -3964,10 +3947,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -4022,10 +4005,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -4080,10 +4063,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -4359,14 +4342,13 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -4421,14 +4403,13 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -4483,14 +4464,13 @@ test:
           ptrace: true
           kvm: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
           - sabre
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -4718,16 +4698,15 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify DBT separately
           kvm: pause(2) scheduler interaction is qualified against the ptrace reference first; qualify KVM separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -5817,10 +5796,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -8471,15 +8450,14 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -8534,10 +8512,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -8592,10 +8570,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -8650,10 +8628,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -8708,10 +8686,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -8766,10 +8744,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -8823,7 +8801,6 @@ test:
         ci: true
         backends_enabled:
           - ptrace
-          - liteinst
         guest_args:
           ptrace:
             - v4-us
@@ -8835,6 +8812,7 @@ test:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -8887,17 +8865,15 @@ test:
       verify:
         ci:
           ptrace: false
-          liteinst: false
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
           kvm: Initial C-corpus migration preserves the established ptrace baseline; qualify KVM separately
           sabre: Initial C-corpus migration preserves the established ptrace baseline; qualify SaBRe separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           ptrace: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
-          liteinst: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a crash error; this cell did not pass every repetition cleanly. Retained detail: verify exited with status 125 before producing a terminal comparison", "result": "crash-error"}
       naked:
         ci: false
         backends_enabled: []
@@ -8952,10 +8928,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -9010,10 +8986,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -10413,10 +10389,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -10471,10 +10447,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -10529,10 +10505,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Initial C-corpus migration preserves the established ptrace baseline; qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -10917,17 +10893,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -10985,17 +10960,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11056,16 +11030,15 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: DBT completes the five-step contract but its dedicated adapter publishes typed no_result with no INFO comparison, so it cannot establish L2
           kvm: Current KVM fixture and /bin/true controls time out before guest start on the validation host, so no personality-specific verdict is available
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11125,9 +11098,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11187,9 +11160,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11248,10 +11221,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11311,9 +11284,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11373,10 +11346,10 @@ test:
         backends_enabled:
           - ptrace
           - kvm
-          - liteinst
           - dbt
         backends_disabled:
           sabre: SaBRe does not virtualize CPUID; this oracle requires Hermit's synthetic CPU identity
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         expected_stdout:
           ptrace: "CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n"
           dbt: "CPUID-SUCCESS vendor=GenuineIntel signature=00000663\n"
@@ -11440,9 +11413,9 @@ test:
           - sabre
           # Qualified zero-time syscall 441: https://github.com/rrnewton/reverie/issues/905
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11502,9 +11475,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11564,9 +11537,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11629,11 +11602,11 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11693,9 +11666,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11755,9 +11728,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11817,9 +11790,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11879,9 +11852,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -11941,9 +11914,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12000,18 +11973,15 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: false
-        ci_disabled_reason:
-          liteinst: {"result": "determinism-failure", "evidence": "8f6d8a57d6a8e4ef7fa0ae14c16e2a494a2c0ab5; task ov-backend-ratchet-fanout", "reason": "Exact-head pipe-capacity canonical verification diverged with its first divergence at a /proc/self/maps COMMIT (turn 10), matching three prior LiteInst demotions; durable population evidence measured 20 of 26 LiteInst candidates diverging at that shared startup point and later saw 2 of the 6 apparent PASSx3 survivors fail, so a single matching pair does not qualify this verify population."}
         backends_enabled:
           - ptrace
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify KVM separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12070,10 +12040,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM ElfExecutor returns a deterministic error for the inotify family (inotify_init1), so the filesystem-watch descriptor lifecycle is unavailable
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12133,9 +12103,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12195,9 +12165,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12257,9 +12227,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12319,9 +12289,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12381,9 +12351,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12443,9 +12413,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12505,11 +12475,11 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12567,17 +12537,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12637,9 +12606,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12699,14 +12668,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -12771,9 +12739,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12833,9 +12801,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12895,9 +12863,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -12957,9 +12925,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13018,10 +12986,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
           - dbt
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         expected_stdout:
           ptrace: "pid=3\n"
           dbt: "pid=3\n"
@@ -13084,9 +13052,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13145,10 +13113,10 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM ElfExecutor returns deterministic ENOSYS for prctl PR_SET_PDEATHSIG/PR_GET_PDEATHSIG; ptrace and DBT drive the full parent-death-signal state machine
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13208,9 +13176,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13269,7 +13237,6 @@ test:
           ptrace: true
           sabre: false
           kvm: false
-          liteinst: true
         ci_disabled_reason:
           sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 26, 26, 26.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
           kvm:
@@ -13280,9 +13247,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: Portable release DynamoRIO can stall or exit during native pthread startup before Detcore readiness; this was the one declared DBT gap of the retired backend-parity matrix, and a --probe-disabled run is the way to requalify it
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13342,9 +13309,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13404,9 +13371,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13466,9 +13433,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13528,9 +13495,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13590,9 +13557,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13652,9 +13619,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13714,9 +13681,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: Never measured for this cell; the original .toml cited a missing toolchain on the authoring host, which is not evidence about the backend
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13776,9 +13743,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13838,9 +13805,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13898,17 +13865,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13968,9 +13934,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14030,9 +13996,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14092,9 +14058,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14152,17 +14118,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14222,9 +14187,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: DBT forwards the host uname(2) nodename instead of pinning it; ptrace and KVM determinize the hostname, DBT leaks the real host name
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14284,9 +14249,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14346,9 +14311,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14408,9 +14373,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14470,9 +14435,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14532,9 +14497,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14592,17 +14557,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14662,14 +14626,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -14732,15 +14695,14 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14799,12 +14761,12 @@ test:
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           # The unchanged eight-check zero-time fixture passes strict KVM verify.
           # https://github.com/rrnewton/reverie/issues/620
           - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14865,9 +14827,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14927,14 +14889,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -15002,14 +14963,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -15072,14 +15032,13 @@ test:
         ci:
           ptrace: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           sabre: Not evaluated in the source backend-parity matrix; qualify SaBRe separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15137,15 +15096,14 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15203,15 +15161,14 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15271,9 +15228,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15333,9 +15290,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15395,9 +15352,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15457,9 +15414,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15519,9 +15476,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15581,14 +15538,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -15653,14 +15609,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -15725,14 +15680,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -15797,14 +15751,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -15869,7 +15822,6 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         ci_disabled_reason:
           dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
         backends_enabled:
@@ -15877,8 +15829,8 @@ test:
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15938,7 +15890,6 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "determinism-failure", "evidence": "Published parent series at dev-hermit 90a55d8190dd2551179a9394be3504ee89a6a5a9 retains pressure-test results pass and determinism-failure for Detcore tree 077a5d847f6541daa5ef145536a7065868e9d3ab; first divergent record 80 and syscall 32.", "reason": "Published canonical verification at the same Detcore tree contains both passing and divergent observations. The 20 clean repetitions in this campaign do not erase the retained divergence, so this backend remains excluded pending separate qualification."}
         backends_enabled:
@@ -15946,8 +15897,8 @@ test:
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -16007,14 +15958,13 @@ test:
           dbt: false
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - dbt
           - sabre
           - kvm
-          - liteinst
-        backends_disabled: {}
+        backends_disabled:
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
         ci_disabled_reason:
           dbt:
             result: infrastructure-error
@@ -16080,17 +16030,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -16153,11 +16102,11 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: Canonical DBT verification has not been qualified for this environment-control fixture
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): native Linux exposes the host pipe default, while this fixture asserts Detcore policy.'
@@ -16218,16 +16167,15 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
           kvm: KVM ElfExecutor implements F_SETLK advisory locking but returns a deterministic ENOSYS for F_GETLK lock queries
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -16288,17 +16236,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -16437,17 +16384,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -16508,17 +16454,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -16579,17 +16524,16 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: L1 parity established in the source matrix row; the L2 --verify witness was not recorded, so qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -16647,15 +16591,14 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: Not buildable on the authoring host (cmake absent); qualify DBT separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (by design): a native run necessarily differs from itself here, since unvirtualized st_ino/st_dev come from the real host filesystem and the timestamps are wall-clock, so native is not a discriminating oracle for a contract whose whole claim is that those fields are virtualized.'
@@ -16716,15 +16659,14 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: DBI is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBI separately -- this guest is a PRIORITY for DBI once it builds, since layout divergence is exactly what it detects
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: Native output is IDENTICAL to Hermit''s here (measured), because the probe is relocation-invariant by construction -- so a native run is a useful sanity check but not a discriminating oracle, and gating on it would assert nothing'
@@ -16786,16 +16728,15 @@ test:
         ci:
           ptrace: true
           dbt: false
-          liteinst: true
         ci_disabled_reason:
           dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained an understood infrastructure failure; this cell did not pass every repetition cleanly. Retained detail: verification recorded no comparison at all (verdict=no_result), so there is no canonical INFO evidence to admit", "result": "infrastructure-error"}
         backends_enabled:
           - ptrace
           - dbt
-          - liteinst
         backends_disabled:
           sabre: 'MEASURED HANG 2026-08-06: prints through the sigkill case then never returns from the SIGILL case (killed at 150s). This is the defect the fixture exists to pin; re-enable when SaBRe signal delivery terminates.'
           kvm: Cannot complete a guest on the current host (startup livelock); no wait-status observation exists to compare
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: The native run is the reference this fixture is compared against, not a case it asserts'
@@ -16856,16 +16797,15 @@ test:
         ci:
           ptrace: true
           dbt: false
-          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 492, 366, 374.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - dbt
-          - liteinst
         backends_disabled:
           sabre: 'MEASURED 2026-08-06: does not deliver #UD to a child with no handler installed (child runs past ud2 and exits 99), and then HANGS on the hardware #DE case until the harness timeout. Re-enable when both are fixed.'
           kvm: Cannot complete a guest on the current host (startup livelock); no trap observation exists to compare
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: The native run is the reference this fixture is compared against, not a case it asserts'
@@ -16927,16 +16867,15 @@ test:
           ptrace: true
           dbt: false
           sabre: true
-          liteinst: true
         ci_disabled_reason:
           dbt: {"result": "unavailable", "evidence": "hermit-cli/src/bin/hermit/run.rs:2163", "reason": "DBT exits successfully after both guest executions, but its dedicated path emits no terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without reporting it green."}
         backends_enabled:
           - ptrace
           - dbt
           - sabre
-          - liteinst
         backends_disabled:
           kvm: KVM times out before guest start on the validation host, so no host-identity verdict is available; re-enable when the startup livelock is fixed
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: A native run intentionally FAILS this contract (it sees the real host identity); that is the fixture''s negative control, not a CI cell'
@@ -16998,16 +16937,15 @@ test:
           ptrace: true
           sabre: true
           kvm: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: 'Measured: the guest produces NO stdout and hermit exits 1 under --backend dbi, so the fixture does not complete there. Recorded as an observed gap, not diagnosed by this change'
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       custom:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: No custom edge-case arguments have been calibrated for this C guest'
@@ -17068,16 +17006,15 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
         assert:
           bitwise_parity: true
         backends_disabled:
           dbt: 'Measured: the guest produces NO stdout and the run is killed at 150s under --backend dbi, so the event-delivery legs never complete there. Observed gap, not diagnosed by this change'
           kvm: KVM does not start the guest on the validation host; the existing inotify_watch entry already records that its ElfExecutor personality omits the inotify family
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: Measured stable 5/5 natively on this host, so native repetition is not a nondeterminism contract; the value of this entry is cross-backend, not native-vs-hermit'
@@ -17198,14 +17135,13 @@ test:
       verify:
         ci:
           ptrace: true
-          liteinst: true
         backends_enabled:
           - ptrace
-          - liteinst
         backends_disabled:
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
           kvm: New top-of-funnel coverage is established on the ptrace reference first; KVM ratchets against it separately
           sabre: New top-of-funnel coverage is established on the ptrace reference first; SaBRe ratchets against it separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: This row asserts strict-verify determinism; it does not assert native nondeterminism'
@@ -17263,15 +17199,14 @@ test:
         ci:
           ptrace: true
           sabre: true
-          liteinst: true
           kvm: true
         backends_enabled:
           - ptrace
           - sabre
-          - liteinst
           - kvm
         backends_disabled:
           dbt: New top-of-funnel coverage is established on the ptrace reference first; DBI ratchets against it separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED: This row asserts strict-verify determinism; it does not assert native nondeterminism'
@@ -17393,9 +17328,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: Not yet qualified for this guest; ratchet separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -17455,9 +17390,9 @@ test:
           - ptrace
           - sabre
           - kvm
-          - liteinst
         backends_disabled:
           dbt: Not yet qualified for this guest; ratchet separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []
@@ -17516,7 +17451,6 @@ test:
         backends_enabled:
           - ptrace
           - kvm
-          - liteinst
         guest_args:
           ptrace:
             - --require-small-determinized
@@ -17530,6 +17464,7 @@ test:
         backends_disabled:
           dbt: DBT is not buildable on the current host (third-party-backends feature off; DynamoRIO needs cmake, absent), so no witness could be recorded; qualify DBT separately
           sabre: SaBRe is not buildable on the current host (same third-party-backends gate); qualify SaBRe separately
+          liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
       naked:
         ci: false
         backends_enabled: []

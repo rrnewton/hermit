@@ -34090,10 +34090,13 @@ mod post_verdict_transaction_tests {
         // test red until 63e2e3cb5. This reads the file with its own untyped
         // parse and its own filter, so it shares neither ExpectedPlan's
         // deserializer nor selected_partition's filter with the code under
-        // test. Five is the population since 2be6440ddd6e; the floor keeps an
+        // test. Five was the population from 2be6440ddd6e; four since the
+        // liteinst system-utils/clock-determinism row left the plan when every
+        // liteinst cell was switched off for the in-guest reset
+        // (https://github.com/rrnewton/hermit/issues/3520). The floor keeps an
         // empty or truncated plan from passing vacuously. Lower it only when
         // a custom row is deliberately removed from the plan.
-        const CUSTOM_FLOOR: usize = 5;
+        const CUSTOM_FLOOR: usize = 4;
         let plan: JsonValue = serde_json::from_slice(
             &fs::read(fixture.root.join("ci/expected-e2e-plan.json")).unwrap(),
         )
