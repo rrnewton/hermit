@@ -1519,8 +1519,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // assignment and every later read agree on the same membership.
         let contents = if guest
             .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())
-            .unwrap_or(false)
+            .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mountinfo_identities())?
         {
             crate::procfs::exclude_ephemeral_host_seed_mounts(&raw_contents)
         } else {
@@ -5019,6 +5018,56 @@ mod procfs_wiring_guard {
                  initialize_procfs_snapshot."
             );
         }
+    }
+
+    /// Both mountinfo captures in the snapshot initializer must drop ephemeral
+    /// host seed rows (https://github.com/rrnewton/hermit/pull/3219): the guest
+    /// read's capture, for the files that carry mountinfo identities, and the
+    /// tracer-side capture that validates fdinfo `mnt_id`. Without either, host
+    /// seed churn reaches guest-visible mountinfo or shifts mount-ID assignment,
+    /// and no unit test of the filter itself notices.
+    #[test]
+    fn snapshot_initializer_excludes_host_seed_mounts_at_both_captures() {
+        let body = handler_body("initialize_procfs_snapshot");
+        let calls = body.matches("exclude_ephemeral_host_seed_mounts(").count();
+        assert_eq!(
+            calls, 2,
+            "MISSING MECHANISM: initialize_procfs_snapshot must call \
+             exclude_ephemeral_host_seed_mounts exactly twice (the guest mountinfo \
+             capture and the fdinfo mnt_id capture); found {calls}. Without it, \
+             unrelated host squashfuse seed mounts make /proc/<pid>/mountinfo and \
+             fdinfo mount IDs depend on host timing."
+        );
+        let guest_capture = body
+            .find("exclude_ephemeral_host_seed_mounts(&raw_contents)")
+            .expect(
+                "MISSING MECHANISM: the guest read's procfs capture (`raw_contents`) is \
+                 no longer filtered for host seed mounts",
+            );
+        let gate = body[..guest_capture]
+            .rfind("let contents = if")
+            .map(|start| &body[start..guest_capture])
+            .unwrap_or_default();
+        assert!(
+            gate.contains("procfs_needs_mountinfo_identities()"),
+            "MISSING MECHANISM: the guest capture's seed filter must apply exactly to \
+             the files that carry mountinfo identities (`let contents = if ... \
+             procfs_needs_mountinfo_identities()`); found {gate:?}"
+        );
+        let fdinfo_capture = body
+            .find("exclude_ephemeral_host_seed_mounts(&mountinfo_contents)")
+            .expect(
+                "MISSING MECHANISM: the fdinfo mnt_id capture (`mountinfo_contents`) is \
+                 no longer filtered for host seed mounts",
+            );
+        let parse = body
+            .find("parse_mountinfo(&mountinfo_contents)")
+            .expect("the fdinfo mnt_id capture no longer parses mountinfo_contents");
+        assert!(
+            fdinfo_capture < parse,
+            "MISSING MECHANISM: the fdinfo mnt_id capture parses mountinfo before \
+             dropping host seed rows"
+        );
     }
 
     #[test]
