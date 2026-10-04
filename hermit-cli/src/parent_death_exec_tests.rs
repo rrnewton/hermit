@@ -268,3 +268,127 @@ fn parent_death_exec_non_kvm_wrappers_do_not_query_backend_admission() {
         check_boundary::<Detcore<Replayer>>(number, true, false, false);
     }
 }
+
+fn check_sigtimedwait_boundary<T: Tool<GlobalState = GlobalState>>(
+    call: Syscall,
+    enrolled: bool,
+    kvm: bool,
+    refuse: bool,
+) {
+    let config = Config {
+        backend_is_kvm: kvm,
+        max_timeslice: None,
+        sequentialize_threads: false,
+        syscall_clobbers_virtualized_by_backend: true,
+        replay_data: Some(std::path::PathBuf::from("unused-parent-death-exec-test")),
+        ..Config::default()
+    };
+    let tool = T::new(Pid::from_raw(i32::MAX), &config);
+    let mut guest = BoundaryGuest::<T> {
+        config,
+        original: call,
+        enrolled,
+        allow_prehook_witness: !refuse,
+        effects: std::array::from_fn(|_| AtomicUsize::new(0)),
+        tool: PhantomData,
+    };
+    let mut future = Box::pin(T::handle_syscall_event(&tool, &mut guest, call));
+    let mut context = Context::from_waker(std::task::Waker::noop());
+    let outcome = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        std::future::Future::poll(future.as_mut(), &mut context)
+    }));
+    drop(future);
+    if refuse {
+        let Ok(Poll::Ready(Err(Error::Tool(error)))) = outcome else {
+            panic!("enrolled rt_sigtimedwait did not fail at first admission");
+        };
+        assert_eq!(
+            error.to_string(),
+            "KVM parent-death signal unsupported enrolled rt_sigtimedwait before rt_sigtimedwait"
+        );
+    } else {
+        let Err(witness) = outcome else {
+            panic!("unenrolled or non-KVM signal wait did not reach the existing prehook");
+        };
+        assert!(
+            witness.is::<PrehookReached>(),
+            "unexpected downstream failure"
+        );
+    }
+    assert_eq!(
+        guest
+            .effects
+            .each_ref()
+            .map(|value| value.load(Ordering::SeqCst)),
+        [usize::from(kvm), 0, usize::from(!refuse), 0, 0, 0, 0]
+    );
+}
+
+fn check_sigtimedwait_forms<T: Tool<GlobalState = GlobalState>>(
+    enrolled: bool,
+    kvm: bool,
+    refuse: bool,
+) {
+    // Fully initialized, aligned output bytes let us check the entire buffer
+    // without reading padding in a Rust siginfo_t value.
+    #[repr(align(16))]
+    struct InfoBytes([u8; std::mem::size_of::<libc::siginfo_t>()]);
+    assert!(std::mem::align_of::<InfoBytes>() >= std::mem::align_of::<libc::siginfo_t>());
+    let mut info = InfoBytes([0xa5; std::mem::size_of::<libc::siginfo_t>()]);
+    let mut mask = 1_u64 << (libc::SIGUSR1 - 1);
+    let mut zero = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut nonzero = libc::timespec {
+        tv_sec: 1,
+        tv_nsec: 0,
+    };
+    let mut invalid = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 1_000_000_000,
+    };
+    let mask_pointer = (&mut mask as *mut u64) as usize;
+    let info_pointer = info.0.as_mut_ptr() as usize;
+    let zero_pointer = (&mut zero as *mut libc::timespec) as usize;
+    let nonzero_pointer = (&mut nonzero as *mut libc::timespec) as usize;
+    let invalid_pointer = (&mut invalid as *mut libc::timespec) as usize;
+    for (set, output, timeout) in [
+        (mask_pointer, info_pointer, zero_pointer),
+        (mask_pointer, info_pointer, nonzero_pointer),
+        (mask_pointer, info_pointer, invalid_pointer),
+        (mask_pointer, info_pointer, 0),
+        (mask_pointer, info_pointer, 1),
+        (1, info_pointer, zero_pointer),
+        (mask_pointer, 1, zero_pointer),
+    ] {
+        let call = Syscall::from_raw(
+            Sysno::rt_sigtimedwait,
+            SyscallArgs::new(set, output, timeout, std::mem::size_of::<u64>(), 0, 0),
+        );
+        check_sigtimedwait_boundary::<T>(call, enrolled, kvm, refuse);
+        assert_eq!(info.0, [0xa5; std::mem::size_of::<libc::siginfo_t>()]);
+        assert_eq!(mask, 1_u64 << (libc::SIGUSR1 - 1));
+        assert_eq!((zero.tv_sec, zero.tv_nsec), (0, 0));
+        assert_eq!((nonzero.tv_sec, nonzero.tv_nsec), (1, 0));
+        assert_eq!((invalid.tv_sec, invalid.tv_nsec), (0, 1_000_000_000));
+    }
+}
+
+#[test]
+fn parent_death_sigtimedwait_refuses_all_subtools_before_prehook_or_memory() {
+    check_sigtimedwait_forms::<Detcore>(true, true, true);
+    check_sigtimedwait_forms::<Detcore<Recorder>>(true, true, true);
+    check_sigtimedwait_forms::<Detcore<Replayer>>(true, true, true);
+    check_sigtimedwait_forms::<Detcore<UnknownWrapper>>(true, true, true);
+}
+
+#[test]
+fn parent_death_sigtimedwait_unenrolled_and_non_kvm_reach_existing_prehook() {
+    for (enrolled, kvm) in [(false, true), (true, false)] {
+        check_sigtimedwait_forms::<Detcore>(enrolled, kvm, false);
+        check_sigtimedwait_forms::<Detcore<Recorder>>(enrolled, kvm, false);
+        check_sigtimedwait_forms::<Detcore<Replayer>>(enrolled, kvm, false);
+        check_sigtimedwait_forms::<Detcore<UnknownWrapper>>(enrolled, kvm, false);
+    }
+}
