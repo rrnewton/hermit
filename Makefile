@@ -183,6 +183,7 @@ lint-parent-checks: ## The lint checker that needs the dev-hermit parent (CI nod
 lint-checks: ## The lint checkers CI schedules as one node (everything in `lint` except the two cargo passes)
 	./scripts/check-skill-discovery.rs
 	./scripts/check-github-actions-triggers.rs
+	./scripts/docs-pages-contract.rs
 	./scripts/test-pre-push-submodule-diagnosis.sh
 	./scripts/test-required-check-outcomes.sh
 	./scripts/test-check-status-outcome.sh

@@ -113,6 +113,7 @@ fn is_checker_path(path: &str) -> bool {
 const CHECKER_PATHS: &[&str] = &[
     "ci/hermetic/check-image-provenance.rs",
     "scripts/bisect-probe.rs",
+    "scripts/docs-pages-contract.rs",
 ];
 
 /// Directory/prefix pairs that identify a checker entrypoint by convention.
@@ -1373,6 +1374,11 @@ fn self_test() {
     assert!(
         is_checker_path("ci/hermetic/check-image-provenance.rs"),
         "the nested hermetic image-provenance gate must stay in the checker population"
+    );
+    assert!(
+        is_checker_path("scripts/docs-pages-contract.rs"),
+        "the docs Pages contract is run only by `make lint-checks`; dropping it from the \
+         population would let that line be deleted with nothing going red"
     );
     // ⚠️ AND THE LIMIT, MEASURED RATHER THAN ASSUMED. Widening the population to every
     // tracked executable under scripts/ and ci/ was measured 2026-08-26 at 32 checkers
