@@ -250,8 +250,88 @@ impl<T> CustodyTasks<T> {
     pub(in crate::network_runtime) fn lose_sole_foreground_lineage(&mut self) {
         self.sole_initial_root_lost.store(true, Ordering::Release);
     }
-    /// Called from the real state-ready observation after the same FD metadata
-    /// was authenticated. Does not issue for a noninitial or partial census.
+    /// Represent an authenticated shared child before its first scheduler turn.
+    /// This inherits physical lineage, not the engine's local metadata-ready
+    /// permission. The actual state-ready callback still checks its own Arcs.
+    pub(super) fn bind_inherited_shared_foreground(
+        &mut self,
+        birth: &super::super::native_birth::NativeBirthAdmission,
+    ) -> std::io::Result<bool> {
+        let raw = birth.raw();
+        if raw.shared_mm != 1
+            || raw.shared_files != 1
+            || raw.same_thread_group != 1
+            || birth
+                .actual_flags()
+                .contains(reverie::syscalls::CloneFlags::CLONE_VFORK)
+        {
+            return Ok(false);
+        }
+        // An already issued root follows the original idempotent metadata
+        // validation, including a child whose creator has since terminated.
+        if self
+            .task_mut(birth.child_owner())?
+            .foreground_root
+            .is_some()
+        {
+            return Ok(false);
+        }
+        let parent_owner = birth.permit().owner;
+        let Some(parent_task) = self.tasks.get(&parent_owner.thread) else {
+            return Ok(false);
+        };
+        let Some(parent) = parent_task.foreground_root.clone() else {
+            return Ok(false);
+        };
+        // Native birth custody also supports creator-final-before-construction.
+        // An unavailable live creator declines this early association only; it
+        // must not reject that broader retained birth or manufacture a root.
+        if self.foreground_lineage_lost
+            || parent_task.retired
+            || parent_task.mm != parent_owner.mm
+            || !parent.is_current(parent_owner)
+            || !parent.has_shared_mm_history()
+        {
+            return Ok(false);
+        }
+        let bad = || std::io::Error::other("shared birth changed authenticated parent lineage");
+        if birth.terminal()
+            || parent_task.process != parent.process()
+            || parent_task.thread != parent.thread()
+            || parent.files() != birth.permit().files
+            || birth.child_owner().mm != parent_owner.mm
+            || birth.child_process() != parent.logical_process()
+            || (
+                raw.provider,
+                raw.creator_task,
+                raw.creator_start,
+                raw.creator_table,
+            ) != parent.native_identity()
+            || raw.child_table != raw.creator_table
+        {
+            return Err(bad());
+        }
+        let metadata = parent.metadata()?;
+        let memory = parent.memory()?;
+        let child = self.task_mut(birth.child_owner())?;
+        if child.native_birth.as_ref() != Some(birth)
+            || child.process != parent.process()
+            || child
+                .foreground_metadata
+                .as_ref()
+                .is_some_and(|(files, mm)| {
+                    !files.ptr_eq(&Arc::downgrade(&metadata))
+                        || !mm.ptr_eq(&Arc::downgrade(&memory))
+                })
+        {
+            return Err(bad());
+        }
+        self.bind_foreground_metadata(birth.child_owner(), &metadata, &memory)?;
+        Ok(true)
+    }
+    /// Bind the actual state-ready objects, or the same objects inherited from
+    /// an authenticated shared birth. Neither path grants engine readiness.
+    /// Does not issue for a noninitial or partial census.
     pub(in crate::network_runtime) fn bind_foreground_metadata(
         &mut self,
         owner: NetworkStreamOwner,

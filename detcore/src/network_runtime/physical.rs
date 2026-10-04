@@ -740,6 +740,13 @@ impl<T> CustodyTasks<T> {
             ));
         }
         task.native_birth = Some(birth.clone());
+        // Retain the original birth even if the lineage association refuses.
+        // ParentContinue may run before the child's state-ready callback.
+        let _ = task;
+        if self.bind_inherited_shared_foreground(birth)? {
+            return Ok(());
+        }
+        let task = self.task_mut(birth.child_owner())?;
         if let Some((metadata, memory)) = &task.foreground_metadata
             && let (Some(metadata), Some(memory)) = (metadata.upgrade(), memory.upgrade())
         {

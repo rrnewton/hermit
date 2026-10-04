@@ -394,12 +394,17 @@ async fn observer_case(nr: Sysno, mutation: Option<u8>) {
         .lock()
         .unwrap()
         .insert(child.owner().thread, child.owner().mm);
-    tool.on_thread_state_ready(
-        Tid::from_raw(child.owner().thread.as_raw()),
-        &state,
-        &child_thread,
-    )
-    .unwrap();
+    assert!(
+        state
+            .network_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .fd_metadata(child.owner(), child.files())
+            .is_err(),
+        "inherited physical lineage must not mark the child reader ready"
+    );
     tool.on_injected_syscall_observed(
         tid,
         &state,
@@ -432,6 +437,25 @@ async fn observer_case(nr: Sysno, mutation: Option<u8>) {
         })
         .unwrap();
     drop(scheduler);
+    // The parent's complete physical census above precedes the actual child
+    // state-ready callback, exactly as with a parent-first scheduler choice.
+    tool.on_thread_state_ready(
+        Tid::from_raw(child.owner().thread.as_raw()),
+        &state,
+        &child_thread,
+    )
+    .unwrap();
+    assert!(
+        state
+            .network_engine
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .fd_metadata(child.owner(), child.files())
+            .is_ok(),
+        "only the actual state-ready callback grants child reader permission"
+    );
     assert!(!parent.is_sole_initial_root(parent.owner()));
     // An unbound second invocation remains a sticky full revocation.
     tool.on_injected_syscall_observed(

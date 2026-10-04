@@ -35,6 +35,30 @@ pub(crate) struct SharedBirthFixture {
     _peer: BirthPeer,
 }
 
+#[derive(Clone, Copy)]
+enum BirthMutation {
+    None,
+    Provider,
+    CreatorTask,
+    CreatorStart,
+    NonThread,
+    CopiedMm,
+    Vfork,
+    Terminal,
+}
+struct BirthOptions {
+    wire: ProviderWireFormat,
+    mutation: BirthMutation,
+}
+impl From<ProviderWireFormat> for BirthOptions {
+    fn from(wire: ProviderWireFormat) -> Self {
+        Self {
+            wire,
+            mutation: BirthMutation::None,
+        }
+    }
+}
+
 struct BirthPeer {
     owner: NetworkRuntimeOwner,
     peer: AcceptedSession,
@@ -203,6 +227,48 @@ impl SharedBirthFixture {
         ) -> Option<NetworkRuntimeResources>,
         wire: ProviderWireFormat,
     ) -> Option<Self> {
+        Self::new_with_retention_observer(
+            thread,
+            syscall,
+            setup,
+            before,
+            observe,
+            wire,
+            |runtime, _, birth, pin| {
+                runtime.retain_native_child(birth, pin).unwrap();
+                true
+            },
+        )
+        .await
+    }
+    async fn new_with_retention_observer(
+        thread: i32,
+        syscall: Option<i32>,
+        setup: impl FnOnce(
+            &Arc<ForegroundRoot>,
+            &InitialTableClaim,
+        ) -> Option<NetworkFdPublicationPermit>,
+        before: impl FnOnce(
+            &NetworkRuntimeResources,
+            &Arc<ForegroundRoot>,
+            &crate::network_runtime::JoinedNativePrefix,
+        ),
+        observe: impl FnOnce(
+            NetworkRuntimeResources,
+            &Arc<ForegroundRoot>,
+            NetworkFdPublicationPermit,
+        ) -> Option<NetworkRuntimeResources>,
+        options: impl Into<BirthOptions>,
+        retain: impl FnOnce(
+            &NetworkRuntimeResources,
+            &Arc<ForegroundRoot>,
+            &NativeBirthAdmission,
+            std::os::fd::BorrowedFd<'_>,
+        ) -> bool,
+    ) -> Option<Self> {
+        let options = options.into();
+        let wire = options.wire;
+        let terminal = matches!(options.mutation, BirthMutation::Terminal);
         let mut pair = [-1; 2];
         assert_eq!(
             unsafe {
@@ -276,10 +342,20 @@ impl SharedBirthFixture {
             lease: NetworkStreamLeaseId::controlled_fixture(184),
         });
         let child_thread = DetTid::from_raw(thread.checked_add(1).unwrap());
-        let flags = CloneFlags::CLONE_VM
+        let mut flags = CloneFlags::CLONE_VM
             | CloneFlags::CLONE_FILES
             | CloneFlags::CLONE_SIGHAND
             | CloneFlags::CLONE_THREAD;
+        match options.mutation {
+            BirthMutation::NonThread => flags.remove(CloneFlags::CLONE_THREAD),
+            BirthMutation::CopiedMm => {
+                flags.remove(
+                    CloneFlags::CLONE_THREAD | CloneFlags::CLONE_SIGHAND | CloneFlags::CLONE_VM,
+                );
+            }
+            BirthMutation::Vfork => flags.insert(CloneFlags::CLONE_VFORK),
+            _ => {}
+        }
         let command = permit.native_command_call() + 17;
         let prepared_request = if let Some(syscall) = syscall {
             let prepare = runtime.prepare_native_birth(permit, syscall);
@@ -322,18 +398,20 @@ impl SharedBirthFixture {
             child_thread,
             parent_owner.thread,
             pin.as_fd(),
-            false,
+            terminal,
             flags,
         );
         let respond = async {
             let (sequence, request) = peer.receive().await;
             assert!(matches!(request, Request::ObserveNativeBirth {
-                call, command: actual, prepared_request: original, child, terminal: false }
-                if call == permit.native_command_call() && actual == command
+                call, command: actual, prepared_request: original, child, terminal: observed_terminal }
+                if observed_terminal == terminal && call == permit.native_command_call() && actual == command
                 && original == prepared_request && child == child_thread.as_raw()));
             let (provider, creator_task, creator_start) =
                 parent.association().native_root().unwrap();
-            let raw = crate::network_runtime::accepted_provider_ffi::NativeBirth {
+            let same_group = flags.contains(CloneFlags::CLONE_THREAD);
+            let raw_child = (creator_task as u32 + 1) as u64;
+            let mut raw = crate::network_runtime::accepted_provider_ffi::NativeBirth {
                 command,
                 call: permit.native_command_call(),
                 owner_mm: parent_owner.mm.generation(),
@@ -341,21 +419,31 @@ impl SharedBirthFixture {
                 creator_task,
                 creator_start,
                 creator_table: parent.association().table(),
-                child_task: (creator_task & !0xffff_ffff) | ((creator_task as u32 + 1) as u64),
+                child_task: if same_group {
+                    (creator_task & !0xffff_ffff) | raw_child
+                } else {
+                    (raw_child << 32) | raw_child
+                },
                 child_start: creator_start + 1,
                 child_table: parent.association().table(),
                 parent_task: creator_task,
                 parent_start: creator_start,
                 kernel_flags: flags.bits(),
-                shared_mm: 1,
+                shared_mm: u32::from(flags.contains(CloneFlags::CLONE_VM)),
                 shared_files: 1,
-                same_thread_group: 1,
+                same_thread_group: u32::from(same_group),
                 exit_signal: -1,
                 requested_exit_signal: 0,
                 ready: 1,
                 pidfd_fd: -1,
                 ..Default::default()
             };
+            match options.mutation {
+                BirthMutation::Provider => raw.provider += 1,
+                BirthMutation::CreatorTask => raw.creator_task ^= 2,
+                BirthMutation::CreatorStart => raw.creator_start += 1,
+                _ => {}
+            }
             peer.reply(
                 sequence,
                 Reply::NativeBirth(Observation {
@@ -370,7 +458,9 @@ impl SharedBirthFixture {
         .await
         .expect("bounded child observation");
         let birth = birth.unwrap();
-        runtime.retain_native_child(&birth, pin.as_fd()).unwrap();
+        if !retain(&runtime, &parent, &birth, pin.as_fd()) {
+            return None;
+        }
         runtime
             .bind_foreground_metadata(birth.child_owner(), &metadata, &memory)
             .unwrap();
@@ -670,4 +760,254 @@ async fn shared_attempt_history_replacement_and_generic_revoke_are_sticky() {
         assert!(!f.child.has_shared_mm_history());
         assert!(tasks.shared_foreground_lineage(f.parent.owner()).is_err());
     }
+}
+
+// The existing fixture used to bind child metadata before exposing its census.
+// This boundary preserves actual retained birth but deliberately withholds the
+// state-ready observation, as when ParentContinue chooses the parent first.
+#[tokio::test]
+async fn shared_birth_retention_completes_parent_census_before_child_ready() {
+    let f = SharedBirthFixture::new_with_retention_observer(
+        61,
+        Some(libc::SYS_clone3 as i32),
+        |_, _| None,
+        |_, _, _| {},
+        |runtime, _, _| Some(runtime),
+        ProviderWireFormat::Abi7Copy4,
+        |runtime, parent, birth, pin| {
+            runtime.retain_native_child(birth, pin).unwrap();
+            let observed = runtime.with_shared_foreground_lineage(parent.owner(), |lineage| {
+                assert_eq!(lineage.members().count(), 2);
+                let child = lineage
+                    .members()
+                    .find(|root| root.owner() == birth.child_owner())
+                    .expect("actual retained child belongs to the complete census");
+                assert!(child.same_memory_authority(parent));
+                assert!(!child.has_sole_initial_root_history());
+                assert!(!parent.has_sole_initial_root_history());
+                Ok(())
+            });
+            assert!(
+                observed.is_ok(),
+                "authenticated shared birth must complete parent census before child ready: {observed:?}"
+            );
+            true
+        },
+    )
+    .await
+    .unwrap();
+    assert!(f.parent.same_memory_authority(&f.child));
+}
+
+#[tokio::test]
+async fn inherited_birth_rejects_current_creator_identity_changes_without_losing_birth() {
+    for mutation in [
+        BirthMutation::Provider,
+        BirthMutation::CreatorTask,
+        BirthMutation::CreatorStart,
+    ] {
+        let result = SharedBirthFixture::new_with_retention_observer(
+            61,
+            Some(libc::SYS_clone3 as i32),
+            |_, _| None,
+            |_, _, _| {},
+            |runtime, _, _| Some(runtime),
+            BirthOptions {
+                wire: ProviderWireFormat::Abi7Copy4,
+                mutation,
+            },
+            |runtime, parent, birth, pin| {
+                assert!(runtime.retain_native_child(birth, pin).is_err());
+                let tasks = runtime.shared.physical.lock().unwrap();
+                assert_eq!(tasks.native_birth(birth.child_owner()).unwrap(), *birth);
+                assert!(tasks.foreground_root(birth.child_owner()).is_err());
+                assert!(tasks.shared_foreground_lineage(parent.owner()).is_err());
+                false
+            },
+        )
+        .await;
+        assert!(result.is_none());
+    }
+}
+
+#[tokio::test]
+async fn inherited_birth_keeps_unsupported_and_terminal_admission_without_issuing_shared_root() {
+    for mutation in [
+        BirthMutation::NonThread,
+        BirthMutation::CopiedMm,
+        BirthMutation::Vfork,
+        BirthMutation::Terminal,
+    ] {
+        let result = SharedBirthFixture::new_with_retention_observer(
+            61,
+            Some(libc::SYS_clone3 as i32),
+            |_, _| None,
+            |_, _, _| {},
+            |runtime, _, _| Some(runtime),
+            BirthOptions {
+                wire: ProviderWireFormat::Abi7Copy4,
+                mutation,
+            },
+            |runtime, _, birth, pin| {
+                runtime.retain_native_child(birth, pin).unwrap();
+                let tasks = runtime.shared.physical.lock().unwrap();
+                assert!(tasks.foreground_root(birth.child_owner()).is_err());
+                if birth.terminal() {
+                    assert!(tasks.get(birth.child_owner()).is_err());
+                } else {
+                    assert_eq!(tasks.native_birth(birth.child_owner()).unwrap(), *birth);
+                }
+                false
+            },
+        )
+        .await;
+        assert!(result.is_none());
+    }
+}
+
+#[tokio::test]
+async fn inherited_birth_does_not_overwrite_metadata_first_fd_or_mm_identity() {
+    for wrong_memory in [false, true] {
+        let result = SharedBirthFixture::new_with_retention_observer(
+            61,
+            Some(libc::SYS_clone3 as i32),
+            |_, _| None,
+            |_, _, _| {},
+            |runtime, _, _| Some(runtime),
+            ProviderWireFormat::Abi7Copy4,
+            |runtime, parent, birth, pin| {
+                let original_files = parent.metadata().unwrap();
+                let original_mm = parent.memory().unwrap();
+                let files = if wrong_memory {
+                    original_files.clone()
+                } else {
+                    Arc::new(Mutex::new(
+                        original_files
+                            .lock()
+                            .unwrap()
+                            .fork_for(birth.child_owner().thread),
+                    ))
+                };
+                let memory = if wrong_memory {
+                    Arc::new(Mutex::new(original_mm.lock().unwrap().clone()))
+                } else {
+                    original_mm.clone()
+                };
+                {
+                    let mut tasks = runtime.shared.physical.lock().unwrap();
+                    tasks
+                        .register(
+                            birth.child_owner(),
+                            birth.child_process().as_raw(),
+                            birth.child_owner().thread.as_raw(),
+                            || pin.try_clone_to_owned(),
+                        )
+                        .unwrap();
+                }
+                runtime
+                    .bind_foreground_metadata(birth.child_owner(), &files, &memory)
+                    .unwrap();
+                assert!(runtime.retain_native_child(birth, pin).is_err());
+                let tasks = runtime.shared.physical.lock().unwrap();
+                assert_eq!(tasks.native_birth(birth.child_owner()).unwrap(), *birth);
+                assert!(tasks.foreground_root(birth.child_owner()).is_err());
+                let (kept_files, kept_mm) = tasks.tasks[&birth.child_owner().thread]
+                    .foreground_metadata
+                    .as_ref()
+                    .unwrap();
+                assert!(kept_files.ptr_eq(&Arc::downgrade(&files)));
+                assert!(kept_mm.ptr_eq(&Arc::downgrade(&memory)));
+                false
+            },
+        )
+        .await;
+        assert!(result.is_none());
+    }
+}
+
+#[tokio::test]
+async fn inherited_birth_declines_early_root_after_creator_terminal_revoke_or_replacement() {
+    for transition in 0..3 {
+        let result = SharedBirthFixture::new_with_retention_observer(
+            61,
+            Some(libc::SYS_clone3 as i32),
+            |_, _| None,
+            |_, _, _| {},
+            |runtime, _, _| Some(runtime),
+            ProviderWireFormat::Abi7Copy4,
+            |runtime, parent, birth, pin| {
+                {
+                    let mut tasks = runtime.shared.physical.lock().unwrap();
+                    match transition {
+                        0 => tasks.close_native_preparations(parent.owner()).unwrap(),
+                        1 => tasks.revoke_foreground_lineage(),
+                        2 => tasks
+                            .register(
+                                NetworkStreamOwner {
+                                    mm: parent.owner().mm.for_exec(parent.logical_process()),
+                                    ..parent.owner()
+                                },
+                                parent.process(),
+                                parent.thread(),
+                                || pin.try_clone_to_owned(),
+                            )
+                            .unwrap(),
+                        _ => unreachable!(),
+                    }
+                }
+                runtime.retain_native_child(birth, pin).unwrap();
+                let tasks = runtime.shared.physical.lock().unwrap();
+                assert_eq!(tasks.native_birth(birth.child_owner()).unwrap(), *birth);
+                assert!(tasks.foreground_root(birth.child_owner()).is_err());
+                assert!(tasks.shared_foreground_lineage(parent.owner()).is_err());
+                false
+            },
+        )
+        .await;
+        assert!(result.is_none());
+    }
+}
+
+#[tokio::test]
+async fn inherited_birth_ready_rechecks_arcs_and_identical_retention_survives_creator_exit() {
+    let f = SharedBirthFixture::new(61).await;
+    let wrong_files = Arc::new(Mutex::new(
+        f.metadata.lock().unwrap().fork_for(f.child.owner().thread),
+    ));
+    let wrong_memory = Arc::new(Mutex::new(f.memory.lock().unwrap().clone()));
+    assert!(
+        f.runtime
+            .bind_foreground_metadata(f.child.owner(), &wrong_files, &f.memory)
+            .is_err()
+    );
+    assert!(
+        f.runtime
+            .bind_foreground_metadata(f.child.owner(), &f.metadata, &wrong_memory)
+            .is_err()
+    );
+    f.runtime
+        .bind_foreground_metadata(f.child.owner(), &f.metadata, &f.memory)
+        .unwrap();
+    let pin: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+    f.runtime
+        .retain_native_child(&f._birth, pin.as_fd())
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &f.child,
+        &f.runtime.foreground_root(f.child.owner()).unwrap()
+    ));
+    f.runtime
+        .shared
+        .physical
+        .lock()
+        .unwrap()
+        .close_native_preparations(f.parent.owner())
+        .unwrap();
+    f.runtime
+        .retain_native_child(&f._birth, pin.as_fd())
+        .unwrap();
+    assert!(Arc::ptr_eq(
+        &f.child,
+        &f.runtime.foreground_root(f.child.owner()).unwrap()
+    ));
 }
