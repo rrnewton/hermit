@@ -22,6 +22,7 @@ use serde_json::Value;
 
 mod accepted_abi11;
 mod accepted_failed;
+mod accepted_failed_abi12;
 mod accepted_only;
 mod original;
 #[cfg(test)]
@@ -280,6 +281,7 @@ impl ResourceRecoveryContext {
             || accepted_only::resolve(self, root, label).is_ok()
             || accepted_failed::resolve(self, root, label).is_ok()
             || accepted_abi11::resolve(self, root, label).is_ok()
+            || accepted_failed_abi12::resolve(self, root, label).is_ok()
     }
     pub(crate) fn unix_resolved(
         &self,
