@@ -421,10 +421,10 @@ impl Scheduler {
         if !self.rpc_incarnation_matches(tid, origin.mm) {
             return Err(ProtocolFailure::Identity);
         }
+        // A control site exists only when the Reverie backend returned one, so
+        // the site itself is the capability. `validate_site` still refuses a
+        // site whose process and task were never bound to the real-timer table.
         if let Some(site) = origin.control.site() {
-            if !self.kvm_shared_dequeue_timers || !self.backend_is_kvm {
-                return Err(ProtocolFailure::Unsupported);
-            }
             let pid = *self
                 .thread_tree
                 .thread_to_leader

@@ -198,9 +198,9 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if !guest.config().kvm_shared_dequeue_timers {
-        return resource_request(guest, resources).await;
-    }
+    // Reverie decides whether this callback is a controlled parked site. A
+    // backend without signal control, or one whose Tool did not opt into
+    // signal dequeues, answers `None`, so no backend identity is checked here.
     let Some(site) = guest.parked_signal_site() else {
         // The unmodeled callback keeps its existing ordinary completion.
         // Process publication does not invent an interruption for this site.
@@ -225,8 +225,9 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if guest.config().kvm_shared_dequeue_timers
-        && resources.poll_attempt > 0
+    // As in `parked_wait_request`, the Reverie query alone decides whether
+    // this read has a controlled site.
+    if resources.poll_attempt > 0
         && let Some(site) = guest.polled_read_signal_site(call)
     {
         return capable_resource_request(guest, resources, ControlCapability::PolledRead { site })
