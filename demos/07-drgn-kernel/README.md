@@ -18,11 +18,15 @@ the same task lists and the same difference between them.
   (`<snapshot>.producer.json`) names that snapshot and the initramfs that
   `demos/lib/qemu-assets.sh` builds now, the same check demo 6 makes. That the
   snapshot exists is not enough. If the default snapshot is missing or has no
-  such record, this demo runs demo 5 to build it again. If demo 5 then exits
-  non-zero, as it can after an initramfs change because its own reference run
-  no longer applies, the rebuilt snapshot is used, with a note, only when its
-  record matches; otherwise the demo asks you to run `demos/clean.sh` and then
-  this demo again. A snapshot named by
+  such record, this demo runs demo 5 to build it again. If the snapshot was
+  missing and demo 5 exits non-zero, this demo stops with demo 5's failure,
+  even if demo 5 saved a snapshot first. If a snapshot was there but had no
+  such record, demo 5 can exit non-zero after it has saved a current snapshot,
+  because after an initramfs change its own reference run no longer applies
+  either. In that case only, this demo checks demo 5's record instead of its
+  exit status: it uses the rebuilt snapshot, with a note, when the record
+  matches, and otherwise asks you to run `demos/clean.sh` and then this demo
+  again. A snapshot named by
   `DEMO07_SNAPSHOT_DISK` is never rebuilt: without a matching record the demo
   stops and says how to rebuild it. Each pass checks its own copy of the
   snapshot against the record again before QEMU restores it.
