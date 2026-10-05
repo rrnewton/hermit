@@ -1013,7 +1013,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // selected CLI identities (`cargo nextest list --profile ci` measured +3).
     // Its two other CLI tests are #[ignore]d: they need the in-guest runtime
     // library, which this selection does not build.
-    ("test.cli", 123),
+    ("test.cli", 125),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -1071,7 +1071,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // prior identities retained.
     // The three https://github.com/rrnewton/hermit/pull/3635 in-guest LiteInst
     // refusal tests, as in test.cli; all 120 prior identities retained.
-    ("test.cli_on_host", 123),
+    ("test.cli_on_host", 125),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
