@@ -19,6 +19,7 @@ mod io;
 mod memory;
 mod misc;
 mod namespace;
+mod network_trace;
 pub(crate) mod robust_list;
 mod signal;
 pub(crate) mod socket_timestamp_ioctl;

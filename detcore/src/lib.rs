@@ -2140,6 +2140,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // A generic pre-dispatch snapshot would become stale across pipe waits.
         let mut rng_readv_output = None;
         let res = match classify_syscall(call.number()) {
+            // Outbound TCP channels under a network trace mode; never with no mode.
+            _ if self.network_trace_owns(guest, &call) => {
+                self.handle_network_trace_syscall(guest, call).await
+            }
             // Rseq is not type-safe in the pinned Reverie revision. Dispatch by Sysno so a
             // future typed representation preserves this explicit policy.
             SyscallClassification::Determinized if call.number() == Sysno::rseq => {

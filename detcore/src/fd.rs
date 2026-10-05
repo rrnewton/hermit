@@ -173,6 +173,14 @@ struct OpenFileDescription {
     /// True when this socket connected to an IPv4 or IPv6 loopback peer.
     #[serde(default)]
     loopback_peer: bool,
+    /// True when this socket is a channel of the external network trace, so
+    /// its traffic is recorded or replayed (see `crate::syscalls::network_trace`).
+    #[serde(default)]
+    network_channel: bool,
+    /// The socket's `SO_RCVLOWAT` while a network trace mode is active, or
+    /// `None` for the default of one byte.
+    #[serde(default)]
+    network_lowat: Option<usize>,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
     /// The `flock(2)` mode this open file description currently holds, as the
@@ -254,6 +262,8 @@ impl DetFd {
                 sock_diag: false,
                 netlink_route: false,
                 loopback_peer: false,
+                network_channel: false,
+                network_lowat: None,
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
@@ -729,6 +739,26 @@ impl DetFd {
     /// Whether this open file is a socket connected to a loopback peer.
     pub(crate) fn is_loopback_peer(&self) -> bool {
         self.description().loopback_peer
+    }
+
+    /// Mark this open file as an external network trace channel.
+    pub(crate) fn set_network_channel(&self) {
+        self.description().network_channel = true;
+    }
+
+    /// Whether this open file is an external network trace channel.
+    pub(crate) fn is_network_channel(&self) -> bool {
+        self.description().network_channel
+    }
+
+    /// Record the socket's `SO_RCVLOWAT`.
+    pub(crate) fn set_network_lowat(&self, lowat: usize) {
+        self.description().network_lowat = Some(lowat);
+    }
+
+    /// The socket's `SO_RCVLOWAT`.
+    pub(crate) fn network_lowat(&self) -> usize {
+        self.description().network_lowat.unwrap_or(1)
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

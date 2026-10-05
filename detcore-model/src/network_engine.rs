@@ -36,6 +36,8 @@ use std::fmt;
 
 use chrono::DateTime;
 use chrono::Utc;
+use serde::Deserialize;
+use serde::Serialize;
 
 use crate::fd::OpenFileId;
 use crate::network_trace::NetworkAddressV1;
@@ -51,7 +53,7 @@ use crate::network_trace::NetworkTransportV1;
 use crate::time::LogicalTime;
 
 /// Something the recorder pulled from a host socket.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkArrival {
     Bytes(Vec<u8>),
     /// The peer shut down its write side (the host `recv` returned 0).
@@ -61,7 +63,7 @@ pub enum NetworkArrival {
 }
 
 /// What a guest receive observes.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkRecvOutcome {
     Data(Vec<u8>),
     /// End of stream: `recv` returns 0.
@@ -74,7 +76,7 @@ pub enum NetworkRecvOutcome {
 
 /// A failure that ends the run: the guest asked for something the recording
 /// cannot answer, or that this version does not model.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkEngineError {
     /// The operation needs a different mode (for example a replay-only call
     /// during record).
@@ -145,6 +147,68 @@ impl fmt::Display for NetworkEngineError {
 
 impl Error for NetworkEngineError {}
 
+/// One engine operation, carried from a guest thread to the global state.
+///
+/// Every request that observes inbound state carries the arrivals the
+/// recorder pulled from the host just before it, so that one round trip
+/// both records the pull and answers the guest at the same global time.
+/// Replay sends no arrivals.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkRequest {
+    /// See [`NetworkEngine::record_connect`].
+    RecordConnect {
+        id: OpenFileId,
+        peer: NetworkAddressV1,
+        local: Option<NetworkAddressV1>,
+        errno: i32,
+        nonblocking: bool,
+    },
+    /// See [`NetworkEngine::replay_connect`].
+    ReplayConnect {
+        id: OpenFileId,
+        peer: NetworkAddressV1,
+        nonblocking: bool,
+    },
+    /// See [`NetworkEngine::recv`].
+    Recv {
+        id: OpenFileId,
+        arrivals: Vec<NetworkArrival>,
+        max_len: usize,
+        target: usize,
+        peek: bool,
+    },
+    /// The readiness of each channel given its `SO_RCVLOWAT`; see
+    /// [`NetworkEngine::readiness`].
+    Readiness(Vec<(OpenFileId, usize, Vec<NetworkArrival>)>),
+    /// See [`NetworkEngine::take_error`].
+    TakeError(OpenFileId),
+    /// See [`NetworkEngine::send_failure`].
+    SendFailure(OpenFileId),
+    /// See [`NetworkEngine::record_send`].
+    RecordSend { id: OpenFileId, bytes: Vec<u8> },
+    /// See [`NetworkEngine::replay_send`].
+    ReplaySend { id: OpenFileId, bytes: Vec<u8> },
+    /// See [`NetworkEngine::shutdown`].
+    Shutdown { id: OpenFileId, how: i32 },
+    /// See [`NetworkEngine::addresses`].
+    Addresses(OpenFileId),
+}
+
+/// The answer to a [`NetworkRequest`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum NetworkReply {
+    /// `0` or a positive errno.
+    Errno(i32),
+    /// A positive errno, or `None` for success.
+    Failure(Option<i32>),
+    Recv(NetworkRecvOutcome),
+    /// Poll events, one per requested channel.
+    Events(Vec<i16>),
+    Sent(usize),
+    /// Local (if connected) and peer address, or `None` for an unknown channel.
+    Addresses(Option<(Option<NetworkAddressV1>, NetworkAddressV1)>),
+}
+
 #[derive(Debug)]
 enum Mode {
     Record {
@@ -173,7 +237,6 @@ struct Channel {
     pending_error: Option<i32>,
     /// Bytes the guest has transmitted.
     tx: u64,
-    lowat: usize,
     shut_rd: bool,
     shut_wr: bool,
     /// Replay: inputs not yet released, in order.
@@ -192,7 +255,6 @@ impl Channel {
             rx_end: 0,
             peer_closed: false,
             tx: 0,
-            lowat: 1,
             shut_rd: false,
             shut_wr: false,
             pending_inputs: VecDeque::new(),
@@ -476,11 +538,13 @@ impl NetworkEngine {
     }
 
     /// The `poll` events `id` reports at global time `now`, before masking
-    /// with the requested events. Mirrors Linux `tcp_poll`.
+    /// with the requested events. Mirrors Linux `tcp_poll`; `lowat` is the
+    /// socket's `SO_RCVLOWAT`, which the guest may set before it connects.
     pub fn readiness(
         &mut self,
         id: OpenFileId,
         now: LogicalTime,
+        lowat: usize,
     ) -> Result<i16, NetworkEngineError> {
         let channel = self.channel(id)?;
         channel.release(now);
@@ -492,7 +556,7 @@ impl NetworkEngine {
         }
         if rcv_shutdown {
             events |= libc::POLLIN | libc::POLLRDNORM | libc::POLLRDHUP;
-        } else if channel.rx.len() >= channel.lowat {
+        } else if channel.rx.len() >= lowat.max(1) {
             events |= libc::POLLIN | libc::POLLRDNORM;
         }
         // Linux reports a socket shut down for writing as writable, so that
@@ -586,13 +650,6 @@ impl NetworkEngine {
         Ok(len)
     }
 
-    /// Apply `setsockopt(SO_RCVLOWAT)`, with Linux's normalisation.
-    pub fn set_lowat(&mut self, id: OpenFileId, lowat: i32) -> Result<(), NetworkEngineError> {
-        let lowat = if lowat < 0 { i32::MAX } else { lowat.max(1) };
-        self.channel(id)?.lowat = lowat as usize;
-        Ok(())
-    }
-
     /// Apply `shutdown(how)`; returns `0` or the errno the guest sees.
     pub fn shutdown(&mut self, id: OpenFileId, how: i32) -> Result<i32, NetworkEngineError> {
         let channel = self.channel(id)?;
@@ -609,6 +666,77 @@ impl NetworkEngine {
             _ => return Ok(libc::EINVAL),
         }
         Ok(0)
+    }
+
+    /// Record pulled arrivals at `now`. Pulls that follow the end of the
+    /// stream are dropped: a drained host socket keeps reporting it.
+    fn record_arrivals(
+        &mut self,
+        id: OpenFileId,
+        now: LogicalTime,
+        arrivals: Vec<NetworkArrival>,
+    ) -> Result<(), NetworkEngineError> {
+        for arrival in arrivals {
+            if !self.needs_pull(id) {
+                break;
+            }
+            self.record_arrival(id, now, arrival)?;
+        }
+        Ok(())
+    }
+
+    /// Perform `request` at global time `now`.
+    pub fn apply(
+        &mut self,
+        now: LogicalTime,
+        request: NetworkRequest,
+    ) -> Result<NetworkReply, NetworkEngineError> {
+        Ok(match request {
+            NetworkRequest::RecordConnect {
+                id,
+                peer,
+                local,
+                errno,
+                nonblocking,
+            } => NetworkReply::Errno(self.record_connect(id, peer, local, errno, nonblocking)?),
+            NetworkRequest::ReplayConnect {
+                id,
+                peer,
+                nonblocking,
+            } => NetworkReply::Errno(self.replay_connect(id, &peer, nonblocking)?),
+            NetworkRequest::Recv {
+                id,
+                arrivals,
+                max_len,
+                target,
+                peek,
+            } => {
+                self.record_arrivals(id, now, arrivals)?;
+                NetworkReply::Recv(self.recv(id, now, max_len, target, peek)?)
+            }
+            NetworkRequest::Readiness(channels) => {
+                let mut events = Vec::with_capacity(channels.len());
+                for (id, lowat, arrivals) in channels {
+                    self.record_arrivals(id, now, arrivals)?;
+                    events.push(self.readiness(id, now, lowat)?);
+                }
+                NetworkReply::Events(events)
+            }
+            NetworkRequest::TakeError(id) => NetworkReply::Errno(self.take_error(id)?),
+            NetworkRequest::SendFailure(id) => NetworkReply::Failure(self.send_failure(id)?),
+            NetworkRequest::RecordSend { id, bytes } => {
+                self.record_send(id, &bytes)?;
+                NetworkReply::Sent(bytes.len())
+            }
+            NetworkRequest::ReplaySend { id, bytes } => {
+                NetworkReply::Sent(self.replay_send(id, &bytes)?)
+            }
+            NetworkRequest::Shutdown { id, how } => NetworkReply::Errno(self.shutdown(id, how)?),
+            NetworkRequest::Addresses(id) => NetworkReply::Addresses(
+                self.addresses(id)
+                    .map(|(local, peer)| (local.cloned(), peer.clone())),
+            ),
+        })
     }
 
     /// The trace of a record run. Fails if the run was a replay or the
@@ -775,12 +903,11 @@ mod tests {
         engine
             .record_connect(id, peer(), local(), 0, false)
             .unwrap();
-        engine.set_lowat(id, 3).unwrap();
         engine
             .record_arrival(id, at(1), NetworkArrival::Bytes(b"ab".to_vec()))
             .unwrap();
         assert_eq!(
-            engine.readiness(id, at(1)),
+            engine.readiness(id, at(1), 3),
             Ok(libc::POLLOUT | libc::POLLWRNORM)
         );
         assert_eq!(
@@ -792,7 +919,7 @@ mod tests {
             .record_arrival(id, at(2), NetworkArrival::Bytes(b"cd".to_vec()))
             .unwrap();
         assert_eq!(
-            engine.readiness(id, at(2)),
+            engine.readiness(id, at(2), 3),
             Ok(libc::POLLIN | libc::POLLRDNORM | libc::POLLOUT | libc::POLLWRNORM)
         );
         assert_eq!(engine.recv(id, at(2), 3, 3, false), Ok(data(b"abc")));
@@ -802,7 +929,7 @@ mod tests {
             .unwrap();
         assert_eq!(engine.recv(id, at(3), 3, 3, false), Ok(data(b"d")));
         assert_eq!(
-            engine.readiness(id, at(3)),
+            engine.readiness(id, at(3), 3),
             Ok(libc::POLLIN
                 | libc::POLLRDNORM
                 | libc::POLLRDHUP
@@ -828,7 +955,7 @@ mod tests {
             engine.record_arrival(id, at(2), NetworkArrival::PeerWriteClosed),
             Err(NetworkEngineError::InvalidArrival(id))
         );
-        let readiness = engine.readiness(id, at(1)).unwrap();
+        let readiness = engine.readiness(id, at(1), 1).unwrap();
         assert_eq!(readiness & libc::POLLERR, libc::POLLERR);
         assert_eq!(readiness & libc::POLLHUP, libc::POLLHUP);
         assert_eq!(engine.recv(id, at(1), 64, 64, false), Ok(data(b"x")));
@@ -867,7 +994,7 @@ mod tests {
             engine.replay_connect(sock(1), &peer(), true),
             Ok(libc::EINPROGRESS)
         );
-        let readiness = engine.readiness(sock(1), at(1)).unwrap();
+        let readiness = engine.readiness(sock(1), at(1), 1).unwrap();
         assert_eq!(
             readiness & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP),
             libc::POLLOUT | libc::POLLERR | libc::POLLHUP
@@ -957,9 +1084,60 @@ mod tests {
             Ok(NetworkRecvOutcome::Eof)
         );
         assert_eq!(
-            engine.readiness(id, at(1)).unwrap() & libc::POLLHUP,
+            engine.readiness(id, at(1), 1).unwrap() & libc::POLLHUP,
             libc::POLLHUP
         );
+    }
+
+    #[test]
+    fn requests_record_pulls_at_the_time_they_answer() {
+        let mut engine = NetworkEngine::new_record(epoch());
+        let id = sock(0);
+        let reply = engine.apply(
+            at(1),
+            NetworkRequest::RecordConnect {
+                id,
+                peer: peer(),
+                local: local(),
+                errno: 0,
+                nonblocking: false,
+            },
+        );
+        assert_eq!(reply, Ok(NetworkReply::Errno(0)));
+        let reply = engine.apply(
+            at(5),
+            NetworkRequest::Readiness(vec![(id, 1, vec![NetworkArrival::Bytes(b"hi".to_vec())])]),
+        );
+        assert_eq!(
+            reply,
+            Ok(NetworkReply::Events(vec![
+                libc::POLLIN | libc::POLLRDNORM | libc::POLLOUT | libc::POLLWRNORM
+            ]))
+        );
+        // A drained host socket keeps reporting end of stream; only the
+        // first report is recorded.
+        let reply = engine.apply(
+            at(9),
+            NetworkRequest::Recv {
+                id,
+                arrivals: vec![
+                    NetworkArrival::PeerWriteClosed,
+                    NetworkArrival::PeerWriteClosed,
+                ],
+                max_len: 64,
+                target: 1,
+                peek: false,
+            },
+        );
+        assert_eq!(reply, Ok(NetworkReply::Recv(data(b"hi"))));
+        assert_eq!(
+            engine.apply(at(9), NetworkRequest::Addresses(id)),
+            Ok(NetworkReply::Addresses(Some((local(), peer()))))
+        );
+        let trace = engine.finish().unwrap();
+        assert_eq!(trace.inputs.len(), 2);
+        assert_eq!(trace.inputs[0].release.not_before_global_time, at(5));
+        assert_eq!(trace.inputs[1].release.not_before_global_time, at(9));
     }
 
     #[test]

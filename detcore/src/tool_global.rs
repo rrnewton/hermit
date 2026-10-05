@@ -35,6 +35,12 @@ use std::time::SystemTime;
 use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
+use detcore_model::network_engine::NetworkEngine;
+use detcore_model::network_engine::NetworkEngineError;
+use detcore_model::network_engine::NetworkReply;
+use detcore_model::network_engine::NetworkRequest;
+use detcore_model::network_trace::NetworkTraceMode;
+use detcore_model::network_trace::NetworkTraceV2;
 use detcore_model::procfs::mount_ids_are_ordered_subset;
 use detcore_model::summary::RunSummary;
 use detcore_model::summary::TimesliceStats;
@@ -571,6 +577,11 @@ pub struct GlobalState {
 
     /// The start is when we construct the global state.  Close enough.
     realtime_start: SystemTime,
+
+    /// External network record or replay state, present only when a network
+    /// trace mode is configured. Every operation reads global time under this
+    /// lock, so an input's release point is fixed by the schedule alone.
+    network: Option<Mutex<NetworkEngine>>,
 }
 
 impl Default for GlobalState {
@@ -644,6 +655,7 @@ impl GlobalState {
             .as_ref()
             .map(|path| PreemptionReader::new(path));
         let range = Self::read_port_range();
+        let network = Self::network_engine(cfg).map(Mutex::new);
 
         let unsupported_syscall_report_fd = cfg.unsupported_syscall_report_fd.and_then(|fd| {
             // This writer is internal controller state. In an in-process DBT
@@ -696,6 +708,58 @@ impl GlobalState {
             realtime_start: SystemTime::now(),
             global_time,
             preemptions_to_replay,
+            network,
+        }
+    }
+
+    /// The network engine for the configured trace mode. The CLI validates a
+    /// replay trace before launch; failing here is a backstop.
+    fn network_engine(cfg: &Config) -> Option<NetworkEngine> {
+        let path = cfg.network_trace.path.as_ref();
+        match cfg.network_trace.mode {
+            NetworkTraceMode::Off => None,
+            NetworkTraceMode::Record => Some(NetworkEngine::new_record(cfg.epoch)),
+            NetworkTraceMode::Replay => {
+                let path = path.expect("network trace replay requires a trace path");
+                let trace = File::open(path)
+                    .map_err(|error| error.to_string())
+                    .and_then(|mut file| {
+                        NetworkTraceV2::read_framed(&mut file).map_err(|error| error.to_string())
+                    })
+                    .unwrap_or_else(|error| {
+                        panic!("cannot read network trace {}: {error}", path.display())
+                    });
+                Some(NetworkEngine::new_replay(trace))
+            }
+        }
+    }
+
+    /// Write the network trace of a record run.
+    fn finish_network_trace(&mut self) {
+        let Some(engine) = self.network.take() else {
+            return;
+        };
+        let engine = engine.into_inner().unwrap();
+        if !engine.is_record() {
+            return;
+        }
+        let path = self
+            .cfg
+            .network_trace
+            .path
+            .as_ref()
+            .expect("network trace recording requires a trace path");
+        let result = engine
+            .finish()
+            .map_err(|error| error.to_string())
+            .and_then(|trace| {
+                let mut file = File::create(path).map_err(|error| error.to_string())?;
+                trace
+                    .write_framed(&mut file)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = result {
+            panic!("cannot write network trace {}: {error}", path.display());
         }
     }
 
@@ -877,6 +941,7 @@ impl GlobalState {
             handle.await.expect("Global scheduler clean shutdown");
             debug!("Global state cleanup, continuing...");
         }
+        self.finish_network_trace();
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
@@ -1802,6 +1867,17 @@ impl GlobalTool for GlobalState {
             GlobalRequest::UnrecoverableShutdown => {
                 self.force_shutdown_with_error();
                 R::UnrecoverableShutdown(())
+            }
+            GlobalRequest::Network(request) => {
+                let _sched = self.lock_rpc_scheduler(false).await;
+                let mut engine = self
+                    .network
+                    .as_ref()
+                    .expect("network request without a network trace mode")
+                    .lock()
+                    .unwrap();
+                let now = self.global_time.lock().unwrap().as_nanos();
+                R::Network(engine.apply(now, request))
             }
             GlobalRequest::RequestPort(open_file_id) => {
                 let _sched = self.lock_rpc_scheduler(false).await;
@@ -3170,6 +3246,8 @@ pub enum GlobalRequest {
     /// Deliver robust-futex wakes collected before exit after the backend has
     /// confirmed that Linux's physical task cleanup completed.
     RobustListWakes(Vec<(DetTid, FutexID)>),
+    /// One external network record or replay operation.
+    Network(NetworkRequest),
 }
 
 /// Responses from the global object
@@ -3244,6 +3322,7 @@ pub enum GlobalResponse {
     ReleasePort(Option<u16>),
     PortFull,
     RobustListWakes(Vec<u64>),
+    Network(Result<NetworkReply, NetworkEngineError>),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED

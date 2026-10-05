@@ -757,8 +757,8 @@ fn read_exact_or_truncated<R: Read>(
     })
 }
 
-/// Semantically invalid v1 trace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// Semantically invalid trace.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkTraceValidationError {
     ChannelCount(usize),
     EpochOutOfRange,
