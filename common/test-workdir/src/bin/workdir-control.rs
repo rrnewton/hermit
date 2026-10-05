@@ -18,7 +18,10 @@ use std::sync::Barrier;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 
+use hermit_test_workdir::BindMount;
+use hermit_test_workdir::Isolation;
 use hermit_test_workdir::with_isolated_workdir;
+use hermit_test_workdir::with_isolation;
 
 fn namespace() -> File {
     File::open("/proc/thread-self/ns/mnt").unwrap()
@@ -62,6 +65,120 @@ fn check_entry(barrier: Option<&Barrier>, transport: &std::path::Path) -> File {
     let worker_inode = std::thread::spawn(|| inode(&namespace())).join().unwrap();
     assert_eq!(worker_inode, inode(&current_namespace));
     current_namespace
+}
+
+fn statfs_type(path: &str) -> i64 {
+    let directory = File::open(path).unwrap();
+    let mut filesystem = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    assert_eq!(
+        unsafe { libc::fstatfs(directory.as_raw_fd(), filesystem.as_mut_ptr()) },
+        0
+    );
+    unsafe { filesystem.assume_init() }.f_type
+}
+
+/// One physical run with binds: a private, otherwise empty tmpfs /tmp holding
+/// the preserved path and the binds, whose sources sit below the original /tmp.
+fn check_binds() -> io::Result<()> {
+    let pid = std::process::id();
+    let source = std::path::PathBuf::from(format!("/tmp/hermit-workdir-control-src-{pid}"));
+    let file_source = std::path::PathBuf::from(format!("/tmp/hermit-workdir-control-file-{pid}"));
+    let keep = std::path::PathBuf::from(format!("/tmp/hermit-workdir-control-keep-{pid}"));
+    let scratch = std::path::PathBuf::from(format!("/tmp/hermit-workdir-control-scratch-{pid}"));
+    // Removed however the check ends, including a setup refusal or a panic.
+    struct Cleanup(Vec<std::path::PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_dir_all(path).or_else(|_| std::fs::remove_file(path));
+            }
+        }
+    }
+    let _cleanup = Cleanup(vec![source.clone(), file_source.clone(), keep.clone()]);
+    std::fs::create_dir(&source)?;
+    std::fs::write(source.join("input"), b"bound input")?;
+    std::fs::write(&file_source, b"bound file")?;
+    std::fs::create_dir(&keep)?;
+    std::fs::write(keep.join("records"), b"preserved")?;
+    let parent_tmp = statfs_type("/tmp");
+    let isolation = Isolation {
+        test_workdir: false,
+        binds: vec![
+            BindMount {
+                source: source.clone(),
+                target: "/tmp/e2e/bound".into(),
+            },
+            BindMount {
+                source: file_source.clone(),
+                target: "/tmp/e2e/file".into(),
+            },
+        ],
+        preserve: vec![keep.clone()],
+    };
+    let (first, second) = (
+        with_isolation(&isolation, || {
+            assert_eq!(statfs_type("/tmp"), libc::TMPFS_MAGIC);
+            let mut names = std::fs::read_dir("/tmp")
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+                .collect::<Vec<_>>();
+            names.sort();
+            let mut expected = vec![
+                "e2e".to_string(),
+                keep.file_name().unwrap().to_str().unwrap().into(),
+            ];
+            expected.sort();
+            assert_eq!(
+                names, expected,
+                "the private /tmp holds only the binds and the preserved path"
+            );
+            assert_eq!(
+                std::fs::read("/tmp/e2e/bound/input").unwrap(),
+                b"bound input"
+            );
+            assert_eq!(std::fs::read("/tmp/e2e/file").unwrap(), b"bound file");
+            assert_eq!(std::fs::read(keep.join("records")).unwrap(), b"preserved");
+            std::fs::write("/tmp/e2e/bound/output", b"written in the run").unwrap();
+            std::fs::write(&scratch, b"private").unwrap();
+            namespace()
+        })?,
+        with_isolation(&isolation, || {
+            assert!(
+                !scratch.exists(),
+                "a second physical run starts with a fresh /tmp"
+            );
+            namespace()
+        })?,
+    );
+    assert_ne!(inode(&first), inode(&second));
+    assert_eq!(statfs_type("/tmp"), parent_tmp, "parent /tmp was replaced");
+    assert_eq!(
+        std::fs::read(source.join("output"))?,
+        b"written in the run",
+        "a write through the bind reaches the host source"
+    );
+    assert!(
+        !scratch.exists(),
+        "a file made in the private /tmp leaked to the parent"
+    );
+    let launched = AtomicBool::new(false);
+    let missing = Isolation {
+        binds: vec![BindMount {
+            source: format!("/tmp/hermit-workdir-control-missing-{pid}").into(),
+            target: "/tmp/e2e/bound".into(),
+        }],
+        ..Isolation::default()
+    };
+    let error = with_isolation(&missing, || launched.store(true, Ordering::SeqCst)).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::NotFound, "{error}");
+    assert!(
+        !launched.load(Ordering::SeqCst),
+        "a missing source launched the callback"
+    );
+    println!(
+        "two runs with binds have private fresh tmpfs /tmp holding only the binds and the preserved path; sources below the original /tmp are reachable; writes reach the source; a missing source fails before launch"
+    );
+    Ok(())
 }
 
 fn main() -> io::Result<()> {
@@ -167,6 +284,7 @@ fn main() -> io::Result<()> {
                 "two sequential and two concurrent runs have private empty tmpfs; parent and sibling filesystems stay unchanged; workers inherit the private namespace; callback error and panic remain failures"
             );
         }
+        [command] if command == "binds" => check_binds()?,
         [command, kind] if command == "expect-setup-error" => {
             let expected = match kind.as_str() {
                 "permission-denied" => io::ErrorKind::PermissionDenied,
@@ -191,7 +309,7 @@ fn main() -> io::Result<()> {
         _ => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "usage: workdir-control check | expect-setup-error permission-denied|not-found",
+                "usage: workdir-control check | binds | expect-setup-error permission-denied|not-found",
             ));
         }
     }

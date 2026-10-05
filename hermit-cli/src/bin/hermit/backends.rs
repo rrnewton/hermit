@@ -250,7 +250,7 @@ fn finalize_dbt_verification(
 /// runner has reaped the whole isolated process group before reading it.
 #[cfg(feature = "dbt")]
 struct DbtStatsCapture {
-    _directory: tempfile::TempDir,
+    directory: tempfile::TempDir,
     path: PathBuf,
 }
 
@@ -266,10 +266,7 @@ impl DbtStatsCapture {
                 ))
             })?;
         let path = directory.path().join("records.bin");
-        Ok(Self {
-            _directory: directory,
-            path,
-        })
+        Ok(Self { directory, path })
     }
 
     fn configure(&self, runner: DbtRunner) -> DbtRunner {
@@ -914,6 +911,7 @@ pub(super) fn run_dbt(
     config: &Config,
     mut environment: BTreeMap<OsString, OsString>,
     workdir: Option<&Path>,
+    binds: Vec<(PathBuf, PathBuf)>,
     verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     if let Some(path) = verify_json.filter(|_| verify) {
@@ -945,11 +943,26 @@ pub(super) fn run_dbt(
 
     let marker = std::env::var_os(hermit_test_workdir::REQUEST_ENV);
     let isolated_workdir = hermit_test_workdir::requested_workdir(marker.as_deref())?;
-    if isolated_workdir.is_some() && workdir != isolated_workdir {
+    let binds = binds
+        .into_iter()
+        .map(|(source, target)| hermit_test_workdir::BindMount { source, target })
+        .collect::<Vec<_>>();
+    // A bound workdir is as fresh as the bind source the caller made for this
+    // run, which is how the other backends get theirs.
+    let workdir_is_bound =
+        workdir.is_some_and(|workdir| binds.iter().any(|bind| workdir.starts_with(&bind.target)));
+    if isolated_workdir.is_some() && workdir != isolated_workdir && !workdir_is_bound {
         return Err(Error::msg(
-            "HERMIT_E2E_EMPTY_WORKDIR=/test requires --workdir=/test for DBT",
+            "HERMIT_E2E_EMPTY_WORKDIR=/test requires --workdir=/test, or a --workdir inside a \
+             --bind target, for DBT",
         ));
     }
+    let isolation = hermit_test_workdir::Isolation {
+        test_workdir: isolated_workdir.is_some() && workdir == isolated_workdir,
+        binds,
+        preserve: Vec::new(),
+    };
+    let execution = DbtExecution::new(isolation)?;
     let stdin_is_terminal = std::io::stdin().is_terminal();
 
     let (drrun, client) = detcore_dbt::prepare_native_client().map_err(|error| {
@@ -958,7 +971,7 @@ pub(super) fn run_dbt(
         ))
     })?;
     let single_run_stats = (!verify && (summary || backend_engagement_json.is_some()))
-        .then(DbtStatsCapture::new)
+        .then(|| execution.stats_capture())
         .transpose()?;
     let mut runner = DbtRunner::new(&drrun, &client)
         .map_err(|error| {
@@ -992,8 +1005,6 @@ pub(super) fn run_dbt(
     apply_exact_environment(&mut guest, &environment);
     guest.args(args);
     apply_dbt_workdir(&mut guest, workdir);
-
-    let execution = DbtExecution::new(isolated_workdir)?;
 
     if !verify {
         if stdin_is_terminal {
@@ -1046,7 +1057,7 @@ pub(super) fn run_dbt(
     let (log2_file, log2_path) = log2.into_parts();
     let evidence_level = dbt_evidence_log_level(log, verify_verbose);
     let mut evidence1 = tempfile::tempfile()?;
-    let stats1 = DbtStatsCapture::new()?;
+    let stats1 = execution.stats_capture()?;
     let runner1 = stats1
         .configure(runner.clone())
         .evidence_file(&evidence1)
@@ -1057,7 +1068,7 @@ pub(super) fn run_dbt(
         })?
         .evidence_log_level(evidence_level);
     let mut evidence2 = tempfile::tempfile()?;
-    let stats2 = DbtStatsCapture::new()?;
+    let stats2 = execution.stats_capture()?;
     let runner2 = stats2
         .configure(runner)
         .evidence_file(&evidence2)
@@ -1343,28 +1354,50 @@ pub(super) fn run_dbt(
     _config: &Config,
     _environment: BTreeMap<OsString, OsString>,
     _workdir: Option<&Path>,
+    _binds: Vec<(std::path::PathBuf, std::path::PathBuf)>,
     _verification_stdin: Option<std::fs::File>,
 ) -> Result<ExitStatus, Error> {
     Err(Error::msg("DBT support was not included in this build"))
 }
 
-/// Ordinary runs share the existing coordinator runtime. Marked runs create
-/// all coordinator workers inside a new mount namespace for each physical run.
+/// Ordinary runs share the existing coordinator runtime. Marked runs, and runs
+/// with binds, create all coordinator workers inside a new mount namespace for
+/// each physical run.
 #[cfg(feature = "dbt")]
 struct DbtExecution {
     runtime: Option<tokio::runtime::Runtime>,
+    isolation: Option<std::sync::Mutex<hermit_test_workdir::Isolation>>,
 }
 
 #[cfg(feature = "dbt")]
 impl DbtExecution {
-    fn new(workdir: Option<&Path>) -> Result<Self, Error> {
-        Ok(Self {
-            runtime: if workdir.is_some() {
-                None
-            } else {
-                Some(Self::new_runtime()?)
-            },
+    fn new(isolation: hermit_test_workdir::Isolation) -> Result<Self, Error> {
+        Ok(if isolation.is_empty() {
+            Self {
+                runtime: Some(Self::new_runtime()?),
+                isolation: None,
+            }
+        } else {
+            Self {
+                runtime: None,
+                isolation: Some(std::sync::Mutex::new(isolation)),
+            }
         })
+    }
+
+    /// A statistics sink the client can still write once binds replace /tmp:
+    /// its directory is made before the run, below the original /tmp, so the
+    /// namespace re-binds it at the same path.
+    fn stats_capture(&self) -> Result<DbtStatsCapture, Error> {
+        let capture = DbtStatsCapture::new()?;
+        if let Some(isolation) = &self.isolation {
+            isolation
+                .lock()
+                .expect("DBT isolation lock")
+                .preserve
+                .push(capture.directory.path().to_path_buf());
+        }
+        Ok(capture)
     }
 
     fn new_runtime() -> Result<tokio::runtime::Runtime, Error> {
@@ -1384,11 +1417,27 @@ impl DbtExecution {
         if let Some(runtime) = &self.runtime {
             return run(runtime);
         }
-        hermit_test_workdir::with_isolated_workdir(move || {
+        let mut isolation = self
+            .isolation
+            .as_ref()
+            .expect("a DBT execution without a runtime is isolated")
+            .lock()
+            .expect("DBT isolation lock")
+            .clone();
+        // A verification's run-1 statistics sink is finished and removed before
+        // run 2; only the sinks that still exist are this run's to preserve.
+        isolation.preserve.retain(|path| path.exists());
+        hermit_test_workdir::with_isolation(&isolation, move || {
             let runtime = Self::new_runtime()?;
             // The operation consumes GlobalState cleanup before returning;
             // runtime Drop joins its workers before this scoped thread exits.
             run(&runtime)
+        })
+        .map_err(|error| {
+            Error::msg(format!(
+                "failed to set up the DBT run's private mount namespace, which --bind and \
+                 HERMIT_E2E_EMPTY_WORKDIR need (CAP_SYS_ADMIN, as in the pinned root): {error}"
+            ))
         })?
     }
 }

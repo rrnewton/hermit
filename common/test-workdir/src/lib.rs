@@ -11,16 +11,57 @@
 //! Callers must create their tracer runtime inside the callback and finish its
 //! cleanup before returning. A pre-existing executor could spawn the guest in
 //! its original namespace. This helper does not change the calling thread's
-//! namespace, cwd, or filesystem sharing, and leaves /tmp transport visible.
+//! namespace, cwd, or filesystem sharing. It leaves /tmp transport visible
+//! unless the run binds paths into a private /tmp ([`Isolation::binds`]); then
+//! only the paths in [`Isolation::preserve`] stay reachable there.
 
+use std::ffi::CString;
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io;
+use std::os::fd::AsRawFd;
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::Component;
 use std::path::Path;
+use std::path::PathBuf;
 
 /// The pinned-root runner requests a fresh /test for each physical run.
 pub const REQUEST_ENV: &str = "HERMIT_E2E_EMPTY_WORKDIR";
 /// The pre-existing mountpoint supplied by the pinned-root container.
 pub const WORKDIR: &str = "/test";
+/// The directory a run with binds gets as a fresh tmpfs.
+pub const TMP_DIR: &str = "/tmp";
+
+/// One host path bound into the run's private /tmp, as `hermit run --bind`
+/// binds it for the other backends: `source` must exist, and `target` is an
+/// absolute path below /tmp, created as a file or a directory to match.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindMount {
+    pub source: PathBuf,
+    pub target: PathBuf,
+}
+
+/// The mounts one physical run gets in its own mount namespace.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct Isolation {
+    /// Mount a fresh tmpfs on the pre-existing [`WORKDIR`].
+    pub test_workdir: bool,
+    /// Mount a fresh tmpfs on /tmp and bind each source at its target there,
+    /// in order. Empty leaves /tmp as it is.
+    pub binds: Vec<BindMount>,
+    /// Paths below the original /tmp, made before the run, that the run must
+    /// still reach at the same path once /tmp is replaced: bound at that path
+    /// before the binds. Ignored when there are no binds.
+    pub preserve: Vec<PathBuf>,
+}
+
+impl Isolation {
+    /// Whether the run needs no mount namespace at all.
+    pub fn is_empty(&self) -> bool {
+        !self.test_workdir && self.binds.is_empty()
+    }
+}
 
 /// Refuse malformed requests instead of silently running without isolation.
 pub fn requested_workdir(value: Option<&OsStr>) -> io::Result<Option<&'static Path>> {
@@ -46,11 +87,36 @@ where
     F: FnOnce() -> T + Send,
     T: Send,
 {
+    with_isolation(
+        &Isolation {
+            test_workdir: true,
+            ..Isolation::default()
+        },
+        run,
+    )
+}
+
+/// Run on a new host thread in a new mount namespace that has `isolation`'s
+/// mounts.
+///
+/// The same contract as [`with_isolated_workdir`]: CAP_SYS_ADMIN is required,
+/// every setup error returns before the callback can launch a guest, and the
+/// mounts disappear with the namespace. A bind target must be a normal
+/// absolute path strictly below /tmp; a bind source and a preserved path are
+/// resolved before /tmp is replaced, so they may lie below the original /tmp.
+pub fn with_isolation<F, T>(isolation: &Isolation, run: F) -> io::Result<T>
+where
+    F: FnOnce() -> T + Send,
+    T: Send,
+{
+    for bind in &isolation.binds {
+        check_bind_target(&bind.target)?;
+    }
     std::thread::scope(|scope| {
         let thread = std::thread::Builder::new()
             .name("hermit-test-workdir".into())
             .spawn_scoped(scope, move || {
-                enter_namespace()?;
+                enter_namespace(isolation)?;
                 Ok(run())
             })?;
         match thread.join() {
@@ -72,7 +138,119 @@ fn syscall_result(result: libc::c_int, operation: &str) -> io::Result<()> {
     }
 }
 
-fn enter_namespace() -> io::Result<()> {
+/// Refuse a bind target the private /tmp cannot hold: relative, outside /tmp,
+/// /tmp itself, or with `.`/`..` components that could leave it.
+pub fn check_bind_target(target: &Path) -> io::Result<()> {
+    let mut components = target.components();
+    let below_tmp = components.next() == Some(Component::RootDir)
+        && components.next() == Some(Component::Normal(OsStr::new("tmp")))
+        && target.components().count() > 2
+        && components.all(|component| matches!(component, Component::Normal(_)));
+    if below_tmp {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "bind target {} must be a normal absolute path below {TMP_DIR}",
+                target.display()
+            ),
+        ))
+    }
+}
+
+fn path_cstring(path: &Path) -> io::Result<CString> {
+    CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("path {} contains a NUL byte", path.display()),
+        )
+    })
+}
+
+/// A path opened before /tmp is replaced: `O_PATH` keeps the original file
+/// reachable through `/proc/thread-self/fd` after its path is covered.
+struct OpenedSource {
+    file: File,
+    is_dir: bool,
+    target: PathBuf,
+}
+
+fn open_source(source: &Path, target: &Path) -> io::Result<OpenedSource> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(source)
+        .map_err(|error| {
+            io::Error::new(
+                error.kind(),
+                format!("open bind source {}: {error}", source.display()),
+            )
+        })?;
+    let is_dir = file.metadata()?.is_dir();
+    Ok(OpenedSource {
+        file,
+        is_dir,
+        target: target.to_path_buf(),
+    })
+}
+
+fn mount_tmpfs(target: &std::ffi::CStr, what: &str) -> io::Result<()> {
+    syscall_result(
+        unsafe {
+            libc::mount(
+                c"tmpfs".as_ptr(),
+                target.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOSUID | libc::MS_NODEV,
+                c"mode=1777".as_ptr().cast(),
+            )
+        },
+        what,
+    )
+}
+
+fn bind_opened(source: &OpenedSource) -> io::Result<()> {
+    let target = &source.target;
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let created = if source.is_dir {
+        std::fs::create_dir(target)
+    } else {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(target)
+            .map(drop)
+    };
+    match created {
+        Err(error) if error.kind() != io::ErrorKind::AlreadyExists => {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("create bind target {}: {error}", target.display()),
+            ));
+        }
+        _ => {}
+    }
+    let from = CString::new(format!("/proc/thread-self/fd/{}", source.file.as_raw_fd()))
+        .expect("a descriptor path has no NUL");
+    let to = path_cstring(target)?;
+    syscall_result(
+        unsafe {
+            libc::mount(
+                from.as_ptr(),
+                to.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND | libc::MS_REC,
+                std::ptr::null(),
+            )
+        },
+        &format!("bind {}", target.display()),
+    )
+}
+
+fn enter_namespace(isolation: &Isolation) -> io::Result<()> {
     // A new thread is essential: unshare also separates its fs_struct, which
     // setns could not restore to the caller's original CLONE_FS sharing.
     syscall_result(
@@ -91,24 +269,29 @@ fn enter_namespace() -> io::Result<()> {
         },
         "make mount propagation private",
     )?;
-    syscall_result(
-        unsafe {
-            libc::mount(
-                c"tmpfs".as_ptr(),
-                c"/test".as_ptr(),
-                c"tmpfs".as_ptr(),
-                libc::MS_NOSUID | libc::MS_NODEV,
-                c"mode=1777".as_ptr().cast(),
-            )
-        },
-        "mount per-run /test tmpfs",
-    )
+    if isolation.test_workdir {
+        mount_tmpfs(c"/test", "mount per-run /test tmpfs")?;
+    }
+    if isolation.binds.is_empty() {
+        return Ok(());
+    }
+    // Everything is opened before the tmpfs covers /tmp, so a source or a
+    // preserved path below the original /tmp is still reachable.
+    let mut opened = Vec::new();
+    for path in &isolation.preserve {
+        if path.starts_with(TMP_DIR) {
+            opened.push(open_source(path, path)?);
+        }
+    }
+    for bind in &isolation.binds {
+        opened.push(open_source(&bind.source, &bind.target)?);
+    }
+    mount_tmpfs(c"/tmp", "mount per-run /tmp tmpfs")?;
+    opened.iter().try_for_each(bind_opened)
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::ffi::OsStrExt;
-
     use super::*;
 
     #[test]
@@ -127,5 +310,69 @@ mod tests {
                     .contains("HERMIT_E2E_EMPTY_WORKDIR must be /test")
             );
         }
+    }
+
+    #[test]
+    fn bind_targets_must_stay_strictly_below_tmp() {
+        // `Path::components` drops an interior `.`, so `/tmp/./test` is `/tmp/test`.
+        for target in ["/tmp/test", "/tmp/e2e/home", "/tmp/a/b/c", "/tmp/./test"] {
+            check_bind_target(Path::new(target)).unwrap();
+        }
+        for target in [
+            "",
+            "tmp/test",
+            "/tmp",
+            "/tmp/",
+            "/test",
+            "/tmpx/test",
+            "/tmp/../etc",
+            "/tmp/a/../../etc",
+            "/var/tmp/test",
+        ] {
+            let error = check_bind_target(Path::new(target)).unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput, "{target}");
+            assert!(
+                error.to_string().contains("below /tmp"),
+                "{target}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_isolation_needs_no_namespace() {
+        assert!(Isolation::default().is_empty());
+        let bound = Isolation {
+            binds: vec![BindMount {
+                source: "/".into(),
+                target: "/tmp/test".into(),
+            }],
+            ..Isolation::default()
+        };
+        assert!(!bound.is_empty());
+        let workdir = Isolation {
+            test_workdir: true,
+            ..Isolation::default()
+        };
+        assert!(!workdir.is_empty());
+    }
+
+    #[test]
+    fn a_bad_bind_target_is_refused_before_any_namespace_or_callback() {
+        // This would need CAP_SYS_ADMIN to get further, so it also shows that
+        // the target check runs first: the error is the target's, not EPERM.
+        let launched = std::sync::atomic::AtomicBool::new(false);
+        let isolation = Isolation {
+            binds: vec![BindMount {
+                source: "/".into(),
+                target: "/etc/passwd".into(),
+            }],
+            ..Isolation::default()
+        };
+        let error = with_isolation(&isolation, || {
+            launched.store(true, std::sync::atomic::Ordering::SeqCst)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert!(!launched.load(std::sync::atomic::Ordering::SeqCst));
     }
 }

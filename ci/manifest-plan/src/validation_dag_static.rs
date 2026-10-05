@@ -719,7 +719,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 944 prior identities (947, measured with cargo nextest list).
     // detcore-model's config::tests::config_fingerprint_includes_the_inode_rpc_identity
     // retains all 947 (948, measured with cargo nextest list).
-    ("test.regular_crates", 948),
+    // The three hermit-test-workdir bind tests (DBT --bind support) retain all
+    // 948: 951, measured with cargo nextest list --profile ci --workspace
+    // --exclude hermit-detcore --exclude hermit
+    // --exclude hermetic_infra_hermit_flaky-tests.
+    ("test.regular_crates", 951),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1365,8 +1369,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3791 listed there retain all
     // 940: 940 + 4 = 944.
     // The three host-input-change retry tests listed there (947), and the
-    // inode-RPC fingerprint test (948).
-    ("test.regular_crates_on_host", 948),
+    // inode-RPC fingerprint test (948). The three hermit-test-workdir bind
+    // tests listed there retain all 948: 951.
+    ("test.regular_crates_on_host", 951),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.

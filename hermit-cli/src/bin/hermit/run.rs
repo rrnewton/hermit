@@ -105,6 +105,14 @@ use super::verify::write_skid_overshoot_without_comparison_json;
 use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
+
+fn warn_bind_outside_tmp(bind: &Bind) {
+    eprintln!(
+        "WARNING: --bind target {} is outside guest /tmp, so this option has no \
+         effect; files outside /tmp are already visible unless another mount hides them",
+        bind.target.to_string_lossy()
+    );
+}
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
 #[cfg(feature = "sabre")]
 const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
@@ -1884,7 +1892,7 @@ fn namespace_only_guest_command_preserves_sanitizer_environment() {
 }
 
 #[test]
-fn dbt_rejects_mount_and_bind_but_accepts_workdir() {
+fn dbt_rejects_mount_but_accepts_bind_and_workdir() {
     let mut with_mount = run_opts_for(&[
         "hermit",
         "--backend",
@@ -1899,19 +1907,24 @@ fn dbt_rejects_mount_and_bind_but_accepts_workdir() {
         .to_string();
     assert!(error.contains("dbt backend cannot apply --mount"));
 
+    // The adapter applies a bind under /tmp; one outside it has no effect, as
+    // for the other backends.
     let mut with_bind = run_opts_for(&[
         "hermit",
         "--backend",
         "dbt",
         "run",
+        "--bind=/tmp:/tmp/test",
         "--bind=/tmp:/test",
+        "--workdir",
+        "/tmp/test",
         "/bin/true",
     ]);
-    let error = with_bind
-        .validate_args_with_perf_support(true)
-        .unwrap_err()
-        .to_string();
-    assert!(error.contains("dbt backend cannot apply --mount"));
+    with_bind.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        with_bind.dbt_binds(),
+        vec![(PathBuf::from("/tmp"), PathBuf::from("/tmp/test"))]
+    );
 
     let mut with_workdir = run_opts_for(&[
         "hermit",
@@ -3896,6 +3909,7 @@ impl RunOpts {
                     &config,
                     environment,
                     self.workdir.as_deref().map(Path::new),
+                    self.dbt_binds(),
                     dbt_verification_stdin,
                 );
             }
@@ -4024,10 +4038,10 @@ impl RunOpts {
                 backend.as_str()
             );
         }
-        if backend == Backend::Dbt && (!self.mount.is_empty() || !self.bind.is_empty()) {
+        if backend == Backend::Dbt && !self.mount.is_empty() {
             anyhow::bail!(
-                "the dbt backend cannot apply --mount or --bind because its DynamoRIO adapter \
-                 does not enter the guest mount namespace"
+                "the dbt backend cannot apply --mount because its DynamoRIO adapter has no guest \
+                 mount namespace to apply it in; it applies only --bind targets under /tmp"
             );
         }
         if self.backend_engagement_json.is_some()
@@ -5612,6 +5626,24 @@ impl RunOpts {
         Ok(status)
     }
 
+    /// The `--bind`s the DBT adapter applies, as (source, target) pairs: those
+    /// with a target under guest `/tmp`, which is where [`Self::mounts`] applies
+    /// binds for the other backends. Any other bind gets the same warning
+    /// there and here, and has no effect.
+    fn dbt_binds(&self) -> Vec<(PathBuf, PathBuf)> {
+        let mut binds = Vec::with_capacity(self.bind.len());
+        for bind in &self.bind {
+            let source = PathBuf::from(OsStr::from_bytes(bind.source.to_bytes()));
+            let target = PathBuf::from(OsStr::from_bytes(bind.target.to_bytes()));
+            if target.starts_with(TMP_DIR) {
+                binds.push((source, target));
+            } else {
+                warn_bind_outside_tmp(bind);
+            }
+        }
+        binds
+    }
+
     /// Returns the mounts to be used with the container.
     fn mounts(&self, tmpfs: &Path) -> Result<PreparedMounts, Error> {
         let (mut identity_mounts, identity_sources) = identity_hardening_mounts()?;
@@ -5647,11 +5679,7 @@ impl RunOpts {
                 let target = tmpfs.join(relative_path);
                 user_mounts.push(mount.target(target).touch_target());
             } else {
-                eprintln!(
-                    "WARNING: --bind target {} is outside guest /tmp, so this option has no \
-                     effect; files outside /tmp are already visible unless another mount hides them",
-                    bind.target.to_string_lossy()
-                );
+                warn_bind_outside_tmp(bind);
             }
         }
 
