@@ -6426,8 +6426,11 @@ fn max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader() {
 /// runs only in-guest, under `--no-namespace` spawns a guest that is not traced
 /// and that no PID namespace contains, DBT's guest is a plain child of the outer process in
 /// every namespace mode, and KVM's host processes under `--no-namespace` are not
-/// shown to die with hermit. The refusal comes before backend availability, so it
-/// holds in builds without either backend. `analyze` and `bisect` trials skip
+/// shown to die with hermit. SaBRe under `--no-namespace` hands its guest to the
+/// supervisor worker stopped and untraced, before `PTRACE_O_EXITKILL` binds it
+/// (round-3 review of the same pull request, finding 2). The refusal comes
+/// before backend availability and before any SaBRe artifact is resolved, so it
+/// holds in builds where none of these backends is available. `analyze` and `bisect` trials skip
 /// `run`'s own check, so both refuse KVM under `--no-namespace` before any
 /// trial, and bisect before it reads its schedules (the paths below do not
 /// exist). The accepted counterpart, ptrace under `--no-namespace` ending with
@@ -6437,7 +6440,7 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
     let _lock = hermit_run_guard();
     /// Arguments and the configuration the refusal must name.
     type Case<'a> = (&'a [&'a str], &'a str);
-    let cases: [Case; 5] = [
+    let cases: [Case; 6] = [
         (
             &[
                 "--max-log-bytes=64K",
@@ -6470,6 +6473,17 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
                 "/bin/true",
             ],
             "--backend=kvm and --no-namespace",
+        ),
+        (
+            &[
+                "--max-log-bytes=64K",
+                "--backend=sabre",
+                "run",
+                "--no-namespace",
+                "--",
+                "/bin/true",
+            ],
+            "--backend=sabre and --no-namespace",
         ),
         (
             &[

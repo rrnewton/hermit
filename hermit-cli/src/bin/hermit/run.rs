@@ -2876,7 +2876,7 @@ fn log_cap_refusal_for(global: &[&str], options: &[&str]) -> Result<(), Error> {
 /// ends nothing where the guest is not bound to that process.
 #[test]
 fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
-    let refused: [(&[&str], &[&str], &str); 4] = [
+    let refused: [(&[&str], &[&str], &str); 5] = [
         (
             &["--max-log-bytes=4K", "--backend=liteinst"],
             &["--no-namespace", "--max-timeslice=disabled"],
@@ -2896,6 +2896,13 @@ fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
             &["--max-log-bytes=4K", "--backend=kvm"],
             &["--no-namespace"],
             "--backend=kvm and --no-namespace",
+        ),
+        // Round-3 review, finding 2: the launcher hands the guest to the
+        // SaBRe worker stopped and untraced, before PTRACE_O_EXITKILL binds it.
+        (
+            &["--max-log-bytes=4K", "--backend=sabre"],
+            &["--no-namespace"],
+            "--backend=sabre and --no-namespace",
         ),
     ];
     for (global, options, named) in refused {
@@ -2928,7 +2935,9 @@ fn log_cap_is_accepted_where_hermit_takes_the_guest_down_with_it() {
         "--backend=liteinst",
     ] {
         for options in [&[][..], &["--no-namespace"][..]] {
-            if (backend == "--backend=kvm" || backend == "--backend=liteinst")
+            if (backend == "--backend=kvm"
+                || backend == "--backend=liteinst"
+                || backend == "--backend=sabre")
                 && !options.is_empty()
             {
                 continue;
@@ -2974,6 +2983,7 @@ fn log_cap_refusal_table_covers_every_backend() {
             (Backend::Dbt, false),
             (Backend::Dbt, true),
             (Backend::Liteinst, true),
+            (Backend::Sabre, true),
             (Backend::Kvm, true),
         ]
     );
@@ -4222,7 +4232,7 @@ impl RunOpts {
     ///   tracer that carries that same parent-death signal
     ///   (`owned_container::run` arms it in `--no-namespace` mode as well).
     ///
-    /// The three configurations refused below have neither:
+    /// The configurations refused below have neither, or not for the whole run:
     ///
     /// - DBT, in every namespace mode: `backends::run_dbt` starts `drrun` as a
     ///   plain child of the outer process. It creates no namespace, and Reverie's
@@ -4231,6 +4241,11 @@ impl RunOpts {
     /// - LiteInst with `--no-namespace` (LiteInst runs only in-guest at this
     ///   base): Reverie spawns the guest directly and does not trace it, and
     ///   no PID namespace contains it.
+    /// - SaBRe with `--no-namespace`: `sabre_ptrace` detaches the guest with
+    ///   SIGSTOP to hand it to the supervisor worker, which re-attaches and
+    ///   only then sets `PTRACE_O_EXITKILL`. In between the guest is stopped,
+    ///   untraced and in no PID namespace, and the worker's charged trace event
+    ///   can cross the cap there, which would leave a stopped guest behind.
     /// - KVM with `--no-namespace`: reverie-kvm creates host processes at
     ///   several sites, and only some of them are shown to arm a parent-death
     ///   signal. Unproven is refused until each site is audited; inside
@@ -4254,6 +4269,12 @@ impl RunOpts {
                 "--backend=liteinst and --no-namespace: the in-guest LiteInst guest is neither \
                  a ptrace tracee nor inside a PID namespace hermit owns, so exiting 123 at the \
                  cap would leave the guest running; drop --no-namespace",
+            ),
+            Backend::Sabre if no_namespace => Some(
+                "--backend=sabre and --no-namespace: the guest is handed to the SaBRe worker \
+                 stopped and untraced, before PTRACE_O_EXITKILL binds it, and no PID namespace \
+                 contains it, so exiting 123 at the cap in that window would leave a stopped \
+                 guest behind; drop --no-namespace",
             ),
             Backend::Kvm if no_namespace => Some(
                 "--backend=kvm and --no-namespace: no PID namespace contains the KVM backend's \
