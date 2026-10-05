@@ -441,7 +441,8 @@ pub struct ModeRecipe {
     /// after the runner's fixed guest environment. A name the runner sets is
     /// refused rather than silently overridden. A replay cell inherits its
     /// verify recipe's unless it declares its own; an empty mapping there
-    /// declares that it adds none. See [`cell_mode_env`].
+    /// declares that it adds none. This module's private `cell_mode_env`
+    /// applies that rule.
     #[serde(default)]
     pub env: Option<BTreeMap<String, String>>,
     /// The comparison a verify cell's two runs must pass. `strict` (the
