@@ -881,7 +881,17 @@ fi
 # recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
 # second budget are unchanged. Source identity carries the calibration;
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=aa1cffcd7893307ce06da3d6d74434b8ea567119
+# CARRY TO e86aba35925080d8a760ea787057b5ded95858b7 (2026-10-05): from
+# aa1cffcd7893307ce06da3d6d74434b8ea567119; all seven recorded DynamoRIO build inputs
+# are byte-identical. The three-commit range deletes the ptrace-hosted
+# LiteInst hybrid (reverie-liteinst launchers and host runtime, its
+# constructor heap, and the LiteInst-only reverie-ptrace modules), not the
+# DynamoRIO build recipe.
+# The available-CPU cap and f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
+# second budget are unchanged. Source identity carries the calibration;
+# no new timing sample or >=5-sample replacement claim is made.
+expected_pin=e86aba35925080d8a760ea787057b5ded95858b7
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
