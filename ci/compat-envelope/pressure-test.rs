@@ -12680,13 +12680,15 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 }
 
 /// Red cells the default run type does not select: a test-level label
-/// (compat/java, compat/strict-du), a per-backend label (compat/comm on
-/// SaBRe), and an rr-compat replay cell, beside a red default-run-type cell.
+/// (compat/strict-du), a row label on the verify cells (compat/java on
+/// ptrace, compat/comm on SaBRe), and the rr-compat replay cell of a row's
+/// own test (compat/awk, whose verify cell on ptrace is of the default run
+/// type), beside a red default-run-type cell.
 const FOCUSED_RED_CELLS: [(&str, &str, &str); 5] = [
     ("c-programs/prctl-identity", "verify", "dbt"),
+    ("compat/awk", "replay", "ptrace"),
     ("compat/comm", "verify", "sabre"),
     ("compat/java", "verify", "ptrace"),
-    ("compat/rr-awk", "replay", "ptrace"),
     ("compat/strict-du", "verify", "ptrace"),
 ];
 /// Disabled SaBRe cells: one of a labelled test, one of a default-run-type test.
@@ -27032,7 +27034,7 @@ mod harness_selection_tests {
     /// Red cells whose run type is not the default one (a test-level label, a
     /// per-backend label, and an rr-compat replay cell), beside a red cell of
     /// the default run type. compat/java prepares through its ptrace cell,
-    /// whose test-level label also excludes it from the default selection.
+    /// whose verify-cell label also excludes it from the default selection.
     #[test]
     fn red_cells_of_focused_run_types_select_their_cells() {
         let (path, cleanup) = scratch("red");
