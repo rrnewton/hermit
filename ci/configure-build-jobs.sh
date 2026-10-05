@@ -949,8 +949,24 @@ fi
 # 1050 effective-job-second budget carry unchanged with the recorded recipe
 # f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21.
 # This source comparison does not claim a new build timing sample.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 2eee28d3f2a32d3cdc6052cb2de60588026df5d4 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 2eee28d3f2a32d3cdc6052cb2de60588026df5d4 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 16d7f24a6d2a41e9b48054e8ce1b1fa421fc534e (2026-10-05): from
+# 2eee28d3f2a32d3cdc6052cb2de60588026df5d4; all seven recorded DynamoRIO build inputs
+# are byte-identical. The one-commit range changes only the native client's
+# evidence-guard errno (reverie-dbt/native/client.c) and its live test fixture,
+# neither of which is a DynamoRIO SDK build input:
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: e05db6238bf07c96d8a850c5635a8c48590f20b7
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# The available-CPU cap, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and
+# 1050 effective-job-second budget carry unchanged with the recorded recipe
+# f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21.
+# This source comparison does not claim a new build timing sample.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 16d7f24a6d2a41e9b48054e8ce1b1fa421fc534e ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 16d7f24a6d2a41e9b48054e8ce1b1fa421fc534e (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
