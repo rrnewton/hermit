@@ -855,7 +855,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_local::timeslice_tests::
     // child_cpu_publication_replacement_rejects_stale_owner_and_snapshot)
     // retain all 904 prior identities: measured 931 = 904 + 27.
-    ("test.detcore_unit", 931),
+    // The exponential scheduler-backoff test
+    // scheduler::test::backoff_sleep_doubles_then_caps retains all 931 prior
+    // identities: 931 + 1 = 932 (`cargo nextest list --profile ci` measured 932).
+    ("test.detcore_unit", 932),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1088,7 +1091,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3226): 881 + 23 = 904.
     // The same 27 https://github.com/rrnewton/hermit/pull/3266 tests as
     // test.detcore_unit retain all 904 prior identities: measured 931.
-    ("test.detcore_unit_on_host", 931),
+    // The scheduler-backoff test listed for test.detcore_unit retains all 931
+    // prior identities: measured 932.
+    ("test.detcore_unit_on_host", 932),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
