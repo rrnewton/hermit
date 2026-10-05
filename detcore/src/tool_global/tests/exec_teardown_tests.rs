@@ -19,9 +19,11 @@ const WORKER: DetTid = DetTid::from_raw(19);
 fn state(tids: &[DetTid]) -> (GlobalState, DetTime) {
     let config = Config {
         sequentialize_threads: true,
-        cancel_killed_thread_rpcs: false,
         ..Config::default()
-    };
+    }
+    .with_backend(|backend| {
+        backend.needs_killed_thread_rpc_cancellation = false;
+    });
     let state = GlobalState::initialize(&config, false);
     {
         let mut sched = state.sched.lock().unwrap();

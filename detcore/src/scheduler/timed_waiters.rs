@@ -27,8 +27,9 @@ pub struct TimedEvents {
 
     // Keep one alarm(2)/setitimer(2) event per process and one event per POSIX timer id.
     signal_timers: BTreeMap<SignalTimerId, SignalTimerState>,
-    // KVM real timers recur only after an actual shared SIGALRM dequeue.
-    kvm_real_deadlines: BTreeMap<DetPid, LogicalTime>,
+    // Real timers of a backend that provides process signal control recur only after an
+    // actual shared SIGALRM dequeue.
+    controlled_real_timer_deadlines: BTreeMap<DetPid, LogicalTime>,
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -145,13 +146,13 @@ impl TimedEvents {
             .map(|state| (state.deadline, state.interval))
     }
 
-    /// Replace a process-owned KVM deadline without entering legacy recurrence.
+    /// Replace a process-owned controlled real-timer deadline without entering legacy recurrence.
     /// Publication is process-owned, and receiver selection is a separate phase;
     /// the task that armed the timer does not own its later delivery.
-    pub fn insert_kvm_real_deadline(&mut self, deadline: LogicalTime, pid: DetPid) {
+    pub fn insert_controlled_real_timer_deadline(&mut self, deadline: LogicalTime, pid: DetPid) {
         assert!(!self.signal_timers.contains_key(&SignalTimerId::Alarm(pid)));
-        self.remove_kvm_real_deadline(pid);
-        self.kvm_real_deadlines.insert(pid, deadline);
+        self.remove_controlled_real_timer_deadline(pid);
+        self.controlled_real_timer_deadlines.insert(pid, deadline);
         self.map
             .entry(deadline)
             .or_default()
@@ -162,9 +163,9 @@ impl TimedEvents {
             ));
     }
 
-    pub fn remove_kvm_real_deadline(&mut self, pid: DetPid) {
+    pub fn remove_controlled_real_timer_deadline(&mut self, pid: DetPid) {
         let old = self
-            .kvm_real_deadlines
+            .controlled_real_timer_deadlines
             .remove(&pid)
             .map(|deadline| SignalTimerState {
                 deadline,
@@ -305,7 +306,7 @@ impl TimedEvents {
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#869)
     pub fn remove_process_timers(&mut self, dp: DetPid) {
-        self.remove_kvm_real_deadline(dp);
+        self.remove_controlled_real_timer_deadline(dp);
         let ids: Vec<_> = self
             .signal_timers
             .keys()
@@ -351,9 +352,9 @@ impl TimedEvents {
         }?;
 
         if let TimedEvent::SignalEvt(SignalTimerId::Alarm(pid), _, _) = evt
-            && self.kvm_real_deadlines.get(&pid) == Some(&time_ns)
+            && self.controlled_real_timer_deadlines.get(&pid) == Some(&time_ns)
         {
-            self.kvm_real_deadlines.remove(&pid);
+            self.controlled_real_timer_deadlines.remove(&pid);
             return Some((time_ns, evt));
         }
         if let TimedEvent::SignalEvt(id, _, _) = evt
@@ -711,7 +712,7 @@ mod test {
             let p = pid(100);
             let deadline = at(1000);
             if kvm {
-                ev.insert_kvm_real_deadline(deadline, p);
+                ev.insert_controlled_real_timer_deadline(deadline, p);
             } else {
                 ev.insert_alarm(deadline, p, tid(100), Signal::SIGALRM, at(250));
             }
@@ -727,7 +728,7 @@ mod test {
             );
             let preserved: Vec<_> = ev.iter().collect();
             let alarm = ev.alarm_state(p);
-            let kvm_deadlines = ev.kvm_real_deadlines.clone();
+            let kvm_deadlines = ev.controlled_real_timer_deadlines.clone();
 
             // Two same-deadline timers, one armed by a sibling, and a timer
             // with its own bucket exercise both map cleanup paths.
@@ -740,7 +741,7 @@ mod test {
             assert_eq!(ev.iter().collect::<Vec<_>>(), preserved);
             assert_eq!(ev.next_deadline(), Some(deadline));
             assert_eq!(ev.alarm_state(p), alarm);
-            assert_eq!(ev.kvm_real_deadlines, kvm_deadlines);
+            assert_eq!(ev.controlled_real_timer_deadlines, kvm_deadlines);
             assert!(
                 !ev.signal_timers
                     .keys()

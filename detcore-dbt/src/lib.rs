@@ -360,27 +360,57 @@ fn default_dbt_config() -> Config {
     }
 }
 
+/// What the DBT backend can do, in the form Detcore reads.
+///
+/// `hermit run --backend=dbt` copies the same value into its configuration and
+/// encodes it into [`DETCONFIG_ENV`]; the DBT runtime decodes exactly this
+/// value back from that encoding when it loads its configuration.
+pub const fn backend_capabilities() -> reverie::BackendCapabilities {
+    reverie_dbt::DbtRunner::capabilities()
+}
+
 /// Builds the Detcore [`Config`] for this DBT runtime.
 ///
 /// The configuration is taken from the CLI-derived Detcore config serialized
 /// into [`DETCONFIG_ENV`] when present; otherwise a strict default is used.
-/// Regardless of the source, the DBT execution-model invariants are re-asserted:
-/// the backend drives the Detcore global scheduler externally on a branch count
-/// rather than PMU retired-conditional-branch preemption, so timeslice
-/// preemption (`max_timeslice`) is disabled and threads stay sequentialized for
-/// the single external scheduler.
+/// Regardless of the source, the DBT execution-model invariants are re-asserted
+/// by [`assert_dbt_execution_model`].
 fn load_dbt_config() -> (Config, ConfigSource) {
-    let (mut config, source) = match std::env::var(DETCONFIG_ENV) {
-        Ok(value) if !value.is_empty() => match serde_json::from_str::<Config>(&value) {
+    dbt_config_from(std::env::var(DETCONFIG_ENV).ok().as_deref())
+}
+
+/// [`load_dbt_config`] for a given value of [`DETCONFIG_ENV`]; `None` when the
+/// variable is absent or not Unicode.
+///
+/// The backend facts are those the value carries, decoded by
+/// [`detcore::from_legacy_backend_json`]; `hermit run` encodes
+/// [`backend_capabilities`] there. Without a parseable value they are the
+/// strict default's, which are ptrace's: a bare `drrun -c client.so` run, or a
+/// guest that execs with an empty environment, therefore keeps its
+/// process-directed signals untranslated, so `kill(-2147483647, SIGKILL)` fails
+/// with `ESRCH` as it did before Detcore read capabilities.
+fn dbt_config_from(value: Option<&str>) -> (Config, ConfigSource) {
+    let (mut config, source) = match value {
+        Some(value) if !value.is_empty() => match detcore::from_legacy_backend_json(value) {
             Ok(config) => (config, ConfigSource::Cli),
             Err(_) => (default_dbt_config(), ConfigSource::ParseFallback),
         },
         _ => (default_dbt_config(), ConfigSource::Default),
     };
+    assert_dbt_execution_model(&mut config);
+    (config, source)
+}
+
+/// Re-asserts the DBT execution model on a configuration from any source. The
+/// backend drives the Detcore global scheduler externally on a branch count
+/// rather than PMU retired-conditional-branch preemption, so timeslice
+/// preemption (`max_timeslice`) is disabled and threads stay sequentialized for
+/// the single external scheduler. A write the guest parks in the backend
+/// cannot be interrupted by a signal here, whatever the configuration says.
+fn assert_dbt_execution_model(config: &mut Config) {
     config.max_timeslice = None;
     config.sequentialize_threads = true;
-    config.backend_supports_parked_write_signal_interruption = false;
-    (config, source)
+    config.backend.supports_parked_write_signal_interruption = false;
 }
 
 // TODO-HUMAN-REVIEW(PR-587): Confirm DynamoRIO-native process lifecycle boundaries.
@@ -2349,6 +2379,128 @@ mod tests {
     unsafe extern "C" fn test_emit_evidence(_bytes: *const u8, _length: usize) {}
 
     unsafe extern "C" fn test_idle() {}
+
+    /// The configuration `hermit run --backend=dbt` would send, encoded as it
+    /// is put in the guest's environment.
+    fn hermit_run_dbt_detconfig() -> (Config, String) {
+        let mut sent = default_dbt_config();
+        sent.seed = 7;
+        sent.chaos = true;
+        sent.backend = backend_capabilities();
+        let json = detcore::to_legacy_backend_json(&sent).unwrap();
+        (sent, json)
+    }
+
+    #[test]
+    fn dbt_execution_model_reads_the_dbt_backend_capabilities() {
+        assert_eq!(backend_capabilities(), reverie::BackendCapabilities::DBT);
+        let (_, json) = hermit_run_dbt_detconfig();
+        let (config, source) = dbt_config_from(Some(&json));
+        assert!(matches!(source, ConfigSource::Cli));
+        assert_eq!(config.backend, backend_capabilities());
+        assert!(!config.backend.supports_parked_write_signal_interruption);
+        assert_eq!(config.max_timeslice, None);
+        assert!(config.sequentialize_threads);
+
+        // The execution model holds whatever the configuration asked for.
+        let mut config = default_dbt_config();
+        config.max_timeslice = std::num::NonZeroU64::new(1);
+        config.sequentialize_threads = false;
+        assert!(config.backend.supports_parked_write_signal_interruption);
+        assert_dbt_execution_model(&mut config);
+        assert_eq!(config.max_timeslice, None);
+        assert!(config.sequentialize_threads);
+        assert!(!config.backend.supports_parked_write_signal_interruption);
+    }
+
+    /// Without a configuration from `hermit run`, the runtime reads exactly
+    /// the backend facts it read before capabilities existed: the strict
+    /// default's ptrace values, with only parked-write interruption disabled.
+    /// In particular these four differ from DBT's own capabilities.
+    #[test]
+    fn a_dbt_run_without_a_cli_configuration_keeps_its_previous_backend_facts() {
+        let (_, json) = hermit_run_dbt_detconfig();
+        // A legacy key of the wrong type failed the parse when it was a
+        // `Config` field, and still does.
+        let mistyped = json.replacen("\"backend_is_kvm\":false", "\"backend_is_kvm\":0", 1);
+        assert_ne!(mistyped, json);
+        for (value, fallback) in [
+            (None, false),
+            (Some(""), false),
+            (Some("not json"), true),
+            (Some(mistyped.as_str()), true),
+        ] {
+            let (config, source) = dbt_config_from(value);
+            if fallback {
+                assert!(matches!(source, ConfigSource::ParseFallback), "{value:?}");
+            } else {
+                assert!(matches!(source, ConfigSource::Default), "{value:?}");
+            }
+            let backend = config.backend;
+            assert!(!backend.supports_parked_write_signal_interruption);
+            assert!(!backend.needs_killed_thread_rpc_cancellation);
+            assert!(backend.tracks_process_children);
+            assert!(backend.runs_exit_robust_list);
+            assert!(!backend.requires_thread_directed_process_signals);
+            let mut expected = reverie::BackendCapabilities::PTRACE;
+            expected.supports_parked_write_signal_interruption = false;
+            assert_eq!(backend, expected);
+            assert_ne!(backend, backend_capabilities());
+            assert_eq!(config.max_timeslice, None);
+            assert!(config.sequentialize_threads);
+        }
+    }
+
+    /// `hermit run --backend=dbt` writes the configuration with
+    /// [`detcore::to_legacy_backend_json`]; the runtime reads it back
+    /// with every field intact, DBT's capabilities included.
+    #[test]
+    fn the_cli_configuration_round_trips_through_its_environment_encoding() {
+        let (sent, json) = hermit_run_dbt_detconfig();
+        assert!(!json.contains("\"backend\":"), "{json}");
+        let (received, source) = dbt_config_from(Some(&json));
+        assert!(matches!(source, ConfigSource::Cli));
+        assert_eq!(received.backend, backend_capabilities());
+        assert_eq!(
+            serde_json::to_string(&received).unwrap(),
+            serde_json::to_string(&sent).unwrap()
+        );
+    }
+
+    /// A parseable configuration is read for the backend facts it carries,
+    /// not replaced by DBT's: a guest can edit the inherited variable before
+    /// it execs, and the runtime reads it again in the new image. Each fact
+    /// keeps the value the configuration gives it, as it did when the facts
+    /// were separate `Config` fields; only parked-write interruption is held
+    /// off. A legacy key that is absent takes that field's old default.
+    #[test]
+    fn a_cli_configuration_keeps_the_backend_facts_it_carries() {
+        let (_, json) = hermit_run_dbt_detconfig();
+        let key = "\"backend_requires_thread_directed_process_signals\"";
+        let edited = json.replacen(&format!("{key}:true"), &format!("{key}:false"), 1);
+        assert_ne!(edited, json);
+        let (config, source) = dbt_config_from(Some(&edited));
+        assert!(matches!(source, ConfigSource::Cli));
+        let mut expected = backend_capabilities();
+        expected.requires_thread_directed_process_signals = false;
+        assert_eq!(config.backend, expected);
+
+        let key = "\"backend_supports_parked_write_signal_interruption\"";
+        let edited = json.replacen(&format!("{key}:false"), &format!("{key}:true"), 1);
+        assert_ne!(edited, json);
+        let (config, _) = dbt_config_from(Some(&edited));
+        assert_eq!(config.backend, backend_capabilities());
+
+        let mut object: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&json).unwrap();
+        object.remove("backend_tracks_process_children").unwrap();
+        let edited = serde_json::to_string(&object).unwrap();
+        let (config, source) = dbt_config_from(Some(&edited));
+        assert!(matches!(source, ConfigSource::Cli));
+        let mut expected = backend_capabilities();
+        expected.tracks_process_children = true;
+        assert_eq!(config.backend, expected);
+    }
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {

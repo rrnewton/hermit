@@ -34,10 +34,10 @@ use tracing::trace;
 use crate::config::SchedHeuristic;
 use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
+use crate::resources::LOOPBACK_POLL_YIELD_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
-use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
@@ -79,7 +79,7 @@ fn zero_timeout_poll_request(dettid: DetTid, yield_to_peer: bool) -> Resources {
     let mut request = Resources::new(dettid);
     if yield_to_peer {
         request.insert(ResourceID::SchedYield, Permission::W);
-        request.fyi(SABRE_LOOPBACK_POLL_YIELD_FYI);
+        request.fyi(LOOPBACK_POLL_YIELD_FYI);
     }
     request
 }
@@ -408,8 +408,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.cfg.sequentialize_threads && call.timeout() == 0 {
             // This cannot block, but still yield a scheduler turn so a polling thread cannot
             // monopolize the guest between preemptions.
-            let yield_to_peer =
-                self.cfg.discover_live_file_metadata && guest.thread_state().has_loopback_peer();
+            let yield_to_peer = self.cfg.backend.loopback_pollers_yield_to_peers
+                && guest.thread_state().has_loopback_peer();
             resource_request(
                 guest,
                 zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
@@ -1101,8 +1101,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A nonblocking poll can still be the synchronization point in a
             // userspace polling loop. Yield once before probing so backends
             // without PMU preemption cannot let that loop starve its producer.
-            let yield_to_peer =
-                self.cfg.discover_live_file_metadata && guest.thread_state().has_loopback_peer();
+            let yield_to_peer = self.cfg.backend.loopback_pollers_yield_to_peers
+                && guest.thread_state().has_loopback_peer();
             resource_request(
                 guest,
                 zero_timeout_poll_request(guest.thread_state().dettid, yield_to_peer),
@@ -1252,7 +1252,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // only on the plain-strict path would be a scheduling regression,
             // not a refactor.
             if self.cfg.sequentialize_threads {
-                let yield_to_peer = self.cfg.discover_live_file_metadata
+                let yield_to_peer = self.cfg.backend.loopback_pollers_yield_to_peers
                     && guest.thread_state().has_loopback_peer();
                 resource_request(
                     guest,
@@ -1355,10 +1355,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         let result = self.execute_nonblockable_fd_syscall(guest, call).await;
-        if self.cfg.discover_live_file_metadata
+        if self.cfg.backend.loopback_pollers_yield_to_peers
             && connect_result_allows_peer_classification(&result)
         {
-            // This metadata is a SaBRe-only scheduling hint, not part of connect's semantics.
+            // This metadata is a loopback-poll scheduling hint, not part of connect's semantics.
             // Let the kernel establish the authoritative result first, then classify the peer
             // best-effort so an invalid guest pointer or an untracked fd can never replace the
             // kernel's errno.
@@ -1879,7 +1879,7 @@ mod tests {
             request.resources.get(&ResourceID::SchedYield),
             Some(&Permission::W)
         );
-        assert_eq!(request.fyi, SABRE_LOOPBACK_POLL_YIELD_FYI);
+        assert_eq!(request.fyi, LOOPBACK_POLL_YIELD_FYI);
     }
 
     #[test]

@@ -207,10 +207,12 @@ impl Fixture {
     async fn configured(retire_leader: bool) -> Self {
         let config = Config {
             sequentialize_threads: true,
-            cancel_killed_thread_rpcs: false,
             max_timeslice: std::num::NonZeroU64::new(200_000_000),
             ..Config::default()
-        };
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = false;
+        });
         assert!(config.use_rcb_time());
         let state = GlobalState::initialize(&config, false);
         let tool = Detcore::new(Tid::from_raw(LEADER.as_raw()), &config);

@@ -19,6 +19,7 @@ use std::time::SystemTime;
 use chrono::DateTime;
 use chrono::Utc;
 use clap::Parser;
+use reverie::BackendCapabilities;
 use serde::Deserialize;
 use serde::Serialize;
 
@@ -29,8 +30,8 @@ use crate::schedule::SigWrapper;
 use crate::time::NANOS_PER_RCB;
 use crate::time::RcbTimeMultiplier;
 
-const fn default_true() -> bool {
-    true
+const fn default_backend_capabilities() -> BackendCapabilities {
+    BackendCapabilities::PTRACE
 }
 
 /// One mount row whose kernel-private root must be replaced before it becomes
@@ -75,110 +76,45 @@ pub struct Config {
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
     pub virtualize_cpuid: bool,
 
-    /// The execution backend installs a deterministic CPUID policy without instruction faults.
-    #[serde(default)]
-    #[clap(skip)]
-    pub cpuid_virtualized_by_backend: bool,
-
-    /// The execution backend implements guest-visible madvise semantics.
-    #[serde(default = "default_true")]
-    #[clap(skip = true)]
-    pub backend_supports_madvise: bool,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review in-process backend descriptor discovery.
-    /// The execution backend runs Detcore inside the guest and can inspect its live descriptors.
-    #[serde(default)]
-    #[clap(skip)]
-    pub discover_live_file_metadata: bool,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review host-clock futex deadline detection.
-    /// Direct guest clock reads may bypass backend virtualization, so absolute futex deadlines
-    /// must be classified against both the host and logical clocks.
-    #[serde(default)]
-    #[clap(skip)]
-    pub detect_host_clock_futex_timeouts: bool,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-owned syscall-clobber determinism.
-    /// The execution backend already returns deterministic values for registers clobbered by a
-    /// syscall instruction, so Detcore must not write the complete register set back afterward.
-    #[serde(default)]
-    #[clap(skip)]
-    pub syscall_clobbers_virtualized_by_backend: bool,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-local exit-group RPC cancellation.
-    /// Logically killed guest threads need an explicit scheduler response because the backend
-    /// does not rely on ptrace's kernel-driven exit-group teardown.
-    #[serde(default)]
-    #[clap(skip)]
-    pub cancel_killed_thread_rpcs: bool,
-
-    /// The execution backend reports final physical process exits after logical tool cleanup, so
-    /// Detcore can prevent virtual timers from overtaking kernel child-exit publication.
-    #[serde(default)]
-    #[clap(skip)]
-    pub backend_reports_physical_process_exits: bool,
-
-    /// The backend reports every process child through Detcore's child-registration protocol.
-    /// When true, an empty scheduler selection is authoritative ECHILD rather than a reason to
-    /// fall back to backend-specific wait filtering.
-    #[serde(default = "default_true")]
-    #[clap(skip = true)]
-    pub backend_tracks_process_children: bool,
-
-    /// The execution backend completes Linux's robust-list cleanup before its task-exit callback
-    /// lets another modeled thread run. Detcore still wakes waiters parked in its precise futex
-    /// model, but it leaves the owner-word transition to Linux so it remains atomic.
-    #[serde(default = "default_true")]
-    #[clap(skip = true)]
-    pub backend_runs_exit_robust_list: bool,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
-    /// The backend cannot execute process-directed signal syscalls using Detcore's guest PID and
-    /// therefore requires Detcore to translate an unambiguous process target to a specific thread.
-    #[serde(default)]
-    #[clap(skip)]
-    pub backend_requires_thread_directed_process_signals: bool,
-
-    /// Identifies KVM for its run-installed process alarm control.
-    #[serde(default)]
-    #[clap(skip)]
-    pub backend_is_kvm: bool,
-
-    /// Startup-only real-timer policy using acknowledged shared signal dequeues.
-    #[serde(default)]
-    #[clap(skip)]
-    pub kvm_shared_dequeue_timers: bool,
-
-    /// The backend can wake a scheduler-managed pipe write for a cross-task signal while
-    /// preserving Linux signal-mask, disposition, and syscall-restart behavior.
-    #[serde(default = "default_true")]
-    #[clap(skip = true)]
-    pub backend_supports_parked_write_signal_interruption: bool,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1125): Review backend-owned capability-control prctls.
-    /// The execution backend virtualizes capability bounding-set and ambient-capability state.
-    #[serde(default)]
-    #[clap(skip)]
-    pub backend_virtualizes_capability_prctls: bool,
-
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
-    /// The execution backend does not keep a `CLONE_VFORK` parent blocked inside the injected
-    /// `clone(2)` until the child registers. The ptrace backend relies on the kernel to suspend a
-    /// vfork parent until the child execs or exits, so the child always registers its vfork barrier
-    /// before the parent asks to continue. Out-of-process backends such as KVM service the clone by
-    /// deferring the child spawn, so the child registers only *after* the parent posts its
-    /// continuation. When this is set the scheduler keeps an unfulfilled vfork barrier in place at
-    /// parent continuation (waiting for the late child) instead of treating it as a failed clone.
+    /// How the execution backend runs the guest, as the backend reports it
+    /// through Reverie (`reverie::Backend::capabilities`).
+    ///
+    /// Detcore reads facts about the backend only from here, never from the
+    /// backend's name, so a new backend is modelled correctly by reporting its
+    /// capabilities. The host copies the running backend's answer into this
+    /// field before the run starts. The default describes a ptrace-hosted
+    /// guest, the backend Detcore's own tests use.
+    ///
+    /// JSON that the guest can see is written by [`to_legacy_backend_json`],
+    /// which carries this field (and `shared_dequeue_timers`) as the separate
+    /// keys used before it existed; [`from_legacy_backend_json`] reads them
+    /// back.
+    #[serde(default = "default_backend_capabilities")]
+    #[clap(skip = BackendCapabilities::PTRACE)]
+    pub backend: BackendCapabilities,
+
+    /// Deliver real-timer signals through the backend's process signal control
+    /// and acknowledged shared signal dequeues, rather than Detcore's own
+    /// signal dispatch. A startup-only policy: the host sets it when
+    /// `backend.provides_process_signal_control` holds and threads are
+    /// sequentialized.
     #[serde(default)]
     #[clap(skip)]
-    pub backend_defers_vfork_child_registration: bool,
+    pub shared_dequeue_timers: bool,
 
     /// Epoch of the logical time.
     ///
@@ -733,6 +669,15 @@ fn try_parse_memory(from_str: &str) -> anyhow::Result<u64> {
 }
 
 impl Config {
+    /// This configuration with `change` applied to its backend capabilities.
+    /// [`BackendCapabilities`] cannot be built field by field outside Reverie,
+    /// so a caller that needs to adjust individual facts starts from the value
+    /// already here.
+    pub fn with_backend(mut self, change: impl FnOnce(&mut BackendCapabilities)) -> Self {
+        change(&mut self.backend);
+        self
+    }
+
     /// Whether the epoch is the stable library default omitted by `Display`.
     pub fn has_default_epoch(&self) -> bool {
         self.epoch == DEFAULT_EPOCH_STR.parse::<DateTime<Utc>>().unwrap()
@@ -1390,6 +1335,12 @@ fn config_wire_default() -> Config {
         "--sched-seed=0",
     ]);
     config.sched_seed = None;
+    // `BackendCapabilities` is defined in Reverie, outside
+    // `CONFIG_DEFINITION_SOURCES`, so the source domain cannot see a change to
+    // it. Encode KVM's capabilities rather than the ptrace default: KVM's is
+    // the constant whose optional user address limit is present, so the wire
+    // bytes carry that field's width instead of a bare `None`.
+    config.backend = BackendCapabilities::KVM;
     config
 }
 
@@ -1436,6 +1387,666 @@ impl Default for Config {
     }
 }
 
+/// Serializes `config` as JSON in the form it had before [`Config::backend`]
+/// existed.
+///
+/// [`Config::backend`] and [`Config::shared_dequeue_timers`] are left out.
+/// In their place, at the same position in the object, are the fifteen
+/// separate backend keys that a serialized configuration carried before,
+/// under the names and in the order it carried them, each with a value
+/// computed from `config`. Every other field is serialized exactly as
+/// `serde_json::to_string(config)` serializes it.
+///
+/// Use this wherever the JSON is visible to the guest. `hermit run
+/// --backend=dbt` passes the configuration to the in-guest DBT runtime in the
+/// guest's own environment, so a guest that reads its environment, or whose
+/// initial stack layout depends on the environment's size, observes this
+/// string; producing the earlier bytes keeps that observation unchanged.
+///
+/// Read the result with [`from_legacy_backend_json`], which recovers both
+/// fields from the fifteen keys. A plain `Config` deserialization ignores the
+/// keys and gives both fields their serde defaults.
+pub fn to_legacy_backend_json(config: &Config) -> serde_json::Result<String> {
+    let mut json = Vec::with_capacity(4096);
+    let mut serializer = serde_json::Serializer::new(&mut json);
+    config.serialize(legacy_backend_json::ConfigSerializer {
+        inner: &mut serializer,
+        config,
+    })?;
+    String::from_utf8(json).map_err(serde::ser::Error::custom)
+}
+
+/// The JSON keys, in order, under which a serialized [`Config`] carried the
+/// backend facts before they moved into [`Config::backend`], each with the
+/// value it has for `config`.
+///
+/// `backend_is_kvm` named the backend rather than a fact; its value is
+/// `provides_process_signal_control`, a capability only KVM reports, and
+/// `kvm_shared_dequeue_timers` is [`Config::shared_dequeue_timers`].
+fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
+    let backend = &config.backend;
+    [
+        ("cpuid_virtualized_by_backend", backend.virtualizes_cpuid),
+        ("backend_supports_madvise", backend.supports_madvise),
+        (
+            "discover_live_file_metadata",
+            backend.tool_shares_guest_descriptor_table,
+        ),
+        (
+            "detect_host_clock_futex_timeouts",
+            backend.guest_clock_reads_bypass_backend,
+        ),
+        (
+            "syscall_clobbers_virtualized_by_backend",
+            backend.virtualizes_syscall_clobbers,
+        ),
+        (
+            "cancel_killed_thread_rpcs",
+            backend.needs_killed_thread_rpc_cancellation,
+        ),
+        (
+            "backend_reports_physical_process_exits",
+            backend.reports_physical_process_exits,
+        ),
+        (
+            "backend_tracks_process_children",
+            backend.tracks_process_children,
+        ),
+        (
+            "backend_runs_exit_robust_list",
+            backend.runs_exit_robust_list,
+        ),
+        (
+            "backend_requires_thread_directed_process_signals",
+            backend.requires_thread_directed_process_signals,
+        ),
+        ("backend_is_kvm", backend.provides_process_signal_control),
+        ("kvm_shared_dequeue_timers", config.shared_dequeue_timers),
+        (
+            "backend_supports_parked_write_signal_interruption",
+            backend.supports_parked_write_signal_interruption,
+        ),
+        (
+            "backend_virtualizes_capability_prctls",
+            backend.virtualizes_capability_prctls,
+        ),
+        (
+            "backend_defers_vfork_child_registration",
+            backend.defers_vfork_child_registration,
+        ),
+    ]
+}
+
+/// Parses JSON written by [`to_legacy_backend_json`], or any JSON in the form
+/// a serialized [`Config`] had before [`Config::backend`] existed, and recovers
+/// [`Config::backend`] and [`Config::shared_dequeue_timers`] from the fifteen
+/// legacy backend keys.
+///
+/// The keys are read exactly as they were read while each was a `Config`
+/// field: a key that is absent takes the default that field had, and a key of
+/// the wrong type fails the parse. Each key then supplies every capability that
+/// replaced a read of it, so a decoded configuration behaves as the same JSON
+/// did before:
+///
+/// - `discover_live_file_metadata` supplies the four descriptor and loopback
+///   facts that were each a read of it;
+/// - `backend_reports_physical_process_exits` supplies
+///   `reports_physical_process_exits` and
+///   `signal_interrupts_external_syscalls`;
+/// - `backend_is_kvm` supplies the five behaviours it selected, including the
+///   x86-64 four-level user address limit;
+/// - every other key supplies the one capability of the same meaning.
+///
+/// This inverts [`to_legacy_backend_json`] for every capability value the keys
+/// can express, which includes every backend's own constant.
+///
+/// Everything else is read as the legacy form was read, by `Config`'s own
+/// derived deserializer with the legacy keys taken out before it sees them:
+///
+/// - In an object, a key the legacy form did not name is ignored, whatever its
+///   value. `backend` and `shared_dequeue_timers` are such keys, so they are
+///   ignored too rather than read as the fields they are now; no writer
+///   produces either. A key the legacy form named fails the parse when it
+///   appears twice or holds the wrong type.
+/// - A JSON array lists the fields by position, as serde reads any derived
+///   struct. The positions are those of the legacy form, which are the key
+///   order of [`to_legacy_backend_json`]: the fifteen legacy keys stand where
+///   [`Config::backend`] stands, and [`Config::shared_dequeue_timers`] has no
+///   position. Too many elements fail the parse; too few leave the fields
+///   after them missing, each taking its default or failing the parse as the
+///   derived deserializer decides for that field.
+pub fn from_legacy_backend_json(json: &str) -> serde_json::Result<Config> {
+    let mut deserializer = serde_json::Deserializer::from_str(json);
+    let (mut config, legacy) = serde::Deserializer::deserialize_struct(
+        &mut deserializer,
+        "Config",
+        &[],
+        legacy_backend_json::LegacyConfigVisitor,
+    )?;
+    deserializer.end()?;
+    config.backend = legacy.capabilities();
+    config.shared_dequeue_timers = legacy.kvm_shared_dequeue_timers;
+    Ok(config)
+}
+
+/// The names of the fifteen legacy backend keys, in the order
+/// [`legacy_backend_keys`] gives them.
+const LEGACY_BACKEND_KEY_NAMES: [&str; 15] = [
+    "cpuid_virtualized_by_backend",
+    "backend_supports_madvise",
+    "discover_live_file_metadata",
+    "detect_host_clock_futex_timeouts",
+    "syscall_clobbers_virtualized_by_backend",
+    "cancel_killed_thread_rpcs",
+    "backend_reports_physical_process_exits",
+    "backend_tracks_process_children",
+    "backend_runs_exit_robust_list",
+    "backend_requires_thread_directed_process_signals",
+    "backend_is_kvm",
+    "kvm_shared_dequeue_timers",
+    "backend_supports_parked_write_signal_interruption",
+    "backend_virtualizes_capability_prctls",
+    "backend_defers_vfork_child_registration",
+];
+
+const fn legacy_backend_key_default_true() -> bool {
+    true
+}
+
+/// The fifteen legacy backend keys with the types and serde defaults they had
+/// as `Config` fields. It is deserialized from the keys
+/// [`legacy_backend_json::LegacyConfigVisitor`] takes out of the input, so a
+/// key given twice fails here as it failed as a `Config` field.
+#[derive(Deserialize)]
+struct LegacyBackendKeys {
+    #[serde(default)]
+    cpuid_virtualized_by_backend: bool,
+    #[serde(default = "legacy_backend_key_default_true")]
+    backend_supports_madvise: bool,
+    #[serde(default)]
+    discover_live_file_metadata: bool,
+    #[serde(default)]
+    detect_host_clock_futex_timeouts: bool,
+    #[serde(default)]
+    syscall_clobbers_virtualized_by_backend: bool,
+    #[serde(default)]
+    cancel_killed_thread_rpcs: bool,
+    #[serde(default)]
+    backend_reports_physical_process_exits: bool,
+    #[serde(default = "legacy_backend_key_default_true")]
+    backend_tracks_process_children: bool,
+    #[serde(default = "legacy_backend_key_default_true")]
+    backend_runs_exit_robust_list: bool,
+    #[serde(default)]
+    backend_requires_thread_directed_process_signals: bool,
+    #[serde(default)]
+    backend_is_kvm: bool,
+    #[serde(default)]
+    kvm_shared_dequeue_timers: bool,
+    #[serde(default = "legacy_backend_key_default_true")]
+    backend_supports_parked_write_signal_interruption: bool,
+    #[serde(default)]
+    backend_virtualizes_capability_prctls: bool,
+    #[serde(default)]
+    backend_defers_vfork_child_registration: bool,
+}
+
+impl LegacyBackendKeys {
+    /// The capabilities these keys describe; the inverse of
+    /// [`legacy_backend_keys`]. Every field is assigned, so the starting
+    /// constant contributes nothing a key decides.
+    fn capabilities(&self) -> BackendCapabilities {
+        let mut backend = BackendCapabilities::PTRACE;
+        backend.tool_shares_guest_descriptor_table = self.discover_live_file_metadata;
+        backend.rediscovers_descriptors_after_exec = self.discover_live_file_metadata;
+        backend.internal_pipe_turns_are_host_timed = self.discover_live_file_metadata;
+        backend.loopback_pollers_yield_to_peers = self.discover_live_file_metadata;
+        backend.guest_clock_reads_bypass_backend = self.detect_host_clock_futex_timeouts;
+        backend.virtualizes_syscall_clobbers = self.syscall_clobbers_virtualized_by_backend;
+        backend.needs_killed_thread_rpc_cancellation = self.cancel_killed_thread_rpcs;
+        backend.reports_physical_process_exits = self.backend_reports_physical_process_exits;
+        backend.signal_interrupts_external_syscalls = self.backend_reports_physical_process_exits;
+        backend.tracks_process_children = self.backend_tracks_process_children;
+        backend.runs_exit_robust_list = self.backend_runs_exit_robust_list;
+        backend.requires_thread_directed_process_signals =
+            self.backend_requires_thread_directed_process_signals;
+        backend.supports_parked_write_signal_interruption =
+            self.backend_supports_parked_write_signal_interruption;
+        backend.defers_vfork_child_registration = self.backend_defers_vfork_child_registration;
+        backend.virtualizes_capability_prctls = self.backend_virtualizes_capability_prctls;
+        backend.virtualizes_cpuid = self.cpuid_virtualized_by_backend;
+        backend.supports_madvise = self.backend_supports_madvise;
+        backend.provides_process_signal_control = self.backend_is_kvm;
+        backend.emulates_child_waits = self.backend_is_kvm;
+        backend.failed_gettimeofday_may_store_host_time = !self.backend_is_kvm;
+        backend.refuses_nonleader_exec_with_enosys = self.backend_is_kvm;
+        backend.user_address_limit = self
+            .backend_is_kvm
+            .then_some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
+        backend
+    }
+}
+
+/// The serde adapters behind [`to_legacy_backend_json`] and
+/// [`from_legacy_backend_json`].
+///
+/// The serializer adapter wraps the JSON serializer only at the top level,
+/// where `Config`'s derived `Serialize` opens one struct and writes its fields
+/// in declaration order. Nested values go straight to the wrapped serializer,
+/// so they, and every field other than the two it replaces, are encoded
+/// unchanged.
+///
+/// The deserializer adapters likewise wrap only the top-level object or array,
+/// and hand every nested value to the wrapped JSON deserializer.
+mod legacy_backend_json {
+    use std::fmt;
+
+    use serde::Deserialize;
+    use serde::Serialize;
+    use serde::de;
+    use serde::de::DeserializeSeed;
+    use serde::de::IgnoredAny;
+    use serde::de::MapAccess;
+    use serde::de::SeqAccess;
+    use serde::de::Visitor;
+    use serde::de::value::BoolDeserializer;
+    use serde::de::value::MapAccessDeserializer;
+    use serde::de::value::MapDeserializer;
+    use serde::de::value::SeqAccessDeserializer;
+    use serde::de::value::StringDeserializer;
+    use serde::ser::Error as _;
+    use serde::ser::Impossible;
+    use serde::ser::SerializeStruct;
+    use serde::ser::Serializer;
+
+    use super::BackendCapabilities;
+    use super::Config;
+    use super::LEGACY_BACKEND_KEY_NAMES;
+    use super::LegacyBackendKeys;
+    use super::legacy_backend_keys;
+
+    /// The keys `Config` has now that its legacy form did not. The legacy
+    /// form ignored them, as it ignored every key it did not name.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 2] = ["backend", "shared_dequeue_timers"];
+
+    /// Reads the top-level object or array of a legacy configuration. The
+    /// derived `Config` deserializer reads every field; this takes the legacy
+    /// backend keys out of the input before it sees them and collects them for
+    /// [`LegacyBackendKeys`].
+    pub(super) struct LegacyConfigVisitor;
+
+    impl<'de> Visitor<'de> for LegacyConfigVisitor {
+        type Value = (Config, LegacyBackendKeys);
+
+        fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+            formatter.write_str("struct Config")
+        }
+
+        fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Self::Value, A::Error> {
+            let mut legacy = Vec::new();
+            let config = Config::deserialize(MapAccessDeserializer::new(LegacyKeys {
+                inner: map,
+                legacy: &mut legacy,
+            }))?;
+            Ok((config, legacy_backend_keys_from(legacy)?))
+        }
+
+        fn visit_seq<A: SeqAccess<'de>>(self, seq: A) -> Result<Self::Value, A::Error> {
+            let fields = config_field_order().map_err(<A::Error as de::Error>::custom)?;
+            let mut legacy = Vec::new();
+            let config = Config::deserialize(SeqAccessDeserializer::new(LegacyPositions {
+                inner: seq,
+                fields: fields.iter(),
+                legacy: &mut legacy,
+            }))?;
+            Ok((config, legacy_backend_keys_from(legacy)?))
+        }
+    }
+
+    /// Reads the collected legacy keys with their old types and defaults. A
+    /// key that appeared twice is collected twice, and fails here as a
+    /// duplicate field.
+    fn legacy_backend_keys_from<E: de::Error>(
+        legacy: Vec<(&'static str, bool)>,
+    ) -> Result<LegacyBackendKeys, E> {
+        LegacyBackendKeys::deserialize(MapDeserializer::<_, E>::new(legacy.into_iter()))
+    }
+
+    /// The top-level object's entries, with each legacy backend key read as the
+    /// boolean it was and collected rather than passed on, and each key of
+    /// [`FIELDS_WITHOUT_A_LEGACY_KEY`] skipped as the unknown key it was.
+    struct LegacyKeys<'l, A> {
+        inner: A,
+        legacy: &'l mut Vec<(&'static str, bool)>,
+    }
+
+    impl<'de, A: MapAccess<'de>> MapAccess<'de> for LegacyKeys<'_, A> {
+        type Error = A::Error;
+
+        fn next_key_seed<K: DeserializeSeed<'de>>(
+            &mut self,
+            seed: K,
+        ) -> Result<Option<K::Value>, A::Error> {
+            while let Some(key) = self.inner.next_key::<String>()? {
+                if let Some(name) = LEGACY_BACKEND_KEY_NAMES
+                    .into_iter()
+                    .find(|name| *name == key)
+                {
+                    let value = self.inner.next_value::<bool>()?;
+                    self.legacy.push((name, value));
+                } else if FIELDS_WITHOUT_A_LEGACY_KEY.contains(&key.as_str()) {
+                    self.inner.next_value::<IgnoredAny>()?;
+                } else {
+                    return seed.deserialize(StringDeserializer::new(key)).map(Some);
+                }
+            }
+            Ok(None)
+        }
+
+        fn next_value_seed<V: DeserializeSeed<'de>>(
+            &mut self,
+            seed: V,
+        ) -> Result<V::Value, A::Error> {
+            self.inner.next_value_seed(seed)
+        }
+    }
+
+    /// The top-level array's elements, in the legacy form's positions. The
+    /// derived `Config` deserializer asks for one element per field in
+    /// declaration order; at [`Config::backend`] this reads up to fifteen
+    /// elements as the legacy backend keys, and neither field it asks for
+    /// there and at [`Config::shared_dequeue_timers`] takes an element. Both
+    /// get a placeholder, which [`super::from_legacy_backend_json`] replaces.
+    struct LegacyPositions<'f, 'l, A> {
+        inner: A,
+        fields: std::slice::Iter<'f, String>,
+        legacy: &'l mut Vec<(&'static str, bool)>,
+    }
+
+    impl<'de, A: SeqAccess<'de>> SeqAccess<'de> for LegacyPositions<'_, '_, A> {
+        type Error = A::Error;
+
+        fn next_element_seed<T: DeserializeSeed<'de>>(
+            &mut self,
+            seed: T,
+        ) -> Result<Option<T::Value>, A::Error> {
+            match self.fields.next().map(String::as_str) {
+                Some("backend") => {
+                    for name in LEGACY_BACKEND_KEY_NAMES {
+                        match self.inner.next_element::<bool>()? {
+                            Some(value) => self.legacy.push((name, value)),
+                            // A short array; the rest take their defaults.
+                            None => break,
+                        }
+                    }
+                    let placeholder = serde_json::to_value(BackendCapabilities::PTRACE)
+                        .map_err(<A::Error as de::Error>::custom)?;
+                    seed.deserialize(placeholder)
+                        .map(Some)
+                        .map_err(<A::Error as de::Error>::custom)
+                }
+                Some("shared_dequeue_timers") => {
+                    seed.deserialize(BoolDeserializer::new(false)).map(Some)
+                }
+                _ => self.inner.next_element_seed(seed),
+            }
+        }
+    }
+
+    /// The names of `Config`'s serialized fields in declaration order, which
+    /// is the order its derived deserializer reads an array in: no field is
+    /// serialized without being deserialized or the reverse.
+    ///
+    /// The configuration serialized to learn them is built by Clap from no
+    /// arguments, with every environment binding removed before parsing.
+    /// Building `Config::command()` still reads the bound variables (Clap's
+    /// `Arg::env` reads a variable's value when the binding is made), but
+    /// removing the bindings discards those values, so no ambient value
+    /// reaches the parse. `Config::default()` would instead parse
+    /// HERMIT_EPOCH, HERMIT_PRNG and HERMIT_SCHED_SEED, and exit the process
+    /// when one of them does not parse; the legacy decoder was not affected
+    /// by any of them.
+    fn config_field_order() -> serde_json::Result<Vec<String>> {
+        let config = environment_free_config().map_err(<serde_json::Error as de::Error>::custom)?;
+        let json = serde_json::to_string(&config)?;
+        Ok(serde_json::from_str::<KeyOrder>(&json)?.0)
+    }
+
+    /// `Config` as Clap builds it from no arguments and no environment.
+    fn environment_free_config() -> Result<Config, clap::Error> {
+        use clap::CommandFactory;
+        use clap::FromArgMatches;
+
+        let matches = Config::command()
+            .mut_args(|arg| arg.env(None::<&'static str>))
+            .try_get_matches_from(["config-field-order"])?;
+        Config::from_arg_matches(&matches)
+    }
+
+    /// The keys of a JSON object, in the order they appear.
+    pub(super) struct KeyOrder(pub(super) Vec<String>);
+
+    impl<'de> Deserialize<'de> for KeyOrder {
+        fn deserialize<D: de::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct KeyOrderVisitor;
+
+            impl<'de> Visitor<'de> for KeyOrderVisitor {
+                type Value = KeyOrder;
+
+                fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                    formatter.write_str("a JSON object")
+                }
+
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<KeyOrder, A::Error> {
+                    let mut keys = Vec::new();
+                    while let Some(key) = map.next_key::<String>()? {
+                        map.next_value::<IgnoredAny>()?;
+                        keys.push(key);
+                    }
+                    Ok(KeyOrder(keys))
+                }
+            }
+
+            deserializer.deserialize_map(KeyOrderVisitor)
+        }
+    }
+
+    pub(super) struct ConfigSerializer<'c, S> {
+        pub(super) inner: S,
+        pub(super) config: &'c Config,
+    }
+
+    pub(super) struct ConfigFields<'c, S> {
+        inner: S,
+        config: &'c Config,
+        wrote_backend_keys: bool,
+    }
+
+    fn not_a_config<E: serde::ser::Error>() -> E {
+        E::custom("the legacy backend JSON encoding applies only to a Detcore Config")
+    }
+
+    impl<'c, S: Serializer> Serializer for ConfigSerializer<'c, S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+        type SerializeSeq = Impossible<S::Ok, S::Error>;
+        type SerializeTuple = Impossible<S::Ok, S::Error>;
+        type SerializeTupleStruct = Impossible<S::Ok, S::Error>;
+        type SerializeTupleVariant = Impossible<S::Ok, S::Error>;
+        type SerializeMap = Impossible<S::Ok, S::Error>;
+        type SerializeStruct = ConfigFields<'c, S::SerializeStruct>;
+        type SerializeStructVariant = Impossible<S::Ok, S::Error>;
+
+        fn is_human_readable(&self) -> bool {
+            self.inner.is_human_readable()
+        }
+
+        fn serialize_struct(
+            self,
+            name: &'static str,
+            len: usize,
+        ) -> Result<Self::SerializeStruct, S::Error> {
+            // Two fields are replaced by fifteen keys.
+            let len = len + legacy_backend_keys(self.config).len() - 2;
+            Ok(ConfigFields {
+                inner: self.inner.serialize_struct(name, len)?,
+                config: self.config,
+                wrote_backend_keys: false,
+            })
+        }
+
+        fn serialize_bool(self, _: bool) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_i8(self, _: i8) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_i16(self, _: i16) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_i32(self, _: i32) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_i64(self, _: i64) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_u8(self, _: u8) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_u16(self, _: u16) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_u32(self, _: u32) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_u64(self, _: u64) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_f32(self, _: f32) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_f64(self, _: f64) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_char(self, _: char) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_str(self, _: &str) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_bytes(self, _: &[u8]) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_none(self) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_some<T: ?Sized + Serialize>(self, _: &T) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_unit(self) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_unit_struct(self, _: &'static str) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_unit_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+        ) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_newtype_struct<T: ?Sized + Serialize>(
+            self,
+            _: &'static str,
+            _: &T,
+        ) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_newtype_variant<T: ?Sized + Serialize>(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: &T,
+        ) -> Result<S::Ok, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_seq(self, _: Option<usize>) -> Result<Self::SerializeSeq, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_tuple(self, _: usize) -> Result<Self::SerializeTuple, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_tuple_struct(
+            self,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleStruct, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_tuple_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeTupleVariant, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_map(self, _: Option<usize>) -> Result<Self::SerializeMap, S::Error> {
+            Err(not_a_config())
+        }
+        fn serialize_struct_variant(
+            self,
+            _: &'static str,
+            _: u32,
+            _: &'static str,
+            _: usize,
+        ) -> Result<Self::SerializeStructVariant, S::Error> {
+            Err(not_a_config())
+        }
+    }
+
+    impl<S: SerializeStruct> SerializeStruct for ConfigFields<'_, S> {
+        type Ok = S::Ok;
+        type Error = S::Error;
+
+        fn serialize_field<T: ?Sized + Serialize>(
+            &mut self,
+            key: &'static str,
+            value: &T,
+        ) -> Result<(), S::Error> {
+            match key {
+                "backend" => {
+                    for (legacy_key, legacy_value) in legacy_backend_keys(self.config) {
+                        self.inner.serialize_field(legacy_key, &legacy_value)?;
+                    }
+                    self.wrote_backend_keys = true;
+                    Ok(())
+                }
+                // Written above as `kvm_shared_dequeue_timers`.
+                "shared_dequeue_timers" => Ok(()),
+                _ => self.inner.serialize_field(key, value),
+            }
+        }
+
+        fn skip_field(&mut self, key: &'static str) -> Result<(), S::Error> {
+            self.inner.skip_field(key)
+        }
+
+        fn end(self) -> Result<S::Ok, S::Error> {
+            if !self.wrote_backend_keys {
+                return Err(S::Error::custom(
+                    "Config serialized no `backend` field to replace with the legacy backend keys",
+                ));
+            }
+            self.inner.end()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1468,13 +2079,448 @@ mod tests {
     #[test]
     fn default_backend_capabilities_match_instrumented_backends() {
         let config = Config::default();
-        assert!(!config.backend_reports_physical_process_exits);
-        assert!(config.backend_tracks_process_children);
-        assert!(config.backend_runs_exit_robust_list);
-        assert!(!config.backend_requires_thread_directed_process_signals);
-        assert!(config.backend_supports_parked_write_signal_interruption);
-        assert!(!config.backend_virtualizes_capability_prctls);
-        assert!(!config.backend_defers_vfork_child_registration);
+        assert_eq!(config.backend, BackendCapabilities::PTRACE);
+        assert!(!config.backend.reports_physical_process_exits);
+        assert!(config.backend.tracks_process_children);
+        assert!(config.backend.runs_exit_robust_list);
+        assert!(!config.backend.requires_thread_directed_process_signals);
+        assert!(config.backend.supports_parked_write_signal_interruption);
+        assert!(!config.backend.virtualizes_capability_prctls);
+        assert!(!config.backend.defers_vfork_child_registration);
+        assert!(!config.shared_dequeue_timers);
+    }
+
+    #[test]
+    fn a_config_without_backend_capabilities_deserializes_as_ptrace() {
+        let mut encoded = serde_json::to_value(Config::default()).unwrap();
+        let fields = encoded.as_object_mut().unwrap();
+        assert!(fields.remove("backend").is_some());
+        assert!(fields.remove("shared_dequeue_timers").is_some());
+        let decoded: Config = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.backend, BackendCapabilities::PTRACE);
+        assert!(!decoded.shared_dequeue_timers);
+    }
+
+    /// Ptrace's capabilities with the robust-list transition and parked-write
+    /// signal interruption both left to Detcore: the value the retired
+    /// ptrace-hosted LiteInst runtime reported. No backend reports it now, but
+    /// the legacy keys can still express it, so the round trips keep it.
+    fn ptrace_without_exit_transitions() -> BackendCapabilities {
+        let mut backend = BackendCapabilities::PTRACE;
+        backend.runs_exit_robust_list = false;
+        backend.supports_parked_write_signal_interruption = false;
+        backend
+    }
+
+    #[test]
+    fn legacy_backend_json_round_trips_every_backend_capabilities_constant() {
+        for (name, backend) in [
+            ("PTRACE", BackendCapabilities::PTRACE),
+            ("E9PATCH", BackendCapabilities::E9PATCH),
+            (
+                "ptrace without exit transitions",
+                ptrace_without_exit_transitions(),
+            ),
+            ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
+            ("SABRE", BackendCapabilities::SABRE),
+            ("DBT", BackendCapabilities::DBT),
+            ("KVM", BackendCapabilities::KVM),
+        ] {
+            for shared_dequeue_timers in [false, true] {
+                let sent = Config {
+                    backend,
+                    shared_dequeue_timers,
+                    ..Config::default()
+                };
+                let json = to_legacy_backend_json(&sent).unwrap();
+                let received = from_legacy_backend_json(&json).unwrap();
+                assert_eq!(received.backend, backend, "{name}");
+                assert_eq!(
+                    received.shared_dequeue_timers, shared_dequeue_timers,
+                    "{name}"
+                );
+                assert_eq!(
+                    serde_json::to_string(&received).unwrap(),
+                    serde_json::to_string(&sent).unwrap(),
+                    "{name}"
+                );
+                assert_eq!(to_legacy_backend_json(&received).unwrap(), json, "{name}");
+            }
+        }
+    }
+
+    /// Each legacy key decodes as the `Config` field it was: absent, it takes
+    /// that field's default, and set alone, it gives exactly the capabilities
+    /// that replaced Detcore's reads of that field.
+    #[test]
+    fn legacy_backend_keys_decode_as_the_fields_they_were() {
+        let ptrace_json = to_legacy_backend_json(&Config::default()).unwrap();
+        let ptrace: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&ptrace_json).unwrap();
+        let keys = legacy_backend_keys(&Config::default());
+
+        let mut absent = ptrace.clone();
+        for (key, _) in keys {
+            assert!(absent.remove(key).is_some(), "{key}");
+        }
+        let decoded = from_legacy_backend_json(&serde_json::to_string(&absent).unwrap()).unwrap();
+        assert_eq!(decoded.backend, BackendCapabilities::PTRACE);
+        assert!(!decoded.shared_dequeue_timers);
+
+        for (key, ptrace_value) in keys {
+            let mut expected = BackendCapabilities::PTRACE;
+            let mut expected_shared_dequeue_timers = false;
+            match key {
+                "cpuid_virtualized_by_backend" => expected.virtualizes_cpuid = true,
+                "backend_supports_madvise" => expected.supports_madvise = false,
+                "discover_live_file_metadata" => {
+                    expected.tool_shares_guest_descriptor_table = true;
+                    expected.rediscovers_descriptors_after_exec = true;
+                    expected.internal_pipe_turns_are_host_timed = true;
+                    expected.loopback_pollers_yield_to_peers = true;
+                }
+                "detect_host_clock_futex_timeouts" => {
+                    expected.guest_clock_reads_bypass_backend = true
+                }
+                "syscall_clobbers_virtualized_by_backend" => {
+                    expected.virtualizes_syscall_clobbers = true
+                }
+                "cancel_killed_thread_rpcs" => expected.needs_killed_thread_rpc_cancellation = true,
+                "backend_reports_physical_process_exits" => {
+                    expected.reports_physical_process_exits = true;
+                    expected.signal_interrupts_external_syscalls = true;
+                }
+                "backend_tracks_process_children" => expected.tracks_process_children = false,
+                "backend_runs_exit_robust_list" => expected.runs_exit_robust_list = false,
+                "backend_requires_thread_directed_process_signals" => {
+                    expected.requires_thread_directed_process_signals = true
+                }
+                "backend_is_kvm" => {
+                    expected.provides_process_signal_control = true;
+                    expected.emulates_child_waits = true;
+                    expected.failed_gettimeofday_may_store_host_time = false;
+                    expected.refuses_nonleader_exec_with_enosys = true;
+                    expected.user_address_limit =
+                        Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
+                }
+                "kvm_shared_dequeue_timers" => expected_shared_dequeue_timers = true,
+                "backend_supports_parked_write_signal_interruption" => {
+                    expected.supports_parked_write_signal_interruption = false
+                }
+                "backend_virtualizes_capability_prctls" => {
+                    expected.virtualizes_capability_prctls = true
+                }
+                "backend_defers_vfork_child_registration" => {
+                    expected.defers_vfork_child_registration = true
+                }
+                other => panic!("no expectation for legacy key {other}"),
+            }
+            let mut flipped = ptrace.clone();
+            flipped.insert(key.to_owned(), serde_json::Value::Bool(!ptrace_value));
+            let decoded =
+                from_legacy_backend_json(&serde_json::to_string(&flipped).unwrap()).unwrap();
+            assert_eq!(decoded.backend, expected, "{key}");
+            assert_eq!(
+                decoded.shared_dequeue_timers, expected_shared_dequeue_timers,
+                "{key}"
+            );
+        }
+    }
+
+    /// A legacy key failed the parse when it held the wrong type, or appeared
+    /// twice, while it was a `Config` field; it still does, so a reader falls
+    /// back as it did.
+    #[test]
+    fn a_legacy_backend_key_of_the_wrong_type_fails_the_parse() {
+        let json = to_legacy_backend_json(&Config::default()).unwrap();
+        assert!(from_legacy_backend_json(&json).is_ok());
+        for (key, value) in legacy_backend_keys(&Config::default()) {
+            let field = format!("\"{key}\":{value}");
+            assert_eq!(json.matches(&field).count(), 1, "{field}");
+            let mistyped = json.replacen(&field, &format!("\"{key}\":0"), 1);
+            assert!(from_legacy_backend_json(&mistyped).is_err(), "{mistyped}");
+            let repeated = json.replacen(&field, &format!("{field},{field}"), 1);
+            assert!(from_legacy_backend_json(&repeated).is_err(), "{repeated}");
+        }
+    }
+
+    /// The entries of a JSON object, in the order they appear.
+    fn ordered_entries(json: &str) -> Vec<(String, serde_json::Value)> {
+        struct Entries(Vec<(String, serde_json::Value)>);
+
+        impl<'de> Deserialize<'de> for Entries {
+            fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+                struct EntriesVisitor;
+
+                impl<'de> serde::de::Visitor<'de> for EntriesVisitor {
+                    type Value = Entries;
+
+                    fn expecting(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                        formatter.write_str("a JSON object")
+                    }
+
+                    fn visit_map<A: serde::de::MapAccess<'de>>(
+                        self,
+                        mut map: A,
+                    ) -> Result<Entries, A::Error> {
+                        let mut entries = Vec::new();
+                        while let Some(entry) = map.next_entry()? {
+                            entries.push(entry);
+                        }
+                        Ok(Entries(entries))
+                    }
+                }
+
+                deserializer.deserialize_map(EntriesVisitor)
+            }
+        }
+
+        serde_json::from_str::<Entries>(json).unwrap().0
+    }
+
+    /// The JSON array of `json`'s values in its key order: the same
+    /// configuration, listed by position.
+    fn positional(json: &str) -> String {
+        let values: Vec<serde_json::Value> = ordered_entries(json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        serde_json::to_string(&values).unwrap()
+    }
+
+    /// The legacy form's positions are `Config`'s fields in declaration order
+    /// with the fifteen legacy keys where `backend` stands and no
+    /// `shared_dequeue_timers`, which is the key order the encoder writes.
+    #[test]
+    fn legacy_positions_are_the_encoded_key_order() {
+        let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
+        assert_eq!(names, LEGACY_BACKEND_KEY_NAMES);
+
+        let fields = serde_json::from_str::<legacy_backend_json::KeyOrder>(
+            &serde_json::to_string(&Config::default()).unwrap(),
+        )
+        .unwrap()
+        .0;
+        let mut expected = Vec::new();
+        for field in &fields {
+            match field.as_str() {
+                "backend" => expected.extend(names.map(str::to_owned)),
+                "shared_dequeue_timers" => {}
+                other => expected.push(other.to_owned()),
+            }
+        }
+        let encoded = to_legacy_backend_json(&Config::default()).unwrap();
+        let keys: Vec<String> = ordered_entries(&encoded)
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, expected);
+        assert_eq!(fields.len() + 13, keys.len());
+    }
+
+    /// Serde reads a derived struct from a JSON array by position, so the
+    /// legacy form could be given as one. Each array reads as the object
+    /// whose values it lists in order, every backend's capabilities included.
+    #[test]
+    fn a_legacy_positional_array_reads_as_the_object_it_lists() {
+        for (name, backend) in [
+            ("PTRACE", BackendCapabilities::PTRACE),
+            ("E9PATCH", BackendCapabilities::E9PATCH),
+            (
+                "ptrace without exit transitions",
+                ptrace_without_exit_transitions(),
+            ),
+            ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
+            ("SABRE", BackendCapabilities::SABRE),
+            ("DBT", BackendCapabilities::DBT),
+            ("KVM", BackendCapabilities::KVM),
+        ] {
+            for shared_dequeue_timers in [false, true] {
+                let sent = Config {
+                    backend,
+                    shared_dequeue_timers,
+                    seed: 7,
+                    chaos: true,
+                    ..Config::default()
+                };
+                let json = to_legacy_backend_json(&sent).unwrap();
+                let array = positional(&json);
+                assert!(array.starts_with('['), "{array}");
+                let received = from_legacy_backend_json(&array).unwrap();
+                assert_eq!(received.backend, backend, "{name}");
+                assert_eq!(
+                    received.shared_dequeue_timers, shared_dequeue_timers,
+                    "{name}"
+                );
+                assert_eq!(received.seed, 7, "{name}");
+                assert!(received.chaos, "{name}");
+                assert_eq!(to_legacy_backend_json(&received).unwrap(), json, "{name}");
+            }
+        }
+    }
+
+    /// An array fails the parse where the legacy form's array did: with an
+    /// element past the last position, with an element of the wrong type, or
+    /// short of a field that has no default. The last position,
+    /// `interrupt_at`, has none, so every shorter array fails.
+    #[test]
+    fn a_malformed_legacy_positional_array_fails_the_parse() {
+        let json = to_legacy_backend_json(&Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        })
+        .unwrap();
+        let entries = ordered_entries(&json);
+        let values: Vec<serde_json::Value> =
+            entries.iter().map(|(_, value)| value.clone()).collect();
+        let parse = |values: &[serde_json::Value]| {
+            from_legacy_backend_json(&serde_json::to_string(values).unwrap())
+        };
+        assert!(parse(&values).is_ok());
+
+        let mut longer = values.clone();
+        longer.push(serde_json::Value::Bool(false));
+        assert!(parse(&longer).is_err());
+
+        assert_eq!(entries.last().unwrap().0, "interrupt_at");
+        for len in 0..values.len() {
+            assert!(parse(&values[..len]).is_err(), "{len} elements");
+        }
+
+        for (position, (key, _)) in entries.iter().enumerate() {
+            if LEGACY_BACKEND_KEY_NAMES.contains(&key.as_str()) || key == "seed" {
+                let mut mistyped = values.clone();
+                mistyped[position] = serde_json::json!("0");
+                assert!(parse(&mistyped).is_err(), "{key}");
+            }
+        }
+    }
+
+    /// Selects the child half of
+    /// [`a_legacy_configuration_decodes_whatever_the_ambient_hermit_settings`] and
+    /// carries the input it decodes.
+    const LEGACY_INPUT_IN_CHILD: &str = "DETCORE_MODEL_TEST_LEGACY_INPUT";
+    /// The legacy object the child's decoded configuration must re-encode as.
+    const LEGACY_EXPECTED_IN_CHILD: &str = "DETCORE_MODEL_TEST_LEGACY_EXPECTED";
+    /// Printed by a child that decoded its input, so that a parent can tell
+    /// that run from one that selected no test.
+    const LEGACY_DECODED_IN_CHILD: &str = "legacy configuration decoded under the ambient settings";
+
+    /// Clap reads HERMIT_EPOCH, HERMIT_PRNG and HERMIT_SCHED_SEED when it
+    /// parses a `Config`, and exits the process when one of them does not
+    /// parse. The legacy decoder read none of them, so a valid legacy object
+    /// or array decodes to the configuration it lists whatever they hold. Each
+    /// decode runs in a child process given those variables unset, set to
+    /// text that does not parse, or set to bytes that are not UTF-8. The child
+    /// builds no `Config` before decoding, which would read them itself.
+    #[test]
+    fn a_legacy_configuration_decodes_whatever_the_ambient_hermit_settings() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+
+        if let Some(input) = std::env::var_os(LEGACY_INPUT_IN_CHILD) {
+            let expected = std::env::var(LEGACY_EXPECTED_IN_CHILD).unwrap();
+            let received = from_legacy_backend_json(input.to_str().unwrap()).unwrap();
+            assert_eq!(received.backend, BackendCapabilities::DBT);
+            assert_eq!(received.seed, 7);
+            assert_eq!(received.sched_seed, Some(11));
+            assert_eq!(to_legacy_backend_json(&received).unwrap(), expected);
+            println!("{LEGACY_DECODED_IN_CHILD}");
+            return;
+        }
+
+        const VARIABLES: [&str; 3] = ["HERMIT_EPOCH", "HERMIT_PRNG", "HERMIT_SCHED_SEED"];
+        let text = OsStr::new("not-a-value");
+        let bytes = OsStr::from_bytes(b"\xff");
+        let mut settings: Vec<Vec<(&str, &OsStr)>> = vec![Vec::new()];
+        for variable in VARIABLES {
+            settings.push(vec![(variable, text)]);
+            settings.push(vec![(variable, bytes)]);
+        }
+        settings.push(VARIABLES.map(|variable| (variable, text)).to_vec());
+        settings.push(VARIABLES.map(|variable| (variable, bytes)).to_vec());
+
+        let object = to_legacy_backend_json(&Config {
+            backend: BackendCapabilities::DBT,
+            seed: 7,
+            sched_seed: Some(11),
+            ..Config::default()
+        })
+        .unwrap();
+        let array = positional(&object);
+        assert!(array.starts_with('['), "{array}");
+        let test = format!(
+            "{}::a_legacy_configuration_decodes_whatever_the_ambient_hermit_settings",
+            module_path!().split_once("::").unwrap().1
+        );
+        for input in [&object, &array] {
+            for setting in &settings {
+                let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+                child
+                    .args(["--exact", &test, "--nocapture"])
+                    .env(LEGACY_INPUT_IN_CHILD, input)
+                    .env(LEGACY_EXPECTED_IN_CHILD, &object);
+                for variable in VARIABLES {
+                    child.env_remove(variable);
+                }
+                for (variable, value) in setting {
+                    child.env(variable, value);
+                }
+                let output = child.output().unwrap();
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    output.status.success()
+                        && stdout.contains(LEGACY_DECODED_IN_CHILD)
+                        && stdout.contains("test result: ok. 1 passed; 0 failed;"),
+                    "decoding {} under {setting:?} did not succeed exactly once: {}\n{stdout}\n{stderr}",
+                    if input.starts_with('[') {
+                        "the array"
+                    } else {
+                        "the object"
+                    },
+                    output.status,
+                );
+            }
+        }
+    }
+
+    /// `backend` and `shared_dequeue_timers` were not keys of the legacy form,
+    /// which ignored every key it did not name. They are still ignored,
+    /// whatever they hold, however often they appear and wherever they stand,
+    /// so the legacy keys alone decide the capabilities. A key the legacy form
+    /// named still fails the parse when it appears twice.
+    #[test]
+    fn keys_the_legacy_form_did_not_name_are_ignored() {
+        let sent = Config {
+            backend: BackendCapabilities::DBT,
+            seed: 7,
+            ..Config::default()
+        };
+        let json = to_legacy_backend_json(&sent).unwrap();
+        let kvm = serde_json::to_string(&BackendCapabilities::KVM).unwrap();
+        for extra in [
+            r#""backend":null"#.to_owned(),
+            r#""shared_dequeue_timers":null"#.to_owned(),
+            r#""backend":null,"shared_dequeue_timers":null"#.to_owned(),
+            format!(r#""backend":{kvm},"shared_dequeue_timers":true"#),
+            r#""backend":7,"backend":{"supports_madvise":false}"#.to_owned(),
+            r#""shared_dequeue_timers":"yes","shared_dequeue_timers":true"#.to_owned(),
+            r#""no_such_field":[1,{"x":null}]"#.to_owned(),
+        ] {
+            for edited in [
+                json.replacen('{', &format!("{{{extra},"), 1),
+                format!("{},{extra}}}", &json[..json.len() - 1]),
+            ] {
+                let received = from_legacy_backend_json(&edited).unwrap();
+                assert_eq!(received.backend, BackendCapabilities::DBT, "{edited}");
+                assert!(!received.shared_dequeue_timers, "{edited}");
+                assert_eq!(to_legacy_backend_json(&received).unwrap(), json, "{edited}");
+            }
+        }
+
+        let repeated = format!("{},\"seed\":7}}", &json[..json.len() - 1]);
+        assert!(from_legacy_backend_json(&repeated).is_err());
     }
 
     #[test]
@@ -1678,6 +2724,26 @@ mod tests {
             ..Default::default()
         };
         config.validate();
+    }
+
+    #[test]
+    fn config_fingerprint_encodes_the_backend_capabilities_optional_field() {
+        // `BackendCapabilities` lives in Reverie, outside the fingerprinted
+        // sources, so only its encoding can reveal a change to it. Its one
+        // optional field must be present in the encoded default, or a change
+        // to that field's width would encode as the same bare `None`.
+        let config = config_wire_default();
+        assert!(config.backend.user_address_limit.is_some());
+        let encode = |config: &Config| {
+            bincode::serde::encode_to_vec(config, bincode::config::legacy()).unwrap()
+        };
+        let without_limit = config
+            .clone()
+            .with_backend(|backend| backend.user_address_limit = None);
+        assert_eq!(
+            encode(&config).len(),
+            encode(&without_limit).len() + std::mem::size_of::<u64>()
+        );
     }
 
     #[test]

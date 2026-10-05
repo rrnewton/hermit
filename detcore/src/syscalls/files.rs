@@ -57,10 +57,10 @@ use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Device;
+use crate::resources::HOST_TIMED_INTERNAL_PIPE_IO_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
-use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
 use crate::tool_global::*;
@@ -307,13 +307,13 @@ fn pipe_capacity_failure(
     Some(PipeCapacityFailure { created_fds, error })
 }
 
-fn should_tag_sabre_internal_pipe_io(
-    discovers_live_metadata: bool,
+fn should_tag_host_timed_internal_pipe_io(
+    internal_pipe_turns_are_host_timed: bool,
     fd_type: FdType,
     physically_nonblocking: bool,
     logically_nonblocking: bool,
 ) -> bool {
-    discovers_live_metadata
+    internal_pipe_turns_are_host_timed
         && fd_type == FdType::Pipe
         && physically_nonblocking
         && !logically_nonblocking
@@ -1868,11 +1868,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 // physical zero-length read of that placeholder returns EINVAL
                 // even though the logical random-device read must return zero.
                 require_random_device_read_access(status_flags)?;
-                let policy = if guest.config().backend_is_kvm {
-                    crate::iovecs::UserAddressPolicy::Kvm
-                } else {
-                    crate::iovecs::UserAddressPolicy::Native
-                };
+                let policy = crate::iovecs::UserAddressPolicy::for_backend(
+                    guest.config().backend.user_address_limit,
+                );
                 // vfs_read still checks access_ok for a zero-length buffer:
                 // NULL is valid, but an address beyond TASK_SIZE is EFAULT.
                 policy.validate(&[crate::iovecs::ImportedIovec {
@@ -1921,13 +1919,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::R);
-            if should_tag_sabre_internal_pipe_io(
-                guest.config().discover_live_file_metadata,
+            if should_tag_host_timed_internal_pipe_io(
+                guest.config().backend.internal_pipe_turns_are_host_timed,
                 fd_type,
                 physically_nonblocking,
                 logically_nonblocking,
             ) {
-                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+                request.fyi(HOST_TIMED_INTERNAL_PIPE_IO_FYI);
             }
             resource_request(guest, request).await;
         }
@@ -2411,13 +2409,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
-            if should_tag_sabre_internal_pipe_io(
-                guest.config().discover_live_file_metadata,
+            if should_tag_host_timed_internal_pipe_io(
+                guest.config().backend.internal_pipe_turns_are_host_timed,
                 fd_type,
                 physically_nonblocking,
                 logically_nonblocking,
             ) {
-                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+                request.fyi(HOST_TIMED_INTERNAL_PIPE_IO_FYI);
             }
             resource_request(guest, request).await;
         }
@@ -2623,13 +2621,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
-            if should_tag_sabre_internal_pipe_io(
-                guest.config().discover_live_file_metadata,
+            if should_tag_host_timed_internal_pipe_io(
+                guest.config().backend.internal_pipe_turns_are_host_timed,
                 fd_type,
                 physically_nonblocking,
                 logically_nonblocking,
             ) {
-                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+                request.fyi(HOST_TIMED_INTERNAL_PIPE_IO_FYI);
             }
             resource_request(guest, request).await;
         }
@@ -2683,11 +2681,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         rng_output: &mut Option<Vec<crate::io_buffers::BufferExtent>>,
     ) -> Result<i64, Error> {
         require_random_device_read_access(detfd.status_flags())?;
-        let policy = if guest.config().backend_is_kvm {
-            crate::iovecs::UserAddressPolicy::Kvm
-        } else {
-            crate::iovecs::UserAddressPolicy::Native
-        };
+        let policy = crate::iovecs::UserAddressPolicy::for_backend(
+            guest.config().backend.user_address_limit,
+        );
         let iovecs = crate::iovecs::import_read_iovecs(
             &guest.memory(),
             request.address,
@@ -2743,13 +2739,13 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::R);
-            if should_tag_sabre_internal_pipe_io(
-                guest.config().discover_live_file_metadata,
+            if should_tag_host_timed_internal_pipe_io(
+                guest.config().backend.internal_pipe_turns_are_host_timed,
                 fd_type,
                 physically_nonblocking,
                 logically_nonblocking,
             ) {
-                request.fyi(SABRE_INTERNAL_PIPE_IO_FYI);
+                request.fyi(HOST_TIMED_INTERNAL_PIPE_IO_FYI);
             }
             resource_request(guest, request).await;
         }
@@ -5992,7 +5988,7 @@ mod test {
     use super::parse_timer_slack_write;
     use super::pipe_capacity_failure;
     use super::random_device_lseek_result;
-    use super::should_tag_sabre_internal_pipe_io;
+    use super::should_tag_host_timed_internal_pipe_io;
     use super::unix_autobind_address;
     use super::unix_autobind_addrlen;
     use super::vectored_offset;
@@ -6076,31 +6072,31 @@ mod test {
 
     #[test]
     fn sabre_pipe_marker_requires_nonblockize_retry_semantics() {
-        assert!(should_tag_sabre_internal_pipe_io(
+        assert!(should_tag_host_timed_internal_pipe_io(
             true,
             FdType::Pipe,
             true,
             false
         ));
-        assert!(!should_tag_sabre_internal_pipe_io(
+        assert!(!should_tag_host_timed_internal_pipe_io(
             true,
             FdType::Pipe,
             true,
             true
         ));
-        assert!(!should_tag_sabre_internal_pipe_io(
+        assert!(!should_tag_host_timed_internal_pipe_io(
             true,
             FdType::Pipe,
             false,
             false
         ));
-        assert!(!should_tag_sabre_internal_pipe_io(
+        assert!(!should_tag_host_timed_internal_pipe_io(
             false,
             FdType::Pipe,
             true,
             false
         ));
-        assert!(!should_tag_sabre_internal_pipe_io(
+        assert!(!should_tag_host_timed_internal_pipe_io(
             true,
             FdType::Regular,
             true,

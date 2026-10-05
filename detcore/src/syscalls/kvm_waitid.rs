@@ -651,10 +651,16 @@ mod tests {
         }
     }
 
-    // Use the actual child-state initializer, including its KVM/serial gate,
+    // Use the actual child-state initializer, including its emulated-wait/serial gate,
     // rather than manufacturing a ready notification in the component.
     fn unpublished_child(guest: &mut CompletionGuest) -> crate::ThreadState<()> {
-        guest.config.backend_is_kvm = true;
+        // The five behaviours the old `backend_is_kvm` identity flag selected.
+        guest.config.backend.provides_process_signal_control = true;
+        guest.config.backend.emulates_child_waits = true;
+        guest.config.backend.refuses_nonleader_exec_with_enosys = true;
+        guest.config.backend.failed_gettimeofday_may_store_host_time = false;
+        guest.config.backend.user_address_limit =
+            Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
         guest.config.sequentialize_threads = true;
         guest.thread.clone_flags = Some(syscalls::CloneFlags::empty());
         let tool = <Detcore as reverie::Tool>::new(Pid::from_raw(3), &guest.config);
@@ -673,7 +679,7 @@ mod tests {
         use std::future::Future;
         use std::task::Context;
 
-        use super::super::complete_selected_kvm_wait4;
+        use super::super::complete_selected_emulated_wait4;
 
         let child = DetPid::from_raw(7);
         for options in [
@@ -696,7 +702,8 @@ mod tests {
                     if prepublished {
                         assert!(exited.record_exited_child_process_cpu_time(child));
                     }
-                    let mut future = Box::pin(complete_selected_kvm_wait4(&mut guest, call, child));
+                    let mut future =
+                        Box::pin(complete_selected_emulated_wait4(&mut guest, call, child));
                     if !prepublished {
                         let wakes = Arc::new(CpuPublicationWake::default());
                         let waker = std::task::Waker::from(Arc::clone(&wakes));
@@ -726,7 +733,7 @@ mod tests {
                     );
                     assert!(!guest.thread.has_exited_child_process_cpu_time(child));
                     assert!(matches!(
-                        complete_selected_kvm_wait4(&mut guest, call, child).await,
+                        complete_selected_emulated_wait4(&mut guest, call, child).await,
                         Err(Error::Tool(_))
                     ));
                     assert_eq!(guest.injected_wait4.len(), 1);
@@ -741,7 +748,7 @@ mod tests {
 
     #[tokio::test]
     async fn wait4_completion_refuses_impossible_selected_results_without_consumption() {
-        use super::super::complete_selected_kvm_wait4;
+        use super::super::complete_selected_emulated_wait4;
         let parent = DetPid::from_raw(3);
         let child = DetPid::from_raw(7);
         let spec = terminal_child_wait_spec(ChildWaitSelector::Exact(child), parent, libc::WEXITED);
@@ -750,7 +757,7 @@ mod tests {
             let mut guest = CompletionGuest::new(result, false);
             let mut exited = unpublished_child(&mut guest);
             assert!(exited.record_exited_child_process_cpu_time(child));
-            let actual = complete_selected_kvm_wait4(&mut guest, call, child).await;
+            let actual = complete_selected_emulated_wait4(&mut guest, call, child).await;
             assert!(matches!(actual, Err(Error::Tool(_))));
             assert_eq!(guest.injected_wait4.len(), 1);
             assert_eq!(guest.injected_wait4[0].pid(), 7);
@@ -776,19 +783,19 @@ mod tests {
         use std::future::Future;
         use std::task::Context;
 
-        use super::super::complete_selected_kvm_wait4;
+        use super::super::complete_selected_emulated_wait4;
         let parent = DetPid::from_raw(3);
         let child = DetPid::from_raw(7);
         let spec = terminal_child_wait_spec(ChildWaitSelector::Exact(child), parent, libc::WEXITED);
         let call = syscalls::Wait4::new().with_pid(7);
         let mut guest = CompletionGuest::new(Ok(7), false);
         assert!(matches!(
-            complete_selected_kvm_wait4(&mut guest, call, child).await,
+            complete_selected_emulated_wait4(&mut guest, call, child).await,
             Err(Error::Tool(_))
         ));
         assert!(guest.injected_wait4.is_empty());
         let mut exited = unpublished_child(&mut guest);
-        let mut future = Box::pin(complete_selected_kvm_wait4(&mut guest, call, child));
+        let mut future = Box::pin(complete_selected_emulated_wait4(&mut guest, call, child));
         let mut cx = Context::from_waker(futures::task::noop_waker_ref());
         assert!(future.as_mut().poll(&mut cx).is_pending());
         drop(future);
@@ -808,7 +815,7 @@ mod tests {
         );
         assert!(exited.record_exited_child_process_cpu_time(child));
         assert_eq!(
-            complete_selected_kvm_wait4(&mut guest, call, child)
+            complete_selected_emulated_wait4(&mut guest, call, child)
                 .await
                 .unwrap(),
             7

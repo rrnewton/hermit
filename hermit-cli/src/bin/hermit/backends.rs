@@ -929,8 +929,12 @@ pub(super) fn run_dbt(
              remove --no-sequentialize-threads (or --strace-only) to run under --backend dbt",
         ));
     }
-    // Guest-visible, so it must keep the legacy key layout; see
-    // `hermit::dbt_detconfig_json`.
+    // The guest sees this string in its environment, so it keeps the encoding
+    // it had before the backend facts moved into `Config::backend` and before
+    // three constant switches were deleted; see `hermit::dbt_detconfig_json`.
+    // The DBT runtime decodes the backend facts back out of it (here DBT's
+    // own); when the string is absent or does not parse, it uses the strict
+    // default's facts, which are ptrace's.
     let config_json = hermit::dbt_detconfig_json(config).map_err(|error| {
         Error::msg(format!(
             "failed to serialize the Detcore config for the DBT backend: {error}"

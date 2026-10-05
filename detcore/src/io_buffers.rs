@@ -1148,9 +1148,15 @@ mod event_tests {
             detlog_heap: false,
             detlog_stack: false,
             detlog_regs: false,
-            backend_is_kvm: true,
-            syscall_clobbers_virtualized_by_backend: true,
-            ..Config::default()
+            ..Config::default().with_backend(|backend| {
+                // The five behaviours the old `backend_is_kvm` identity flag selected.
+                backend.provides_process_signal_control = true;
+                backend.emulates_child_waits = true;
+                backend.refuses_nonleader_exec_with_enosys = true;
+                backend.failed_gettimeofday_may_store_host_time = false;
+                backend.user_address_limit = Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
+                backend.virtualizes_syscall_clobbers = true;
+            })
         };
         let pid = DetPid::from_raw(1);
         let mut thread = ThreadState::new(pid, &config, ());
