@@ -5511,7 +5511,7 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 3700);
+        assert_eq!(parsed.cells.len(), 3144);
         assert_eq!(
             parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
             [&ParityBackend::Dbt]
@@ -5521,6 +5521,8 @@ mod tests {
         // took the snapshot to 1,099,771 bytes: every test lists one line per
         // backend, and the 139 rr-compat-only replay tests added 556
         // not-applicable lines. 854 KB of it is the 2857 not-applicable lines.
+        // Folding those replay cells into the rows' own tests removed the 556
+        // lines again (902,846 bytes, 3144 cells, on 2026-10-04).
         assert!(
             committed.len() < 1536 * 1024,
             "{PARITY_CELLS_PATH} is {} bytes; it must stay well under 2 MiB",

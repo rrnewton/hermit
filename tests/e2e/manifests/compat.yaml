@@ -1,13 +1,13 @@
 schema: 3
 bucket: compat
 # The portable strict compatibility corpus: real programs installed on the
-# validation host, each run under Hermit's verify. The rows labelled
-# sabre-compat-only, and every row's SaBRe cell (`focused`), belong to the SaBRe
-# run type alone; the full validation runs the ptrace cells of the other rows.
-# The `variants` entries repeat the strict corpus's rows as strict-<row> tests
-# for the strict run type alone, on ptrace with none of the relaxations below,
-# and the rr lane's rows as rr-<row> tests whose one cell records and replays
-# the program on ptrace, for the rr run type alone.
+# validation host, each run under Hermit's verify. The verify cells of the rows
+# labelled sabre-compat-only, and every row's SaBRe cell (`focused`), belong to
+# the SaBRe run type alone; the full validation runs the ptrace verify cells of
+# the other rows. The rr lane's rows also have a replay cell (`replay`) that
+# records and replays the program on ptrace, for the rr run type alone. The
+# `variants` entry repeats the strict corpus's rows as strict-<row> tests for
+# the strict run type alone, on ptrace with none of the relaxations below.
 # The scheduled super suite still runs its four heavy rows (rustc, javac, java,
 # node) on ptrace from ci/compat/corpus-strict.json. Lane settings are stated
 # once below and every row is expanded into an ordinary test recipe
@@ -201,6 +201,97 @@ corpus:
         [
           java, javac
         ]
+  # The rr run type (scripts/validate.rs --rr-compat-only): every program
+  # the rr lane listed as passing record/replay (its 139
+  # RR_COMPAT_PASSING_LABELS) recorded and replayed once on ptrace by
+  # `hermit record start --verify`, as the replay cell of the row's own
+  # test. Until 2026-10-02 these were 139 separate rrcompat.<program>
+  # validation nodes running the argv of ci/compat/corpus-rr.json, whose rows
+  # are this corpus's rows of the same labels (the -direct rows for lua, perl
+  # and df); that file and the label list went with them. Until 2026-10-04
+  # each was a separate compat/rr-<row> test. Like the rr lane's command, the
+  # replay cell runs without the verify settings above: no Hermit flags,
+  # comparator or TMPDIR, and one attempt.
+  replay:
+    label: rr-compat-only
+    timeout_seconds: 60
+    cpu_timeout_seconds: 59
+    slow_reason: >-
+      The rr lane gave every program 60 wall seconds, the wall bound its
+      generated rrcompat.<program> validation nodes carried. Their 120 CPU
+      seconds cannot be stated: a cell's CPU budget must stay below its
+      wall bound, so it is 59. Measured on 2026-10-02 with the release
+      Hermit built from 97ae0ccef: the 51 programs that pass took 56.7
+      wall seconds together through the retired command
+    except:
+      - reason: >-
+          Not in the rr lane's corpus (ci/compat/corpus-rr.json until
+          2026-10-02), so the rr lane never ran it
+        rows:
+          [
+            xmllint, shell-build, clang, gzip-roundtrip, bzip2-roundtrip,
+            xz-roundtrip, zstd-roundtrip, tar-roundtrip, cpio-roundtrip,
+            wget-localhost, curl-localhost, ip, ss, netlink-route,
+            netlink-sock-diag, lscpu, lsof, time, javac, timeout, truncate,
+            fallocate, setfattr, setfacl, mountpoint, diff3, basenc,
+            dos2unix, envsubst, col, colrm, crc32, uuidgen, shred, sync,
+            pathchk, namei, getconf, cscope, flex, msgfmt, msgunfmt
+          ]
+      - reason: >-
+          The rr corpus ran these programs with the argv of the -direct
+          row of the same name, which this run type runs instead
+        rows: [lua, perl, df]
+      - reason: >-
+          In the rr lane's corpus but not in its measured passing set
+          (RR_COMPAT_PASSING_LABELS), so the rr lane generated no node for
+          it
+        rows:
+          [
+            jq, cargo, curl, cmake, pkg-config, m4, zip-unzip, mktemp,
+            iostat, vmstat-disk, pidstat-disk, findmnt, sysctl-random-uuid,
+            sar-resource-tables, lsirq, mpstat-softirqs, lsmod, numastat,
+            numactl-hardware, ps, vmstat, top, kill, pgrep, pkill, patch,
+            chown, ln, csplit, rustc
+          ]
+      - reason: >-
+          Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
+          validate.sh): replay of thread 13 diverges near event 132, where
+          the header lookup is a readlink in one run and a newfstatat of
+          the precompiled .gch in the other
+        rows: [g++]
+      - reason: >-
+          Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
+          validate.sh): replay of thread 11 diverges near event 3, in the
+          execveat of the rm -rf teardown
+        rows: [ar]
+      - reason: >-
+          Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
+          validate.sh): replay diverges at replayer/mod.rs:776 after a
+          clean record
+        rows: [strip, gprof, gcov]
+    # Measured red on 2026-10-02 with the release Hermit built from
+    # 97ae0ccef: through this bucket, and through the retired
+    # rrcompat.<program> command, where each exits 122 at its first clock
+    # read (81 at gettimeofday, 4 at clock_gettime, 3 at time).
+    unselected:
+      - result: replay-failure
+        evidence: https://github.com/rrnewton/hermit/issues/3519
+        reason: >-
+          Record mode refuses every clock read (gettimeofday,
+          clock_gettime, time) as an unsupported syscall, and the recording
+          stops with exit status 122
+        rows:
+          [
+            addr2line, as, awk, bash, bc, bzip2, cal, c++filt, chmod, chrt,
+            cmp, column, comm, cp, cpp, cut, date, dc, dd, diff, egrep,
+            elfedit, env, expand, factor, fgrep, file, find, flock, fmt,
+            fold, gcc, git, grep, gzip, hexdump, iconv, install, java, join,
+            ld, logger, logname, lua-direct, make, mkdir, mkfifo, mv, nl, nm,
+            node, objcopy, objdump, od, paste, perl-direct, ptx, python3,
+            ranlib, readelf, rev, rm, rmdir, ruby, sed, seq, shuf, size,
+            sort, split, sqlite3, strings, tac, tar, taskset, tcl, tee,
+            touch, tr, tsort, tty, unexpand, uniq, xargs, xxd, xz, "yes", zstd
+          ]
   # The strict run type (scripts/validate.rs --strict-compat-only): every row
   # of ci/compat/corpus-strict.json once more on ptrace, under --strict and
   # Hermit's stripped --verify with none of the corpus's relaxations, so
@@ -253,96 +344,6 @@ corpus:
             Diverges at a read whose content differs between runs (syscall
             134, after the JVM's .hotspotrc lookup)
           rows: [java, javac]
-    # The rr run type (scripts/validate.rs --rr-compat-only): every program
-    # the rr lane listed as passing record/replay (its 139
-    # RR_COMPAT_PASSING_LABELS) recorded and replayed once on ptrace by
-    # `hermit record start --verify`. Until 2026-10-02 these were 139
-    # separate rrcompat.<program> validation nodes running the argv of
-    # ci/compat/corpus-rr.json, whose rows are this corpus's rows of the same
-    # labels (the -direct rows for lua, perl and df); that file and the label
-    # list went with them.
-    - label: rr-compat-only
-      id_prefix: rr-
-      description: Real program recorded and replayed by Hermit
-      mode: replay
-      timeout_seconds: 60
-      cpu_timeout_seconds: 59
-      slow_reason: >-
-        The rr lane gave every program 60 wall seconds, the wall bound its
-        generated rrcompat.<program> validation nodes carried. Their 120 CPU
-        seconds cannot be stated: a cell's CPU budget must stay below its
-        wall bound, so it is 59. Measured on 2026-10-02 with the release
-        Hermit built from 97ae0ccef: the 51 programs that pass took 56.7
-        wall seconds together through the retired command
-      except:
-        - reason: >-
-            Not in the rr lane's corpus (ci/compat/corpus-rr.json until
-            2026-10-02), so the rr lane never ran it
-          rows:
-            [
-              xmllint, shell-build, clang, gzip-roundtrip, bzip2-roundtrip,
-              xz-roundtrip, zstd-roundtrip, tar-roundtrip, cpio-roundtrip,
-              wget-localhost, curl-localhost, ip, ss, netlink-route,
-              netlink-sock-diag, lscpu, lsof, time, javac, timeout, truncate,
-              fallocate, setfattr, setfacl, mountpoint, diff3, basenc,
-              dos2unix, envsubst, col, colrm, crc32, uuidgen, shred, sync,
-              pathchk, namei, getconf, cscope, flex, msgfmt, msgunfmt
-            ]
-        - reason: >-
-            The rr corpus ran these programs with the argv of the -direct
-            row of the same name, which this run type runs instead
-          rows: [lua, perl, df]
-        - reason: >-
-            In the rr lane's corpus but not in its measured passing set
-            (RR_COMPAT_PASSING_LABELS), so the rr lane generated no node for
-            it
-          rows:
-            [
-              jq, cargo, curl, cmake, pkg-config, m4, zip-unzip, mktemp,
-              iostat, vmstat-disk, pidstat-disk, findmnt, sysctl-random-uuid,
-              sar-resource-tables, lsirq, mpstat-softirqs, lsmod, numastat,
-              numactl-hardware, ps, vmstat, top, kill, pgrep, pkill, patch,
-              chown, ln, csplit, rustc
-            ]
-        - reason: >-
-            Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
-            validate.sh): replay of thread 13 diverges near event 132, where
-            the header lookup is a readlink in one run and a newfstatat of
-            the precompiled .gch in the other
-          rows: [g++]
-        - reason: >-
-            Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
-            validate.sh): replay of thread 11 diverges near event 3, in the
-            execveat of the rm -rf teardown
-          rows: [ar]
-        - reason: >-
-            Measured to fail record/replay (RR_COMPAT_KNOWN_FAILURES in
-            validate.sh): replay diverges at replayer/mod.rs:776 after a
-            clean record
-          rows: [strip, gprof, gcov]
-      # Measured red on 2026-10-02 with the release Hermit built from
-      # 97ae0ccef: through this bucket, and through the retired
-      # rrcompat.<program> command, where each exits 122 at its first clock
-      # read (81 at gettimeofday, 4 at clock_gettime, 3 at time).
-      unselected:
-        - result: replay-failure
-          evidence: https://github.com/rrnewton/hermit/issues/3519
-          reason: >-
-            Record mode refuses every clock read (gettimeofday,
-            clock_gettime, time) as an unsupported syscall, and the recording
-            stops with exit status 122
-          rows:
-            [
-              addr2line, as, awk, bash, bc, bzip2, cal, c++filt, chmod, chrt,
-              cmp, column, comm, cp, cpp, cut, date, dc, dd, diff, egrep,
-              elfedit, env, expand, factor, fgrep, file, find, flock, fmt,
-              fold, gcc, git, grep, gzip, hexdump, iconv, install, java, join,
-              ld, logger, logname, lua-direct, make, mkdir, mkfifo, mv, nl, nm,
-              node, objcopy, objdump, od, paste, perl-direct, ptx, python3,
-              ranlib, readelf, rev, rm, rmdir, ruby, sed, seq, shuf, size,
-              sort, split, sqlite3, strings, tac, tar, taskset, tcl, tee,
-              touch, tr, tsort, tty, unexpand, uniq, xargs, xxd, xz, "yes", zstd
-            ]
   rows:
     - {label: "echo", argv: ["/bin/echo", "hermit-compat"]}
     - {label: "true", argv: ["/usr/bin/true"]}
