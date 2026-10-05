@@ -787,7 +787,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3219) retains all 817 prior
     // identities (`cargo nextest list --profile ci` lists 823 = 818 plus the
     // five real_random_ PMU cases this node skips).
-    ("test.hermit_unit", 818),
+    // The four dbt_detconfig_tests::* cases, which pin HERMIT_DBT_DETCONFIG to
+    // its 806cf2fa38d1 bytes after the deleted Detcore switches
+    // (https://github.com/rrnewton/hermit/issues/3765), retain all 818 prior
+    // identities (`cargo nextest list --profile ci` lists 827 = 822 plus the
+    // same five skipped real_random_ cases).
+    ("test.hermit_unit", 822),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1139,7 +1144,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/issues/1845 test.
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3219 test.
-    ("test.hermit_unit_on_host", 818),
+    // The host twin selects the same four
+    // https://github.com/rrnewton/hermit/issues/3765 dbt_detconfig_tests.
+    ("test.hermit_unit_on_host", 822),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
