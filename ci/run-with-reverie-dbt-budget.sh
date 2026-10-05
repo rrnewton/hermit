@@ -900,7 +900,15 @@ fi
 # recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
 # second budget are unchanged. Source identity carries the calibration;
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=addd1a04e31601c01afaf1442580563e8213ad6c
+# CARRY TO 5cd0b28a878f41c49fafc69bee740807846e5ffa (2026-10-05): from
+# addd1a04e31601c01afaf1442580563e8213ad6c; all seven recorded DynamoRIO build inputs
+# are byte-identical. The two-commit range (d639265a, 5cd0b28a) changes only
+# reverie-liteinst, not reverie-dbt or the DynamoRIO build recipe.
+# The available-CPU cap and f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
+# second budget are unchanged. Source identity carries the calibration;
+# no new timing sample or >=5-sample replacement claim is made.
+expected_pin=5cd0b28a878f41c49fafc69bee740807846e5ffa
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
