@@ -1219,8 +1219,12 @@ fn variable_words(lines: &[&str], name: &str) -> Vec<String> {
             };
             match word {
                 "override" | "export" | "private" => rest = tail.trim_start(),
+                // make also accepts the operator attached to the name, as in
+                // `define NAME+=`, so compare the name without it.
                 "define" | "undefine" => {
-                    return tail.split_whitespace().next() == Some(name);
+                    return tail.split_whitespace().next().map(|word| {
+                        word.trim_end_matches(['=', ':', '+', '?', '!'])
+                    }) == Some(name);
                 }
                 _ => break,
             }
@@ -1864,6 +1868,8 @@ mod tests {
             "private LINT_CHECK_TARGETS = lint-check-unlisted\n",
             "override export LINT_CHECK_TARGETS+=lint-check-unlisted\n",
             "define LINT_CHECK_TARGETS +=\nlint-check-unlisted\nendef\n",
+            "define LINT_CHECK_TARGETS+=\nlint-check-unlisted\nendef\n",
+            "define LINT_CHECK_TARGETS:=\nlint-check-unlisted\nendef\n",
             "undefine LINT_CHECK_TARGETS\n",
         ];
         for form in forms {

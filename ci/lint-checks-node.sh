@@ -175,18 +175,27 @@ make: *** [lint-checks] Error 1"
     # ---- trace lines: on the node's stderr, never in make's captured output ----
     local tdir
     tdir=$(mktemp -d)
-    printf 'lint-check-ok:\n\t@echo out-ok\nlint-check-bad:\n\t@exit 7\n' >"$tdir/Makefile"
+    # lint-check-env fails if the trace plumbing reaches the checker itself:
+    # the target name, the descriptor variable, or descriptor 9.
+    {
+        printf 'lint-check-ok:\n\t@echo out-ok\n'
+        printf 'lint-check-bad:\n\t@exit 7\n'
+        # shellcheck disable=SC2016 # $$ is make's escape for a shell $.
+        printf 'lint-check-env:\n\t@%s\n' \
+            'if [ -n "$${LINT_CHECK_TARGET+x}$${LINT_CHECKS_TRACE_FD+x}" ] || [ -e /proc/self/fd/9 ]; then exit 9; fi; echo env-clean'
+    } >"$tdir/Makefile"
     trace_run() {
         open_trace_fd
         export LINT_CHECKS_TRACE_FD=9
         env -u MAKEFLAGS -u MFLAGS -u MAKELEVEL make -C "$tdir" --no-print-directory \
-            -k -Otarget lint-check-ok lint-check-bad "${trace_make_args[@]}" \
+            -k -Otarget lint-check-ok lint-check-bad lint-check-env "${trace_make_args[@]}" \
             >"$tdir/out" 2>&1
     }
     (trace_run) 2>"$tdir/err" || :  # lint-check-bad makes make exit 2
     for want in 'lint-checks: started  lint-check-ok: echo out-ok' \
         'lint-checks: finished lint-check-ok: exit 0 after' \
-        'lint-checks: finished lint-check-bad: exit 7 after'; do
+        'lint-checks: finished lint-check-bad: exit 7 after' \
+        'lint-checks: finished lint-check-env: exit 0 after'; do
         if ! grep -qF -- "$want" "$tdir/err"; then
             echo "FAIL: trace: stderr lacks '${want}'" >&2
             failures=$((failures + 1))
@@ -200,10 +209,29 @@ make: *** [lint-checks] Error 1"
         echo 'FAIL: trace: the recipes did not run as make would run them' >&2
         failures=$((failures + 1))
     fi
+    if ! grep -qx 'env-clean' "$tdir/out"; then
+        echo 'FAIL: trace: the checker saw the target name, the descriptor variable, or descriptor 9' >&2
+        failures=$((failures + 1))
+    fi
     rm -f "$tdir/out"
     (trace_run) 2>&- || :
     if ! grep -qx 'out-ok' "$tdir/out"; then
         echo 'FAIL: trace: with stderr closed the checkers did not run' >&2
+        failures=$((failures + 1))
+    fi
+    # Descriptor 9 on a pipe nobody reads: every trace write fails with EPIPE or
+    # SIGPIPE, and the checkers must still run. The read end opened with the
+    # FIFO is closed before make starts, so no reader exists at any write.
+    local keep_fd write_fd
+    rm -f "$tdir/out"
+    mkfifo "$tdir/fifo"
+    exec {keep_fd}<>"$tdir/fifo"
+    exec {write_fd}>"$tdir/fifo"
+    exec {keep_fd}>&-
+    (trace_run) 2>&"$write_fd" || :
+    exec {write_fd}>&-
+    if ! grep -qx 'out-ok' "$tdir/out" || ! grep -qx 'env-clean' "$tdir/out"; then
+        echo 'FAIL: trace: with stderr on a pipe nobody reads the checkers did not run' >&2
         failures=$((failures + 1))
     fi
     rm -rf -- "$tdir"
