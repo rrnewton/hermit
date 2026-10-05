@@ -2252,6 +2252,48 @@ fn with_runner_log_dir<T>(
     result
 }
 
+/// A summary row, tagged `role: reference` when it is a parity reference's,
+/// so no reader can take it for sampled evidence.
+fn tagged_row(mut row: JsonValue, is_reference: bool) -> JsonValue {
+    if is_reference {
+        row["role"] = json!("reference");
+    }
+    row
+}
+
+/// The base node slugs (without a repetition suffix) of the parity references
+/// a retained run's run.json lists. Readers that walk `cells/` skip them: a
+/// reference is not sampled evidence. A directory without run.json, such as
+/// a rows-only collection from another runner, has none.
+fn retained_reference_slugs(results: &Path) -> Result<BTreeSet<String>, String> {
+    let path = results.join("run.json");
+    let text = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(BTreeSet::new());
+        }
+        Err(error) => return Err(format!("cannot read {}: {error}", path.display())),
+    };
+    let run: JsonValue = serde_json::from_str(&text)
+        .map_err(|error| format!("invalid {}: {error}", path.display()))?;
+    let references: Vec<CellId> = match run.get("reference_cells") {
+        None => Vec::new(),
+        Some(value) => serde_json::from_value(value.clone())
+            .map_err(|error| format!("{} reference_cells: {error}", path.display()))?,
+    };
+    Ok(references
+        .iter()
+        .map(|cell| cell_run_slug(cell, None))
+        .collect())
+}
+
+/// A `cells/` directory name without its `-repetition-NNNN` suffix.
+fn base_cell_dir_name(name: &str) -> &str {
+    name.rsplit_once("-repetition-")
+        .filter(|(_, number)| number.len() == 4 && number.bytes().all(|byte| byte.is_ascii_digit()))
+        .map_or(name, |(base, _)| base)
+}
+
 /// The `cell.*` tags of every planned cell run: each repetition of the
 /// selected cells and of a sample's parity references.
 fn planned_cell_run_tags(metadata: &RunMetadata) -> BTreeSet<String> {
@@ -2905,6 +2947,8 @@ fn host_inapplicable_cell(dir: &Path, slug: &str) -> Option<CellId> {
 /// collection) through the same per-repetition fold and table as summarize.
 fn verdicts(dir: &Path, repetitions: usize) -> Result<(), String> {
     let cells_dir = dir.join("cells");
+    // A pressure run's parity references are not sampled cells.
+    let references = retained_reference_slugs(dir)?;
     let mut by_slug = BTreeMap::<String, BTreeMap<usize, PathBuf>>::new();
     for entry in fs::read_dir(&cells_dir)
         .map_err(|error| format!("cannot read {}: {error}", cells_dir.display()))?
@@ -2923,6 +2967,9 @@ fn verdicts(dir: &Path, repetitions: usize) -> Result<(), String> {
                 entry.path().display()
             ));
         };
+        if references.contains(&slug) {
+            continue;
+        }
         by_slug
             .entry(slug)
             .or_default()
@@ -3561,6 +3608,9 @@ fn collect_series_rows(
     let mut result_files = Vec::new();
     collect_series_result_files(results, &mut result_files)?;
     result_files.sort();
+    // A parity reference is not a sampled cell, so its rows never reach the
+    // series as cell results; its pair's parity row carries what it measured.
+    let references = retained_reference_slugs(results)?;
     let mut collected: Vec<(String, CellResult)> = Vec::new();
     for result_file in result_files {
         let dir_name = result_file
@@ -3569,6 +3619,9 @@ fn collect_series_rows(
             .ok_or_else(|| format!("{} has no result-directory name", result_file.display()))?
             .to_string_lossy()
             .into_owned();
+        if references.contains(base_cell_dir_name(&dir_name)) {
+            continue;
+        }
         let rows = if current_timeouts {
             read_current_result_rows(&result_file)?
         } else {
@@ -8179,6 +8232,7 @@ fn verify_repetition_summary_json(
         if cell.mode != parity::PARITY_MODE
             || cell.backend != parity::PARITY_REFERENCE_BACKEND
             || sampled.contains(&cell)
+            || reference.get("role") != Some(&json!("reference"))
         {
             return Err(format!(
                 "summary JSON reports {} as a parity reference; a reference is a ptrace verify cell the sample does not hold",
@@ -9244,7 +9298,8 @@ fn summarize(
                             Some(recorded) => recorded,
                             None => expected_result,
                         };
-                        output_rows.push(json!({
+                        output_rows.push(tagged_row(
+                            json!({
                             "cell": cell,
                             "repetition": repetition,
                             "attempt": earlier_row.attempt,
@@ -9271,11 +9326,14 @@ fn summarize(
                             "runner_output_log": runner_output_log,
                             "oom_proven_by_runner_and_attempt_marker": false,
                             "timeout_proven_by_runner_and_attempt_marker": false,
-                        }));
+                            }),
+                            is_reference,
+                        ));
                     }
                 }
             }
-            output_rows.push(json!({
+            output_rows.push(tagged_row(
+                json!({
                 "cell": cell,
                 "repetition": repetition,
                 "attempt": attempt,
@@ -9304,7 +9362,9 @@ fn summarize(
                 "runner_output_log": runner_output_log,
                 "oom_proven_by_runner_and_attempt_marker": proven_oom,
                 "timeout_proven_by_runner_and_attempt_marker": proven_timeout,
-            }));
+                }),
+                is_reference,
+            ));
         }
     }
     println!("{}", summary_heading(&metadata));
@@ -19323,7 +19383,8 @@ fn self_test(root: &Path) -> Result<(), String> {
     };
     let mut with_reference = summary_accounting.clone();
     with_reference["rows"] = json!([{"cell": candidate_cell}]);
-    with_reference["reference_cells"] = json!([{"cell": reference_cell, "result": "pass"}]);
+    with_reference["reference_cells"] =
+        json!([{"cell": reference_cell, "result": "pass", "role": "reference"}]);
     verify_repetition_summary_json(&with_reference, 3, 1)
         .map_err(|e| format!("a summary with a parity reference was refused: {e}"))?;
     let mut candidate_as_reference = with_reference.clone();
@@ -19334,7 +19395,13 @@ fn self_test(root: &Path) -> Result<(), String> {
     anonymous_reference["reference_cells"] = json!([{"result": "pass"}]);
     let mut scalar_references = with_reference.clone();
     scalar_references["reference_cells"] = json!(1);
+    let mut untagged_reference = with_reference.clone();
+    untagged_reference["reference_cells"][0]
+        .as_object_mut()
+        .expect("reference fixture is an object")
+        .remove("role");
     for (label, forged) in [
+        ("untagged", &untagged_reference),
         ("candidate backend", &candidate_as_reference),
         ("sampled row", &sampled_reference),
         ("missing cell", &anonymous_reference),
@@ -24178,6 +24245,167 @@ mod pressure_sample_tests {
         );
         record.validate().unwrap();
         cleanup.remove().unwrap();
+    }
+
+    /// Parity references never count as sampled evidence. A repeated
+    /// one-cell sample that runs a reference beside its candidate gives the
+    /// same summary counts, the same series rows and the same rows-only
+    /// verdicts as a run of the candidate alone; every reference row in
+    /// summary.json carries `role: reference`, and no sampled row does.
+    #[test]
+    fn reference_rows_are_tagged_and_change_no_count() {
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let pairs = snapshot_parity_pairs(&root).unwrap();
+        let (seed, candidate) = one_cell_sample_seed(&root, |cell| {
+            cell.mode == parity::PARITY_MODE
+                && parity::ParityBackend::parse(&cell.backend)
+                    .is_ok_and(|backend| backend.inputs_not_equalizable().is_none())
+                && pairs.contains(&(cell.test.clone(), cell.backend.clone()))
+        });
+        let reference = reference_of(&candidate);
+        // Plan, plant and summarize one series; return its summary, series
+        // rows and rows-only verdict document.
+        let run = |label: &str,
+                   selection: CellSelection,
+                   with_reference: bool|
+         -> (
+            JsonValue,
+            Vec<(String, CellResult)>,
+            JsonValue,
+            SelfTestDirectory,
+        ) {
+            let (results, cleanup) = parity_self_test_results(label);
+            let (mut metadata, _) = write_plan_after_scorecard_check(
+                &checked,
+                &results,
+                &results.join("dag.json"),
+                &selection,
+            )
+            .unwrap();
+            assert_eq!(metadata.cells, vec![candidate.clone()], "{label}");
+            metadata.source_tree_dirty = false;
+            fs::write(
+                results.join("run.json"),
+                serde_json::to_vec(&metadata).unwrap(),
+            )
+            .unwrap();
+            let mut planted = vec![plant_matched_verify_cell(
+                &results,
+                &candidate,
+                &metadata,
+                Some(1),
+            )];
+            if with_reference {
+                planted.push(plant_matched_verify_cell(
+                    &results,
+                    &reference,
+                    &metadata,
+                    Some(1),
+                ));
+            }
+            let evidence: BTreeMap<String, RunnerEvidence> = planted
+                .iter()
+                .map(|slug| {
+                    (
+                        format!("cell.{slug}"),
+                        RunnerEvidence {
+                            seen: true,
+                            ok: true,
+                            ..RunnerEvidence::default()
+                        },
+                    )
+                })
+                .collect();
+            let _ = summarize(&root, &results, false, Some(&evidence), true);
+            let summary: JsonValue =
+                serde_json::from_slice(&fs::read(results.join("summary.json")).unwrap()).unwrap();
+            let series = collect_series_rows(&results, true).unwrap();
+            let _ = verdicts(&results, 1);
+            let verdict_document: JsonValue =
+                serde_json::from_slice(&fs::read(results.join("verdicts.json")).unwrap()).unwrap();
+            (summary, series, verdict_document, cleanup)
+        };
+        let (with, with_series, with_verdicts, with_cleanup) = run(
+            "reference-role-with",
+            CellSelection {
+                sample: Some(1),
+                seed: Some(seed),
+                repetitions: Some(1),
+                run_timeout_seconds: Some(1_000_000),
+                ..CellSelection::default()
+            },
+            true,
+        );
+        let cells_file = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-reference-role-cells-{}.jsonl",
+            std::process::id()
+        ));
+        fs::write(
+            &cells_file,
+            canonical_cells_jsonl(std::slice::from_ref(&candidate)).unwrap(),
+        )
+        .unwrap();
+        let (without, without_series, without_verdicts, without_cleanup) = run(
+            "reference-role-without",
+            CellSelection {
+                cells_file: Some(cells_file.clone()),
+                repetitions: Some(1),
+                run_timeout_seconds: Some(1_000_000),
+                ..CellSelection::default()
+            },
+            false,
+        );
+        fs::remove_file(&cells_file).unwrap();
+        assert_eq!(
+            with["reference_cells"].as_array().map(Vec::len),
+            Some(1),
+            "{with}"
+        );
+        assert_eq!(with["reference_cells"][0]["cell"], json!(reference));
+        assert_eq!(
+            with["reference_cells"][0]["role"],
+            json!("reference"),
+            "{with}"
+        );
+        for summary in [&with, &without] {
+            for row in summary["rows"].as_array().unwrap() {
+                assert_ne!(row["role"], json!("reference"), "{row}");
+            }
+        }
+        for field in [
+            "selected_cells",
+            "attempted",
+            "retried_repetitions",
+            "repeated_result",
+            "repeated_cells",
+            "pass_candidates",
+        ] {
+            assert_eq!(with[field], without[field], "{field}");
+        }
+        let results_of = |summary: &JsonValue| -> Vec<(JsonValue, JsonValue)> {
+            summary["rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| (row["cell"].clone(), row["result"].clone()))
+                .collect()
+        };
+        assert_eq!(results_of(&with), results_of(&without));
+        let series_cells = |series: &[(String, CellResult)]| -> Vec<(String, Option<String>)> {
+            series
+                .iter()
+                .map(|(_, row)| (row.test.clone(), row.backend.clone()))
+                .collect()
+        };
+        assert_eq!(series_cells(&with_series), series_cells(&without_series));
+        assert_eq!(with_verdicts["cells"], without_verdicts["cells"]);
+        with_cleanup.remove().unwrap();
+        without_cleanup.remove().unwrap();
     }
 }
 
