@@ -683,7 +683,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests and retains all 907 prior identities: six
     // network_trace::tests::network_trace_v2_* tests and ten
     // network_engine::tests (907 + 16 = 923).
-    ("test.regular_crates", 923),
+    // Opt-in network record and replay
+    // (https://github.com/rrnewton/hermit/pull/3778) adds
+    // network_engine::tests::requests_record_pulls_at_the_time_they_answer and
+    // fd::tests::open_file_ids_display_their_kind_sequence_and_creator and
+    // retains all 923 prior identities (923 + 2 = 925, measured with
+    // cargo nextest list --profile ci).
+    ("test.regular_crates", 925),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -799,7 +805,18 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // its 806cf2fa38d1 bytes after the deleted Detcore switches
     // (https://github.com/rrnewton/hermit/issues/3765), retain all 818 prior
     // identities: 818 + 4 = 822.
-    ("test.hermit_unit", 822),
+    // The six --record-networking/--replay-networking parsing tests of
+    // https://github.com/rrnewton/hermit/pull/3778 in hermit's run.rs
+    // (network_trace_is_off_without_a_networking_flag,
+    // record_networking_selects_record_mode_and_host_networking,
+    // record_networking_refuses_a_missing_directory_and_conflicting_flags,
+    // replay_networking_reads_the_trace_before_the_guest_starts,
+    // replay_networking_adopts_the_trace_epoch_and_refuses_another and
+    // network_trace_is_reached_through_a_descriptor_opened_before_the_container)
+    // retain all 822 prior identities: 822 + 6 = 828 (`cargo nextest list
+    // --profile ci` lists 833 = 828 plus the five real_random_ PMU cases this
+    // node skips).
+    ("test.hermit_unit", 828),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -883,7 +900,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_local::timeslice_tests::
     // child_cpu_publication_replacement_rejects_stale_owner_and_snapshot)
     // retain all 904 prior identities: measured 931 = 904 + 27.
-    ("test.detcore_unit", 931),
+    // The six syscalls::network_trace::tests of
+    // https://github.com/rrnewton/hermit/pull/3778 (sockaddr_round_trips_both_families,
+    // sockaddr_matches_the_libc_layout, other_families_and_short_buffers_are_not_traced,
+    // lowat_normalisation_follows_linux,
+    // poll_reports_requested_events_and_the_unmaskable_ones and
+    // host_pulls_classify_like_the_recorder) retain all 931 prior identities
+    // (the validate node at 27ee682e6475 executed 937, all passing).
+    ("test.detcore_unit", 937),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1116,7 +1140,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3226): 881 + 23 = 904.
     // The same 27 https://github.com/rrnewton/hermit/pull/3266 tests as
     // test.detcore_unit retain all 904 prior identities: measured 931.
-    ("test.detcore_unit_on_host", 931),
+    // The same six https://github.com/rrnewton/hermit/pull/3778 tests retain
+    // all 931.
+    ("test.detcore_unit_on_host", 937),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1153,7 +1179,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3219 test.
     // The host twin selects the same four
     // https://github.com/rrnewton/hermit/issues/3765 dbt_detconfig_tests.
-    ("test.hermit_unit_on_host", 822),
+    // The host twin selects the same six https://github.com/rrnewton/hermit/pull/3778 tests.
+    ("test.hermit_unit_on_host", 828),
     ("test.ignored_syscall_regressions_on_host", 4),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
@@ -1209,8 +1236,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // so 899 of the 902 prior identities are retained (+3).
     // The two timed-out-match stress_series tests listed there: 905 + 2 = 907.
     // The 16 https://github.com/rrnewton/hermit/pull/3777 tests listed there
-    // retain all 907.
-    ("test.regular_crates_on_host", 923),
+    // retain all 907, and the two https://github.com/rrnewton/hermit/pull/3778
+    // tests listed there retain all 923.
+    ("test.regular_crates_on_host", 925),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
