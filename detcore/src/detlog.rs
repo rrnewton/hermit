@@ -113,15 +113,185 @@ pub fn record_suffix(event: DetLogEvent) -> String {
 /// target `tracing` would give the record), the record suffix, and the message.
 pub type DetlogForwarder = for<'a> fn(&str, &str, fmt::Arguments<'a>);
 
-static FORWARDER: OnceLock<DetlogForwarder> = OnceLock::new();
+/// Which emitting modules a forwarded process may send DETLOG records from.
+///
+/// WHY THIS IS NEEDED. In-process, `detlog!` asks `tracing` whether INFO is
+/// enabled at its own callsite, whose target is the emitting module's path, so
+/// a target-scoped filter such as `RUST_LOG=warn,detcore::random=info` keeps
+/// the `detcore::random` records and drops the rest. A tool running in another
+/// process (SaBRe's guest plugin) has no subscriber to ask, so the coordinator
+/// must hand it the same per-target answer. A single yes/no for the whole
+/// `detcore` target either drops the scoped records or emits records the
+/// coordinator's filter suppresses; both make the backends' logs disagree.
+///
+/// The policy holds the coordinator's answer at a default target that no
+/// directive names and at every target a directive names. Its answer for a
+/// record is the entry for the longest named target that is a string prefix of
+/// the record's target, else the default. That is `tracing-subscriber`'s rule
+/// for target directives: the most specific matching directive decides, and
+/// any target a directive could match through is itself an entry here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForwardPolicy {
+    default: bool,
+    targets: Vec<(String, bool)>,
+}
+
+impl ForwardPolicy {
+    /// Forward every record. This is the policy the historical encoding `1`
+    /// denoted, and the one a coordinator logging all of Detcore at INFO sends.
+    pub fn all() -> Self {
+        Self {
+            default: true,
+            targets: Vec::new(),
+        }
+    }
+
+    /// Ask the current `tracing` subscriber which targets it takes INFO
+    /// records from.
+    ///
+    /// `directives` is the filter text the subscriber was built from (for the
+    /// CLI, `RUST_LOG`). Only the target names are read from it; whether each is
+    /// enabled is asked of the subscriber, so level overrides added after the
+    /// text (`--log`) are honoured. Unparseable or extra names are harmless:
+    /// probing a target no directive names returns that target's true answer.
+    pub fn from_current_subscriber(directives: &str) -> Self {
+        Self::from_probe(directives, info_enabled_for_target)
+    }
+
+    /// Build a policy from `directives`' target names and an INFO probe.
+    pub fn from_probe(directives: &str, info_enabled: impl Fn(&str) -> bool) -> Self {
+        let mut targets: Vec<(String, bool)> = Vec::new();
+        for directive in directives.split(',') {
+            let target = directive
+                .split(['[', '='])
+                .next()
+                .unwrap_or_default()
+                .trim();
+            if target.is_empty() || targets.iter().any(|(named, _)| named == target) {
+                continue;
+            }
+            targets.push((target.to_owned(), info_enabled(target)));
+        }
+        Self {
+            // No directive target is empty, so only directives that name no
+            // target (the default level) can match this one.
+            default: info_enabled(""),
+            targets,
+        }
+    }
+
+    /// Whether any record could be forwarded under this policy.
+    pub fn forwards_any(&self) -> bool {
+        self.default || self.targets.iter().any(|(_, enabled)| *enabled)
+    }
+
+    /// Whether a record emitted by module `target` is forwarded.
+    pub fn forwards(&self, target: &str) -> bool {
+        self.targets
+            .iter()
+            .filter(|(named, _)| target.starts_with(named.as_str()))
+            .max_by_key(|(named, _)| named.len())
+            .map_or(self.default, |(_, enabled)| *enabled)
+    }
+
+    /// Encode for an environment variable: the default (`1` or `0`) followed by
+    /// `,target=1` or `,target=0` per named target. Directive targets cannot
+    /// contain `,` or `=`. `1` alone is the historical forward-everything value.
+    pub fn encode(&self) -> String {
+        let mut encoded = String::from(if self.default { "1" } else { "0" });
+        for (target, enabled) in &self.targets {
+            encoded.push(',');
+            encoded.push_str(target);
+            encoded.push_str(if *enabled { "=1" } else { "=0" });
+        }
+        encoded
+    }
+
+    /// Decode [`ForwardPolicy::encode`]'s output, refusing anything else.
+    pub fn decode(encoded: &str) -> Result<Self, String> {
+        fn flag(text: &str) -> Option<bool> {
+            match text {
+                "1" => Some(true),
+                "0" => Some(false),
+                _ => None,
+            }
+        }
+        let mut entries = encoded.split(',');
+        let default = entries
+            .next()
+            .and_then(flag)
+            .ok_or_else(|| format!("DETLOG forwarding policy {encoded:?} lacks a 0/1 default"))?;
+        let mut targets = Vec::new();
+        for entry in entries {
+            let parsed = entry
+                .split_once('=')
+                .filter(|(target, _)| !target.is_empty())
+                .and_then(|(target, enabled)| Some((target.to_owned(), flag(enabled)?)));
+            let Some(parsed) = parsed else {
+                return Err(format!(
+                    "DETLOG forwarding policy {encoded:?} has malformed entry {entry:?}"
+                ));
+            };
+            targets.push(parsed);
+        }
+        Ok(Self { default, targets })
+    }
+}
+
+/// Whether the current subscriber would take an INFO event whose target is
+/// `target`, as `tracing::enabled!` at a callsite in that module would answer.
+pub fn info_enabled_for_target(target: &str) -> bool {
+    use tracing::Metadata;
+    use tracing::callsite::DefaultCallsite;
+    use tracing::field::FieldSet;
+    use tracing::level_filters::LevelFilter;
+    use tracing::metadata::Kind;
+
+    // `detlog!` events carry exactly one field, the formatted message.
+    static PROBE_CALLSITE: DefaultCallsite = DefaultCallsite::new(&PROBE_METADATA);
+    static PROBE_METADATA: Metadata<'static> = Metadata::new(
+        "detlog forwarding probe",
+        "detcore::detlog",
+        tracing::Level::INFO,
+        None,
+        None,
+        None,
+        FieldSet::new(&["message"], tracing::callsite::Identifier(&PROBE_CALLSITE)),
+        Kind::EVENT,
+    );
+
+    if tracing::level_filters::STATIC_MAX_LEVEL < LevelFilter::INFO
+        || LevelFilter::current() < LevelFilter::INFO
+    {
+        return false;
+    }
+    let metadata = Metadata::new(
+        "detlog forwarding probe",
+        target,
+        tracing::Level::INFO,
+        None,
+        None,
+        Some(target),
+        FieldSet::new(&["message"], tracing::callsite::Identifier(&PROBE_CALLSITE)),
+        Kind::EVENT,
+    );
+    tracing::dispatcher::get_default(|dispatch| dispatch.enabled(&metadata))
+}
+
+static FORWARDER: OnceLock<(DetlogForwarder, ForwardPolicy)> = OnceLock::new();
 
 /// Installs a process-local sink for deterministic INFO records.
 ///
 /// Backends whose tool runs in another process can use this to transport the
 /// same records that are normally observed through the coordinator's tracing
-/// subscriber. Only the first sink installed in a process is retained.
-pub fn set_forwarder(forwarder: DetlogForwarder) -> Result<(), DetlogForwarder> {
-    FORWARDER.set(forwarder)
+/// subscriber. `policy` is the coordinator's per-target answer; records from
+/// other modules are not forwarded. Only the first sink installed in a process
+/// is retained.
+pub fn set_forwarder(
+    forwarder: DetlogForwarder,
+    policy: ForwardPolicy,
+) -> Result<(), (DetlogForwarder, ForwardPolicy)> {
+    FORWARDER.set((forwarder, policy))
 }
 
 /// The line a forwarded record travels as: the record as the coordinator's tracing
@@ -319,10 +489,13 @@ pub fn drain_forwarded() {
     }
 }
 
-/// Returns whether a process-local deterministic-record sink is installed.
+/// Returns whether a record emitted by module `target` goes to the
+/// process-local deterministic-record sink.
 #[doc(hidden)]
-pub fn forwarding_enabled() -> bool {
-    FORWARDER.get().is_some()
+pub fn forwards_target(target: &str) -> bool {
+    FORWARDER
+        .get()
+        .is_some_and(|(_, policy)| policy.forwards(target))
 }
 
 /// Emits one deterministic record through tracing and the process-local sink. `target` is
@@ -331,7 +504,7 @@ pub fn forwarding_enabled() -> bool {
 #[doc(hidden)]
 pub fn emit_forwarded(target: &str, record_suffix: &str, message: fmt::Arguments<'_>) {
     tracing::info!("DETLOG {}{}", message, record_suffix);
-    FORWARDER.get().expect("forwarder disappeared")(target, record_suffix, message);
+    FORWARDER.get().expect("forwarder disappeared").0(target, record_suffix, message);
 }
 
 /// Macro used to encapsulate tracing should-be-deterministic information.
@@ -339,9 +512,11 @@ pub fn emit_forwarded(target: &str, record_suffix: &str, message: fmt::Arguments
 #[macro_export]
 macro_rules! detlog {
     (event = $event:expr; $($arg:tt)+) => {{
-        if $crate::detlog::forwarding_enabled() || ::tracing::enabled!(::tracing::Level::INFO) {
+        if $crate::detlog::forwards_target(::core::module_path!())
+            || ::tracing::enabled!(::tracing::Level::INFO)
+        {
             let record_suffix = $crate::detlog::record_suffix($event);
-            if $crate::detlog::forwarding_enabled() {
+            if $crate::detlog::forwards_target(::core::module_path!()) {
                 $crate::detlog::emit_forwarded(
                     ::core::module_path!(),
                     &record_suffix,
@@ -361,8 +536,8 @@ macro_rules! detlog {
 ///
 /// WHY THIS IS NEEDED, and why it is a macro rather than a function.
 ///
-/// `detlog!` routes to the process-local forwarder when one is installed and to
-/// `tracing::info!` otherwise. `tracing` does not evaluate a macro's value
+/// `detlog!` routes to the process-local forwarder when one is installed and its
+/// policy takes the calling module's records, and to `tracing::info!` otherwise. `tracing` does not evaluate a macro's value
 /// expressions when the level is disabled, so work done *inside* a `detlog!`
 /// argument is already free when nothing observes the record. Work done
 /// *before* the macro is not, and callers that must prepare something expensive
@@ -379,7 +554,8 @@ macro_rules! detlog {
 #[macro_export]
 macro_rules! detlog_observed {
     () => {
-        $crate::detlog::forwarding_enabled() || ::tracing::enabled!(::tracing::Level::INFO)
+        $crate::detlog::forwards_target(::core::module_path!())
+            || ::tracing::enabled!(::tracing::Level::INFO)
     };
 }
 
@@ -407,6 +583,7 @@ mod tests {
 
     use super::DetLogEvent;
     use super::DetLogRecord;
+    use super::ForwardPolicy;
     use super::RECORD_SEPARATOR;
     use super::record_suffix;
 
@@ -577,5 +754,85 @@ mod tests {
         tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
             assert!(!detlog_observed!());
         });
+    }
+
+    /// Takes WARN from everywhere and INFO only from `detcore::random` and its
+    /// submodules, as `RUST_LOG=warn,detcore::random=info` does.
+    struct RandomAtInfo;
+
+    impl tracing::Subscriber for RandomAtInfo {
+        fn register_callsite(&self, _: &'static Metadata<'static>) -> Interest {
+            Interest::sometimes()
+        }
+        fn enabled(&self, metadata: &Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::WARN
+                || (*metadata.level() <= tracing::Level::INFO
+                    && metadata.target().starts_with("detcore::random"))
+        }
+        fn max_level_hint(&self) -> Option<tracing::level_filters::LevelFilter> {
+            Some(tracing::level_filters::LevelFilter::INFO)
+        }
+        fn new_span(&self, _: &span::Attributes<'_>) -> span::Id {
+            span::Id::from_u64(1)
+        }
+        fn record(&self, _: &span::Id, _: &span::Record<'_>) {}
+        fn record_follows_from(&self, _: &span::Id, _: &span::Id) {}
+        fn event(&self, _: &tracing::Event<'_>) {}
+        fn enter(&self, _: &span::Id) {}
+        fn exit(&self, _: &span::Id) {}
+    }
+
+    /// A forwarded process must emit exactly the records the coordinator's
+    /// subscriber would take in-process. A target-scoped filter used to yield
+    /// no forwarding at all, because the coordinator asked only about the
+    /// generic `detcore` target, so SaBRe silently dropped the scoped records.
+    #[test]
+    fn forward_policy_answers_per_target_as_the_subscriber_does() {
+        let policy = tracing::subscriber::with_default(RandomAtInfo, || {
+            ForwardPolicy::from_current_subscriber("warn,detcore::random=info")
+        });
+        assert!(policy.forwards_any());
+        assert!(policy.forwards("detcore::random"));
+        assert!(policy.forwards("detcore::random::inner"));
+        assert!(!policy.forwards("detcore"));
+        assert!(!policy.forwards("detcore::tool_local"));
+        assert!(!policy.forwards("detcore::scheduler::runqueue"));
+        assert_eq!(policy.encode(), "0,warn=0,detcore::random=1");
+
+        let everything = tracing::subscriber::with_default(AlwaysEnabled, || {
+            ForwardPolicy::from_current_subscriber("")
+        });
+        assert_eq!(everything, ForwardPolicy::all());
+
+        let nothing =
+            tracing::subscriber::with_default(tracing::subscriber::NoSubscriber::default(), || {
+                ForwardPolicy::from_current_subscriber("warn,detcore::random=info")
+            });
+        assert!(!nothing.forwards_any());
+    }
+
+    /// The longest named target that prefixes the record's target decides, by
+    /// string prefix as `tracing-subscriber` matches directives.
+    #[test]
+    fn forward_policy_most_specific_target_decides() {
+        let policy = ForwardPolicy::decode("1,detcore=0,detcore::random=1").unwrap();
+        assert!(policy.forwards("hermit"));
+        assert!(!policy.forwards("detcore"));
+        assert!(!policy.forwards("detcore::tool_local"));
+        assert!(policy.forwards("detcore::random"));
+        assert!(policy.forwards("detcore::randomness"));
+    }
+
+    #[test]
+    fn forward_policy_encoding_round_trips_and_refuses_malformed_values() {
+        assert_eq!(ForwardPolicy::decode("1").unwrap(), ForwardPolicy::all());
+        let policy = ForwardPolicy::decode("0,warn=0,detcore::random=1").unwrap();
+        assert_eq!(ForwardPolicy::decode(&policy.encode()).unwrap(), policy);
+        for malformed in ["", "2", "1,detcore", "1,=1", "1,detcore=2", "1,detcore=1=0"] {
+            assert!(
+                ForwardPolicy::decode(malformed).is_err(),
+                "{malformed:?} must be refused"
+            );
+        }
     }
 }

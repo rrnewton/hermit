@@ -27,6 +27,7 @@ use std::sync::atomic::Ordering;
 pub use detcore::CONFIG_FINGERPRINT_ENV;
 use detcore::Detcore;
 use detcore::config_wire_fingerprint;
+use detcore::detlog::ForwardPolicy;
 use reverie::Signal;
 use reverie_memory::LocalMemory;
 use reverie_memory::MemoryAccess;
@@ -58,16 +59,48 @@ fn coordinator_socket() -> Option<PathBuf> {
     remember_coordinator_socket(&RPC_SOCKET, requested.as_deref())
 }
 
+// The coordinator sends its per-target INFO answer (detcore::detlog::ForwardPolicy), so a
+// target-scoped RUST_LOG keeps the same records here as in-process. A value this plugin
+// cannot read is a coordinator/plugin mismatch: say so rather than drop records silently.
+fn detlog_forward_policy(requested: Option<&OsStr>) -> Result<Option<ForwardPolicy>, String> {
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let requested = requested
+        .to_str()
+        .ok_or_else(|| format!("{DETLOG_FORWARD_ENV} is not UTF-8"))?;
+    ForwardPolicy::decode(requested).map(Some)
+}
+
+// Says why records are not forwarded, on the standard error the forwarder would use,
+// with one raw write as detcore::detlog::forward_to_stderr does.
+fn report_unforwarded_detlogs(error: &str) {
+    let line = format!("hermit SaBRe plugin: no DETLOG forwarding: {error}\n");
+    // SAFETY: `line` is a live, initialized byte slice of the given length.
+    let _ = unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            line.as_ptr().cast::<libc::c_void>(),
+            line.len(),
+        )
+    };
+}
+
 fn init_detlog_forwarder() {
     // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
     let requested = unsafe { sabre::take_private_env(DETLOG_FORWARD_ENV) };
-    if requested.as_deref() != Some(OsStr::new("1")) {
-        return;
-    }
+    let policy = match detlog_forward_policy(requested.as_deref()) {
+        Ok(Some(policy)) => policy,
+        Ok(None) => return,
+        Err(error) => {
+            report_unforwarded_detlogs(&error);
+            return;
+        }
+    };
 
     // Stderr is protected by reverie-sabre and is captured separately during
     // verification.
-    let _ = detcore::detlog::set_forwarder(detcore::detlog::forward_to_stderr);
+    let _ = detcore::detlog::set_forwarder(detcore::detlog::forward_to_stderr, policy);
 }
 
 fn remember_coordinator_socket(
@@ -578,6 +611,23 @@ mod tests {
                 .to_bytes(),
             b"abcdefghijklmno"
         );
+    }
+
+    #[test]
+    fn detlog_forwarding_follows_the_coordinators_per_target_policy() {
+        assert_eq!(detlog_forward_policy(None), Ok(None));
+        // The historical value still forwards everything.
+        assert_eq!(
+            detlog_forward_policy(Some(OsStr::new("1"))),
+            Ok(Some(ForwardPolicy::all()))
+        );
+        let scoped = detlog_forward_policy(Some(OsStr::new("0,detcore::random=1")))
+            .unwrap()
+            .unwrap();
+        assert!(scoped.forwards("detcore::random"));
+        assert!(!scoped.forwards("detcore::tool_local"));
+        assert!(detlog_forward_policy(Some(OsStr::new("yes"))).is_err());
+        assert!(detlog_forward_policy(Some(OsStr::from_bytes(b"\xff"))).is_err());
     }
 
     #[test]

@@ -68,7 +68,13 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
             reverie_liteinst::reserve_tool_output_fd(fd, detcore::detlog::FORWARDING_RETIRED_NOTICE)
         } {
             Ok(_) => {
-                let _ = detcore::detlog::set_forwarder(forward_detlog);
+                // The opt-in carries only the descriptor, not the coordinator's
+                // per-target answer, so every record is forwarded, as before
+                // set_forwarder took a policy.
+                let _ = detcore::detlog::set_forwarder(
+                    forward_detlog,
+                    detcore::detlog::ForwardPolicy::all(),
+                );
             }
             Err(error) => fail(&format!(
                 "cannot reserve the DETLOG forwarding descriptor {fd}: {error}"

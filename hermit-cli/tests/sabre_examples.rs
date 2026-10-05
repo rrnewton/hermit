@@ -733,60 +733,7 @@ fn sabre_and_ptrace_detlogs_agree_through_post_exec() {
     let Some(loader) = sabre_loader() else {
         return;
     };
-    // The live INFO stream, where the host and the SaBRe guest both write their
-    // records as they happen. (A verification's run log does not yet keep that
-    // order: it appends the guest's forwarded records after the host's.)
-    let run = |backend: Option<&Path>, label: &str| {
-        let mut command = Command::new(hermit_binary());
-        command.arg("--log=info");
-        if let Some(loader) = backend {
-            command
-                .env("HERMIT_SABRE_BINARY", loader)
-                .args(["--backend", "sabre"]);
-        }
-        command
-            .arg("run")
-            .args([
-                "--strict",
-                "--no-virtualize-cpuid",
-                "--max-timeslice=disabled",
-                COMPARISON_EPOCH,
-            ])
-            .args(["--", "/bin/true"]);
-        // The INFO stream goes to a file: run_bounded reads its pipes only after
-        // the run exits, and a full stderr pipe stalls the run until it is killed.
-        let stream = tempfile::Builder::new()
-            .prefix("sabre-startup-order-")
-            .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
-            .expect("failed to create the INFO stream file");
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(
-                stream
-                    .reopen()
-                    .expect("failed to reopen the INFO stream file"),
-            )
-            .process_group(0);
-        let mut child = command
-            .spawn()
-            .unwrap_or_else(|error| panic!("failed to start {label}: {error}"));
-        let started = Instant::now();
-        let status = loop {
-            if let Some(status) = child.try_wait().expect("failed to poll the run") {
-                break status;
-            }
-            if started.elapsed() >= Duration::from_secs(45) {
-                kill_process_group(child.id(), label);
-                panic!("{label} did not finish within 45 s");
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        let text = std::fs::read_to_string(stream.path())
-            .unwrap_or_else(|error| panic!("failed to read the {label} INFO stream: {error}"));
-        assert!(status.success(), "{label} failed: {status}\n{text}");
-        detlog_records(&text)
-    };
+    let run = |backend: Option<&Path>, label: &str| live_detlog_records(backend, label, None);
     let through_post_exec = |records: &[String], label: &str| {
         let end = records
             .iter()
@@ -804,6 +751,99 @@ fn sabre_and_ptrace_detlogs_agree_through_post_exec() {
         "ptrace logged no root-thread seeding before post-exec: {expected:#?}"
     );
     assert_eq!(through_post_exec(&sabre, "SaBRe"), expected);
+}
+
+/// SaBRe's guest plugin has no tracing subscriber: it forwards Detcore's
+/// records by the per-target policy the CLI hands it, and ptrace asks the CLI's
+/// subscriber at each record's own module. A target-scoped `RUST_LOG` must
+/// therefore keep the same records on both backends. When the CLI asked only
+/// whether the generic `detcore` target logged INFO, SaBRe forwarded nothing
+/// here and dropped the AT_RANDOM record ptrace prints.
+#[test]
+fn sabre_forwards_a_target_scoped_detlog_filter_as_ptrace_applies_it() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    const SCOPED: &str = "warn,detcore::random=info";
+    let ptrace = live_detlog_records(None, "ptrace /bin/true", Some(SCOPED));
+    let sabre = live_detlog_records(Some(&loader), "SaBRe /bin/true", Some(SCOPED));
+    assert!(
+        ptrace
+            .iter()
+            .any(|record| record.contains("] init auxv AT_RANDOM value to ")),
+        "ptrace logged no AT_RANDOM record under RUST_LOG={SCOPED}: {ptrace:#?}"
+    );
+    assert!(
+        ptrace
+            .iter()
+            .all(|record| record.starts_with("INFO detcore::random: ")),
+        "RUST_LOG={SCOPED} let another module's records through: {ptrace:#?}"
+    );
+    assert_eq!(sabre, ptrace);
+}
+
+/// The DETLOG records of one `/bin/true` run's live INFO stream, where the host
+/// and the SaBRe guest both write their records as they happen. (A
+/// verification's run log does not yet keep that order: it appends the guest's
+/// forwarded records after the host's.) `rust_log` replaces `--log=info` with
+/// that `RUST_LOG` filter.
+fn live_detlog_records(backend: Option<&Path>, label: &str, rust_log: Option<&str>) -> Vec<String> {
+    let mut command = Command::new(hermit_binary());
+    match rust_log {
+        Some(filter) => {
+            command.env("RUST_LOG", filter);
+        }
+        None => {
+            command.arg("--log=info");
+        }
+    }
+    if let Some(loader) = backend {
+        command
+            .env("HERMIT_SABRE_BINARY", loader)
+            .args(["--backend", "sabre"]);
+    }
+    command
+        .arg("run")
+        .args([
+            "--strict",
+            "--no-virtualize-cpuid",
+            "--max-timeslice=disabled",
+            COMPARISON_EPOCH,
+        ])
+        .args(["--", "/bin/true"]);
+    // The INFO stream goes to a file: run_bounded reads its pipes only after
+    // the run exits, and a full stderr pipe stalls the run until it is killed.
+    let stream = tempfile::Builder::new()
+        .prefix("sabre-startup-order-")
+        .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the INFO stream file");
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(
+            stream
+                .reopen()
+                .expect("failed to reopen the INFO stream file"),
+        )
+        .process_group(0);
+    let mut child = command
+        .spawn()
+        .unwrap_or_else(|error| panic!("failed to start {label}: {error}"));
+    let started = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().expect("failed to poll the run") {
+            break status;
+        }
+        if started.elapsed() >= Duration::from_secs(45) {
+            kill_process_group(child.id(), label);
+            panic!("{label} did not finish within 45 s");
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let text = std::fs::read_to_string(stream.path())
+        .unwrap_or_else(|error| panic!("failed to read the {label} INFO stream: {error}"));
+    assert!(status.success(), "{label} failed: {status}\n{text}");
+    detlog_records(&text)
 }
 
 #[test]

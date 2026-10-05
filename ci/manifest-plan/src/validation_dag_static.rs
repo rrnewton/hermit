@@ -747,7 +747,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 965 (966, measured by a full validation's executed count).
     // detcore-model's config::tests::record_host_inputs_never_enters_the_legacy_form
     // retains all 966 (967; each was measured as 965 + 1 on its own).
-    ("test.regular_crates", 967),
+    // detcore-sabre's
+    // tests::detlog_forwarding_follows_the_coordinators_per_target_policy
+    // retains all 967 prior identities: 967 + 1 = 968.
+    ("test.regular_crates", 968),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -908,7 +911,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // run::tests::forwarded_detlogs_respect_the_log_bound_and_keep_its_truncation_marker
     // (https://github.com/rrnewton/hermit/issues/3520, C5) retains all 837:
     // 837 + 1 = 838.
-    ("test.hermit_unit", 838),
+    // tests::sabre_detlog_forwarding_answers_each_target_as_the_cli_filter_does
+    // retains all 838 prior identities: 838 + 1 = 839.
+    ("test.hermit_unit", 839),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1020,7 +1025,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detlog::tests::forwarding_failures_become_loss_notices
     // (https://github.com/rrnewton/hermit/issues/3520, C5) retain all 952:
     // 952 + 2 = 954.
-    ("test.detcore_unit", 954),
+    // detlog::tests::forward_policy_answers_per_target_as_the_subscriber_does,
+    // detlog::tests::forward_policy_most_specific_target_decides and
+    // detlog::tests::forward_policy_encoding_round_trips_and_refuses_malformed_values
+    // retain all 954 prior identities: 954 + 3 = 957.
+    ("test.detcore_unit", 957),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1232,7 +1241,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sabre_names_no_host_input_change_for_another_divergence and
     // sabre_names_no_host_input_change_for_a_guest_that_replaced_a_file_after_diverging
     // retain all 9 (12, measured with cargo nextest list).
-    ("test.sabre_examples", 12),
+    // sabre_forwards_a_target_scoped_detlog_filter_as_ptrace_applies_it
+    // retains all 12 prior identities: 13.
+    ("test.sabre_examples", 13),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -1329,7 +1340,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same two inode-identity tests (951) and the
     // host-input observation test (952).
     // The same two forwarded-record tests retain all 952: 952 + 2 = 954.
-    ("test.detcore_unit_on_host", 954),
+    // The same three DETLOG forwarding-policy tests retain all 954: 957.
+    ("test.detcore_unit_on_host", 957),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1374,7 +1386,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same four backend-capability controls:
     // 833 + 4 = 837.
     // The same forwarded-record bound test retains all 837: 837 + 1 = 838.
-    ("test.hermit_unit_on_host", 838),
+    // The same SaBRe DETLOG forwarding-policy test retains all 838: 839.
+    ("test.hermit_unit_on_host", 839),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -1437,11 +1450,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 951: 951 + 14 = 965.
     // The delegated write-back test listed there retains all 965: 966.
     // The legacy-form host-input test listed there retains all 966: 967.
-    ("test.regular_crates_on_host", 967),
+    // The same detcore-sabre forwarding-policy test retains all 967: 968.
+    ("test.regular_crates_on_host", 968),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
-    ("test.sabre_examples_on_host", 12),
+    // And the same target-scoped DETLOG forwarding test (13).
+    ("test.sabre_examples_on_host", 13),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {

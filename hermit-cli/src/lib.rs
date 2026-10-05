@@ -1706,6 +1706,16 @@ fn request_liteinst_detlog_forwarding(
 }
 #[cfg(feature = "sabre")]
 const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
+
+/// The INFO policy for DETLOG records SaBRe's guest plugin forwards: the
+/// current subscriber's answer for every target the CLI's `RUST_LOG` names
+/// (the text `EffectiveFilter::from_default_env` builds every CLI subscriber
+/// from) and for any other target.
+#[cfg(feature = "sabre")]
+fn sabre_detlog_forward_policy() -> detcore::detlog::ForwardPolicy {
+    let directives = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).unwrap_or_default();
+    detcore::detlog::ForwardPolicy::from_current_subscriber(&directives)
+}
 #[cfg(feature = "sabre")]
 const SABRE_STAGING_DIRECTORY: &str = "/dev/shm";
 
@@ -1977,8 +1987,12 @@ async fn run_sabre(
     );
     command.env_remove(SABRE_PATH_EVIDENCE_ENV);
     command.env_remove(SABRE_DETLOG_FORWARD_ENV);
-    if tracing::enabled!(target: "detcore", tracing::Level::INFO) {
-        command.env(SABRE_DETLOG_FORWARD_ENV, "1");
+    // Per emitting module, as each in-process `detlog!` callsite asks tracing:
+    // asking only about `detcore` dropped every record a target-scoped
+    // RUST_LOG (warn,detcore::random=info) keeps under ptrace.
+    let detlog_policy = sabre_detlog_forward_policy();
+    if detlog_policy.forwards_any() {
+        command.env(SABRE_DETLOG_FORWARD_ENV, detlog_policy.encode());
     }
     command.env_remove("SABRE_BINARY");
     command.env_remove("SABRE_PLUGIN");
@@ -6432,5 +6446,81 @@ mod tests {
             );
             assert_eq!(parse_reverie_pin(&text), None);
         }
+    }
+
+    /// SaBRe's guest plugin has no subscriber, so it forwards DETLOG records by
+    /// the policy the CLI hands it. For each filter the CLI builds, that policy
+    /// must answer every emitting module as the CLI's own subscriber does,
+    /// which is what each in-process `detlog!` callsite asks under ptrace.
+    /// `warn,detcore::random=info` once yielded no forwarding at all, because
+    /// only the generic `detcore` target was asked, so SaBRe dropped the
+    /// AT_RANDOM and early getrandom records ptrace prints.
+    #[cfg(feature = "sabre")]
+    #[test]
+    fn sabre_detlog_forwarding_answers_each_target_as_the_cli_filter_does() {
+        use detcore::detlog::ForwardPolicy;
+        use detcore::detlog::info_enabled_for_target;
+        use tracing::level_filters::LevelFilter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use crate::liteinst_bootstrap::EffectiveFilter;
+
+        let targets = [
+            "",
+            "detcore",
+            "detcore::random",
+            "detcore::randomness",
+            "detcore::tool_local",
+            "detcore::scheduler",
+            "detcore::scheduler::runqueue",
+            "detcore::syscalls::files",
+            "hermit",
+            "warn",
+        ];
+        let policy_under = |raw: &str, level: LevelFilter| {
+            let subscriber = tracing_subscriber::registry()
+                .with(EffectiveFilter::from_directives_lossy(raw, level).into_filter());
+            tracing::subscriber::with_default(subscriber, || {
+                let policy = ForwardPolicy::from_current_subscriber(raw);
+                let subscriber_says: Vec<bool> = targets
+                    .iter()
+                    .map(|target| info_enabled_for_target(target))
+                    .collect();
+                (policy, subscriber_says)
+            })
+        };
+        for (raw, level) in [
+            ("warn,detcore::random=info", LevelFilter::WARN),
+            ("detcore::random=info", LevelFilter::WARN),
+            ("detcore::random=warn", LevelFilter::INFO),
+            (
+                "warn,detcore=info,detcore::scheduler=off",
+                LevelFilter::WARN,
+            ),
+            (
+                "warn,detcore[work]=info,detcore::random=info",
+                LevelFilter::WARN,
+            ),
+            ("", LevelFilter::INFO),
+            ("", LevelFilter::WARN),
+        ] {
+            let (policy, subscriber_says) = policy_under(raw, level);
+            for (target, enabled) in targets.iter().zip(subscriber_says) {
+                assert_eq!(
+                    policy.forwards(target),
+                    enabled,
+                    "RUST_LOG={raw:?} --log={level}: policy {policy:?} disagrees on {target:?}"
+                );
+            }
+        }
+
+        let (scoped, subscriber_says) =
+            policy_under("warn,detcore::random=info", LevelFilter::WARN);
+        assert!(!subscriber_says[1], "the generic detcore target is off");
+        assert!(scoped.forwards_any());
+        assert!(scoped.forwards("detcore::random"));
+        assert!(!scoped.forwards("detcore::tool_local"));
+        assert_eq!(policy_under("", LevelFilter::INFO).0, ForwardPolicy::all());
+        assert!(!policy_under("", LevelFilter::WARN).0.forwards_any());
     }
 }
