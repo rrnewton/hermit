@@ -164,11 +164,14 @@ enum DeathStep {
 /// `futex_cmpxchg_value_locked()` and the `nval != uval` test that follows it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FutexCasOutcome {
-    /// The word still held the expected value and now holds the new one.
-    Stored,
-    /// The backend will perform the atomic replacement before the modeled wake
-    /// can let another thread run.
-    Deferred,
+    /// The word still held the expected value, so the replacement goes ahead.
+    ///
+    /// The production effects do not store the word themselves: the backend's
+    /// native task exit repeats the owner check and replaces the word
+    /// atomically before the modeled wake can let another thread run. The
+    /// unit-test model stores it immediately, so the walk can be checked
+    /// against the kernel's write sequence.
+    Matched,
     /// The word held this other value instead, so nothing was written. The
     /// kernel's `goto retry`.
     Changed(u32),
@@ -197,8 +200,8 @@ pub(crate) trait RobustDeathEffects {
     /// stores `desired` over a word whose value moved since it was read,
     /// because that word may have been re-acquired by a live thread. A backend
     /// whose Linux task-exit cleanup completes before another modeled thread
-    /// can run may return [`FutexCasOutcome::Deferred`] and leave the atomic
-    /// replacement to it.
+    /// can run may return [`FutexCasOutcome::Matched`] without storing and
+    /// leave the atomic replacement to it.
     fn compare_and_swap(&mut self, address: usize, expected: u32, desired: u32) -> FutexCasOutcome;
 
     /// Wake exactly one waiter on the futex word, as the kernel's
@@ -382,7 +385,7 @@ async fn handle_futex_death<E: RobustDeathEffects>(
         };
 
         match effects.compare_and_swap(word, uval, transition.new_value) {
-            FutexCasOutcome::Stored | FutexCasOutcome::Deferred => {
+            FutexCasOutcome::Matched => {
                 if transition.wake_one {
                     effects.wake_one(word, transition.new_value).await;
                 }
@@ -547,11 +550,11 @@ mod tests {
                 self.put_u32(address, raced);
             }
             if self.defer_owner_death_to_backend {
-                return FutexCasOutcome::Deferred;
+                return FutexCasOutcome::Matched;
             }
             self.put_u32(address, desired);
             self.marks.push((address, expected, desired));
-            FutexCasOutcome::Stored
+            FutexCasOutcome::Matched
         }
 
         async fn wake_one(&mut self, address: usize, observed: u32) {
@@ -920,7 +923,7 @@ mod tests {
             FUTEX_WAITERS | FUTEX_OWNER_DIED,
         );
 
-        assert_eq!(outcome, FutexCasOutcome::Stored);
+        assert_eq!(outcome, FutexCasOutcome::Matched);
         assert_eq!(
             guest.get_u32(0x2000),
             Some(FUTEX_WAITERS | FUTEX_OWNER_DIED),
