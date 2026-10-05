@@ -81,6 +81,9 @@ pub fn root_prng(seed: u64) -> Pcg64Mcg {
 /// Fixed maximum for the backend-independent initial random-state handoff.
 pub const MAX_INITIAL_STATE_BYTES: usize = 4096;
 
+/// Version 2 carries the AT_RANDOM bytes so that post-exec emits their record.
+const INITIAL_STATE_VERSION: u32 = 2;
+
 /// Identity of the sole initial image whose real auxv was already written.
 /// Backends must authenticate this identity before constructing a handoff.
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -125,6 +128,10 @@ pub enum LoaderState {
     InitialRandom {
         /// Stream after the real auxv and getrandom operations.
         prng: Pcg64Mcg,
+        /// The bytes the real auxv write stored at AT_RANDOM. That write emits
+        /// no record; the thread's post-exec callback emits it from these
+        /// bytes (`record_initial_auxv`), where every backend emits it.
+        at_random_value: [u8; 16],
     },
     /// A later real kernel exec observed in this owned process lineage.
     ObservedExecContinuation,
@@ -152,19 +159,24 @@ fn configuration_identity(config: &crate::Config) -> Result<[u8; 32], Errno> {
     Ok(writer.0.finalize().into())
 }
 
-/// Encode only the actual PRNG and completed auxv identity. No clock, metadata,
-/// chaos RNG, scheduler state or request history is transferred.
+/// Encode only the actual PRNG, the completed auxv identity and the bytes
+/// written there ([`write_initial_auxv`]). No clock, metadata, chaos RNG,
+/// scheduler state or request history is transferred.
 pub fn encode_initial_state(
     config: &crate::Config,
     image: InitialImage,
     prng: &Pcg64Mcg,
+    at_random_value: [u8; 16],
 ) -> Result<Vec<u8>, Errno> {
     image.validate()?;
     let value = InitialRandomState {
-        version: 1,
+        version: INITIAL_STATE_VERSION,
         configuration: configuration_identity(config)?,
         image,
-        state: LoaderState::InitialRandom { prng: prng.clone() },
+        state: LoaderState::InitialRandom {
+            prng: prng.clone(),
+            at_random_value,
+        },
     };
     encode_state(value)
 }
@@ -181,7 +193,7 @@ pub fn encode_continuation(
         return Err(Errno::EPROTO);
     }
     encode_state(InitialRandomState {
-        version: 1,
+        version: INITIAL_STATE_VERSION,
         configuration: configuration_identity(config)?,
         image,
         state,
@@ -208,7 +220,7 @@ pub fn decode_loader_state(
         return Err(Errno::EPROTO);
     }
     let value: InitialRandomState = serde_json::from_slice(bytes).map_err(|_| Errno::EPROTO)?;
-    if value.version != 1
+    if value.version != INITIAL_STATE_VERSION
         || value.configuration != configuration_identity(config)?
         || value.image != expected
         || serde_json::to_vec(&value).map_err(|_| Errno::EPROTO)? != bytes
@@ -224,9 +236,12 @@ pub(crate) fn decode_initial_state(
     bytes: &[u8],
     config: &crate::Config,
     expected: InitialImage,
-) -> Result<Pcg64Mcg, Errno> {
+) -> Result<(Pcg64Mcg, [u8; 16]), Errno> {
     match decode_loader_state(bytes, config, expected)? {
-        LoaderState::InitialRandom { prng } => Ok(prng),
+        LoaderState::InitialRandom {
+            prng,
+            at_random_value,
+        } => Ok((prng, at_random_value)),
         LoaderState::ObservedExecContinuation | LoaderState::InitialStaticLegacy => {
             Err(Errno::EPROTO)
         }
@@ -375,12 +390,32 @@ pub fn initialize_auxv(
     dettid: DetTid,
 ) -> Result<(), Errno> {
     let bytes: [u8; 16] = prng.random();
+    record_initial_auxv(dettid, &bytes);
+    memory.write_value(pointer.cast::<[u8; 16]>(), &bytes)
+}
+
+/// Draw and write the initial auxv bytes before the thread's post-exec
+/// callback, emitting no record, and return them for the handoff
+/// ([`encode_initial_state`]). Post-exec then emits the record, so a run's
+/// records come in the same order whichever backend wrote the bytes, and the
+/// root thread's seeding records precede it on every backend.
+pub fn write_initial_auxv(
+    prng: &mut Pcg64Mcg,
+    mut memory: impl MemoryAccess,
+    pointer: AddrMut<u8>,
+) -> Result<[u8; 16], Errno> {
+    let bytes: [u8; 16] = prng.random();
+    memory.write_value(pointer.cast::<[u8; 16]>(), &bytes)?;
+    Ok(bytes)
+}
+
+/// The record of the initial auxv bytes, emitted once per initial image.
+pub(crate) fn record_initial_auxv(dettid: DetTid, bytes: &[u8; 16]) {
     detlog!(
         "[post_exec, dtid {}] init auxv AT_RANDOM value to {:?}",
         dettid,
         bytes
     );
-    memory.write_value(pointer.cast::<[u8; 16]>(), &bytes)
 }
 
 #[cfg(test)]
@@ -626,7 +661,12 @@ mod tests {
             at_random: pages.address(0).as_raw(),
         };
         let mut stream = root_prng(config.rng_seed());
-        initialize_auxv(&mut stream, OwnMemory, pages.address(0), tid).unwrap();
+        let written = write_initial_auxv(&mut stream, OwnMemory, pages.address(0)).unwrap();
+        assert_eq!(pages.bytes(0, 16), written);
+        // The early write draws exactly what post-exec's own write would have.
+        let mut ordinary = root_prng(config.rng_seed());
+        initialize_auxv(&mut ordinary, OwnMemory, pages.address(64), tid).unwrap();
+        assert_eq!(pages.bytes(64, 16), written);
         guest_getrandom(
             &mut stream,
             OwnMemory,
@@ -634,17 +674,22 @@ mod tests {
             call(pages.address(32).as_raw(), 8, 1),
         )
         .unwrap();
-        let encoded = encode_initial_state(&config, image, &stream).unwrap();
-        same_state(
-            &decode_initial_state(&encoded, &config, image).unwrap(),
-            &stream,
-        );
+        let encoded = encode_initial_state(&config, image, &stream, written).unwrap();
+        let (decoded, decoded_value) = decode_initial_state(&encoded, &config, image).unwrap();
+        same_state(&decoded, &stream);
+        assert_eq!(decoded_value, written);
         for bad in [
             Vec::new(),
             [encoded.as_slice(), b" "].concat(),
+            // Version 1 carried no AT_RANDOM bytes; neither it nor a later
+            // version is accepted.
             String::from_utf8(encoded.clone())
                 .unwrap()
-                .replace("\"version\":1", "\"version\":2")
+                .replace("\"version\":2", "\"version\":1")
+                .into_bytes(),
+            String::from_utf8(encoded.clone())
+                .unwrap()
+                .replace("\"version\":2", "\"version\":3")
                 .into_bytes(),
         ] {
             assert!(decode_initial_state(&bad, &config, image).is_err());
@@ -708,10 +753,11 @@ mod tests {
                 &untouched.memory_metadata,
                 &memory_before
             ));
-            assert!(
-                !untouched
+            assert_eq!(
+                untouched
                     .complete_initial_random_auxv(Some(image.at_random))
-                    .unwrap()
+                    .unwrap(),
+                None
             );
             assert!(matches!(
                 decode_loader_state(
@@ -763,17 +809,21 @@ mod tests {
             .unwrap();
         // handle_post_exec sets this before consuming the completion fact.
         state.past_global_first_execve = true;
-        assert!(
+        // It returns the bytes the early write stored, for post-exec's record,
+        // not what the guest left there since.
+        assert_eq!(
             state
                 .complete_initial_random_auxv(Some(image.at_random))
-                .unwrap()
+                .unwrap(),
+            Some(written)
         );
         assert_eq!(pages.bytes(0, 16), [0x7c; 16]);
         same_state(&state.prng, &stream);
-        assert!(
-            !state
+        assert_eq!(
+            state
                 .complete_initial_random_auxv(Some(image.at_random))
-                .unwrap()
+                .unwrap(),
+            None
         );
         assert!(
             state

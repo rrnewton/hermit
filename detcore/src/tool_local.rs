@@ -1911,7 +1911,9 @@ pub struct ThreadState<T> {
     /// before libc initialization. Consumed by the first post-exec callback;
     /// normal construction and child derivation never manufacture this fact.
     #[serde(default)]
-    pub(crate) initialized_random_auxv: Option<crate::random::InitialImage>,
+    /// The initial image whose AT_RANDOM a backend wrote before post-exec, and
+    /// the bytes it wrote, until post-exec emits their record.
+    pub(crate) initialized_random_auxv: Option<(crate::random::InitialImage, [u8; 16])>,
 
     /// RNG to drive chaos scheduling decisions, separate from other (guest) RNG.
     pub chaos_prng: Pcg64Mcg,
@@ -2476,24 +2478,26 @@ impl<T> ThreadState<T> {
         {
             return Err(Errno::EPROTO);
         }
-        let prng = crate::random::decode_initial_state(bytes, config, image)?;
+        let (prng, at_random_value) = crate::random::decode_initial_state(bytes, config, image)?;
         self.prng = prng;
-        self.initialized_random_auxv = Some(image);
+        self.initialized_random_auxv = Some((image, at_random_value));
         Ok(())
     }
 
+    /// Consume the early auxv write's fact, returning the bytes it wrote, or
+    /// `None` when no backend wrote AT_RANDOM before post-exec.
     pub(crate) fn complete_initial_random_auxv(
         &mut self,
         pointer: Option<usize>,
-    ) -> Result<bool, Errno> {
-        let Some(image) = self.initialized_random_auxv else {
-            return Ok(false);
+    ) -> Result<Option<[u8; 16]>, Errno> {
+        let Some((image, at_random_value)) = self.initialized_random_auxv else {
+            return Ok(None);
         };
         if pointer != Some(image.at_random) || self.dettid.as_raw() != image.pid {
             return Err(Errno::EPROTO);
         }
         self.initialized_random_auxv = None;
-        Ok(true)
+        Ok(Some(at_random_value))
     }
 
     pub(crate) fn record_robust_list_head(&mut self, head: Option<usize>) {

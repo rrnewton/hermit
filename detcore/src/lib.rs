@@ -1881,9 +1881,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             .thread_state_mut()
             .complete_initial_random_auxv(auxv.at_random().map(|p| p.as_raw()))
             .expect("authenticated initial random handoff no longer matches this image");
-        // The successful early write already emitted the ordinary auxv INFO
-        // record. Consume only its fact here: no second draw, write or event.
-        if !initialized && let Some(ptr) = auxv.at_random() {
+        // A backend that wrote AT_RANDOM before this callback (the loader
+        // handoff) emitted no record: emit it here from the bytes it wrote, with
+        // no second draw or write, so the record sits where every backend puts
+        // it, after the root thread's seeding records.
+        if let Some(bytes) = initialized {
+            random::record_initial_auxv(guest.thread_state().dettid, &bytes);
+        } else if let Some(ptr) = auxv.at_random() {
             // It is safe to mutate this address since libc has not yet had a
             // chance to modify or copy the auxv table.
             let memory = guest.memory();

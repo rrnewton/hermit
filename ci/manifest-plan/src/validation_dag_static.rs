@@ -1199,9 +1199,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 145 prior identities: 147. Both need the pinned Reverie to
     // emulate CPUID in code mapped after the in-guest runtime started.
     ("test.cli", 147),
-    // sabre_dispatch_record_reports_its_routes_and_tracer_stops retains all 6
-    // prior identities.
-    ("test.sabre_examples", 7),
+    // sabre_and_ptrace_detlogs_agree_through_post_exec and
+    // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
+    // identities.
+    ("test.sabre_examples", 9),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -1401,9 +1402,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 951: 951 + 14 = 965.
     ("test.regular_crates_on_host", 965),
     ("test.rr_suite_contract_on_host", 1),
-    // The host twin also selects
-    // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
-    ("test.sabre_examples_on_host", 7),
+    // The host twin also selects the two startup-order tests.
+    ("test.sabre_examples_on_host", 9),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
