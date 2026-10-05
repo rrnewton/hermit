@@ -635,6 +635,11 @@ impl GlobalState {
     }
 
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
+        // This run's host-input records start empty, whatever an earlier run
+        // in this process that shared the log's name left behind.
+        if let Some(log) = &cfg.host_input_log {
+            crate::host_inputs::begin(log);
+        }
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
         let handle = if cfg.sequentialize_threads && spawn_scheduler {
@@ -889,6 +894,10 @@ impl GlobalState {
     /// join error and any requested partial preemption recording's write error
     /// for the caller, without allowing either to replace the backend failure.
     pub async fn clean_up_after_backend_failure(mut self) -> BackendFailureCleanup {
+        // A failed run writes no host-input log; its records are dropped.
+        if let Some(log) = &self.cfg.host_input_log {
+            crate::host_inputs::discard(log);
+        }
         let scheduler = if let Some(handle) = self.sched_handle.take() {
             handle.await
         } else {
@@ -948,6 +957,10 @@ impl GlobalState {
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
+        // The run is over: write what it opened for --verify.
+        if let Some(log) = &self.cfg.host_input_log {
+            crate::host_inputs::finish(log);
+        }
         let (mut summary, info_reprio_descrip) = self.into_run_summary_for_log().unwrap();
         summary.dispatch_stats = dispatch_stats;
 

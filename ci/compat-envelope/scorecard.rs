@@ -3244,6 +3244,11 @@ impl ResultRow {
                                 index + 1
                             )
                         }
+                        Some(
+                            ref change @ canonical_verdict::InfrastructureError::HostInputChanged {
+                                ..
+                            },
+                        ) => format!("attempt {} recorded {change}", index + 1),
                         None => format!("attempt {} recorded an infrastructure error", index + 1),
                     };
                     unavailable.get_or_insert(reason);

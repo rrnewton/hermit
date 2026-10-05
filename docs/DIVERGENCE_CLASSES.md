@@ -91,6 +91,50 @@ This class is the `/proc` family: **host state the guest can read**. It is fixed
 by determinizing or excluding at the boundary the bytes enter through, not by
 touching clocks and not by hunting guest behaviour.
 
+## Not a class: a host input that changed during a run
+
+A host file the guest opens can be replaced while a run is going; a package
+manager rewriting `/etc/ld.so.cache` between the opens of two guest processes
+is the measured case (`compat/sar-resource-tables`, 2026-10-05). Hermit numbers
+inodes in the order it first sees them, so that run gets one inode more than the
+other, and every later inode number differs by one. The first record that shows
+it can be far from the file, such as the `d_ino` values of an unrelated directory
+listing whose entries and order are otherwise identical.
+
+`--verify` names this cause itself. Each run records the host identity (`dev`,
+`ino`, size, mtime) of every file the guest opens, and which thread and syscall
+opened it, in a side file outside the compared log that is written when the run
+ends. A cause is named only when all of these hold:
+
+- the two runs diverged, and the comparison was one strict enough for bitwise
+  parity (`--verify-strict`), so everything before the divergence was compared;
+- both side files are complete;
+- the runs made the same opens, in the same order, up to an open where one run
+  found a different host inode (`dev:ino`) at a path while the other found the
+  one it had seen before: a replacement, the change that shifts Hermit's later
+  inode numbers. A change of size or time alone is not named;
+- in BOTH runs' logs, that open's finish record appears exactly once and before
+  the scheduler commit preceding the first divergent record. A guest that
+  replaces a file itself because it already behaves differently has diverged
+  by then, so its divergence stays a failure.
+
+Then the report's verdict is `infrastructure_error` with
+`infrastructure_error.kind` `host_input_changed`, naming the run, the path and
+both identities. The comparison and the divergence position are kept, stderr
+carries a `HERMIT_HOST_INPUT_CHANGED` line, and the run still exits 1. The
+validation harness reruns such a cell once, unless either run also breaks a
+stdout assertion the cell declares; a second divergence stays a failure. The
+row stays its own type, an infrastructure ERROR, and is never counted as a
+pass.
+
+Capture runs where Detcore's configuration arrives in-process: the ptrace and
+KVM backends. Elsewhere (DBT, SaBRe, LiteInst) nothing is recorded, so no cause
+is named and a divergence stays red.
+
+The one remaining case is a coincidence: a host file replaced during an attempt
+before the divergence, and an unrelated flaky product divergence in that same
+attempt. That attempt earns the one retry.
+
 ## Why this class is only now visible
 
 `compare_io_buffers` became the default in

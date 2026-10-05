@@ -42,10 +42,17 @@ use hermit::DetConfig;
 use hermit::Error;
 use hermit::Shebang;
 use hermit::SkidOvershootError;
+use hermit::canonical_verdict::Verdict;
 use hermit::happens_before::DebugInfoResolver;
 use hermit::happens_before::describe_anchor;
 use hermit::happens_before::load_program;
 use hermit::happens_before::resolve_program;
+use hermit::host_input_change::HostInputs;
+use hermit::host_input_change::PatternDifference;
+use hermit::host_input_change::explains_divergence;
+use hermit::host_input_change::find_pattern_difference;
+use hermit::host_input_change::open_position;
+use hermit::host_input_change::read_host_inputs;
 use hermit::run_evidence::GuestRunDeterminism;
 use reverie::Errno;
 use reverie::process::Bind;
@@ -90,6 +97,7 @@ use super::verify::temp_log_files_in;
 use super::verify::validate_log_level;
 use super::verify::verification_log_level;
 use super::verify::verification_runtime_from_summaries;
+use super::verify::write_host_input_change_verification_json;
 use super::verify::write_pending_verification_json;
 use super::verify::write_report_json;
 use super::verify::write_skid_overshoot_verification_json;
@@ -274,8 +282,59 @@ fn summary_dir_under(start: &Path) -> Result<PathBuf, Error> {
 /// (`staged_summary::writer_path`). The named file and its location are
 /// unchanged, so what the guest can observe is unchanged too.
 fn private_summary_descriptor_path(file: &tempfile::NamedTempFile) -> PathBuf {
+    descriptor_path(file.as_file())
+}
+
+/// The `/proc/self/fd` spelling of `file`, which the run container reaches
+/// whatever its mount namespace hides; see [`private_summary_descriptor_path`].
+fn descriptor_path(file: &fs::File) -> PathBuf {
     use std::os::fd::AsRawFd;
-    PathBuf::from(format!("/proc/self/fd/{}", file.as_file().as_raw_fd()))
+    PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()))
+}
+
+/// The first host-input pattern difference between the runs and where its
+/// open sits in each run's log (see `hermit::host_input_change`), or `None`
+/// when the runs' records show none or cannot be read. `run1` is run 1's
+/// records, read before the shared record was emptied for run 2, and `path`
+/// now holds run 2's.
+fn place_host_input_change(
+    run1: std::io::Result<HostInputs>,
+    path: &Path,
+    logs: [&Path; 2],
+) -> Option<(PatternDifference, [Option<Option<u64>>; 2])> {
+    let read = |result: std::io::Result<HostInputs>| {
+        result
+            .inspect_err(|error| {
+                eprintln!(
+                    "WARNING: the runs' host-input records cannot be read, so a host file \
+                     change cannot be named: {error}"
+                )
+            })
+            .ok()
+    };
+    let run1 = read(run1)?;
+    let run2 = read(read_host_inputs(path))?;
+    let difference = find_pattern_difference(&run1, &run2)?;
+    let place = |log: &Path, label: &str| {
+        fs::File::open(log)
+            .and_then(|file| {
+                open_position(
+                    std::io::BufReader::new(file),
+                    difference.dtid,
+                    difference.syscall,
+                )
+            })
+            .inspect_err(|error| {
+                eprintln!(
+                    "WARNING: the {label} log cannot be read, so a host file change cannot be \
+                     placed: {error}"
+                )
+            })
+            .ok()
+            .flatten()
+    };
+    let positions = [place(logs[0], "run 1"), place(logs[1], "run 2")];
+    Some((difference, positions))
 }
 
 fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
@@ -415,6 +474,12 @@ pub struct RunOpts {
     /// defaults it to `None` when `RunOpts` is parsed or round-tripped.
     #[clap(skip)]
     resolved_happens_before: Option<HappensBeforeProgram>,
+
+    /// Runtime-only: where `--verify` has this run record the host files the
+    /// guest opens (`DetConfig::host_input_log`). Never a CLI argument and
+    /// never serialized, like `resolved_happens_before`.
+    #[clap(skip)]
+    host_input_log: Option<PathBuf>,
 
     /// Whether this invocation's epoch was captured from the host clock because
     /// neither `--epoch` nor `HERMIT_EPOCH` supplied an explicit input.
@@ -5143,6 +5208,18 @@ impl RunOpts {
         let mut run2_options = self.clone();
         run2_options.summary_json = Some(summary2_path.to_owned());
 
+        // Each run records the host files its guest opens, so that a
+        // divergence caused by a host file changing during a run can be named
+        // (see `hermit::host_input_change`). Both runs share one unlinked file,
+        // reached through the controller's descriptor as the private summary
+        // is. Detcore writes it only when a run ends, and it is read and
+        // emptied before run 2, so it is empty while either guest runs: a
+        // guest that finds it through /proc sees the same thing in both runs.
+        let host_inputs_file = tempfile::tempfile().context("creating the host-input record")?;
+        let host_inputs_path = descriptor_path(&host_inputs_file);
+        run1_options.host_input_log = Some(host_inputs_path.clone());
+        run2_options.host_input_log = Some(host_inputs_path.clone());
+
         // Captured BEFORE run 1 so the same values can be put back before run 2.
         // See the restore call below for the measurement this exists for.
         let fd_flags_before_run1 = standard_fd_status_flags();
@@ -5265,6 +5342,10 @@ impl RunOpts {
         }
 
         let summary1 = take_verify_summary_before_next_run(&summary1_path)?;
+        let host_inputs1 = read_host_inputs(&host_inputs_path);
+        host_inputs_file
+            .set_len(0)
+            .context("emptying the host-input record before run 2")?;
         if skid_overshoots_run1 > 0
             && let Some(path) = &self.verify_json
         {
@@ -5420,6 +5501,14 @@ impl RunOpts {
         // verdict. `--keep-logs` then retains both logs, as every other error
         // path does, instead of the single golden log kept after a match.
         comparison_options.match_overridden = skid_overshoots > 0;
+        // The comparison consumes both logs, so a host file change is placed
+        // in its run's log now, and judged against the divergence below.
+        let host_input_change = if skid_overshoots == 0 {
+            place_host_input_change(host_inputs1, &host_inputs_path, [&log1_path, &log2_path])
+        } else {
+            None
+        };
+        drop(host_inputs_file);
         let mut outcome = compare_two_runs(
             ComparedRun {
                 output: &out1,
@@ -5439,6 +5528,21 @@ impl RunOpts {
         )?;
         outcome.runtime = verification_runtime_from_summaries(summary1.as_ref(), summary2.as_ref());
 
+        // A divergence that a host file changing during one run explains is
+        // named as such: only a divergence is examined, and only a change
+        // found before the divergence, by a comparison that compared
+        // everything, explains it.
+        let host_input_change = host_input_change
+            .filter(|_| outcome.verdict == Verdict::Diverged)
+            .filter(|(_, positions)| {
+                explains_divergence(
+                    outcome.comparison.is_bitwise_parity(),
+                    *positions,
+                    outcome.first_divergent_scheduler_turn,
+                )
+            })
+            .map(|(difference, _)| difference.into_infrastructure_error());
+
         // Emit the machine-readable verdict (if requested) before collapsing the
         // outcome to the historical exit-code convention. The verdict is recorded
         // whether or not the runs matched, and independent of the guest's own
@@ -5446,6 +5550,8 @@ impl RunOpts {
         if let Some(path) = &self.verify_json {
             if skid_overshoots > 0 {
                 write_skid_overshoot_verification_json(path, &outcome, skid_overshoots)?;
+            } else if let Some(change) = &host_input_change {
+                write_host_input_change_verification_json(path, &outcome, change.clone())?;
             } else {
                 write_verification_json(path, &outcome)?;
             }
@@ -5454,6 +5560,10 @@ impl RunOpts {
             return Err(Error::new(SkidOvershootError::new(skid_overshoots)));
         }
         announce_verification_outcome(&outcome, SecondRun::Rerun, success_message, failure_message);
+        if let Some(change) = &host_input_change {
+            // The divergence stays a failure; this names its cause.
+            eprintln!("HERMIT_HOST_INPUT_CHANGED {change}");
+        }
 
         // On divergence, still return the nonzero status and skip
         // the backend banner — but EMIT THE GUEST'S OUTPUT FIRST when both runs
@@ -5777,6 +5887,7 @@ impl RunOpts {
         // this is in-process only; it reaches the ptrace backend directly and is not
         // carried through the DBT JSON config or `--save-config`.
         config.happens_before = self.resolved_happens_before.clone();
+        config.host_input_log = self.host_input_log.clone();
         config
     }
 

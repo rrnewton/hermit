@@ -114,6 +114,42 @@ pub enum InfrastructureError {
     /// A ptrace PMU timer interrupt arrived after its target. Both runs and
     /// their comparison may still be retained, but the result is not admitted.
     SkidOvershoot { count: u64 },
+    /// The two runs diverged, and a host file the guest opened changed during
+    /// one of them: `run` opened `path` again and found the host file `after`
+    /// where it had found `before`, while the other run found the same file at
+    /// that open (see `detcore_model::host_input`). Hermit numbers inodes in
+    /// the order it first sees them, so a file replaced mid-run alone shifts
+    /// every later inode number of that run. The comparison is retained, but
+    /// the divergence is not attributed to Hermit.
+    HostInputChanged {
+        run: VerificationRun,
+        path: String,
+        before: detcore_model::host_input::HostFileIdentity,
+        after: detcore_model::host_input::HostFileIdentity,
+    },
+}
+
+impl std::fmt::Display for InfrastructureError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SkidOvershoot { count } => {
+                write!(f, "{count} precise-timer skid overshoot(s)")
+            }
+            Self::HostInputChanged {
+                run,
+                path,
+                before,
+                after,
+            } => write!(
+                f,
+                "host input changed during run {}: {path} ({before} -> {after})",
+                match run {
+                    VerificationRun::Run1 => 1,
+                    VerificationRun::Run2 => 2,
+                }
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -474,6 +510,16 @@ impl VerificationReport {
             (Verdict::InfrastructureError, Some(InfrastructureError::SkidOvershoot { .. })) => {
                 return Err(
                     "incomplete verification report: skid_overshoot count must be positive".into(),
+                );
+            }
+            // Named only for a divergence: the comparison that found it is
+            // part of the evidence.
+            (Verdict::InfrastructureError, Some(InfrastructureError::HostInputChanged { .. }))
+                if self.comparison.is_some() => {}
+            (Verdict::InfrastructureError, Some(InfrastructureError::HostInputChanged { .. })) => {
+                return Err(
+                    "incomplete verification report: host_input_changed requires the comparison that found the divergence"
+                        .into(),
                 );
             }
             (Verdict::InfrastructureError, None) => {

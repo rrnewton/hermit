@@ -768,6 +768,35 @@ pub fn write_skid_overshoot_verification_json(
     write_report_json(path, &report)
 }
 
+/// Write a divergence that a host file changed during one of the runs
+/// explains (`change` is [`InfrastructureError::HostInputChanged`], from
+/// `hermit::host_input_change`). The comparison and the divergence position
+/// are kept as evidence; the verdict says the divergence is not attributed to
+/// Hermit.
+pub fn write_host_input_change_verification_json(
+    path: &Path,
+    outcome: &VerificationOutcome,
+    change: InfrastructureError,
+) -> Result<(), Error> {
+    assert_eq!(
+        outcome.verdict,
+        Verdict::Diverged,
+        "only a divergence can be explained by a host input change"
+    );
+    assert!(
+        matches!(change, InfrastructureError::HostInputChanged { .. }),
+        "not a host input change: {change:?}"
+    );
+    let mut report = verification_report(outcome);
+    report.verified = false;
+    report.bitwise_parity = false;
+    report.verdict = Verdict::InfrastructureError;
+    report.no_result_reason = None;
+    report.infrastructure_error = Some(change);
+    report.dbt_counted_branches = None;
+    write_report_json(path, &report)
+}
+
 /// Write a named PMU skid infrastructure error when execution did not produce
 /// both sides of a comparison. Unlike the pending no-result stamp, this records
 /// the cause that is already known.

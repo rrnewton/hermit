@@ -3170,6 +3170,93 @@ pub fn skid_overshoot_reason(count: u64) -> String {
     format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)")
 }
 
+/// The reason the runner records for a verify attempt whose verification
+/// report is Hermit's typed `host_input_changed` infrastructure error
+/// (`change`). [`host_input_change_only`] reads it back, as
+/// [`skid_overshoot_only_reports`] reads back [`skid_overshoot_reason`].
+pub fn host_input_changed_reason(change: &InfrastructureError) -> String {
+    format!("verification diverged and Hermit found the cause outside the guest: {change}")
+}
+
+/// Whether `result` is a verify attempt whose only failure is a divergence
+/// that a host file changing during one run explains: Hermit's typed
+/// `host_input_changed` report (see `detcore_model::host_input`).
+///
+/// Such an attempt measured a change of the host's files, not the guest's
+/// determinism, so the runner gives the cell one fresh attempt, even a cell
+/// that declares `no_retry_reason`: that declaration keeps a PRODUCT
+/// failure final, and this is not one. The fresh attempt decides the cell by
+/// the ordinary rules: a second divergence fails it, and a divergence for
+/// any other reason was never this. Nothing here turns a divergence green.
+///
+/// Every condition must hold, from the row and from each inner attempt's own
+/// retained evidence, so that a label alone cannot claim it: the row is a
+/// verify `ERROR` of failure class `understood_infrastructure_failure` and
+/// error kind `infrastructure` whose reason is its first attempt's; each inner
+/// attempt is an `ERROR` of error kind `infrastructure` that did not time
+/// out, whose retained verification report is the bytes its recorded
+/// `verification_report_sha256` names and parses as a current report with
+/// verdict `infrastructure_error`, a `host_input_changed` error, a comparison
+/// and no `no_result_reason`, whose reason is [`host_input_changed_reason`]
+/// of that error, and whose report and captured stdout meet the cell's
+/// declared stdout assertions, which the row records
+/// ([`CellResult::declared_stdout`]; a row without that record never
+/// qualifies). A host change explains the divergence, not a declared output
+/// either run got wrong.
+pub fn host_input_change_only(result: &CellResult) -> bool {
+    let Some(declared) = result.declared_stdout.as_ref() else {
+        return false;
+    };
+    if result.mode != "verify"
+        || result.outcome != "ERROR"
+        || result.failure_class != Some(FailureClass::UnderstoodInfrastructureFailure)
+        || result.error_kind.as_deref() != Some("infrastructure")
+        || result.attempts.is_empty()
+        || result
+            .attempts
+            .first()
+            .is_none_or(|first| result.reason != first.reason)
+    {
+        return false;
+    }
+    result.attempts.iter().all(|attempt| {
+        if attempt.outcome != "ERROR"
+            || attempt.timed_out
+            || attempt.error_kind.as_deref() != Some("infrastructure")
+        {
+            return false;
+        }
+        let Some(raw) = attempt.verification_report.as_deref() else {
+            return false;
+        };
+        if attempt.verification_report_sha256.as_deref()
+            != Some(hex_digest(raw.as_bytes()).as_str())
+        {
+            return false;
+        }
+        let Ok(report) = current_verification_report(raw.as_bytes()) else {
+            return false;
+        };
+        match &report.infrastructure_error {
+            Some(change @ InfrastructureError::HostInputChanged { .. }) => {
+                report.verdict == Verdict::InfrastructureError
+                    && report.no_result_reason.is_none()
+                    && report.comparison.is_some()
+                    && attempt.reason.as_deref() == Some(host_input_changed_reason(change).as_str())
+                    && declared
+                        .exact
+                        .as_deref()
+                        .is_none_or(|expected| check_expected_stdout(expected, &report).is_ok())
+                    && declared.contains.as_deref().is_none_or(|text| {
+                        check_expected_stdout_contains(text, attempt.stdout.as_bytes(), &report)
+                            .is_ok()
+                    })
+            }
+            _ => false,
+        }
+    })
+}
+
 /// The number of `HERMIT_SKID_OVERSHOOT` reports behind `result`, when, and
 /// only when, the cell is a verify cell and its failure is a precise-timer
 /// overshoot and nothing else
@@ -3435,7 +3522,9 @@ fn attempt_skid_overshoot_reports(
     {
         return None;
     }
-    let InfrastructureError::SkidOvershoot { count } = report.infrastructure_error?;
+    let Some(InfrastructureError::SkidOvershoot { count }) = report.infrastructure_error else {
+        return None;
+    };
     let refusal =
         format!("HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={count}");
     let mut overshoot_marked = false;
@@ -4950,6 +5039,9 @@ fn execute_spec_until(
                                 Some(InfrastructureError::SkidOvershoot { count }) => {
                                     skid_overshoot_reason(*count)
                                 }
+                                Some(change @ InfrastructureError::HostInputChanged { .. }) => {
+                                    host_input_changed_reason(change)
+                                }
                                 None => unreachable!(
                                     "typed report parser requires an infrastructure error"
                                 ),
@@ -4974,6 +5066,11 @@ fn execute_spec_until(
                             // the plain skid reason and re-decides the row's
                             // recorded declaration from the attempt's own
                             // evidence (https://github.com/rrnewton/hermit/issues/1845).
+                            // A host input change is decided the same way: it
+                            // explains the divergence, not a declared output
+                            // that either run got wrong, so a violated or
+                            // undecidable assertion keeps the attempt out of
+                            // the host-input retry as well.
                             let stdout_error = report
                                 .compared_outputs
                                 .as_ref()
@@ -17372,6 +17469,179 @@ exit "$(cat "$PWD/exit-status")"
         let json = serde_json::to_string(&report).unwrap();
         current_verification_report(json.as_bytes()).unwrap();
         json
+    }
+
+    /// Hermit's report of a divergence that a host file replaced during run
+    /// 1 explains (`detcore_model::host_input`).
+    fn host_input_change_report_value() -> VerificationReport {
+        let identity = |ino| detcore_model::host_input::HostFileIdentity {
+            dev: 33,
+            ino,
+            size: 100,
+            mtime_sec: 1_700_000_000,
+            mtime_nsec: 0,
+        };
+        let mut report = parity_fixture_verification(Verdict::Diverged);
+        report.verdict = Verdict::InfrastructureError;
+        report.infrastructure_error = Some(InfrastructureError::HostInputChanged {
+            run: crate::canonical_verdict::VerificationRun::Run1,
+            path: "/etc/ld.so.cache".into(),
+            before: identity(57_899_095),
+            after: identity(57_907_831),
+        });
+        report
+    }
+
+    /// A divergence Hermit attributes to a host file changing during a run is
+    /// an infrastructure ERROR, not a product failure, and is the one row the
+    /// host-input retry accepts. A plain divergence stays a product FAIL, and
+    /// a row whose reason or report does not match its own evidence does not
+    /// qualify.
+    #[test]
+    fn only_a_typed_host_input_change_is_a_host_input_row() {
+        let change_report = serde_json::to_string(&host_input_change_report_value()).unwrap();
+        current_verification_report(change_report.as_bytes()).unwrap();
+        let changed = || {
+            attempt_from_script(
+                "ptrace",
+                "printf %s \"$1\" > \"$2\"; exit 1",
+                Some(&change_report),
+            )
+        };
+        let row = verify_row_from_attempts(vec![changed()]);
+        assert_eq!(row.outcome, "ERROR", "{row:?}");
+        assert_eq!(row.error_kind.as_deref(), Some("infrastructure"));
+        assert_eq!(
+            row.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        let change = host_input_change_report_value()
+            .infrastructure_error
+            .unwrap();
+        assert_eq!(
+            row.reason.as_deref(),
+            Some(host_input_changed_reason(&change).as_str())
+        );
+        assert!(
+            row.reason.as_deref().unwrap().contains(
+                "host input changed during run 1: /etc/ld.so.cache (dev:ino 0:33:57899095"
+            ),
+            "{row:?}"
+        );
+        assert!(host_input_change_only(&row));
+        assert_eq!(skid_overshoot_only_reports(&row), None);
+
+        // A plain divergence is a product failure, never a host input change.
+        let diverged_report =
+            serde_json::to_string(&parity_fixture_verification(Verdict::Diverged)).unwrap();
+        let diverged = verify_row_from_attempts(vec![attempt_from_script(
+            "ptrace",
+            "printf %s \"$1\" > \"$2\"; exit 1",
+            Some(&diverged_report),
+        )]);
+        assert_eq!(diverged.outcome, "FAIL", "{diverged:?}");
+        assert_eq!(diverged.failure_class, Some(FailureClass::ProductFailure));
+        assert!(!host_input_change_only(&diverged));
+
+        // A reason the report does not produce is not evidence.
+        let mut relabelled = row.clone();
+        relabelled.attempts[0].reason = Some("host input changed during run 1".into());
+        relabelled.reason = relabelled.attempts[0].reason.clone();
+        assert!(!host_input_change_only(&relabelled));
+
+        // Nor is a report whose bytes are not the ones the runner hashed.
+        let mut swapped = row.clone();
+        swapped.attempts[0].verification_report = Some(diverged_report);
+        assert!(!host_input_change_only(&swapped));
+
+        // A timed-out attempt is not one.
+        let mut timed_out = row.clone();
+        timed_out.attempts[0].timed_out = true;
+        assert!(!host_input_change_only(&timed_out));
+
+        // The skid report is not a host input change.
+        let skid = verify_row_from_attempts(vec![attempt_from_script(
+            "ptrace",
+            &format!("printf %s \"$1\" > \"$2\"; {SKID_STDERR}; exit 122"),
+            Some(&skid_report(2)),
+        )]);
+        assert!(!host_input_change_only(&skid));
+    }
+
+    /// A host-input attempt whose compared runs break the cell's declared
+    /// stdout assertion is not a host-input row: the host change explains the
+    /// divergence, not a wrong output. It keeps the infrastructure ERROR with
+    /// a reason naming both, and the predicate refuses it even relabelled with
+    /// the plain host-input reason, because it re-decides the row's recorded
+    /// assertion from the attempt's own report. The same attempt with the
+    /// assertion met is one.
+    #[test]
+    fn a_host_input_attempt_that_breaks_a_declared_stdout_assertion_is_not_host_input_only() {
+        let golden = "sar-ok\n";
+        let wrong = "sar-bad\n";
+        let change_with = |first: &str, second: &str| {
+            let mut report = host_input_change_report_value();
+            let outputs = report.compared_outputs.as_mut().unwrap();
+            outputs.left.stdout_sha256 = hex_digest(first.as_bytes());
+            outputs.left.stdout_bytes = first.len() as u64;
+            outputs.right.stdout_sha256 = hex_digest(second.as_bytes());
+            outputs.right.stdout_bytes = second.len() as u64;
+            report
+        };
+        let change = host_input_change_report_value()
+            .infrastructure_error
+            .unwrap();
+        let plain = host_input_changed_reason(&change);
+        let declaring = |mut row: CellResult| {
+            row.declared_stdout = Some(DeclaredStdout {
+                exact: Some(golden.to_string()),
+                contains: None,
+            });
+            row
+        };
+
+        let met = attempt_with_stdout_assertions(
+            Some(golden),
+            None,
+            change_with(golden, golden),
+            golden,
+            "exit 1",
+        );
+        assert_eq!(met.reason.as_deref(), Some(plain.as_str()), "{met:?}");
+        let met_row = declaring(verify_row_from_attempts(vec![met]));
+        assert!(host_input_change_only(&met_row));
+        // A row without the recorded declaration never qualifies.
+        let mut undeclared = met_row;
+        undeclared.declared_stdout = None;
+        assert!(!host_input_change_only(&undeclared));
+
+        let broken = attempt_with_stdout_assertions(
+            Some(golden),
+            None,
+            change_with(golden, wrong),
+            golden,
+            "exit 1",
+        );
+        assert_eq!(
+            (broken.outcome.as_str(), broken.error_kind.as_deref()),
+            ("ERROR", Some("infrastructure")),
+            "{broken:?}"
+        );
+        assert!(
+            broken
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.starts_with(&format!(
+                    "{plain}, and its compared runs violate a declared stdout assertion: "
+                ))),
+            "{broken:?}"
+        );
+        let row = declaring(verify_row_from_attempts(vec![broken]));
+        assert!(!host_input_change_only(&row), "{row:?}");
+        let mut relabelled = row;
+        relabelled.reason = Some(plain.clone());
+        relabelled.attempts[0].reason = Some(plain);
+        assert!(!host_input_change_only(&relabelled));
     }
 
     /// Only a verify row whose every attempt is Hermit's typed overshoot

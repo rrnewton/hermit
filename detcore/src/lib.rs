@@ -45,6 +45,7 @@ mod dirents;
 #[allow(missing_docs)]
 pub mod edit_distance;
 mod fd;
+mod host_inputs;
 mod io_buffers;
 mod iovecs;
 #[allow(unused)]

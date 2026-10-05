@@ -483,6 +483,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         memory: default_config.memory,
         interrupt_at: vec![],
         happens_before: None,
+        host_input_log: None,
         fuzz_futexes: false,
         chaos_target_races: false,
         chaos_per_thread_slowdown: false,

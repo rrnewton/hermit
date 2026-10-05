@@ -711,7 +711,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // apply_stamps_a_waited_send_with_the_global_time_of_its_request, and
     // network_trace::tests::network_trace_v4_holds_send_waits_that_v2_and_v3_cannot
     // and network_trace_v4_validation_rejects_each_malformed_wait (940 + 4 = 944).
-    ("test.regular_crates", 944),
+    // The three host-input-change retry tests (runner::tests::
+    // only_a_typed_host_input_change_is_a_host_input_row and
+    // a_host_input_attempt_that_breaks_a_declared_stdout_assertion_is_not_host_input_only,
+    // and test-harness's
+    // tests::a_host_input_change_earns_one_retry_even_on_a_no_retry_cell)
+    // retain all 944 prior identities (947, measured with cargo nextest list).
+    ("test.regular_crates", 947),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -861,7 +867,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // this is 822 - 8 = 814.
     // Both together: 822 + 6 (https://github.com/rrnewton/hermit/pull/3778)
     // - 8 (https://github.com/rrnewton/hermit/issues/3520) = 820.
-    ("test.hermit_unit", 820),
+    // The thirteen host_input_change::tests (naming a host file that changed
+    // during one verification run) retain all 820 prior identities (833,
+    // measured with cargo nextest list and this node's filters).
+    ("test.hermit_unit", 833),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1024,7 +1033,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_renamed_over_target_does_not_get_the_explicit_mtime
     // (https://github.com/rrnewton/hermit/issues/3565); they retain all 193
     // prior identities.
-    ("test.hermit_integration", 195),
+    // verify_claim_names_its_limit adds
+    // a_host_file_replaced_during_run_1_is_named_as_the_cause,
+    // a_divergence_with_no_host_file_change_names_no_host_input_change and
+    // a_guest_that_replaces_a_file_after_diverging_names_no_host_input_change;
+    // they retain all 195 prior identities (198, measured with cargo nextest
+    // list).
+    ("test.hermit_integration", 198),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but two (`cargo nextest list` lists 105):
     // the --skip waivers of record_node_eventfd_epoll_sequence
@@ -1258,7 +1273,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3639).
     // The host twin also selects the two utimensat_mtime tests
     // (https://github.com/rrnewton/hermit/issues/3565).
-    ("test.hermit_integration_on_host", 195),
+    // The host twin also selects the three host-input-change verify tests.
+    ("test.hermit_integration_on_host", 198),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -1285,7 +1301,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the same six https://github.com/rrnewton/hermit/pull/3778 tests, and
     // drops the same eight https://github.com/rrnewton/hermit/issues/3520
     // tests: 822 + 6 - 8 = 820.
-    ("test.hermit_unit_on_host", 820),
+    // The host twin selects the same thirteen host_input_change tests (833).
+    ("test.hermit_unit_on_host", 833),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -1341,7 +1358,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The four tests of the fixes to the post-facto review of
     // https://github.com/rrnewton/hermit/pull/3791 listed there retain all
     // 940: 940 + 4 = 944.
-    ("test.regular_crates_on_host", 944),
+    // The three host-input-change retry tests listed there (947).
+    ("test.regular_crates_on_host", 947),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.

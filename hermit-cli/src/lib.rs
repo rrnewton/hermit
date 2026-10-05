@@ -25,6 +25,7 @@ mod event;
 mod event_stream;
 mod fd;
 pub mod happens_before;
+pub mod host_input_change;
 mod id;
 pub mod instruction_map;
 mod interp;

@@ -51,6 +51,9 @@ fn canonical_report(
             Some(InfrastructureError::SkidOvershoot { count }) => {
                 format!("recorded infrastructure_error: {count} HERMIT_SKID_OVERSHOOT report(s)")
             }
+            Some(change @ InfrastructureError::HostInputChanged { .. }) => {
+                format!("recorded infrastructure_error: {change}")
+            }
             None => unreachable!("typed report parser requires an infrastructure error"),
         });
     }

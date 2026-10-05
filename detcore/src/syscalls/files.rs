@@ -956,9 +956,21 @@ impl<T: RecordOrReplay> Detcore<T> {
         flags: OFlag,
         ty: FdType,
     ) -> Result<(), Errno> {
-        let stat = if guest.config().virtualize_metadata {
+        self.add_fd_with_stat(guest, fd, flags, ty).await.map(drop)
+    }
+
+    /// [`Self::add_fd`], also returning the host `fstat` it took of `fd`, which
+    /// it takes only when metadata is virtualized.
+    async fn add_fd_with_stat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        flags: OFlag,
+        ty: FdType,
+    ) -> Result<Option<libc::stat>, Errno> {
+        let host_stat = if guest.config().virtualize_metadata {
             match self.inject_fstat(guest, fd).await {
-                Ok(stat) => Some(stat.into()),
+                Ok(stat) => Some(stat),
                 Err(errno) => {
                     // `fd` is already open in the guest, but Detcore cannot
                     // model it: with metadata virtualization on, a descriptor
@@ -982,7 +994,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        guest.thread_state().add_fd(fd, flags, ty, stat)
+        guest
+            .thread_state()
+            .add_fd(fd, flags, ty, host_stat.map(Into::into))?;
+        Ok(host_stat)
     }
 
     pub(crate) async fn release_port_for_open_file<G: Guest<Self>>(
@@ -1088,7 +1103,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     fd_type
                 };
-                self.add_fd(guest, fd, call.flags(), fd_type).await?;
+                let host_stat = self
+                    .add_fd_with_stat(guest, fd, call.flags(), fd_type)
+                    .await?;
+                if let (Some(log), Some(stat)) =
+                    (guest.config().host_input_log.as_deref(), &host_stat)
+                {
+                    let thread = guest.thread_state();
+                    crate::host_inputs::record(
+                        log,
+                        thread.dettid.as_raw() as u64,
+                        thread.stats.syscall_count,
+                        &observed_path,
+                        stat,
+                    );
+                }
                 if fd_type == FdType::Pipe {
                     self.maybe_set_nonblocking_fd(guest, fd);
                 }

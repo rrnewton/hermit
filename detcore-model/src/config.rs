@@ -696,6 +696,18 @@ pub struct Config {
     #[serde(skip)]
     #[clap(skip)]
     pub happens_before: Option<HappensBeforeProgram>,
+
+    /// Where each host file the guest opens is recorded, one
+    /// [`crate::host_input::HostInputRecord`] JSON line per open, appended.
+    /// `hermit run --verify` sets a private file for each of its two runs, so
+    /// that a divergence caused by a host file replaced during a run can be
+    /// named (see [`crate::host_input`]). The records are never part of the
+    /// compared log. Set programmatically, like `happens_before`: never a CLI
+    /// flag and never serialized, so it reaches only a backend that receives
+    /// this `Config` in-process.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub host_input_log: Option<PathBuf>,
 }
 
 fn try_parse_numbers_with_colon(from_str: &str) -> anyhow::Result<(DetTid, u64)> {

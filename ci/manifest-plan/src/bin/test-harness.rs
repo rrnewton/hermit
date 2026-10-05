@@ -42,6 +42,7 @@ use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::diagnostic_failure_reason;
 use hermit_manifest_plan::runner::host_inapplicable_result;
+use hermit_manifest_plan::runner::host_input_change_only;
 use hermit_manifest_plan::runner::is_diagnostic_cell;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::requires_capability;
@@ -2805,6 +2806,11 @@ enum RetryCause {
     /// `HERMIT_SKID_OVERSHOOT` reports. It is counted and reported as a
     /// SKID-RETRY (<https://github.com/rrnewton/hermit/issues/1845>).
     SkidOvershoot { reports: u64 },
+    /// A verify cell whose only failure is a divergence that a host file
+    /// changing during one run explains ([`host_input_change_only`]). It is
+    /// retried even when the cell declares `no_retry_reason`, which keeps
+    /// only a product failure final, and reported as a HOST-INPUT-RETRY.
+    HostInputChanged,
 }
 
 /// Why this finished attempt of `cell` is retried, or `None` when it is not.
@@ -2820,7 +2826,13 @@ fn attempt_retry_cause(
     cell: &SelectedCell,
     result: &CellResult,
 ) -> Option<RetryCause> {
-    if retries != Retries::Framework || !retries_product_failures(cell) {
+    if retries != Retries::Framework {
+        return None;
+    }
+    if host_input_change_only(result) {
+        return Some(RetryCause::HostInputChanged);
+    }
+    if !retries_product_failures(cell) {
         return None;
     }
     if cell_result_is_retryable(result.outcome.as_str(), result.failure_class) {
@@ -3166,16 +3178,17 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 suffix
             };
             let effective_will_retry = published && will_retry;
-            let skid_reports = match attempt_retry_cause(args.retries, &cells[index], &result) {
-                Some(RetryCause::SkidOvershoot { reports }) => Some(reports),
-                _ => None,
-            };
-            let retry_note = match (effective_will_retry, skid_reports) {
-                (true, Some(reports)) => format!(
+            let retry_cause = attempt_retry_cause(args.retries, &cells[index], &result);
+            let retry_note = match (effective_will_retry, retry_cause) {
+                (true, Some(RetryCause::SkidOvershoot { reports })) => format!(
                     " [SKID-RETRY: attempt {} of at most {} is a typed HERMIT_SKID_OVERSHOOT infrastructure error ({reports} report(s)) and nothing else; retrying this cell only]",
                     result.attempt, MAX_ATTEMPTS_PER_CELL
                 ),
-                (true, None) => format!(
+                (true, Some(RetryCause::HostInputChanged)) => format!(
+                    " [HOST-INPUT-RETRY: attempt {} of at most {} diverged because a host file changed during a run, which is not a product failure; retrying this cell once, and a second divergence stays a failure]",
+                    result.attempt, MAX_ATTEMPTS_PER_CELL
+                ),
+                (true, _) => format!(
                     " [attempt {} of at most {}; retrying this cell only]",
                     result.attempt, MAX_ATTEMPTS_PER_CELL
                 ),
@@ -3190,8 +3203,8 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 retry_note,
                 located
             );
-            let unretried_skid = match (effective_will_retry, skid_reports) {
-                (false, Some(reports)) => Some((
+            let unretried_skid = match (effective_will_retry, retry_cause) {
+                (false, Some(RetryCause::SkidOvershoot { reports })) => Some((
                     reports,
                     result.test.clone(),
                     result.mode.clone(),
@@ -9063,6 +9076,109 @@ sys.exit(1 if failed else 0)
             &cell("c-programs/random-readv-stream"),
             &failed
         ));
+    }
+
+    /// A verify attempt whose only failure is a divergence Hermit attributes to
+    /// a host file changing during one run earns one retry, even on a
+    /// strict-compatibility row (no_retry_reason), whose product failures are
+    /// final. `--no-retry` still turns it off, and a plain divergence of the
+    /// same row stays final.
+    #[test]
+    fn a_host_input_change_earns_one_retry_even_on_a_no_retry_cell() {
+        use sha2::Digest;
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let compat_cat = manifests
+            .select(&hermit_manifest_plan::runner::Selection {
+                test: Some("compat/cat".into()),
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
+                population: Some(hermit_manifest_plan::runner::Population::Required),
+                ..hermit_manifest_plan::runner::Selection::default()
+            })
+            .unwrap()
+            .remove(0);
+        let output = serde_json::json!({"exit_code": 0, "signal": null,
+            "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+            "stdout_bytes": 0, "stderr_bytes": 0});
+        let identity = |ino: u64| {
+            serde_json::json!({"dev": 33, "ino": ino, "size": 100,
+            "mtime_sec": 1_700_000_000_i64, "mtime_nsec": 0})
+        };
+        let report = serde_json::json!({
+            "verified": false, "bitwise_parity": false, "verdict": "infrastructure_error",
+            "no_result_reason": null,
+            "infrastructure_error": {"kind": "host_input_changed", "run": "run1",
+                "path": "/etc/ld.so.cache", "before": identity(57_899_095),
+                "after": identity(57_907_831)},
+            "comparison": {"strictness": "canonical", "display_name": "BitwiseInfoV1",
+                "compare_logs": true, "compare_io_buffers": true, "log_scope": "info",
+                "record_envelope": "all_records_v1", "virtualize_time": true,
+                "strip_lines": false, "canonicalize_addresses": true, "full_trace": true,
+                "exact_remainder": true, "stripped_prefixes": ["real-wall-clock-prefix/v1"],
+                "canonicalizations": ["host-address-to-first-appearance-ordinal/v1"],
+                "ignore_lines": false, "skip_commit": false, "skip_detlog": false},
+            "compared_log_messages": {"left": 2, "right": 2},
+            "compared_outputs": {"left": output, "right": output},
+            "guest_exit_code": 0, "guest_signal": null,
+            "first_divergent_scheduler_turn": 4, "first_divergent_virtual_nanoseconds": 7,
+            "first_divergent_record": 9, "first_divergent_syscall": 2,
+            "first_divergent_left_message": "left", "first_divergent_right_message": "right"
+        });
+        let bytes = serde_json::to_string(&report).unwrap();
+        let parsed =
+            hermit_manifest_plan::canonical_verdict::VerificationReport::from_current_json_slice(
+                bytes.as_bytes(),
+            )
+            .unwrap();
+        let reason = hermit_manifest_plan::runner::host_input_changed_reason(
+            parsed.infrastructure_error.as_ref().unwrap(),
+        );
+        let row = |reason: &str, report: &str| -> CellResult {
+            let digest = format!("{:x}", sha2::Sha256::digest(report.as_bytes()));
+            let attempt = serde_json::json!({"index": "1", "outcome": "ERROR",
+                "error_kind": "infrastructure", "status": 1, "signal": null,
+                "timed_out": false, "duration_ms": 1, "argv": [], "guest_argv": [],
+                "env": {}, "cwd": "/repo", "shell_command": "", "stdout": "", "stderr": "",
+                "reason": reason, "verification_report": report,
+                "verification_report_sha256": digest});
+            let mut row = serde_json::json!({
+                "schema": 4, "run_id": "fixture", "hermit_sha": "sha", "source_tree_dirty": false,
+                "test": "compat/cat", "category": "compat", "lane": "portable", "mode": "verify",
+                "backend": "ptrace", "classification": "required", "outcome": "ERROR",
+                "failure_class": "understood_infrastructure_failure",
+                "error_kind": "infrastructure", "attempt": 1, "relaxations": [],
+                "reason": reason, "argv": [], "guest_argv": [], "env": {}, "cwd": "/repo",
+                "shell_command": "", "artifact_dir": "/repo/a",
+                "declared_stdout": {"exact": null, "contains": null}
+            });
+            row["attempts"] = serde_json::json!([attempt]);
+            serde_json::from_value(row).unwrap()
+        };
+        let changed = row(&reason, &bytes);
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &changed),
+            Some(super::RetryCause::HostInputChanged)
+        );
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Off, &compat_cat, &changed),
+            None
+        );
+        // The same row with a reason its report does not produce, or labelled
+        // a product failure, is not a host input change and stays final on
+        // this cell.
+        let relabelled = row("host input changed", &bytes);
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &relabelled),
+            None
+        );
+        let mut product = changed.clone();
+        product.outcome = "FAIL".into();
+        product.failure_class = Some(hermit_manifest_plan::runner::FailureClass::ProductFailure);
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &compat_cat, &product),
+            None
+        );
     }
 
     /// The production retry decision for a replay cell: its product FAIL (a
