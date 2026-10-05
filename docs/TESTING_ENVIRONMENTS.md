@@ -244,7 +244,7 @@ erasing the host; this table is where the erased identities go back.
 | validation DAG node `check.lint_checks`: `default_lint_jobs` in `ci/lint-checks-node.sh` and the node description in `ci/manifest-plan/src/validation_dag_static.rs` (mirrored in `ci/dag/validate.json`) | `devbig030` | 2026-10-05 at Hermit `32e2d4bb3e`, 44 checkers: anonymous memory peaked at 1.46 GB with `-j8` and 4.18 GB with `-j44`; the largest single checker process (lint-check-shellcheck) reached 230 MiB |
 | shard count in `scripts/core-review-protocol-lint-test.sh` | `devbig030` | 316 cores, 670 cases: all cases serially took 42 s; 1/4/8 shards took 39.1/10.2/5.3 s wall with 104/290/542 MB peak anonymous memory |
 | concurrent jobs in `scripts/test-authority-obtained-once.sh` | `devbig030` | Run serially the checks took 66 s, 41 s of it the core-review self-test, the longest single path in `check.lint_checks` |
-| `portable` cell `applications/timed-progress-bar`, mode `verify`, `slow_reason.ptrace` in `tests/e2e/manifests/applications.yaml` | `devbig030`, `twshared38869` | On 2026-10-05 the default 50 x 20 ms workload took about 7 CPU seconds on `devbig030` but reached the 32-second CPU bound on the Buck remote-execution host `twshared38869`, where zstd-multithread verify/ptrace ran 5.7x slower than at `3446e8af` |
+| `portable` cell `applications/timed-progress-bar`, mode `verify`, `slow_reason.ptrace` in `tests/e2e/manifests/applications.yaml` | `devbig030`, one Buck remote-execution host | On 2026-10-05 the default 50 x 20 ms workload took about 7 CPU seconds on `devbig030` but reached the 32-second CPU bound on one Buck remote-execution host, where zstd-multithread verify/ptrace ran 5.7x slower than at `3446e8af` |
 
 ## Hardware-sensitive Cargo tests
 
