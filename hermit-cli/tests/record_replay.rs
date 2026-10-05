@@ -2560,3 +2560,6 @@ record_replay_tests! {
     record_rs_stack_ptr => "rustbin_stack_ptr",
     record_rs_thread_random => "rustbin_thread_random",
 }
+
+#[path = "record_replay/network_trace.rs"]
+mod network_trace;
