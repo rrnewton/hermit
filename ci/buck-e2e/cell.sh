@@ -69,14 +69,17 @@ tpx_timeout=${TPX_TIMEOUT_SEC:-600}
 deadline=${CELL_DEADLINE_S:-$((tpx_timeout - 30))}
 ((deadline > 10)) || deadline=10
 
-# The cargo flow runs every cell in a fresh tmpfs at /test (HERMIT_E2E_EMPTY_WORKDIR).
-# hermit can only mount it where /test exists: a local host can provide it, an RE
-# worker cannot, so RE cells use the harness's default bound /tmp/test workdir.
-# The pinned-root container always has a fresh tmpfs at /test.
+# Every cell outside the pinned root uses the harness's default workdir: a fresh,
+# empty per-attempt directory bound at /tmp/test. RE workers cannot mount at /test, and
+# backend parity compares a candidate's log with a ptrace reference that may have run on
+# RE, so a local cell must see the same workdir or the two guests' inputs differ (a local
+# /test tmpfs made every kvm comparison inputs-not-equalized). The pinned-root container
+# keeps its fresh tmpfs at /test: the DBT adapter refuses --bind and enters that mount
+# namespace itself, and a guest that asserts /test (c-programs/environment-and-workdir)
+# runs there for it (defs.bzl PINNED_ROOT_ONLY).
 container=${HERMIT_E2E_CONTAINER:-}
 workdir_env=()
-[[ ${HERMIT_E2E_ROUTE:-} == local && (-d /test || $container == pinned-root) ]] &&
-    workdir_env=(HERMIT_E2E_EMPTY_WORKDIR=/test)
+[[ $container == pinned-root ]] && workdir_env=(HERMIT_E2E_EMPTY_WORKDIR=/test)
 # The harness measures each budgeted invocation's live CPU from a cgroup of its own and
 # refuses the invocation when it cannot create one. An RE worker runs the test inside a
 # root-owned cgroup that cell.sh cannot write (cgroup.procs: EACCES), so an RE cell is a
