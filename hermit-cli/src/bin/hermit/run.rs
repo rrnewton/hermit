@@ -94,6 +94,7 @@ use super::verify::write_pending_verification_json;
 use super::verify::write_report_json;
 use super::verify::write_skid_overshoot_verification_json;
 use super::verify::write_skid_overshoot_without_comparison_json;
+use super::verify::write_unreliable_pmu_verification_json;
 use super::verify::write_verification_json;
 
 const TMP_DIR: &str = "/tmp";
@@ -2714,6 +2715,100 @@ fn only_instrumented_ptrace_family_runs_depend_on_host_perf() {
     assert!(!kvm.arms_reverie_ptrace_pmu_timer());
 }
 
+/// The failed-check path, forced with an injected result so no host with the
+/// defect is needed: a `--max-timeslice` run on the ptrace backend refuses
+/// before any guest starts, with a typed error naming the defect, and replaces
+/// the pending `--verify-json` stamp with that cause.
+#[cfg(target_arch = "x86_64")]
+#[test]
+fn a_failed_pmu_validation_refuses_a_timeslice_run_and_names_the_defect() {
+    let dir = tempfile::tempdir().unwrap();
+    let json = dir.path().join("verify.json");
+    let json_arg = format!("--verify-json={}", json.display());
+    let mut ro = RunOpts::parse_from(["fakehermit", "--verify", json_arg.as_str(), "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    assert!(ro.det_opts.det_config.max_timeslice.is_some());
+    let arms = ro.schedules_by_ptrace_rcb_counter().unwrap();
+    assert!(arms);
+    write_pending_verification_json(&json).unwrap();
+
+    let error = ro
+        .refuse_unreliable_pmu_with(arms, || {
+            Err(reverie_ptrace::PmuValidationError::AmdSpecLockMapShouldBeDisabled)
+        })
+        .unwrap_err();
+    let refusal = error
+        .downcast_ref::<hermit::UnreliablePmuError>()
+        .expect("the refusal must be the typed unreliable-PMU error");
+    assert_eq!(refusal.defect(), "AmdSpecLockMapShouldBeDisabled");
+    let message = format!("{error:#}");
+    assert!(message.contains("SpecLockMap"), "{message}");
+    assert!(message.contains("--max-timeslice=disabled"), "{message}");
+
+    let report: serde_json::Value = serde_json::from_slice(&fs::read(&json).unwrap()).unwrap();
+    assert_eq!(report["verdict"], "infrastructure_error");
+    assert_eq!(report["verified"], false);
+    assert_eq!(
+        report["infrastructure_error"],
+        serde_json::json!({"kind": "unreliable_pmu", "defect": "AmdSpecLockMapShouldBeDisabled"})
+    );
+}
+
+/// `--no-rcb-time` stops RCBs from advancing virtual time but still preempts
+/// by the counter, so the counter's reliability still decides the schedule.
+#[test]
+fn no_rcb_time_still_preempts_by_the_counter_and_is_still_refused() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "--no-rcb-time", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    assert!(!ro.det_opts.det_config.use_rcb_time());
+    let arms = ro.schedules_by_ptrace_rcb_counter().unwrap();
+    assert!(arms);
+    let error = ro
+        .refuse_unreliable_pmu_with(arms, || {
+            Err(reverie_ptrace::PmuValidationError::IocPeriodBugDetected)
+        })
+        .unwrap_err();
+    assert_eq!(
+        error
+            .downcast_ref::<hermit::UnreliablePmuError>()
+            .map(hermit::UnreliablePmuError::defect),
+        Some("IocPeriodBugDetected")
+    );
+    // A passing check lets the same run proceed.
+    ro.refuse_unreliable_pmu_with(arms, || Ok(())).unwrap();
+}
+
+/// A run that does not preempt by the ptrace RCB counter neither reads the
+/// validation result nor is refused by it: `--max-timeslice=disabled`, the
+/// perf-unavailable downgrade, `--namespace-only`, and backends without the
+/// ptrace timer.
+#[test]
+fn a_run_without_the_ptrace_rcb_timer_never_reads_the_pmu_validation() {
+    let cases: [(&[&str], bool); 6] = [
+        (
+            &["hermit", "run", "--max-timeslice=disabled", "fakeprog"],
+            true,
+        ),
+        (&["hermit", "run", "fakeprog"], false),
+        (&["hermit", "run", "--namespace-only", "fakeprog"], true),
+        (&["hermit", "--backend=kvm", "run", "fakeprog"], true),
+        (&["hermit", "--backend=dbt", "run", "fakeprog"], true),
+        (&["hermit", "--backend=sabre", "run", "fakeprog"], true),
+    ];
+    for (argv, perf_supported) in cases {
+        let mut ro = run_opts_for(argv);
+        ro.validate_args_with_perf_support(perf_supported)
+            .unwrap_or_else(|error| panic!("{argv:?} should validate: {error:#}"));
+        let arms = ro.schedules_by_ptrace_rcb_counter().unwrap();
+        assert!(
+            !arms,
+            "{argv:?} should not schedule by the ptrace RCB counter"
+        );
+        ro.refuse_unreliable_pmu_with(arms, || panic!("{argv:?} read the PMU validation"))
+            .unwrap();
+    }
+}
+
 #[test]
 fn display_runopts_without_perf_support() {
     let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog", "arg1"]);
@@ -3538,6 +3633,11 @@ impl RunOpts {
             backend.ensure_available()?;
         }
         self.install_pmu_config()?;
+        // After `install_pmu_config`: the validation result is computed once,
+        // from the PMU configuration in force, and reading it first would
+        // freeze the default configuration before `--skid-margin` is applied.
+        // Before every guest start, including both `--verify` runs.
+        self.refuse_unreliable_pmu()?;
         // The KVM backend reaches real reverie-kvm code from its dispatch path
         // and reports an accurate, program-specific error there, so it is not
         // pre-empted by the generic availability probe above. E9patch is a CLI
@@ -3703,6 +3803,56 @@ impl RunOpts {
                 Backend::Ptrace | Backend::Liteinst | Backend::E9patch => true,
                 Backend::Dbt | Backend::Sabre | Backend::Kvm => false,
             }
+    }
+
+    /// Whether this run places preemption points with Reverie ptrace's
+    /// retired-conditional-branch (RCB) counter. Valid after `validate_args`,
+    /// which turns `--max-timeslice` off when perf is unavailable.
+    ///
+    /// This keys on `--max-timeslice`, not on `DetConfig::use_rcb_time`:
+    /// `--no-rcb-time` only stops RCBs from advancing virtual time, while
+    /// Detcore still arms the RCB preemption timer and reads the counter for
+    /// every timeslice, so a miscounting counter still moves the schedule.
+    /// In-guest LiteInst arms no ptrace timer (and `validate_args` refuses
+    /// `--max-timeslice` for it).
+    fn schedules_by_ptrace_rcb_counter(&self) -> Result<bool, Error> {
+        Ok(self.arms_reverie_ptrace_pmu_timer()
+            && self.liteinst_runtime()? != LiteinstRuntime::InGuest
+            && self.det_opts.det_config.max_timeslice.is_some())
+    }
+
+    /// Refuse to start the guest when the run would schedule by the RCB
+    /// counter and Reverie's PMU validation failed on this host. The counter
+    /// may miscount there (for example the AMD Zen SpecLockMap erratum,
+    /// <https://github.com/rr-debugger/rr/issues/2034>), so the schedule
+    /// would not be reproducible and Hermit could not vouch for the run.
+    fn refuse_unreliable_pmu(&self) -> Result<(), Error> {
+        let arms = self.schedules_by_ptrace_rcb_counter()?;
+        self.refuse_unreliable_pmu_with(arms, reverie_ptrace::pmu_validation)
+    }
+
+    /// [`Self::refuse_unreliable_pmu`] with the validation result supplied by
+    /// the caller, so a test can force the failed-check path on any host.
+    fn refuse_unreliable_pmu_with(
+        &self,
+        arms_rcb_timer: bool,
+        validation: impl FnOnce() -> Result<(), reverie_ptrace::PmuValidationError>,
+    ) -> Result<(), Error> {
+        let Err(refusal) = hermit::refuse_unreliable_pmu(arms_rcb_timer, validation) else {
+            return Ok(());
+        };
+        let defect = refusal.defect();
+        let mut error = Error::new(refusal);
+        // Replace the pending NO-RESULT stamp with the known cause, as the
+        // skid-overshoot path does, so the receipt names the defect. A failed
+        // write is reported alongside the refusal rather than replacing it, so
+        // the exit status still says "refused".
+        if let Some(path) = self.verify_json_path()
+            && let Err(report_error) = write_unreliable_pmu_verification_json(path, defect)
+        {
+            error = retain_verification_error(error, "publishing unreliable PMU", report_error);
+        }
+        Err(error)
     }
 
     fn validate_args_with_perf_support(&mut self, perf_supported: bool) -> Result<(), Error> {

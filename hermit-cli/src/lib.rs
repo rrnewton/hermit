@@ -1646,6 +1646,74 @@ impl std::fmt::Display for SkidOvershootError {
 
 impl std::error::Error for SkidOvershootError {}
 
+/// Reverie's PMU validation failed on a host where the run would place
+/// preemption points by the ptrace retired-conditional-branch (RCB) counter, so
+/// Hermit refuses before the guest starts.
+///
+/// The check (`reverie_ptrace::pmu_validation`) looks for host defects that
+/// make that counter miscount. The one seen in practice is the AMD Zen
+/// SpecLockMap erratum (<https://github.com/rr-debugger/rr/issues/2034>): a
+/// speculatively executed locked instruction can leave the count off by a few
+/// branches, so a preemption point moves by a few branches from run to run and
+/// two runs of the same program can differ by a few tens of virtual
+/// nanoseconds. Like [`SkidOvershootError`], this is an understood
+/// infrastructure failure: the host cannot support the run, and Hermit
+/// declines to produce a result it cannot vouch for.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnreliablePmuError {
+    defect: &'static str,
+    detail: String,
+}
+
+impl UnreliablePmuError {
+    pub fn new(error: &reverie_ptrace::PmuValidationError) -> Self {
+        Self {
+            defect: error.name(),
+            detail: error.to_string(),
+        }
+    }
+
+    /// The stable name of the failed check, such as
+    /// `AmdSpecLockMapShouldBeDisabled`.
+    pub fn defect(&self) -> &'static str {
+        self.defect
+    }
+}
+
+impl std::fmt::Display for UnreliablePmuError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "refusing to run: --max-timeslice places preemption points by the retired \
+             conditional branch counter, but Reverie's PMU validation failed on this host \
+             ({}: {}), so the counter may miscount and the schedule would not be \
+             reproducible. Run on a host where the check passes, or pass \
+             --max-timeslice=disabled to run without preemption",
+            self.defect, self.detail
+        )
+    }
+}
+
+impl std::error::Error for UnreliablePmuError {}
+
+/// Refuse a run whose preemption points come from the ptrace RCB counter when
+/// Reverie's PMU validation failed on this host.
+///
+/// `arms_rcb_timer` says whether the run would arm that timer at all. When it
+/// is false, `validation` is not called, so a run with
+/// `--max-timeslice=disabled` or a backend without the ptrace timer neither
+/// runs the check nor depends on its result. `validation` is a parameter so a
+/// test can supply a failed result without a host that has the defect.
+pub fn refuse_unreliable_pmu(
+    arms_rcb_timer: bool,
+    validation: impl FnOnce() -> Result<(), reverie_ptrace::PmuValidationError>,
+) -> Result<(), UnreliablePmuError> {
+    if !arms_rcb_timer {
+        return Ok(());
+    }
+    validation().map_err(|error| UnreliablePmuError::new(&error))
+}
+
 fn take_skid_overshoot_error() -> Option<SkidOvershootError> {
     let count = reverie::take_skid_overshoot_count();
     (count > 0).then(|| SkidOvershootError::new(count))

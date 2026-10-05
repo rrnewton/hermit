@@ -3218,6 +3218,13 @@ impl ResultRow {
                                 index + 1
                             )
                         }
+                        Some(canonical_verdict::InfrastructureError::UnreliablePmu { defect }) => {
+                            format!(
+                                "attempt {} refused before starting the guest: unreliable PMU \
+                                 ({defect})",
+                                index + 1
+                            )
+                        }
                         None => format!("attempt {} recorded an infrastructure error", index + 1),
                     };
                     unavailable.get_or_insert(reason);

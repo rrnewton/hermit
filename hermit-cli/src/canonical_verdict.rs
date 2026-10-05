@@ -114,6 +114,13 @@ pub enum InfrastructureError {
     /// A ptrace PMU timer interrupt arrived after its target. Both runs and
     /// their comparison may still be retained, but the result is not admitted.
     SkidOvershoot { count: u64 },
+    /// Reverie's PMU validation failed on this host, so the retired-branch
+    /// counter that `--max-timeslice` preemption is scheduled by may miscount
+    /// and the schedule would not be reproducible. Hermit refused before
+    /// starting the guest, so no run, comparison or guest status exists.
+    /// `defect` is the stable name of Reverie's `PmuValidationError` variant,
+    /// for example `AmdSpecLockMapShouldBeDisabled`.
+    UnreliablePmu { defect: String },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -475,6 +482,28 @@ impl VerificationReport {
                 return Err(
                     "incomplete verification report: skid_overshoot count must be positive".into(),
                 );
+            }
+            (Verdict::InfrastructureError, Some(InfrastructureError::UnreliablePmu { defect })) => {
+                if defect.trim().is_empty() {
+                    return Err(
+                        "incomplete verification report: unreliable_pmu must name its defect"
+                            .into(),
+                    );
+                }
+                // The refusal happens before the guest starts, so a report
+                // carrying any execution evidence is not this refusal.
+                if self.comparison.is_some()
+                    || self.compared_log_messages.is_some()
+                    || self.compared_outputs.is_some()
+                    || self.runtime.is_some()
+                    || self.guest_exit_code.is_some()
+                    || self.guest_signal.is_some()
+                {
+                    return Err(
+                        "inconsistent verification report: unreliable_pmu is a refusal before execution but the report carries execution evidence"
+                            .into(),
+                    );
+                }
             }
             (Verdict::InfrastructureError, None) => {
                 return Err(
@@ -1564,5 +1593,61 @@ mod tests {
         let error = VerificationReport::from_json_value(report)
             .expect_err("zero cannot describe an observed skid overshoot");
         assert!(error.contains("count must be positive"), "{error}");
+    }
+
+    #[test]
+    fn unreliable_pmu_is_a_named_refusal_without_execution_evidence() {
+        let mut report = serde_json::to_value(VerificationReport::no_result()).unwrap();
+        report["verdict"] = serde_json::json!("infrastructure_error");
+        report["no_result_reason"] = serde_json::Value::Null;
+        report["infrastructure_error"] = serde_json::json!({
+            "kind": "unreliable_pmu",
+            "defect": "AmdSpecLockMapShouldBeDisabled",
+        });
+        let bytes = serde_json::to_vec(&report).unwrap();
+        let parsed = VerificationReport::from_current_json_slice(&bytes).unwrap();
+        assert_eq!(parsed.verdict, Verdict::InfrastructureError);
+        assert!(!parsed.verified);
+        assert_eq!(
+            parsed.infrastructure_error,
+            Some(InfrastructureError::UnreliablePmu {
+                defect: "AmdSpecLockMapShouldBeDisabled".into()
+            })
+        );
+        let reserialized = serde_json::to_vec(&parsed).unwrap();
+        assert_eq!(
+            VerificationReport::from_current_json_slice(&reserialized).unwrap(),
+            parsed
+        );
+
+        let mut unnamed = report.clone();
+        unnamed["infrastructure_error"]["defect"] = serde_json::json!(" ");
+        let error =
+            VerificationReport::from_current_json_slice(&serde_json::to_vec(&unnamed).unwrap())
+                .expect_err("a refusal must say which check failed");
+        assert!(error.contains("must name its defect"), "{error}");
+
+        for (field, value) in [
+            ("guest_exit_code", serde_json::json!(0)),
+            ("guest_signal", serde_json::json!(9)),
+            (
+                "compared_log_messages",
+                serde_json::json!({"left": 1, "right": 1}),
+            ),
+        ] {
+            let mut ran = report.clone();
+            ran[field] = value;
+            let error =
+                VerificationReport::from_current_json_slice(&serde_json::to_vec(&ran).unwrap())
+                    .expect_err("a refusal before execution has no execution evidence");
+            assert!(error.contains("execution evidence"), "{field}: {error}");
+        }
+
+        let mut matched = report;
+        matched["verdict"] = serde_json::json!("no_result");
+        let error =
+            VerificationReport::from_current_json_slice(&serde_json::to_vec(&matched).unwrap())
+                .expect_err("only the infrastructure_error verdict carries the refusal");
+        assert!(error.contains("carries infrastructure_error"), "{error}");
     }
 }

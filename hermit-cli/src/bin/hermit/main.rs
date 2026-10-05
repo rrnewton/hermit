@@ -719,6 +719,12 @@ fn failure_exit_code(error: &Error) -> i32 {
     if error.downcast_ref::<hermit::SkidOvershootError>().is_some() {
         return detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
     }
+    // The same understood infrastructure failure, found before the guest
+    // started: Reverie's PMU validation failed on a host where the run would
+    // schedule by the RCB counter. The receipt carries the defect's name.
+    if error.downcast_ref::<hermit::UnreliablePmuError>().is_some() {
+        return detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
+    }
     // ⚠️ A REFUSAL IS NOT A FAILURE, AND IT IS CHECKED FIRST FOR THAT REASON.
     // A fail-closed policy stopping the run is hermit working; reporting it as
     // HERMIT_INTERNAL_FAILURE_EXIT tells the operator to file a bug against a
@@ -752,6 +758,12 @@ fn classify_failure(error: &Error) -> String {
         return format!(
             "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={}",
             overshoot.count()
+        );
+    }
+    if let Some(refusal) = error.downcast_ref::<hermit::UnreliablePmuError>() {
+        return format!(
+            "HERMIT_POLICY_REFUSAL class=policy-refusal cause=unreliable-pmu defect={}",
+            refusal.defect()
         );
     }
     // ⚠️ REFUSAL BEFORE FAILURE. This arm and the ContainerChildExit arm below
@@ -1224,6 +1236,33 @@ mod tests {
         assert_eq!(
             classify_failure(&error),
             "HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count=2"
+        );
+    }
+
+    #[test]
+    fn unreliable_pmu_uses_the_policy_refusal_exit_and_marker() {
+        let error = Error::new(hermit::UnreliablePmuError::new(
+            &reverie_ptrace::PmuValidationError::IocPeriodBugDetected,
+        ));
+        assert_eq!(
+            failure_exit_code(&error),
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT
+        );
+        assert_eq!(
+            classify_failure(&error),
+            "HERMIT_POLICY_REFUSAL class=policy-refusal cause=unreliable-pmu \
+             defect=IocPeriodBugDetected"
+        );
+        // A failure to publish the receipt is reported alongside the refusal
+        // and does not turn it into an internal failure.
+        let with_publish_failure = super::verify::retain_verification_error(
+            error,
+            "publishing unreliable PMU",
+            Error::msg("disk full"),
+        );
+        assert_eq!(
+            failure_exit_code(&with_publish_failure),
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT
         );
     }
 

@@ -791,6 +791,21 @@ pub fn write_skid_overshoot_without_comparison_json(
     write_report_json(path, &report)
 }
 
+/// Write a named unreliable-PMU infrastructure error: Hermit refused before
+/// starting the guest because Reverie's PMU validation failed on a host where
+/// the run would schedule by the retired-conditional-branch counter. Nothing
+/// ran, so the report carries no comparison, runtime or guest status, only the
+/// name of the failed check.
+pub fn write_unreliable_pmu_verification_json(path: &Path, defect: &str) -> Result<(), Error> {
+    let mut report = VerificationReport::no_result();
+    report.verdict = Verdict::InfrastructureError;
+    report.no_result_reason = None;
+    report.infrastructure_error = Some(InfrastructureError::UnreliablePmu {
+        defect: defect.to_owned(),
+    });
+    write_report_json(path, &report)
+}
+
 /// Publish an explicit NO-RESULT record to `path` *before* verification starts.
 ///
 /// This is what makes the artifact invocation-bound. `write_verification_json`
@@ -3936,6 +3951,41 @@ mod tests {
         assert!(report.no_result_reason.is_none());
         assert!(report.comparison.is_none());
         assert_eq!(report.guest_exit_code, Some(7));
+    }
+
+    #[test]
+    fn unreliable_pmu_refusal_is_a_named_infrastructure_error_without_execution() {
+        let file = NamedTempFile::new().unwrap();
+        // The pending stamp main() writes first is what the refusal replaces.
+        write_pending_verification_json(file.path()).unwrap();
+        write_unreliable_pmu_verification_json(file.path(), "AmdSpecLockMapShouldBeDisabled")
+            .unwrap();
+
+        let text = fs::read_to_string(file.path()).unwrap();
+        let report =
+            VerificationReport::from_current_json_value(serde_json::from_str(&text).unwrap())
+                .unwrap();
+        assert_eq!(report.verdict, Verdict::InfrastructureError);
+        assert_eq!(
+            report.infrastructure_error,
+            Some(InfrastructureError::UnreliablePmu {
+                defect: "AmdSpecLockMapShouldBeDisabled".to_owned()
+            })
+        );
+        assert!(!report.verified);
+        assert!(report.no_result_reason.is_none());
+        assert!(report.comparison.is_none());
+        assert!(report.runtime.is_none());
+        assert_eq!(report.guest_exit_code, None);
+        assert_eq!(report.guest_signal, None);
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(
+            value["infrastructure_error"],
+            serde_json::json!({
+                "kind": "unreliable_pmu",
+                "defect": "AmdSpecLockMapShouldBeDisabled"
+            })
+        );
     }
 
     #[test]

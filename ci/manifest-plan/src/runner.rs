@@ -3138,6 +3138,21 @@ pub fn skid_overshoot_reason(count: u64) -> String {
     format!("verification recorded {count} HERMIT_SKID_OVERSHOOT report(s)")
 }
 
+/// The reason the runner records for a verify attempt whose verification
+/// report is Hermit's typed `unreliable_pmu` infrastructure error: Hermit
+/// refused before starting the guest because Reverie's PMU validation failed
+/// on a host where the run would schedule by the retired-conditional-branch
+/// counter. Like a skid overshoot it is an understood infrastructure ERROR,
+/// but it is never skid-only and so never earns the skid retry: the defect is
+/// a property of the host, and a same-host retry would refuse again.
+pub fn unreliable_pmu_reason(defect: &str) -> String {
+    format!(
+        "unsupported host: Hermit refused before starting the guest because Reverie's PMU \
+         validation failed ({defect}), so the retired-conditional-branch counter that places \
+         preemption points may miscount on this host"
+    )
+}
+
 /// The number of `HERMIT_SKID_OVERSHOOT` reports behind `result`, when, and
 /// only when, the cell is a verify cell and its failure is a precise-timer
 /// overshoot and nothing else
@@ -3403,7 +3418,9 @@ fn attempt_skid_overshoot_reports(
     {
         return None;
     }
-    let InfrastructureError::SkidOvershoot { count } = report.infrastructure_error?;
+    let Some(InfrastructureError::SkidOvershoot { count }) = report.infrastructure_error else {
+        return None;
+    };
     let refusal =
         format!("HERMIT_POLICY_REFUSAL class=policy-refusal cause=skid-overshoot count={count}");
     let mut overshoot_marked = false;
@@ -4914,9 +4931,12 @@ fn execute_spec_until(
                                 }
                                 .err()
                             });
-                            let skid_reason = match report.infrastructure_error.as_ref() {
+                            let infrastructure_reason = match report.infrastructure_error.as_ref() {
                                 Some(InfrastructureError::SkidOvershoot { count }) => {
                                     skid_overshoot_reason(*count)
+                                }
+                                Some(InfrastructureError::UnreliablePmu { defect }) => {
+                                    unreliable_pmu_reason(defect)
                                 }
                                 None => unreachable!(
                                     "typed report parser requires an infrastructure error"
@@ -4956,16 +4976,16 @@ fn execute_spec_until(
                                 error_kind = Some("infrastructure".into());
                                 reason = Some(match error {
                                     ExpectedStdoutError::Unevidenced(error) => format!(
-                                        "{skid_reason}, and a declared stdout assertion cannot be checked: {error}"
+                                        "{infrastructure_reason}, and a declared stdout assertion cannot be checked: {error}"
                                     ),
                                     ExpectedStdoutError::Mismatch(error) => format!(
-                                        "{skid_reason}, and its compared runs violate a declared stdout assertion: {error}"
+                                        "{infrastructure_reason}, and its compared runs violate a declared stdout assertion: {error}"
                                     ),
                                 });
                             } else {
                                 outcome = "ERROR".into();
                                 error_kind = Some("infrastructure".into());
-                                reason = Some(skid_reason);
+                                reason = Some(infrastructure_reason);
                             }
                         } else if report.verdict == Verdict::NoResult
                             && matches!(
@@ -17221,6 +17241,45 @@ exit "$(cat "$PWD/exit-status")"
         let json = serde_json::to_string(&report).unwrap();
         current_verification_report(json.as_bytes()).unwrap();
         json
+    }
+
+    /// Hermit's refusal before execution on a host whose PMU validation
+    /// failed is an understood infrastructure ERROR that names the defect,
+    /// classified as a skid refusal is, but it is never skid-only, so the
+    /// runner never spends the same-host skid retry on a host defect.
+    #[test]
+    fn unreliable_pmu_refusal_is_an_infrastructure_error_and_never_skid_only() {
+        let mut report = VerificationReport::no_result();
+        report.verdict = Verdict::InfrastructureError;
+        report.no_result_reason = None;
+        report.infrastructure_error = Some(InfrastructureError::UnreliablePmu {
+            defect: "AmdSpecLockMapShouldBeDisabled".into(),
+        });
+        let report = serde_json::to_string(&report).unwrap();
+        current_verification_report(report.as_bytes()).unwrap();
+
+        let attempt = attempt_from_script(
+            "ptrace",
+            "printf %s \"$1\" > \"$2\"; printf '%s\\n' \
+             'HERMIT_POLICY_REFUSAL class=policy-refusal cause=unreliable-pmu defect=AmdSpecLockMapShouldBeDisabled' >&2; \
+             exit 122",
+            Some(&report),
+        );
+        assert_eq!(attempt.outcome, "ERROR");
+        assert_eq!(attempt.error_kind.as_deref(), Some("infrastructure"));
+        assert_eq!(attempt.status, Some(122));
+        assert_eq!(
+            attempt.reason.as_deref(),
+            Some(unreliable_pmu_reason("AmdSpecLockMapShouldBeDisabled").as_str())
+        );
+
+        let row = verify_row_from_attempts(vec![attempt]);
+        assert_eq!(row.outcome, "ERROR");
+        assert_eq!(
+            row.failure_class,
+            Some(FailureClass::UnderstoodInfrastructureFailure)
+        );
+        assert_eq!(skid_overshoot_only_reports(&row), None);
     }
 
     /// Only a verify row whose every attempt is Hermit's typed overshoot

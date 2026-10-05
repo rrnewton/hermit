@@ -51,6 +51,10 @@ fn canonical_report(
             Some(InfrastructureError::SkidOvershoot { count }) => {
                 format!("recorded infrastructure_error: {count} HERMIT_SKID_OVERSHOOT report(s)")
             }
+            Some(InfrastructureError::UnreliablePmu { defect }) => format!(
+                "recorded infrastructure_error: unreliable PMU ({defect}); Hermit refused before \
+                 starting the guest"
+            ),
             None => unreachable!("typed report parser requires an infrastructure error"),
         });
     }
