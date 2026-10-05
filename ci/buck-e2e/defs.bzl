@@ -9,7 +9,8 @@ and the ingester keeps "passed only on rerun" red.
 Routing (per cell, first match wins; see _route):
   local: kvm or dbt backend, privileged lane, a host-capability requirement, a `requires` tool
          RE workers lack, the LOCAL_TESTS deny-list, a test measured to fail only on RE
-         (re_exclusions.json), or a PMU-armed cell under -c hermit_e2e.pmu_on_re=false.
+         (re_exclusions.json), a PMU-armed cell under -c hermit_e2e.pmu_on_re=false, or
+         the ptrace verify cell of a test with a kvm verify cell (its parity reference).
   re:    everything else.
 `-c hermit_e2e.routing=local` runs every cell locally (the buck-local test mode).
 
@@ -66,7 +67,7 @@ def cell_slug(cell):
 def pmu_armed(cell):
     return cell["backend"] in ["ptrace", "liteinst"] and cell["category"] != "compat" and cell_id(cell) not in PMU_FREE_CELLS
 
-def _route(cell, pmu_on_re, re_exclusions):
+def _route(cell, pmu_on_re, re_exclusions, kvm_verify_tests):
     """Returns (where, reason): where is "local" or "re"."""
     if cell["backend"] == "kvm":
         return ("local", "kvm backend: RE workers have no /dev/kvm")
@@ -90,6 +91,11 @@ def _route(cell, pmu_on_re, re_exclusions):
         return ("local", "measured: " + re_exclusions[cell["test"]]["reason"])
     if pmu_armed(cell) and not pmu_on_re:
         return ("local", "arms the PMU and -c hermit_e2e.pmu_on_re=false")
+    if cell["backend"] == "ptrace" and cell["mode"] == "verify" and cell["test"] in kvm_verify_tests:
+        # Backend parity credits a kvm verify cell against this test's ptrace verify cell
+        # only when both ran on one route (ci/manifest-plan/src/parity.rs shares_route),
+        # and a kvm cell always runs locally.
+        return ("local", "parity reference of a kvm verify cell, which runs locally")
     return ("re", "")
 
 def _container(cell, where):
@@ -192,8 +198,9 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
     if plan["schema"] != 1:
         fail("expected-e2e-plan.json schema must be 1")
     by_route = {"local": [], "re": []}
+    kvm_verify_tests = {c["test"]: True for c in plan["cells"] if c["backend"] == "kvm" and c["mode"] == "verify"}
     for cell in plan["cells"]:
-        where, reason = _route(cell, pmu_on_re, re_exclusions["tests"])
+        where, reason = _route(cell, pmu_on_re, re_exclusions["tests"], kvm_verify_tests)
         if routing == "local":
             where = "local"
         container, container_reason = _container(cell, where)

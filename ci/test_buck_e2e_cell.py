@@ -686,5 +686,25 @@ class ContainerChoiceTest(unittest.TestCase):
         self.assertLessEqual(dbt, chosen)
 
 
+class ParityRouteTest(unittest.TestCase):
+    """Backend parity credits a candidate verify cell against its test's ptrace verify cell
+    only when both ran on one route and container (ci/manifest-plan/src/parity.rs
+    shares_route), so each pair must be routed alike."""
+
+    def routes(self, routing: str) -> dict[tuple[str, str], tuple[str, str]]:
+        targets = evaluate_cells(routing)
+        return {(t["args"][0], t["args"][2]): (t["route"], t["env"]["HERMIT_E2E_CONTAINER"])
+                for t in targets.values() if t["args"][1] == "verify"}
+
+    def test_every_kvm_cells_ptrace_reference_shares_its_route(self) -> None:
+        for routing in ("hybrid", "local"):
+            routes = self.routes(routing)
+            kvm = sorted(test for test, backend in routes if backend == "kvm")
+            self.assertGreater(len(kvm), 250, routing)
+            for test in kvm:
+                if (test, "ptrace") in routes:
+                    self.assertEqual(routes[(test, "ptrace")], routes[(test, "kvm")], (routing, test))
+
+
 if __name__ == "__main__":
     unittest.main()
