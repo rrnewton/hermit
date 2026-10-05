@@ -6361,6 +6361,103 @@ fn max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader() {
     );
 }
 
+/// Where the cap could end hermit and leave the guest running, hermit refuses
+/// the flag instead, with 122 (round-2 review of
+/// https://github.com/rrnewton/hermit/pull/3686, finding 2). LiteInst, which
+/// runs only in-guest, under `--no-namespace` spawns a guest that is not traced
+/// and that no PID namespace contains, DBT's guest is a plain child of the outer process in
+/// every namespace mode, and KVM's host processes under `--no-namespace` are not
+/// shown to die with hermit. The refusal comes before backend availability, so it
+/// holds in builds without either backend. `analyze` and `bisect` trials skip
+/// `run`'s own check, so both refuse KVM under `--no-namespace` before any
+/// trial, and bisect before it reads its schedules (the paths below do not
+/// exist). The accepted counterpart, ptrace under `--no-namespace` ending with
+/// 123, is `max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader`.
+#[test]
+fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
+    let _lock = hermit_run_guard();
+    /// Arguments and the configuration the refusal must name.
+    type Case<'a> = (&'a [&'a str], &'a str);
+    let cases: [Case; 5] = [
+        (
+            &[
+                "--max-log-bytes=64K",
+                "--backend=liteinst",
+                "run",
+                "--no-namespace",
+                "--max-timeslice=disabled",
+                "--",
+                "/bin/true",
+            ],
+            "--backend=liteinst and --no-namespace",
+        ),
+        (
+            &[
+                "--max-log-bytes=64K",
+                "--backend=dbt",
+                "run",
+                "--",
+                "/bin/true",
+            ],
+            "--backend=dbt",
+        ),
+        (
+            &[
+                "--max-log-bytes=64K",
+                "--backend=kvm",
+                "run",
+                "--no-namespace",
+                "--",
+                "/bin/true",
+            ],
+            "--backend=kvm and --no-namespace",
+        ),
+        (
+            &[
+                "--max-log-bytes=64K",
+                "--backend=kvm",
+                "analyze",
+                "--run-arg=--no-namespace",
+                "--",
+                "/bin/true",
+            ],
+            "--backend=kvm and --no-namespace",
+        ),
+        (
+            &[
+                "--max-log-bytes=64K",
+                "--backend=kvm",
+                "bisect",
+                "--good=/nonexistent/hermit-3686/good.json",
+                "--bad=/nonexistent/hermit-3686/bad.json",
+                "--",
+                "--no-namespace",
+                "/bin/true",
+            ],
+            "--backend=kvm and --no-namespace",
+        ),
+    ];
+    for (args, named) in cases {
+        let output = hermit_command(args).stdin(Stdio::null()).output().unwrap();
+        let text = stderr(&output);
+        assert_eq!(
+            output.status.code(),
+            Some(HERMIT_POLICY_REFUSAL_EXIT),
+            "{args:?}: {output:?}"
+        );
+        assert!(
+            text.contains(&format!(
+                "--max-log-bytes cannot be enforced with {named}: "
+            )),
+            "{args:?}: {text}"
+        );
+        assert!(
+            text.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+            "{args:?}: {text}"
+        );
+    }
+}
+
 /// The happy path: a run under its cap is unaffected, and a refused value
 /// tells the user what to pass instead.
 #[test]

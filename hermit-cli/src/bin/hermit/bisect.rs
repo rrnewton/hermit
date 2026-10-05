@@ -80,12 +80,6 @@ pub struct BisectOpts {
 
 impl BisectOpts {
     pub fn main(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
-        let good = read_schedule(&self.good, "good")?;
-        let bad = read_schedule(&self.bad, "bad")?;
-        if good == bad {
-            bail!("the --good and --bad schedules contain identical event traces");
-        }
-
         let mut analyzer = AnalyzeOpts {
             target_stdout: self.target_stdout.clone(),
             target_stderr: self.target_stderr.clone(),
@@ -118,6 +112,14 @@ impl BisectOpts {
             max_log_bytes: global.max_log_bytes,
             log_budget: global.log_budget(),
         };
+        // Before the schedules are read: a refused cap reads and starts nothing.
+        analyzer.refuse_unsupervised_log_cap()?;
+
+        let good = read_schedule(&self.good, "good")?;
+        let bad = read_schedule(&self.bad, "bad")?;
+        if good == bad {
+            bail!("the --good and --bad schedules contain identical event traces");
+        }
 
         analyzer.bisect_schedule_pair(good, bad)
     }

@@ -2853,6 +2853,132 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
     liteinst_in_guest_refusal(&["--max-timeslice=disabled", "--verify"]).unwrap();
 }
 
+/// `RunOpts::refuse_unsupervised_log_cap` for `hermit GLOBAL... run OPTIONS...
+/// fakeprog`.
+#[cfg(test)]
+fn log_cap_refusal_for(global: &[&str], options: &[&str]) -> Result<(), Error> {
+    let mut argv = vec!["hermit"];
+    argv.extend_from_slice(global);
+    argv.push("run");
+    argv.extend_from_slice(options);
+    argv.push("fakeprog");
+    let args = crate::Args::try_parse_from(&argv)
+        .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+    let crate::Subcommand::Run(mut run) = args.command else {
+        panic!("{argv:?} is not a `run` command");
+    };
+    run.backend = args.global.backend;
+    run.refuse_unsupervised_log_cap(args.global.max_log_bytes)
+}
+
+/// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding 2:
+/// the cap ends a run by exiting the hermit process that crossed it, which
+/// ends nothing where the guest is not bound to that process.
+#[test]
+fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
+    let refused: [(&[&str], &[&str], &str); 4] = [
+        (
+            &["--max-log-bytes=4K", "--backend=liteinst"],
+            &["--no-namespace", "--max-timeslice=disabled"],
+            "--backend=liteinst and --no-namespace",
+        ),
+        (
+            &["--max-log-bytes=4K", "--backend=dbt"],
+            &[],
+            "--backend=dbt",
+        ),
+        (
+            &["--max-log-bytes=4K", "--backend=dbt"],
+            &["--no-namespace"],
+            "--backend=dbt",
+        ),
+        (
+            &["--max-log-bytes=4K", "--backend=kvm"],
+            &["--no-namespace"],
+            "--backend=kvm and --no-namespace",
+        ),
+    ];
+    for (global, options, named) in refused {
+        let error = log_cap_refusal_for(global, options).unwrap_err();
+        assert!(
+            error.downcast_ref::<PolicyRefusal>().is_some(),
+            "{global:?} {options:?}: {error:#}"
+        );
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!(
+                "--max-log-bytes cannot be enforced with {named}: "
+            )),
+            "{global:?} {options:?}: {message}"
+        );
+        assert!(!message.contains('\n'), "one line: {message}");
+        assert!(!message.contains("  "), "no runs of spaces: {message}");
+        // The same configuration without the flag is not this check's business.
+        log_cap_refusal_for(&global[1..], options).unwrap();
+    }
+}
+
+#[test]
+fn log_cap_is_accepted_where_hermit_takes_the_guest_down_with_it() {
+    for backend in [
+        "--backend=ptrace",
+        "--backend=sabre",
+        "--backend=kvm",
+        "--backend=e9patch",
+        "--backend=liteinst",
+    ] {
+        for options in [&[][..], &["--no-namespace"][..]] {
+            if (backend == "--backend=kvm" || backend == "--backend=liteinst")
+                && !options.is_empty()
+            {
+                continue;
+            }
+            log_cap_refusal_for(&["--max-log-bytes=4K", backend], options)
+                .unwrap_or_else(|error| panic!("{backend} {options:?}: {error:#}"));
+        }
+    }
+    // LiteInst is accepted inside hermit's PID namespace, whose death takes the
+    // untraced in-guest LiteInst guest with it.
+    log_cap_refusal_for(
+        &["--max-log-bytes=4K", "--backend=liteinst"],
+        &["--max-timeslice=disabled"],
+    )
+    .unwrap();
+    // The default backend, without --backend.
+    log_cap_refusal_for(&["--max-log-bytes=4K"], &["--no-namespace"]).unwrap();
+}
+
+/// Every backend and namespace mode, so a change to the decision is a change
+/// to this table.
+#[test]
+fn log_cap_refusal_table_covers_every_backend() {
+    let backends = [
+        Backend::Ptrace,
+        Backend::Dbt,
+        Backend::Liteinst,
+        Backend::Sabre,
+        Backend::Kvm,
+        Backend::E9patch,
+    ];
+    let mut refused = Vec::new();
+    for backend in backends {
+        for no_namespace in [false, true] {
+            if RunOpts::log_cap_refusal(backend, no_namespace).is_some() {
+                refused.push((backend, no_namespace));
+            }
+        }
+    }
+    assert_eq!(
+        refused,
+        [
+            (Backend::Dbt, false),
+            (Backend::Dbt, true),
+            (Backend::Liteinst, true),
+            (Backend::Kvm, true),
+        ]
+    );
+}
+
 #[test]
 fn deprecated_preemption_timeout_alias_round_trips_canonically() {
     let mut ro = RunOpts::parse_from(["fakehermit", "--preemption-timeout=100000", "fakeprog"]);
@@ -4080,6 +4206,86 @@ impl RunOpts {
         )))
     }
 
+    /// Why `--max-log-bytes` cannot end a run of this backend in this namespace
+    /// mode, or `None` when every guest process is bound to the hermit process
+    /// that would end it.
+    ///
+    /// The cap ends a run by `_exit(123)` in whichever hermit process crossed
+    /// it: the outer process, a container init, or the `--no-namespace` tracer.
+    /// That ends the RUN only if the guest tree cannot outlive that process,
+    /// and two mechanisms make sure it cannot:
+    ///
+    /// - a PID namespace whose init is hermit's container init. The namespace
+    ///   dies with its init, and the init dies with the outer process through
+    ///   `container::arm_parent_death_signal`;
+    /// - every guest task being a ptrace tracee with `PTRACE_O_EXITKILL`, of a
+    ///   tracer that carries that same parent-death signal
+    ///   (`owned_container::run` arms it in `--no-namespace` mode as well).
+    ///
+    /// The three configurations refused below have neither:
+    ///
+    /// - DBT, in every namespace mode: `backends::run_dbt` starts `drrun` as a
+    ///   plain child of the outer process. It creates no namespace, and Reverie's
+    ///   DBT launcher sets only a process group and the personality: no
+    ///   parent-death signal and no ptrace attachment.
+    /// - LiteInst with `--no-namespace` (LiteInst runs only in-guest at this
+    ///   base): Reverie spawns the guest directly and does not trace it, and
+    ///   no PID namespace contains it.
+    /// - KVM with `--no-namespace`: reverie-kvm creates host processes at
+    ///   several sites, and only some of them are shown to arm a parent-death
+    ///   signal. Unproven is refused until each site is audited; inside
+    ///   hermit's PID namespace the question does not arise.
+    ///
+    /// The match has no wildcard arm, so a new backend must be classified here
+    /// before it compiles. Every subcommand that accepts the global flag reaches
+    /// a guest through `RunOpts::main`, which calls this, except `analyze` and
+    /// `bisect`, whose trials go straight to `RunOpts::run`; they call it
+    /// through `AnalyzeOpts::refuse_unsupervised_log_cap` before any trial.
+    /// `Subcommand::validate_backend_scope` admits DBT and LiteInst only through
+    /// `run`, so KVM under `--no-namespace` is the case that check catches.
+    fn log_cap_refusal(backend: Backend, no_namespace: bool) -> Option<&'static str> {
+        match backend {
+            Backend::Dbt => Some(
+                "--backend=dbt: the DynamoRIO guest is a plain child of this hermit process, \
+                 and no PID namespace, parent-death signal or ptrace attachment binds it to \
+                 hermit, so exiting 123 at the cap would leave the guest running",
+            ),
+            Backend::Liteinst if no_namespace => Some(
+                "--backend=liteinst and --no-namespace: the in-guest LiteInst guest is neither \
+                 a ptrace tracee nor inside a PID namespace hermit owns, so exiting 123 at the \
+                 cap would leave the guest running; drop --no-namespace",
+            ),
+            Backend::Kvm if no_namespace => Some(
+                "--backend=kvm and --no-namespace: no PID namespace contains the KVM backend's \
+                 host processes, and they are not shown to die with hermit, so exiting 123 at \
+                 the cap might leave the guest running; drop --no-namespace",
+            ),
+            Backend::Ptrace
+            | Backend::Liteinst
+            | Backend::Sabre
+            | Backend::Kvm
+            | Backend::E9patch => None,
+        }
+    }
+
+    /// Refuses `--max-log-bytes` (exit 122) where [`Self::log_cap_refusal`]
+    /// says the cap could end hermit and leave the guest running. Hermit does
+    /// not supervise the guest tree itself, so the honest answer is to refuse
+    /// the combination rather than report a run as stopped when it is not.
+    pub(crate) fn refuse_unsupervised_log_cap(
+        &self,
+        max_log_bytes: Option<u64>,
+    ) -> Result<(), Error> {
+        if max_log_bytes.is_none() {
+            return Ok(());
+        }
+        match Self::log_cap_refusal(self.selected_backend(), self.no_namespace) {
+            None => Ok(()),
+            Some(reason) => Err(Error::new(PolicyRefusal)
+                .context(format!("--max-log-bytes cannot be enforced with {reason}"))),
+        }
+    }
+
     /// Which comparator a `--verify` run uses, as a function of the request
     /// ALONE.
     ///
@@ -4197,6 +4403,10 @@ impl RunOpts {
         // LiteInst refuses must not wait for its input. `validate_args` repeats
         // the check for its other callers.
         self.refuse_unqualified_liteinst_in_guest_options()?;
+        // Beside the refusals above, and before stdin is read for the same
+        // reason: a refused run must not consume its input. It is also above the
+        // DBT arm below, which returns without reaching `RunOpts::run`.
+        self.refuse_unsupervised_log_cap(global.max_log_bytes)?;
         if self.verify {
             validate_log_level(global)?;
         }

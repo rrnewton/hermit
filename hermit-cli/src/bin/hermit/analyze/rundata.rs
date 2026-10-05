@@ -569,9 +569,105 @@ impl RunData {
     }
 }
 
+impl AnalyzeOpts {
+    /// Refuses `--max-log-bytes` (exit 122) where the cap's `_exit(123)` could
+    /// leave a trial's guest running (`RunOpts::log_cap_refusal`). `run` makes
+    /// this check in `RunOpts::main`, but trials go straight to `RunOpts::run`,
+    /// so `analyze` and `bisect` make it here, before any workspace or trial
+    /// exists.
+    pub fn refuse_unsupervised_log_cap(&self) -> anyhow::Result<()> {
+        let trial = RunData::get_raw_runopts(self);
+        trial.refuse_unsupervised_log_cap(self.max_log_bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
+    /// 2: the refusal `RunOpts::main` makes never sees an analyze or bisect
+    /// trial, which goes straight to `RunOpts::run`. KVM is the one backend
+    /// those commands admit that has a refused mode: `--no-namespace`, passed
+    /// through the run arguments.
+    #[test]
+    fn log_cap_refusal_reaches_analyze_and_bisect_trials() {
+        let options = |argv: &[&str]| {
+            let args = crate::Args::try_parse_from(argv)
+                .unwrap_or_else(|error| panic!("{argv:?} should parse: {error}"));
+            let crate::Subcommand::Analyze(mut options) = args.command else {
+                panic!("{argv:?} is not analyze")
+            };
+            options.apply_global(&args.global);
+            options
+        };
+        for refused in [
+            &[
+                "hermit",
+                "--max-log-bytes=4K",
+                "--backend=kvm",
+                "analyze",
+                "--run-arg=--no-namespace",
+                "--",
+                "/bin/true",
+            ][..],
+            &[
+                "hermit",
+                "--max-log-bytes=4K",
+                "--backend=kvm",
+                "analyze",
+                "--",
+                "--no-namespace",
+                "/bin/true",
+            ][..],
+        ] {
+            let error = options(refused)
+                .refuse_unsupervised_log_cap()
+                .expect_err("the trial's guest could outlive hermit");
+            assert!(
+                error
+                    .downcast_ref::<crate::container::PolicyRefusal>()
+                    .is_some(),
+                "{refused:?}: {error:#}"
+            );
+            assert!(
+                error.to_string().starts_with(
+                    "--max-log-bytes cannot be enforced with --backend=kvm and --no-namespace: "
+                ),
+                "{refused:?}: {error:#}"
+            );
+        }
+        for accepted in [
+            &[
+                "hermit",
+                "--backend=kvm",
+                "analyze",
+                "--run-arg=--no-namespace",
+                "--",
+                "/bin/true",
+            ][..],
+            &[
+                "hermit",
+                "--max-log-bytes=4K",
+                "--backend=kvm",
+                "analyze",
+                "--",
+                "/bin/true",
+            ][..],
+            &[
+                "hermit",
+                "--max-log-bytes=4K",
+                "analyze",
+                "--run-arg=--no-namespace",
+                "--",
+                "/bin/true",
+            ][..],
+        ] {
+            options(accepted)
+                .refuse_unsupervised_log_cap()
+                .unwrap_or_else(|error| panic!("{accepted:?}: {error:#}"));
+        }
+    }
 
     /// `run` has no `--backend`, so `hermit --backend <BACKEND> analyze` is the
     /// only way to choose the trials' backend. The selection must pass the

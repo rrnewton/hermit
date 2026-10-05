@@ -737,6 +737,8 @@ impl AnalyzeOpts {
 
     pub fn main(&mut self, global: &GlobalOpts) -> anyhow::Result<ExitStatus> {
         self.apply_global(global);
+        // Before phase 0 creates the workspace: a refused cap starts nothing.
+        self.refuse_unsupervised_log_cap()?;
         // Not implemented yet:
         if self.run1_schedule.is_some() {
             unimplemented!()
