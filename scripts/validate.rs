@@ -30133,6 +30133,8 @@ mod committed_selection_preservation_tests {
 
 #[cfg(test)]
 mod fused_privileged_build_tests {
+    use hermit_manifest_plan::nextest_binaries::record_workloads;
+
     use super::*;
     include!("../ci/cargo-guest-binaries.rs");
 
@@ -30169,6 +30171,49 @@ mod fused_privileged_build_tests {
             serde_json::to_vec(&CARGO_GUEST_BINARIES).unwrap(),
         )
         .unwrap();
+        // A profile that selects record_replay also prepares its workloads
+        // (ci/record-replay-workloads.rs): Cargo's Rust targets from the guest
+        // package, and C sources compiled by `cc`. The producer hashes every
+        // declared source and requires the guest package's manifest to be
+        // tests/Cargo.toml, so the fixture holds witnesses at those paths. The
+        // Cargo fixture reports the Rust targets from this map.
+        std::fs::write(
+            root.path().join("record-workloads.json"),
+            serde_json::to_vec(
+                &record_workloads::RUST_SOURCES
+                    .into_iter()
+                    .map(|(_, target, source)| (target, source))
+                    .collect::<BTreeMap<_, _>>(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        for name in record_workloads::names() {
+            let source = root.path().join(record_workloads::source(name).unwrap());
+            std::fs::create_dir_all(source.parent().unwrap()).unwrap();
+            std::fs::write(&source, "source witness\n").unwrap();
+        }
+        std::fs::write(
+            root.path().join("tests/Cargo.toml"),
+            "[package]\nname = \"hermetic_infra_hermit_tests\"\n",
+        )
+        .unwrap();
+        // The producer finds `cc` on PATH, where bin/ comes first. Like the
+        // Cargo fixture, this compiler logs its argv to the same call log, so
+        // every check that a consumer invoked no compiler covers it too.
+        write_executable(
+            &root.path().join("bin/cc"),
+            r##"#!/usr/bin/env python3
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+with open(os.environ["CARGO_CALL_LOG"], "a", encoding="utf-8") as log:
+    log.write(json.dumps(["cc", *args]) + "\n")
+output = Path(args[args.index("-o") + 1])
+output.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+output.chmod(0o755)
+"##,
+        );
         std::fs::write(
             root.path().join(".gitignore"),
             "/target/\n/custom-cargo-target/\n/cargo-calls\n",
@@ -30351,7 +30396,25 @@ mod fused_privileged_build_tests {
                     && args.iter().any(|a| a == "hermetic_infra_hermit_tests"))
                 .count(),
             1,
-            "the 21 Cargo guests are built together once"
+            "the 21 Cargo guests and the record workloads' Rust targets are built together once"
+        );
+        // A profile that selects record_replay compiles each record workload C
+        // source exactly once, in the producer.
+        let record_selected = expected.values().any(|args| {
+            args.windows(2)
+                .any(|pair| pair == ["--test", "record_replay"])
+        });
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|args| args.first().map(String::as_str) == Some("cc"))
+                .count(),
+            if record_selected {
+                record_workloads::C_SOURCES.len()
+            } else {
+                0
+            },
+            "record workload C compilations"
         );
         assert_eq!(
             calls

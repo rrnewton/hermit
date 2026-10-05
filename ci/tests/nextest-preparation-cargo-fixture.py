@@ -64,6 +64,19 @@ for selection in selections:
 packages["hermetic_infra_hermit_tests"] = {
     name: {"name": name, "kind": ["bin"], "test": False} for name in guest_names
 }
+# A profile that selects record_replay also prepares the record/replay
+# workloads, whose Rust targets come from the same package build. The producer
+# checks each one's Cargo target name and source, so they carry src_path as real
+# Cargo metadata does. The driver writes this map from RUST_SOURCES in
+# ci/record-replay-workloads.rs: Cargo target name -> repository-relative source.
+record_sources = json.loads((root / "record-workloads.json").read_text())
+for name, source in record_sources.items():
+    packages["hermetic_infra_hermit_tests"][name] = {
+        "name": name,
+        "kind": ["bin"],
+        "test": False,
+        "src_path": str(root / source),
+    }
 
 packages["hermit-manifest-plan"] = {
     "nextest-cpu-wrapper": {
@@ -85,7 +98,17 @@ if args[:1] == ["metadata"]:
                         "name": name,
                         "id": package_id(name),
                         "source": None,
-                        "manifest_path": str(root / "Cargo.toml"),
+                        # Cargo names each package's own manifest. The guest
+                        # package is tests/Cargo.toml, which the record
+                        # workload producer requires of it.
+                        "manifest_path": str(
+                            root
+                            / (
+                                "tests/Cargo.toml"
+                                if name == "hermetic_infra_hermit_tests"
+                                else "Cargo.toml"
+                            )
+                        ),
                         "targets": list(targets.values()),
                     }
                     for name, targets in packages.items()
@@ -190,19 +213,28 @@ elif args[:1] == ["build"] and "hermit-manifest-plan" in args:
     if mode == "wrapper-ambiguous":
         print(json.dumps(event))
 elif args[:1] == ["build"] and "hermetic_infra_hermit_tests" in args:
-    for name in guest_names:
+    # `--bins` builds every binary of the package: the hermit_modes guests and
+    # the record workloads' Rust targets.
+    for spec in packages["hermetic_infra_hermit_tests"].values():
+        name = spec["name"]
         path = target / "debug" / name
         write_binary(path)
+        artifact_target = {"name": name, "kind": ["bin"]}
+        if "src_path" in spec:
+            artifact_target["src_path"] = spec["src_path"]
         print(
             json.dumps(
                 {
                     "reason": "compiler-artifact",
                     "package_id": package_id("hermetic_infra_hermit_tests"),
-                    "target": {"name": name, "kind": ["bin"]},
+                    "target": artifact_target,
                     "profile": {"test": False},
                     "executable": str(path),
                 }
             )
         )
+    # Cargo's JSON stream ends with this; the record workload producer refuses
+    # a build that does not report success.
+    print(json.dumps({"reason": "build-finished", "success": True}))
 else:
     raise SystemExit(f"unexpected Cargo invocation: {args!r}")
