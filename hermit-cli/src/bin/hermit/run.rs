@@ -4263,7 +4263,11 @@ impl RunOpts {
         }
 
         // Set after the strict check: a recording reaches the host network, but
-        // every input it admits is captured and released deterministically.
+        // only through recorded channels. Every IPv4 or IPv6 operation either
+        // becomes an outbound TCP channel, whose inputs are captured and
+        // released deterministically, or ends the run with a refusal (see
+        // detcore's `syscalls::network_trace`). Other families, such as netlink
+        // route queries, still see the host's interfaces during a recording.
         self.det_opts.det_config.network_trace = self.network_trace_config()?;
         if self.record_networking.is_some() {
             self.network = NetworkingMode::Host;

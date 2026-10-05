@@ -32,7 +32,12 @@
 //! record and replay take the same scheduler turns.
 //!
 //! Anything the engine cannot answer ends the run with the policy-refusal
-//! status, naming the reason; replay never falls back to the host.
+//! status, naming the reason and the remedy; replay never falls back to the
+//! host. That includes every IPv4 or IPv6 operation that could reach the
+//! network outside a channel: a UDP or raw send, `bind`, `listen`, a TCP Fast
+//! Open send, a packet socket, and `epoll` registration of an IPv4 or IPv6
+//! socket. Creating such a socket and closing it stays allowed, because
+//! resolvers probe for IPv6 support that way.
 
 use std::os::unix::io::RawFd;
 use std::time::Duration;
@@ -40,6 +45,7 @@ use std::time::Duration;
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
 use detcore_model::fd::OpenFileId;
 use detcore_model::network_engine::NetworkArrival;
+use detcore_model::network_engine::NetworkEngineError;
 use detcore_model::network_engine::NetworkRecvOutcome;
 use detcore_model::network_engine::NetworkReply;
 use detcore_model::network_engine::NetworkRequest;
@@ -58,11 +64,13 @@ use reverie::syscalls::SyscallInfo;
 
 use super::io::ppoll_timeout_duration;
 use crate::fd::FdType;
+use crate::fd::NetworkSocketKind;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::syscalls::helpers::NonblockableSyscall;
+use crate::syscalls::helpers::get_fd;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
 use crate::tool_global::GlobalRequest;
@@ -93,6 +101,105 @@ const RECV_FLAGS: i32 =
 
 /// `send` flags with a modelled meaning.
 const SEND_FLAGS: i32 = libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT | libc::MSG_MORE;
+
+/// The remedy for an operation network record/replay does not model.
+const UNSUPPORTED_REMEDY: &str = "Network record/replay supports only outbound TCP clients. To \
+     let this program use the network without recording it, run it without \
+     --record-networking or --replay-networking, with --network=host and without --strict.";
+
+/// The remedy for a record run that the host network failed.
+const HOST_REMEDY: &str = "Check that the peer is reachable and responding, then record again.";
+
+/// Whether `getsockopt` on a channel may read the host socket in both modes:
+/// options that report the socket's configuration, which the guest set or
+/// Linux fixes, rather than the state of the connection.
+fn is_configuration_option(level: i32, name: i32) -> bool {
+    match level {
+        libc::SOL_SOCKET => matches!(
+            name,
+            libc::SO_TYPE
+                | libc::SO_DOMAIN
+                | libc::SO_PROTOCOL
+                | libc::SO_RCVLOWAT
+                | libc::SO_KEEPALIVE
+                | libc::SO_REUSEADDR
+                | libc::SO_REUSEPORT
+                | libc::SO_LINGER
+                | libc::SO_ACCEPTCONN
+                | libc::SO_BROADCAST
+                | libc::SO_OOBINLINE
+                | libc::SO_RCVTIMEO
+                | libc::SO_SNDTIMEO
+        ),
+        libc::IPPROTO_TCP => matches!(
+            name,
+            libc::TCP_NODELAY
+                | libc::TCP_CORK
+                | libc::TCP_KEEPIDLE
+                | libc::TCP_KEEPINTVL
+                | libc::TCP_KEEPCNT
+                | libc::TCP_USER_TIMEOUT
+        ),
+        _ => false,
+    }
+}
+
+/// Whether `call`, naming a channel, may take its ordinary path: it closes
+/// the descriptor, changes or reads descriptor flags or file metadata, or
+/// uses it only as the directory of a path lookup, which a socket fails or
+/// ignores. Everything else on a channel is answered by the engine or
+/// refused.
+fn channel_call_takes_ordinary_path(call: &Syscall) -> bool {
+    matches!(
+        call,
+        Syscall::Close(_)
+            | Syscall::Fcntl(_)
+            | Syscall::Fstat(_)
+            | Syscall::Fstatfs(_)
+            | Syscall::Openat(_)
+            | Syscall::Mkdirat(_)
+            | Syscall::Mknodat(_)
+            | Syscall::Fchownat(_)
+            | Syscall::Futimesat(_)
+            | Syscall::Newfstatat(_)
+            | Syscall::Unlinkat(_)
+            | Syscall::Readlinkat(_)
+            | Syscall::Fchmodat(_)
+            | Syscall::Faccessat(_)
+            | Syscall::NameToHandleAt(_)
+            | Syscall::Execveat(_)
+            | Syscall::Statx(_)
+            | Syscall::Symlinkat(_)
+            | Syscall::Utimensat(_)
+    )
+}
+
+/// Whether `call`, naming an IPv4 or IPv6 socket of `kind` that is not a
+/// channel, could reach the network unrecorded and must be refused.
+fn reaches_network_outside_channel(call: &Syscall, kind: NetworkSocketKind) -> bool {
+    let fast_open = |flags: i32| flags & libc::MSG_FASTOPEN != 0;
+    match kind {
+        NetworkSocketKind::NotInet => false,
+        NetworkSocketKind::InetOther => matches!(
+            call,
+            Syscall::Bind(_)
+                | Syscall::Listen(_)
+                | Syscall::Sendto(_)
+                | Syscall::Sendmsg(_)
+                | Syscall::Sendmmsg(_)
+        ),
+        NetworkSocketKind::InetStream => match call {
+            Syscall::Bind(_) | Syscall::Listen(_) => true,
+            Syscall::Sendto(c) => fast_open(c.flags() as i32),
+            Syscall::Sendmsg(c) => fast_open(c.flags()),
+            Syscall::Sendmmsg(c) => fast_open(c.flags()),
+            Syscall::Setsockopt(c) => {
+                c.level() == libc::IPPROTO_TCP && c.optname() == libc::TCP_FASTOPEN_CONNECT
+            }
+            _ => false,
+        },
+    }
+}
 
 /// The traced address of an IPv4 or IPv6 `sockaddr`, or `None` for any other
 /// family or a short buffer.
@@ -190,10 +297,22 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     fn is_network_channel<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> bool {
+        Self::network_socket_state(guest, fd).0
+    }
+
+    /// Whether `fd` is a channel, and how its socket was classified.
+    fn network_socket_state<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> (bool, NetworkSocketKind) {
         guest
             .thread_state()
-            .with_detfd(fd, |detfd| detfd.is_network_channel())
-            .unwrap_or(false)
+            .with_detfd(fd, |detfd| {
+                (detfd.is_network_channel(), detfd.network_socket())
+            })
+            .unwrap_or((false, NetworkSocketKind::NotInet))
+    }
+
+    fn names_channel<G: Guest<Self>>(guest: &mut G, fds: [RawFd; 2]) -> bool {
+        fds.into_iter()
+            .any(|fd| Self::is_network_channel(guest, fd))
     }
 
     /// Whether the network trace handles `call`. Always false with no trace
@@ -202,50 +321,48 @@ impl<T: RecordOrReplay> Detcore<T> {
         if self.network_mode() == NetworkTraceMode::Off {
             return false;
         }
-        let fd = match call {
+        match call {
             // A connect may create a channel and a poll may name one; each
             // falls back to its ordinary handler otherwise.
-            Syscall::Connect(_) | Syscall::Poll(_) | Syscall::Ppoll(_) => return true,
-            Syscall::Select(c) => {
-                return Self::select_names_channel(
-                    guest,
-                    c.nfds(),
-                    [c.readfds(), c.writefds(), c.exceptfds()],
-                );
+            Syscall::Connect(_) | Syscall::Poll(_) | Syscall::Ppoll(_) => true,
+            Syscall::Socket(c) => {
+                matches!(c.family(), libc::AF_INET | libc::AF_INET6 | libc::AF_PACKET)
             }
-            Syscall::Pselect6(c) => {
-                return Self::select_names_channel(
-                    guest,
-                    c.nfds(),
-                    [c.readfds(), c.writefds(), c.exceptfds()],
-                );
-            }
+            Syscall::Select(c) => Self::select_names_channel(
+                guest,
+                c.nfds(),
+                [c.readfds(), c.writefds(), c.exceptfds()],
+            ),
+            Syscall::Pselect6(c) => Self::select_names_channel(
+                guest,
+                c.nfds(),
+                [c.readfds(), c.writefds(), c.exceptfds()],
+            ),
             // The receive low-water mark may be set before the socket connects.
-            Syscall::Setsockopt(c) => {
-                if c.level() == libc::SOL_SOCKET && c.optname() == libc::SO_RCVLOWAT {
-                    return true;
-                }
-                c.fd()
+            Syscall::Setsockopt(c)
+                if c.level() == libc::SOL_SOCKET && c.optname() == libc::SO_RCVLOWAT =>
+            {
+                true
             }
-            Syscall::Read(c) => c.fd(),
-            Syscall::Write(c) => c.fd(),
-            Syscall::Recvfrom(c) => c.fd(),
-            Syscall::Sendto(c) => c.fd(),
-            Syscall::Shutdown(c) => c.fd(),
-            Syscall::Getsockname(c) => c.fd(),
-            Syscall::Getpeername(c) => c.fd(),
-            Syscall::Getsockopt(c) => c.fd(),
-            Syscall::Readv(c) => c.fd(),
-            Syscall::Writev(c) => c.fd(),
-            Syscall::Recvmsg(c) => c.sockfd(),
-            Syscall::Sendmsg(c) => c.fd(),
-            Syscall::Recvmmsg(c) => c.fd(),
-            Syscall::Sendmmsg(c) => c.sockfd(),
-            Syscall::Ioctl(c) => c.fd(),
-            Syscall::EpollCtl(c) => c.fd(),
-            _ => return false,
-        };
-        Self::is_network_channel(guest, fd)
+            // A registration outlives the connect, so refuse it on any IPv4 or
+            // IPv6 socket rather than only on a channel.
+            Syscall::EpollCtl(c) => {
+                Self::network_socket_state(guest, c.fd()).1 != NetworkSocketKind::NotInet
+            }
+            Syscall::Sendfile(c) => Self::names_channel(guest, [c.out_fd(), c.in_fd()]),
+            Syscall::Splice(c) => Self::names_channel(guest, [c.fd_in(), c.fd_out()]),
+            Syscall::Tee(c) => Self::names_channel(guest, [c.fd_in(), c.fd_out()]),
+            Syscall::CopyFileRange(c) => Self::names_channel(guest, [c.fd_in(), c.fd_out()]),
+            _ => {
+                let Some(fd) = get_fd(*call) else {
+                    return false;
+                };
+                match Self::network_socket_state(guest, fd) {
+                    (true, _) => !channel_call_takes_ordinary_path(call),
+                    (false, kind) => reaches_network_outside_channel(call, kind),
+                }
+            }
+        }
     }
 
     /// Whether a `select` descriptor set below `nfds` names a channel.
@@ -274,10 +391,43 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: Syscall,
     ) -> Result<i64, Error> {
         match call {
-            Syscall::Connect(c) => self.network_connect(guest, c).await,
-            Syscall::Poll(c) => self.network_poll(guest, c).await,
-            Syscall::Ppoll(c) => self.network_ppoll(guest, c).await,
-            Syscall::Setsockopt(c) => self.network_setsockopt(guest, c).await,
+            Syscall::Socket(c) => return self.network_socket(guest, c).await,
+            Syscall::Connect(c) => return self.network_connect(guest, c).await,
+            Syscall::Poll(c) => return self.network_poll(guest, c).await,
+            Syscall::Ppoll(c) => return self.network_ppoll(guest, c).await,
+            Syscall::Setsockopt(c) => return self.network_setsockopt(guest, c).await,
+            Syscall::EpollCtl(_) => {
+                self.network_refuse(
+                    guest,
+                    "network record/replay does not model epoll registration of an IPv4 or \
+                     IPv6 socket",
+                    UNSUPPORTED_REMEDY,
+                )
+                .await
+            }
+            Syscall::Select(_)
+            | Syscall::Pselect6(_)
+            | Syscall::Sendfile(_)
+            | Syscall::Splice(_)
+            | Syscall::Tee(_)
+            | Syscall::CopyFileRange(_) => self.network_refuse_on_channel(guest, &call).await,
+            _ => {}
+        }
+        // Every other call the trace owns names one socket.
+        let fd = get_fd(call).expect("an owned call names a descriptor");
+        if !Self::is_network_channel(guest, fd) {
+            self.network_refuse(
+                guest,
+                &format!(
+                    "network record/replay does not model {} on an IPv4 or IPv6 socket that is \
+                     not a connected TCP client",
+                    call.name()
+                ),
+                UNSUPPORTED_REMEDY,
+            )
+            .await
+        }
+        match call {
             Syscall::Read(c) => {
                 self.network_recv(
                     guest,
@@ -331,26 +481,83 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 self.network_so_error(guest, c).await
             }
-            // Options other than the pending error describe the socket rather
-            // than the connection; the host socket answers them in both modes.
-            Syscall::Getsockopt(c) => self.handle_getsockopt(guest, c).await,
-            other => {
+            // Configuration options are the same in record and replay; the
+            // host socket answers them in both modes.
+            Syscall::Getsockopt(c) if is_configuration_option(c.level(), c.optname()) => {
+                self.handle_getsockopt(guest, c).await
+            }
+            Syscall::Getsockopt(c) => {
                 self.network_refuse(
                     guest,
                     &format!(
-                        "network trace does not model {} on a recorded socket",
-                        other.name()
+                        "network trace does not model getsockopt level {} option {} on a \
+                         recorded socket",
+                        c.level(),
+                        c.optname()
                     ),
+                    UNSUPPORTED_REMEDY,
                 )
                 .await
             }
+            other => self.network_refuse_on_channel(guest, &other).await,
         }
     }
 
     /// End the run: the engine cannot answer this operation faithfully.
-    async fn network_refuse<G: Guest<Self>>(&self, guest: &mut G, reason: &str) -> ! {
-        eprintln!("hermit: {reason}");
+    async fn network_refuse<G: Guest<Self>>(&self, guest: &mut G, reason: &str, remedy: &str) -> ! {
+        eprintln!("hermit: {reason}. {remedy}");
         unrecoverable_shutdown(guest, HERMIT_POLICY_REFUSAL_EXIT).await
+    }
+
+    /// End the run on an engine error, naming its remedy.
+    async fn network_refuse_error<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        error: &NetworkEngineError,
+    ) -> ! {
+        self.network_refuse(guest, &error.to_string(), error.remedy())
+            .await
+    }
+
+    async fn network_refuse_on_channel<G: Guest<Self>>(&self, guest: &mut G, call: &Syscall) -> ! {
+        self.network_refuse(
+            guest,
+            &format!(
+                "network trace does not model {} on a recorded socket",
+                call.name()
+            ),
+            UNSUPPORTED_REMEDY,
+        )
+        .await
+    }
+
+    /// `socket`: refuse packet sockets, which receive from every interface,
+    /// and classify IPv4 and IPv6 sockets for later calls.
+    async fn network_socket<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Socket,
+    ) -> Result<i64, Error> {
+        if call.family() == libc::AF_PACKET {
+            self.network_refuse(
+                guest,
+                "network record/replay does not model packet sockets",
+                UNSUPPORTED_REMEDY,
+            )
+            .await
+        }
+        let fd = self.handle_socket(guest, call).await?;
+        let stream = call.r#type() & 0xf == libc::SOCK_STREAM
+            && matches!(call.protocol(), 0 | libc::IPPROTO_TCP);
+        let kind = if stream {
+            NetworkSocketKind::InetStream
+        } else {
+            NetworkSocketKind::InetOther
+        };
+        guest
+            .thread_state()
+            .with_detfd(fd as RawFd, |detfd| detfd.set_network_socket(kind))?;
+        Ok(fd)
     }
 
     /// Perform one engine operation at the current global time.
@@ -368,7 +575,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         match reply {
             Ok(reply) => reply,
-            Err(error) => self.network_refuse(guest, &error.to_string()).await,
+            Err(error) => self.network_refuse_error(guest, &error).await,
         }
     }
 
@@ -475,12 +682,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             .with_len(len)
             .with_flags(libc::MSG_DONTWAIT);
         let result = guest.inject(call).await;
+        if result == Err(Errno::EFAULT) {
+            self.network_refuse_bad_buffer(guest).await
+        }
         let mut bytes = Vec::new();
         if let Ok(received) = result {
             bytes.resize(received as usize, 0);
             guest.memory().read_exact(buffer, &mut bytes)?;
         }
         Ok(arrival_from_pull(result, &bytes))
+    }
+
+    /// End the run: the guest received into memory it cannot write. Linux
+    /// would leave the bytes queued, which replay cannot reproduce because the
+    /// engine hands bytes over only by consuming them.
+    async fn network_refuse_bad_buffer<G: Guest<Self>>(&self, guest: &mut G) -> ! {
+        self.network_refuse(
+            guest,
+            "network trace cannot receive into an unwritable guest buffer",
+            "The program passed a bad buffer to a receive call; fix the program.",
+        )
+        .await
     }
 
     /// `connect`: an outbound TCP connect to an IPv4 or IPv6 peer becomes a
@@ -499,14 +721,28 @@ impl<T: RecordOrReplay> Detcore<T> {
                         detfd.open_file_id(),
                         detfd.is_nonblocking(),
                         detfd.is_network_channel(),
+                        detfd.network_socket(),
                     )
                 })
             })
             .ok()
             .flatten();
-        let Some((id, nonblocking, already_channel)) = socket else {
+        let Some((id, nonblocking, already_channel, kind)) = socket else {
             return self.handle_connect(guest, call).await;
         };
+        match kind {
+            NetworkSocketKind::NotInet => return self.handle_connect(guest, call).await,
+            NetworkSocketKind::InetOther => {
+                self.network_refuse(
+                    guest,
+                    "network record/replay does not model connect on an IPv4 or IPv6 socket \
+                     other than TCP",
+                    UNSUPPORTED_REMEDY,
+                )
+                .await
+            }
+            NetworkSocketKind::InetStream => {}
+        }
         if already_channel {
             // Linux reports a finished connect's error once, then EISCONN.
             let NetworkReply::Errno(errno) = self
@@ -524,28 +760,33 @@ impl<T: RecordOrReplay> Detcore<T> {
             guest.memory().read_exact(address.cast(), &mut bytes).ok()?;
             address_from_sockaddr(&bytes)
         })();
+        // An address of another family, or a short one, fails in Linux
+        // before any network effect.
         let Some(peer) = peer else {
             return self.handle_connect(guest, call).await;
         };
-        if self
-            .network_host_int_option(guest, fd, libc::SO_PROTOCOL)
-            .await
-            != Ok(libc::IPPROTO_TCP)
-        {
-            return self.handle_connect(guest, call).await;
-        }
 
         let request = if self.network_mode() == NetworkTraceMode::Record {
+            if !peer.is_traceable_peer() {
+                self.network_refuse_error(guest, &NetworkEngineError::UntraceablePeer(peer))
+                    .await
+            }
             let errno = match guest.inject(call).await {
                 Ok(_) => 0,
-                Err(Errno::EINPROGRESS) => {
+                // An interrupted connect continues in Linux; finish it, so the
+                // recording never holds a signal the replay cannot reproduce.
+                Err(Errno::EINPROGRESS | Errno::EINTR) => {
                     if self
                         .network_host_wait(guest, fd, libc::POLLOUT, CONNECT_WAIT_MILLIS)
                         .await?
                         .is_none()
                     {
-                        self.network_refuse(guest, "network connect did not finish in time")
-                            .await
+                        self.network_refuse(
+                            guest,
+                            "network connect did not finish in time",
+                            HOST_REMEDY,
+                        )
+                        .await
                     }
                     self.network_host_int_option(guest, fd, libc::SO_ERROR)
                         .await?
@@ -565,8 +806,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 match self.network_host_local_address(guest, fd).await? {
                     Some(local) => Some(local),
                     None => {
-                        self.network_refuse(guest, "network connect has no local address")
-                            .await
+                        self.network_refuse(
+                            guest,
+                            "network connect has no local address",
+                            HOST_REMEDY,
+                        )
+                        .await
                     }
                 }
             } else {
@@ -606,6 +851,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Setsockopt,
     ) -> Result<i64, Error> {
+        if call.level() == libc::IPPROTO_TCP && call.optname() == libc::TCP_FASTOPEN_CONNECT {
+            self.network_refuse(
+                guest,
+                "network record/replay does not model TCP Fast Open",
+                UNSUPPORTED_REMEDY,
+            )
+            .await
+        }
         let result = self.handle_setsockopt(guest, call).await?;
         if call.level() == libc::SOL_SOCKET
             && call.optname() == libc::SO_RCVLOWAT
@@ -633,6 +886,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.network_refuse(
                 guest,
                 &format!("network trace does not model recv flags {flags:#x}"),
+                UNSUPPORTED_REMEDY,
             )
             .await
         }
@@ -688,10 +942,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             match outcome {
                 NetworkRecvOutcome::Data(bytes) => {
-                    guest
-                        .memory()
-                        .write_exact(buffer, &bytes)
-                        .map_err(|_| Errno::EFAULT)?;
+                    if guest.memory().write_exact(buffer, &bytes).is_err() {
+                        self.network_refuse_bad_buffer(guest).await
+                    }
                     return Ok(bytes.len() as i64);
                 }
                 NetworkRecvOutcome::Eof => return Ok(0),
@@ -720,6 +973,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.network_refuse(
                 guest,
                 &format!("network trace does not model send flags {flags:#x}"),
+                UNSUPPORTED_REMEDY,
             )
             .await
         }
@@ -743,7 +997,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             if errno == libc::EPIPE && flags & libc::MSG_NOSIGNAL == 0 {
                 self.network_refuse(
                     guest,
-                    "network trace does not model SIGPIPE; send with MSG_NOSIGNAL",
+                    "network trace does not model SIGPIPE",
+                    "Send with MSG_NOSIGNAL, or run without --record-networking.",
                 )
                 .await
             }
@@ -776,14 +1031,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                             .await?
                             .is_none()
                         {
-                            self.network_refuse(guest, "network send did not drain in time")
-                                .await
+                            self.network_refuse(
+                                guest,
+                                "network send did not drain in time",
+                                HOST_REMEDY,
+                            )
+                            .await
                         }
                     }
                     Err(errno) => {
                         self.network_refuse(
                             guest,
                             &format!("network send failed in the host with {errno}"),
+                            HOST_REMEDY,
                         )
                         .await
                     }
@@ -891,6 +1151,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.network_refuse(
                 guest,
                 "network trace does not model ppoll with a signal mask on a recorded socket",
+                UNSUPPORTED_REMEDY,
             )
             .await
         }
@@ -1221,5 +1482,69 @@ mod tests {
             arrival_from_pull(Err(Errno::ECONNRESET), &[]),
             Some(NetworkArrival::Error(libc::ECONNRESET))
         );
+    }
+
+    #[test]
+    fn sockets_outside_a_channel_are_refused_only_where_they_reach_the_network() {
+        use NetworkSocketKind::*;
+        let bind = Syscall::Bind(syscalls::Bind::new());
+        let listen = Syscall::Listen(syscalls::Listen::new());
+        let send = Syscall::Sendto(syscalls::Sendto::new());
+        let fast_open =
+            Syscall::Sendto(syscalls::Sendto::new().with_flags(libc::MSG_FASTOPEN as u32));
+        let fast_open_option = Syscall::Setsockopt(
+            syscalls::Setsockopt::new()
+                .with_level(libc::IPPROTO_TCP)
+                .with_optname(libc::TCP_FASTOPEN_CONNECT),
+        );
+        let read = Syscall::Read(syscalls::Read::new());
+        for call in [&bind, &listen, &send, &fast_open] {
+            assert!(reaches_network_outside_channel(call, InetOther), "{call:?}");
+            assert!(!reaches_network_outside_channel(call, NotInet), "{call:?}");
+        }
+        for call in [&bind, &listen, &fast_open, &fast_open_option] {
+            assert!(
+                reaches_network_outside_channel(call, InetStream),
+                "{call:?}"
+            );
+        }
+        // An unconnected TCP socket fails these in Linux without a packet.
+        for call in [&send, &read] {
+            assert!(
+                !reaches_network_outside_channel(call, InetStream),
+                "{call:?}"
+            );
+        }
+        assert!(!reaches_network_outside_channel(&read, InetOther));
+    }
+
+    #[test]
+    fn a_channel_admits_only_descriptor_and_configuration_calls() {
+        assert!(channel_call_takes_ordinary_path(&Syscall::Close(
+            syscalls::Close::new()
+        )));
+        assert!(channel_call_takes_ordinary_path(&Syscall::Fcntl(
+            syscalls::Fcntl::new()
+        )));
+        for call in [
+            Syscall::Mmap(syscalls::Mmap::new()),
+            Syscall::Preadv2(syscalls::Preadv2::new()),
+            Syscall::Accept(syscalls::Accept::new()),
+        ] {
+            assert!(!channel_call_takes_ordinary_path(&call), "{call:?}");
+        }
+        assert!(is_configuration_option(
+            libc::IPPROTO_TCP,
+            libc::TCP_NODELAY
+        ));
+        assert!(is_configuration_option(libc::SOL_SOCKET, libc::SO_RCVTIMEO));
+        for (level, name) in [
+            (libc::IPPROTO_TCP, libc::TCP_INFO),
+            (libc::IPPROTO_TCP, libc::TCP_MAXSEG),
+            (libc::SOL_SOCKET, libc::SO_RCVBUF),
+            (libc::SOL_SOCKET, libc::SO_ERROR),
+        ] {
+            assert!(!is_configuration_option(level, name), "{level} {name}");
+        }
     }
 }

@@ -14,6 +14,10 @@
  * the socket and one on a dup of it, race to poll and receive the two
  * three-byte inputs. Which thread wins depends on the schedule; the bytes
  * the client sends and receives do not.
+ *
+ * The other client modes each do one thing network record/replay must
+ * refuse: end before sending the whole request, send with sendmsg or
+ * sendfile, connect to the unspecified address, send UDP, or listen.
  */
 
 #include <arpa/inet.h>
@@ -27,8 +31,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/uio.h>
 #include <sys/time.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -271,12 +277,78 @@ static void *run_reader(void *raw) {
   return NULL;
 }
 
-static int run_client(const char *port_text, int mismatch) {
-  set_deadline();
+static uint16_t parse_port(const char *port_text) {
   char *end = NULL;
   unsigned long parsed = strtoul(port_text, &end, 10);
   if (end == port_text || *end != '\0' || parsed == 0 || parsed > UINT16_MAX)
     fail_message("invalid controller port");
+  return (uint16_t)parsed;
+}
+
+static struct sockaddr_in loopback_address(uint16_t port) {
+  struct sockaddr_in address = {
+      .sin_family = AF_INET,
+      .sin_port = htons(port),
+      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+  };
+  return address;
+}
+
+/* A client that each mode ends differently, all of them refused by network
+ * record/replay. Returns only if no refusal ended the run. */
+static int run_refused_client(const char *port_text, const char *mode) {
+  set_deadline();
+  struct sockaddr_in address = loopback_address(parse_port(port_text));
+  if (strcmp(mode, "udp") == 0) {
+    /* A resolver's IPv6 probe: creating and closing a socket stays allowed. */
+    int probe = socket(AF_INET6, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (probe < 0)
+      fail("socket probe");
+    close(probe);
+    int udp = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    if (udp < 0)
+      fail("socket udp");
+    if (sendto(udp, REQUEST, sizeof(REQUEST) - 1, 0, (struct sockaddr *)&address,
+               sizeof(address)) < 0)
+      fail("sendto udp");
+    return 0;
+  }
+  int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (socket_fd < 0)
+    fail("socket client");
+  if (strcmp(mode, "listen") == 0) {
+    address.sin_port = 0;
+    if (bind(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+      fail("bind client");
+    if (listen(socket_fd, 1) != 0)
+      fail("listen client");
+    return 0;
+  }
+  if (strcmp(mode, "unspecified") == 0)
+    address.sin_addr.s_addr = htonl(INADDR_ANY);
+  if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+    fail("connect client");
+  if (strcmp(mode, "truncated") == 0) {
+    send_all(socket_fd, REQUEST, 3);
+  } else if (strcmp(mode, "sendmsg") == 0) {
+    struct iovec part = {.iov_base = (void *)REQUEST, .iov_len = sizeof(REQUEST) - 1};
+    struct msghdr message = {.msg_iov = &part, .msg_iovlen = 1};
+    if (sendmsg(socket_fd, &message, MSG_NOSIGNAL) < 0)
+      fail("sendmsg client");
+  } else if (strcmp(mode, "sendfile") == 0) {
+    int source = open("/dev/zero", O_RDONLY | O_CLOEXEC);
+    if (source < 0)
+      fail("open /dev/zero");
+    if (sendfile(socket_fd, source, NULL, 1) < 0)
+      fail("sendfile client");
+  }
+  close(socket_fd);
+  return 0;
+}
+
+static int run_client(const char *port_text, int mismatch) {
+  set_deadline();
+  uint16_t port = parse_port(port_text);
 
   int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (socket_fd < 0)
@@ -286,11 +358,7 @@ static int run_client(const char *port_text, int mismatch) {
   if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVLOWAT, &low_water,
                  sizeof(low_water)) != 0)
     fail("setsockopt SO_RCVLOWAT");
-  struct sockaddr_in address = {
-      .sin_family = AF_INET,
-      .sin_port = htons((uint16_t)parsed),
-      .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
-  };
+  struct sockaddr_in address = loopback_address(port);
   if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
     fail("connect client");
 
@@ -371,10 +439,15 @@ int main(int argc, char **argv) {
       return run_client(argv[2], 0);
     if (strcmp(argv[3], "mismatch") == 0)
       return run_client(argv[2], 1);
+    const char *refused[] = {"truncated", "sendmsg",  "sendfile",
+                             "unspecified", "udp", "listen"};
+    for (size_t index = 0; index < sizeof(refused) / sizeof(refused[0]); ++index)
+      if (strcmp(argv[3], refused[index]) == 0)
+        return run_refused_client(argv[2], argv[3]);
   }
   fprintf(stderr,
           "usage: %s controller PORT_FILE REPORT_FILE CONTACT_FILE | client PORT "
-          "match|mismatch\n",
+          "match|mismatch|truncated|sendmsg|sendfile|unspecified|udp|listen\n",
           argv[0]);
   return 2;
 }

@@ -72,6 +72,19 @@ pub enum FdType {
     Rng,
 }
 
+/// How an active network trace mode classifies a socket's family and type
+/// (see `crate::syscalls::network_trace`).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum NetworkSocketKind {
+    /// Not an IPv4 or IPv6 socket, or no network trace mode was active.
+    #[default]
+    NotInet,
+    /// An IPv4 or IPv6 TCP stream socket.
+    InetStream,
+    /// Any other IPv4 or IPv6 socket, such as UDP or raw.
+    InetOther,
+}
+
 /// Deterministic file descriptor
 ///
 /// Notice `statbuf` can be cached here, this is because
@@ -181,6 +194,10 @@ struct OpenFileDescription {
     /// `None` for the default of one byte.
     #[serde(default)]
     network_lowat: Option<usize>,
+    /// The socket's family and type, recorded at creation while a network
+    /// trace mode is active.
+    #[serde(default)]
+    network_socket: NetworkSocketKind,
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(#2373)
     /// The `flock(2)` mode this open file description currently holds, as the
@@ -264,6 +281,7 @@ impl DetFd {
                 loopback_peer: false,
                 network_channel: false,
                 network_lowat: None,
+                network_socket: NetworkSocketKind::NotInet,
                 flock_mode: None,
                 flock_mode_known: true,
                 flock_mode_ever_known: true,
@@ -759,6 +777,16 @@ impl DetFd {
     /// The socket's `SO_RCVLOWAT`.
     pub(crate) fn network_lowat(&self) -> usize {
         self.description().network_lowat.unwrap_or(1)
+    }
+
+    /// Record the socket's family and type for the network trace.
+    pub(crate) fn set_network_socket(&self, kind: NetworkSocketKind) {
+        self.description().network_socket = kind;
+    }
+
+    /// The socket's family and type as the network trace classified it.
+    pub(crate) fn network_socket(&self) -> NetworkSocketKind {
+        self.description().network_socket
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

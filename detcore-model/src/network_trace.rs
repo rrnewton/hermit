@@ -171,6 +171,13 @@ impl NetworkAddressV1 {
     }
 
     /// An address no connection can have as its peer.
+    /// Whether a v2 trace can hold a connection to this peer: a nonzero port
+    /// and an address that names one host. The unspecified address, which
+    /// Linux connects to loopback, is excluded.
+    pub fn is_traceable_peer(&self) -> bool {
+        self.port() != 0 && !self.is_unroutable()
+    }
+
     fn is_unroutable(&self) -> bool {
         match self {
             Self::Inet4 { address, .. } => {
@@ -556,7 +563,7 @@ impl NetworkTraceV2 {
             if !channel.id.is_socket() {
                 return Err(NetworkTraceValidationError::NonSocketChannelIdentity);
             }
-            if channel.peer_address.port() == 0 || channel.peer_address.is_unroutable() {
+            if !channel.peer_address.is_traceable_peer() {
                 return Err(NetworkTraceValidationError::UnsupportedPeerAddress);
             }
             if let Some(local) = &channel.local_address

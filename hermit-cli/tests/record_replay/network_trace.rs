@@ -450,6 +450,73 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
         "network outbound mismatch",
     );
 
+    // A replay that ends with part of the recording unsent, or that sends
+    // through a call the engine does not model, is refused with a remedy.
+    let replay_refusals = [
+        (
+            "truncated",
+            "network replay ended after",
+            "diverged from the recording",
+        ),
+        (
+            "sendmsg",
+            "does not model sendmsg on a recorded socket",
+            "--network=host",
+        ),
+        (
+            "sendfile",
+            "does not model sendfile on a recorded socket",
+            "--network=host",
+        ),
+    ];
+    for (mode, reason, remedy) in replay_refusals {
+        let label = format!("replay-refuses-{mode}");
+        let mut arguments = run_arguments(0, 1_000_000);
+        arguments.push(format!("--replay-networking={}", trace.display()));
+        let refused = hermit_command(
+            evidence,
+            &label,
+            &arguments,
+            fixture,
+            &["client", &port, mode],
+        );
+        assert_fails_naming(&refused, &label, reason);
+        assert_fails_naming(&refused, &label, remedy);
+    }
+
+    // Record refuses, before touching the host, anything that would reach
+    // the network outside an outbound TCP channel. No server is listening.
+    let record_refusals = [
+        (
+            "udp",
+            "does not model sendto on an IPv4 or IPv6 socket that is not a connected TCP client",
+            "--network=host",
+        ),
+        (
+            "listen",
+            "does not model bind on an IPv4 or IPv6 socket",
+            "--network=host",
+        ),
+        ("unspecified", "names no single host", "nonzero port"),
+    ];
+    for (mode, reason, remedy) in record_refusals {
+        let label = format!("record-refuses-{mode}");
+        let mut arguments = run_arguments(0, 1_000_000);
+        arguments.push(format!(
+            "--record-networking={}",
+            evidence.join(format!("{label}.trace")).display()
+        ));
+        let refused = hermit_command(
+            evidence,
+            &label,
+            &arguments,
+            fixture,
+            &["client", &port, mode],
+        );
+        assert_fails_naming(&refused, &label, reason);
+        assert_fails_naming(&refused, &label, remedy);
+    }
+
     // A missing trace is refused before the guest starts.
     let mut missing_arguments = run_arguments(0, 1_000_000);
     missing_arguments.push(format!(

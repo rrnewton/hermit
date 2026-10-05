@@ -105,6 +105,65 @@ pub enum NetworkEngineError {
     InvalidArrival(OpenFileId),
     /// The finished recording failed validation.
     Trace(NetworkTraceValidationError),
+    /// Record connected to a peer a trace cannot hold.
+    UntraceablePeer(NetworkAddressV1),
+    /// Replay waited [`REPLAY_STALL_LIMIT`] past the recorded arrival of an
+    /// input that the recording released only after the guest had sent
+    /// `needed` bytes; this replay has sent `sent`.
+    ReplayStalled {
+        channel: OpenFileId,
+        needed: u64,
+        sent: u64,
+    },
+    /// Replay ended without connecting a socket the recording connected.
+    ReplayUnconnected(OpenFileId),
+    /// Replay ended having sent `sent` of the `recorded` bytes on a channel.
+    ReplayUnsent {
+        channel: OpenFileId,
+        sent: u64,
+        recorded: u64,
+    },
+}
+
+/// How long past an input's recorded arrival, in global time, replay waits
+/// for the guest to send the bytes that gate it before declaring that the
+/// guest diverged. Matches the host waits of record mode.
+pub const REPLAY_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// The remedy for a replay whose guest did something other than what the
+/// recording holds.
+const DIVERGED_REMEDY: &str = "The replayed program diverged from the recording. Replay the same \
+     program with the same arguments, files and environment, or record it again with \
+     --record-networking.";
+
+impl NetworkEngineError {
+    /// What the user can do about this error.
+    pub fn remedy(&self) -> &'static str {
+        match self {
+            Self::NotInTrace(_)
+            | Self::PeerMismatch { .. }
+            | Self::OutboundMismatch { .. }
+            | Self::OutboundBeyondRecording { .. }
+            | Self::ReplayStalled { .. }
+            | Self::ReplayUnconnected(_)
+            | Self::ReplayUnsent { .. } => DIVERGED_REMEDY,
+            Self::UntraceablePeer(_) => {
+                "Connect to a specific host address and nonzero port, for example \
+                 127.0.0.1 instead of 0.0.0.0, or run without --record-networking."
+            }
+            Self::ChannelExists(_) => {
+                "Network record/replay supports one connect per socket; run this program \
+                 without --record-networking."
+            }
+            Self::Trace(_) => {
+                "The recording is outside what network record/replay supports; run this \
+                 program without --record-networking."
+            }
+            Self::WrongMode | Self::UnknownChannel(_) | Self::InvalidArrival(_) => {
+                "This is a hermit defect; report it with the command line that produced it."
+            }
+        }
+    }
 }
 
 impl fmt::Display for NetworkEngineError {
@@ -138,6 +197,32 @@ impl fmt::Display for NetworkEngineError {
                 "network record received input for {id} after its stream ended"
             ),
             Self::Trace(error) => write!(f, "network trace: {error}"),
+            Self::UntraceablePeer(peer) => write!(
+                f,
+                "network record cannot trace a connection to {peer:?}, which names no single host"
+            ),
+            Self::ReplayStalled {
+                channel,
+                needed,
+                sent,
+            } => write!(
+                f,
+                "network replay stalled: {channel} is waiting for input that the recording \
+                 delivered after {needed} bytes were sent, but this replay has sent {sent}"
+            ),
+            Self::ReplayUnconnected(id) => write!(
+                f,
+                "network replay ended without connecting {id}, which the recording connected"
+            ),
+            Self::ReplayUnsent {
+                channel,
+                sent,
+                recorded,
+            } => write!(
+                f,
+                "network replay ended after {channel} sent {sent} of the {recorded} bytes the \
+                 recording sent"
+            ),
         }
     }
 }
@@ -277,6 +362,25 @@ impl Channel {
         }
     }
 
+    /// Replay: fail if the next input has been due for [`REPLAY_STALL_LIMIT`]
+    /// and is still held back only by bytes the guest has not sent.
+    fn check_stalled(&self, now: LogicalTime) -> Result<(), NetworkEngineError> {
+        let Some(input) = self.pending_inputs.front() else {
+            return Ok(());
+        };
+        let release = &input.release;
+        if self.tx < release.after_transmitted_offset
+            && now >= release.not_before_global_time + REPLAY_STALL_LIMIT
+        {
+            return Err(NetworkEngineError::ReplayStalled {
+                channel: self.record.id,
+                needed: release.after_transmitted_offset,
+                sent: self.tx,
+            });
+        }
+        Ok(())
+    }
+
     fn release(&mut self, now: LogicalTime) {
         while let Some(input) = self.pending_inputs.front() {
             if !input.release.is_eligible(now, self.tx) {
@@ -383,6 +487,9 @@ impl NetworkEngine {
             return Err(NetworkEngineError::WrongMode);
         }
         self.check_new(id)?;
+        if !peer.is_traceable_peer() {
+            return Err(NetworkEngineError::UntraceablePeer(peer));
+        }
         let record = NetworkChannelV2 {
             id,
             transport: NetworkTransportV1::Tcp,
@@ -531,6 +638,7 @@ impl NetworkEngine {
                 return Ok(NetworkRecvOutcome::Eof);
             }
         }
+        channel.check_stalled(now)?;
         Ok(NetworkRecvOutcome::WouldBlock)
     }
 
@@ -545,6 +653,7 @@ impl NetworkEngine {
     ) -> Result<i16, NetworkEngineError> {
         let channel = self.channel(id)?;
         channel.release(now);
+        channel.check_stalled(now)?;
         let rcv_shutdown = channel.shut_rd || channel.input_ended();
         let snd_shutdown = channel.shut_wr || channel.reset;
         let mut events = 0;
@@ -734,6 +843,30 @@ impl NetworkEngine {
                     .map(|(local, peer)| (local.cloned(), peer.clone())),
             ),
         })
+    }
+
+    /// End a replay: fail if the guest left part of the recording unused, by
+    /// never connecting a recorded socket or by sending fewer bytes than the
+    /// recording holds. Inputs the guest never read are not checked: when an
+    /// input is released depends on the schedule, so a replay may end before
+    /// a final input the recording happened to observe.
+    pub fn finish_replay(self) -> Result<(), NetworkEngineError> {
+        let Mode::Replay { unconnected } = self.mode else {
+            return Err(NetworkEngineError::WrongMode);
+        };
+        if let Some(id) = unconnected.into_keys().next() {
+            return Err(NetworkEngineError::ReplayUnconnected(id));
+        }
+        for (id, channel) in self.channels {
+            if let Some(last) = channel.expected_outputs.back() {
+                return Err(NetworkEngineError::ReplayUnsent {
+                    channel: id,
+                    sent: channel.tx,
+                    recorded: last.stream_offset + last.bytes.len() as u64,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// The trace of a record run. Fails if the run was a replay or the
@@ -1156,6 +1289,118 @@ mod tests {
         assert_eq!(
             engine.recv(sock(9), at(1), 1, 1, false),
             Err(NetworkEngineError::UnknownChannel(sock(9)))
+        );
+    }
+
+    /// `n` seconds after `at(0)`.
+    fn after_secs(n: u64) -> LogicalTime {
+        at(0) + std::time::Duration::from_secs(n)
+    }
+
+    #[test]
+    fn replay_refuses_an_input_held_back_by_bytes_never_sent() {
+        let mut engine = NetworkEngine::new_replay(recorded_exchange());
+        let id = sock(0);
+        engine.replay_connect(id, &peer(), false).unwrap();
+        // Short of the limit past the recorded arrival at 20 us: still waiting.
+        let waiting = at(19) + REPLAY_STALL_LIMIT;
+        assert_eq!(
+            engine.recv(id, waiting, 64, 1, false),
+            Ok(NetworkRecvOutcome::WouldBlock)
+        );
+        let stalled = Err(NetworkEngineError::ReplayStalled {
+            channel: id,
+            needed: 3,
+            sent: 0,
+        });
+        assert_eq!(engine.recv(id, after_secs(61), 64, 1, false), stalled);
+        assert_eq!(engine.readiness(id, after_secs(61), 1), stalled.map(|_| 0));
+    }
+
+    #[test]
+    fn replay_that_sends_what_gates_an_input_never_stalls() {
+        let mut engine = NetworkEngine::new_replay(recorded_exchange());
+        let id = sock(0);
+        engine.replay_connect(id, &peer(), false).unwrap();
+        assert_eq!(engine.replay_send(id, b"req"), Ok(3));
+        assert_eq!(
+            engine.recv(id, after_secs(3_600), 64, 1, false),
+            Ok(data(b"abcdef"))
+        );
+    }
+
+    #[test]
+    fn finished_replay_accepts_a_complete_run_even_with_input_unread() {
+        let mut engine = NetworkEngine::new_replay(recorded_exchange());
+        let id = sock(0);
+        engine.replay_connect(id, &peer(), false).unwrap();
+        assert_eq!(engine.replay_send(id, b"req"), Ok(3));
+        // The response was never read: release depends on the schedule.
+        assert_eq!(engine.finish_replay(), Ok(()));
+    }
+
+    #[test]
+    fn finished_replay_refuses_unsent_output_and_unmade_connections() {
+        let mut engine = NetworkEngine::new_replay(recorded_exchange());
+        let id = sock(0);
+        engine.replay_connect(id, &peer(), false).unwrap();
+        assert_eq!(engine.replay_send(id, b"r"), Ok(1));
+        assert_eq!(
+            engine.finish_replay(),
+            Err(NetworkEngineError::ReplayUnsent {
+                channel: id,
+                sent: 1,
+                recorded: 3,
+            })
+        );
+        let engine = NetworkEngine::new_replay(recorded_exchange());
+        assert_eq!(
+            engine.finish_replay(),
+            Err(NetworkEngineError::ReplayUnconnected(sock(0)))
+        );
+        let record = NetworkEngine::new_record(epoch());
+        assert_eq!(record.finish_replay(), Err(NetworkEngineError::WrongMode));
+    }
+
+    #[test]
+    fn record_refuses_a_peer_naming_no_single_host() {
+        let mut engine = NetworkEngine::new_record(epoch());
+        for peer in [
+            NetworkAddressV1::Inet4 {
+                address: [0, 0, 0, 0],
+                port: 8080,
+            },
+            NetworkAddressV1::Inet4 {
+                address: [127, 0, 0, 1],
+                port: 0,
+            },
+        ] {
+            assert_eq!(
+                engine.record_connect(sock(0), peer.clone(), local(), 0, false),
+                Err(NetworkEngineError::UntraceablePeer(peer))
+            );
+        }
+        assert!(engine.finish().unwrap().channels.is_empty());
+    }
+
+    #[test]
+    fn every_error_names_a_remedy() {
+        let divergence = NetworkEngineError::ReplayUnsent {
+            channel: sock(0),
+            sent: 1,
+            recorded: 3,
+        };
+        assert!(divergence.to_string().contains("sent 1 of the 3 bytes"));
+        assert!(divergence.remedy().contains("--record-networking"));
+        assert!(
+            NetworkEngineError::UnknownChannel(sock(0))
+                .remedy()
+                .contains("hermit defect")
+        );
+        assert!(
+            NetworkEngineError::UntraceablePeer(peer())
+                .remedy()
+                .contains("nonzero port")
         );
     }
 }

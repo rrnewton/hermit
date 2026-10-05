@@ -734,14 +734,16 @@ impl GlobalState {
         }
     }
 
-    /// Write the network trace of a record run.
-    fn finish_network_trace(&mut self) {
-        let Some(engine) = self.network.take() else {
-            return;
-        };
+    /// Write the network trace of a record run, or check that a replay used
+    /// the whole recording. Returns the refusal a replay ends with.
+    fn finish_network_trace(&mut self) -> Option<String> {
+        let engine = self.network.take()?;
         let engine = engine.into_inner().unwrap();
         if !engine.is_record() {
-            return;
+            return engine
+                .finish_replay()
+                .err()
+                .map(|error| format!("hermit: {error}. {}", error.remedy()));
         }
         let path = self
             .cfg
@@ -761,6 +763,7 @@ impl GlobalState {
         if let Err(error) = result {
             panic!("cannot write network trace {}: {error}", path.display());
         }
+        None
     }
 
     /// Initializes global state whose sequential scheduler is driven by an
@@ -941,7 +944,7 @@ impl GlobalState {
             handle.await.expect("Global scheduler clean shutdown");
             debug!("Global state cleanup, continuing...");
         }
-        self.finish_network_trace();
+        let network_refusal = self.finish_network_trace();
         let banner =
             "  ------------------------------ hermit run report ------------------------------";
         let recording_destination = self.cfg.record_preemptions_to.clone();
@@ -979,6 +982,14 @@ impl GlobalState {
             if let Some(x) = rt {
                 debug!("Nondeterministic realtime elapsed: {:?}", x);
             }
+        }
+        // After the report, so a refused replay still describes the run.
+        if let Some(refusal) = network_refusal {
+            {
+                use std::io::Write;
+                let _ = writeln!(crate::util::RetryingStderr, "{refusal}");
+            }
+            std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
         }
     }
 
