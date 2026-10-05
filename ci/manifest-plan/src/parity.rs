@@ -46,9 +46,9 @@
 //! guest. Every [`ParityRecord`] says whether the two runs were given equal
 //! inputs, decided from how both were launched ([`inputs_equalized`]), and
 //! credit from a comparison whose inputs were not equalized is reported apart
-//! from clean credit (see [`ParityRecord::unequalized_credit`]). A backend
-//! that cannot be given the reference's inputs at all reports
-//! [`ParityVerdict::InputsNotEqualized`] instead of credit.
+//! from clean credit (see [`ParityRecord::unequalized_credit`]). Every
+//! backend is compared the same way; [`ParityVerdict::InputsNotEqualized`]
+//! survives only in dbt's published history.
 
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -117,10 +117,6 @@ const TOKEN_LIMIT_BYTES: usize = 80;
 /// The largest `f64` below 1.0. A partial match must never round up to full
 /// credit.
 const BELOW_ONE: f64 = 1.0 - f64::EPSILON / 2.0;
-/// Why a dbt guest cannot be given the ptrace cell's inputs.
-const DBT_INPUTS_NOT_EQUALIZABLE: &str = "the dbt backend refuses --bind and --mount (hermit-cli/src/bin/hermit/run.rs: \
-     \"its DynamoRIO adapter does not enter the guest mount namespace\"), so its guest cannot be \
-     given the ptrace cell's input paths";
 
 /// A candidate backend. ptrace is the reference and is deliberately not
 /// representable. Declared in alphabetical order so the derived `Ord` matches
@@ -176,14 +172,13 @@ impl ParityBackend {
             })
     }
 
-    /// Why this backend's guest cannot be given the same input paths as the
-    /// ptrace reference, or `None` if it can. Such a backend's parity rows
-    /// report [`ParityVerdict::InputsNotEqualized`] instead of credit.
-    pub fn inputs_not_equalizable(self) -> Option<&'static str> {
-        match self {
-            Self::Dbt => Some(DBT_INPUTS_NOT_EQUALIZABLE),
-            Self::Kvm | Self::Liteinst | Self::Sabre => None,
-        }
+    /// Whether this backend's ledger history may hold
+    /// [`ParityVerdict::InputsNotEqualized`] rows: dbt's, from before the dbt
+    /// backend could apply `--bind` and so be given the reference's inputs.
+    /// Every backend is now compared alike, so no new record has that
+    /// verdict; this only keeps the published history readable.
+    pub fn has_unequalizable_history(self) -> bool {
+        matches!(self, Self::Dbt)
     }
 }
 
@@ -450,9 +445,9 @@ pub enum ParityVerdict {
     /// deterministic log, or the parity tool could not compare two logs (see
     /// [`UnavailableClass::LogDiffFailed`]).
     Unavailable,
-    /// The candidate backend cannot be given the reference's inputs at all
-    /// (see [`ParityBackend::inputs_not_equalizable`]), so any comparison would
-    /// measure the path difference rather than the backend.
+    /// Historical only ([`ParityBackend::has_unequalizable_history`]): the
+    /// candidate backend could not then be given the reference's inputs at
+    /// all, so it was not compared.
     InputsNotEqualized,
 }
 
@@ -571,25 +566,6 @@ impl ParityRecord {
         run_id: &str,
         hermit_sha: &str,
     ) -> Result<Self, String> {
-        if let Some(why) = cell.backend.inputs_not_equalizable() {
-            if inputs_equalized {
-                return Err(format!(
-                    "parity cell {cell}: inputs cannot be equalized: {why}"
-                ));
-            }
-            return Self::unmeasured(
-                cell,
-                ParityVerdict::InputsNotEqualized,
-                UnavailableClass::InputsNotEqualized,
-                Some(ParityOperand::Candidate),
-                false,
-                why,
-                Some(reference_log),
-                Some(candidate_log),
-                run_id,
-                hermit_sha,
-            );
-        }
         // Both logs were deterministic and retained, so a report that yields
         // no usable verdict is the parity tool's failure: it concerns the
         // comparison, not either side.
@@ -766,17 +742,12 @@ impl ParityRecord {
                 "{at}: unequalized_credit is set but the inputs were equalized"
             ));
         }
-        // Such a backend is never compared, so none of its records claims
-        // equal inputs; `check_class` refuses its measured verdicts and an
-        // `inputs-not-equalized` verdict of any other backend.
-        if let Some(why) = self.backend.inputs_not_equalizable() {
-            if self.inputs_equalized {
-                return Err(format!(
-                    "{at}: {} inputs cannot be equalized, so it reports no measured \
-                     comparison and never equal inputs: {why}",
-                    self.backend
-                ));
-            }
+        // A historical not-compared record never claims equal inputs.
+        if self.verdict == ParityVerdict::InputsNotEqualized && self.inputs_equalized {
+            return Err(format!(
+                "{at}: an inputs-not-equalized record was not compared and cannot claim \
+                 equal inputs"
+            ));
         }
         check_class(
             &at,
@@ -1163,10 +1134,6 @@ pub struct ParityCells {
     pub reference: ParityReference,
     pub selection_path: String,
     pub selection_rule: String,
-    /// Backends whose guest cannot be given the reference's inputs, with the
-    /// reason. Their parity rows report `inputs-not-equalized` rather than
-    /// credit, even for a selected, selectable cell.
-    pub inputs_not_equalizable: BTreeMap<ParityBackend, String>,
     pub counts: ParityCounts,
     pub cells: Vec<ParityCellStatus>,
 }
@@ -1295,14 +1262,6 @@ pub fn snapshot(matrix: &ParityMatrix, selection: &ParitySelection) -> Result<Pa
         },
         selection_path: PARITY_SELECTION_PATH.to_string(),
         selection_rule: selection.rule.clone(),
-        inputs_not_equalizable: ParityBackend::ALL
-            .into_iter()
-            .filter_map(|backend| {
-                backend
-                    .inputs_not_equalizable()
-                    .map(|why| (backend, why.to_string()))
-            })
-            .collect(),
         counts: ParityCounts { all, by_backend },
         cells,
     })
@@ -1586,7 +1545,6 @@ pub fn retention_closure(
 ) -> BTreeSet<(String, String)> {
     scope
         .iter()
-        .filter(|cell| cell.backend.inputs_not_equalizable().is_none())
         .filter(|cell| {
             plans(planned_verify, &cell.test_id, PARITY_REFERENCE_BACKEND)
                 && plans(planned_verify, &cell.test_id, cell.backend.as_str())
@@ -2369,9 +2327,7 @@ struct Comparison {
 ///   [`PostPassConfig::nondeterministic`], is
 ///   [`ParityVerdict::Nondeterministic`]; no golden is written for it;
 /// - b) the candidate left no deterministic log, by the same rules;
-/// - c) the backend cannot be given the reference's inputs
-///   ([`ParityVerdict::InputsNotEqualized`]), whatever its rows or logs;
-/// - d) both operands should have a golden, but the cell cannot be measured
+/// - c) both operands should have a golden, but the cell cannot be measured
 ///   ([`UnavailableGroup::Unmeasured`]): a missing result row, a log that
 ///   was not retained or cannot be read, an invalid test id, a
 ///   `HERMIT_EPOCH` the operands cannot be shown to share, or a golden that
@@ -2566,9 +2522,7 @@ fn measure(
         if let Err(unusable) = &candidate {
             if unusable.class.group() == UnavailableGroup::NoGolden {
                 let golden = match reference {
-                    Ok(row) if cell.backend.inputs_not_equalizable().is_none() => {
-                        golden_of(&mut goldens, test, row).ok()
-                    }
+                    Ok(row) => golden_of(&mut goldens, test, row).ok(),
                     _ => None,
                 };
                 records[index] = Some(unusable_record(
@@ -2579,20 +2533,7 @@ fn measure(
                 continue;
             }
         }
-        // c) Not compared: whatever its rows or logs, such a backend stops
-        // here.
-        if let Some(why) = cell.backend.inputs_not_equalizable() {
-            records[index] = Some(record(
-                ParityVerdict::InputsNotEqualized,
-                UnavailableClass::InputsNotEqualized,
-                Some(ParityOperand::Candidate),
-                why,
-                None,
-                None,
-            )?);
-            continue;
-        }
-        // d) Both operands should have a deterministic log, but the cell
+        // c) Both operands should have a deterministic log, but the cell
         // cannot be measured. In order: a missing result row, an operand's
         // log (the reference's first), an invalid test id, a HERMIT_EPOCH the
         // operands cannot be shown to share, and a golden that could not be
@@ -3931,8 +3872,8 @@ pub enum UnavailableClass {
     /// ([`ParityRejection::HostInapplicable`]).
     HostInapplicable,
     // Not compared.
-    /// The backend cannot be given the reference's inputs
-    /// ([`ParityBackend::inputs_not_equalizable`]). Only verdict
+    /// Historical only: the backend could not then be given the reference's
+    /// inputs ([`ParityBackend::has_unequalizable_history`]). Only verdict
     /// `inputs-not-equalized`, operand `candidate`.
     InputsNotEqualized,
     // Unmeasured.
@@ -4139,10 +4080,10 @@ fn shown_operand(operand: Option<ParityOperand>) -> &'static str {
 /// ([`UnavailableClass::verdicts`]: `determinism-mismatch` goes with exactly
 /// `nondeterministic`, and so on), and `operand` is a side the class may
 /// concern ([`UnavailableClass::operands`]), which a `reference-missing` or
-/// `candidate-missing` verdict also names. A backend declared
-/// [`ParityBackend::inputs_not_equalizable`] is never compared: it has no
-/// measured verdict and no unmeasured class, and no other backend has an
-/// `inputs-not-equalized` verdict. The reason text is never read. dev-hermit's
+/// `candidate-missing` verdict also names. Only a backend with
+/// [`ParityBackend::has_unequalizable_history`] may have the historical
+/// `inputs-not-equalized` verdict; otherwise every backend is held to the
+/// same rules. The reason text is never read. dev-hermit's
 /// `ci-hub/series/parity_ledger.py` `check_class`, added by slice D5 of
 /// <https://github.com/rrnewton/hermit/issues/3301>, makes the same checks
 /// with the same messages.
@@ -4153,20 +4094,13 @@ pub fn check_class(
     class: Option<UnavailableClass>,
     operand: Option<ParityOperand>,
 ) -> Result<(), String> {
-    let why = backend.inputs_not_equalizable();
-    if verdict == LedgerVerdict::InputsNotEqualized && why.is_none() {
+    if verdict == LedgerVerdict::InputsNotEqualized && !backend.has_unequalizable_history() {
         return Err(format!(
             "{at}: {backend} inputs can be equalized; a comparison with unequal inputs is \
              measured and reports unequalized_credit"
         ));
     }
     if verdict.is_measured() {
-        if let Some(why) = why {
-            return Err(format!(
-                "{at}: {backend} inputs cannot be equalized, so it reports no measured \
-                 comparison and never equal inputs: {why}"
-            ));
-        }
         if let Some(class) = class {
             return Err(format!(
                 "{at}: a {verdict} verdict is measured and carries no unavailable_class, \
@@ -4194,12 +4128,6 @@ pub fn check_class(
                 .map(|verdict| verdict.as_str())
                 .collect::<Vec<_>>()
                 .join(" or ")
-        ));
-    }
-    if why.is_some() && class.group() == UnavailableGroup::Unmeasured {
-        return Err(format!(
-            "{at}: {backend} inputs cannot be equalized, so no comparison is attempted and \
-             it carries no unmeasured class, got {class}"
         ));
     }
     let operands = class.operands();
@@ -5512,10 +5440,6 @@ mod tests {
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
         assert_eq!(parsed.cells.len(), 3144);
-        assert_eq!(
-            parsed.inputs_not_equalizable.keys().collect::<Vec<_>>(),
-            [&ParityBackend::Dbt]
-        );
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
         // took the snapshot to 1,099,771 bytes: every test lists one line per
@@ -6424,45 +6348,44 @@ mod tests {
         assert!(serde_json::from_value::<ParityRecord>(value).is_err());
     }
 
+    /// Every backend, dbt included, is compared alike: a matched report is a
+    /// measured verdict with clean credit when the inputs were equalized and
+    /// unequalized credit otherwise. Only dbt's published history may hold the
+    /// earlier not-compared verdict, which no record is built with any more.
     #[test]
-    fn a_backend_that_cannot_be_equalized_reports_inputs_not_equalized() {
+    fn every_backend_is_compared_alike_and_only_dbt_history_is_not_compared() {
         let current = LOG_DIFF_REPORT_SCHEMA;
         let matched = report(current, LogDiffVerdict::Matched, 3, 3, Some(3));
-        let dbt = record_on(ParityBackend::Dbt, &matched, false);
-        assert_eq!(dbt.verdict, ParityVerdict::InputsNotEqualized);
-        assert!(!dbt.verdict.is_measured());
-        assert_eq!(dbt.measured_credit(), None);
-        assert_eq!(dbt.matched_prefix, None);
-        assert!(dbt.reason.as_deref().unwrap().contains("--bind"));
-        assert_eq!(dbt.candidate_log.as_deref(), Some("cand.log"));
-        assert!(
-            serde_json::to_string(&dbt)
-                .unwrap()
-                .contains(r#""verdict":"inputs-not-equalized""#)
-        );
-
-        let dbt_cell = ParityCellId {
-            backend: ParityBackend::Dbt,
-            ..cell()
-        };
-        let error = ParityRecord::from_comparison(
-            &dbt_cell, &matched, true, "ref.log", "cand.log", "run-1", SHA,
-        )
-        .unwrap_err();
-        assert!(error.contains("cannot be equalized"), "{error}");
-        for backend in [
-            ParityBackend::Kvm,
-            ParityBackend::Liteinst,
-            ParityBackend::Sabre,
-        ] {
-            assert_eq!(backend.inputs_not_equalizable(), None);
+        for backend in ParityBackend::ALL {
+            for equalized in [true, false] {
+                let record = record_on(backend, &matched, equalized);
+                record.validate().unwrap();
+                assert_eq!(record.verdict, ParityVerdict::Matched, "{backend}");
+                assert_eq!(record.credit.is_some(), equalized, "{backend}");
+                assert_eq!(record.unequalized_credit.is_some(), !equalized, "{backend}");
+            }
+            assert_eq!(
+                backend.has_unequalizable_history(),
+                backend == ParityBackend::Dbt
+            );
+            let historical = check_class(
+                "row",
+                backend,
+                LedgerVerdict::InputsNotEqualized,
+                Some(UnavailableClass::InputsNotEqualized),
+                Some(ParityOperand::Candidate),
+            );
+            assert_eq!(
+                historical.is_ok(),
+                backend == ParityBackend::Dbt,
+                "{backend}"
+            );
         }
     }
 
     /// The first `log-diff-failed` site: a report whose verdict is not a
     /// measurement is `unavailable` with class `log-diff-failed`, no operand,
-    /// both logs, and the verdict and any refusal as its reason, unless the
-    /// backend is never compared, which is decided first.
+    /// both logs, and the verdict and any refusal as its reason.
     #[test]
     fn a_log_diff_verdict_that_is_not_a_measurement_is_log_diff_failed() {
         let current = LOG_DIFF_REPORT_SCHEMA;
@@ -6503,28 +6426,16 @@ mod tests {
             record_for(&refused).reason.as_deref(),
             Some("log-diff verdict was Refused: detail")
         );
-        let why = ParityBackend::Dbt.inputs_not_equalizable().unwrap();
+        // dbt is compared like every backend, so its refused report is the
+        // same log-diff failure.
         let dbt = record_on(ParityBackend::Dbt, &refused, false);
         assert_eq!(
             (dbt.verdict, dbt.unavailable_class, dbt.operand),
             (
-                ParityVerdict::InputsNotEqualized,
-                Some(UnavailableClass::InputsNotEqualized),
-                Some(ParityOperand::Candidate)
+                ParityVerdict::Unavailable,
+                Some(UnavailableClass::LogDiffFailed),
+                None
             )
-        );
-        assert_eq!(dbt.reason.as_deref(), Some(why));
-        let dbt_cell = ParityCellId {
-            backend: ParityBackend::Dbt,
-            ..cell()
-        };
-        assert_eq!(
-            ParityRecord::from_comparison(
-                &dbt_cell, &refused, true, "ref.log", "cand.log", "run-1", SHA,
-            ),
-            Err(format!(
-                "parity cell {dbt_cell}: inputs cannot be equalized: {why}"
-            ))
         );
     }
 
@@ -6639,19 +6550,19 @@ mod tests {
             (record.run_id.as_str(), record.hermit_sha.as_str()),
             ("run-1", SHA)
         );
-        let error =
-            unrecorded_comparison(&config, &comparison(ParityBackend::Dbt, false), "planted")
-                .unwrap_err();
-        assert!(error.contains("no comparison is attempted"), "{error}");
+        // dbt is compared, and fails to be recorded, like every other backend.
+        let dbt = unrecorded_comparison(&config, &comparison(ParityBackend::Dbt, false), "planted")
+            .unwrap();
+        dbt.validate().unwrap();
+        assert_eq!(dbt.unavailable_class, Some(UnavailableClass::LogDiffFailed));
     }
 
-    /// Only a backend whose inputs cannot be equalized reports
-    /// `inputs-not-equalized`, and such a backend reports nothing else of a
-    /// comparison: no measured verdict and no unmeasured class.
+    /// `inputs-not-equalized` is a historical verdict: only dbt's history may
+    /// hold it, as `check_class` and the record check both say, and dbt is
+    /// otherwise held to the same rules as every backend.
     #[test]
-    fn inputs_not_equalized_is_for_a_backend_that_cannot_be_equalized_only() {
+    fn inputs_not_equalized_is_dbt_history_only() {
         let at = |backend: ParityBackend| format!("parity record fixture/parity@{backend}");
-        let why = ParityBackend::Dbt.inputs_not_equalizable().unwrap();
         let (ine, candidate) = (
             Some(UnavailableClass::InputsNotEqualized),
             Some(ParityOperand::Candidate),
@@ -6687,39 +6598,24 @@ mod tests {
             ),
             Ok(())
         );
-        let never_measured = format!(
-            "{}: dbt inputs cannot be equalized, so it reports no measured comparison and \
-             never equal inputs: {why}",
-            at(dbt)
-        );
         for verdict in [LedgerVerdict::Matched, LedgerVerdict::Diverged] {
-            assert_eq!(
-                check_class(&at(dbt), dbt, verdict, None, None),
-                Err(never_measured.clone())
-            );
+            assert_eq!(check_class(&at(dbt), dbt, verdict, None, None), Ok(()));
         }
         for class in UnavailableClass::ALL {
             let (verdict, operand) = (class.verdicts()[0], class.operands()[0]);
-            let on_dbt = check_class(&at(dbt), dbt, verdict, Some(class), operand);
-            if class.group() == UnavailableGroup::Unmeasured {
-                assert_eq!(
-                    on_dbt,
-                    Err(format!(
-                        "{}: dbt inputs cannot be equalized, so no comparison is attempted \
-                         and it carries no unmeasured class, got {class}",
-                        at(dbt)
-                    ))
-                );
-            } else {
-                assert_eq!(on_dbt, Ok(()), "{class}");
-            }
+            assert_eq!(
+                check_class(&at(dbt), dbt, verdict, Some(class), operand),
+                Ok(()),
+                "{class}"
+            );
             assert_eq!(
                 check_class(&at(kvm), kvm, verdict, Some(class), operand).is_ok(),
                 class != UnavailableClass::InputsNotEqualized,
                 "{class}"
             );
         }
-        // The record check refuses the same contradictions.
+        // The record check refuses the same contradictions, and a historical
+        // not-compared record that claims equal inputs.
         let matched = report(
             LOG_DIFF_REPORT_SCHEMA,
             LogDiffVerdict::Matched,
@@ -6727,29 +6623,34 @@ mod tests {
             3,
             Some(3),
         );
+        let historical = ParityRecord {
+            verdict: ParityVerdict::InputsNotEqualized,
+            unavailable_class: ine,
+            operand: candidate,
+            reason: Some("history".into()),
+            credit: None,
+            unequalized_credit: None,
+            matched_prefix: None,
+            left_len: None,
+            right_len: None,
+            first_divergent_record: None,
+            first_difference: None,
+            ..record_on(dbt, &matched, false)
+        };
         let error = ParityRecord {
             backend: kvm,
-            ..record_on(dbt, &matched, false)
+            ..historical.clone()
         }
         .validate()
         .unwrap_err();
         assert!(error.contains("kvm inputs can be equalized"), "{error}");
-        let clean = record_for(&matched);
-        for record in [
-            ParityRecord {
-                backend: dbt,
-                inputs_equalized: false,
-                credit: None,
-                unequalized_credit: Some(1.0),
-                ..clean.clone()
-            },
-            ParityRecord {
-                backend: dbt,
-                ..clean
-            },
-        ] {
-            assert_eq!(record.validate(), Err(never_measured.clone()));
+        let error = ParityRecord {
+            inputs_equalized: true,
+            ..historical
         }
+        .validate()
+        .unwrap_err();
+        assert!(error.contains("cannot claim equal inputs"), "{error}");
     }
 
     #[test]
@@ -6758,7 +6659,23 @@ mod tests {
         let diverged = report(current, LogDiffVerdict::Diverged, 4, 4, Some(2));
         let clean = record_for(&diverged);
         let unequal = record_on(ParityBackend::Kvm, &diverged, false);
+        // dbt is measured like every backend; its history may hold a record
+        // that was not compared.
         let dbt = record_on(ParityBackend::Dbt, &diverged, false);
+        let historical = ParityRecord {
+            verdict: ParityVerdict::InputsNotEqualized,
+            unavailable_class: Some(UnavailableClass::InputsNotEqualized),
+            operand: Some(ParityOperand::Candidate),
+            reason: Some("history".into()),
+            credit: None,
+            unequalized_credit: None,
+            matched_prefix: None,
+            left_len: None,
+            right_len: None,
+            first_divergent_record: None,
+            first_difference: None,
+            ..dbt.clone()
+        };
         let cases: Vec<(&str, ParityRecord)> = vec![
             (
                 "clean credit from unequal inputs",
@@ -6791,38 +6708,31 @@ mod tests {
                 },
             ),
             (
-                "a measured dbt comparison",
-                ParityRecord {
-                    backend: ParityBackend::Dbt,
-                    ..unequal.clone()
-                },
-            ),
-            (
-                "dbt with equal inputs",
+                "a historical not-compared record with equal inputs",
                 ParityRecord {
                     inputs_equalized: true,
-                    ..dbt.clone()
+                    ..historical.clone()
                 },
             ),
             (
-                "inputs-not-equalized on a backend that can be equalized",
+                "inputs-not-equalized on a backend without that history",
                 ParityRecord {
                     backend: ParityBackend::Kvm,
-                    ..dbt.clone()
+                    ..historical.clone()
                 },
             ),
             (
                 "an unmeasured verdict with unequalized credit",
                 ParityRecord {
                     unequalized_credit: Some(0.5),
-                    ..dbt.clone()
+                    ..historical.clone()
                 },
             ),
         ];
         for (label, record) in cases {
             assert!(record.validate().is_err(), "{label} must be refused");
         }
-        for record in [clean, unequal, dbt] {
+        for record in [clean, unequal, dbt, historical] {
             record.validate().unwrap();
         }
     }
@@ -7508,10 +7418,10 @@ mod tests {
             (
                 "fx/same",
                 ParityBackend::Dbt,
-                ParityVerdict::InputsNotEqualized,
-                UnavailableClass::InputsNotEqualized,
+                ParityVerdict::CandidateMissing,
+                UnavailableClass::NoResultRow,
                 candidate,
-                "refuses --bind and --mount",
+                "the dbt candidate verify cell of fx/same has no result row in this run",
             ),
             (
                 "fx/nolog",
@@ -7693,11 +7603,11 @@ mod tests {
         let summary = report.summary_line();
         for part in [
             "12 cell(s)",
-            "matched 1, diverged 1, nondeterministic 2, reference-missing 1, candidate-missing 3, \
-             unavailable 3, inputs-not-equalized 1",
+            "matched 1, diverged 1, nondeterministic 2, reference-missing 1, candidate-missing 4, \
+             unavailable 3, inputs-not-equalized 0",
             "measured 2; no golden 5 (determinism-mismatch 2, failed-untyped 2, \
-             host-inapplicable 1); not compared 1; unmeasured 4 (log-not-retained 2, \
-             no-result-row 2)",
+             host-inapplicable 1); not compared 0; unmeasured 5 (log-not-retained 2, \
+             no-result-row 3)",
             "none measured with equal inputs; mean credit 0.6667 over 2 measured with unequal inputs",
             "2 log-diff comparison(s), 0 guest runs",
         ] {
@@ -8508,23 +8418,18 @@ mod tests {
             );
         }
 
+        // dbt is compared like the others: its row was launched without the
+        // equalized inputs, so its match is unequalized credit.
         let dbt = record("fx/one", ParityBackend::Dbt);
-        assert_eq!(dbt.verdict, ParityVerdict::InputsNotEqualized);
+        assert_eq!(dbt.verdict, ParityVerdict::Matched, "{dbt:?}");
         assert!(!dbt.inputs_equalized);
-        assert_eq!(dbt.measured_credit(), None);
-        assert_eq!(
-            (dbt.unavailable_class, dbt.operand),
-            (
-                Some(UnavailableClass::InputsNotEqualized),
-                Some(ParityOperand::Candidate)
-            )
-        );
+        assert_eq!((dbt.credit, dbt.unequalized_credit), (None, Some(1.0)));
 
         let summary = report.summary_line();
         assert!(
             summary.contains(
                 "mean credit 0.6667 over 2 measured with equal inputs; mean credit 1.0000 \
-                 over 2 measured with unequal inputs"
+                 over 3 measured with unequal inputs"
             ),
             "{summary}"
         );
@@ -10349,8 +10254,8 @@ mod tests {
         let report = post_pass(&fixture.config(), &scope, &rows).unwrap();
         assert_eq!(
             (report.log_diff_runs, fixture.log_diff_calls()),
-            (3, 3),
-            "only c/matched@kvm, c/diverged and c/no-messages are compared"
+            (4, 4),
+            "only c/matched@kvm, c/matched@dbt, c/diverged and c/no-messages are compared"
         );
         let (reference, candidate) = (
             Some(ParityOperand::Reference),
@@ -10403,13 +10308,7 @@ mod tests {
                     Some(C::InfrastructureError),
                     candidate
                 ),
-                (
-                    "c/matched",
-                    Dbt,
-                    V::InputsNotEqualized,
-                    Some(C::InputsNotEqualized),
-                    candidate
-                ),
+                ("c/matched", Dbt, V::Matched, None, None),
                 ("c/matched", Kvm, V::Matched, None, None),
                 (
                     "c/mismatch",
@@ -10490,15 +10389,16 @@ mod tests {
                 );
             }
         }
-        // Every class a record can carry, once; record-missing is the
-        // ledger's, never a record's.
+        // Every class a new record can carry, once; record-missing is the
+        // ledger's, never a record's, and inputs-not-equalized is history only.
         for class in C::ALL {
             let cells = report
                 .records
                 .iter()
                 .filter(|record| record.unavailable_class == Some(class))
                 .count();
-            assert_eq!(cells, usize::from(class != C::RecordMissing), "{class}");
+            let expected = !matches!(class, C::RecordMissing | C::InputsNotEqualized);
+            assert_eq!(cells, usize::from(expected), "{class}");
         }
         let in_group = |wanted: UnavailableGroup| {
             report
@@ -10520,7 +10420,7 @@ mod tests {
                 in_group(UnavailableGroup::Unmeasured),
                 in_group(UnavailableGroup::RecordMissing),
             ),
-            (2, 9, 1, 7, 0)
+            (3, 9, 0, 7, 0)
         );
         let by_cell = |test: &str, backend: ParityBackend| {
             report
@@ -10585,15 +10485,15 @@ mod tests {
         let summary = report.summary_line();
         for part in [
             "19 cell(s)",
-            "matched 1, diverged 1, nondeterministic 1, reference-missing 0, candidate-missing 4, \
-             unavailable 11, inputs-not-equalized 1",
-            "measured 2; no golden 9 (determinism-mismatch 1, timeout 1, crash 1, oom 1, \
+            "matched 2, diverged 1, nondeterministic 1, reference-missing 0, candidate-missing 4, \
+             unavailable 11, inputs-not-equalized 0",
+            "measured 3; no golden 9 (determinism-mismatch 1, timeout 1, crash 1, oom 1, \
              infrastructure-error 1, sandbox-denied 1, failed-untyped 1, ended 1, \
-             host-inapplicable 1); not compared 1; unmeasured 7 (log-not-retained 1, \
+             host-inapplicable 1); not compared 0; unmeasured 7 (log-not-retained 1, \
              log-unreadable 1, no-result-row 1, log-diff-failed 1, invalid-test-id 1, \
              golden-not-written 1, epoch-not-shared 1)",
-            "none measured with equal inputs; mean credit 0.6667 over 2 measured with unequal inputs",
-            "3 log-diff comparison(s), 0 guest runs",
+            "none measured with equal inputs; mean credit 0.7778 over 3 measured with unequal inputs",
+            "4 log-diff comparison(s), 0 guest runs",
         ] {
             assert!(summary.contains(part), "{part:?} not in {summary}");
         }

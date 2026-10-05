@@ -184,9 +184,9 @@ and `E2E_FIXTURE_DIR` name those paths and a prepared program runs as
 `/tmp/e2e/fixtures/program`. Every backend's guest therefore sees the same
 strings, which the parity post-pass requires before it reports a
 comparison's `credit` rather than its `unequalized_credit`
-(<https://github.com/rrnewton/hermit/issues/3301>). dbt refuses `--bind`, so a
-dbt guest, and a guest in any other mode, sees the host paths. Read these
-directories through the variables rather than assuming either form.
+(<https://github.com/rrnewton/hermit/issues/3301>). A guest in any other mode
+sees the host paths. Read these directories through the variables rather
+than assuming either form.
 
 `ci` may also be a mapping when enabled backends have different validation
 status. The mapping must name every enabled backend and no disabled backend.

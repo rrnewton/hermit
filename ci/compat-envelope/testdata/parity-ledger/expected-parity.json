@@ -1,5 +1,5 @@
 {
-  "schema": "parity-summary/v2",
+  "schema": "parity-summary/v3",
   "generated_from": {
     "store_sha256": "cd19380683195a5ef899ee52d6718ba2f3909ed3a383a0716b0e32d3810c6cab",
     "series_commit": null,

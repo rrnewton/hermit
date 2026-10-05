@@ -108,8 +108,10 @@ const TEST_LEDGER_REPOSITORY: &str = "https://github.com/rrnewton/hermit_test_le
 /// and the compatibility website read. See
 /// <https://github.com/rrnewton/hermit/issues/3301>. Version 2 adds each
 /// row's source tree state, and only a run from a clean source tree can be a
-/// headline (<https://github.com/rrnewton/dev-hermit/issues/463>).
-const PARITY_SUMMARY_SCHEMA: &str = "parity-summary/v2";
+/// headline (<https://github.com/rrnewton/dev-hermit/issues/463>). Version 3
+/// floors dbt's cells like every other backend's, now that dbt is compared;
+/// the website still reads version 2, whose dbt cells are in no floor.
+const PARITY_SUMMARY_SCHEMA: &str = "parity-summary/v3";
 const LEDGER_PARITY_SUMMARY: &str = "scorecard/parity.json";
 /// The ledger store `series.py append-parity` publishes `parity-ledger/v1`
 /// rows into, as `parity/<team>/<host>/<YYYY-MM>.jsonl`.
@@ -6476,10 +6478,9 @@ fn credit_text(value: Option<f64>) -> String {
 ///
 /// `mean_credit` divides the credit sum by the measured cells, so a measured
 /// cell without credit counts as 0, and `floor_credit` divides it by the
-/// `floor_cells`. No cell of a backend whose inputs cannot be equalized
-/// ([`ParityBackend::inputs_not_equalizable`]) enters any floor, a
-/// record-missing or refused one included. A mean or floor over no cells is
-/// `None`, never 0.
+/// `floor_cells`. Every backend's record-missing and refused cells are in
+/// the floor as 0, dbt's included now that dbt is compared like the others.
+/// A mean or floor over no cells is `None`, never 0.
 ///
 /// The pooled means mix clean credit (equal inputs) with unequalized credit
 /// only under a marker that says so, and `clean_mean_credit` and
@@ -6567,9 +6568,8 @@ impl ParityTally {
         > = BTreeMap::new();
         for cell in cells {
             tally.selected += 1;
-            // No cell of a backend whose inputs cannot be equalized is in a
-            // floor, and neither is a no-golden or not-compared cell.
-            let mut in_floor = cell.backend.inputs_not_equalizable().is_none();
+            // A no-golden or not-compared cell is in no floor.
+            let mut in_floor = true;
             match cell.kind {
                 None => tally.refused += 1,
                 Some(LedgerVerdict::RecordMissing) => tally.record_missing += 1,
@@ -42085,58 +42085,36 @@ mod parity_summary_tests {
         );
     }
 
-    /// A record-missing or refused cell of a backend whose inputs cannot be
-    /// equalized is excluded from every floor. A backend's own line names each
-    /// kind on its side; a total with such cells beside ones counted as 0
-    /// cannot tell the kinds apart and gives each side's sum.
+    /// dbt is compared like every backend: a measured dbt row is admitted,
+    /// and dbt's record-missing cells are counted as 0 in the floor like any
+    /// other backend's.
     #[test]
-    fn unequalizable_record_missing_and_refused_cells_are_excluded_from_the_floor() {
+    fn dbt_cells_are_measured_and_floored_like_every_backend() {
         let rows = [
             row(diverged(&golden(1), KVM, 10, 100, 11, 12, false)),
             missing(&golden(2), KVM),
             missing(&golden(2), DBT),
-            // dbt is never compared, so a measured dbt row is refused.
             row(diverged(&golden(3), DBT, 10, 100, 11, 12, false)),
         ];
         let summary = summarize_rows(&rows, &no_cells());
-        let why = DBT.inputs_not_equalizable().unwrap();
-        assert_eq!(
-            summary.refusals,
-            [ParityRefusal {
-                path: SHARD.into(),
-                line: Some(4),
-                message: format!(
-                    "parity ledger row c-programs/golden-3@dbt (validate run {RUN}): dbt inputs \
-                     cannot be equalized, so it reports no measured comparison and never equal \
-                     inputs: {why}"
-                ),
-            }]
-        );
-        assert_eq!(summary.refused_rows, 1);
+        assert_eq!(summary.refusals, []);
+        assert_eq!(summary.refused_rows, 0);
         let run = only_run(&summary);
-        assert_eq!(cell(run, "c-programs/golden-3@dbt").verdict, "refused");
-        assert_eq!(counts(&run.total), [4, 1, 0, 1, 0, 0, 0, 2, 1]);
-        assert_eq!(run.total.floor_cells, 2);
-        assert_eq!(counts(&run.per_backend[&DBT]), [2, 0, 0, 0, 0, 0, 0, 1, 1]);
-        assert_eq!(run.per_backend[&DBT].floor_cells, 0);
+        assert_eq!(counts(&run.total), [4, 2, 0, 2, 0, 0, 0, 2, 0]);
+        assert_eq!(run.total.floor_cells, 4);
+        assert_eq!(counts(&run.per_backend[&DBT]), [2, 1, 0, 1, 0, 0, 0, 1, 0]);
+        assert_eq!(run.per_backend[&DBT].floor_cells, 2);
         assert_eq!(
             run.line,
-            "parity: 0/4 matched; committed selection unknown; mean 0.100 over 1 measured; \
-             floor 0.050 over 2 of 4 selected (counted as 0: 1 record-missing or refused; \
-             excluded: 0 no golden; 0 not compared; 2 record-missing or refused whose inputs \
-             cannot be equalized) [inputs not equalized]"
-        );
-        assert_eq!(
-            run.per_backend[&KVM].line,
-            "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
-             floor 0.050 over 2 of 2 selected (counted as 0: 1 record-missing; excluded: \
+            "parity: 0/4 matched; committed selection unknown; mean 0.100 over 2 measured; \
+             floor 0.050 over 4 of 4 selected (counted as 0: 2 record-missing; excluded: \
              0 no golden; 0 not compared) [inputs not equalized]"
         );
         assert_eq!(
             run.per_backend[&DBT].line,
-            "parity: 0/2 matched; committed selection unknown; mean n/a over 0 measured; \
-             floor n/a over 0 of 2 selected (excluded: 0 no golden; 0 not compared; \
-             1 record-missing and 1 refused whose inputs cannot be equalized)"
+            "parity: 0/2 matched; committed selection unknown; mean 0.100 over 1 measured; \
+             floor 0.050 over 2 of 2 selected (counted as 0: 1 record-missing; excluded: \
+             0 no golden; 0 not compared) [inputs not equalized]"
         );
     }
 
@@ -42849,7 +42827,7 @@ mod parity_summary_tests {
         let encoded =
             String::from_utf8(encoded_parity_summary(&summary).unwrap().unwrap()).unwrap();
         let value: JsonValue = serde_json::from_str(&encoded).unwrap();
-        assert_eq!(value["schema"], "parity-summary/v2");
+        assert_eq!(value["schema"], "parity-summary/v3");
         assert_eq!(
             value["producers"][0]["total"]["floor_credit"]
                 .as_f64()
@@ -44497,7 +44475,7 @@ mod parity_summary_tests {
             BRIEF_KEYS
         );
         let value: JsonValue = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(value["schema"], "parity-summary/v2");
+        assert_eq!(value["schema"], "parity-summary/v3");
         assert_eq!(value["producers"][0]["source_tree_dirty"], false);
         assert_eq!(value["runs"][0]["source_tree_dirty"], false);
         assert_eq!(value["runs"][0]["headline"], true);

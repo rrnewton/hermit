@@ -7,9 +7,6 @@
   },
   "selection_path": "tests/e2e/parity-selection.yaml",
   "selection_rule": "Every candidate-backend (dbt, kvm, liteinst, sabre) verify cell of a test folded from the retired backend-parity-c bucket into c-programs (the ids of the backend-parity-c retirement in tests/e2e/manifests/inventory/retired-ids.json) whose ptrace verify cell is selected by full validation, provided the candidate's verify cell is enabled. Candidate cells that are enabled but not selected by full validation are included and marked not selectable in ci/compat-envelope/parity-cells.json.",
-  "inputs_not_equalizable": {
-    "dbt": "the dbt backend refuses --bind and --mount (hermit-cli/src/bin/hermit/run.rs: \"its DynamoRIO adapter does not enter the guest mount namespace\"), so its guest cannot be given the ptrace cell's input paths"
-  },
   "counts": {
     "all": {
       "cells": 3144,

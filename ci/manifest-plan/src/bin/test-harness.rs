@@ -6459,30 +6459,30 @@ sys.exit(1 if failed else 0)
             !none_stdout.contains("test-harness: parity:"),
             "{none_stdout}"
         );
-        // alpha@kvm, alpha@liteinst and beta@kvm are measurable; dbt and a
-        // candidate that failed determinism are not compared.
-        assert_eq!(count(&five_calls, "compare"), 3);
-        assert_eq!(count(&mutated_calls, "compare"), 3);
+        // alpha@dbt, alpha@kvm, alpha@liteinst and beta@kvm are measurable; a
+        // candidate that failed determinism is not compared.
+        assert_eq!(count(&five_calls, "compare"), 4);
+        assert_eq!(count(&mutated_calls, "compare"), 4);
         assert!(
             five_stdout.contains("test-harness: parity: 5 cell(s)"),
             "{five_stdout}"
         );
         assert!(
             five_stdout.contains(
-                "measured 3; no golden 1 (determinism-mismatch 1); not compared 1; unmeasured 0; \
-                 mean credit 1.0000 over 3 measured with equal inputs; none measured with \
+                "measured 4; no golden 1 (determinism-mismatch 1); not compared 0; unmeasured 0; \
+                 mean credit 1.0000 over 4 measured with equal inputs; none measured with \
                  unequal inputs"
             ),
             "{five_stdout}"
         );
         assert!(
-            mutated_stdout.contains("3 log-diff comparison(s), 0 guest runs"),
+            mutated_stdout.contains("4 log-diff comparison(s), 0 guest runs"),
             "{mutated_stdout}"
         );
         assert_eq!(
             verdicts(&five_records),
             [
-                "parity/alpha@dbt=InputsNotEqualized",
+                "parity/alpha@dbt=Matched",
                 "parity/alpha@kvm=Matched",
                 "parity/alpha@liteinst=Matched",
                 "parity/beta@kvm=Matched",
@@ -6501,21 +6501,21 @@ sys.exit(1 if failed else 0)
         assert_eq!(
             verdicts(&mutated_records),
             [
-                "parity/alpha@dbt=InputsNotEqualized",
+                "parity/alpha@dbt=Diverged",
                 "parity/alpha@kvm=Diverged",
                 "parity/alpha@liteinst=Diverged",
                 "parity/beta@kvm=Diverged",
                 "parity/beta@liteinst=Nondeterministic",
             ]
         );
-        // The harness launched every kvm and liteinst verify cell, and their
-        // ptrace reference, with the equalized guest inputs, so each measured
-        // comparison is clean credit. dbt cannot be given them, and a cell
-        // refused before comparing is not shown to have them.
+        // The harness launched every candidate verify cell, dbt included, and
+        // their ptrace reference, with the equalized guest inputs, so each
+        // measured comparison is clean credit. A cell refused before
+        // comparing is not shown to have them.
         for records in [&five_records, &mutated_records] {
             for (index, record) in records.iter().enumerate() {
                 record.validate().unwrap();
-                let measured = (1..4).contains(&index);
+                let measured = (0..4).contains(&index);
                 assert_eq!(record.inputs_equalized, measured, "{record:?}");
                 assert_eq!(record.unequalized_credit, None, "{record:?}");
                 if !measured {
@@ -6523,10 +6523,10 @@ sys.exit(1 if failed else 0)
                 }
             }
         }
-        for record in &five_records[1..4] {
+        for record in &five_records[0..4] {
             assert_eq!(record.credit, Some(1.0), "{record:?}");
         }
-        for record in &mutated_records[1..4] {
+        for record in &mutated_records[0..4] {
             assert_eq!(record.matched_prefix, Some(1), "{record:?}");
             assert_eq!(record.first_divergent_record, Some(2), "{record:?}");
             assert_eq!(record.credit, Some(1.0 / 3.0), "{record:?}");
@@ -6584,11 +6584,11 @@ sys.exit(1 if failed else 0)
                 "no additional guest execution"
             );
         }
-        assert_eq!(count(&pass_calls, "compare"), 4);
+        assert_eq!(count(&pass_calls, "compare"), 5);
         assert_eq!(
             verdicts(&records(&pass.join("parity.jsonl"))),
             [
-                "parity/alpha@dbt=InputsNotEqualized",
+                "parity/alpha@dbt=Diverged",
                 "parity/alpha@kvm=Diverged",
                 "parity/alpha@liteinst=Diverged",
                 "parity/beta@kvm=Diverged",
@@ -6659,14 +6659,14 @@ sys.exit(1 if failed else 0)
         assert_eq!(
             verdicts(&expired_records),
             [
-                "parity/alpha@dbt=InputsNotEqualized",
+                "parity/alpha@dbt=Unavailable",
                 "parity/alpha@kvm=Unavailable",
                 "parity/alpha@liteinst=Unavailable",
                 "parity/beta@kvm=Unavailable",
                 "parity/beta@liteinst=Unavailable",
             ]
         );
-        for record in &expired_records[1..] {
+        for record in &expired_records {
             let reason = record.reason.as_deref().unwrap();
             assert!(
                 reason.contains("the enclosing dagrun step's unknown wall bound")
@@ -6691,15 +6691,14 @@ sys.exit(1 if failed else 0)
             assert_eq!(count(calls, "normalize"), 0);
         }
         assert_eq!(count(&retained_off_calls, "compare"), 0);
-        assert_eq!(count(&retained_calls, "compare"), 3);
+        assert_eq!(count(&retained_calls, "compare"), 4);
         assert!(!retained_off.join("parity.jsonl").exists());
         let retained_off_outputs = without_timings(&retained_off);
         assert_eq!(retained_off_outputs.3, baseline.3, "{retained_off_stdout}");
         assert_eq!(without_kept_logs(retained_off_outputs.clone()).1, 0);
         let (retained_outputs, kept_rows) = without_kept_logs(without_timings(&retained));
-        // Seven rows keep logs: every row but alpha@dbt's, beta@liteinst's
-        // twice.
-        assert_eq!(kept_rows, 7);
+        // Eight rows keep logs: every row, beta@liteinst's twice.
+        assert_eq!(kept_rows, 8);
         assert_eq!(
             retained_outputs, retained_off_outputs,
             "retaining the parity closure's logs changed a determinism output"
@@ -6707,13 +6706,7 @@ sys.exit(1 if failed else 0)
         for row in rows(&retained) {
             let kept = row.argv.iter().any(|arg| arg == "--verify-log-dir");
             let backend = row.backend.as_deref().unwrap();
-            assert_eq!(
-                kept,
-                backend != "dbt",
-                "{} {backend}: {:?}",
-                row.test,
-                row.argv
-            );
+            assert!(kept, "{} {backend}: {:?}", row.test, row.argv);
         }
         assert_eq!(
             verdicts(&records(&retained.join("parity.jsonl"))),
