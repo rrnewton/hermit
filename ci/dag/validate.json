@@ -1427,6 +1427,13 @@
           "category": "c-programs",
           "test": "c-programs/cpu-virtualization",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/cpu-virtualization",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -1624,6 +1631,13 @@
           "test": "c-programs/dbt-wait-lifecycle",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dup-shared-offset",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -1883,6 +1897,13 @@
           "test": "c-programs/fcntl-owner",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fd-duplication",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -2155,6 +2176,13 @@
           "category": "c-programs",
           "test": "c-programs/getcpu-identity",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/getcpu-identity",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -2212,6 +2240,13 @@
           "test": "c-programs/getitimer-determinism-probe",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/getpriority-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -2310,6 +2345,13 @@
           "test": "c-programs/hello-signals",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/host-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -2639,6 +2681,13 @@
           "test": "c-programs/liteinst-advanced",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lseek-positioning",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -3464,6 +3513,13 @@
           "category": "c-programs",
           "test": "c-programs/numa-node-identity",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/numa-node-identity",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -3723,6 +3779,13 @@
           "category": "c-programs",
           "test": "c-programs/pidfd-open-self-pair",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pidfd-open-self-pair",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -3976,6 +4039,13 @@
           "test": "c-programs/prctl-dumpable",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/prctl-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -4277,6 +4347,13 @@
           "test": "c-programs/pselect6-simulation",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pthread-lifecycle",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -4738,6 +4815,13 @@
           "category": "c-programs",
           "test": "c-programs/rlimit-identity",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/rlimit-identity",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -4774,6 +4858,13 @@
           "test": "c-programs/robust-list",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sched-getaffinity-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -20437,6 +20528,13 @@
           "category": "c-programs",
           "test": "c-programs/cpu-virtualization",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/cpu-virtualization",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20585,6 +20683,13 @@
           "test": "c-programs/dbt-wait-lifecycle",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dup-shared-offset",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -20773,6 +20878,13 @@
           "category": "c-programs",
           "test": "c-programs/fd-duplication",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fd-duplication",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20955,6 +21067,13 @@
           "category": "c-programs",
           "test": "c-programs/getcpu-identity",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/getcpu-identity",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -20991,6 +21110,13 @@
           "test": "c-programs/getitimer-determinism-probe",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/getpriority-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -21068,6 +21194,13 @@
           "test": "c-programs/hello-signals",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/host-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -21313,6 +21446,13 @@
           "test": "c-programs/liteinst-advanced",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lseek-positioning",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -21886,6 +22026,13 @@
           "category": "c-programs",
           "test": "c-programs/numa-node-identity",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/numa-node-identity",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -22075,6 +22222,13 @@
           "category": "c-programs",
           "test": "c-programs/pidfd-open-self-pair",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pidfd-open-self-pair",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -22251,6 +22405,13 @@
           "test": "c-programs/prctl-dumpable",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/prctl-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -22817,6 +22978,13 @@
           "category": "c-programs",
           "test": "c-programs/rlimit-identity",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/rlimit-identity",
+          "mode": "verify",
           "backend": "ptrace"
         },
         {
@@ -22839,6 +23007,13 @@
           "test": "c-programs/robust-list",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sched-getaffinity-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -35099,6 +35274,13 @@
           "category": "c-programs",
           "test": "c-programs/cpu-virtualization",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/cpu-virtualization",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -35296,6 +35478,13 @@
           "test": "c-programs/dbt-wait-lifecycle",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/dup-shared-offset",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -35555,6 +35744,13 @@
           "test": "c-programs/fcntl-owner",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/fd-duplication",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -35827,6 +36023,13 @@
           "category": "c-programs",
           "test": "c-programs/getcpu-identity",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/getcpu-identity",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -35884,6 +36087,13 @@
           "test": "c-programs/getitimer-determinism-probe",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/getpriority-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -35982,6 +36192,13 @@
           "test": "c-programs/hello-signals",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/host-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -36311,6 +36528,13 @@
           "test": "c-programs/liteinst-advanced",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/lseek-positioning",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -37136,6 +37360,13 @@
           "category": "c-programs",
           "test": "c-programs/numa-node-identity",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/numa-node-identity",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -37395,6 +37626,13 @@
           "category": "c-programs",
           "test": "c-programs/pidfd-open-self-pair",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pidfd-open-self-pair",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -37648,6 +37886,13 @@
           "test": "c-programs/prctl-dumpable",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/prctl-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",
@@ -37949,6 +38194,13 @@
           "test": "c-programs/pselect6-simulation",
           "mode": "verify",
           "backend": "ptrace"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/pthread-lifecycle",
+          "mode": "verify",
+          "backend": "kvm"
         },
         {
           "lane": "portable",
@@ -38410,6 +38662,13 @@
           "category": "c-programs",
           "test": "c-programs/rlimit-identity",
           "mode": "verify",
+          "backend": "dbt"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/rlimit-identity",
+          "mode": "verify",
           "backend": "kvm"
         },
         {
@@ -38446,6 +38705,13 @@
           "test": "c-programs/robust-list",
           "mode": "verify",
           "backend": "sabre"
+        },
+        {
+          "lane": "portable",
+          "category": "c-programs",
+          "test": "c-programs/sched-getaffinity-identity",
+          "mode": "verify",
+          "backend": "dbt"
         },
         {
           "lane": "portable",

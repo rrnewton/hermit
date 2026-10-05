@@ -12665,7 +12665,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
         backends_enabled:
@@ -12675,11 +12675,6 @@ test:
           - kvm
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -13236,13 +13231,9 @@ test:
         ci:
           ptrace: true
           sabre: false
-          kvm: false
+          kvm: true
         ci_disabled_reason:
           sabre: {"result": "determinism-failure", "evidence": "Generated scorecard ci/compat-envelope/cells.json at Hermit 5b811757980b9cab599206c047560a7962176a6b retains historical results determinism-failure at Hermit 90e46cba9ad83550205f3c9cd232ae222c6b6173; retained first divergent record positions: 26, 26, 26.", "reason": "Historical canonical verification diverged at recorded positions. The later clean observations do not erase that retained failure, so this backend remains excluded pending separate qualification."}
-          kvm:
-            result: timeout
-            evidence: RUN1709 at Hermit 8c2bb5620f13e5d351e7bdb5d20c8dcec1f3eaba
-            reason: Both canonical full-validation attempts exceeded the 57-second wall backstop and produced no comparison, so KVM remains red without a divergence claim.
         backends_enabled:
           - ptrace
           - sabre
@@ -14623,7 +14614,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
         backends_enabled:
@@ -14633,11 +14624,6 @@ test:
           - kvm
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14886,7 +14872,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
         backends_enabled:
@@ -14896,11 +14882,6 @@ test:
           - kvm
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -14960,7 +14941,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
         backends_enabled:
@@ -14970,11 +14951,6 @@ test:
           - kvm
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15535,7 +15511,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
         backends_enabled:
@@ -15545,11 +15521,6 @@ test:
           - kvm
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15606,7 +15577,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
         backends_enabled:
@@ -15616,11 +15587,6 @@ test:
           - kvm
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15677,7 +15643,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
         backends_enabled:
@@ -15687,11 +15653,6 @@ test:
           - kvm
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15748,7 +15709,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
         backends_enabled:
@@ -15758,11 +15719,6 @@ test:
           - kvm
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -15819,11 +15775,9 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
-        ci_disabled_reason:
-          dbt: {"evidence": "TaskGraph list-the-never-measured-red-cells-by-test-id-mode-backend; Hermit 5b811757980b9cab599206c047560a7962176a6b; repeated canonical verification summary sha256 944bf8af55c1102757a068818e840ee7f8e083f9855f9e302b1eddfd363e4cb4", "reason": "Repeated canonical verification retained a determinism failure; this cell did not pass every repetition cleanly. Retained detail: canonical verification did not match: verified=false verdict=diverged bitwise_parity=false", "result": "determinism-failure"}
         backends_enabled:
           - ptrace
           - dbt
@@ -15887,11 +15841,9 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
-        ci_disabled_reason:
-          dbt: {"result": "determinism-failure", "evidence": "Published parent series at dev-hermit 90a55d8190dd2551179a9394be3504ee89a6a5a9 retains pressure-test results pass and determinism-failure for Detcore tree 077a5d847f6541daa5ef145536a7065868e9d3ab; first divergent record 80 and syscall 32.", "reason": "Published canonical verification at the same Detcore tree contains both passing and divergent observations. The 20 clean repetitions in this campaign do not erase the retained divergence, so this backend remains excluded pending separate qualification."}
         backends_enabled:
           - ptrace
           - dbt
@@ -15955,7 +15907,7 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
           kvm: true
         backends_enabled:
@@ -15965,11 +15917,6 @@ test:
           - kvm
         backends_disabled:
           liteinst: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)
-        ci_disabled_reason:
-          dbt:
-            result: infrastructure-error
-            evidence: RUN1598 at Hermit cd976f804de7568e34dc731b859dd7a5a1c1c0b9
-            reason: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence.
       naked:
         ci: false
         ci_disabled_reason: 'NOT-EXERCISED (family-wide, by design): this migration inventories strict verification and asserts nothing about native nondeterminism, so there is no naked oracle to run.'
@@ -16865,10 +16812,8 @@ test:
       verify:
         ci:
           ptrace: true
-          dbt: false
+          dbt: true
           sabre: true
-        ci_disabled_reason:
-          dbt: {"result": "unavailable", "evidence": "hermit-cli/src/bin/hermit/run.rs:2163", "reason": "DBT exits successfully after both guest executions, but its dedicated path emits no terminal canonical comparison, leaving verdict=no_result and comparison=null; retain the cell for direct evidence without reporting it green."}
         backends_enabled:
           - ptrace
           - dbt
