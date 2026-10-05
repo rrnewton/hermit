@@ -75,14 +75,10 @@ deadline=${CELL_DEADLINE_S:-$((tpx_timeout - 30))}
 # RE, so a local cell must see the same workdir or the two guests' inputs differ (a local
 # /test tmpfs made every kvm comparison inputs-not-equalized). The pinned-root container
 # keeps its fresh tmpfs at /test, and a guest that asserts /test
-# (c-programs/environment-and-workdir) runs there for it (defs.bzl PINNED_ROOT_ONLY). A
-# DBT verify cell is in the pinned root only for CAP_SYS_ADMIN, which the DBT adapter's
-# own mount namespace needs to apply --bind; it is compared with a ptrace reference that
-# ran outside, so it uses the bound /tmp/test as well.
+# (c-programs/environment-and-workdir) runs there for it (defs.bzl PINNED_ROOT_ONLY).
 container=${HERMIT_E2E_CONTAINER:-}
 workdir=
-[[ $container == pinned-root && ! ($BACKEND == dbt && $MODE == verify) ]] &&
-    workdir=HERMIT_E2E_EMPTY_WORKDIR=/test
+[[ $container == pinned-root ]] && workdir=HERMIT_E2E_EMPTY_WORKDIR=/test
 # env's -u options must precede its assignments (cpu_scan_env may be either).
 # The harness measures each budgeted invocation's live CPU from a cgroup of its own and
 # refuses the invocation when it cannot create one. An RE worker runs the test inside a

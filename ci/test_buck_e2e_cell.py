@@ -269,7 +269,7 @@ class CellTest(unittest.TestCase):
 
     def test_pinned_root_runs_the_harness_only_through_the_wrapper(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
-                                     HERMIT_E2E_CONTAINER_REASON="dbt backend: needs CAP_SYS_ADMIN")
+                                     HERMIT_E2E_CONTAINER_REASON="privileged lane")
         self.assertEqual(done["status"], "passed", done)
         self.assertEqual(json.loads(done["details"])["outcome"], "PASS")
         self.assertEqual(len(self.calls_by("check-image")), 1)
@@ -279,9 +279,7 @@ class CellTest(unittest.TestCase):
         self.assertEqual(wrapper["mountpoints"], ["agent-utils/rs/.agent-utils-locks",
                                                   "agent-utils/rs/.agent-utils-snapshots",
                                                   "agent-utils/rs/target", "target"])
-        # A DBT verify cell is here only for CAP_SYS_ADMIN: it gets the bound /tmp/test that
-        # its ptrace reference outside the container gets, not the /test marker.
-        self.assertNotIn("HERMIT_E2E_EMPTY_WORKDIR", wrapper["forwarded"])
+        self.assertEqual(wrapper["forwarded"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
         for name in ("E2E_RESULT_ROOT", "VALIDATE_RUN_STATE", "E2E_RUN_ID"):
             self.assertTrue(wrapper["forwarded"].get(name), name)
         self.assertEqual(wrapper["forwarded"]["E2E_KEEP_VERIFY_LOGS"], "1")
@@ -303,7 +301,7 @@ class CellTest(unittest.TestCase):
         self.assertTrue(all(not c.startswith(str(self.tmp)) for c in command),
                         "the in-container command must not name host paths")
         [harness] = self.calls_by("harness")
-        self.assertIsNone(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"])
+        self.assertEqual(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
         self.assertEqual(harness["env"]["E2E_RESULT_ROOT"], "/results")
         self.assertEqual(harness["env"]["E2E_BUILD_ROOT"], "/src/bundle/build")
         # The image's libc, libm, libgcc_s and its ld.so, from the same glibc, beside the
@@ -312,8 +310,8 @@ class CellTest(unittest.TestCase):
                                                           "libshipped.so")})
         self.assertEqual(harness["rsrcs"], expected)
         self.assertEqual(result["container"], "pinned-root")
-        self.assertEqual(result["container_reason"], "dbt backend: needs CAP_SYS_ADMIN")
-        self.assertEqual(result["empty_workdir"], "")
+        self.assertEqual(result["container_reason"], "privileged lane")
+        self.assertEqual(result["empty_workdir"], "HERMIT_E2E_EMPTY_WORKDIR=/test")
         self.assertTrue(result["evidence_complete"], result)
         self.assertEqual(result["outcome"], "PASS")
         after = sorted(str(p.relative_to(self.bundle)) for p in self.bundle.rglob("*"))
@@ -414,10 +412,10 @@ class CellTest(unittest.TestCase):
         self.assertIsNone(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "local cells use the bound /tmp/test")
         self.assertEqual(result["empty_workdir"], "")
 
-    def test_other_pinned_root_cells_keep_the_test_workdir(self) -> None:
-        # Only a DBT verify cell drops /test: a non-verify DBT cell and a cell of another
-        # backend in the pinned root keep the container's fresh tmpfs at /test.
-        for backend, mode in (("dbt", "custom"), ("ptrace", "verify"), ("kvm", "verify")):
+    def test_every_pinned_root_cell_keeps_the_test_workdir(self) -> None:
+        # A cell in the pinned root keeps the container's fresh tmpfs at /test, whatever its
+        # backend (a DBT cell is there only for the same reasons as any other now).
+        for backend, mode in (("dbt", "verify"), ("dbt", "custom"), ("ptrace", "verify"), ("kvm", "verify")):
             with self.subTest(backend=backend, mode=mode):
                 self.calls.write_text("")
                 done, result = self.run_cell(backend, TEST, mode, HERMIT_E2E_CONTAINER="pinned-root",
@@ -430,7 +428,9 @@ class CellTest(unittest.TestCase):
                 self.assertEqual(result["empty_workdir"], "HERMIT_E2E_EMPTY_WORKDIR=/test")
 
     def test_a_callers_workdir_marker_never_reaches_a_bound_cell(self) -> None:
-        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", HERMIT_E2E_EMPTY_WORKDIR="/test")
+        # A cell outside the pinned root uses the bound /tmp/test even when its caller
+        # exported the pinned root's marker.
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="local", HERMIT_E2E_EMPTY_WORKDIR="/test")
         self.assertEqual(done["status"], "passed", done)
         [harness] = self.calls_by("harness")
         self.assertIsNone(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"])
@@ -652,7 +652,6 @@ class ContainerChoiceTest(unittest.TestCase):
             self.assertEqual(env["HERMIT_E2E_ROUTE"], target["route"], target["name"])
             expected = target["route"] == "local" and (
                 cell["lane"] == "privileged"
-                or cell["backend"] == "dbt"
                 or cell["test"] == "c-programs/environment-and-workdir")
             self.assertEqual(env["HERMIT_E2E_CONTAINER"], "pinned-root" if expected else "", target["name"])
             self.assertEqual(bool(env["HERMIT_E2E_CONTAINER_REASON"]), expected, target["name"])
@@ -668,22 +667,24 @@ class ContainerChoiceTest(unittest.TestCase):
         privileged = {self.slug(c) for c in self.plan if c["lane"] == "privileged"}
         self.assertTrue(privileged, "the plan has privileged-lane cells")
         self.assertLessEqual(privileged, chosen)
-        self.assertIn("c-programs-cpuid-probe-verify-dbt", chosen)
         self.assertIn("c-programs-environment-and-workdir-custom-ptrace", chosen)
         self.assertIn("c-programs-environment-and-workdir-verify-ptrace", chosen)
-        # Every DBT cell runs locally, in the pinned root: its mount namespace, which applies
-        # --bind, needs CAP_SYS_ADMIN, and RE workers cannot mount.
-        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt"}
+        # The DBT adapter takes its own user namespace for its mounts, so a DBT cell needs no
+        # container and no particular route: a kvm test's DBT verify cell runs locally with
+        # its parity reference, and the others go to RE.
+        self.assertEqual(targets["c-programs-cpuid-probe-verify-dbt"]["route"], "local")
+        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged"}
         self.assertTrue(dbt)
-        for name in dbt:
-            self.assertEqual(targets[name]["route"], "local", name)
-        self.assertEqual(chosen, privileged | dbt | {"c-programs-environment-and-workdir-custom-ptrace",
-                                                     "c-programs-environment-and-workdir-verify-ptrace"})
+        self.assertFalse(dbt & chosen)
+        self.assertTrue(any(targets[name]["route"] == "re" for name in dbt))
+        self.assertEqual(chosen, privileged | {"c-programs-environment-and-workdir-custom-ptrace",
+                                               "c-programs-environment-and-workdir-verify-ptrace"})
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))
-        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt"}
-        self.assertLessEqual(dbt, chosen)
+        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged"}
+        self.assertTrue(dbt)
+        self.assertFalse(dbt & chosen)
 
 
 class ParityRouteTest(unittest.TestCase):
@@ -715,6 +716,17 @@ class ParityRouteTest(unittest.TestCase):
             for test in sabre:
                 if (test, "ptrace") in routes:
                     self.assertEqual(routes[(test, "sabre")], routes[(test, "ptrace")], (routing, test))
+
+    def test_every_dbt_cell_shares_its_references_route(self) -> None:
+        # A DBT verify cell is compared with its test's ptrace verify cell like any other
+        # candidate, so it runs on that cell's route and container, local or RE.
+        for routing in ("hybrid", "local"):
+            routes = self.routes(routing)
+            dbt = sorted(test for test, backend in routes if backend == "dbt")
+            self.assertGreater(len(dbt), 20, routing)
+            for test in dbt:
+                if (test, "ptrace") in routes:
+                    self.assertEqual(routes[(test, "dbt")], routes[(test, "ptrace")], (routing, test))
 
 
 if __name__ == "__main__":

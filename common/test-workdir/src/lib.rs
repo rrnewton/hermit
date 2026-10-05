@@ -77,9 +77,10 @@ pub fn requested_workdir(value: Option<&OsStr>) -> io::Result<Option<&'static Pa
 
 /// Run on a new host thread with a fresh tmpfs mounted at /test.
 ///
-/// This requires CAP_SYS_ADMIN in the owning user namespace and an existing
-/// /test directory. No user-namespace fallback or shared-directory substitute
-/// is used. Setup errors return before the callback can launch a guest. The
+/// This requires CAP_SYS_ADMIN in the owning user namespace (the pinned root
+/// grants it; [`enter_root_user_namespace`] gives it to an unprivileged
+/// process) and an existing /test directory. No user-namespace fallback or
+/// shared-directory substitute is used here. Setup errors return before the callback can launch a guest. The
 /// scoped thread is joined on success, error and panic; a callback panic keeps
 /// its original payload. Each invocation creates its own mount namespace.
 pub fn with_isolated_workdir<F, T>(run: F) -> io::Result<T>
@@ -124,6 +125,38 @@ where
             Err(panic) => std::panic::resume_unwind(panic),
         }
     })
+}
+
+/// Make the calling process root in a new user namespace that maps root to the
+/// caller's own user and group, exactly as `reverie::process::Container::map_root`
+/// maps the guest of every other backend. The process then holds CAP_SYS_ADMIN
+/// over the mount namespaces it creates, so [`with_isolation`] works on a host
+/// that grants no privilege, and a guest sees the same identity as under the
+/// other backends.
+///
+/// Linux refuses to move a multithreaded process into a new user namespace, so
+/// this must run before the process starts its first thread; it fails, with
+/// the thread count, instead of leaving the process where it was.
+pub fn enter_root_user_namespace() -> io::Result<()> {
+    let threads = std::fs::read_dir("/proc/self/task")?.count();
+    if threads != 1 {
+        return Err(io::Error::other(format!(
+            "a new user namespace needs a single-threaded process; this one has {threads} threads"
+        )));
+    }
+    let uid = unsafe { libc::geteuid() };
+    let gid = unsafe { libc::getegid() };
+    syscall_result(
+        unsafe { libc::unshare(libc::CLONE_NEWUSER) },
+        "unshare user namespace",
+    )?;
+    let write = |path: &str, contents: String| {
+        std::fs::write(path, contents)
+            .map_err(|error| io::Error::new(error.kind(), format!("write {path}: {error}")))
+    };
+    write("/proc/self/uid_map", format!("0 {uid} 1"))?;
+    write("/proc/self/setgroups", "deny".to_string())?;
+    write("/proc/self/gid_map", format!("0 {gid} 1"))
 }
 
 fn syscall_result(result: libc::c_int, operation: &str) -> io::Result<()> {

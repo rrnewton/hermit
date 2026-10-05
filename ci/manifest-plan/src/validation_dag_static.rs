@@ -253,7 +253,9 @@ pub(super) const PMU_MEMORY_FAILURE_FAMILY_MEMBERS: &[&str] = &[
 /// an empty or narrowed run refuse. Update these only after enumerating the
 /// corresponding shipped command and accounting for changed test identities.
 pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
-    ("test.isolated_dbt_workdir", 2),
+    // run_dbt_binds_in_a_user_namespace_of_its_own retains both prior
+    // identities: 2 + 1 = 3.
+    ("test.isolated_dbt_workdir", 3),
     ("test.isolated_detcore_workdir", 1),
     // Prepared inventories retain all prior identities and add four reporting
     // tests to regular crates and nine to Hermit's library/binary selection.
@@ -1665,13 +1667,13 @@ pub(super) fn config() -> DagConfig {
         (
             "cli",
             "isolated_dbt_workdir",
-            "Verify sequential and concurrent physical DBT working directories and retain the existing blocked-input failure control. The exact selected tests require the pinned-root marker, prepared CLI executable, canonical INFO and IO-buffer comparison, and unchanged per-test CPU/wall policy. Retained files additionally inherit a 64 MiB per-file limit; a cap hit remains failure.",
+            "Verify sequential and concurrent physical DBT working directories, a bound DBT run in the adapter's own user namespace, and retain the existing blocked-input failure control. The exact selected tests require the pinned-root marker, prepared CLI executable, canonical INFO and IO-buffer comparison, and unchanged per-test CPU/wall policy. Retained files additionally inherit a 64 MiB per-file limit; a cap hit remains failure.",
             concat!(
                 "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ",
                 "test \"${HERMIT_E2E_EMPTY_WORKDIR:-}\" = /test && ",
                 "prlimit --fsize=67108864:67108864 -- ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ",
                 "${CI:+--profile ci} -p hermit --features third-party-backends --test cli ",
-                "-E 'test(=run_dbt_verifies_fresh_physical_workdirs) | test(=run_dbt_strict_returns_with_blocked_stdin_source)' -- --include-ignored"
+                "-E 'test(=run_dbt_verifies_fresh_physical_workdirs) | test(=run_dbt_binds_in_a_user_namespace_of_its_own) | test(=run_dbt_strict_returns_with_blocked_stdin_source)' -- --include-ignored"
             ),
         ),
         (

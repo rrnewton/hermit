@@ -7,16 +7,16 @@ pass --no-retry to the harness, so `buck2 test ... -- --retry 1` retries a faile
 and the ingester keeps "passed only on rerun" red.
 
 Routing (per cell, first match wins; see _route):
-  local: kvm or dbt backend, privileged lane, a host-capability requirement, a `requires` tool
+  local: kvm backend, privileged lane, a host-capability requirement, a `requires` tool
          RE workers lack, the LOCAL_TESTS deny-list, a test measured to fail only on RE
          (re_exclusions.json), a PMU-armed cell under -c hermit_e2e.pmu_on_re=false, or
-         the ptrace or sabre verify cell of a test with a kvm verify cell (its parity
-         reference, and the other candidate compared with that reference).
+         the ptrace, sabre or dbt verify cell of a test with a kvm verify cell (its parity
+         reference, and the other candidates compared with that reference).
   re:    everything else.
 `-c hermit_e2e.routing=local` runs every cell locally (the buck-local test mode).
 
-Container (per local cell; see _container): a privileged-lane cell, a pinned-root-only
-cell and a DBT cell run inside ci/hermetic/run-in-pinned-root.sh, the privileged podman
+Container (per local cell; see _container): a privileged-lane cell and a pinned-root-only
+cell run inside ci/hermetic/run-in-pinned-root.sh, the privileged podman
 container the cargo flow runs every e2e node in. Other local cells run on the host.
 
 RE-routed cells support Buck's test execution caching: when the bundle (hermit, harness,
@@ -72,10 +72,6 @@ def _route(cell, pmu_on_re, re_exclusions, kvm_verify_tests):
     """Returns (where, reason): where is "local" or "re"."""
     if cell["backend"] == "kvm":
         return ("local", "kvm backend: RE workers have no /dev/kvm")
-    if cell["backend"] == "dbt":
-        # The DBT adapter applies --bind (the bound workdir and the equalized inputs) in its
-        # own mount namespace, which needs CAP_SYS_ADMIN; RE workers cannot mount.
-        return ("local", "dbt backend: its mount namespace needs CAP_SYS_ADMIN, which RE workers lack")
     if cell["lane"] == "privileged":
         return ("local", "privileged lane")
     if cell.get("requires_host_capabilities"):
@@ -97,8 +93,9 @@ def _route(cell, pmu_on_re, re_exclusions, kvm_verify_tests):
         # only when both ran on one route (ci/manifest-plan/src/parity.rs shares_route),
         # and a kvm cell always runs locally.
         return ("local", "parity reference of a kvm verify cell, which runs locally")
-    if cell["backend"] == "sabre" and cell["mode"] == "verify" and cell["test"] in kvm_verify_tests:
-        # The same reference is this sabre cell's; keep the pair on one route too.
+    if cell["backend"] in ["sabre", "dbt"] and cell["mode"] == "verify" and cell["test"] in kvm_verify_tests:
+        # The same reference is this cell's; keep the pair on one route too. (The DBT
+        # adapter takes the user namespace its --bind mounts need, so it runs anywhere.)
         return ("local", "shares its parity reference with a kvm verify cell, which runs locally")
     return ("re", "")
 
@@ -111,11 +108,6 @@ def _container(cell, where):
     pinned = PINNED_ROOT_ONLY.get("{}/{}".format(cell["test"], cell["mode"]))
     if pinned:
         return ("pinned-root", "pinned-root-only: " + pinned)
-    if cell["backend"] == "dbt":
-        # The DBT adapter makes its own mount namespace (hermit_test_workdir) for --bind and
-        # /test, which needs CAP_SYS_ADMIN; the other backends mount in hermit's own user
-        # namespace.
-        return ("pinned-root", "dbt backend: its own mount namespace needs CAP_SYS_ADMIN")
     return ("", "")
 
 def _cell_test_impl(ctx):

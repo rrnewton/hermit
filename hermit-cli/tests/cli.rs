@@ -1911,6 +1911,44 @@ fn run_dbt_verifies_simple_env_shebang() {
 }
 
 #[test]
+#[ignore = "requires the pinned-root isolation validation node"]
+fn run_dbt_binds_in_a_user_namespace_of_its_own() {
+    if !cfg!(feature = "dbt") {
+        panic!("the bind control requires the DBT feature");
+    }
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    fs::write(directory.path().join("input"), "bound input\n").unwrap();
+    let bind = format!("{}:/tmp/e2e/bound", directory.path().display());
+    let output = hermit_command(&[
+        "--backend",
+        "dbt",
+        "run",
+        "--bind",
+        &bind,
+        "--",
+        "/bin/sh",
+        "-c",
+        "cat /tmp/e2e/bound/input; cat /proc/self/uid_map",
+    ])
+    .output()
+    .unwrap();
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let mut lines = text.lines();
+    assert_eq!(lines.next(), Some("bound input"), "{text}");
+    // The mounts --bind needs come from a user namespace of the DBT adapter's
+    // own, which maps root to the caller alone (as reverie's Container::map_root
+    // does for every other backend), not from a privileged host.
+    let map = lines
+        .next()
+        .unwrap_or_default()
+        .split_whitespace()
+        .collect::<Vec<_>>();
+    assert_eq!((map.len(), map[0], map[2]), (3, "0", "1"), "{text}");
+    assert_eq!(lines.next(), None, "{text}");
+}
+
+#[test]
 #[ignore = "requires the pinned-root isolation validation node and its /test marker"]
 fn run_dbt_verifies_fresh_physical_workdirs() {
     if !cfg!(feature = "dbt") {
