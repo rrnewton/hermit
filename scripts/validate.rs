@@ -2379,28 +2379,49 @@ const SUBMODULE_SERVICE_FIXTURE_SOURCES: &[&str] = &[
 /// then become a schema-4 FAILED result from `pre.submodules`, even though
 /// cgroup setup replaces the process first: once compiled from the copied
 /// sources with every submodule absent, and once from the original root's
-/// prepared scripts with only agent-utils populated.
+/// prepared scripts with only agent-utils populated. The self-test drives the
+/// two halves separately; see `SubmoduleServiceBracket`.
+#[cfg(test)]
 fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, String> {
-    fn run_fixture(
+    SubmoduleServiceBracket::start(root)?.finish()
+}
+
+type SubmoduleLedgerIdentity = (u64, u64, u32, u64, i64, i64, i64, i64);
+
+fn submodule_ledger_identity(metadata: &std::fs::Metadata) -> SubmoduleLedgerIdentity {
+    use std::os::unix::fs::MetadataExt;
+
+    (
+        metadata.dev(),
+        metadata.ino(),
+        metadata.mode(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec(),
+        metadata.ctime(),
+        metadata.ctime_nsec(),
+    )
+}
+
+/// One `validate --only portable pre.submodules` child of the submodule
+/// service-result fixture. Its stdout and stderr go to files beside its result
+/// so it can run while other self-test brackets proceed. Dropping it without
+/// waiting terminates it: `timeout` forwards SIGTERM to the child it runs.
+struct SubmoduleFixtureChild {
+    child: Option<std::process::Child>,
+    stdout: PathBuf,
+    stderr: PathBuf,
+    ledger: PathBuf,
+    ledger_before: SubmoduleLedgerIdentity,
+}
+
+impl SubmoduleFixtureChild {
+    fn spawn(
         checkout: &Path,
         prepared_source_root: Option<&Path>,
         result: &Path,
         ledger: &Path,
-    ) -> Result<std::process::Output, String> {
-        use std::os::unix::fs::MetadataExt;
-
-        let ledger_identity = |metadata: &std::fs::Metadata| {
-            (
-                metadata.dev(),
-                metadata.ino(),
-                metadata.mode(),
-                metadata.len(),
-                metadata.mtime(),
-                metadata.mtime_nsec(),
-                metadata.ctime(),
-                metadata.ctime_nsec(),
-            )
-        };
+    ) -> Result<Self, String> {
         let ledger_before = std::fs::symlink_metadata(ledger).map_err(|error| {
             format!("submodule service result: cannot inspect private ledger: {error}")
         })?;
@@ -2473,182 +2494,283 @@ fn submodule_failure_service_result_bracket(root: &Path) -> Result<String, Strin
         // The missing-rr case retains normal producer selection for the
         // original-root script. Its RUN entrypoint (never this process's
         // potentially libtest current_exe) still discovers the fixture via cwd.
-        let output = command
-            .output()
+        let stdout = result.with_extension("stdout");
+        let stderr = result.with_extension("stderr");
+        let capture = |path: &Path| {
+            std::fs::File::create(path).map_err(|error| {
+                format!(
+                    "submodule service result: cannot create {}: {error}",
+                    path.display()
+                )
+            })
+        };
+        // `Command::output` gives the child a null stdin; keep that.
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(capture(&stdout)?)
+            .stderr(capture(&stderr)?);
+        let child = command
+            .spawn()
             .map_err(|error| format!("submodule service result: cannot launch fixture: {error}"))?;
-        let ledger_after = std::fs::symlink_metadata(ledger).map_err(|error| {
+        Ok(Self {
+            child: Some(child),
+            stdout,
+            stderr,
+            ledger: ledger.to_path_buf(),
+            ledger_before: submodule_ledger_identity(&ledger_before),
+        })
+    }
+
+    fn wait(mut self) -> Result<std::process::Output, String> {
+        let status = self
+            .child
+            .take()
+            .ok_or("submodule service result: fixture child was already reaped")?
+            .wait()
+            .map_err(|error| {
+                format!("submodule service result: cannot wait for fixture: {error}")
+            })?;
+        let read = |path: &Path| {
+            std::fs::read(path).map_err(|error| {
+                format!(
+                    "submodule service result: cannot read {}: {error}",
+                    path.display()
+                )
+            })
+        };
+        let output = std::process::Output {
+            status,
+            stdout: read(&self.stdout)?,
+            stderr: read(&self.stderr)?,
+        };
+        let ledger_after = std::fs::symlink_metadata(&self.ledger).map_err(|error| {
             format!("submodule service result: cannot reread private ledger: {error}")
         })?;
-        if ledger_identity(&ledger_after) != ledger_identity(&ledger_before) {
+        if submodule_ledger_identity(&ledger_after) != self.ledger_before {
             return Err("submodule service result: child modified the private ledger".into());
         }
         Ok(output)
     }
+}
 
-    fn checked_command(command: &mut Command, what: &str) -> Result<(), String> {
-        let output = command
-            .output()
-            .map_err(|error| format!("submodule service result: cannot {what}: {error}"))?;
-        if output.status.success() {
-            Ok(())
-        } else {
-            Err(format!(
-                "submodule service result: {what} failed with {:?}: {}{}",
-                output.status.code(),
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr)
-            ))
+impl Drop for SubmoduleFixtureChild {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            if let Ok(pid) = libc::pid_t::try_from(child.id()) {
+                // SAFETY: `pid` is this process's own unreaped child.
+                unsafe { libc::kill(pid, libc::SIGTERM) };
+            }
+            let _ = child.wait();
         }
     }
+}
 
-    let fixture = tempfile::tempdir()
-        .map_err(|error| format!("submodule service result: cannot create fixture: {error}"))?;
-    let ledger = tempfile::NamedTempFile::new_in(fixture.path()).map_err(|error| {
-        format!("submodule service result: cannot create private ledger: {error}")
-    })?;
-    let checkout = fixture.path().join("hermit");
-    // The bracket needs the current tree and recorded AU API, not unrelated
-    // branch history. Keep transport copying (--no-local), so the disposable
-    // repositories remain independent of the source's object store.
-    checked_command(
-        scratch_git()
-            .args([
-                "clone",
-                "--quiet",
-                "--no-local",
-                "--no-recurse-submodules",
-                "--depth",
-                "1",
-                "--single-branch",
-                "--no-tags",
-            ])
-            .arg(root)
-            .arg(&checkout),
-        "clone the independent Hermit fixture",
-    )?;
-
-    // A self-test can run from an uncommitted edit while it is being developed.
-    // Overlay exactly this test's production files, then commit only when that
-    // changed the clone. The real child therefore still runs from a clean SHA.
-    for relative in SUBMODULE_SERVICE_FIXTURE_SOURCES {
-        exec_safe_fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
-            format!("submodule service result: cannot copy {relative} into fixture: {error}")
-        })?;
-    }
-    checked_command(
-        scratch_git()
-            .args(["add", "--"])
-            .args(SUBMODULE_SERVICE_FIXTURE_SOURCES)
-            .current_dir(&checkout),
-        "stage the fixture sources",
-    )?;
-    let staged = scratch_git()
-        .args(["diff", "--cached", "--quiet"])
-        .current_dir(&checkout)
-        .status()
-        .map_err(|error| {
-            format!("submodule service result: cannot inspect fixture diff: {error}")
-        })?;
-    if !staged.success() {
-        checked_command(
-            scratch_git()
-                .args([
-                    "-c",
-                    "user.name=validate fixture",
-                    "-c",
-                    "user.email=validate-fixture@example.invalid",
-                    "commit",
-                    "--quiet",
-                    "-m",
-                    "validate service-result fixture",
-                ])
-                .current_dir(&checkout),
-            "commit the fixture sources",
-        )?;
-    }
-
-    // `.gitmodules` lists third-party/rr first, so both cases fail on it.
-    fn expect_missing_rr_result(
-        case: &str,
-        output: &std::process::Output,
-        result_path: &Path,
-    ) -> Result<(), String> {
-        let rendered = format!(
-            "{}{}",
+fn submodule_checked_command(command: &mut Command, what: &str) -> Result<(), String> {
+    let output = command
+        .output()
+        .map_err(|error| format!("submodule service result: cannot {what}: {error}"))?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "submodule service result: {what} failed with {:?}: {}{}",
+            output.status.code(),
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
-        );
-        let result = ValidationServiceResult::from_json_slice(
-            &std::fs::read(result_path).map_err(|error| {
-                format!(
-                    "submodule service result ({case}): pre.submodules failure wrote no typed \
-                     result: {error}; status={:?} output={rendered}",
-                    output.status.code()
-                )
-            })?,
-        )?;
-        if output.status.code() != Some(1)
-            || result.final_validate_status != FinalValidateStatus::Failed
-            || result.exit_code != 1
-            || result.executed_nodes != 1
-            || !rendered.contains("pre.submodules")
-            || !rendered.contains("third-party/rr")
-            || !rendered.contains("FINAL_VALIDATE_STATUS: FAILED")
-        {
-            return Err(format!(
-                "submodule service result ({case}): missing rr was not attributed to the real \
-                 first DAG node: status={:?} result={result:?} output={rendered}",
+        ))
+    }
+}
+
+// `.gitmodules` lists third-party/rr first, so both cases fail on it.
+fn expect_missing_rr_result(
+    case: &str,
+    output: &std::process::Output,
+    result_path: &Path,
+) -> Result<(), String> {
+    let rendered = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let result = ValidationServiceResult::from_json_slice(&std::fs::read(result_path).map_err(
+        |error| {
+            format!(
+                "submodule service result ({case}): pre.submodules failure wrote no typed \
+                 result: {error}; status={:?} output={rendered}",
                 output.status.code()
-            ));
+            )
+        },
+    )?)?;
+    if output.status.code() != Some(1)
+        || result.final_validate_status != FinalValidateStatus::Failed
+        || result.exit_code != 1
+        || result.executed_nodes != 1
+        || !rendered.contains("pre.submodules")
+        || !rendered.contains("third-party/rr")
+        || !rendered.contains("FINAL_VALIDATE_STATUS: FAILED")
+    {
+        return Err(format!(
+            "submodule service result ({case}): missing rr was not attributed to the real \
+             first DAG node: status={:?} result={result:?} output={rendered}",
+            output.status.code()
+        ));
+    }
+    Ok(())
+}
+
+/// The submodule service-result bracket, split so its slow first case can run
+/// while the rest of the self-test proceeds. `start` builds the fixture clone
+/// and launches the no-submodules child, whose copied-source rust-script
+/// compile dominates the bracket's cost; `finish` waits for it and runs the
+/// agent-utils case. Fields drop in declaration order, so an unfinished
+/// bracket stops its child before the fixture directory is removed.
+struct SubmoduleServiceBracket {
+    bootstrap: SubmoduleFixtureChild,
+    bootstrap_result: PathBuf,
+    root: PathBuf,
+    checkout: PathBuf,
+    ledger: tempfile::NamedTempFile,
+    fixture: tempfile::TempDir,
+}
+
+impl SubmoduleServiceBracket {
+    fn start(root: &Path) -> Result<Self, String> {
+        let fixture = tempfile::tempdir()
+            .map_err(|error| format!("submodule service result: cannot create fixture: {error}"))?;
+        let ledger = tempfile::NamedTempFile::new_in(fixture.path()).map_err(|error| {
+            format!("submodule service result: cannot create private ledger: {error}")
+        })?;
+        let checkout = fixture.path().join("hermit");
+        // The bracket needs the current tree and recorded AU API, not unrelated
+        // branch history. Keep transport copying (--no-local), so the disposable
+        // repositories remain independent of the source's object store.
+        submodule_checked_command(
+            scratch_git()
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--no-local",
+                    "--no-recurse-submodules",
+                    "--depth",
+                    "1",
+                    "--single-branch",
+                    "--no-tags",
+                ])
+                .arg(root)
+                .arg(&checkout),
+            "clone the independent Hermit fixture",
+        )?;
+
+        // A self-test can run from an uncommitted edit while it is being developed.
+        // Overlay exactly this test's production files, then commit only when that
+        // changed the clone. The real child therefore still runs from a clean SHA.
+        for relative in SUBMODULE_SERVICE_FIXTURE_SOURCES {
+            exec_safe_fs::copy(root.join(relative), checkout.join(relative)).map_err(|error| {
+                format!("submodule service result: cannot copy {relative} into fixture: {error}")
+            })?;
         }
-        Ok(())
+        submodule_checked_command(
+            scratch_git()
+                .args(["add", "--"])
+                .args(SUBMODULE_SERVICE_FIXTURE_SOURCES)
+                .current_dir(&checkout),
+            "stage the fixture sources",
+        )?;
+        let staged = scratch_git()
+            .args(["diff", "--cached", "--quiet"])
+            .current_dir(&checkout)
+            .status()
+            .map_err(|error| {
+                format!("submodule service result: cannot inspect fixture diff: {error}")
+            })?;
+        if !staged.success() {
+            submodule_checked_command(
+                scratch_git()
+                    .args([
+                        "-c",
+                        "user.name=validate fixture",
+                        "-c",
+                        "user.email=validate-fixture@example.invalid",
+                        "commit",
+                        "--quiet",
+                        "-m",
+                        "validate service-result fixture",
+                    ])
+                    .current_dir(&checkout),
+                "commit the fixture sources",
+            )?;
+        }
+
+        let bootstrap_result = fixture.path().join("bootstrap-result.json");
+        let bootstrap =
+            SubmoduleFixtureChild::spawn(&checkout, None, &bootstrap_result, ledger.path())?;
+        Ok(Self {
+            bootstrap,
+            bootstrap_result,
+            root: root.to_path_buf(),
+            checkout,
+            ledger,
+            fixture,
+        })
     }
 
-    let bootstrap_result = fixture.path().join("bootstrap-result.json");
-    let bootstrap = run_fixture(&checkout, None, &bootstrap_result, ledger.path())?;
-    expect_missing_rr_result("no submodules", &bootstrap, &bootstrap_result)?;
+    fn finish(self) -> Result<String, String> {
+        let Self {
+            bootstrap,
+            bootstrap_result,
+            root,
+            checkout,
+            ledger,
+            fixture,
+        } = self;
+        // The no-submodules case must finish before agent-utils is populated.
+        let bootstrap = bootstrap.wait()?;
+        expect_missing_rr_result("no submodules", &bootstrap, &bootstrap_result)?;
 
-    checked_command(
-        scratch_git()
-            .args([
-                "clone",
-                "--quiet",
-                "--no-local",
-                "--depth",
-                "1",
-                "--single-branch",
-                "--no-tags",
-            ])
-            .arg(root.join("agent-utils"))
-            .arg(checkout.join("agent-utils")),
-        "populate only agent-utils",
-    )?;
-    let expected_agent_utils = scratch_git()
-        .args(["ls-tree", "HEAD", "agent-utils"])
-        .current_dir(&checkout)
-        .output()
-        .map_err(|error| {
-            format!("submodule service result: cannot read agent-utils pin: {error}")
-        })?;
-    let expected_agent_utils = String::from_utf8_lossy(&expected_agent_utils.stdout)
-        .split_whitespace()
-        .nth(2)
-        .ok_or("submodule service result: agent-utils gitlink is absent")?
-        .to_string();
-    checked_command(
-        scratch_git()
-            .args(["checkout", "--quiet", &expected_agent_utils])
-            .current_dir(checkout.join("agent-utils")),
-        "checkout the recorded agent-utils pin",
-    )?;
+        submodule_checked_command(
+            scratch_git()
+                .args([
+                    "clone",
+                    "--quiet",
+                    "--no-local",
+                    "--depth",
+                    "1",
+                    "--single-branch",
+                    "--no-tags",
+                ])
+                .arg(root.join("agent-utils"))
+                .arg(checkout.join("agent-utils")),
+            "populate only agent-utils",
+        )?;
+        let expected_agent_utils = scratch_git()
+            .args(["ls-tree", "HEAD", "agent-utils"])
+            .current_dir(&checkout)
+            .output()
+            .map_err(|error| {
+                format!("submodule service result: cannot read agent-utils pin: {error}")
+            })?;
+        let expected_agent_utils = String::from_utf8_lossy(&expected_agent_utils.stdout)
+            .split_whitespace()
+            .nth(2)
+            .ok_or("submodule service result: agent-utils gitlink is absent")?
+            .to_string();
+        submodule_checked_command(
+            scratch_git()
+                .args(["checkout", "--quiet", &expected_agent_utils])
+                .current_dir(checkout.join("agent-utils")),
+            "checkout the recorded agent-utils pin",
+        )?;
 
-    assert_submodule_fixture_source(root, &checkout, &expected_agent_utils)?;
+        assert_submodule_fixture_source(&root, &checkout, &expected_agent_utils)?;
 
-    let result_path = fixture.path().join("service-result.json");
-    let output = run_fixture(&checkout, Some(root), &result_path, ledger.path())?;
-    expect_missing_rr_result("agent-utils present", &output, &result_path)?;
+        let result_path = fixture.path().join("service-result.json");
+        let output =
+            SubmoduleFixtureChild::spawn(&checkout, Some(&root), &result_path, ledger.path())?
+                .wait()?;
+        expect_missing_rr_result("agent-utils present", &output, &result_path)?;
 
-    Ok("with no submodules the driver builds from copied sources and missing rr is a typed pre.submodules failure; with agent-utils present it stays one across scope re-exec".into())
+        Ok("with no submodules the driver builds from copied sources and missing rr is a typed pre.submodules failure; with agent-utils present it stays one across scope re-exec".into())
+    }
 }
 
 /// Pin the measured resource policy for the shard-coverage guard.
@@ -3085,6 +3207,14 @@ fn self_test_runner_log_isolation_bracket() -> Result<String, String> {
 /// on every invocation (validate.sh:308); here they are a `--self-test` subcommand
 /// so the cost is not paid on the hot path.
 fn self_test() -> Result<(), String> {
+    // The submodule service-result bracket clones the committed tree and
+    // therefore must exercise the recorded submodule API rather than any
+    // locally materialized dependency. Its no-submodules case compiles
+    // scripts/validate.rs from the clone with real rust-script, which took
+    // 119 s of this self-test's 287 s at a two-core cap on 2026-10-04. Start
+    // that child now, before any bracket below edits this process's
+    // environment, so the compile overlaps the independent policy brackets.
+    let submodule_service = SubmoduleServiceBracket::start(&repo_root())?;
     println!("  {}", self_test_runner_log_isolation_bracket()?);
     inner_freshness_skip_cli_bracket()?;
     plan_export_dirtiness_bracket()?;
@@ -4942,13 +5072,9 @@ cleared-caps refusal names {} starved step(s)",
         );
     }
 
-    // This bracket clones the committed tree and therefore must exercise the
-    // recorded submodule API rather than any locally materialized dependency.
-    // Keep it last so all Hermit-only policy brackets report independently.
-    println!(
-        "  {}",
-        submodule_failure_service_result_bracket(&repo_root())?
-    );
+    // Finish the submodule bracket last so all Hermit-only policy brackets
+    // report independently of it.
+    println!("  {}", submodule_service.finish()?);
 
     Ok(())
 }
