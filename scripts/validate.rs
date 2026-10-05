@@ -6845,11 +6845,15 @@ fn resolve_cgroups(
 /// inherit, given whether the run is boxed and the caller's own value. Each
 /// budgeted cell measures its live CPU in a cgroup of its own. A boxed run
 /// passes no marker, so a cell whose cgroup cannot be created is stopped, and
-/// it refuses to start when the caller set the marker, so a boxed run never
-/// measures with the scan. Only a run let go unboxed on purpose
-/// (`--allow-cgroup-failure`) lets such a cell fall back to the agent-utils
-/// process-group CPU scan, which its rows then name as their source. That run
-/// sets the marker itself, whatever the caller passed.
+/// it refuses to start when the caller set the marker, so no cell a boxed run
+/// executes on this host measures with the scan. Only a run let go unboxed on
+/// purpose (`--allow-cgroup-failure`) lets such a cell fall back to the
+/// agent-utils process-group CPU scan, which its rows then name as their
+/// source. That run sets the marker itself, whatever the caller passed. This
+/// governs local execution only: rows a `--e2e-runner buck-hybrid` run imports
+/// from Buck remote execution were measured on an RE worker, where
+/// `ci/buck-e2e/cell.sh` sets the marker because the worker's cgroup is not
+/// writable, so those rows name the scan as their source even in a boxed run.
 fn process_group_scan_marker(
     boxed: bool,
     caller: Option<&OsStr>,
@@ -6858,7 +6862,7 @@ fn process_group_scan_marker(
         (false, _) => Ok(Some("1")),
         (true, None) => Ok(None),
         (true, Some(value)) => Err(format!(
-            "this run is boxed, and a boxed run refuses the caller's {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}={value:?}: its E2E cells measure live CPU from cgroups of their own and stop when one cannot be created, never falling back to the process-group CPU scan"
+            "this run is boxed, and a boxed run refuses the caller's {ALLOW_PROCESS_GROUP_CPU_SCAN_ENV}={value:?}: the E2E cells it executes on this host measure live CPU from cgroups of their own and stop when one cannot be created, never falling back to the process-group CPU scan (rows imported from Buck remote execution were measured on the RE worker; see ci/buck-e2e/cell.sh)"
         )),
     }
 }
