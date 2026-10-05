@@ -800,7 +800,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_public_dispatch_runs_in_guest_detcore, and retains the other
     // 808 identities unchanged (`cargo nextest list --profile ci` with this
     // node's filters lists 810, the two renamed tests included).
-    ("test.hermit_unit", 810),
+    // The four dbt_detconfig_tests::* cases, which pin HERMIT_DBT_DETCONFIG to
+    // its 806cf2fa38d1 bytes after the deleted Detcore switches
+    // (https://github.com/rrnewton/hermit/issues/3765), retain all 810 prior
+    // identities (`cargo nextest list --profile ci` with this node's filters
+    // lists 814; without the --skip filters it lists 819 = 814 plus the same
+    // five skipped real_random_ cases).
+    ("test.hermit_unit", 814),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1192,7 +1198,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same https://github.com/rrnewton/hermit/pull/3219 test.
     // The host twin drops the same eight
     // https://github.com/rrnewton/hermit/issues/3520 tests.
-    ("test.hermit_unit_on_host", 810),
+    // The host twin selects the same four
+    // https://github.com/rrnewton/hermit/issues/3765 dbt_detconfig_tests.
+    ("test.hermit_unit_on_host", 814),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
