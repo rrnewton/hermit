@@ -46,6 +46,7 @@ LOCAL_TESTS = {
 # that container (_container).
 PINNED_ROOT_ONLY = {
     "c-programs/environment-and-workdir/custom": "asserts HOSTNAME=hermetic-container.local, the pinned-root PATH and /results paths, which only the pinned-root container provides",
+    "c-programs/environment-and-workdir/verify": "asserts a fresh tmpfs workdir at /test, which cell.sh gives only pinned-root cells (elsewhere the workdir is the bound /tmp/test)",
 }
 
 # ptrace/liteinst cells that run with --max-timeslice=disabled and so never arm the PMU.

@@ -231,7 +231,8 @@ class CellTest(unittest.TestCase):
         self.calls = self.tmp / "calls.jsonl"
         self.calls.touch()
 
-    def run_cell(self, backend: str = BACKEND, **env: str) -> tuple[dict, dict | None]:
+    def run_cell(self, backend: str = BACKEND, cell_test: str = TEST, cell_mode: str = MODE,
+                 **env: str) -> tuple[dict, dict | None]:
         artifacts = self.tmp / "tpx" / "artifacts"
         annotations = self.tmp / "tpx" / "annotations"
         shutil.rmtree(self.tmp / "tpx", ignore_errors=True)
@@ -243,10 +244,10 @@ class CellTest(unittest.TestCase):
             "HERMIT_E2E_BUNDLE": str(self.bundle),
             "HERMIT_E2E_ROUTE": "local",
             "FAKE_CALLS": str(self.calls),
-            "FAKE_SLUG": SLUG.removesuffix("-" + BACKEND) + "-" + backend,
+            "FAKE_SLUG": "{}-{}-{}".format(cell_test.replace("/", "-"), cell_mode, backend),
         }
         base.update(env)
-        proc = subprocess.run(["bash", str(CELL_SH), TEST, MODE, backend], env=base,
+        proc = subprocess.run(["bash", str(CELL_SH), cell_test, cell_mode, backend], env=base,
                               capture_output=True, text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stderr)
         lines = [json.loads(l) for l in proc.stdout.splitlines() if l.strip()]
@@ -401,6 +402,34 @@ class CellTest(unittest.TestCase):
         done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", HERMIT_E2E_ROUTE="re")
         self.assert_error(done, "needs a local route", "'re'")
         self.assertEqual(self.calls_by("check-image"), [])
+
+    def test_local_cell_uses_the_bound_workdir_like_an_re_cell(self) -> None:
+        # Backend parity compares a local candidate (kvm) with a ptrace reference that may
+        # have run on RE, where /test cannot be mounted: both must use the bound /tmp/test.
+        done, result = self.run_cell(HERMIT_E2E_ROUTE="local")
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "local cells use the bound /tmp/test")
+        self.assertEqual(result["empty_workdir"], "")
+
+    def test_every_cell_whose_guest_asserts_the_test_workdir_gets_it(self) -> None:
+        # The guest of c-programs/environment-and-workdir asserts that it starts in a fresh
+        # tmpfs at /test (tests/c/environment_and_workdir.c, check_workdir), the only test
+        # source that requires /test rather than adapting to it. Whatever route and container
+        # defs.bzl gives each of its cells, cell.sh must hand the harness the /test workdir.
+        # 5c59c0c0 gave /test only to pinned-root cells and left the verify cell on the host.
+        for routing in ("hybrid", "local"):
+            cells = [t for t in evaluate_cells(routing).values()
+                     if t["args"][0] == "c-programs/environment-and-workdir"]
+            self.assertTrue(cells, routing)
+            for target in cells:
+                test, mode, backend = target["args"]
+                with self.subTest(routing=routing, cell=target["name"]):
+                    self.calls.write_text("")
+                    done, _ = self.run_cell(backend, test, mode, **target["env"])
+                    self.assertEqual(done["status"], "passed", done)
+                    [harness] = self.calls_by("harness")
+                    self.assertEqual(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
 
     def test_unknown_container_is_an_error(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_CONTAINER="docker")
@@ -601,7 +630,7 @@ class ContainerChoiceTest(unittest.TestCase):
             expected = target["route"] == "local" and (
                 cell["lane"] == "privileged"
                 or cell["backend"] == "dbt"
-                or (cell["test"], cell["mode"]) == ("c-programs/environment-and-workdir", "custom"))
+                or cell["test"] == "c-programs/environment-and-workdir")
             self.assertEqual(env["HERMIT_E2E_CONTAINER"], "pinned-root" if expected else "", target["name"])
             self.assertEqual(bool(env["HERMIT_E2E_CONTAINER_REASON"]), expected, target["name"])
             self.assertEqual("hermit_e2e_container_pinned_root" in labels, expected, target["name"])
@@ -618,12 +647,14 @@ class ContainerChoiceTest(unittest.TestCase):
         self.assertLessEqual(privileged, chosen)
         self.assertIn("c-programs-cpuid-probe-verify-dbt", chosen)
         self.assertIn("c-programs-environment-and-workdir-custom-ptrace", chosen)
+        self.assertIn("c-programs-environment-and-workdir-verify-ptrace", chosen)
         # A portable DBT cell stays on RE, where the workdir is not requested.
         portable_dbt = {self.slug(c) for c in self.plan if c["lane"] == "portable" and c["backend"] == "dbt"}
         self.assertTrue(portable_dbt)
         for name in portable_dbt:
             self.assertEqual(targets[name]["route"], "re", name)
-        self.assertEqual(chosen, privileged | {"c-programs-environment-and-workdir-custom-ptrace"})
+        self.assertEqual(chosen, privileged | {"c-programs-environment-and-workdir-custom-ptrace",
+                                               "c-programs-environment-and-workdir-verify-ptrace"})
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))
