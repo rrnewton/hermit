@@ -1137,6 +1137,14 @@ impl Backoff {
         Backoff { count: 0 }
     }
 
+    /// Host sleep, in microseconds, for sleeping round `round` (the first
+    /// round after the initial yields is 1). The sleep doubles from 2 us to
+    /// 8192 us over rounds 1 through 13 and is capped at 10 ms afterwards.
+    /// This is host wall time only; no guest-visible value depends on it.
+    fn sleep_micros(round: u64) -> u64 {
+        if round > 13 { 10_000 } else { 1u64 << round }
+    }
+
     async fn further(&mut self, blocking: bool) {
         self.count += 1;
         const YIELDS_FIRST: u64 = 10;
@@ -1144,15 +1152,13 @@ impl Backoff {
             if self.count <= YIELDS_FIRST {
                 std::thread::yield_now();
             } else {
-                let round = self.count - YIELDS_FIRST;
-                let micros = if round > 13 { 10_000 } else { 2 ^ round };
+                let micros = Self::sleep_micros(self.count - YIELDS_FIRST);
                 std::thread::sleep(Duration::from_micros(micros));
             }
         } else if self.count <= YIELDS_FIRST {
             tokio::task::yield_now().await;
         } else {
-            let round = self.count - YIELDS_FIRST;
-            let micros = if round > 13 { 10_000 } else { 2 ^ round };
+            let micros = Self::sleep_micros(self.count - YIELDS_FIRST);
             tokio::time::sleep(Duration::from_micros(micros)).await;
         }
     }
@@ -5862,6 +5868,18 @@ mod test {
     use crate::tool_local::RobustListExit;
     use crate::tool_local::RobustListWake;
     use crate::tool_local::ThreadState;
+
+    #[test]
+    fn backoff_sleep_doubles_then_caps() {
+        let rounds: Vec<u64> = (1..=15).map(Backoff::sleep_micros).collect();
+        assert_eq!(
+            rounds,
+            [
+                2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 10_000, 10_000
+            ]
+        );
+        assert_eq!(Backoff::sleep_micros(u64::MAX), 10_000);
+    }
 
     #[test]
     fn every_scheduler_commit_shape_uses_the_same_typed_record() {
