@@ -1144,15 +1144,13 @@ impl Backoff {
             if self.count <= YIELDS_FIRST {
                 std::thread::yield_now();
             } else {
-                let round = self.count - YIELDS_FIRST;
-                let micros = if round > 13 { 10_000 } else { 2 ^ round };
+                let micros = backoff_sleep_micros(self.count - YIELDS_FIRST);
                 std::thread::sleep(Duration::from_micros(micros));
             }
         } else if self.count <= YIELDS_FIRST {
             tokio::task::yield_now().await;
         } else {
-            let round = self.count - YIELDS_FIRST;
-            let micros = if round > 13 { 10_000 } else { 2 ^ round };
+            let micros = backoff_sleep_micros(self.count - YIELDS_FIRST);
             tokio::time::sleep(Duration::from_micros(micros)).await;
         }
     }
@@ -1160,6 +1158,12 @@ impl Backoff {
     fn reset(&mut self) {
         self.count = 0;
     }
+}
+
+/// Sleep length for backoff round `round` (1-based): 2^round microseconds, capped at
+/// 10 ms once 2^round would pass 8192 us.
+fn backoff_sleep_micros(round: u64) -> u64 {
+    if round > 13 { 10_000 } else { 1 << round }
 }
 
 impl Default for Backoff {
@@ -9629,5 +9633,16 @@ mod test {
         // note_spawn is idempotent, so a re-registration does not shift indices.
         hb.note_spawn(root);
         assert_eq!(hb.anchors_at_syscall(child, 4), vec!["b".to_string()]);
+    }
+
+    #[test]
+    fn backoff_sleep_doubles_each_round_then_caps() {
+        let got: Vec<u64> = (1..=15).map(backoff_sleep_micros).collect();
+        assert_eq!(
+            got,
+            vec![
+                2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 10_000, 10_000
+            ]
+        );
     }
 }

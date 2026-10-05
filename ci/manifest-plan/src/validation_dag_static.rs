@@ -943,7 +943,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // interface_and_route_ioctls_are_recognised and
     // host_network_state_paths_are_recognised) retain all 931 prior
     // identities (931 + 16 = 947, measured with cargo nextest list --profile ci).
-    ("test.detcore_unit", 947),
+    // scheduler::test::backoff_sleep_doubles_each_round_then_caps retains all
+    // 947 prior identities: 947 + 1 = 948, measured with cargo nextest list
+    // --profile ci -p hermit-detcore --lib --bins.
+    ("test.detcore_unit", 948),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1217,7 +1220,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.detcore_unit retain all 904 prior identities: measured 931.
     // The same sixteen https://github.com/rrnewton/hermit/pull/3778 tests
     // retain all 931: 931 + 16 = 947.
-    ("test.detcore_unit_on_host", 947),
+    // The same scheduler backoff test retains all 947: 947 + 1 = 948.
+    ("test.detcore_unit_on_host", 948),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
