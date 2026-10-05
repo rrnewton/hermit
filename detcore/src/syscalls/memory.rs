@@ -136,7 +136,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
 
         match action {
-            MadviseAction::ForwardHint if self.cfg.backend_supports_madvise => {
+            MadviseAction::ForwardHint if self.cfg.backend.supports_madvise => {
                 Ok(self.record_or_replay(guest, call).await?)
             }
             MadviseAction::ForwardHint => {
@@ -147,7 +147,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 );
                 Ok(0)
             }
-            MadviseAction::ForwardSemantic if self.cfg.backend_supports_madvise => {
+            MadviseAction::ForwardSemantic if self.cfg.backend.supports_madvise => {
                 Ok(self.record_or_replay(guest, call).await?)
             }
             MadviseAction::ForwardSemantic => {

@@ -34,7 +34,8 @@ folded into c-programs (https://github.com/rrnewton/hermit/issues/3301).
   then timed out after starting Run2. The other attempt timed out in Run1 with
   an empty log.
 - Current explanation: before Hermit `221c3d77959ebdef08f2890aaf3ce5185ea5d425`,
-  DBT alone set `backend_tracks_process_children` false. When the parent reached
+  DBT alone set `backend_tracks_process_children` (now
+  `BackendCapabilities::tracks_process_children`) false. When the parent reached
   blocking `wait4` before the child exit was published, Detcore used the generic
   nonblocking retry path and recorded a host-dependent number of
   scheduler-visible polling turns. The landed repair removes that record

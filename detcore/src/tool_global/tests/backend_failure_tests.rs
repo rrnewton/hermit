@@ -534,10 +534,12 @@ async fn ordinary_unknown_started_owner_is_not_acknowledged_as_unstarted() {
 async fn dbt_missing_physical_id_start_preserves_tombstone_deregistration_accounting() {
     let config = Config {
         sequentialize_threads: true,
-        cancel_killed_thread_rpcs: true,
-        backend_requires_thread_directed_process_signals: true,
         ..Config::default()
-    };
+    }
+    .with_backend(|backend| {
+        backend.needs_killed_thread_rpc_cancellation = true;
+        backend.requires_thread_directed_process_signals = true;
+    });
     let state = GlobalState::initialize(&config, false);
     let tid = DetTid::from_raw(19);
     let process = DetPid::from_raw(17);

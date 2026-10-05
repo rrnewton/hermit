@@ -192,10 +192,16 @@ fn task(pid: i32, tid: i32) -> SignalTaskIdentity {
 }
 fn fixture() -> (Scheduler, Arc<Backend>) {
     let mut s = Scheduler::new(&Config {
-        backend_is_kvm: true,
-        kvm_shared_dequeue_timers: true,
-        cancel_killed_thread_rpcs: true,
-        ..Config::default()
+        shared_dequeue_timers: true,
+        ..Config::default().with_backend(|backend| {
+            // The five behaviours the old `backend_is_kvm` identity flag selected.
+            backend.provides_process_signal_control = true;
+            backend.emulates_child_waits = true;
+            backend.refuses_nonleader_exec_with_enosys = true;
+            backend.failed_gettimeofday_may_store_host_time = false;
+            backend.user_address_limit = Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
+            backend.needs_killed_thread_rpc_cancellation = true;
+        })
     });
     let backend = Arc::new(Backend::default());
     s.install_signal_control(Some(BackendSignalControl {
@@ -2313,7 +2319,7 @@ fn timed_maintenance_preserves_reference_selection_and_clock() {
 
     let observe = |controlled| {
         let (mut s, backend) = fixture();
-        s.kvm_shared_dequeue_timers = controlled;
+        s.shared_dequeue_timers = controlled;
         let mut expected_time = GlobalTime::new(&Config::default());
         let start = expected_time.as_nanos();
         let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));

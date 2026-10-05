@@ -693,7 +693,24 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // network_trace::tests::traceable_peer_names_one_host_including_ipv4_mapped_addresses
     // and fd::tests::open_file_ids_display_their_kind_sequence_and_creator
     // (923 + 10 = 933, measured with cargo nextest list --profile ci).
-    ("test.regular_crates", 933),
+    // Fourteen backend-capability controls (detcore-dbt's
+    // tests::dbt_execution_model_reads_the_dbt_backend_capabilities,
+    // tests::a_dbt_run_without_a_cli_configuration_keeps_its_previous_backend_facts,
+    // tests::the_cli_configuration_round_trips_through_its_environment_encoding
+    // and tests::a_cli_configuration_keeps_the_backend_facts_it_carries;
+    // detcore-model's
+    // config::tests::a_config_without_backend_capabilities_deserializes_as_ptrace,
+    // config::tests::config_fingerprint_encodes_the_backend_capabilities_optional_field,
+    // config::tests::legacy_backend_json_round_trips_every_backend_capabilities_constant,
+    // config::tests::legacy_backend_keys_decode_as_the_fields_they_were,
+    // config::tests::a_legacy_backend_key_of_the_wrong_type_fails_the_parse,
+    // config::tests::legacy_positions_are_the_encoded_key_order,
+    // config::tests::a_legacy_positional_array_reads_as_the_object_it_lists,
+    // config::tests::a_malformed_legacy_positional_array_fails_the_parse,
+    // config::tests::a_legacy_configuration_decodes_whatever_the_ambient_hermit_settings
+    // and config::tests::keys_the_legacy_form_did_not_name_are_ignored)
+    // retain all 933 prior identities: 933 + 14 = 947.
+    ("test.regular_crates", 947),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -843,7 +860,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // this is 822 - 8 = 814.
     // Both together: 822 + 6 (https://github.com/rrnewton/hermit/pull/3778)
     // - 8 (https://github.com/rrnewton/hermit/issues/3520) = 820.
-    ("test.hermit_unit", 820),
+    // Four backend-capability controls (tests::backend_capabilities_match_the_golden_table,
+    // tests::backend_capabilities_are_the_ones_each_backend_reports,
+    // tests::dbt_detconfig_bytes_are_unchanged_by_backend_capabilities and
+    // tests::every_backend_encodes_its_previous_backend_keys) retain all 820
+    // prior identities: 820 + 4 = 824.
+    ("test.hermit_unit", 824),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -942,10 +964,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // interface_and_route_ioctls_are_recognised and
     // host_network_state_paths_are_recognised) retain all 931 prior
     // identities (931 + 16 = 947, measured with cargo nextest list --profile ci).
-    // scheduler::test::backoff_sleep_doubles_each_round_then_caps retains all
-    // 947 prior identities: 947 + 1 = 948, measured with cargo nextest list
+    // scheduler::test::backoff_sleep_doubles_each_round_then_caps and
+    // iovecs::tests::backend_user_address_limit_selects_the_policy retain all
+    // 947 prior identities: 947 + 2 = 949, measured with cargo nextest list
     // --profile ci -p hermit-detcore --lib --bins.
-    ("test.detcore_unit", 948),
+    ("test.detcore_unit", 949),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1213,8 +1236,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // test.detcore_unit retain all 904 prior identities: measured 931.
     // The same sixteen https://github.com/rrnewton/hermit/pull/3778 tests
     // retain all 931: 931 + 16 = 947.
-    // The same scheduler backoff test retains all 947: 947 + 1 = 948.
-    ("test.detcore_unit_on_host", 948),
+    // The same scheduler backoff and backend-user-address-limit tests retain
+    // all 947: 947 + 2 = 949.
+    ("test.detcore_unit_on_host", 949),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1254,7 +1278,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the same six https://github.com/rrnewton/hermit/pull/3778 tests, and
     // drops the same eight https://github.com/rrnewton/hermit/issues/3520
     // tests: 822 + 6 - 8 = 820.
-    ("test.hermit_unit_on_host", 820),
+    // The host twin selects the same four backend-capability controls:
+    // 820 + 4 = 824.
+    ("test.hermit_unit_on_host", 824),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -1305,8 +1331,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two timed-out-match stress_series tests listed there: 905 + 2 = 907.
     // The 16 https://github.com/rrnewton/hermit/pull/3777 tests listed there
     // retain all 907, and the ten https://github.com/rrnewton/hermit/pull/3778
-    // tests listed there retain all 923: 923 + 10 = 933.
-    ("test.regular_crates_on_host", 933),
+    // tests listed there retain all 923: 923 + 10 = 933. The fourteen
+    // backend-capability controls listed there retain all 933: 933 + 14 = 947.
+    ("test.regular_crates_on_host", 947),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.

@@ -238,7 +238,7 @@ impl Scheduler {
         &mut self,
         control: Option<BackendSignalControl>,
     ) -> Result<BackendSignalControlMode, reverie::Error> {
-        if !self.kvm_shared_dequeue_timers {
+        if !self.shared_dequeue_timers {
             return Ok(BackendSignalControlMode::Unchanged);
         }
         if self.parked.control.is_some() || !self.next_turns.is_empty() {

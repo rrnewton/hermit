@@ -409,7 +409,9 @@ impl Scheduler {
                 _ => TimerFailure::Unsupported,
             },
         );
-        self.blocked.timed_waiters.remove_kvm_real_deadline(pid);
+        self.blocked
+            .timed_waiters
+            .remove_controlled_real_timer_deadline(pid);
         if let Some(wake) = self.report_backend_failure_location(super::BackendFailureLocation {
             pid: reverie::Pid::from_raw(pid.as_raw()),
             tid: tid.map(|tid| reverie::Tid::from_raw(tid.as_raw())),
@@ -557,7 +559,7 @@ impl Scheduler {
         if let Some(deadline) = next {
             self.blocked
                 .timed_waiters
-                .insert_kvm_real_deadline(deadline, pid);
+                .insert_controlled_real_timer_deadline(deadline, pid);
         }
         Ok(ack)
     }
@@ -571,20 +573,22 @@ impl Scheduler {
         interval: LogicalTime,
         signal: nix::sys::signal::Signal,
     ) -> Result<(LogicalTime, LogicalTime), TimerFailure> {
-        if !self.backend_is_kvm {
+        if !self.backend.provides_process_signal_control {
             return Ok(self.register_alarm(pid, tid, now, duration, interval, signal));
         }
-        if !self.kvm_shared_dequeue_timers || signal != nix::sys::signal::Signal::SIGALRM {
+        if !self.shared_dequeue_timers || signal != nix::sys::signal::Signal::SIGALRM {
             return Err(TimerFailure::Unsupported);
         }
         let (old, next) = self
             .real_timers
             .replace(pid, tid, now, duration, interval)?;
-        self.blocked.timed_waiters.remove_kvm_real_deadline(pid);
+        self.blocked
+            .timed_waiters
+            .remove_controlled_real_timer_deadline(pid);
         if let Some(deadline) = next {
             self.blocked
                 .timed_waiters
-                .insert_kvm_real_deadline(deadline, pid);
+                .insert_controlled_real_timer_deadline(deadline, pid);
         }
         Ok((old.remaining, old.interval))
     }
@@ -594,7 +598,7 @@ impl Scheduler {
         pid: DetPid,
         now: LogicalTime,
     ) -> Result<super::real_timer::ItimerSnapshot, TimerFailure> {
-        if self.backend_is_kvm {
+        if self.backend.provides_process_signal_control {
             return self.real_timers.snapshot(pid, now);
         }
         Ok(match self.blocked.timed_waiters.alarm_state(pid) {
@@ -634,7 +638,7 @@ impl Scheduler {
         signal: nix::sys::signal::Signal,
         normal_due: bool,
     ) {
-        if self.kvm_shared_dequeue_timers && matches!(id, SignalTimerId::Alarm(_)) {
+        if self.shared_dequeue_timers && matches!(id, SignalTimerId::Alarm(_)) {
             if let Err(failure) = self.publish_real_expiry(id.process(), deadline) {
                 self.fail_parked(tid, failure);
             }

@@ -51,6 +51,7 @@ use rand::SeedableRng;
 use rand::seq::IndexedRandom;
 use rand::seq::SliceRandom;
 use rand_pcg::Pcg64Mcg;
+use reverie::BackendCapabilities;
 use reverie::Errno;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
@@ -79,11 +80,11 @@ use crate::ivar::Ivar;
 use crate::preemptions::PreemptionWriter;
 use crate::preemptions::read_trace;
 use crate::resources::ExternalOpId;
+use crate::resources::HOST_TIMED_INTERNAL_PIPE_IO_FYI;
+use crate::resources::LOOPBACK_POLL_YIELD_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
-use crate::resources::SABRE_INTERNAL_PIPE_IO_FYI;
-use crate::resources::SABRE_LOOPBACK_POLL_YIELD_FYI;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
@@ -650,22 +651,14 @@ pub struct Scheduler {
     backend_failure_sender: Option<oneshot::Sender<()>>,
     backend_failure_wake: Shared<oneshot::Receiver<()>>,
 
-    /// Whether exit-group teardown must explicitly cancel parked backend RPCs.
-    cancel_killed_thread_rpcs: bool,
-
-    /// Whether scheduler identities must be resolved through a host thread
-    /// pidfd before sending process-directed signals.
-    backend_requires_thread_directed_process_signals: bool,
-    backend_is_kvm: bool,
+    /// How the backend runs the guest. See [`Config::backend`].
+    backend: BackendCapabilities,
     #[cfg(test)]
     host_signal_attempts: u64,
-    kvm_shared_dequeue_timers: bool,
+    /// See [`Config::shared_dequeue_timers`].
+    shared_dequeue_timers: bool,
     pub(crate) real_timers: real_timer::RealTimers,
     parked: parked::ParkedRequests,
-
-    /// Whether this backend can preserve Linux signal semantics when a
-    /// scheduler-managed pipe write is woken by a cross-task signal.
-    backend_supports_parked_write_signal_interruption: bool,
 
     /// Raw TIDs removed by logical teardown. Tombstones are permanent for the life of this
     /// scheduler: accepting Linux TID reuse would let delayed backend RPCs bind to a new thread.
@@ -688,9 +681,6 @@ pub struct Scheduler {
     /// Logical exit-group teardown and physical exit cleanup are distinct events.
     deregistration_accounted: BTreeSet<DetTid>,
 
-    /// Whether the backend will report final physical process exits after logical cleanup.
-    backend_reports_physical_process_exits: bool,
-
     /// SaBRe process leaders whose tool exit hook ran before the ptrace supervisor observed the
     /// final kernel exit status. While the run queue is empty, these prevent virtual timers from
     /// overtaking a child exit that is not physically waitable yet.
@@ -701,12 +691,6 @@ pub struct Scheduler {
 
     /// Reporting-backend children whose final physical exit has been observed.
     completed_physical_process_exits: BTreeSet<DetPid>,
-
-    /// Whether the backend defers spawning a vfork child until after the parent posts its
-    /// continuation, so an unfulfilled vfork barrier at parent continuation means the child is
-    /// still on its way rather than that the clone failed. See
-    /// [`Config::backend_defers_vfork_child_registration`].
-    backend_defers_vfork_child_registration: bool,
 
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
@@ -1430,7 +1414,7 @@ pub async fn do_a_turn_blocking(
     global_time: Arc<Mutex<GlobalTime>>,
     last_turn: &Result<Resources, SkipTurn>,
 ) -> Result<Resources, SkipTurn> {
-    let controlled = sched.lock().unwrap().kvm_shared_dequeue_timers;
+    let controlled = sched.lock().unwrap().shared_dequeue_timers;
     if !controlled {
         return do_ordinary_turn_blocking(sched, global_time, last_turn).await;
     }
@@ -1776,26 +1760,19 @@ impl Scheduler {
             backend_failure: None,
             backend_failure_sender: Some(backend_failure_sender),
             backend_failure_wake: backend_failure_wake.shared(),
-            cancel_killed_thread_rpcs: cfg.cancel_killed_thread_rpcs,
-            backend_is_kvm: cfg.backend_is_kvm,
+            backend: cfg.backend,
             #[cfg(test)]
             host_signal_attempts: 0,
-            kvm_shared_dequeue_timers: cfg.kvm_shared_dequeue_timers,
+            shared_dequeue_timers: cfg.shared_dequeue_timers,
             real_timers: Default::default(),
             parked: Default::default(),
-            backend_requires_thread_directed_process_signals: cfg
-                .backend_requires_thread_directed_process_signals,
-            backend_supports_parked_write_signal_interruption: cfg
-                .backend_supports_parked_write_signal_interruption,
             logically_killed_threads: Default::default(),
             exec_incarnations: Default::default(),
             retired_transferred_exec_callers: Default::default(),
             exec_teardowns: Default::default(),
             deregistration_accounted: Default::default(),
-            backend_reports_physical_process_exits: cfg.backend_reports_physical_process_exits,
             pending_physical_process_exits: Default::default(),
             logically_exited_processes: Default::default(),
-            backend_defers_vfork_child_registration: cfg.backend_defers_vfork_child_registration,
             completed_physical_process_exits: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
@@ -1883,7 +1860,7 @@ impl Scheduler {
     }
 
     pub(crate) fn note_process_sigkill(&mut self, dettid: DetTid, detpid: DetPid) {
-        if !self.backend_requires_thread_directed_process_signals {
+        if !self.backend.requires_thread_directed_process_signals {
             return;
         }
         let Some((mm, _, _, _)) = self.physical_thread_pidfds.get(&dettid) else {
@@ -2291,7 +2268,7 @@ impl Scheduler {
     /// This is IDEMPOTENT, and it may indeed be called twice, both to proactively remove a thread,
     /// and then reactively in response to an exit hook.
     pub fn logically_kill_thread(&mut self, dtid: &DetTid, detpid: &DetPid, mm: MmId) {
-        if self.cancel_killed_thread_rpcs {
+        if self.backend.needs_killed_thread_rpc_cancellation {
             self.logically_killed_threads.insert(*dtid);
         }
         // Remove from the runnable queue at the next deterministic drain. This
@@ -2326,7 +2303,10 @@ impl Scheduler {
                 // down the exit scenarios and ensure that they happen when the guest is running and
                 // has NOT filled its request to the scheduler yet.
                 let request_was_pending = nextturn.req.try_put(Err(ThreadExited)).is_some();
-                if request_was_pending && self.cancel_killed_thread_rpcs && !self.backend_failed() {
+                if request_was_pending
+                    && self.backend.needs_killed_thread_rpc_cancellation
+                    && !self.backend_failed()
+                {
                     // AUTONOMOUS-BOT-IMPLEMENTED
                     // TODO-HUMAN-REVIEW(PR-845): Review killed-thread RPC cancellation.
                     nextturn.resp.try_put(SchedResponse::Signaled(None));
@@ -2556,7 +2536,8 @@ impl Scheduler {
 
     // TODO-HUMAN-REVIEW(PR-1023): Review fail-closed SaBRe thread tombstones.
     pub(crate) fn thread_is_logically_killed(&self, dettid: DetTid) -> bool {
-        self.cancel_killed_thread_rpcs && self.logically_killed_threads.contains(&dettid)
+        self.backend.needs_killed_thread_rpc_cancellation
+            && self.logically_killed_threads.contains(&dettid)
     }
 
     pub(crate) fn rpc_incarnation_matches(&self, dettid: DetTid, mm: MmId) -> bool {
@@ -2648,7 +2629,7 @@ impl Scheduler {
         // Remember an owner accounted before a later peer failure as well.
         // Ordinary non-cancelling behavior still accepts its prior callbacks.
         let first = self.deregistration_accounted.insert(dettid);
-        (!self.cancel_killed_thread_rpcs
+        (!self.backend.needs_killed_thread_rpc_cancellation
             && !self.backend_failed()
             && !self.transferred_exec_syscall_offsets.contains_key(&dettid))
             || first
@@ -2657,7 +2638,7 @@ impl Scheduler {
     /// Install a barrier between SaBRe's logical process-leader exit hook and the final ptrace
     /// wait status. Other backends retain their existing lifecycle behavior.
     pub(crate) fn begin_physical_process_exit(&mut self, detpid: DetPid) -> bool {
-        if self.backend_reports_physical_process_exits {
+        if self.backend.reports_physical_process_exits {
             self.completed_physical_process_exits.remove(&detpid);
             let inserted = self.pending_physical_process_exits.insert(detpid);
             if inserted {
@@ -2996,13 +2977,13 @@ impl Scheduler {
     /// `clone(2)` until the child execs or exits, so a registered child (barrier `Some`) is always
     /// present by the time the parent posts its continuation; an unfulfilled barrier (`None`) at
     /// that point therefore means the clone failed and the barrier must be dropped. On a backend
-    /// that defers the child spawn (see `backend_defers_vfork_child_registration`, e.g. KVM) the
+    /// that defers the child spawn (see `defers_vfork_child_registration`, e.g. KVM) the
     /// child registers only *after* the parent posts its continuation, so an unfulfilled barrier at
     /// parent continuation means the child is still on its way and the barrier must be kept.
     fn step2a_wait_for_vfork_barrier(&mut self) -> Result<(), SkipTurn> {
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-1152): Review deferred vfork child registration.
-        let defers_registration = self.backend_defers_vfork_child_registration;
+        let defers_registration = self.backend.defers_vfork_child_registration;
         let completed_parents: Vec<_> = self
             .vfork_barriers
             .iter()
@@ -3181,7 +3162,7 @@ impl Scheduler {
             return ExactChildWaitState::Unknown;
         }
 
-        if !self.backend_reports_physical_process_exits {
+        if !self.backend.reports_physical_process_exits {
             ExactChildWaitState::LogicallyExited
         } else if self.pending_physical_process_exits.contains(&child) {
             ExactChildWaitState::PhysicalExitPending
@@ -3324,7 +3305,7 @@ impl Scheduler {
             } else {
                 Ok(())
             }
-        } else if self.backend_requires_thread_directed_process_signals {
+        } else if self.backend.requires_thread_directed_process_signals {
             self.terminal_deadlock.get_or_insert_with(|| {
                 format!(
                     "HERMIT_DEADLOCK: scheduler cannot deliver signal {} to dettid {} without its host thread pidfd",
@@ -3387,7 +3368,7 @@ impl Scheduler {
         let has_external_blocker = self.blocked.external_io_blockers.contains_key(&dettid)
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
         let await_external_continuation =
-            self.backend_reports_physical_process_exits && has_external_blocker;
+            self.backend.signal_interrupts_external_syscalls && has_external_blocker;
         if cfg!(debug_assertions) && !await_external_continuation {
             let nxtturn = self
                 .next_turns
@@ -3487,7 +3468,7 @@ impl Scheduler {
     }
 
     fn restartable_internal_io_signals(&self, dettid: DetTid) -> Option<Vec<SigWrapper>> {
-        if !self.backend_supports_parked_write_signal_interruption {
+        if !self.backend.supports_parked_write_signal_interruption {
             return None;
         }
         self.next_turns
@@ -4752,17 +4733,19 @@ impl Scheduler {
         Self::is_x_turn(rsrcs, &ResourceID::InternalIOPolling)
     }
 
-    /// SaBRe discovers an inherited stdio pipe as a device resource before the inner
+    /// A backend whose internal pipe turns are host-timed (today SaBRe) discovers an
+    /// inherited stdio pipe as a device resource before the inner
     /// `InternalIOPolling` request. Both turns belong to one host-timing-sensitive pipe
     /// operation, so their logical-time logging must use the same retry normalization.
-    fn is_sabre_internal_pipe_io_turn(&self, rsrcs: &Resources) -> bool {
-        rsrcs.fyi == SABRE_INTERNAL_PIPE_IO_FYI
+    fn is_host_timed_internal_pipe_io_turn(&self, rsrcs: &Resources) -> bool {
+        rsrcs.fyi == HOST_TIMED_INTERNAL_PIPE_IO_FYI
     }
 
-    /// A strong yield issued by a SaBRe task before a zero-timeout poll while it owns a
+    /// A strong yield issued, on a backend whose loopback pollers yield to their peers
+    /// (today SaBRe), before a zero-timeout poll while the task owns a
     /// loopback connection. Its count is kernel-readiness timing, not guest-visible progress.
-    fn is_sabre_loopback_poll_yield_turn(&self, rsrcs: &Resources) -> bool {
-        rsrcs.fyi == SABRE_LOOPBACK_POLL_YIELD_FYI
+    fn is_loopback_poll_yield_turn(&self, rsrcs: &Resources) -> bool {
+        rsrcs.fyi == LOOPBACK_POLL_YIELD_FYI
     }
 
     fn is_x_turn(rsrcs: &Resources, x: &ResourceID) -> bool {
@@ -4800,8 +4783,8 @@ impl Scheduler {
             .as_ref()
             .map(|resources| {
                 Self::is_polling_turn(resources)
-                    || self.is_sabre_internal_pipe_io_turn(resources)
-                    || self.is_sabre_loopback_poll_yield_turn(resources)
+                    || self.is_host_timed_internal_pipe_io_turn(resources)
+                    || self.is_loopback_poll_yield_turn(resources)
             })
             .unwrap_or(false);
 
@@ -4922,9 +4905,9 @@ impl Scheduler {
                 }
                 // N.B.: these prints themselves should be deterministic between
                 // runs.  They are part of the "detlog".
-                let normalization_marker = if self.is_sabre_internal_pipe_io_turn(rsrcs) {
+                let normalization_marker = if self.is_host_timed_internal_pipe_io_turn(rsrcs) {
                     " [sabre-internal-pipe-io]"
-                } else if self.is_sabre_loopback_poll_yield_turn(rsrcs) {
+                } else if self.is_loopback_poll_yield_turn(rsrcs) {
                     " [sabre-loopback-poll-zero-timeout]"
                 } else {
                     ""
@@ -4932,8 +4915,8 @@ impl Scheduler {
                 if enabled!(Level::INFO) {
                     let internal_io_poll =
                         rsrcs.resources.contains_key(&ResourceID::InternalIOPolling)
-                            || self.is_sabre_internal_pipe_io_turn(rsrcs)
-                            || self.is_sabre_loopback_poll_yield_turn(rsrcs);
+                            || self.is_host_timed_internal_pipe_io_turn(rsrcs)
+                            || self.is_loopback_poll_yield_turn(rsrcs);
                     let runtime_maps_read = rsrcs.resources.keys().any(|resource| {
                         matches!(
                             resource,
@@ -6048,10 +6031,9 @@ mod test {
 
     #[test]
     fn required_physical_thread_pidfd_does_not_fall_back_to_virtual_tid() {
-        let config = Config {
-            backend_requires_thread_directed_process_signals: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.requires_thread_directed_process_signals = true;
+        });
         let mut scheduler = Scheduler::new(&config);
 
         scheduler.signal_guest(DetTid::from_raw(37), Signal::SIGUSR1);
@@ -6064,10 +6046,9 @@ mod test {
 
     #[test]
     fn dbt_process_sigkill_completes_registered_child_lifecycle() {
-        let config = Config {
-            backend_requires_thread_directed_process_signals: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.requires_thread_directed_process_signals = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let parent = DetTid::from_raw(37);
         let child = DetTid::from_raw(38);
@@ -6343,10 +6324,9 @@ mod test {
     #[test]
     fn transferred_exec_reconnect_retires_former_rpc_identity_without_cancellation() {
         for transfer in [true, false] {
-            let config = Config {
-                cancel_killed_thread_rpcs: false,
-                ..Config::default()
-            };
+            let config = Config::default().with_backend(|backend| {
+                backend.needs_killed_thread_rpc_cancellation = false;
+            });
             let mut sched = Scheduler::new(&config);
             let leader = DetTid::from_raw(17);
             let caller = DetTid::from_raw(18);
@@ -6379,10 +6359,9 @@ mod test {
 
     #[test]
     fn transferred_exec_reconnect_accumulates_consumed_leader_syscalls_once() {
-        let config = Config {
-            cancel_killed_thread_rpcs: false,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = false;
+        });
         let mut sched = Scheduler::new(&config);
         let leader = DetTid::from_raw(17);
         let caller = DetTid::from_raw(18);
@@ -6421,10 +6400,9 @@ mod test {
     #[test]
     fn transferred_exec_syscall_accounting_leaves_ordinary_and_reload_behavior_unchanged() {
         for reload in [false, true] {
-            let config = Config {
-                cancel_killed_thread_rpcs: false,
-                ..Config::default()
-            };
+            let config = Config::default().with_backend(|backend| {
+                backend.needs_killed_thread_rpc_cancellation = false;
+            });
             let mut sched = Scheduler::new(&config);
             let leader = DetTid::from_raw(17);
             let caller = DetTid::from_raw(18);
@@ -6900,11 +6878,10 @@ mod test {
     /// without cancelling the latter.
     #[test]
     fn nonleader_exec_removal_preserves_replacement_admission() {
-        let config = Config {
-            cancel_killed_thread_rpcs: true,
-            backend_requires_thread_directed_process_signals: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+            backend.requires_thread_directed_process_signals = true;
+        });
         let mut sched = Scheduler::new(&config);
         let leader = DetTid::from_raw(17);
         let caller = DetTid::from_raw(18);
@@ -6968,10 +6945,9 @@ mod test {
 
     #[test]
     fn exec_replacement_killed_before_drain_is_not_resurrected() {
-        let config = Config {
-            cancel_killed_thread_rpcs: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let mut sched = Scheduler::new(&config);
         let leader = DetTid::from_raw(17);
         let caller = DetTid::from_raw(18);
@@ -7001,10 +6977,9 @@ mod test {
 
     #[test]
     fn exec_reconnect_only_buffers_while_tentative_selection_is_live() {
-        let config = Config {
-            cancel_killed_thread_rpcs: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let mut sched = Scheduler::new(&config);
         let anchor = DetTid::from_raw(3);
         let leader = DetTid::from_raw(17);
@@ -7064,9 +7039,11 @@ mod test {
         let config = Config {
             sched_seed: Some(0x5107),
             runs_post_fork: RunsPostFork::Random,
-            cancel_killed_thread_rpcs: true,
             ..Config::default()
-        };
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let sched = Arc::new(Mutex::new(Scheduler::new(&config)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let leader = DetTid::from_raw(17);
@@ -7562,10 +7539,9 @@ mod test {
         // On a backend that defers the child spawn (e.g. KVM), the parent posts its continuation
         // BEFORE the child registers. An unfulfilled barrier at continuation must be kept, not
         // torn down as a failed clone; otherwise the late child panics on registration.
-        let config = Config {
-            backend_defers_vfork_child_registration: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.defers_vfork_child_registration = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let parent = DetTid::from_raw(3);
         let child = DetTid::from_raw(5);
@@ -7599,10 +7575,9 @@ mod test {
     // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
     #[test]
     fn vfork_registration_barrier_releases_deferred_failed_clone() {
-        let config = Config {
-            backend_defers_vfork_child_registration: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.defers_vfork_child_registration = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let parent = DetTid::from_raw(3);
         let op_id = ExternalOpId::new(parent, 7);
@@ -7869,10 +7844,9 @@ mod test {
 
     #[test]
     fn unsupported_backend_does_not_rewrite_a_marked_internal_poller() {
-        let config = Config {
-            backend_supports_parked_write_signal_interruption: false,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.supports_parked_write_signal_interruption = false;
+        });
         let mut scheduler = Scheduler::new(&config);
         let target = DetTid::from_raw(100);
         register_known_thread(&mut scheduler, target);
@@ -8197,10 +8171,9 @@ mod test {
 
     #[test]
     fn logically_kill_thread_unblocks_pending_rpc() {
-        let config = Config {
-            cancel_killed_thread_rpcs: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let dettid = DetTid::from_raw(100);
         let detpid = DetPid::from_raw(100);
@@ -8227,10 +8200,9 @@ mod test {
 
     #[test]
     fn logically_kill_running_thread_does_not_preload_response() {
-        let config = Config {
-            cancel_killed_thread_rpcs: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let dettid = DetTid::from_raw(100);
         let detpid = DetPid::from_raw(100);
@@ -8417,10 +8389,10 @@ mod test {
 
     #[test]
     fn physical_exit_barrier_precedes_empty_queue_timer_fast_forward() {
-        let config = Config {
-            backend_reports_physical_process_exits: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.reports_physical_process_exits = true;
+            backend.signal_interrupts_external_syscalls = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let initial_time = global_time.lock().unwrap().as_nanos();
@@ -8467,10 +8439,10 @@ mod test {
     }
 
     fn physical_wait_handoff_queue(completion_before_wait: bool) -> Vec<DetTid> {
-        let config = Config {
-            backend_reports_physical_process_exits: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.reports_physical_process_exits = true;
+            backend.signal_interrupts_external_syscalls = true;
+        });
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let mut scheduler = Scheduler::new(&config);
         let waiter = DetTid::from_raw(100);
@@ -8660,10 +8632,9 @@ mod test {
 
     #[test]
     fn physical_exit_barrier_is_disabled_for_other_backends() {
-        let config = Config {
-            cancel_killed_thread_rpcs: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let process = DetPid::from_raw(100);
 
@@ -9118,10 +9089,10 @@ mod test {
 
     #[test]
     fn physical_exit_barrier_begins_when_last_process_thread_is_logically_dead() {
-        let config = Config {
-            backend_reports_physical_process_exits: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.reports_physical_process_exits = true;
+            backend.signal_interrupts_external_syscalls = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let leader = DetTid::from_raw(100);
         let worker = DetTid::from_raw(101);
@@ -9152,10 +9123,10 @@ mod test {
 
     #[test]
     fn final_root_and_orphan_exits_release_exact_pid_barriers() {
-        let config = Config {
-            backend_reports_physical_process_exits: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.reports_physical_process_exits = true;
+            backend.signal_interrupts_external_syscalls = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let root = DetPid::from_raw(100);
         let child = DetPid::from_raw(200);
@@ -9194,10 +9165,10 @@ mod test {
 
     #[test]
     fn final_child_exit_does_not_block_parent_timer() {
-        let config = Config {
-            backend_reports_physical_process_exits: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.reports_physical_process_exits = true;
+            backend.signal_interrupts_external_syscalls = true;
+        });
         let mut scheduler = Scheduler::new(&config);
         let global_time = Arc::new(Mutex::new(GlobalTime::new(&config)));
         let initial_time = global_time.lock().unwrap().as_nanos();
@@ -9458,10 +9429,10 @@ mod test {
         ) {
             return;
         }
-        let config = Config {
-            backend_reports_physical_process_exits: true,
-            ..Config::default()
-        };
+        let config = Config::default().with_backend(|backend| {
+            backend.reports_physical_process_exits = true;
+            backend.signal_interrupts_external_syscalls = true;
+        });
         let root = DetTid::from_raw(3);
         let mut runs = Vec::new();
         for landing in SHUTDOWN_LANDINGS {
@@ -9505,7 +9476,7 @@ mod test {
             return;
         }
         let config = Config::default();
-        assert!(!config.backend_reports_physical_process_exits);
+        assert!(!config.backend.reports_physical_process_exits);
         let leader = DetTid::from_raw(3);
         let worker = DetTid::from_raw(4);
         // With no physical-exit barrier the loop exits at the top of pass 2,

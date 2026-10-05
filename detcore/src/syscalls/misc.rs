@@ -287,7 +287,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::ArchPrctl,
     ) -> Result<i64, Error> {
         let cpuid_uses_backend_policy =
-            self.cfg.virtualize_cpuid && self.cfg.cpuid_virtualized_by_backend;
+            self.cfg.virtualize_cpuid && self.cfg.backend.virtualizes_cpuid;
         let cpuid_uses_faulting = self.cfg.virtualize_cpuid && guest.has_cpuid_interception();
         match call.cmd() {
             ArchPrctlCmd::ARCH_SET_FS(_)
@@ -392,7 +392,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             libc::PR_GET_TIMERSLACK => Ok(guest.thread_state().timer_slack_ns as i64),
             option
-                if guest.config().backend_virtualizes_capability_prctls
+                if guest.config().backend.virtualizes_capability_prctls
                     && is_backend_virtualized_capability_prctl(option) =>
             {
                 self.passthrough(guest, call.into()).await
