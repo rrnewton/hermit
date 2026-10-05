@@ -941,8 +941,23 @@ fi
 # clamp. These two local samples do not replace the original n=3 hosted
 # calibration or satisfy the >=5-sample replacement rule, and they are not a
 # Hermit guest or replay result; fresh validation is required.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c8181d43a59a6d1ac602f2fad7615189f4996b41 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c8181d43a59a6d1ac602f2fad7615189f4996b41 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 7da1155a301436b6c221b4b2bf99b050f98dd042 (2026-10-04): from c8181d43a59a6d1ac602f2fad7615189f4996b41; all seven
+# recorded DynamoRIO build inputs are byte-identical. The 9-commit range (the
+# canonical vDSO and auxv for a freshly exec'd image,
+# https://github.com/rrnewton/reverie/issues/947, and guest-write and
+# register-reply fixes) touches no DBT build input.
+# Source identity carries the existing calibration; no new timing sample is claimed.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: e05db6238bf07c96d8a850c5635a8c48590f20b7
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
+# 1050 effective-job-seconds budget are unchanged.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 7da1155a301436b6c221b4b2bf99b050f98dd042 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 7da1155a301436b6c221b4b2bf99b050f98dd042 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
