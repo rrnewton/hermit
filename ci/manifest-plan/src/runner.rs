@@ -11183,22 +11183,39 @@ mod tests {
         let mut first_missing = None;
         let mut valid_samples = 0;
         let mut missing_after_valid = 0;
+        // The one valid sample comes one poll interval before the original grace
+        // ends, and it is synthetic, so the sequence does not depend on host
+        // load. A failed poll before it is less than the grace after the first
+        // failure, and any later poll is itself the valid one, so the original
+        // grace cannot stop the command first. The grace then restarts at the next
+        // failure, about one grace after the first one, and `done` is written 200 ms
+        // past the original grace, which leaves about 0.8 s for the child to exit
+        // and be reaped before the restarted grace ends.
+        //
+        // This test used to take the valid sample at 500 ms from a real host-wide
+        // /proc census (`ProcessGroupCpu::seconds`), which under load can be slow
+        // or refused (https://github.com/rrnewton/hermit/issues/3377), and it left
+        // the child about 0.4 s to exit (measured: done written at 1.32 s, the
+        // restarted grace due at 1.72 s). It failed under host load 155-173.
         let output = monitor_process(
             child,
             ProcessLimits {
+                // A hang guard only: the run ends about 1.4 s in (measured 1.34 to
+                // 1.37 s with the earlier timeline, free or pinned to one CPU).
                 deadline: Instant::now() + Duration::from_secs(5),
                 cpu_budget_usec: Some(5_000_000),
                 cpu_poll_interval: CELL_CPU_POLL_INTERVAL,
             },
             started,
             &mut observation,
-            |pid| dagrun::proccpu::ProcessGroupCpu::new(pid).map_err(|error| error.to_string()),
-            |reader| {
+            |_| Ok(()),
+            |_| {
                 let first = *first_missing.get_or_insert_with(Instant::now);
-                if valid_samples == 0 && first.elapsed() >= Duration::from_millis(500) {
-                    let seconds = reader.seconds().map_err(|error| error.to_string())?;
+                if valid_samples == 0
+                    && first.elapsed() >= CELL_CPU_ACCOUNTING_GRACE - CELL_CPU_POLL_INTERVAL
+                {
                     valid_samples += 1;
-                    return Ok(seconds);
+                    return Ok(0.0);
                 }
                 if valid_samples > 0 {
                     missing_after_valid += 1;
