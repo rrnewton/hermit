@@ -1213,10 +1213,7 @@ fn logical_line(lines: &[&str], starts: impl Fn(&str) -> bool) -> Option<String>
 fn variable_words(lines: &[&str], name: &str) -> Vec<String> {
     let assigns = |line: &str| {
         let mut rest = line.trim_start();
-        loop {
-            let Some((word, tail)) = rest.split_once(char::is_whitespace) else {
-                break;
-            };
+        while let Some((word, tail)) = rest.split_once(char::is_whitespace) {
             match word {
                 "override" | "export" | "private" => rest = tail.trim_start(),
                 // make also accepts the operator attached to the name, as in
