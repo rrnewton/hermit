@@ -705,6 +705,17 @@ class ParityRouteTest(unittest.TestCase):
                 if (test, "ptrace") in routes:
                     self.assertEqual(routes[(test, "ptrace")], routes[(test, "kvm")], (routing, test))
 
+    def test_every_sabre_cell_shares_its_references_route(self) -> None:
+        # Moving a reference to the kvm cell's route must not leave the test's sabre cell,
+        # compared with the same reference, on another route.
+        for routing in ("hybrid", "local"):
+            routes = self.routes(routing)
+            sabre = sorted(test for test, backend in routes if backend == "sabre")
+            self.assertGreater(len(sabre), 200, routing)
+            for test in sabre:
+                if (test, "ptrace") in routes:
+                    self.assertEqual(routes[(test, "sabre")], routes[(test, "ptrace")], (routing, test))
+
 
 if __name__ == "__main__":
     unittest.main()

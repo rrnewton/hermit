@@ -10,7 +10,8 @@ Routing (per cell, first match wins; see _route):
   local: kvm or dbt backend, privileged lane, a host-capability requirement, a `requires` tool
          RE workers lack, the LOCAL_TESTS deny-list, a test measured to fail only on RE
          (re_exclusions.json), a PMU-armed cell under -c hermit_e2e.pmu_on_re=false, or
-         the ptrace verify cell of a test with a kvm verify cell (its parity reference).
+         the ptrace or sabre verify cell of a test with a kvm verify cell (its parity
+         reference, and the other candidate compared with that reference).
   re:    everything else.
 `-c hermit_e2e.routing=local` runs every cell locally (the buck-local test mode).
 
@@ -96,6 +97,9 @@ def _route(cell, pmu_on_re, re_exclusions, kvm_verify_tests):
         # only when both ran on one route (ci/manifest-plan/src/parity.rs shares_route),
         # and a kvm cell always runs locally.
         return ("local", "parity reference of a kvm verify cell, which runs locally")
+    if cell["backend"] == "sabre" and cell["mode"] == "verify" and cell["test"] in kvm_verify_tests:
+        # The same reference is this sabre cell's; keep the pair on one route too.
+        return ("local", "shares its parity reference with a kvm verify cell, which runs locally")
     return ("re", "")
 
 def _container(cell, where):
