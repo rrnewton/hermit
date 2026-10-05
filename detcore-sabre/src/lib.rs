@@ -86,12 +86,20 @@ impl Write for RawStderr {
     }
 }
 
-fn forward_detlog(record_suffix: &str, message: std::fmt::Arguments<'_>) {
-    let mut stderr = RawStderr;
-    let _ = stderr.write_all(b"INFO detcore: DETLOG ");
-    let _ = stderr.write_fmt(message);
-    let _ = stderr.write_all(record_suffix.as_bytes());
-    let _ = stderr.write_all(b"\n");
+// The record names the module that emitted it, as the coordinator's tracing subscriber
+// would: a forwarded `detcore::tool_local` record must not read as `detcore` and differ
+// from the same record logged through tracing.
+fn forwarded_detlog_line(
+    target: &str,
+    record_suffix: &str,
+    message: std::fmt::Arguments<'_>,
+) -> Vec<u8> {
+    format!("INFO {target}: DETLOG {message}{record_suffix}\n").into_bytes()
+}
+
+// One write per record, so records forwarded from several guest threads cannot interleave.
+fn forward_detlog(target: &str, record_suffix: &str, message: std::fmt::Arguments<'_>) {
+    let _ = RawStderr.write_all(&forwarded_detlog_line(target, record_suffix, message));
 }
 
 fn init_detlog_forwarder() {
@@ -621,6 +629,16 @@ mod tests {
     fn rpc_socket_uses_sabre_private_environment_namespace() {
         assert!(RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
         assert!(DETLOG_FORWARD_ENV.starts_with("REVERIE_SABRE_"));
+        // A forwarded record keeps the module that emitted it, as tracing would name it.
+        assert_eq!(
+            forwarded_detlog_line(
+                "detcore::tool_local",
+                " DETLOG_RECORD={}",
+                format_args!("USER RAND: seeding PRNG for root thread with seed {}", 0)
+            ),
+            b"INFO detcore::tool_local: DETLOG USER RAND: seeding PRNG for root thread with seed 0 DETLOG_RECORD={}\n"
+                .to_vec()
+        );
     }
 
     #[test]

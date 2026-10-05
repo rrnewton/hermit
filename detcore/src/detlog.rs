@@ -104,8 +104,9 @@ pub fn record_suffix(event: DetLogEvent) -> String {
     format!("{RECORD_SEPARATOR}{encoded}")
 }
 
-/// A process-local sink for deterministic INFO records.
-pub type DetlogForwarder = for<'a> fn(&str, fmt::Arguments<'a>);
+/// A process-local sink for deterministic INFO records: the emitting module's path (the
+/// target `tracing` would give the record), the record suffix, and the message.
+pub type DetlogForwarder = for<'a> fn(&str, &str, fmt::Arguments<'a>);
 
 static FORWARDER: OnceLock<DetlogForwarder> = OnceLock::new();
 
@@ -124,11 +125,13 @@ pub fn forwarding_enabled() -> bool {
     FORWARDER.get().is_some()
 }
 
-/// Emits one deterministic record through tracing and the process-local sink.
+/// Emits one deterministic record through tracing and the process-local sink. `target` is
+/// the emitting module's path, so a forwarded record names the same module a record observed
+/// through tracing does.
 #[doc(hidden)]
-pub fn emit_forwarded(record_suffix: &str, message: fmt::Arguments<'_>) {
+pub fn emit_forwarded(target: &str, record_suffix: &str, message: fmt::Arguments<'_>) {
     tracing::info!("DETLOG {}{}", message, record_suffix);
-    FORWARDER.get().expect("forwarder disappeared")(record_suffix, message);
+    FORWARDER.get().expect("forwarder disappeared")(target, record_suffix, message);
 }
 
 /// Macro used to encapsulate tracing should-be-deterministic information.
@@ -139,7 +142,11 @@ macro_rules! detlog {
         if $crate::detlog::forwarding_enabled() || ::tracing::enabled!(::tracing::Level::INFO) {
             let record_suffix = $crate::detlog::record_suffix($event);
             if $crate::detlog::forwarding_enabled() {
-                $crate::detlog::emit_forwarded(&record_suffix, format_args!($($arg)+));
+                $crate::detlog::emit_forwarded(
+                    ::core::module_path!(),
+                    &record_suffix,
+                    format_args!($($arg)+),
+                );
             } else {
                 ::tracing::info!("DETLOG {}{}", format_args!($($arg)+), record_suffix);
             }
