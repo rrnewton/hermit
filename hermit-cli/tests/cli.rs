@@ -3387,7 +3387,6 @@ fn run_dbt_uses_the_normalized_backend_config() {
 }
 
 // TODO-HUMAN-REVIEW(PR-1038): Review DBT queued self-signal verification.
-// TODO(#2791): Remove the portable test.cli skip when DBT queued-signal defect #1818 is fixed.
 #[test]
 fn run_dbt_verifies_queued_self_signals() {
     if dbt_unavailable("run_dbt_verifies_queued_self_signals") {
@@ -3641,7 +3640,6 @@ fn run_dbt_virtualizes_process_identities() {
 
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1065): Review DBT self-prlimit L2 coverage.
-// TODO(#2791): Remove the portable test.cli skip when DBT self-prlimit defect #2806 is fixed.
 #[test]
 fn run_dbt_verifies_self_prlimit() {
     if dbt_unavailable("run_dbt_verifies_self_prlimit") {

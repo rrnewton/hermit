@@ -400,7 +400,19 @@ fn requires_native_lifecycle(sysnum: i64) -> bool {
 
 // TODO-HUMAN-REVIEW(PR-1038): Review DBT self-target queued-signal identity translation.
 // TODO-HUMAN-REVIEW(PR-1065): Review DBT self-target prlimit64 translation.
+/// Rewrite a guest's own virtual pid/tid targets to the identities Detcore
+/// uses for it.
+///
+/// Only ABI v1 needs this: there Detcore's scheduler and process identities
+/// are physical, so a guest naming itself by its virtual id must be rewritten
+/// to the host id before Detcore resolves the target. On the current callback
+/// path Detcore's identities are the client's virtual ids (see
+/// `RuntimeAbi::runtime_identity`), so a host id would name no Detcore thread
+/// or process: `rt_sigqueueinfo` failed with ESRCH and `prlimit64` with EPERM.
+/// There the targets stay virtual and the native client maps them to host ids
+/// when it executes the syscall.
 fn translate_self_identity_targets(
+    abi: RuntimeAbi,
     sysnum: i64,
     args: &mut [u64; 6],
     virtual_pid: i32,
@@ -408,7 +420,7 @@ fn translate_self_identity_targets(
     host_pid: i32,
     host_tid: i32,
 ) {
-    if virtual_pid <= 0 || host_pid <= 0 {
+    if abi != RuntimeAbi::V1 || virtual_pid <= 0 || host_pid <= 0 {
         return;
     }
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1967,6 +1979,7 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     let raw_args = unsafe { std::slice::from_raw_parts(args, 6) };
     let mut dispatch_args: [u64; 6] = raw_args.try_into().expect("six syscall arguments");
     translate_self_identity_targets(
+        runtime.abi,
         sysnum,
         &mut dispatch_args,
         scratch.virtual_pid,
@@ -3067,6 +3080,7 @@ mod tests {
 
         let mut targeted = [3, 4, libc::SIGUSR1 as u64, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_rt_tgsigqueueinfo,
             &mut targeted,
             3,
@@ -3078,6 +3092,7 @@ mod tests {
 
         let mut process = [3, libc::SIGUSR1 as u64, 0, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_rt_sigqueueinfo,
             &mut process,
             3,
@@ -3089,6 +3104,7 @@ mod tests {
 
         let mut other = [5, 6, libc::SIGUSR1 as u64, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_rt_tgsigqueueinfo,
             &mut other,
             3,
@@ -3100,6 +3116,7 @@ mod tests {
 
         let mut process_group = [0, libc::SIGUSR1 as u64, 0, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_rt_sigqueueinfo,
             &mut process_group,
             0,
@@ -3110,11 +3127,20 @@ mod tests {
         assert_eq!(process_group[0], 0);
 
         let mut prlimit = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut prlimit, 3, 4, 10_003, 10_004);
+        translate_self_identity_targets(
+            RuntimeAbi::V1,
+            libc::SYS_prlimit64,
+            &mut prlimit,
+            3,
+            4,
+            10_003,
+            10_004,
+        );
         assert_eq!(prlimit[0], 10_003);
 
         let mut prlimit_without_tid = [3, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_prlimit64,
             &mut prlimit_without_tid,
             3,
@@ -3125,11 +3151,20 @@ mod tests {
         assert_eq!(prlimit_without_tid[0], 10_003);
 
         let mut current = [0, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
-        translate_self_identity_targets(libc::SYS_prlimit64, &mut current, 3, 4, 10_003, 10_004);
+        translate_self_identity_targets(
+            RuntimeAbi::V1,
+            libc::SYS_prlimit64,
+            &mut current,
+            3,
+            4,
+            10_003,
+            10_004,
+        );
         assert_eq!(current[0], 0);
 
         let mut other_process = [5, libc::RLIMIT_NOFILE as u64, 0, 0, 0, 0];
         translate_self_identity_targets(
+            RuntimeAbi::V1,
             libc::SYS_prlimit64,
             &mut other_process,
             3,
@@ -3138,6 +3173,61 @@ mod tests {
             10_004,
         );
         assert_eq!(other_process[0], 5);
+    }
+
+    #[test]
+    fn self_identity_targets_reach_detcore_as_the_abis_runtime_identity() {
+        // Detcore resolves a queued signal's target, and its prlimit64 self
+        // check, against the identities `runtime_identity` selects for the
+        // caller. A guest naming itself must therefore reach Detcore with
+        // exactly those ids. On the current ABI they are the client's virtual
+        // ids; rewriting them to host ids named no Detcore thread or process,
+        // and the guest saw ESRCH from rt_sigqueueinfo and EPERM from
+        // prlimit64.
+        let (virtual_pid, virtual_tid, host_pid, host_tid) = (3, 4, 10_003, 10_004);
+        let translate = |abi, sysnum, mut args: [u64; 6]| {
+            translate_self_identity_targets(
+                abi,
+                sysnum,
+                &mut args,
+                virtual_pid,
+                virtual_tid,
+                host_pid,
+                host_tid,
+            );
+            args
+        };
+        let signal = libc::SIGUSR1 as u64;
+        let resource = libc::RLIMIT_NOFILE as u64;
+        for (abi, expected_pid, expected_tid) in [
+            (RuntimeAbi::V1, host_pid, host_tid),
+            (RuntimeAbi::Current, virtual_pid, virtual_tid),
+        ] {
+            let (det_tid, det_pid) = abi
+                .runtime_identity(virtual_tid, virtual_pid, host_tid, host_pid)
+                .expect("positive identities are valid on both ABIs");
+            assert_eq!(
+                (i32::from(det_pid), i32::from(det_tid)),
+                (expected_pid, expected_tid),
+                "{abi:?} runtime identity"
+            );
+            let (pid, tid) = (expected_pid as u64, expected_tid as u64);
+            assert_eq!(
+                translate(abi, libc::SYS_rt_tgsigqueueinfo, [3, 4, signal, 0, 0, 0]),
+                [pid, tid, signal, 0, 0, 0],
+                "{abi:?} rt_tgsigqueueinfo"
+            );
+            assert_eq!(
+                translate(abi, libc::SYS_rt_sigqueueinfo, [3, signal, 0, 0, 0, 0]),
+                [pid, signal, 0, 0, 0, 0],
+                "{abi:?} rt_sigqueueinfo"
+            );
+            assert_eq!(
+                translate(abi, libc::SYS_prlimit64, [3, resource, 0, 0, 0, 0]),
+                [pid, resource, 0, 0, 0, 0],
+                "{abi:?} prlimit64"
+            );
+        }
     }
 
     #[test]
