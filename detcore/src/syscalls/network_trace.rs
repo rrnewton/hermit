@@ -35,8 +35,10 @@
 //! status, naming the reason; replay never falls back to the host.
 
 use std::os::unix::io::RawFd;
+use std::time::Duration;
 
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
+use detcore_model::fd::OpenFileId;
 use detcore_model::network_engine::NetworkArrival;
 use detcore_model::network_engine::NetworkRecvOutcome;
 use detcore_model::network_engine::NetworkReply;
@@ -54,6 +56,7 @@ use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 
+use super::io::ppoll_timeout_duration;
 use crate::fd::FdType;
 use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
@@ -70,6 +73,7 @@ use crate::tool_global::send_and_update_time;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::unrecoverable_shutdown;
 use crate::tool_local::Detcore;
+use crate::types::LogicalTime;
 
 /// How long record mode waits for the host to finish a TCP handshake.
 const CONNECT_WAIT_MILLIS: i32 = 60_000;
@@ -79,6 +83,9 @@ const SEND_WAIT_MILLIS: i32 = 60_000;
 
 /// Size of the scratch buffer a readiness check pulls into.
 const POLL_PULL_BYTES: usize = 512;
+
+/// A polled channel and its receive low-water mark.
+type PolledChannel = (OpenFileId, usize);
 
 /// `recv` flags with a modelled meaning.
 const RECV_FLAGS: i32 =
@@ -196,9 +203,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             return false;
         }
         let fd = match call {
-            // A connect may create a channel and a poll may name one; both
-            // fall back to their ordinary handlers otherwise.
-            Syscall::Connect(_) | Syscall::Poll(_) => return true,
+            // A connect may create a channel and a poll may name one; each
+            // falls back to its ordinary handler otherwise.
+            Syscall::Connect(_) | Syscall::Poll(_) | Syscall::Ppoll(_) => return true,
+            Syscall::Select(c) => {
+                return Self::select_names_channel(
+                    guest,
+                    c.nfds(),
+                    [c.readfds(), c.writefds(), c.exceptfds()],
+                );
+            }
+            Syscall::Pselect6(c) => {
+                return Self::select_names_channel(
+                    guest,
+                    c.nfds(),
+                    [c.readfds(), c.writefds(), c.exceptfds()],
+                );
+            }
             // The receive low-water mark may be set before the socket connects.
             Syscall::Setsockopt(c) => {
                 if c.level() == libc::SOL_SOCKET && c.optname() == libc::SO_RCVLOWAT {
@@ -227,6 +248,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         Self::is_network_channel(guest, fd)
     }
 
+    /// Whether a `select` descriptor set below `nfds` names a channel.
+    fn select_names_channel<G: Guest<Self>>(
+        guest: &mut G,
+        nfds: i32,
+        sets: [Option<AddrMut<'_, libc::fd_set>>; 3],
+    ) -> bool {
+        let nfds = nfds.clamp(0, libc::FD_SETSIZE as i32);
+        sets.into_iter().flatten().any(|set| {
+            let Ok(set) = guest.memory().read_value(set) else {
+                return false;
+            };
+            (0..nfds).any(|fd| {
+                // SAFETY: `fd` is below FD_SETSIZE.
+                let named = unsafe { libc::FD_ISSET(fd, &set) };
+                named && Self::is_network_channel(guest, fd)
+            })
+        })
+    }
+
     /// Handle a call that [`Self::network_trace_owns`] accepted.
     pub(crate) async fn handle_network_trace_syscall<G: Guest<Self>>(
         &self,
@@ -236,6 +276,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         match call {
             Syscall::Connect(c) => self.network_connect(guest, c).await,
             Syscall::Poll(c) => self.network_poll(guest, c).await,
+            Syscall::Ppoll(c) => self.network_ppoll(guest, c).await,
             Syscall::Setsockopt(c) => self.network_setsockopt(guest, c).await,
             Syscall::Read(c) => {
                 self.network_recv(
@@ -331,7 +372,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    fn network_id<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> detcore_model::fd::OpenFileId {
+    fn network_id<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> OpenFileId {
         guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.open_file_id())
@@ -769,14 +810,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(sent as i64)
     }
 
-    /// `poll` over channels only; a poll naming no channel takes the
-    /// ordinary path.
-    async fn network_poll<G: Guest<Self>>(
-        &self,
+    /// The pollfd array at `address` and, for each entry, its channel and
+    /// receive low-water mark. `None` when the array names no channel, so the
+    /// call takes its ordinary path.
+    fn network_pollfds<G: Guest<Self>>(
         guest: &mut G,
-        call: syscalls::Poll,
-    ) -> Result<i64, Error> {
-        let nfds = call.nfds() as usize;
+        address: Option<AddrMut<'_, libc::pollfd>>,
+        nfds: usize,
+    ) -> Option<(Vec<libc::pollfd>, Vec<Option<PolledChannel>>)> {
+        let address = address?;
         let mut pollfds = vec![
             libc::pollfd {
                 fd: -1,
@@ -785,44 +827,128 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             nfds
         ];
-        let Some(address) = call.fds().map(|fds| fds.cast::<libc::pollfd>()) else {
-            return self.handle_poll(guest, call).await;
-        };
-        if guest
+        guest
             .memory()
             .read_values(address.into(), &mut pollfds)
-            .is_err()
-        {
+            .ok()?;
+        let channels: Vec<_> = pollfds
+            .iter()
+            .map(|pollfd| {
+                guest
+                    .thread_state()
+                    .with_detfd(pollfd.fd, |detfd| {
+                        detfd
+                            .is_network_channel()
+                            .then(|| (detfd.open_file_id(), detfd.network_lowat()))
+                    })
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+        channels
+            .iter()
+            .any(Option::is_some)
+            .then_some((pollfds, channels))
+    }
+
+    /// `poll` naming at least one channel.
+    async fn network_poll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Poll,
+    ) -> Result<i64, Error> {
+        let address = call.fds().map(|fds| fds.cast::<libc::pollfd>());
+        let Some((pollfds, channels)) = Self::network_pollfds(guest, address, call.nfds() as usize)
+        else {
             return self.handle_poll(guest, call).await;
-        }
-        let mut channels = Vec::new();
-        let mut others = false;
-        for pollfd in &pollfds {
-            if pollfd.fd < 0 {
-                channels.push(None);
-            } else if Self::is_network_channel(guest, pollfd.fd) {
-                let (id, lowat) = guest.thread_state().with_detfd(pollfd.fd, |detfd| {
-                    (detfd.open_file_id(), detfd.network_lowat())
-                })?;
-                channels.push(Some((id, lowat)));
-            } else {
-                others = true;
-                channels.push(None);
-            }
-        }
-        if channels.iter().all(Option::is_none) {
-            return self.handle_poll(guest, call).await;
-        }
-        if others {
+        };
+        let deadline = millis_duration_to_absolute_timeout(guest, call.timeout()).await;
+        self.network_wait(
+            guest,
+            address.expect("a pollfd array naming a channel"),
+            pollfds,
+            &channels,
+            call.timeout() == 0,
+            deadline,
+            call.signal_interrupt_errno(),
+            Syscall::Poll(call),
+        )
+        .await
+    }
+
+    /// `ppoll` naming at least one channel.
+    async fn network_ppoll<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Ppoll,
+    ) -> Result<i64, Error> {
+        let Some((pollfds, channels)) =
+            Self::network_pollfds(guest, call.fds(), call.nfds() as usize)
+        else {
+            return self.handle_ppoll(guest, call).await;
+        };
+        if call.sigmask().is_some() {
             self.network_refuse(
                 guest,
-                "network trace does not model a poll mixing recorded sockets with other descriptors",
+                "network trace does not model ppoll with a signal mask on a recorded socket",
             )
             .await
         }
+        let timeout = match call.timeout() {
+            Some(address) => Some(ppoll_timeout_duration(guest.memory().read_value(address)?)?),
+            None => None,
+        };
+        let started_at = thread_observe_time(guest).await;
+        let result = self
+            .network_wait(
+                guest,
+                call.fds().expect("a pollfd array naming a channel"),
+                pollfds,
+                &channels,
+                timeout == Some(Duration::ZERO),
+                timeout.map(|timeout| started_at + timeout),
+                call.signal_interrupt_errno(),
+                Syscall::Ppoll(call),
+            )
+            .await;
+        // Linux reports the time not slept, and leaves a zero timeout alone.
+        if let (Some(address), Some(timeout)) = (call.timeout(), timeout)
+            && !timeout.is_zero()
+        {
+            self.write_ppoll_remaining(guest, address, timeout, started_at)
+                .await?;
+        }
+        result
+    }
 
-        let deadline = millis_duration_to_absolute_timeout(guest, call.timeout()).await;
+    /// Wait for readiness on a pollfd array naming channels. Each scheduler
+    /// turn asks the engine about the channels and probes every other
+    /// descriptor with a zero-timeout host poll, as a strict guest-internal
+    /// poll does; channel entries are masked to -1 for that probe, which
+    /// Linux skips.
+    #[allow(clippy::too_many_arguments)]
+    async fn network_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        address: AddrMut<'_, libc::pollfd>,
+        mut pollfds: Vec<libc::pollfd>,
+        channels: &[Option<PolledChannel>],
+        zero_timeout: bool,
+        deadline: Option<LogicalTime>,
+        interrupted: Errno,
+        retry: Syscall,
+    ) -> Result<i64, Error> {
         let record = self.network_mode() == NetworkTraceMode::Record;
+        let probe: Vec<libc::pollfd> = pollfds
+            .iter()
+            .zip(channels)
+            .map(|(pollfd, channel)| libc::pollfd {
+                fd: if channel.is_some() { -1 } else { pollfd.fd },
+                events: pollfd.events,
+                revents: 0,
+            })
+            .collect();
+        let probe_host = probe.iter().any(|pollfd| pollfd.fd >= 0);
         let mut stack = guest.stack().await;
         let scratch: AddrMut<[u8; POLL_PULL_BYTES]> = stack.reserve();
         let _guard = stack.commit()?;
@@ -834,10 +960,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 resource_request(guest, rsrc.clone()).await,
                 ResumeStatus::Signaled(_)
             ) {
-                return Err(call.signal_interrupt_errno().into());
+                return Err(interrupted.into());
             }
             let mut request = Vec::new();
-            for (pollfd, channel) in pollfds.iter().zip(&channels) {
+            for (pollfd, channel) in pollfds.iter().zip(channels) {
                 if let Some((id, lowat)) = channel {
                     let arrivals = if record {
                         self.network_pull(guest, pollfd.fd, scratch.cast(), POLL_PULL_BYTES)
@@ -856,21 +982,46 @@ impl<T: RecordOrReplay> Detcore<T> {
             else {
                 unreachable!()
             };
+            let mut host_revents = vec![0; pollfds.len()];
+            if probe_host {
+                guest
+                    .memory()
+                    .write_values(address, &probe)
+                    .map_err(|_| Errno::EFAULT)?;
+                let call = syscalls::Poll::new()
+                    .with_fds(Some(address.cast()))
+                    .with_nfds(probe.len() as libc::nfds_t)
+                    .with_timeout(0);
+                let probed = guest.inject(call).await;
+                let mut after = probe.clone();
+                let read = guest.memory().read_values(address.into(), &mut after);
+                // Restore the guest's descriptors before reporting anything.
+                guest
+                    .memory()
+                    .write_values(address, &pollfds)
+                    .map_err(|_| Errno::EFAULT)?;
+                probed?;
+                read?;
+                for (revents, pollfd) in host_revents.iter_mut().zip(&after) {
+                    *revents = pollfd.revents;
+                }
+            }
             let mut events = events.into_iter();
             let mut ready = 0;
-            for (pollfd, channel) in pollfds.iter_mut().zip(&channels) {
+            for ((pollfd, channel), host) in pollfds.iter_mut().zip(channels).zip(host_revents) {
                 pollfd.revents = match channel {
                     Some(_) => masked_revents(events.next().unwrap(), pollfd.events),
-                    None => 0,
+                    None => host,
                 };
                 if pollfd.revents != 0 {
                     ready += 1;
                 }
             }
-            let expired = match deadline {
-                Some(deadline) => thread_observe_time(guest).await >= deadline,
-                None => call.timeout() == 0,
-            };
+            let expired = zero_timeout
+                || match deadline {
+                    Some(deadline) => thread_observe_time(guest).await >= deadline,
+                    None => false,
+                };
             if ready > 0 || expired {
                 guest
                     .memory()
@@ -879,7 +1030,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(ready);
             }
             rsrc.poll_attempt += 1;
-            record_retry_event(guest, call).await;
+            record_retry_event(guest, retry).await;
         }
     }
 

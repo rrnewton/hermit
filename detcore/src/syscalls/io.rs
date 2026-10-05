@@ -186,7 +186,7 @@ where
     Ok(())
 }
 
-fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errno> {
+pub(super) fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errno> {
     let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
     let nanoseconds = u32::try_from(timeout.tv_nsec).map_err(|_| Errno::EINVAL)?;
     if nanoseconds >= 1_000_000_000 {
@@ -1069,7 +1069,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    async fn write_ppoll_remaining<G: Guest<Self>>(
+    pub(super) async fn write_ppoll_remaining<G: Guest<Self>>(
         &self,
         guest: &mut G,
         timeout_address: AddrMut<'_, Timespec>,
