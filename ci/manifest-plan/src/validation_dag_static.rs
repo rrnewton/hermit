@@ -675,7 +675,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and the front door's tests::accepts_an_env_in_a_replay_mode and
     // rejects_an_env_outside_verify_and_replay, so 899 of the 902 prior
     // identities are retained: 902 - 3 + 6 = 905 (the same listing gives 708).
-    ("test.regular_crates", 905),
+    // stress_series::tests::timed_out_match_evidence_is_the_timeout_and_nothing_else
+    // and stress_series::tests::declared_guest_exit_holds_a_timed_out_sibling_to_the_timeout_rule
+    // retain all 905: 905 + 2 = 907 (the same listing gives 710 with them).
+    ("test.regular_crates", 907),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1193,7 +1196,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // two replay-retry tests listed there retain all 900. The rr fold listed
     // there removes three tests, rewrites them under new names and adds three,
     // so 899 of the 902 prior identities are retained (+3).
-    ("test.regular_crates_on_host", 905),
+    // The two timed-out-match stress_series tests listed there: 905 + 2 = 907.
+    ("test.regular_crates_on_host", 907),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
