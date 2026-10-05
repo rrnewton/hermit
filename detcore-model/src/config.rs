@@ -154,6 +154,27 @@ pub struct Config {
     #[clap(skip)]
     pub kvm_shared_dequeue_timers: bool,
 
+    /// The backend commits a SIGKILL that the calling task sends to itself as an immediate,
+    /// nonreturning exit of the caller's whole process, so the syscall has no later return at
+    /// which the ordinary pending-signal path could act. Detcore therefore takes the process's
+    /// exit fence at that syscall's own scheduler turn, as `exit_group` does. This describes a
+    /// backend property, so it is meant to become the backend capability
+    /// `self_sigkill_is_nonreturning_exit`.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_self_sigkill_is_nonreturning_exit: bool,
+
+    /// A SIGKILL that the calling task sends to itself ends the process without the backend
+    /// running a thread-exit callback or reporting the exit to Detcore afterward, so nothing
+    /// else would retire the caller from the scheduler. Detcore therefore retires the caller
+    /// itself at the fenced turn, just before it issues the kill, as the backend's thread-exit
+    /// callback would. Meaningful only together with
+    /// `backend_self_sigkill_is_nonreturning_exit`. This describes a backend property, so it is
+    /// meant to become the backend capability `self_sigkill_bypasses_exit_callbacks`.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_self_sigkill_bypasses_exit_callbacks: bool,
+
     /// The backend can wake a scheduler-managed pipe write for a cross-task signal while
     /// preserving Linux signal-mask, disposition, and syscall-restart behavior.
     #[serde(default = "default_true")]
@@ -1454,6 +1475,8 @@ mod tests {
         assert!(config.backend_tracks_process_children);
         assert!(config.backend_runs_exit_robust_list);
         assert!(!config.backend_requires_thread_directed_process_signals);
+        assert!(!config.backend_self_sigkill_is_nonreturning_exit);
+        assert!(!config.backend_self_sigkill_bypasses_exit_callbacks);
         assert!(config.backend_supports_parked_write_signal_interruption);
         assert!(!config.backend_virtualizes_capability_prctls);
         assert!(!config.backend_defers_vfork_child_registration);

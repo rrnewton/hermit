@@ -4442,9 +4442,9 @@ pub async fn notify_signal_pending<G, T>(
 /// Such exits are not determinizable (see "quasi-determinism").
 ///
 /// ⚠️ `status` IS NOT A DEFAULTABLE PARAMETER, AND THAT IS THE POINT. This
-/// function has four callers and they do not all mean the same thing: three are
-/// fail-closed policy refusals (`HERMIT_POLICY_REFUSAL_EXIT`) and one is an
-/// operator interrupt (`HERMIT_SIGINT_DEATH_EXIT`). While the status was baked in
+/// function's callers do not all mean the same thing: one is an operator
+/// interrupt (`HERMIT_SIGINT_DEATH_EXIT`) and every other is a fail-closed
+/// policy refusal (`HERMIT_POLICY_REFUSAL_EXIT`). While the status was baked in
 /// here, every caller inherited whatever the last edit chose, so the SIGINT path
 /// reported "hermit refused this run" for a run hermit did not refuse. Making it
 /// an argument turns the meaning into a visible claim at each call site, which is

@@ -2683,24 +2683,26 @@ mod dbt_detconfig_tests {
     use super::insert_legacy_dbt_detconfig_keys;
     use super::prepare_backend_config;
 
-    /// `HERMIT_DBT_DETCONFIG` bytes for each config below, captured with
-    /// `serde_json::to_string` from a build of
+    /// `HERMIT_DBT_DETCONFIG` bytes for each config below. They were first
+    /// captured with `serde_json::to_string` from a build of
     /// 806cf2fa38d13b806195d54aeba22d282d79f33d, which still had the legacy
-    /// switches. Any later change to `DetConfig`'s serialized fields also
+    /// switches. Adding the two `backend_self_sigkill_*` fields regenerated
+    /// them; those two keys, where serde places them, are the only bytes that
+    /// changed. Any later change to `DetConfig`'s serialized fields also
     /// changes this guest-visible variable, so this test is meant to fail on
     /// it and make that change a deliberate one.
     const GOLDEN: [(&str, &str); 3] = [
         (
             "default",
-            include_str!("../tests/fixtures/dbt/detconfig-806cf2fa-default.json"),
+            include_str!("../tests/fixtures/dbt/detconfig-default.json"),
         ),
         (
             "dbt",
-            include_str!("../tests/fixtures/dbt/detconfig-806cf2fa-dbt.json"),
+            include_str!("../tests/fixtures/dbt/detconfig-dbt.json"),
         ),
         (
             "rich_dbt",
-            include_str!("../tests/fixtures/dbt/detconfig-806cf2fa-rich_dbt.json"),
+            include_str!("../tests/fixtures/dbt/detconfig-rich_dbt.json"),
         ),
     ];
 
@@ -2771,13 +2773,13 @@ mod dbt_detconfig_tests {
     }
 
     #[test]
-    fn dbt_detconfig_matches_806cf2fa_bytes() {
+    fn dbt_detconfig_matches_golden_bytes() {
         for ((name, config), (golden_name, golden)) in cases().into_iter().zip(GOLDEN) {
             assert_eq!(name, golden_name);
             let encoded = dbt_detconfig_json(&config).unwrap();
             assert_eq!(
                 encoded, golden,
-                "HERMIT_DBT_DETCONFIG for the {name} config differs from the 806cf2fa bytes"
+                "HERMIT_DBT_DETCONFIG for the {name} config differs from its golden bytes"
             );
         }
     }
@@ -3084,6 +3086,14 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
     config.backend_is_kvm = backend == Backend::Kvm;
     config.kvm_shared_dequeue_timers = config.backend_is_kvm && config.sequentialize_threads;
+    // KVM commits a self-directed SIGKILL as an immediate process exit and then
+    // reports it through its terminal child callback. DBT forwards the kill to
+    // the kernel, and DynamoRIO can neither intercept SIGKILL nor run a
+    // thread-exit callback for a process that the kernel kills. Ptrace reports
+    // the killed tasks through its ordinary exit events.
+    config.backend_self_sigkill_is_nonreturning_exit =
+        matches!(backend, Backend::Kvm | Backend::Dbt);
+    config.backend_self_sigkill_bypasses_exit_callbacks = backend == Backend::Dbt;
     // E9patch preprocesses the guest and then uses the ptrace builder. LiteInst,
     // DBT, KVM, and SaBRe re-invoke the Tool callback on ERESTARTSYS instead of
     // resuming through the kernel's ptrace syscall-restart frame.
@@ -5416,6 +5426,35 @@ mod tests {
             assert_eq!(
                 config.backend_supports_parked_write_signal_interruption, supports_interruption,
                 "unexpected parked-write signal support for {backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_self_sigkill_contract_is_explicit() {
+        for (backend, nonreturning, bypasses_exit_callbacks) in [
+            (Backend::Ptrace, false, false),
+            (Backend::Dbt, true, true),
+            (Backend::Kvm, true, false),
+            (Backend::Sabre, false, false),
+            (Backend::Liteinst, false, false),
+            (Backend::E9patch, false, false),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend_self_sigkill_is_nonreturning_exit, nonreturning,
+                "unexpected self-SIGKILL exit contract for {backend:?}"
+            );
+            assert_eq!(
+                config.backend_self_sigkill_bypasses_exit_callbacks, bypasses_exit_callbacks,
+                "unexpected self-SIGKILL exit-callback contract for {backend:?}"
+            );
+            // Detcore retires the caller only after it has taken the exit
+            // fence, so a backend that skips exit callbacks must also take it.
+            assert!(
+                !config.backend_self_sigkill_bypasses_exit_callbacks
+                    || config.backend_self_sigkill_is_nonreturning_exit,
+                "{backend:?} would retire a self-SIGKILL caller without an exit fence"
             );
         }
     }

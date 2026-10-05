@@ -847,7 +847,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // this is 822 - 8 = 814.
     // Both together: 822 + 6 (https://github.com/rrnewton/hermit/pull/3778)
     // - 8 (https://github.com/rrnewton/hermit/issues/3520) = 820.
-    ("test.hermit_unit", 820),
+    // tests::backend_self_sigkill_contract_is_explicit, added with the
+    // self-SIGKILL capability flags
+    // (https://github.com/rrnewton/hermit/issues/1818), is new, and
+    // dbt_detconfig_tests::dbt_detconfig_matches_806cf2fa_bytes is renamed
+    // dbt_detconfig_matches_golden_bytes because the regenerated goldens no
+    // longer hold the 806cf2fa38d1 bytes; the other 819 of the 820 prior
+    // identities are kept (`cargo nextest list` with this node's filters
+    // lists 821).
+    ("test.hermit_unit", 821),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1261,7 +1269,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // the same six https://github.com/rrnewton/hermit/pull/3778 tests, and
     // drops the same eight https://github.com/rrnewton/hermit/issues/3520
     // tests: 822 + 6 - 8 = 820.
-    ("test.hermit_unit_on_host", 820),
+    // The host twin selects the same
+    // https://github.com/rrnewton/hermit/issues/1818 test and rename
+    // (`cargo nextest list` with this node's filters lists 821).
+    ("test.hermit_unit_on_host", 821),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -123,7 +123,6 @@ pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
-use tool_global::ThreadDeregistration;
 use tool_global::acknowledge_robust_list_exit_time;
 use tool_global::create_child_thread;
 use tool_global::create_vfork_child_thread;
@@ -3175,16 +3174,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                 );
             }
         }
-        let pending_chaos_epochs = thread_state.take_pending_chaos_epochs();
-        let deregistration = ThreadDeregistration {
-            dettid,
-            detpid,
-            mm: mm_id,
-            thread_start_entered: thread_state.thread_start_entered,
-            timeslice_stats: thread_state.stats.timeslice_stats,
-            syscall_count: thread_state.stats.syscall_count,
-            chaos_epochs: pending_chaos_epochs,
-        };
+        let deregistration = thread_state.final_deregistration(detpid);
         if transferred_exec {
             tool_global::retire_exec(
                 thread_state.thread_logical_time.clone(),
