@@ -13399,7 +13399,7 @@ fn parity_reference_sample_self_test(root: &Path, scratch: &Path) -> Result<(), 
                 .collect();
             references.iter().any(|cell| !sampled.contains(cell))
                 && references.iter().any(|cell| sampled.contains(cell))
-                && sampled.iter().any(|cell| unpaired_candidate(cell))
+                && sampled.iter().any(&unpaired_candidate)
                 && sampled.iter().any(|cell| {
                     candidate(cell)
                         && !comparable(cell)
