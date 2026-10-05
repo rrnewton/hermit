@@ -6205,6 +6205,65 @@ fn max_log_bytes_aborts_a_run_whose_log_file_runs_away() {
     }
 }
 
+/// A log that ends with the `--max-log-bytes` stop message lost its tail, and
+/// `hermit log-diff` must refuse it as it refuses a log that ends with the
+/// bounded writer's truncation marker
+/// (<https://github.com/rrnewton/hermit/pull/3686>, round-2 review finding 5).
+///
+/// The records are a real run's `--log-file` at INFO; the stop message is the
+/// exact text the cap writes. It is appended here rather than produced by a
+/// capped run because the cap writes it to a regular file with
+/// `pwritev2(RWF_NOWAIT)`, which this host's btrfs refuses with `EAGAIN` (see
+/// `max_log_bytes_aborts_a_run_whose_log_file_runs_away`); where the write is
+/// accepted (a FIFO sink, a file system that takes non-waiting appends) the
+/// file ends exactly like this.
+///
+/// Three tails, each compared with itself through the JSON comparison:
+/// - the stop message alone: the cap fired before the file bound did;
+/// - the truncation marker, then the stop message: what the cap wrote before
+///   this fix once the file bound had already truncated;
+/// - the truncation marker alone: the control, refused before and after.
+#[test]
+fn max_log_bytes_stopped_log_is_refused_by_log_diff() {
+    let _lock = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let base = directory.path().join("base.log");
+    log_true_run(&base, "info", "2026-01-01T00:00:00.123456789+00:00");
+    let records = fs::read_to_string(&base).unwrap();
+    assert!(records.contains(" INFO "), "{records}");
+    let stop = "hermit: log output exceeded --max-log-bytes=64K (65536 bytes); aborting the \
+                run and killing the guest process tree (exit 123). Lower --log / RUST_LOG \
+                verbosity, or raise --max-log-bytes, to let the run finish.\n\
+                HERMIT_LOG_CAP class=log-cap\n";
+    let marker = detcore::logdiff::TRUNCATION_MARKER;
+    for (label, tail) in [
+        ("stop message alone", stop.to_owned()),
+        (
+            "truncation marker, then stop message",
+            format!("\n{marker}\n{stop}"),
+        ),
+        ("truncation marker alone", format!("\n{marker}\n")),
+    ] {
+        let log = directory.path().join("capped.log");
+        fs::write(&log, format!("{records}{tail}")).unwrap();
+        let json = directory.path().join("report.json");
+        let _ = fs::remove_file(&json);
+        let log_arg = log.to_str().unwrap();
+        let output = log_diff(&["--json", json.to_str().unwrap(), log_arg, log_arg]);
+        let stderr = stderr(&output);
+        let report: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json).unwrap()).unwrap();
+        assert_ne!(output.status.code(), Some(0), "{label}: {stderr}");
+        assert_eq!(report["verdict"], "refused", "{label}: {report}");
+        assert!(
+            report["refusal"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("truncated at the configured size bound")),
+            "{label}: {report}"
+        );
+    }
+}
+
 /// A pipe for a child's stderr whose buffer is already full and whose reader
 /// (the first descriptor, held by the caller) stays open and never reads. The
 /// write end is back in blocking mode, so a plain `write(2)` to it waits

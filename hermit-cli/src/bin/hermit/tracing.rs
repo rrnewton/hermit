@@ -239,6 +239,12 @@ impl<W: Write> BoundedWriter<W> {
 }
 
 impl<W: Write> BoundedWriter<W> {
+    /// Whether bytes have been discarded and the truncation marker written.
+    /// From then on the marker is this log's final line.
+    fn has_truncated(&self) -> bool {
+        self.announced
+    }
+
     /// Announce truncation the FIRST time bytes are actually discarded.
     ///
     /// Deferring this to the next `write` leaves a log that was truncated on
@@ -548,6 +554,12 @@ pub struct CappedWriter<W: Write> {
     /// inner writer. `None` when the inner writer is stderr itself (so the
     /// message is written once) or has no descriptor (an in-memory test sink).
     final_message_fd: Option<RawFd>,
+    /// Whether the inner writer has already ended its output with its own
+    /// last line. [`BoundedWriter`] writes the truncation marker as the final
+    /// bytes of a truncated log, and the comparator recognizes a truncated log
+    /// only by that marker at end of file, so the final message must not be
+    /// appended after it.
+    inner_has_final_line: fn(&W) -> bool,
 }
 
 impl<W: Write> CappedWriter<W> {
@@ -558,6 +570,7 @@ impl<W: Write> CappedWriter<W> {
             inner,
             budget,
             final_message_fd: None,
+            inner_has_final_line: |_| false,
         }
     }
 
@@ -565,9 +578,15 @@ impl<W: Write> CappedWriter<W> {
         let message = budget.exceeded_message().as_bytes();
         if let Some(fd) = self.final_message_fd {
             // Best effort: the log should say why it ends. Written to the
-            // descriptor directly, so it lands even after BoundedWriter has
-            // reached its bound (a few hundred bytes past it, once).
-            write_without_waiting(fd, message);
+            // descriptor directly, so it lands even when BoundedWriter is
+            // close to its bound (a few hundred bytes past it, once) -- but
+            // NOT once BoundedWriter has truncated: its marker must stay the
+            // final line of a truncated log, because that is the only thing
+            // `detcore::logdiff::log_was_truncated` accepts as truncation.
+            // The message still reaches stderr below.
+            if !(self.inner_has_final_line)(&self.inner) {
+                write_without_waiting(fd, message);
+            }
         }
         write_without_waiting(libc::STDERR_FILENO, message);
         // SAFETY: _exit has no preconditions; see the type-level note for why
@@ -585,6 +604,7 @@ impl CappedWriter<BoundedWriter<File>> {
             inner: BoundedWriter::new(file, file_limit),
             budget,
             final_message_fd: Some(fd),
+            inner_has_final_line: BoundedWriter::has_truncated,
         }
     }
 }
@@ -596,6 +616,7 @@ impl CappedWriter<detcore::util::RetryingStderr> {
             inner: detcore::util::RetryingStderr,
             budget,
             final_message_fd: None,
+            inner_has_final_line: |_| false,
         }
     }
 }
@@ -1777,6 +1798,74 @@ mod tests {
             assert_eq!(message.matches("HERMIT_LOG_CAP").count(), 1, "{message}");
             assert!(message.len() < libc::PIPE_BUF, "{} bytes", message.len());
         }
+    }
+
+    /// The comparator recognizes a log stopped by the cap from its last line,
+    /// so the real stop message must end a log in a form
+    /// `detcore::logdiff::log_was_truncated` accepts -- at every limit, after
+    /// an ordinary record (round-2 review finding 5 on
+    /// <https://github.com/rrnewton/hermit/pull/3686>).
+    #[test]
+    fn a_log_ending_with_the_stop_message_reads_as_truncated() {
+        let record = "2026-10-05T12:00:00.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: \
+                      write(1, 0x2000, 1) = Ok(1)\n";
+        for limit in [1, 100, 64 << 10, 8 << 30, u64::MAX] {
+            let log = format!("{record}{}", exceeded_message(limit));
+            assert!(detcore::logdiff::log_was_truncated(&log), "{log}");
+        }
+        assert!(!detcore::logdiff::log_was_truncated(record));
+    }
+
+    /// Once the file bound has truncated the log, the cap must not append its
+    /// stop message after the truncation marker: the marker is the final line
+    /// of a truncated log, and the comparator accepts nothing else after it.
+    /// The stop message still reaches stderr. (Round-2 review finding 5 on
+    /// <https://github.com/rrnewton/hermit/pull/3686>.)
+    #[test]
+    fn the_stop_message_is_not_appended_after_the_truncation_marker() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+
+        let budget = LogBudget::new(100).unwrap();
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let (read_fd, write_fd) = (fds[0], fds[1]);
+        // SAFETY: the child uses only preformatted data, atomics, write(2) and
+        // _exit, so it is safe after fork in a multithreaded test process.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
+        if child == 0 {
+            unsafe {
+                libc::close(read_fd);
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                libc::dup2(null, 2);
+                // A 50-byte file bound under a 100-byte cap: the first write
+                // truncates the file, the second crosses the cap.
+                let mut writer = CappedWriter::file(
+                    std::fs::File::from_raw_fd(write_fd),
+                    50,
+                    Some(budget.clone()),
+                );
+                let _ = writer.write_all(&[b'a'; 60]);
+                let _ = writer.write_all(&[b'b'; 60]);
+                libc::_exit(0);
+            }
+        }
+        unsafe { libc::close(write_fd) };
+        let mut output = Vec::new();
+        unsafe { std::fs::File::from_raw_fd(read_fd) }
+            .read_to_end(&mut output)
+            .unwrap();
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), hermit::HERMIT_LOG_CAP_EXIT);
+
+        let mut expected = vec![b'a'; 50];
+        expected.extend_from_slice(TRUNCATION_MARKER);
+        let text = String::from_utf8(output).unwrap();
+        assert_eq!(text.as_bytes(), expected.as_slice(), "{text}");
+        assert!(detcore::logdiff::log_was_truncated(&text), "{text}");
     }
 
     /// A pipe whose buffer is full and whose reader never reads, switched back

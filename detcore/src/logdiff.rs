@@ -50,6 +50,16 @@ pub const TRUNCATION_MARKER: &str = "=== HERMIT LOG TRUNCATED: reached the confi
      (HERMIT_LOG_MAX_BYTES). Output beyond this point was DISCARDED. The run itself continued and \
      was NOT affected. ===";
 
+/// The last line hermit's `--max-log-bytes` cap writes before it ends the run
+/// with exit 123 (the class line of its stop message, without the newline).
+///
+/// A log that ends with this line stopped at the cap: whatever the run would
+/// have logged after it was never written, exactly as after
+/// [`TRUNCATION_MARKER`]. The cap's writer in `hermit-cli` composes the line
+/// itself; its unit test runs the real stop message through
+/// [`log_was_truncated`], which binds the two texts.
+pub const LOG_CAP_STOP_LINE: &str = "HERMIT_LOG_CAP class=log-cap";
+
 /// Versioned policy token for the only prefix removed by `BitwiseInfoV1`.
 pub const STRIP_WALL_CLOCK_PREFIX_V1: &str = "real-wall-clock-prefix/v1";
 
@@ -79,14 +89,27 @@ pub const CANON_ADDRESS_ORDINAL_V1: &str = "host-address-to-first-appearance-ord
 ///
 /// A genuinely truncated log still satisfies both, so this narrows the
 /// predicate to the real condition without weakening it.
+///
+/// The same two anchors also accept [`LOG_CAP_STOP_LINE`]: a run stopped by
+/// `--max-log-bytes` loses its tail just as surely, and its log ends with that
+/// line when the stop message reached the file. A capped log whose stop message
+/// was NOT written (the cap writes it without waiting and omits it when the
+/// file cannot take it at once) ends abruptly and is not recognized here; the
+/// run's exit status 123 is then the only record of the cap.
 pub fn log_was_truncated(log_text: &str) -> bool {
     let trimmed = log_text.trim_end_matches(['\n', '\r']);
-    if !trimmed.ends_with(TRUNCATION_MARKER) {
+    ends_with_whole_line(trimmed, TRUNCATION_MARKER)
+        || ends_with_whole_line(trimmed, LOG_CAP_STOP_LINE)
+}
+
+/// Whether `text` ends with `line` and `line` starts at a line boundary.
+fn ends_with_whole_line(text: &str, line: &str) -> bool {
+    if !text.ends_with(line) {
         return false;
     }
     // `ends_with` matched, so this offset is on a character boundary.
-    let marker_start = trimmed.len() - TRUNCATION_MARKER.len();
-    marker_start == 0 || trimmed.as_bytes()[marker_start - 1] == b'\n'
+    let line_start = text.len() - line.len();
+    line_start == 0 || text.as_bytes()[line_start - 1] == b'\n'
 }
 
 /// Selects the set of log messages compared for determinism.
@@ -2095,7 +2118,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             (false, false) => unreachable!("guarded by the condition above"),
         };
         let refusal_reason = format!(
-            "{which_side} truncated at the configured size bound (the log ends with the bounded writer's truncation marker). The discarded tail was never written, so no comparison of these files can establish that the runs agree past that point. Re-run with a larger HERMIT_LOG_MAX_BYTES, or 0 to disable the bound."
+            "{which_side} truncated at the configured size bound (the log ends with the bounded writer's truncation marker, or with the stop line of hermit's --max-log-bytes cap). The discarded tail was never written, so no comparison of these files can establish that the runs agree past that point. Re-run with a larger HERMIT_LOG_MAX_BYTES (or 0 to disable that bound), or a larger --max-log-bytes."
         );
         writeln!(
             w,
@@ -3257,6 +3280,69 @@ mod test {
             );
         }
 
+        Ok(())
+    }
+
+    /// A log that ends with the `--max-log-bytes` stop line lost its tail like
+    /// a log that ends with the truncation marker, and is refused the same way
+    /// on the same matching content (round-2 review finding 5 on
+    /// <https://github.com/rrnewton/hermit/pull/3686>). The stop line must be a
+    /// whole line at end of file: guest-controlled text that merely contains
+    /// it, or a stop line followed by more log, is compared as usual.
+    #[test]
+    fn a_log_stopped_by_the_cap_is_refused_like_a_truncated_one() -> std::io::Result<()> {
+        let body = "2022-09-06T14:15:47.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: read(3, 0x1000, 1) = Ok(1)\n2022-09-06T14:15:48.000000Z INFO detcore: DETLOG [syscall] finish syscall #2: write(1, 0x2000, 1) = Ok(1)";
+        let stop = format!(
+            "hermit: log output exceeded --max-log-bytes=64K (65536 bytes); aborting the run and \
+             killing the guest process tree (exit 123). Lower --log / RUST_LOG verbosity, or raise \
+             --max-log-bytes, to let the run finish.\n{}\n",
+            super::LOG_CAP_STOP_LINE
+        );
+        let stopped = format!("{body}\n{stop}");
+        let marked_then_stopped = format!("{body}\n{}\n{stop}", super::TRUNCATION_MARKER);
+        let options = super::LogDiffOpts {
+            no_color: true,
+            ..Default::default()
+        };
+        for (label, left, right) in [
+            ("left", stopped.as_str(), body),
+            ("right", body, stopped.as_str()),
+            ("both", stopped.as_str(), stopped.as_str()),
+            ("marker then stop", marked_then_stopped.as_str(), body),
+        ] {
+            let mut out = Vec::new();
+            let summary = super::log_diff_summary_from_strs(left, right, &options, &mut out)?;
+            assert!(summary.diff_found, "{label}: {summary:?}");
+            assert_eq!((summary.compared_left, summary.compared_right), (0, 0));
+            assert!(
+                summary
+                    .refusal_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("truncated at the configured size bound")),
+                "{label}: {summary:?}"
+            );
+            assert!(!summary.matched_with_evidence(), "{label}");
+        }
+
+        let line = super::LOG_CAP_STOP_LINE;
+        for (label, text) in [
+            (
+                "stop line inside the final DETLOG line",
+                format!(
+                    "{body}\n2022-09-06T14:15:49.000000Z INFO detcore: DETLOG [syscall] inbound \
+                     syscall: statx(-100, 0x7fff -> \"/tmp/{line}\", AtFlags(0x0), 2, 0x7fff) = ?"
+                ),
+            ),
+            ("stop line followed by more log", format!("{line}\n{body}")),
+            (
+                "stop line at end of file but mid-line",
+                format!("{body}\nx {line}"),
+            ),
+        ] {
+            assert!(!super::log_was_truncated(&text), "{label}");
+        }
+        assert!(super::log_was_truncated(&stopped));
+        assert!(super::log_was_truncated(&marked_then_stopped));
         Ok(())
     }
 
