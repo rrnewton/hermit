@@ -2241,7 +2241,7 @@ mod tests {
             "/proc/self/netfilter",
             "/proc/abc/net/dev",
             "/sys/class/block",
-            "/home/net/dev",
+            "/srv/net/dev",
             "/net/dev",
             "/proc/net/../cpuinfo",
         ] {
