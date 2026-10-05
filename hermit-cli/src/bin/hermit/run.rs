@@ -11,7 +11,6 @@ use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::fs::File;
-#[cfg(feature = "sabre")]
 use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
@@ -517,7 +516,7 @@ pub struct RunOpts {
     #[clap(
         long,
         value_name = "NEW_TRACE",
-        conflicts_with_all = ["replay_networking", "network", "verify"]
+        conflicts_with_all = ["replay_networking", "network", "verify", "namespace_only"]
     )]
     record_networking: Option<PathBuf>,
 
@@ -526,7 +525,7 @@ pub struct RunOpts {
     #[clap(
         long,
         value_name = "TRACE",
-        conflicts_with_all = ["record_networking", "network"]
+        conflicts_with_all = ["record_networking", "network", "namespace_only"]
     )]
     replay_networking: Option<PathBuf>,
 
@@ -2257,6 +2256,56 @@ fn replay_networking_reads_the_trace_before_the_guest_starts() {
         format!("{error:#}").contains("is not a valid network trace"),
         "{error:#}"
     );
+}
+
+#[test]
+fn network_trace_is_reached_through_a_descriptor_opened_before_the_container() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("net.trace");
+    fs::write(&trace, b"stale trace").unwrap();
+    let flag = format!("--record-networking={}", trace.display());
+    let mut ro = RunOpts::parse_from(["fakehermit", &flag, "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    let file = ro.open_network_trace().unwrap().unwrap();
+    let inner = ro.det_opts.det_config.network_trace.path.clone().unwrap();
+    assert!(inner.starts_with("/proc/self/fd/"), "{}", inner.display());
+    assert_eq!(
+        fs::read(&trace).unwrap(),
+        b"",
+        "a record truncates up front"
+    );
+    let epoch = "2026-01-01T00:00:00Z".parse().unwrap();
+    detcore_model::network_engine::NetworkEngine::new_record(epoch)
+        .finish()
+        .unwrap()
+        .write_framed(File::create(&inner).unwrap())
+        .unwrap();
+    drop(file);
+    NetworkTraceV2::read_framed(File::open(&trace).unwrap()).unwrap();
+
+    let flag = format!("--replay-networking={}", trace.display());
+    let mut ro = RunOpts::parse_from(["fakehermit", &flag, "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    let _file = ro.open_network_trace().unwrap().unwrap();
+    let inner = ro.det_opts.det_config.network_trace.path.clone().unwrap();
+    assert!(inner.starts_with("/proc/self/fd/"), "{}", inner.display());
+    NetworkTraceV2::read_framed(File::open(&inner).unwrap()).unwrap();
+
+    let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    assert!(ro.open_network_trace().unwrap().is_none());
+    assert_eq!(ro.det_opts.det_config.network_trace.path, None);
+
+    for networking in [
+        "--record-networking=t".to_owned(),
+        format!("--replay-networking={}", trace.display()),
+    ] {
+        assert!(
+            RunOpts::try_parse_from(["fakehermit", &networking, "--namespace-only", "fakeprog"])
+                .is_err(),
+            "{networking} must conflict with --namespace-only, which bypasses detcore"
+        );
+    }
 }
 
 #[test]
@@ -4182,6 +4231,42 @@ impl RunOpts {
         })
     }
 
+    /// Open the network trace before the container starts and point the
+    /// config at the inherited descriptor. Detcore reads and writes the trace
+    /// inside the container, where the private `/tmp` and any chroot hide the
+    /// host path. A record truncates now, so a run that fails before writing
+    /// leaves an empty file that `--replay-networking` refuses.
+    fn open_network_trace(&mut self) -> Result<Option<File>, Error> {
+        let config = &mut self.det_opts.det_config.network_trace;
+        let file = match (config.mode, &config.path) {
+            (NetworkTraceMode::Off, _) | (_, None) => return Ok(None),
+            (NetworkTraceMode::Record, Some(path)) => OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .with_context(|| {
+                    format!(
+                        "--record-networking: cannot create network trace {}; choose a writable \
+                         path",
+                        path.display()
+                    )
+                })?,
+            (NetworkTraceMode::Replay, Some(path)) => File::open(path).with_context(|| {
+                format!(
+                    "--replay-networking: cannot open network trace {}; pass a trace written by \
+                     --record-networking",
+                    path.display()
+                )
+            })?,
+        };
+        config.path = Some(PathBuf::from(format!(
+            "/proc/self/fd/{}",
+            std::os::fd::AsRawFd::as_raw_fd(&file)
+        )));
+        Ok(Some(file))
+    }
+
     fn install_pmu_config(&self) -> Result<(), Error> {
         let Some(skid_margin) = self.skid_margin else {
             return Ok(());
@@ -4855,7 +4940,8 @@ impl RunOpts {
         } else {
             None
         };
-        let options = self.clone();
+        let mut options = self.clone();
+        let network_trace = options.open_network_trace()?;
         let global = global.clone();
         let guest_capture = guest_capture
             .map(GuestRunCaptureSession::try_clone_for_child)
@@ -4866,12 +4952,12 @@ impl RunOpts {
             apply_affinity(&mut process, self.pin_threads);
             return super::owned_container::run(
                 &mut process,
-                summary_output,
-                "held summary/output descriptors; no PID namespace".into(),
+                (summary_output, network_trace),
+                "held summary/output and network trace descriptors; no PID namespace".into(),
                 false,
                 "with_container",
                 timeout,
-                move |summary| {
+                move |(summary, _)| {
                     options.run_in_container(
                         &global,
                         capture_output,
@@ -4886,17 +4972,17 @@ impl RunOpts {
         let tmpfs = self.tmpfs()?;
         let (mut container, identity) = self.container(tmpfs.path())?;
         let resources = format!(
-            "private tmp {}, identity mounts and summary/output descriptors",
+            "private tmp {}, identity mounts, summary/output and network trace descriptors",
             tmpfs.path().display()
         );
         super::owned_container::run(
             &mut container,
-            (tmpfs, identity, summary_output),
+            (tmpfs, identity, summary_output, network_trace),
             resources,
             true,
             "with_container",
             timeout,
-            move |(_, identity, summary)| {
+            move |(_, identity, summary, _)| {
                 options.run_in_container(
                     &global,
                     capture_output,
@@ -5495,36 +5581,39 @@ impl RunOpts {
         log_file: fs::File,
         global: &GlobalOpts,
     ) -> Result<(Output, u64), Error> {
-        let options = self.clone();
+        let mut options = self.clone();
+        let network_trace = options.open_network_trace()?;
         let global = global.clone();
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
             return super::owned_container::run(
                 &mut process,
-                Some(log_file),
-                "verification log descriptor; no PID namespace".into(),
+                (Some(log_file), network_trace),
+                "verification log and network trace descriptors; no PID namespace".into(),
                 false,
                 "with_container",
                 None,
-                move |log| options.run_verify_in_container(log, &global, None),
+                move |(log, _)| options.run_verify_in_container(log, &global, None),
             )
             .map(|(value, _guards)| value);
         }
         let tmpfs = self.tmpfs()?;
         let (mut container, identity) = self.container(tmpfs.path())?;
         let resources = format!(
-            "private tmp {}, identity mounts and verification log",
+            "private tmp {}, identity mounts, verification log and network trace descriptors",
             tmpfs.path().display()
         );
         super::owned_container::run(
             &mut container,
-            (tmpfs, identity, Some(log_file)),
+            (tmpfs, identity, Some(log_file), network_trace),
             resources,
             true,
             "with_container",
             None,
-            move |(_, identity, log)| options.run_verify_in_container(log, &global, Some(identity)),
+            move |(_, identity, log, _)| {
+                options.run_verify_in_container(log, &global, Some(identity))
+            },
         )
         .map(|(value, _guards)| value)
     }
