@@ -130,7 +130,7 @@ pub enum LoaderState {
         prng: Pcg64Mcg,
         /// The bytes the real auxv write stored at AT_RANDOM. That write emits
         /// no record; the thread's post-exec callback emits it from these
-        /// bytes ([`record_initial_auxv`]), where every backend emits it.
+        /// bytes (`record_initial_auxv`), where every backend emits it.
         at_random_value: [u8; 16],
     },
     /// A later real kernel exec observed in this owned process lineage.
