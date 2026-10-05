@@ -2252,6 +2252,51 @@ fn with_runner_log_dir<T>(
     result
 }
 
+/// The `cell.*` tags of every planned cell run: each repetition of the
+/// selected cells and of a sample's parity references.
+fn planned_cell_run_tags(metadata: &RunMetadata) -> BTreeSet<String> {
+    metadata
+        .cells
+        .iter()
+        .chain(&metadata.reference_cells)
+        .flat_map(|cell| {
+            repetition_numbers(metadata.repetitions)
+                .map(move |repetition| format!("cell.{}", cell_run_slug(cell, repetition)))
+        })
+        .collect()
+}
+
+/// The typed scheduler must return exactly one outcome per planned cell run,
+/// by identity: the selected cells' and the parity references', no more and
+/// no fewer. The run path and `summarize` share this check.
+fn require_runner_outcomes_for_planned_cells(
+    metadata: &RunMetadata,
+    runner_evidence: &BTreeMap<String, RunnerEvidence>,
+) -> Result<(), String> {
+    let expected_runner_tags = planned_cell_run_tags(metadata);
+    let actual_runner_tags: BTreeSet<String> = runner_evidence.keys().cloned().collect();
+    if actual_runner_tags != expected_runner_tags {
+        let missing = expected_runner_tags
+            .difference(&actual_runner_tags)
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "none".into());
+        let foreign = actual_runner_tags
+            .difference(&expected_runner_tags)
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "none".into());
+        return Err(format!(
+            "typed scheduler cell identities do not match the selected runs: expected={} actual={} first_missing={} first_foreign={}",
+            expected_runner_tags.len(),
+            actual_runner_tags.len(),
+            missing,
+            foreign
+        ));
+    }
+    Ok(())
+}
+
 fn retain_execution_evidence(
     results: &Path,
     execution: &ExecutionEvidence,
@@ -2539,13 +2584,7 @@ fn run() -> Result<(), String> {
             let (metadata, dag) = write_plan(&root, &results, &output, &selection)?;
             println!("DAG: {}", output.display());
             println!("Results: {}", results.display());
-            println!(
-                "Cell runs: {}",
-                metadata
-                    .cells
-                    .len()
-                    .saturating_mul(metadata.repetitions.unwrap_or(1))
-            );
+            println!("Cell runs: {}", planned_cell_run_tags(&metadata).len());
             print_manifest_guest_memory(&metadata);
             print_unavailable(&metadata);
             println!("Whole-run bound: {}s", metadata.run_timeout_seconds);
@@ -2616,16 +2655,7 @@ fn run() -> Result<(), String> {
                     })
                 })?;
                 let runner_evidence = retain_execution_evidence(&results, &execution)?;
-                let expected_runs = metadata
-                    .cells
-                    .len()
-                    .saturating_mul(metadata.repetitions.unwrap_or(1));
-                if runner_evidence.len() != expected_runs {
-                    return Err(format!(
-                        "typed scheduler returned {} cell outcomes, expected exactly {expected_runs}",
-                        runner_evidence.len()
-                    ));
-                }
+                require_runner_outcomes_for_planned_cells(&metadata, &runner_evidence)?;
                 println!(
                     "Scheduler: {} pass(es), fixed -j {}, {:.3}s scheduler wall",
                     execution.passes, metadata.jobs, execution.scheduler_wall_s
@@ -3092,6 +3122,15 @@ fn print_sample(metadata: &RunMetadata) {
     }
     for cell in &metadata.cells {
         println!("  {}", display_id(cell));
+    }
+    if !metadata.reference_cells.is_empty() {
+        println!(
+            "Parity references: {} extra ptrace verify cell(s), not part of the sample",
+            metadata.reference_cells.len()
+        );
+        for cell in &metadata.reference_cells {
+            println!("  REFERENCE {}", display_id(cell));
+        }
     }
 }
 
@@ -8604,35 +8643,7 @@ fn summarize(
             .as_ref()
             .expect("standalone summary loaded runner evidence")
     });
-    let expected_runner_tags: BTreeSet<String> = metadata
-        .cells
-        .iter()
-        .chain(&metadata.reference_cells)
-        .flat_map(|cell| {
-            repetition_numbers(metadata.repetitions)
-                .map(move |repetition| format!("cell.{}", cell_run_slug(cell, repetition)))
-        })
-        .collect();
-    let actual_runner_tags: BTreeSet<String> = runner_evidence.keys().cloned().collect();
-    if actual_runner_tags != expected_runner_tags {
-        let missing = expected_runner_tags
-            .difference(&actual_runner_tags)
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "none".into());
-        let foreign = actual_runner_tags
-            .difference(&expected_runner_tags)
-            .next()
-            .cloned()
-            .unwrap_or_else(|| "none".into());
-        return Err(format!(
-            "typed scheduler cell identities do not match the selected runs: expected={} actual={} first_missing={} first_foreign={}",
-            expected_runner_tags.len(),
-            actual_runner_tags.len(),
-            missing,
-            foreign
-        ));
-    }
+    require_runner_outcomes_for_planned_cells(&metadata, runner_evidence)?;
 
     let mut by_backend: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
     let mut repeated = BTreeMap::<CellId, RepeatedCellTally>::new();
@@ -12032,26 +12043,6 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
     Ok(())
 }
 
-/// Prove that the generated checkout never follows an inherited repository
-/// location back to its source.
-///
-/// Git exports `GIT_DIR` to `git rebase --exec` steps, and `GIT_DIR`,
-/// `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks. With `GIT_DIR` naming the
-/// source, the checkout step detached the source's HEAD and rewrote its index
-/// before a later check noticed the empty checkout. With `GIT_WORK_TREE`
-/// naming the source, the clone refused to start
-/// (https://github.com/rrnewton/hermit/issues/3362). The source's state is
-/// compared before any preparation error is reported, so a run that both
-/// damages the source and fails names the damage.
-///
-/// The case goes through `enter_fresh_checkout`, the entry `run` uses, and
-/// then performs the reads a clean-source run makes of the generated checkout
-/// (`write_plan`'s source-dirtiness bit and HEAD read, and summarize's HEAD
-/// read) before this test clears anything itself. The source's HEAD is first
-/// moved past the prepared commit and an untracked file is planted in it, so a
-/// read that followed an inherited location back to the source would see
-/// another HEAD or a dirty tree. The self-test process runs no other thread,
-/// so it may set and clear the variables here.
 /// Red cells the default run type does not select: a test-level label
 /// (compat/java, compat/strict-du), a per-backend label (compat/comm on
 /// SaBRe), and an rr-compat replay cell, beside a red default-run-type cell.
@@ -12643,6 +12634,26 @@ fn parity_reference_sample_self_test(root: &Path, scratch: &Path) -> Result<(), 
     Ok(())
 }
 
+/// Prove that the generated checkout never follows an inherited repository
+/// location back to its source.
+///
+/// Git exports `GIT_DIR` to `git rebase --exec` steps, and `GIT_DIR`,
+/// `GIT_WORK_TREE` and `GIT_INDEX_FILE` to hooks. With `GIT_DIR` naming the
+/// source, the checkout step detached the source's HEAD and rewrote its index
+/// before a later check noticed the empty checkout. With `GIT_WORK_TREE`
+/// naming the source, the clone refused to start
+/// (https://github.com/rrnewton/hermit/issues/3362). The source's state is
+/// compared before any preparation error is reported, so a run that both
+/// damages the source and fails names the damage.
+///
+/// The case goes through `enter_fresh_checkout`, the entry `run` uses, and
+/// then performs the reads a clean-source run makes of the generated checkout
+/// (`write_plan`'s source-dirtiness bit and HEAD read, and summarize's HEAD
+/// read) before this test clears anything itself. The source's HEAD is first
+/// moved past the prepared commit and an untracked file is planted in it, so a
+/// read that followed an inherited location back to the source would see
+/// another HEAD or a dirty tree. The self-test process runs no other thread,
+/// so it may set and clear the variables here.
 fn inherited_location_fresh_checkout_self_test(source: &Path, sha: &str) -> Result<(), String> {
     let git_dir = source.join(".git");
     let git_dir_text = git_dir.to_string_lossy().into_owned();
@@ -25604,5 +25615,90 @@ mod parity_reference_tests {
         let cleanup = SelfTestDirectory::new(path.clone());
         parity_reference_sample_self_test(&root, &path).unwrap();
         cleanup.remove().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod runner_outcome_tests {
+    //! The run path accepts the typed scheduler's outcomes only when they are
+    //! exactly the planned cell runs: the sample's and its parity references'.
+    use super::*;
+
+    fn cell(test: &str, backend: &str) -> CellId {
+        CellId {
+            lane: "portable".into(),
+            category: "fixture".into(),
+            test: test.into(),
+            mode: "verify".into(),
+            backend: backend.into(),
+        }
+    }
+
+    fn metadata(
+        cells: Vec<CellId>,
+        references: Vec<CellId>,
+        repetitions: Option<usize>,
+    ) -> RunMetadata {
+        let mut metadata: RunMetadata = serde_json::from_value(json!({
+            "schema": RUN_SCHEMA,
+            "hermit_sha": "fixture",
+            "detcore_tree": "fixture",
+            "source_tree_dirty": false,
+            "run_timeout_seconds": 7200,
+            "cells": [],
+        }))
+        .unwrap();
+        metadata.cells = cells;
+        metadata.reference_cells = references;
+        metadata.repetitions = repetitions;
+        metadata
+    }
+
+    fn outcomes(tags: impl IntoIterator<Item = String>) -> BTreeMap<String, RunnerEvidence> {
+        tags.into_iter()
+            .map(|tag| (tag, RunnerEvidence::default()))
+            .collect()
+    }
+
+    #[test]
+    fn a_sample_with_references_needs_exactly_its_cells_and_references_outcomes() {
+        let sampled = vec![cell("fixture/a", "sabre"), cell("fixture/b", "kvm")];
+        let references = vec![cell("fixture/a", "ptrace")];
+        for repetitions in [None, Some(2)] {
+            let metadata = metadata(sampled.clone(), references.clone(), repetitions);
+            let tags = |cells: &[CellId]| -> Vec<String> {
+                cells
+                    .iter()
+                    .flat_map(|cell| {
+                        repetition_numbers(repetitions).map(move |repetition| {
+                            format!("cell.{}", cell_run_slug(cell, repetition))
+                        })
+                    })
+                    .collect()
+            };
+            let all: Vec<String> = tags(&sampled)
+                .into_iter()
+                .chain(tags(&references))
+                .collect();
+            require_runner_outcomes_for_planned_cells(&metadata, &outcomes(all.clone()))
+                .unwrap_or_else(|error| {
+                    panic!("{repetitions:?}: N plus R outcomes refused: {error}")
+                });
+            // A missing reference outcome is refused.
+            let missing_reference: Vec<String> = tags(&sampled);
+            assert!(
+                require_runner_outcomes_for_planned_cells(&metadata, &outcomes(missing_reference))
+                    .is_err(),
+                "{repetitions:?}: a missing reference outcome was accepted"
+            );
+            // The right count with a foreign tag in place of a reference is refused.
+            let mut foreign = tags(&sampled);
+            foreign
+                .extend((0..tags(&references).len()).map(|index| format!("cell.foreign-{index}")));
+            assert!(
+                require_runner_outcomes_for_planned_cells(&metadata, &outcomes(foreign)).is_err(),
+                "{repetitions:?}: a foreign outcome was accepted in place of a reference"
+            );
+        }
     }
 }
