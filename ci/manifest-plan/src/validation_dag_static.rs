@@ -1220,8 +1220,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result
     // (https://github.com/rrnewton/hermit/issues/3520, C5) retain all 147
     // prior identities (`cargo nextest list --profile ci` with this node's
-    // skips lists 150).
-    ("test.cli", 150),
+    // skips lists 150). liteinst_in_guest_verify_log_keeps_records_in_ptraces_order
+    // retains all 150: 150 + 1 = 151, measured with the same listing.
+    ("test.cli", 151),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1284,8 +1285,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same installed-resource test as test.cli; all 144 prior identities
     // retained. The same two late-mapped-CPUID tests as test.cli; all 145
     // prior identities retained. The same three forwarded-record --verify
-    // tests as test.cli; all 147 prior identities retained.
-    ("test.cli_on_host", 150),
+    // tests as test.cli; all 147 prior identities retained. The same
+    // forwarded-record order test as test.cli; all 150 retained.
+    ("test.cli_on_host", 151),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),

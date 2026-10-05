@@ -11,6 +11,9 @@
 //! ['detlog_debug] can be use to write a deterministic log entry at DEBUG level
 
 use std::fmt;
+use std::os::fd::AsRawFd;
+use std::os::fd::OwnedFd;
+use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -237,6 +240,83 @@ pub fn send_forwarded_record(
             }
         }
     });
+}
+
+/// Receives each message the coordinator drains from a forwarding socket, in arrival
+/// order: a [`forwarded_line`], or a [`FORWARDING_LOSS_NOTICE`].
+pub type ForwardedRecordSink = Box<dyn FnMut(&[u8]) + Send>;
+
+/// The receiving end of the socket an in-guest Tool sends its records on, and where
+/// the coordinator writes them ([`set_forwarded_source`]).
+static FORWARDED_SOURCE: Mutex<Option<(OwnedFd, ForwardedRecordSink)>> = Mutex::new(None);
+
+/// Registers the receiving end of the socket an in-guest Tool sends its records on
+/// ([`send_forwarded_record`]) and the sink that writes them to the run's log.
+///
+/// THE ORDER RULE, one for every backend whose Tool runs in the guest: the coordinator
+/// writes the records already waiting on the socket immediately before it handles any
+/// guest request ([`drain_forwarded`] at the top of the request handler), and once more
+/// when the run ends. A `send` on a message socket queues the record on the receiver
+/// before it returns, so a guest thread's records for an event are waiting when its
+/// next request arrives, and every coordinator record for that event comes from
+/// handling that request. The log then holds the guest's and the coordinator's
+/// records in the order a single-process (ptrace) run writes them, and both
+/// verification runs of a deterministic guest write the same log.
+pub fn set_forwarded_source(socket: OwnedFd, sink: ForwardedRecordSink) {
+    *FORWARDED_SOURCE.lock().unwrap() = Some((socket, sink));
+}
+
+/// Unregisters the source set with [`set_forwarded_source`], after a last
+/// [`drain_forwarded`], and closes its socket.
+pub fn clear_forwarded_source() {
+    drain_forwarded();
+    FORWARDED_SOURCE.lock().unwrap().take();
+}
+
+/// Passes every message waiting on the registered forwarding socket to its sink, in
+/// arrival order, without blocking. Without a registered source it does nothing.
+pub fn drain_forwarded() {
+    let mut source = FORWARDED_SOURCE.lock().unwrap();
+    let Some((socket, sink)) = source.as_mut() else {
+        return;
+    };
+    let fd = socket.as_raw_fd();
+    let mut buffer = Vec::new();
+    loop {
+        // The size of the next message, without taking it (a message socket reports
+        // the whole message's length with MSG_TRUNC).
+        // SAFETY: a zero-length peek writes nothing.
+        let size = unsafe {
+            libc::recv(
+                fd,
+                std::ptr::null_mut(),
+                0,
+                libc::MSG_PEEK | libc::MSG_TRUNC | libc::MSG_DONTWAIT,
+            )
+        };
+        if size < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+            continue;
+        }
+        if size <= 0 {
+            // Nothing waiting (EAGAIN), the senders are gone (0), or an error: the
+            // next drain tries again, and the end of the run drains the rest.
+            return;
+        }
+        buffer.resize(size as usize, 0);
+        // SAFETY: `buffer` has room for `size` bytes.
+        let received = unsafe {
+            libc::recv(
+                fd,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+                libc::MSG_DONTWAIT,
+            )
+        };
+        if received <= 0 {
+            return;
+        }
+        sink(&buffer[..received as usize]);
+    }
 }
 
 /// Returns whether a process-local deterministic-record sink is installed.

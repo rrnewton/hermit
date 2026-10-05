@@ -491,20 +491,6 @@ fn append_within_log_bound(path: &Path, bytes: &[u8], limit: u64) -> Result<(), 
     Ok(())
 }
 
-/// Ends the log at `path` with the bound's truncation marker unless it already
-/// ends with it: records past the bound were discarded before they reached it.
-fn mark_log_truncated(path: &Path, limit: u64) -> Result<(), Error> {
-    let log = OpenOptions::new().read(true).append(true).open(path)?;
-    if log_ends_truncated(&log)? {
-        return Ok(());
-    }
-    // No room left under the bound, so the write is discarded and announced.
-    let mut log = BoundedWriter::resume(log, limit, limit);
-    log.write_all(b"\n")?;
-    log.flush()?;
-    Ok(())
-}
-
 /// Whether `log` already ends with the bound's truncation marker.
 fn log_ends_truncated(mut log: &fs::File) -> Result<bool, Error> {
     let written = log.metadata()?.len();
@@ -518,253 +504,92 @@ fn log_ends_truncated(mut log: &fs::File) -> Result<bool, Error> {
     ))
 }
 
-/// How long [`ForwardedDrain`] waits for its helper to stop before killing it.
-const FORWARDED_DRAIN_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Starts a line the coordinator writes into a run's log for a message on the
+/// forwarding socket that is not a record (a loss notice, or anything else), so
+/// verification refuses the run instead of comparing incomplete records.
+const FORWARDING_REFUSED_MARKER: &str = "HERMIT_DETLOG_FORWARDING_REFUSED";
 
-/// Collects what one in-guest LiteInst run sends on its forwarding socket while
-/// the run executes, so a guest is never blocked on a full socket. The work is
-/// done by a forked helper process, not a thread: the verify process must stay
-/// single-threaded until it has cloned the run's container, because Reverie's
-/// raw clone runs no fork handlers, so a thread holding the allocator's lock at
-/// that moment would leave the container with it held. The helper keeps at
-/// most one byte more than the log bound (enough for the bound to announce the
-/// truncation) and discards the rest, in a temporary file. It stops at end of
-/// input, or once the run is over (the parent writes a byte to its stop pipe)
-/// and nothing is left to read: a descendant that outlives the run must not
-/// hold verification open. The stop is an explicit byte, not the pipe's end of
-/// file, because container clones inherit the pipe's write end; and waiting
-/// for the helper is bounded, so a helper that does not stop is killed and
-/// reported rather than waited for forever.
-struct ForwardedDrain {
-    helper: libc::pid_t,
-    stop: Option<std::os::fd::OwnedFd>,
-    output: fs::File,
+/// A verification run's log writer, shared between the tracing subscriber and
+/// the coordinator's forwarded records (`detcore::detlog::set_forwarded_source`).
+/// Each write takes the one lock for the whole buffer, so a record and a
+/// tracing event never interleave within a line, and both go through the
+/// log's byte bound.
+#[derive(Clone)]
+struct SharedLog(std::sync::Arc<std::sync::Mutex<BoundedWriter<fs::File>>>);
+
+impl SharedLog {
+    fn new(writer: BoundedWriter<fs::File>) -> Self {
+        Self(std::sync::Arc::new(std::sync::Mutex::new(writer)))
+    }
+
+    /// Writes each forwarded record as the line `extract_forwarded_detlogs`
+    /// writes for one (the normalized timestamp, then the record), and any other
+    /// message behind [`FORWARDING_REFUSED_MARKER`].
+    fn record_sink(&self) -> detcore::detlog::ForwardedRecordSink {
+        let log = self.clone();
+        Box::new(move |message: &[u8]| {
+            let payload = message.strip_suffix(b"\n").unwrap_or(message);
+            let mut line = Vec::with_capacity(payload.len() + 40);
+            if payload.starts_with(b"INFO detcore") && find_bytes(payload, b" DETLOG ").is_some() {
+                line.extend_from_slice(NORMALIZED_FORWARDED_DETLOG_TIMESTAMP.as_bytes());
+                line.push(b' ');
+                line.extend_from_slice(payload);
+            } else {
+                line.extend_from_slice(FORWARDING_REFUSED_MARKER.as_bytes());
+                line.push(b' ');
+                line.extend_from_slice(&payload[..payload.len().min(200)]);
+            }
+            line.push(b'\n');
+            // A failed write is the log's own failure; the bound announces it.
+            let _ = log.0.lock().unwrap().write_all(&line);
+        })
+    }
 }
 
-impl ForwardedDrain {
-    fn start(
-        receiver: std::os::fd::OwnedFd,
-        sender: &std::os::fd::OwnedFd,
-        limit: u64,
-    ) -> Result<Self, Error> {
-        let output = tempfile::tempfile().context("creating the in-guest DETLOG drain file")?;
-        let mut pipe = [-1; 2];
-        // SAFETY: pipe2 writes two descriptors into `pipe` on success.
-        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
-            return Err(Error::new(std::io::Error::last_os_error())
-                .context("creating the in-guest DETLOG drain's stop pipe"));
-        }
-        // SAFETY: pipe2 returned two new descriptors this function owns.
-        let [stop_reader, stop_writer] = pipe
-            .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
-        // SAFETY: the verify process is single-threaded here (see above), so the
-        // child may allocate; it leaves only through `_exit`.
-        match unsafe { libc::fork() } {
-            -1 => Err(Error::new(std::io::Error::last_os_error())
-                .context("forking the in-guest DETLOG drain")),
-            0 => {
-                // Hold nothing but its own three descriptors and stdio. Best
-                // effort: the helper stops on an explicit byte, so a copy of a
-                // stop pipe's writer or of a sending end that survives here
-                // cannot keep it running.
-                let _ = sender;
-                close_all_descriptors_except(&[
-                    receiver.as_raw_fd(),
-                    stop_reader.as_raw_fd(),
-                    output.as_raw_fd(),
-                ]);
-                let status = match drain_forwarded_records(
-                    receiver.as_raw_fd(),
-                    stop_reader.as_raw_fd(),
-                    output.as_raw_fd(),
-                    limit,
-                ) {
-                    Ok(()) => 0,
-                    Err(_) => 1,
-                };
-                // SAFETY: `_exit` takes no pointers and does not return.
-                unsafe { libc::_exit(status) }
-            }
-            helper => Ok(Self {
-                helper,
-                stop: Some(stop_writer),
-                output,
-            }),
-        }
+impl Write for SharedLog {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().write(bytes)
     }
 
-    /// Tells the helper the run is over and waits for it, at most
-    /// [`FORWARDED_DRAIN_STOP_TIMEOUT`]; a helper still running then is killed,
-    /// and reaped if it dies within a further second. Returns its wait status,
-    /// or `None` when it had to be killed.
-    fn stop_and_reap(&mut self) -> Option<libc::c_int> {
-        if let Some(stop) = self.stop.take() {
-            // SAFETY: one byte from a live buffer to this process's pipe.
-            unsafe { libc::write(stop.as_raw_fd(), b"x".as_ptr().cast(), 1) };
-        }
-        let helper = std::mem::replace(&mut self.helper, -1);
-        if helper <= 0 {
-            return None;
-        }
-        let deadline = std::time::Instant::now() + FORWARDED_DRAIN_STOP_TIMEOUT;
-        let mut status = 0;
-        loop {
-            // SAFETY: polling this process's own child.
-            match unsafe { libc::waitpid(helper, &mut status, libc::WNOHANG) } {
-                pid if pid == helper => return Some(status),
-                0 if std::time::Instant::now() < deadline => {
-                    std::thread::sleep(std::time::Duration::from_millis(5));
-                }
-                _ => {
-                    // SAFETY: killing this process's own child.
-                    unsafe { libc::kill(helper, libc::SIGKILL) };
-                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-                    // SAFETY: polling this process's own child.
-                    while unsafe { libc::waitpid(helper, &mut status, libc::WNOHANG) } == 0
-                        && std::time::Instant::now() < deadline
-                    {
-                        std::thread::sleep(std::time::Duration::from_millis(5));
-                    }
-                    return None;
-                }
-            }
-        }
+    fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        self.0.lock().unwrap().write_all(bytes)
     }
 
-    fn finish(mut self) -> Result<Vec<u8>, Error> {
-        let Some(status) = self.stop_and_reap() else {
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.lock().unwrap().flush()
+    }
+}
+
+/// How many forwarded syscall records the coordinator wrote into the log at
+/// `path` during the run. A [`FORWARDING_REFUSED_MARKER`] line (the socket
+/// carried a loss notice or anything else) is an error, so verification
+/// reports no result instead of comparing incomplete records.
+fn forwarded_records_in_log(path: &Path) -> Result<usize, Error> {
+    let text = fs::read(path)?;
+    let mut syscall_records = 0;
+    for line in text.split(|byte| *byte == b'\n') {
+        if let Some(refused) = line.strip_prefix(FORWARDING_REFUSED_MARKER.as_bytes()) {
+            let refused = String::from_utf8_lossy(refused);
+            if refused
+                .trim_start()
+                .starts_with(detcore::detlog::FORWARDING_LOSS_NOTICE)
+            {
+                anyhow::bail!(
+                    "the in-guest Tool could not forward every DETLOG record (it sent{refused} \
+                     instead), so the compared records would be incomplete"
+                );
+            }
             anyhow::bail!(
-                "the in-guest DETLOG drain did not stop within {FORWARDED_DRAIN_STOP_TIMEOUT:?} \
-                 and was killed"
+                "the in-guest DETLOG forwarding socket carried a message that is not a record:{refused}"
             );
-        };
-        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
-            anyhow::bail!("the in-guest DETLOG drain failed (wait status {status})");
         }
-        let mut records = Vec::new();
-        self.output.seek(std::io::SeekFrom::Start(0))?;
-        self.output.read_to_end(&mut records)?;
-        Ok(records)
+        if line.starts_with(NORMALIZED_FORWARDED_DETLOG_TIMESTAMP.as_bytes())
+            && find_bytes(line, b"DETLOG [syscall]").is_some()
+        {
+            syscall_records += 1;
+        }
     }
-}
-
-impl Drop for ForwardedDrain {
-    fn drop(&mut self) {
-        let _ = self.stop_and_reap();
-    }
-}
-
-/// Closes every descriptor above standard error except `keep`, in this
-/// (forked, single-threaded) process.
-fn close_all_descriptors_except(keep: &[libc::c_int]) {
-    let mut keep: Vec<libc::c_uint> = keep.iter().map(|&fd| fd as libc::c_uint).collect();
-    keep.sort_unstable();
-    let mut start: libc::c_uint = 3;
-    for &fd in &keep {
-        if fd > start {
-            // SAFETY: close_range takes plain integers.
-            unsafe { libc::syscall(libc::SYS_close_range, start, fd - 1, 0) };
-        }
-        start = start.max(fd + 1);
-    }
-    // SAFETY: as above.
-    unsafe { libc::syscall(libc::SYS_close_range, start, libc::c_uint::MAX, 0) };
-}
-
-/// The drain helper's loop: see [`ForwardedDrain`].
-fn drain_forwarded_records(
-    receiver: libc::c_int,
-    stop: libc::c_int,
-    output: libc::c_int,
-    limit: u64,
-) -> std::io::Result<()> {
-    let cap = if limit == 0 {
-        u64::MAX
-    } else {
-        limit.saturating_add(1)
-    };
-    let mut kept: u64 = 0;
-    let mut stopping = false;
-    let mut buffer = vec![0u8; 1 << 20];
-    loop {
-        let mut polls = [
-            libc::pollfd {
-                fd: receiver,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: stop,
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        let count = if stopping { 1 } else { 2 };
-        // SAFETY: `polls` holds `count` valid pollfds.
-        let ready = unsafe { libc::poll(polls.as_mut_ptr(), count, if stopping { 0 } else { -1 }) };
-        if ready < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if !stopping && polls[1].revents != 0 {
-            // The run is over: read what is queued, then stop.
-            stopping = true;
-        }
-        if polls[0].revents & (libc::POLLIN | libc::POLLHUP) == 0 {
-            if stopping {
-                return Ok(());
-            }
-            continue;
-        }
-        // SAFETY: `buffer` is a live, writable byte slice of the given length.
-        let received = unsafe {
-            libc::recv(
-                receiver,
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                libc::MSG_DONTWAIT | libc::MSG_TRUNC,
-            )
-        };
-        if received == 0 {
-            return Ok(());
-        }
-        if received < 0 {
-            let error = std::io::Error::last_os_error();
-            match error.kind() {
-                std::io::ErrorKind::Interrupted => continue,
-                std::io::ErrorKind::WouldBlock if stopping => return Ok(()),
-                std::io::ErrorKind::WouldBlock => continue,
-                _ => return Err(error),
-            }
-        }
-        let received = received as usize;
-        if received > buffer.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "a forwarded DETLOG record of {received} bytes exceeds the reader's buffer"
-                ),
-            ));
-        }
-        let take = (received as u64).min(cap - kept) as usize;
-        let mut rest = &buffer[..take];
-        while !rest.is_empty() {
-            // SAFETY: `rest` is a live, initialized byte slice of the given length.
-            let written = unsafe { libc::write(output, rest.as_ptr().cast(), rest.len()) };
-            if written < 0 {
-                let error = std::io::Error::last_os_error();
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
-            rest = &rest[written as usize..];
-        }
-        kept += take as u64;
-    }
+    Ok(syscall_records)
 }
 
 struct PreparedMounts {
@@ -3949,11 +3774,13 @@ impl RunOpts {
     /// LiteInst: the guest's runtime sends each record as one message on the
     /// sending end, a descriptor Reverie protects from the guest, so the
     /// guest's own output never mixes with them
-    /// (`hermit::forward_in_guest_detlogs_to`). Returns the sending end and a
-    /// drain already collecting from the receiving end.
+    /// (`hermit::forward_in_guest_detlogs_to`). Returns the sending end and the
+    /// receiving end; inside the run's container, the coordinator writes what
+    /// arrives on the receiving end into the run's log in order
+    /// (`detcore::detlog::set_forwarded_source`).
     fn forwarded_detlog_channel(
         &self,
-    ) -> Result<Option<(std::os::fd::OwnedFd, ForwardedDrain)>, Error> {
+    ) -> Result<Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>, Error> {
         if !self.uses_in_guest_liteinst() {
             return Ok(None);
         }
@@ -3988,45 +3815,31 @@ impl RunOpts {
                 )
             };
         }
-        let limit = log_max_bytes().map_err(Error::msg)?;
-        let drain = ForwardedDrain::start(receiver, &sender, limit)?;
-        Ok(Some((sender, drain)))
+        Ok(Some((sender, receiver)))
     }
 
     /// Moves the DETLOG records this run's in-guest Tool forwarded into the
     /// run's log and returns how many are syscall records, or `None` when the
     /// backend forwards none. SaBRe's plugin forwards them on the guest's
-    /// standard error, from which they are cut out; in-guest LiteInst sends
-    /// them on its own socket, collected by `drain`, which carries nothing else.
+    /// standard error, from which they are cut out and appended. In-guest
+    /// LiteInst sends them on its own socket (`socket`), whose records the
+    /// coordinator already wrote into the log in order during the run; they
+    /// are only counted here, and a run whose socket carried anything but
+    /// records is refused.
     fn take_forwarded_detlogs(
         &self,
         log: &Path,
         stderr: &mut Vec<u8>,
-        drain: Option<ForwardedDrain>,
+        socket: bool,
     ) -> Result<Option<usize>, Error> {
         if !self.forwards_in_guest_detlogs() {
             return Ok(None);
         }
+        if socket {
+            return forwarded_records_in_log(log).map(Some);
+        }
         let limit = log_max_bytes().map_err(Error::msg)?;
-        let Some(drain) = drain else {
-            return extract_forwarded_detlogs(log, stderr, limit, false).map(Some);
-        };
-        let mut records = drain.finish()?;
-        let overflowed = limit != 0 && records.len() as u64 > limit;
-        if overflowed {
-            // The drain kept one byte past the bound and discarded the rest, so
-            // its last line may be cut short: drop it.
-            let whole = records
-                .iter()
-                .rposition(|byte| *byte == b'\n')
-                .map_or(0, |end| end + 1);
-            records.truncate(whole);
-        }
-        let syscall_records = extract_forwarded_detlogs(log, &mut records, limit, true)?;
-        if overflowed {
-            mark_log_truncated(log, limit)?;
-        }
-        Ok(Some(syscall_records))
+        extract_forwarded_detlogs(log, stderr, limit, false).map(Some)
     }
 
     /// Whether this run hosts Detcore inside the guest through LiteInst.
@@ -5637,8 +5450,9 @@ impl RunOpts {
 
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
-        let (forwarded1_for_run, mut forwarded1) = self.forwarded_detlog_channel()?.unzip();
-        let (forwarded2_for_run, mut forwarded2) = self.forwarded_detlog_channel()?.unzip();
+        let forwarded1_for_run = self.forwarded_detlog_channel()?;
+        let forwarded2_for_run = self.forwarded_detlog_channel()?;
+        let (forwarded1, forwarded2) = (forwarded1_for_run.is_some(), forwarded2_for_run.is_some());
 
         // Verification historically sent both executions to one --summary-json
         // path, so run 2 overwrote run 1. Keep the public path's run-2 meaning,
@@ -5716,7 +5530,7 @@ impl RunOpts {
         };
         let mut out1 = out1;
         let forwarded_syscalls1 =
-            match self.take_forwarded_detlogs(&log1_path, &mut out1.stderr, forwarded1.take()) {
+            match self.take_forwarded_detlogs(&log1_path, &mut out1.stderr, forwarded1) {
                 Ok(count) => count,
                 Err(error) => {
                     if self.keep_logs {
@@ -5888,7 +5702,7 @@ impl RunOpts {
                 "LiteInst"
             };
             let forwarded_syscalls2 = match self
-                .take_forwarded_detlogs(&log2_path, &mut out2.stderr, forwarded2.take())
+                .take_forwarded_detlogs(&log2_path, &mut out2.stderr, forwarded2)
                 .and_then(|count| {
                     count.context("run 2 forwarded no DETLOG records where run 1 did")
                 }) {
@@ -6212,7 +6026,7 @@ impl RunOpts {
     pub fn run_verify(
         &self,
         log_file: fs::File,
-        forwarded_detlogs: Option<std::os::fd::OwnedFd>,
+        forwarded_detlogs: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
         global: &GlobalOpts,
     ) -> Result<(Output, u64), Error> {
         let mut options = self.clone();
@@ -6588,7 +6402,7 @@ impl RunOpts {
     fn run_verify_in_container(
         &self,
         log_file: &mut Option<fs::File>,
-        forwarded_detlogs: &mut Option<std::os::fd::OwnedFd>,
+        forwarded_detlogs: &mut Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(Output, u64), Error> {
@@ -6613,11 +6427,10 @@ impl RunOpts {
         // when a fail-closed guest dies, which is precisely the line naming the
         // cause -- measured 0 of 18 runs versus 4 of 4. See
         // `init_sync_file_tracing`.
-        let _guard = init_sync_file_tracing(
-            Some(level),
-            BoundedWriter::new(log_file, limit),
-            self.runtime_backend(),
-        );
+        // The coordinator writes forwarded records through this same writer, so
+        // a record and a tracing event never share a line.
+        let log = SharedLog::new(BoundedWriter::new(log_file, limit));
+        let _guard = init_sync_file_tracing(Some(level), log.clone(), self.runtime_backend());
 
         let command = self.guest_command()?;
 
@@ -6635,9 +6448,10 @@ impl RunOpts {
         config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
 
-        if let Some(socket) = forwarded_detlogs.take() {
-            hermit::forward_in_guest_detlogs_to(socket);
-        }
+        let forwarding = forwarded_detlogs.take().map(|(sender, receiver)| {
+            hermit::forward_in_guest_detlogs_to(sender);
+            detcore::detlog::set_forwarded_source(receiver, log.record_sink());
+        });
         let result = hermit::run_with_output_backend_timeout_and_skid_overshoots(
             command,
             config,
@@ -6645,7 +6459,12 @@ impl RunOpts {
             &self.summary_json,
             self.runtime_backend(),
             None,
-        )?;
+        );
+        if forwarding.is_some() {
+            // Records sent after the guest's last request, then close the socket.
+            detcore::detlog::clear_forwarded_source();
+        }
+        let result = result?;
         self.relabel_e9patch_dispatch_stats(&self.summary_json)?;
         Ok(result)
     }
@@ -7309,21 +7128,11 @@ mod tests {
         assert!(detcore::logdiff::log_was_truncated(&text), "{text}");
         assert!(text.starts_with(coordinator), "{text}");
 
-        // A log the bound already truncated keeps the marker on its last line,
-        // and marking it truncated again changes nothing.
+        // A log the bound already truncated keeps the marker on its last line.
         let truncated = std::fs::read(log.path()).unwrap();
         let mut stream = records(3);
         extract_forwarded_detlogs(log.path(), &mut stream, 0, true).unwrap();
-        mark_log_truncated(log.path(), limit).unwrap();
         assert_eq!(std::fs::read(log.path()).unwrap(), truncated);
-
-        // Records the drain had to discard: the log is marked truncated even
-        // though what reached it fits.
-        let log = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(log.path(), coordinator).unwrap();
-        mark_log_truncated(log.path(), 1 << 20).unwrap();
-        let text = std::fs::read_to_string(log.path()).unwrap();
-        assert!(detcore::logdiff::log_was_truncated(&text), "{text}");
 
         // Within the bound nothing is cut.
         let log = tempfile::NamedTempFile::new().unwrap();

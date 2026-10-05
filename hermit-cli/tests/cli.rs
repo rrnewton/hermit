@@ -12272,6 +12272,103 @@ fn liteinst_in_guest_verify_compares_the_records_the_guest_forwards() {
     );
 }
 
+/// Run 1's retained verify log of `/bin/true` under `backend`, with one fixed
+/// epoch, kept in `logs`.
+#[cfg(feature = "liteinst")]
+fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
+    let log_dir = logs.to_str().expect("UTF-8 temporary path");
+    // `--log info`, as the e2e harness runs every verify cell: at the default
+    // verification level a ptrace record carries its tracing span.
+    let args = [
+        "--log",
+        "info",
+        "--backend",
+        backend,
+        "run",
+        "--max-timeslice=disabled",
+        "--epoch=2026-10-05T09:20:32+00:00",
+        "--verify",
+        "--keep-logs",
+        "--verify-log-dir",
+        log_dir,
+        "--",
+        "/bin/true",
+    ];
+    let output = hermit_command(&args)
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    assert_success(&output, &args);
+    let golden: Vec<_> = fs::read_dir(logs)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("run1_log_"))
+        })
+        .collect();
+    let [golden] = &golden[..] else {
+        panic!("expected one retained run 1 log in {log_dir}, found {golden:?}");
+    };
+    golden.clone()
+}
+
+/// The coordinator writes the records the in-guest Tool forwards into the log
+/// as it handles the guest's requests, so backend parity's own comparison
+/// (`hermit log-diff --record-envelope cross-backend-detcore-v1`) of the
+/// ptrace and the in-guest LiteInst run 1 logs of `/bin/true` matches through
+/// the root thread's seeding, the first scheduler commits and the post-exec
+/// AT_RANDOM record. When the records were appended after the run, the log
+/// held every coordinator record first, and the comparison diverged at the
+/// third record (2 matched).
+#[test]
+#[cfg(feature = "liteinst")]
+fn liteinst_in_guest_verify_log_keeps_records_in_ptraces_order() {
+    let _lock = hermit_run_guard();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (ptrace_dir, liteinst_dir) = (dir.path().join("ptrace"), dir.path().join("liteinst"));
+    fs::create_dir_all(&ptrace_dir).unwrap();
+    fs::create_dir_all(&liteinst_dir).unwrap();
+    let ptrace = verify_log_of_true("ptrace", &ptrace_dir);
+    let liteinst = verify_log_of_true("liteinst", &liteinst_dir);
+    let report = dir.path().join("log-diff.json");
+    let args = [
+        "log-diff",
+        ptrace.to_str().unwrap(),
+        liteinst.to_str().unwrap(),
+        "--json",
+        report.to_str().unwrap(),
+        "--record-envelope",
+        "cross-backend-detcore-v1",
+    ];
+    // /bin/true still differs later (its loader's system calls are not
+    // intercepted in the guest), so the comparison exits nonzero; read its report.
+    hermit_command(&args)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit log-diff");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("log-diff report")).unwrap();
+    let matched = report["matched_prefix_records"].as_u64().unwrap_or(0);
+    let first = report["first_divergent_left_message"]
+        .as_str()
+        .unwrap_or("");
+    assert!(matched >= 6, "{report}");
+    for early in [
+        "USER RAND",
+        "CHAOSRAND",
+        "AT_RANDOM",
+        "COMMIT turn 0",
+        "COMMIT turn 1",
+    ] {
+        assert!(!first.contains(early), "diverged at {early}: {report}");
+    }
+}
+
 /// A guest that points its stderr at a pipe nobody reads, with SIGPIPE at its
 /// default action, that dup2s onto every descriptor from 1024 to 1039 (where
 /// Reverie keeps, and keeps moving, the forwarding socket) and then closes
