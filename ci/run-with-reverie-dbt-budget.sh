@@ -851,7 +851,23 @@ fi
 # rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
 # CMAKE/CMAKE_GENERATOR policy, MAX_PARALLEL_JOBS=16 and the existing
 # 1050 effective-job-seconds budget are unchanged.
-expected_pin=7b3168b7af405ca0f4af25fba73afa913e47d90c
+# PRIVATE SDK MAIN CARRY TO 2eee28d3f2a32d3cdc6052cb2de60588026df5d4 (2026-10-05).
+# The main recipe is f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21.
+# From the prior 7b3168b7af405ca0f4af25fba73afa913e47d90c, build.rs changes
+# 0ff8ae24b97464044735ba79ea74765ba4ac3ff0 -> e05db6238bf07c96d8a850c5635a8c48590f20b7:
+# native jobs are additionally capped at available CPUs. The other six recorded
+# inputs are unchanged; this carries the reviewed main source without a new timing sample.
+# reverie-dbt/Cargo.toml: 0e24d047d544a3daae2d6350270b26ceb74139d1
+# reverie-dbt/build.rs: e05db6238bf07c96d8a850c5635a8c48590f20b7
+# reverie-dbt/native/CMakeLists.txt: bcfb298a4f87ed190d7fdc52393e01d1245a8fe3
+# reverie-dbt/vendor/dynamorio: 117d54d744df23921c531d0fe08537249f5a510a
+# third-party: fb49c0ba7a9abd48a4ea662bf20e08246c81fc5a
+# Cargo.toml: 4168dea2771f18a00fb1afdfd2218efba415ecbb
+# rust-toolchain.toml: b7ca9302bc65522b829aa2fe3b8783fc77fcb7b9
+# CMAKE/CMAKE_GENERATOR, MAX_PARALLEL_JOBS=16 and the 1050 effective-job-seconds limit stay unchanged.
+# Public SDK archives use release facf55df5c77b517eaef4650dfa23e28b74c5438 separately;
+# its build.rs retains the b024 recipe and its DBT manifest adds only publish=false.
+expected_pin=2eee28d3f2a32d3cdc6052cb2de60588026df5d4
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
@@ -916,6 +932,6 @@ export REVERIE_DBT_BUDGET_BOUND_PIN
 # shellcheck source=ci/configure-build-jobs.sh
 source "$ROOT_DIR/ci/configure-build-jobs.sh" reverie-dbt-budget-child
 
-echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:b0247764df7fba083f90538e12d3afcc8ffad5150c65bd321e689da5e57b74ed}" >&2
+echo "run-with-reverie-dbt-budget.sh: reverie-dbt-budget={pin:$REVERIE_DBT_BUDGET_BOUND_PIN,source:$REVERIE_DBT_BUILD_JOBS_SOURCE,raw-build-jobs:$REVERIE_DBT_RAW_BUILD_JOBS,effective-cpus-source:$REVERIE_DBT_EFFECTIVE_CPUS_SOURCE,effective-cpus:$REVERIE_DBT_EFFECTIVE_CPUS,reverie-max-jobs:$REVERIE_DBT_MAX_PARALLEL_JOBS,effective-native-jobs:$REVERIE_DBT_EFFECTIVE_BUILD_JOBS,effective-job-seconds:$REVERIE_DBT_MAX_BUILD_EFFECTIVE_JOB_SECONDS,max-elapsed-seconds:$REVERIE_DBT_MAX_BUILD_SECONDS,basis:github-portable-cold-miss-n3-affinity4,carried-to-pin-on-dynamorio-recipe-key:f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21}" >&2
 
 exec "$@"
