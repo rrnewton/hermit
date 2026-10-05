@@ -931,7 +931,9 @@ pub(super) fn run_dbt(
              remove --no-sequentialize-threads (or --strace-only) to run under --backend dbt",
         ));
     }
-    let config_json = serde_json::to_string(config).map_err(|error| {
+    // Guest-visible, so it must keep the legacy key layout; see
+    // `hermit::dbt_detconfig_json`.
+    let config_json = hermit::dbt_detconfig_json(config).map_err(|error| {
         Error::msg(format!(
             "failed to serialize the Detcore config for the DBT backend: {error}"
         ))
