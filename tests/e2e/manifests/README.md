@@ -330,8 +330,8 @@ https://github.com/rrnewton/hermit/blob/82e24cc0e6fac0f7f9a8dac4b4b25d9ad8e3231d
 The matrix compared the
 stdout of three `--strict` runs with one attempt. A verify cell compares two
 runs, their stdout and their recorded event streams, and like every manifest
-cell a failed attempt is retried once; a passing retry passes the cell and the
-failed attempt's row is kept in the results.
+cell but a replay cell a failed attempt is retried once; a passing retry passes
+the cell and the failed attempt's row is kept in the results.
 
 A `verify` mode may also declare, for a test whose recorded policy runs one
 specific configuration:
@@ -427,6 +427,10 @@ A verify mode may declare `no_retry_reason`: the cell then gets one attempt
 instead of the runner's retry after a product failure, so a first-attempt
 failure stays a failure. `compat.yaml` declares it because each of its programs
 ran once per validation as its own node before the corpus moved here.
+A replay cell never gets that retry and takes no `no_retry_reason`: its
+product failure is a replay that diverged from its recording, or a recording
+that did not complete, and a fresh recording on a second attempt does not
+answer for the first.
 
 A test may carry `labels` (lowercase words joined by `-`, unique), naming the
 run types it belongs to, and a non-naked mode may carry `labels` per enabled
