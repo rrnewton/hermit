@@ -165,6 +165,17 @@ enum DeathStep {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FutexCasOutcome {
     /// The word still held the expected value and now holds the new one.
+    ///
+    /// The production effects never store the word themselves; they always
+    /// answer [`FutexCasOutcome::Deferred`]. The unit-test model stores it so
+    /// the walk can be checked against the kernel's write sequence.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "only the unit-test effects model stores the owner word"
+        )
+    )]
     Stored,
     /// The backend will perform the atomic replacement before the modeled wake
     /// can let another thread run.

@@ -93,14 +93,6 @@ pub struct Config {
     pub discover_live_file_metadata: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
-    // TODO-HUMAN-REVIEW(PR-845): Review backend-local guest clock observations.
-    /// Legacy serialized setting retained for record compatibility. Guest-visible wall and
-    /// monotonic clocks always use the coordinator's virtual-time domain.
-    #[serde(default)]
-    #[clap(skip)]
-    pub use_thread_local_clock_reads: bool,
-
-    // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review host-clock futex deadline detection.
     /// Direct guest clock reads may bypass backend virtualization, so absolute futex deadlines
     /// must be classified against both the host and logical clocks.
@@ -129,18 +121,6 @@ pub struct Config {
     #[serde(default)]
     #[clap(skip)]
     pub backend_reports_physical_process_exits: bool,
-
-    // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
-    /// The execution backend completes forked process children before returning to the parent.
-    #[serde(default)]
-    #[clap(skip)]
-    pub backend_serializes_fork_children: bool,
-
-    // TODO-HUMAN-REVIEW(PR-1013): Review backend thread callback coverage.
-    /// The execution backend dispatches cloned thread syscalls through this tool.
-    #[serde(default = "default_true")]
-    #[clap(skip = true)]
-    pub backend_dispatches_thread_tools: bool,
 
     /// The backend reports every process child through Detcore's child-registration protocol.
     /// When true, an empty scheduler selection is authoritative ECHILD rather than a reason to
@@ -1472,8 +1452,6 @@ mod tests {
     fn default_backend_capabilities_match_instrumented_backends() {
         let config = Config::default();
         assert!(!config.backend_reports_physical_process_exits);
-        assert!(!config.backend_serializes_fork_children);
-        assert!(config.backend_dispatches_thread_tools);
         assert!(config.backend_tracks_process_children);
         assert!(config.backend_runs_exit_robust_list);
         assert!(!config.backend_requires_thread_directed_process_signals);
