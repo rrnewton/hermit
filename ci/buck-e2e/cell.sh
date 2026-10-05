@@ -165,7 +165,8 @@ exec "$@"'
         timeout --kill-after=10 "$outer" \
         "$wrapper" --src "$R" --out "$W/pinned" --src-rw \
         --env HERMIT_E2E_EMPTY_WORKDIR --env VALIDATE_RUN_STATE --env E2E_RESULT_ROOT \
-        --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS -- \
+        --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS \
+        --env HERMIT_EPOCH -- \
         "${prologue[@]}" env E2E_BUILD_ROOT=/src/bundle/build \
         HERMIT_BIN=/src/bundle/hermit/hermit HERMIT_INSTALL_DIR=/src/bundle/hermit/install \
         timeout --kill-after=10 "$deadline" \

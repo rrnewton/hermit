@@ -57,7 +57,7 @@ def host(path):
     return path
 keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDATE_RUN_STATE",
         "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS",
-        "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN")
+        "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN", "HERMIT_EPOCH")
 # The client directory the DBT backend would load from: name -> link target, or None.
 rsrcs = os.path.join(host(os.environ.get("HERMIT_INSTALL_DIR", "/nonexistent")), "rsrcs")
 links = {n: os.readlink(os.path.join(rsrcs, n)) if os.path.islink(os.path.join(rsrcs, n)) else None
@@ -121,7 +121,9 @@ if args[:1] == ["--check-image"]:
 split = args.index("--")
 opts, command = args[:split], args[split + 1:]
 src = opts[opts.index("--src") + 1]
-forwarded = {opts[i + 1]: os.environ.get(opts[i + 1]) for i, o in enumerate(opts) if o == "--env"}
+# Like run-in-pinned-root.sh, which skips a named variable that is unset.
+forwarded = {n: os.environ[n] for n in (opts[i + 1] for i, o in enumerate(opts) if o == "--env")
+             if n in os.environ}
 mountpoints = sorted(p for p in ("target", "agent-utils/rs/target", "agent-utils/rs/.agent-utils-locks",
                                  "agent-utils/rs/.agent-utils-snapshots") if os.path.isdir(os.path.join(src, p)))
 with open(calls, "a") as f:
@@ -261,6 +263,7 @@ class CellTest(unittest.TestCase):
         self.assertEqual(wrapper["forwarded"]["E2E_PARITY_POST_PASS"], "0")
         self.assertNotIn("E2E_BUILD_ROOT", wrapper["forwarded"],
                          "the wrapper would replace E2E_BUILD_ROOT with /src/target/e2e-build")
+        self.assertNotIn("HERMIT_EPOCH", wrapper["forwarded"], "an unset HERMIT_EPOCH is not forwarded")
         self.assertEqual(command[:2], ["sh", "-c"])
         self.assertEqual(command[3:6], ["link-dbt-runtime", "/src/bundle/hermit/install/rsrcs", "env"])
         for assignment in ("E2E_BUILD_ROOT=/src/bundle/build", "HERMIT_BIN=/src/bundle/hermit/hermit",
@@ -293,6 +296,22 @@ class CellTest(unittest.TestCase):
         self.assertEqual((self.bundle / "hermit" / "hermit").read_text(), "hermit\n",
                          "a write in the container reached the bundle: the copy shares its inodes")
         self.assertEqual(list(self.tmp.joinpath("tpx").glob("hermit-cell.*")), [], "scratch left behind")
+
+    def test_hermit_epoch_reaches_the_harness_in_and_out_of_the_container(self) -> None:
+        # Backend parity compares a ptrace reference with its candidates only under one guest
+        # epoch, so the run's HERMIT_EPOCH (defs.bzl, from validate-node) must reach every
+        # cell's harness: through the wrapper's --env in the pinned root, and inherited outside it.
+        epoch = "2026-10-05T11:07:23+00:00"
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", HERMIT_EPOCH=epoch)
+        self.assertEqual(done["status"], "passed", done)
+        [wrapper] = self.calls_by("wrapper")
+        self.assertEqual(wrapper["forwarded"]["HERMIT_EPOCH"], epoch)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_EPOCH"], epoch)
+        done, _ = self.run_cell(HERMIT_EPOCH=epoch)
+        self.assertEqual(done["status"], "passed", done)
+        self.assertEqual(len(self.calls_by("wrapper")), 1, "outside the container, no wrapper runs")
+        self.assertEqual(self.calls_by("harness")[-1]["env"]["HERMIT_EPOCH"], epoch)
 
     def test_library_missing_from_the_image_is_an_error(self) -> None:
         done, result = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",

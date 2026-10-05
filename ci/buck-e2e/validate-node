@@ -76,6 +76,21 @@ step "staging the inputs Buck does not build (cargo, target/)"
 "${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
 rm -rf -- "${state:?}/results"
 mkdir -p "$state/work"
-step "running every cell under Buck ($runner)"
+# Every cell of the run gets one HERMIT_EPOCH: backend parity compares a ptrace reference with
+# its candidates only when they share the guest epoch, and each cell is its own harness
+# process, which would otherwise sample its own start time. The epoch is derived from the
+# inputs, the checked-out commit's committer time, not sampled: it is part of every cell's
+# action digest, so a sample would keep any cell result from being reused, while this keeps
+# a re-validation of the same commit cacheable and its runs reproducible. An exported
+# HERMIT_EPOCH overrides it.
+if [[ -n ${HERMIT_EPOCH:-} ]]; then
+    epoch=$HERMIT_EPOCH
+elif committed=$(git -C "$root" show -s --format=%ct HEAD) && [[ $committed =~ ^[0-9]+$ ]]; then
+    epoch=$(date -u -d "@$committed" +%Y-%m-%dT%H:%M:%S+00:00)
+else
+    echo "validate-node: cannot read the checked-out commit's committer time for HERMIT_EPOCH; export HERMIT_EPOCH to supply one" >&2
+    exit 2
+fi
+step "running every cell under Buck ($runner), HERMIT_EPOCH=$epoch"
 ./ci/buck-e2e/run --mode "$mode" --no-verdict --out "$state/results" --work "$state/work" \
-    --buck2 "$buck2" -- "${buck_args[@]}" -c hermit_e2e.hermit=staged
+    --buck2 "$buck2" -- "${buck_args[@]}" -c hermit_e2e.hermit=staged -c "hermit_e2e.epoch=$epoch"
