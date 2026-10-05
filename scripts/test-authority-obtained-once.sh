@@ -353,7 +353,7 @@ exit 2
 STUB
 chmod +x "$response_bin/git" "$response_bin/make"
 lint_node_out="$work/response/lint-node-tee-write-error.out"
-env PATH="$response_bin" "$ROOT_DIR/ci/lint-checks-node.sh" >"$lint_node_out" 2>&1
+env PATH="$response_bin" HERMIT_LINT_CHECK_JOBS=2 "$ROOT_DIR/ci/lint-checks-node.sh" >"$lint_node_out" 2>&1
 lint_node_rc=$?
 lint_node_markers=$(grep -c '^NO-RESULT-CASE:' "$lint_node_out" || true)
 if [ "$lint_node_rc" -ne 1 ]; then

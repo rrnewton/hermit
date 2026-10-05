@@ -1205,8 +1205,39 @@ fn logical_line(lines: &[&str], starts: impl Fn(&str) -> bool) -> Option<String>
     Some(joined)
 }
 
-/// The words of `NAME := ...` (or `NAME = ...`). A missing definition refuses.
+/// The words of `NAME := ...` (or `NAME = ...`). A missing definition refuses, and
+/// so does any second assignment to NAME: make uses the last `:=`/`=` and appends
+/// every `+=`, so reading only the first would schedule a different list than make
+/// runs. An assignment counts however make accepts it: indented (inside an
+/// `ifeq`), behind `override`/`export`/`private`, or as `define`/`undefine`.
 fn variable_words(lines: &[&str], name: &str) -> Vec<String> {
+    let assigns = |line: &str| {
+        let mut rest = line.trim_start();
+        loop {
+            let Some((word, tail)) = rest.split_once(char::is_whitespace) else {
+                break;
+            };
+            match word {
+                "override" | "export" | "private" => rest = tail.trim_start(),
+                "define" | "undefine" => {
+                    return tail.split_whitespace().next() == Some(name);
+                }
+                _ => break,
+            }
+        }
+        rest.strip_prefix(name).is_some_and(|rest| {
+            let rest = rest.trim_start();
+            ["=", ":=", "::=", ":::=", "+=", "?=", "!="]
+                .iter()
+                .any(|op| rest.starts_with(op))
+        })
+    };
+    let assignments = lines.iter().filter(|line| assigns(line)).count();
+    assert!(
+        assignments <= 1,
+        "the Makefile assigns {name} {assignments} times; this guard reads one \
+         definition, so keep the list in a single `{name} :=`"
+    );
     let defines = |line: &str| {
         line.strip_prefix(name).is_some_and(|rest| {
             let rest = rest.trim_start();
@@ -1810,10 +1841,60 @@ mod tests {
             "lint-checks: lint-check-group\nlint-check-group: lint-check-a\n\n\
              lint-check-a:\n\t./scripts/check-a.sh\n"
                 .to_string(),
+            // A second definition: make uses the last one, the first-match read would not.
+            format!("{PER_TARGET_MK}LINT_CHECK_TARGETS := lint-check-unlisted\n"),
+            // An append: make runs lint-check-unlisted too.
+            format!("{PER_TARGET_MK}LINT_CHECK_TARGETS += lint-check-unlisted\n"),
         ];
         for mk in cases {
             let r = std::panic::catch_unwind(|| lint_checks_recipe(&mk));
             assert!(r.is_err(), "must refuse, not under-count:\n{mk}");
+        }
+    }
+
+    /// Every way make lets a second line change the list is counted as an
+    /// assignment, and the refusal is THIS guard's, not some later panic.
+    #[test]
+    fn a_second_assignment_in_any_form_is_refused_by_the_count() {
+        let forms = [
+            "  LINT_CHECK_TARGETS += lint-check-unlisted\n",
+            "ifeq ($(X),)\n\tLINT_CHECK_TARGETS += lint-check-unlisted\nendif\n",
+            "override LINT_CHECK_TARGETS += lint-check-unlisted\n",
+            "export LINT_CHECK_TARGETS += lint-check-unlisted\n",
+            "private LINT_CHECK_TARGETS = lint-check-unlisted\n",
+            "override export LINT_CHECK_TARGETS+=lint-check-unlisted\n",
+            "define LINT_CHECK_TARGETS +=\nlint-check-unlisted\nendef\n",
+            "undefine LINT_CHECK_TARGETS\n",
+        ];
+        for form in forms {
+            let mk = format!("{PER_TARGET_MK}{form}");
+            let err = std::panic::catch_unwind(|| lint_checks_recipe(&mk))
+                .expect_err(&format!("must refuse:\n{mk}"));
+            let msg = err
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+                .unwrap_or_default();
+            assert!(
+                msg.contains("assigns LINT_CHECK_TARGETS 2 times"),
+                "refused for the wrong reason ({msg}):\n{mk}"
+            );
+        }
+    }
+
+    /// Lines that only mention the name, or assign a longer name, are not
+    /// assignments to it.
+    #[test]
+    fn a_line_that_only_mentions_the_list_is_not_an_assignment() {
+        for line in [
+            "LINT_CHECK_TARGETS_EXTRA := lint-check-unlisted\n",
+            "$(info $(LINT_CHECK_TARGETS))\n",
+            "export LINT_CHECK_TARGETS\n",
+            "define LINT_CHECK_TARGETS_HELP\nlint-check-unlisted\nendef\n",
+        ] {
+            let mk = format!("{PER_TARGET_MK}{line}");
+            let r = std::panic::catch_unwind(|| lint_checks_recipe(&mk));
+            assert!(r.is_ok(), "must not refuse:\n{mk}");
         }
     }
 
