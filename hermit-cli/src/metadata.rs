@@ -438,6 +438,8 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         backend_requires_thread_directed_process_signals: false,
         backend_is_kvm: false,
         kvm_shared_dequeue_timers: false,
+        backend_self_sigkill_is_nonreturning_exit: false,
+        backend_self_sigkill_bypasses_exit_callbacks: false,
         backend_supports_parked_write_signal_interruption: true,
         backend_virtualizes_capability_prctls: false,
         backend_defers_vfork_child_registration: false,

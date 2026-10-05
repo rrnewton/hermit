@@ -2998,6 +2998,14 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
     config.backend_is_kvm = backend == Backend::Kvm;
     config.kvm_shared_dequeue_timers = config.backend_is_kvm && config.sequentialize_threads;
+    // KVM commits a self-directed SIGKILL as an immediate process exit and then
+    // reports it through its terminal child callback. DBT forwards the kill to
+    // the kernel, and DynamoRIO can neither intercept SIGKILL nor run a
+    // thread-exit callback for a process that the kernel kills. Ptrace reports
+    // the killed tasks through its ordinary exit events.
+    config.backend_self_sigkill_is_nonreturning_exit =
+        matches!(backend, Backend::Kvm | Backend::Dbt);
+    config.backend_self_sigkill_bypasses_exit_callbacks = backend == Backend::Dbt;
     // E9patch preprocesses the guest and then uses the ptrace builder. LiteInst,
     // DBT, KVM, and SaBRe re-invoke the Tool callback on ERESTARTSYS instead of
     // resuming through the kernel's ptrace syscall-restart frame.
@@ -5453,6 +5461,35 @@ mod tests {
             assert_eq!(
                 config.backend_supports_parked_write_signal_interruption, supports_interruption,
                 "unexpected parked-write signal support for {backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_self_sigkill_contract_is_explicit() {
+        for (backend, nonreturning, bypasses_exit_callbacks) in [
+            (Backend::Ptrace, false, false),
+            (Backend::Dbt, true, true),
+            (Backend::Kvm, true, false),
+            (Backend::Sabre, false, false),
+            (Backend::Liteinst, false, false),
+            (Backend::E9patch, false, false),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend_self_sigkill_is_nonreturning_exit, nonreturning,
+                "unexpected self-SIGKILL exit contract for {backend:?}"
+            );
+            assert_eq!(
+                config.backend_self_sigkill_bypasses_exit_callbacks, bypasses_exit_callbacks,
+                "unexpected self-SIGKILL exit-callback contract for {backend:?}"
+            );
+            // Detcore retires the caller only after it has taken the exit
+            // fence, so a backend that skips exit callbacks must also take it.
+            assert!(
+                !config.backend_self_sigkill_bypasses_exit_callbacks
+                    || config.backend_self_sigkill_is_nonreturning_exit,
+                "{backend:?} would retire a self-SIGKILL caller without an exit fence"
             );
         }
     }

@@ -56,6 +56,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::Priority;
 use crate::stat::*;
+use crate::tool_global::ThreadDeregistration;
 use crate::types::*;
 
 /// The detcore tool and its per-process state.
@@ -2890,6 +2891,20 @@ impl<T> ThreadState<T> {
     // TODO-HUMAN-REVIEW(PR-1151)
     pub(crate) fn take_pending_chaos_epochs(&mut self) -> Vec<ChaosEpochTransition> {
         std::mem::take(&mut self.pending_chaos_epochs)
+    }
+
+    /// The final scheduler deregistration for this thread as a member of
+    /// `detpid`, carrying its last accounting and its unsent chaos epochs.
+    pub(crate) fn final_deregistration(&mut self, detpid: DetPid) -> ThreadDeregistration {
+        ThreadDeregistration {
+            dettid: self.dettid,
+            detpid,
+            mm: self.mm_id,
+            thread_start_entered: self.thread_start_entered,
+            timeslice_stats: self.stats.timeslice_stats,
+            syscall_count: self.stats.syscall_count,
+            chaos_epochs: self.take_pending_chaos_epochs(),
+        }
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED

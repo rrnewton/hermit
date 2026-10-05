@@ -20,7 +20,9 @@ use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
 use reverie::syscalls::MemoryAccess;
+use reverie::syscalls::Syscall;
 use reverie::syscalls::Timespec;
+use tracing::error;
 use tracing::info;
 
 use crate::Detcore;
@@ -34,11 +36,13 @@ use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
 use crate::tool_global::ResumeStatus;
 use crate::tool_global::alarm_remaining;
+use crate::tool_global::deregister_thread;
 use crate::tool_global::notify_signal_pending;
 use crate::tool_global::register_alarm;
 use crate::tool_global::resolve_kill_targets;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
+use crate::tool_global::unrecoverable_shutdown;
 use crate::types::DetPid;
 use crate::types::DetTid;
 use crate::types::LogicalTime;
@@ -561,32 +565,39 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Fence an exact self-SIGKILL at the scheduler-selected syscall turn.
     ///
-    /// KVM commits this syscall as an immediate, nonreturning process exit. It
-    /// therefore has no later return boundary at which the ordinary pending
-    /// signal path could acquire a delivery permit. Without this preflight, the
-    /// backend's terminal child callback arrives with no generation-bound
-    /// reservation and must fail closed. `ResourceID::Exit` is the same fence
-    /// used by `exit_group`; the KVM-only configuration guard avoids changing
-    /// ptrace, DBT, or non-sequential execution.
-    async fn reserve_kvm_self_sigkill_exit<G: Guest<Self>>(
+    /// A backend with `backend_self_sigkill_is_nonreturning_exit` commits this
+    /// syscall as an immediate, nonreturning process exit. It therefore has no
+    /// later return boundary at which the ordinary pending signal path could
+    /// acquire a delivery permit. `ResourceID::Exit` is the same fence used by
+    /// `exit_group`: granting it retires the caller's sibling threads, and a
+    /// backend that later reports the terminal exit finds the generation-bound
+    /// reservation its terminal child callback requires instead of failing
+    /// closed. Ptrace and non-sequential execution are unchanged.
+    ///
+    /// The process is the calling thread's own `detpid`, as in `exit_group`,
+    /// not the tool's `self.detpid`. A forked DBT child inherits its parent's
+    /// tool, so there `self.detpid` still names the parent: comparing against
+    /// it misses the child's self-SIGKILL, and fencing with it would attribute
+    /// the retired siblings to the parent process.
+    async fn reserve_self_sigkill_exit<G: Guest<Self>>(
         &self,
         guest: &mut G,
         signal: libc::c_int,
         target_process: Option<DetPid>,
         target_thread: Option<DetTid>,
     ) -> bool {
-        if !self.cfg.kvm_shared_dequeue_timers {
+        if !self.cfg.backend_self_sigkill_is_nonreturning_exit || !self.cfg.sequentialize_threads {
             return false;
         }
-        let (current_thread, mm) = {
+        let (current_process, current_thread, mm) = {
             let state = guest.thread_state();
-            (state.dettid, state.mm_id)
+            (state.detpid.expect("detpid unset"), state.dettid, state.mm_id)
         };
         if !self_sigkill_targets_current_task(
             signal,
             target_process,
             target_thread,
-            self.detpid,
+            current_process,
             current_thread,
         ) {
             return false;
@@ -594,13 +605,66 @@ impl<T: RecordOrReplay> Detcore<T> {
         let request = guest.thread_state().mk_request(
             ResourceID::Exit {
                 group: true,
-                process: self.detpid,
+                process: current_process,
                 mm,
             },
             Permission::RW,
         );
         resource_request(guest, request).await;
         true
+    }
+
+    /// Issue a self-SIGKILL after [`Self::reserve_self_sigkill_exit`] fenced it.
+    ///
+    /// The fence retired the caller's siblings; the caller itself is left to
+    /// the ordinary exit mechanics. A backend with
+    /// `backend_self_sigkill_bypasses_exit_callbacks` never runs them for a
+    /// process the kernel kills, so the scheduler would wait forever for the
+    /// caller's next request. Retire the caller here instead, in the order its
+    /// thread-exit callback uses and still at the fenced turn: close the final
+    /// timeslice, publish CPU time, then send the same deregistration. Robust
+    /// list owner death needs no step here, because Detcore models it only for
+    /// a backend that runs the exit robust list itself.
+    ///
+    /// If the kill returns, the caller has already left the scheduler and
+    /// cannot be resumed deterministically, so fail closed.
+    async fn send_fenced_self_sigkill<G: Guest<Self>, S: Into<Syscall>>(
+        &self,
+        guest: &mut G,
+        call: S,
+    ) -> Result<i64, Error> {
+        if !self.cfg.backend_self_sigkill_bypasses_exit_callbacks {
+            return Ok(self.record_or_replay(guest, call).await?);
+        }
+        let (dettid, time, deregistration) = {
+            let state = guest.thread_state_mut();
+            let dettid = state.dettid;
+            let detpid = state.detpid.expect("detpid unset");
+            let now = state.thread_logical_time.as_nanos();
+            state.stats.close_final_timeslice(now);
+            let cpu_published = if dettid == detpid {
+                state.record_exited_child_process_cpu_time(detpid)
+            } else {
+                state.account_process_cpu_time();
+                true
+            };
+            let deregistration = cpu_published.then(|| state.final_deregistration(detpid));
+            (dettid, state.thread_logical_time.clone(), deregistration)
+        };
+        let Some(deregistration) = deregistration else {
+            error!(
+                "[detcore, dtid {}] child CPU publication ownership changed before self-SIGKILL",
+                dettid
+            );
+            unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await
+        };
+        deregister_thread(time, &self.cfg, &*guest, deregistration).await;
+        let result = self.record_or_replay(guest, call).await;
+        error!(
+            "[detcore, dtid {}] self-SIGKILL returned {:?} after the thread left the scheduler",
+            dettid, result
+        );
+        unrecoverable_shutdown(guest, detcore_model::HERMIT_POLICY_REFUSAL_EXIT).await
     }
 
     // AUTONOMOUS-BOT-IMPLEMENTED
@@ -644,10 +708,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // ambiguity even when the process has several live threads. Reserve it
         // before the generic process-signal path rejects that thread set.
         if self
-            .reserve_kvm_self_sigkill_exit(guest, call.sig(), Some(DetPid::from_raw(tgid)), None)
+            .reserve_self_sigkill_exit(guest, call.sig(), Some(DetPid::from_raw(tgid)), None)
             .await
         {
-            return Ok(self.record_or_replay(guest, call).await?);
+            return self.send_fenced_self_sigkill(guest, call).await;
         }
         let targets = resolve_kill_targets(guest, DetPid::from_raw(tgid)).await;
         let tid = deterministic_kill_target(&targets, call.sig())?;
@@ -677,14 +741,18 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tgkill,
     ) -> Result<i64, Error> {
-        let _reserved = self
-            .reserve_kvm_self_sigkill_exit(
+        // The fenced path never notifies: its only target is the caller itself.
+        if self
+            .reserve_self_sigkill_exit(
                 guest,
                 call.sig(),
                 Some(DetPid::from_raw(call.tgid())),
                 Some(DetTid::from_raw(call.tid())),
             )
-            .await;
+            .await
+        {
+            return self.send_fenced_self_sigkill(guest, call).await;
+        }
         let value = self.record_or_replay(guest, call).await?;
         // `pthread_kill` lowers to `tgkill`, so this is the ordinary way one
         // guest THREAD signals a sibling. Like `kill`, a successful cross-task
@@ -706,14 +774,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Tkill,
     ) -> Result<i64, Error> {
-        let _reserved = self
-            .reserve_kvm_self_sigkill_exit(
-                guest,
-                call.sig(),
-                None,
-                Some(DetTid::from_raw(call.tid())),
-            )
-            .await;
+        if self
+            .reserve_self_sigkill_exit(guest, call.sig(), None, Some(DetTid::from_raw(call.tid())))
+            .await
+        {
+            return self.send_fenced_self_sigkill(guest, call).await;
+        }
         let value = self.record_or_replay(guest, call).await?;
         // Same wakeup obligation as `tgkill`; `tkill` is the older two-argument
         // spelling of the same thread-directed send.
