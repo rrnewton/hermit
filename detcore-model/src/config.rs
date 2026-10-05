@@ -526,10 +526,9 @@ pub struct Config {
     #[clap(long, env = "HERMIT_SCHED_SEED", value_name = "uint64")]
     pub sched_seed: Option<u64>,
 
-    /// Reserved configuration for a schedule-independent external-network trace.
-    ///
-    /// This is inert until a recorder/replayer integration explicitly consumes
-    /// it. In particular, its perturbation seed has no fallback to `seed` or
+    /// External network record or replay, set by `hermit run --record-networking`
+    /// or `--replay-networking`; `Off` otherwise, in which case Detcore never
+    /// consults it. Its perturbation seed has no fallback to `seed` or
     /// `sched_seed`.
     #[serde(default)]
     #[clap(skip)]

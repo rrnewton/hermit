@@ -33,6 +33,9 @@ use detcore_model::backend_engagement::BackendEngagement;
 use detcore_model::backend_engagement::BackendEngagementReport;
 use detcore_model::happens_before::HappensBeforeProgram;
 use detcore_model::happens_before::Strength;
+use detcore_model::network_trace::NetworkTraceConfig;
+use detcore_model::network_trace::NetworkTraceMode;
+use detcore_model::network_trace::NetworkTraceV2;
 use detcore_model::summary::RunSummary;
 use hermit::Backend;
 use hermit::Context;
@@ -507,6 +510,25 @@ pub struct RunOpts {
         default_value = "local"
     )]
     network: NetworkingMode,
+
+    /// Record outbound TCP traffic to a new trace at this path. The guest reaches the host
+    /// network; every byte it receives is stamped with the deterministic time at which the
+    /// guest observed it, so `--replay-networking` reproduces the run without the network.
+    #[clap(
+        long,
+        value_name = "NEW_TRACE",
+        conflicts_with_all = ["replay_networking", "network", "verify"]
+    )]
+    record_networking: Option<PathBuf>,
+
+    /// Replay outbound TCP traffic from a trace written by `--record-networking`, without
+    /// contacting the network. Any difference in what the guest sends ends the run.
+    #[clap(
+        long,
+        value_name = "TRACE",
+        conflicts_with_all = ["record_networking", "network"]
+    )]
+    replay_networking: Option<PathBuf>,
 
     /// Run with namespaces but without ptrace, seccomp interception, or determinization. This is a
     /// useful smoke test when diagnosing ptrace/seccomp policy failures; PID and `/tmp` isolation
@@ -1076,8 +1098,22 @@ impl fmt::Display for RunOpts {
         if self.allow_unsupported_syscalls {
             write!(f, " --allow-unsupported-syscalls")?;
         }
-        if self.network != Default::default() {
+        // Recording switches to host networking; render the flag that asked for it.
+        if let Some(path) = &self.record_networking {
+            write!(
+                f,
+                " --record-networking={}",
+                shell_words::quote(&path.to_string_lossy())
+            )?;
+        } else if self.network != Default::default() {
             write!(f, " --network={}", self.network)?;
+        }
+        if let Some(path) = &self.replay_networking {
+            write!(
+                f,
+                " --replay-networking={}",
+                shell_words::quote(&path.to_string_lossy())
+            )?;
         }
         if self.namespace_only {
             write!(f, " --namespace-only")?;
@@ -2120,6 +2156,107 @@ fn passthru_optimization_rejects_fail_closed_modes() {
             "unexpected error: {message}"
         );
     }
+}
+
+#[test]
+fn network_trace_is_off_without_a_networking_flag() {
+    let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        ro.det_opts.det_config.network_trace,
+        NetworkTraceConfig::default()
+    );
+    assert_eq!(ro.network, NetworkingMode::Local);
+}
+
+#[test]
+fn record_networking_selects_record_mode_and_host_networking() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("net.trace");
+    let flag = format!("--record-networking={}", trace.display());
+    let mut ro = RunOpts::parse_from(["fakehermit", "--strict", &flag, "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    let config = &ro.det_opts.det_config.network_trace;
+    assert_eq!(config.mode, NetworkTraceMode::Record);
+    assert_eq!(config.path.as_deref(), Some(trace.as_path()));
+    assert_eq!(ro.network, NetworkingMode::Host);
+
+    let rendered = format!("{}", ro);
+    assert!(rendered.contains(&flag), "{rendered}");
+    assert!(!rendered.contains("--network="), "{rendered}");
+    let mut reparsed_args = vec!["fakehermit".to_owned()];
+    reparsed_args.extend(shell_words::split(&rendered).unwrap());
+    let mut reparsed = RunOpts::parse_from(reparsed_args);
+    reparsed.validate_args_with_perf_support(true).unwrap();
+    assert_eq!(
+        reparsed.det_opts.det_config.network_trace,
+        ro.det_opts.det_config.network_trace
+    );
+}
+
+#[test]
+fn record_networking_refuses_a_missing_directory_and_conflicting_flags() {
+    let mut ro = RunOpts::parse_from([
+        "fakehermit",
+        "--record-networking=/nonexistent-hermit-dir/net.trace",
+        "fakeprog",
+    ]);
+    let error = ro.validate_args_with_perf_support(true).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("create it or choose a trace path"),
+        "{error:#}"
+    );
+    for conflicting in ["--verify", "--network=host", "--replay-networking=t"] {
+        assert!(
+            RunOpts::try_parse_from([
+                "fakehermit",
+                "--record-networking=t",
+                conflicting,
+                "fakeprog"
+            ])
+            .is_err(),
+            "{conflicting} must conflict with --record-networking"
+        );
+    }
+}
+
+#[test]
+fn replay_networking_reads_the_trace_before_the_guest_starts() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("net.trace");
+    let epoch = "2026-01-01T00:00:00Z".parse().unwrap();
+    detcore_model::network_engine::NetworkEngine::new_record(epoch)
+        .finish()
+        .unwrap()
+        .write_framed(File::create(&trace).unwrap())
+        .unwrap();
+    let flag = format!("--replay-networking={}", trace.display());
+    let mut ro = RunOpts::parse_from(["fakehermit", &flag, "fakeprog"]);
+    ro.validate_args_with_perf_support(true).unwrap();
+    let config = &ro.det_opts.det_config.network_trace;
+    assert_eq!(config.mode, NetworkTraceMode::Replay);
+    assert_eq!(config.path.as_deref(), Some(trace.as_path()));
+    assert_eq!(ro.network, NetworkingMode::Local);
+    assert!(format!("{}", ro).contains(&flag));
+
+    let missing = dir.path().join("missing.trace");
+    let flag = format!("--replay-networking={}", missing.display());
+    let mut ro = RunOpts::parse_from(["fakehermit", &flag, "fakeprog"]);
+    let error = ro.validate_args_with_perf_support(true).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("pass a trace written by --record-networking"),
+        "{error:#}"
+    );
+
+    fs::write(&missing, b"not a trace").unwrap();
+    let mut ro = RunOpts::parse_from(["fakehermit", &flag, "fakeprog"]);
+    let error = ro.validate_args_with_perf_support(true).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("is not a valid network trace"),
+        "{error:#}"
+    );
 }
 
 #[test]
@@ -3978,6 +4115,13 @@ impl RunOpts {
             );
         }
 
+        // Set after the strict check: a recording reaches the host network, but
+        // every input it admits is captured and released deterministically.
+        self.det_opts.det_config.network_trace = self.network_trace_config()?;
+        if self.record_networking.is_some() {
+            self.network = NetworkingMode::Host;
+        }
+
         // Advise when running a VMM (e.g. QEMU) under host-time virtualization,
         // whose emulated guest clock calibration this corrupts (issue #6).
         // Checked last so it reflects any overrides above that disable virtual
@@ -3991,6 +4135,51 @@ impl RunOpts {
         }
 
         Ok(())
+    }
+
+    /// The network trace mode the record and replay flags select, `Off` with
+    /// neither. A replay trace is read and checked here so a bad path fails
+    /// before the guest starts.
+    fn network_trace_config(&self) -> Result<NetworkTraceConfig, Error> {
+        let (mode, path) = match (&self.record_networking, &self.replay_networking) {
+            (None, None) => return Ok(NetworkTraceConfig::default()),
+            (Some(path), _) => (NetworkTraceMode::Record, path),
+            (None, Some(path)) => (NetworkTraceMode::Replay, path),
+        };
+        // The trace is written by the tracer when the run ends; resolve it
+        // against the directory the user named it from.
+        let path = std::path::absolute(path)
+            .with_context(|| format!("cannot resolve network trace path {}", path.display()))?;
+        if mode == NetworkTraceMode::Record {
+            let parent = path.parent().unwrap_or(Path::new("/"));
+            if !parent.is_dir() {
+                anyhow::bail!(
+                    "--record-networking: directory {} does not exist; create it or choose a \
+                     trace path in an existing directory",
+                    parent.display()
+                );
+            }
+        } else {
+            let file = File::open(&path).with_context(|| {
+                format!(
+                    "--replay-networking: cannot open network trace {}; pass a trace written by \
+                     --record-networking",
+                    path.display()
+                )
+            })?;
+            NetworkTraceV2::read_framed(std::io::BufReader::new(file)).with_context(|| {
+                format!(
+                    "--replay-networking: {} is not a valid network trace; record a new one with \
+                     --record-networking",
+                    path.display()
+                )
+            })?;
+        }
+        Ok(NetworkTraceConfig {
+            mode,
+            path: Some(path),
+            network_perturb_seed: None,
+        })
     }
 
     fn install_pmu_config(&self) -> Result<(), Error> {
