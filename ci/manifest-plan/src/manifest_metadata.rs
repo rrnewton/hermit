@@ -27,7 +27,9 @@ use crate::runner::TestRecipe;
 use crate::timeouts::MANIFEST_SCHEMA;
 
 // Schema 2 requires the independently resolved CPU timeout for every cell.
-const EXPORT_SCHEMA: u64 = 2;
+// Schema 3 exports every custom cell of both source populations, selected by
+// full validation or not (see `ManifestMetadata::selected_by_full_custom_commands`).
+const EXPORT_SCHEMA: u64 = 3;
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ManifestMetadata {
@@ -36,6 +38,15 @@ pub struct ManifestMetadata {
     pub manifest_sha256: String,
     pub tests: Vec<TestMetadata>,
     pub cells: Vec<CellMetadata>,
+    /// Every custom-mode cell in the manifest, from both the enabled and the
+    /// disabled populations, each carrying its own `selected_by_full` and
+    /// reason fields exactly as `cells` does. Through schema 2 this held only
+    /// the custom cells that full validation selects, so a custom cell moved
+    /// to `backends_disabled` vanished from the export and the compatibility
+    /// site dropped its history. The field keeps its schema-2 name because the
+    /// website builder decodes this type through a Cargo path dependency on
+    /// whichever Hermit checkout sits beside it; a rename would stop that
+    /// builder compiling against one of the two schemas.
     pub selected_by_full_custom_commands: Vec<CellMetadata>,
 }
 
@@ -130,9 +141,12 @@ fn build_export_from_inputs(
         .collect();
 
     let mut cells = Vec::new();
+    let mut selected_by_full_custom_commands = Vec::new();
     // Keep both source populations: selection by full validation is a separate
-    // fact from whether a comparable cell is present in the manifest. A cell
-    // only a focused run type selects (by its label) is still in the manifest.
+    // fact from whether a cell is present in the manifest. A cell only a
+    // focused run type selects (by its label) is still in the manifest. The
+    // same rule holds for custom cells, which are exported separately because
+    // they are not part of the comparable matrix.
     for population in [Population::Enabled, Population::Disabled] {
         let selected = manifests.select(&Selection {
             population: Some(population),
@@ -142,25 +156,38 @@ fn build_export_from_inputs(
             ..Selection::default()
         })?;
         for cell in selected {
-            if cell.id.mode != "custom" {
-                cells.push(cell_metadata(
-                    &cell,
-                    selected_by_full_ids.contains(&cell.id),
-                )?);
+            let metadata = cell_metadata(&cell, selected_by_full_ids.contains(&cell.id))?;
+            if cell.id.mode == "custom" {
+                selected_by_full_custom_commands.push(metadata);
+            } else {
+                cells.push(metadata);
             }
         }
     }
     sort_and_require_unique_cells("comparable cells in the manifest", &mut cells)?;
-
-    let mut selected_by_full_custom_commands = selected_by_full_cells
-        .into_iter()
-        .filter(|cell| cell.id.mode == "custom")
-        .map(|cell| cell_metadata(&cell, true))
-        .collect::<Result<Vec<_>, _>>()?;
     sort_and_require_unique_cells(
-        "custom commands selected by full validation",
+        "custom commands in the manifest",
         &mut selected_by_full_custom_commands,
     )?;
+    // Every custom cell full validation selects must still be exported as
+    // selected: schema 2 took them from that selection directly.
+    for cell in selected_by_full_cells
+        .iter()
+        .filter(|cell| cell.id.mode == "custom")
+    {
+        let backend = cell.id.backend.as_deref().unwrap_or("native");
+        if !selected_by_full_custom_commands.iter().any(|exported| {
+            exported.selected_by_full
+                && exported.test == cell.id.test
+                && exported.mode == cell.id.mode
+                && exported.backend == backend
+        }) {
+            return Err(format!(
+                "{}/{}@{backend} is selected by full validation but absent from the exported custom commands",
+                cell.id.test, cell.id.mode
+            ));
+        }
+    }
 
     let manifest_sha256 =
         require_stable_manifest_sha(manifest_sha256_before, manifest_sha256(&read_current()?)?)?;
@@ -804,7 +831,37 @@ test:
             )
         );
         assert!(verify.not_applicable_reason.is_none());
-        assert!(export.selected_by_full_custom_commands.is_empty());
+
+        // Schema 3 exports a custom cell whether or not full validation
+        // selects it (schema 2 exported only selected ones, so this list was
+        // empty): the enabled ptrace cell with the occasional reason and the
+        // four disabled backends with their not-applicable reasons.
+        let custom = &export.selected_by_full_custom_commands;
+        assert_eq!(custom.len(), 5);
+        assert!(custom.iter().all(|cell| {
+            cell.test == "occasional/full-selection"
+                && cell.mode == "custom"
+                && !cell.selected_by_full
+        }));
+        let enabled = custom.iter().find(|cell| cell.backend == "ptrace").unwrap();
+        assert_eq!(
+            enabled
+                .not_selected_by_full_reason
+                .as_ref()
+                .map(|reason| reason.reason.as_str()),
+            Some(
+                "This test is marked occasional, and full validation does not select occasional tests."
+            )
+        );
+        assert!(enabled.not_applicable_reason.is_none());
+        for backend in ["dbt", "kvm", "sabre", "liteinst"] {
+            let disabled = custom.iter().find(|cell| cell.backend == backend).unwrap();
+            assert!(disabled.not_selected_by_full_reason.is_none());
+            assert_eq!(
+                disabled.not_applicable_reason.as_deref(),
+                Some("Not applicable in this fixture")
+            );
+        }
     }
 
     #[test]
@@ -963,7 +1020,7 @@ test:
             };
             let fixture = TemporaryManifestRoot::new("occasional", &source);
             let export = build_export(fixture.path()).unwrap();
-            assert_eq!(export.schema, 2);
+            assert_eq!(export.schema, 3);
             let limits = export
                 .cells
                 .iter()
@@ -992,7 +1049,7 @@ test:
     fn metadata_contract_has_stable_json_and_round_trips() {
         let encoded = serde_json::to_string(&contract_fixture()).unwrap();
         let expected = concat!(
-            r#"{"schema":2,"manifest_schema":3,"manifest_sha256":"abc","tests":["#,
+            r#"{"schema":3,"manifest_schema":3,"manifest_sha256":"abc","tests":["#,
             r#"{"id":"shell","description":"shell command","category":"fixture","lane":"portable","requires":["kvm"],"occasional":false,"program":null,"direct":{"kind":"shell","command":"true"},"build":null,"observation":{"status":true,"stdout":false,"stderr":true,"artifacts":["result.txt"]},"preprocessors":[]},"#,
             r#"{"id":"argv","description":"argv command","category":"fixture","lane":"portable","requires":[],"occasional":true,"program":"fixture-bin","direct":{"kind":"argv","argv":["fixture-bin","--flag"]},"build":{"cflags":["-O2"],"rustflags":["-Copt-level=2"]},"observation":{"status":false,"stdout":true,"stderr":false,"artifacts":[]},"preprocessors":["e9patch"]}],"#,
             r#""cells":[{"test":"shell","category":"fixture","lane":"portable","mode":"verify","backend":"ptrace","selected_by_full":false,"not_selected_by_full_reason":{"result":"unavailable","evidence":"fixture-evidence","reason":"fixture reason"},"not_applicable_reason":null,"timeout_seconds":15,"cpu_timeout_seconds":7,"guest_args":["--guest",""],"workdir":"fixture-workdir","current_reproducer":{"argv":["test-harness","run"],"shell_command":"test-harness run"},"current_reproducer_unavailable_reason":null},"#,
@@ -1345,7 +1402,11 @@ test:
             .count();
         assert!(cells_selected_by_full > 0);
         assert!(cells_selected_by_full < cells_in_manifest);
-        for cell in &first.cells {
+        for cell in first
+            .cells
+            .iter()
+            .chain(&first.selected_by_full_custom_commands)
+        {
             if cell.selected_by_full {
                 assert!(cell.not_selected_by_full_reason.is_none());
                 assert!(cell.not_applicable_reason.is_none());
@@ -1360,11 +1421,28 @@ test:
                 );
             }
         }
+        // Schema 3 semantic change: this list holds every custom cell in the
+        // manifest, not only those full validation selects. Schema 2 asserted
+        // here that every entry was selected by full; a custom cell moved to
+        // backends_disabled (the LiteInst reset) is now exported unselected
+        // with its not-applicable reason instead of disappearing.
+        let custom = &first.selected_by_full_custom_commands;
+        assert!(custom.iter().all(|cell| cell.mode == "custom"));
+        assert!(first.cells.iter().all(|cell| cell.mode != "custom"));
+        assert!(custom.iter().any(|cell| cell.selected_by_full));
+        let liteinst = custom
+            .iter()
+            .find(|cell| {
+                cell.test == "system-utils/clock-determinism" && cell.backend == "liteinst"
+            })
+            .expect("the disabled clock-determinism custom/liteinst cell is exported");
+        assert!(!liteinst.selected_by_full);
+        assert!(liteinst.not_selected_by_full_reason.is_none());
         assert!(
-            first
-                .selected_by_full_custom_commands
-                .iter()
-                .all(|cell| cell.mode == "custom" && cell.selected_by_full)
+            liteinst
+                .not_applicable_reason
+                .as_deref()
+                .is_some_and(|reason| !reason.trim().is_empty())
         );
     }
 
