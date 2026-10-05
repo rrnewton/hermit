@@ -312,9 +312,12 @@ impl SeriesPressureAttempt {
     /// leaves it without a result when a non-product error kind decides the
     /// cell (`runner::observed_result_from_typed_evidence`), and refines
     /// either to sandbox-denied or infrastructure-error when an attempt's
-    /// output shows an environmental block (`runner::observed_result`). Every
-    /// reader that judges retained attempts holds them to this one rule,
-    /// whatever a timed-out attempt's report says and whether it wrote one.
+    /// output shows an environmental block (`runner::observed_result`).
+    /// `validate_pressure_evidence`, `validate_declared_guest_exit` and
+    /// pressure-test.rs's `checked_inner_pressure_history` hold the attempts
+    /// they judge to this one rule, whatever a timed-out attempt's report says
+    /// and whether it wrote one. Other readers of retained attempts do not
+    /// apply it yet.
     pub fn require_result_supported_by_timeouts(
         attempts: &[SeriesPressureAttempt],
         result: Option<ObservedResult>,
