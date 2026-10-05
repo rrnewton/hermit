@@ -90,16 +90,9 @@ fn public_record_uses_the_completed_command_namespace_and_stdio() {
     fs::write(&source, b"mounted-content\n").expect("write mount source");
     fs::write(&target, b"unmounted-content\n").expect("write mount target");
 
-    let guest = files.path().join("public-record-mount-stdio");
-    compile_c(
-        &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli must be inside the repository")
-            .join("tests/c/public_record_mount_stdio.c"),
-        &guest,
-    );
+    let guest = &workload("c_public_record_mount_stdio").path;
 
-    let mut command = ReverieCommand::new(&guest);
+    let mut command = ReverieCommand::new(guest);
     command
         .arg(&target)
         .map_root()
@@ -179,17 +172,9 @@ fn public_record_replay_preserves_distinct_forked_child_streams() {
 
     let _guard = hermit_record_lock();
     let data = tempfile::tempdir().expect("create recording directory");
-    let build = tempfile::tempdir().expect("create guest build directory");
-    let guest = build.path().join("record-replay-forked-streams");
-    compile_c(
-        &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli must be inside the repository")
-            .join("tests/c/record_replay_forked_streams.c"),
-        &guest,
-    );
+    let guest = &workload("c_record_replay_forked_streams").path;
 
-    let mut command = ReverieCommand::new(&guest);
+    let mut command = ReverieCommand::new(guest);
     command.map_root();
     let recording =
         hermit::record_with_output(command, data.path()).expect("forked guest should record");
@@ -446,17 +431,9 @@ fn public_record_replay_handles_a_deep_serial_fork_chain() {
 
     let _guard = hermit_record_lock();
     let data = tempfile::tempdir().expect("create recording directory");
-    let build = tempfile::tempdir().expect("create guest build directory");
-    let guest = build.path().join("record-replay-deep-fork-chain");
-    compile_c(
-        &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli must be inside the repository")
-            .join("tests/c/record_replay_deep_fork_chain.c"),
-        &guest,
-    );
+    let guest = &workload("c_record_replay_deep_fork_chain").path;
 
-    let mut command = ReverieCommand::new(&guest);
+    let mut command = ReverieCommand::new(guest);
     command.map_root();
     let recording =
         hermit::record_with_output(command, data.path()).expect("deep fork chain should record");
@@ -625,17 +602,6 @@ fn first_mountinfo_row_difference(left: &[u8], right: &[u8]) -> String {
         }
     }
     unreachable!("different mountinfo byte strings must have a differing row")
-}
-
-fn compile_c(source: &Path, output: &Path) {
-    record_workloads::require_standalone().expect("unprepared standalone C fixture");
-    let mut command = Command::new("cc");
-    command
-        .args(["-O0", "-g", "-pthread"])
-        .arg(source)
-        .arg("-o")
-        .arg(output);
-    command_output(command, "C record workload compilation");
 }
 
 fn workloads() -> &'static [Workload] {
@@ -900,7 +866,9 @@ fn record_rejects_initial_executable_without_shebang() {
 fn replay_bootstrap_uses_snapshot_after_original_executable_is_removed() {
     let _guard = hermit_record_lock();
     let fixture = tempfile::tempdir().expect("failed to create bootstrap replay fixture");
-    let executable = fixture.path().join("ephemeral-echo");
+    // Keep the basename "echo": a multicall coreutils, as in the pinned
+    // validation root, picks the applet from argv[0] and refuses other names.
+    let executable = fixture.path().join("echo");
     fs::copy("/bin/echo", &executable).expect("failed to copy ephemeral executable");
     fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
         .expect("failed to mark ephemeral executable executable");
@@ -1235,17 +1203,7 @@ fn record_start_ordered_var_then_nscd_keeps_run_nscd_hardening() {
     fs::write(user_var.path().join("run/nscd/from-var"), b"from-var\n").expect("write /var marker");
     let later_nscd = tempfile::tempdir().expect("create later nscd source");
     fs::write(later_nscd.path().join("from-later"), b"from-later\n").expect("write later marker");
-    let guest = Path::new(env!("CARGO_BIN_EXE_hermit"))
-        .parent()
-        .expect("Hermit binary should have a parent directory")
-        .join("mount-nscd-order-round8");
-    compile_c(
-        &Path::new(env!("CARGO_MANIFEST_DIR"))
-            .parent()
-            .expect("hermit-cli must be inside the repository")
-            .join("tests/c/mount_nscd_order.c"),
-        &guest,
-    );
+    let guest = &workload("c_mount_nscd_order").path;
 
     let mut record = Command::new(env!("CARGO_BIN_EXE_hermit"));
     record
@@ -1260,7 +1218,7 @@ fn record_start_ordered_var_then_nscd_keeps_run_nscd_hardening() {
             later_nscd.path().display()
         ))
         .arg("--")
-        .arg(&guest);
+        .arg(guest);
     let recorded = command_output(record, "record ordered /var and nscd mounts");
     let text = std::str::from_utf8(&recorded.stdout).expect("guest output should be UTF-8");
     assert!(
@@ -2353,7 +2311,7 @@ fn record_poll_invalid_nfds_preserves_einval() {
 
 /// faccessat/faccessat2, chdir/getcwd and the legacy path mutations (rename,
 /// link, symlink, chmod, chown, lchown, mknod, rmdir) must replay from the
-/// recording. The replay chroot lacks /etc/passwd and /usr/lib, so a live
+/// recording. The replay chroot lacks /etc/passwd and /usr/bin, so a live
 /// query there answers differently and the guest's output diverges.
 #[test]
 fn record_path_queries_and_legacy_mutations() {

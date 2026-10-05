@@ -25,7 +25,7 @@ pub const REQUIRED_ENV: &str = "HERMIT_PREPARED_NEXTEST_REQUIRED";
 pub const PACKAGE: &str = "hermetic_infra_hermit_tests";
 pub const C_FLAGS: [&str; 3] = ["-O0", "-g", "-pthread"];
 
-pub const C_SOURCES: [(&str, &str); 31] = [
+pub const C_SOURCES: [(&str, &str); 35] = [
     ("c_getpid", "tests/c/getpid.c"),
     ("c_getsockopt_null", "tests/c/getsockopt_null.c"),
     ("c_setsockopt_replay", "tests/c/record_replay_setsockopt.c"),
@@ -99,6 +99,19 @@ pub const C_SOURCES: [(&str, &str); 31] = [
         "c_localhost_http_server",
         "tests/compat/localhost_http_server.c",
     ),
+    (
+        "c_public_record_mount_stdio",
+        "tests/c/public_record_mount_stdio.c",
+    ),
+    (
+        "c_record_replay_forked_streams",
+        "tests/c/record_replay_forked_streams.c",
+    ),
+    (
+        "c_record_replay_deep_fork_chain",
+        "tests/c/record_replay_deep_fork_chain.c",
+    ),
+    ("c_mount_nscd_order", "tests/c/mount_nscd_order.c"),
 ];
 
 // Alias, Cargo target, repository-relative source. The clock now uses the
@@ -279,7 +292,7 @@ struct Envelope {
 pub fn prepared_envelope(paths: &BTreeMap<String, PathBuf>) -> Result<String, String> {
     if paths.keys().map(String::as_str).collect::<BTreeSet<_>>() != names().collect() {
         return Err(
-            "prepared record workload population must contain exactly all 43 aliases".into(),
+            "prepared record workload population must contain exactly all 52 aliases".into(),
         );
     }
     let workloads = paths
@@ -328,7 +341,7 @@ pub fn consume_prepared(
     }
     if paths.keys().map(String::as_str).collect::<BTreeSet<_>>() != names().collect() {
         return Err(
-            "prepared record workload population must contain exactly all 43 aliases".into(),
+            "prepared record workload population must contain exactly all 52 aliases".into(),
         );
     }
     Ok(Some(
