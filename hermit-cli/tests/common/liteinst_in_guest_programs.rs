@@ -203,6 +203,40 @@ fn compressed_fixtures() -> &'static [PathBuf; 2] {
     })
 }
 
+// AUTONOMOUS-BOT-IMPLEMENTED
+// TODO-HUMAN-REVIEW(liteinst-c2-hermit): Review running a Nix wrapper's ELF directly.
+/// The ELF that runs when `program` is executed. Nix installs some programs
+/// (gzip in the pinned validation root) as a `#!` shell wrapper that execs
+/// `.<name>-wrapped` beside it. In-guest LiteInst does not support execve yet,
+/// so a wrapper would fail at that exec; run the wrapped ELF directly. An
+/// ordinary ELF program is returned unchanged.
+fn elf_program(program: &Path) -> PathBuf {
+    fn is_elf(path: &Path) -> bool {
+        let mut magic = [0_u8; 4];
+        fs::File::open(path)
+            .and_then(|mut file| file.read_exact(&mut magic))
+            .is_ok()
+            && magic == *b"\x7fELF"
+    }
+    if is_elf(program) {
+        return program.to_path_buf();
+    }
+    let resolved = fs::canonicalize(program)
+        .unwrap_or_else(|error| panic!("failed to resolve {}: {error}", program.display()));
+    let name = resolved
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_else(|| panic!("{} has no UTF-8 file name", resolved.display()));
+    let wrapped = resolved.with_file_name(format!(".{name}-wrapped"));
+    assert!(
+        is_elf(&wrapped),
+        "{} is neither an ELF nor a Nix wrapper around {}",
+        program.display(),
+        wrapped.display()
+    );
+    wrapped
+}
+
 const VIRTUAL_TIME_EPOCH: &str = "2026-01-01T00:00:00Z";
 
 fn liteinst_command_at_epoch(log_level: &str, epoch: Option<&str>) -> Command {
@@ -790,7 +824,7 @@ fn liteinst_in_guest_round3_encoding_and_compression_utilities() {
         ("/usr/bin/bzip2", bzip2_fixture),
     ] {
         assert_liteinst_in_guest(
-            Path::new(program),
+            &elf_program(Path::new(program)),
             &[
                 "-cd",
                 compressed_fixture
