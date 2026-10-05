@@ -179,6 +179,11 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
     pmu_on_re = read_root_config("hermit_e2e", "pmu_on_re", "true") == "true"
     # -c hermit_e2e.nonce=X gives every cell a fresh action digest: a cache-busting rerun.
     nonce = read_root_config("hermit_e2e", "nonce", "")
+    # -c hermit_e2e.epoch=E gives every cell HERMIT_EPOCH=E. Backend parity compares a ptrace
+    # reference with its candidates only when they ran under one guest epoch, and each cell is
+    # its own harness process, which otherwise samples its own start time. validate-node sets
+    # it from the checked-out commit's committer time.
+    epoch = read_root_config("hermit_e2e", "epoch", "")
     if plan["schema"] != 1:
         fail("expected-e2e-plan.json schema must be 1")
     by_route = {"local": [], "re": []}
@@ -188,17 +193,22 @@ def hermit_e2e_cells(plan, re_exclusions, bundle = ":bundle", runner = "cell.sh"
             where = "local"
         container, container_reason = _container(cell, where)
         name = cell_slug(cell)
+        env = {
+            "HERMIT_E2E_CONTAINER": container,
+            "HERMIT_E2E_CONTAINER_REASON": container_reason,
+            "HERMIT_E2E_ROUTE": where,
+            "HERMIT_E2E_ROUTE_REASON": reason,
+        }
+        if nonce:
+            env["HERMIT_E2E_NONCE"] = nonce
+        if epoch:
+            env["HERMIT_EPOCH"] = epoch
         hermit_e2e_cell_test(
             name = name,
             runner = runner,
             args = [cell["test"], cell["mode"], cell["backend"]],
             bundle = bundle,
-            env = dict({
-                "HERMIT_E2E_CONTAINER": container,
-                "HERMIT_E2E_CONTAINER_REASON": container_reason,
-                "HERMIT_E2E_ROUTE": where,
-                "HERMIT_E2E_ROUTE_REASON": reason,
-            }, **({"HERMIT_E2E_NONCE": nonce} if nonce else {})),
+            env = env,
             labels = [
                 "tpx-enable-artifact-reporting",
                 "hermit_e2e",
