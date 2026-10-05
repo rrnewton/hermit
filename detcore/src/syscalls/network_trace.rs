@@ -1553,7 +1553,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             // recording holds the refusal so that replay reports it at the
             // same stream offset. A blocking send yields to the scheduler
             // until the host accepts all of it, so that other guest threads,
-            // which may be what the peer waits for, keep running.
+            // which may be what the peer waits for, keep running. It carries
+            // its mark across each wait, and the engine refuses it if any
+            // other output event on the channel happened in between: replay
+            // never waits here, so it would order the two the other way.
             let mut rsrc = Resources::new(guest.thread_state().dettid);
             rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
             rsrc.fyi("network send");
@@ -1590,6 +1593,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                         return Err(Errno::EAGAIN.into());
                     }
                     Err(Errno::EAGAIN) => {
+                        if at.is_none() {
+                            // Waiting before the first accepted byte: take
+                            // the mark now; an empty send records nothing.
+                            let request = NetworkRequest::RecordSend {
+                                id,
+                                bytes: Vec::new(),
+                                at: None,
+                            };
+                            let NetworkReply::Recorded(mark) =
+                                self.network_request(guest, request).await
+                            else {
+                                unreachable!()
+                            };
+                            at = Some(mark);
+                        }
                         rsrc.poll_attempt += 1;
                         record_retry_event(guest, syscalls::Sendto::new().with_fd(fd)).await;
                         if matches!(

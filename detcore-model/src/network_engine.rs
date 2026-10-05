@@ -107,8 +107,9 @@ pub enum NetworkEngineError {
         channel: OpenFileId,
         offset: u64,
     },
-    /// Record: another send reached the stream while a blocking send waited
-    /// for buffer space, so the stream interleaves the two.
+    /// Record: another send, accepted or refused, reached the stream while a
+    /// blocking send waited for buffer space, so the stream interleaves the
+    /// two.
     InterleavedSend {
         channel: OpenFileId,
         offset: u64,
@@ -225,8 +226,8 @@ impl fmt::Display for NetworkEngineError {
             ),
             Self::InterleavedSend { channel, offset } => write!(
                 f,
-                "network record: another send on {channel} reached stream offset {offset} \
-                 while a blocking send waited for buffer space"
+                "network record: another send on {channel}, accepted or refused, reached \
+                 stream offset {offset} while a blocking send waited for buffer space"
             ),
             Self::InvalidArrival(id) => write!(
                 f,
@@ -313,7 +314,7 @@ pub enum NetworkRequest {
     RecordSend {
         id: OpenFileId,
         bytes: Vec<u8>,
-        at: Option<u64>,
+        at: Option<SendMark>,
     },
     /// See [`NetworkEngine::record_refused_send`].
     RecordRefusedSend(OpenFileId),
@@ -329,6 +330,17 @@ pub enum NetworkRequest {
     Addresses(OpenFileId),
 }
 
+/// Where a recorded send left a channel's outbound stream: its offset, and
+/// how many output events (accepted chunks and refused sends) the channel
+/// has recorded. A blocking send that waits for buffer space passes its mark
+/// back with its next chunk; any output event in between changes `events`,
+/// even a refusal, which does not move `offset`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SendMark {
+    pub offset: u64,
+    pub events: u64,
+}
+
 /// The answer to a [`NetworkRequest`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum NetworkReply {
@@ -340,8 +352,8 @@ pub enum NetworkReply {
     /// Poll events, one per requested channel.
     Events(Vec<i16>),
     Sent(usize),
-    /// The outbound stream offset after a recorded send.
-    Recorded(u64),
+    /// Where a recorded send left the outbound stream.
+    Recorded(SendMark),
     /// A nonblocking send that the recording refused with `EAGAIN`.
     WouldBlock,
     /// Local (if connected) and peer address, or `None` for an unknown channel.
@@ -376,6 +388,8 @@ struct Channel {
     pending_error: Option<i32>,
     /// Bytes the guest has transmitted.
     tx: u64,
+    /// Record: output events recorded, accepted chunks and refused sends.
+    output_events: u64,
     shut_rd: bool,
     shut_wr: bool,
     /// Replay: inputs not yet released, in order.
@@ -394,10 +408,18 @@ impl Channel {
             rx_end: 0,
             peer_closed: false,
             tx: 0,
+            output_events: 0,
             shut_rd: false,
             shut_wr: false,
             pending_inputs: VecDeque::new(),
             expected_outputs: VecDeque::new(),
+        }
+    }
+
+    fn send_mark(&self) -> SendMark {
+        SendMark {
+            offset: self.tx,
+            events: self.output_events,
         }
     }
 
@@ -762,16 +784,18 @@ impl NetworkEngine {
         Ok(None)
     }
 
-    /// Record the bytes a host send accepted and return the stream offset
-    /// after them. `at` is where a send that already accepted bytes, and
-    /// then waited for buffer space, left the stream; another send reaching
-    /// the stream in the meantime is refused.
+    /// Record the bytes a host send accepted and return where they left the
+    /// stream. Empty `sent` records nothing and returns the current mark,
+    /// which a blocking send takes before its first wait. `at` is the mark
+    /// of a send that then waited for buffer space; any output event on the
+    /// channel in the meantime, accepted or refused, is refused, because
+    /// replay never waits there and would order the two the other way.
     pub fn record_send(
         &mut self,
         id: OpenFileId,
         sent: &[u8],
-        at: Option<u64>,
-    ) -> Result<u64, NetworkEngineError> {
+        at: Option<SendMark>,
+    ) -> Result<SendMark, NetworkEngineError> {
         let channel = self
             .channels
             .get_mut(&id)
@@ -780,15 +804,15 @@ impl NetworkEngine {
             return Err(NetworkEngineError::WrongMode);
         };
         if let Some(at) = at
-            && at != channel.tx
+            && at != channel.send_mark()
         {
             return Err(NetworkEngineError::InterleavedSend {
                 channel: id,
-                offset: at,
+                offset: at.offset,
             });
         }
         if sent.is_empty() {
-            return Ok(channel.tx);
+            return Ok(channel.send_mark());
         }
         outputs.push(NetworkOutputV1 {
             channel: id,
@@ -796,7 +820,8 @@ impl NetworkEngine {
             bytes: sent.to_vec(),
         });
         channel.tx += sent.len() as u64;
-        Ok(channel.tx)
+        channel.output_events += 1;
+        Ok(channel.send_mark())
     }
 
     /// Record a nonblocking send that the host refused with `EAGAIN`, as an
@@ -804,7 +829,7 @@ impl NetworkEngine {
     pub fn record_refused_send(&mut self, id: OpenFileId) -> Result<(), NetworkEngineError> {
         let channel = self
             .channels
-            .get(&id)
+            .get_mut(&id)
             .ok_or(NetworkEngineError::UnknownChannel(id))?;
         let Mode::Record { outputs, .. } = &mut self.mode else {
             return Err(NetworkEngineError::WrongMode);
@@ -814,6 +839,7 @@ impl NetworkEngine {
             stream_offset: channel.tx,
             bytes: Vec::new(),
         });
+        channel.output_events += 1;
         Ok(())
     }
 
@@ -1047,6 +1073,10 @@ mod tests {
 
     fn sock(n: u64) -> OpenFileId {
         OpenFileId::new_socket(DetTid::from_raw(1), n)
+    }
+
+    fn mark(offset: u64, events: u64) -> SendMark {
+        SendMark { offset, events }
     }
 
     fn peer() -> NetworkAddressV1 {
@@ -1383,10 +1413,10 @@ mod tests {
             .unwrap();
         // The host accepted a prefix of a nonblocking send, then refused
         // the next two attempts with EAGAIN before accepting the rest.
-        assert_eq!(engine.record_send(id, b"re", None), Ok(2));
+        assert_eq!(engine.record_send(id, b"re", None), Ok(mark(2, 1)));
         engine.record_refused_send(id).unwrap();
         engine.record_refused_send(id).unwrap();
-        assert_eq!(engine.record_send(id, b"q", None), Ok(3));
+        assert_eq!(engine.record_send(id, b"q", None), Ok(mark(3, 4)));
         engine.record_refused_send(id).unwrap();
         let trace = engine.finish().unwrap();
         assert!(trace.records_refused_sends());
@@ -1466,11 +1496,14 @@ mod tests {
             .unwrap();
         // A blocking send accepted a prefix and waits; its continuation
         // lands where it left the stream.
-        assert_eq!(engine.record_send(id, b"ab", None), Ok(2));
-        assert_eq!(engine.record_send(id, b"cd", Some(2)), Ok(4));
+        assert_eq!(engine.record_send(id, b"ab", None), Ok(mark(2, 1)));
+        assert_eq!(
+            engine.record_send(id, b"cd", Some(mark(2, 1))),
+            Ok(mark(4, 2))
+        );
         // Another send reached the stream while it waited.
-        assert_eq!(engine.record_send(id, b"xy", None), Ok(6));
-        let error = engine.record_send(id, b"ef", Some(4)).unwrap_err();
+        assert_eq!(engine.record_send(id, b"xy", None), Ok(mark(6, 3)));
+        let error = engine.record_send(id, b"ef", Some(mark(4, 2))).unwrap_err();
         assert_eq!(
             error,
             NetworkEngineError::InterleavedSend {
@@ -1484,6 +1517,55 @@ mod tests {
             3,
             "a refused continuation must not be recorded"
         );
+    }
+
+    #[test]
+    fn record_refuses_a_send_that_overtook_a_zero_byte_wait() {
+        let mut engine = NetworkEngine::new_record(epoch());
+        let id = sock(0);
+        engine
+            .record_connect(id, peer(), local(), 0, false)
+            .unwrap();
+        assert_eq!(engine.record_send(id, b"ab", None), Ok(mark(2, 1)));
+        // A blocking send found the buffer full before accepting any byte
+        // and took its mark before waiting; taking it records nothing.
+        let waiting = engine.record_send(id, b"", None).unwrap();
+        assert_eq!(waiting, mark(2, 1));
+        // Another thread's send was accepted while it waited. Replay never
+        // waits there, so it would give the waiting send these offsets.
+        assert_eq!(engine.record_send(id, b"xy", None), Ok(mark(4, 2)));
+        let error = engine.record_send(id, b"cd", Some(waiting)).unwrap_err();
+        assert_eq!(
+            error,
+            NetworkEngineError::InterleavedSend {
+                channel: id,
+                offset: 2
+            }
+        );
+        assert_eq!(engine.finish().unwrap().outputs.len(), 2);
+    }
+
+    #[test]
+    fn record_refuses_a_refusal_pushed_during_a_wait() {
+        let mut engine = NetworkEngine::new_record(epoch());
+        let id = sock(0);
+        engine
+            .record_connect(id, peer(), local(), 0, false)
+            .unwrap();
+        assert_eq!(engine.record_send(id, b"ab", None), Ok(mark(2, 1)));
+        // Another thread's nonblocking send was refused while this send
+        // waited. The refusal does not move the offset, but replay would
+        // hand it to the waiting blocking send.
+        engine.record_refused_send(id).unwrap();
+        let error = engine.record_send(id, b"cd", Some(mark(2, 1))).unwrap_err();
+        assert_eq!(
+            error,
+            NetworkEngineError::InterleavedSend {
+                channel: id,
+                offset: 2
+            }
+        );
+        assert_eq!(engine.finish().unwrap().outputs.len(), 2);
     }
 
     #[test]

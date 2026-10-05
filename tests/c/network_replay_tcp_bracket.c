@@ -31,7 +31,12 @@
  * while a second thread sends "go" only after the first is stuck: after a
  * nonblocking send reported EAGAIN, or while a blocking send waits. Linux
  * completes both; so must record, which may not hold the second thread back
- * while the first waits for buffer space.
+ * while the first waits for buffer space. In the interleaved mode the first
+ * thread fills the buffer, then waits in a blocking send before any byte of
+ * it is accepted, and the second thread's nonblocking send on the same
+ * connection is refused before it sends "go". Linux completes that too;
+ * record refuses it, because replay would hand the refusal to the waiting
+ * blocking send.
  */
 
 #include <arpa/inet.h>
@@ -742,6 +747,9 @@ static int run_backpressure_controller(const char *port_path,
 struct backpressure {
   int control;
   int blocking;
+  /* The data connection, on which this thread first makes a refused
+   * nonblocking send; -1 if it makes none. */
+  int interleave;
   pthread_mutex_t lock;
   pthread_cond_t stuck_cond;
   int stuck;
@@ -767,6 +775,15 @@ static void *run_go_sender(void *raw) {
     const struct timespec delay = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
     nanosleep(&delay, NULL);
   }
+  if (state->interleave >= 0) {
+    unsigned char byte = backpressure_byte(0);
+    ssize_t accepted;
+    do
+      accepted = send(state->interleave, &byte, 1, MSG_DONTWAIT | MSG_NOSIGNAL);
+    while (accepted < 0 && errno == EINTR);
+    if (!(accepted < 0 && errno == EAGAIN))
+      fail_message("a nonblocking send on the full data connection was not refused");
+  }
   send_all(state->control, GO, sizeof(GO) - 1);
   return NULL;
 }
@@ -784,7 +801,41 @@ static int connect_loopback(uint16_t port, int send_buffer) {
   return fd;
 }
 
-static int run_backpressure_client(const char *port_text, int blocking) {
+enum backpressure_kind { NONBLOCKING, BLOCKING, INTERLEAVED };
+
+/* Sends nonblocking from `sent` until the connection refuses; returns the
+ * new total. */
+static size_t fill_until_refused(int fd, const unsigned char *bytes, size_t sent) {
+  for (;;) {
+    ssize_t accepted =
+        send(fd, bytes + sent, BACKPRESSURE_BYTES - sent, MSG_DONTWAIT | MSG_NOSIGNAL);
+    if (accepted > 0)
+      sent += (size_t)accepted;
+    else if (accepted < 0 && errno == EAGAIN)
+      return sent;
+    else if (!(accepted < 0 && errno == EINTR))
+      fail("send nonblocking fill");
+    if (sent == BACKPRESSURE_BYTES)
+      fail_message("the data connection accepted everything without refusing");
+  }
+}
+
+/* Fills the connection until it stays full: acknowledgements still in
+ * flight after the first refusal free buffer space, which a later
+ * one-byte send would take. */
+static size_t fill_until_full(int fd, const unsigned char *bytes) {
+  size_t sent = fill_until_refused(fd, bytes, 0);
+  for (int quiet = 0; quiet < 3;) {
+    const struct timespec settle = {.tv_sec = 0, .tv_nsec = 20 * 1000 * 1000};
+    nanosleep(&settle, NULL);
+    size_t more = fill_until_refused(fd, bytes, sent);
+    quiet = more == sent ? quiet + 1 : 0;
+    sent = more;
+  }
+  return sent;
+}
+
+static int run_backpressure_client(const char *port_text, enum backpressure_kind kind) {
   set_deadline();
   uint16_t port = parse_port(port_text);
   int data = connect_loopback(port, BACKPRESSURE_SOCKET_BUFFER);
@@ -793,7 +844,9 @@ static int run_backpressure_client(const char *port_text, int blocking) {
   for (size_t index = 0; index < BACKPRESSURE_BYTES; ++index)
     bytes[index] = backpressure_byte(index);
 
-  struct backpressure state = {.control = control, .blocking = blocking};
+  struct backpressure state = {.control = control,
+                               .blocking = kind != NONBLOCKING,
+                               .interleave = kind == INTERLEAVED ? data : -1};
   if (pthread_mutex_init(&state.lock, NULL) != 0 ||
       pthread_cond_init(&state.stuck_cond, NULL) != 0)
     fail_message("backpressure synchronization setup failed");
@@ -801,7 +854,11 @@ static int run_backpressure_client(const char *port_text, int blocking) {
   if (pthread_create(&go_sender, NULL, run_go_sender, &state) != 0)
     fail_message("pthread_create go sender failed");
 
-  if (blocking) {
+  if (kind == INTERLEAVED) {
+    size_t sent = fill_until_full(data, bytes);
+    announce_stuck(&state);
+    send_all(data, bytes + sent, BACKPRESSURE_BYTES - sent);
+  } else if (kind == BLOCKING) {
     announce_stuck(&state);
     send_all(data, bytes, BACKPRESSURE_BYTES);
   } else {
@@ -832,8 +889,8 @@ static int run_backpressure_client(const char *port_text, int blocking) {
     fail_message("pthread_join go sender failed");
   close(data);
   close(control);
-  printf("backpressure=%s bytes=%d reply=ok\n", blocking ? "blocking" : "nonblocking",
-         BACKPRESSURE_BYTES);
+  const char *names[] = {"nonblocking", "blocking", "interleaved"};
+  printf("backpressure=%s bytes=%d reply=ok\n", names[kind], BACKPRESSURE_BYTES);
   return 0;
 }
 
@@ -848,9 +905,11 @@ int main(int argc, char **argv) {
     if (strcmp(argv[3], "mismatch") == 0)
       return run_client(argv[2], 1);
     if (strcmp(argv[3], "backpressure-nonblocking") == 0)
-      return run_backpressure_client(argv[2], 0);
+      return run_backpressure_client(argv[2], NONBLOCKING);
     if (strcmp(argv[3], "backpressure-blocking") == 0)
-      return run_backpressure_client(argv[2], 1);
+      return run_backpressure_client(argv[2], BLOCKING);
+    if (strcmp(argv[3], "backpressure-interleaved") == 0)
+      return run_backpressure_client(argv[2], INTERLEAVED);
     const char *refused[] = {"truncated", "sendmsg",    "sendfile", "unspecified",
                              "udp",       "listen",     "ipv6-24",  "netlink",
                              "abstract",  "rcvtimeo",   "scm-rights", "epoll",
@@ -863,7 +922,8 @@ int main(int argc, char **argv) {
   fprintf(stderr,
           "usage: %s controller|backpressure-controller PORT_FILE REPORT_FILE "
           "CONTACT_FILE | client PORT "
-          "match|mismatch|backpressure-nonblocking|backpressure-blocking|truncated|sendmsg|sendfile|unspecified|udp|listen|"
+          "match|mismatch|backpressure-nonblocking|backpressure-blocking|"
+          "backpressure-interleaved|truncated|sendmsg|sendfile|unspecified|udp|listen|"
           "ipv6-24|netlink|abstract|rcvtimeo|scm-rights|epoll|async|"
           "rcvtimeo-negative|ifindex|procnet|select-high|pselect-high\n",
           argv[0]);

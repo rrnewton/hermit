@@ -371,7 +371,7 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     assert_guest_invariants(&output.stdout, "native TCP bracket client");
     assert_controller_report(&controller.finish());
 
-    for mode in BACKPRESSURE_MODES {
+    for mode in BACKPRESSURE_MODES.into_iter().chain([INTERLEAVED_MODE]) {
         let directory = evidence.path().join(mode);
         fs::create_dir(&directory).expect("create native backpressure directory");
         let (controller, port) =
@@ -392,6 +392,9 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
 /// drains it only after a second thread sends on another connection.
 const BACKPRESSURE_MODES: [&str; 2] = ["backpressure-nonblocking", "backpressure-blocking"];
 const BACKPRESSURE_BYTES: usize = 256 * 1024;
+/// A blocking send waits before any byte of it is accepted while another
+/// thread's nonblocking send on the same connection is refused.
+const INTERLEAVED_MODE: &str = "backpressure-interleaved";
 
 fn assert_backpressure_output(stdout: &[u8], mode: &str, label: &str) {
     let kind = mode.strip_prefix("backpressure-").unwrap();
@@ -508,6 +511,32 @@ fn tcp_backpressure_records_and_replays_without_stalling_other_threads() {
         "replay-blocking-at-refusal",
         "where the recording holds a nonblocking send refused with EAGAIN",
         "diverged from the recording",
+    );
+
+    // Another thread's output event while a blocking send waits, here a
+    // refusal before the waiting send's first accepted byte, would be
+    // replayed in the other order, so record refuses it.
+    let controller_directory = evidence.join("interleaved-controller");
+    fs::create_dir(&controller_directory).expect("create interleaved controller directory");
+    let (_controller, port) =
+        Controller::start_mode(fixture, &controller_directory, "backpressure-controller");
+    let mut arguments = run_arguments(0, 1_000_000);
+    arguments.push(format!(
+        "--record-networking={}",
+        evidence.join("interleaved.trace").display()
+    ));
+    let interleaved = hermit_command(
+        evidence,
+        "record-interleaved",
+        &arguments,
+        fixture,
+        &["client", &port, INTERLEAVED_MODE],
+    );
+    assert_refused(
+        &interleaved,
+        "record-interleaved",
+        "accepted or refused, reached stream offset",
+        "one thread at a time",
     );
 }
 
