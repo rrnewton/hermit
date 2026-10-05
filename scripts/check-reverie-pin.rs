@@ -42,7 +42,8 @@
 //!         -> CHECKER ERROR rc=2, saying "incomplete fetch, not a pin
 //!            violation". Distinct from the pin being off-history.
 //!   * `ls-remote` cannot resolve the authority tip
-//!         -> BLOCKED rc=1 (pre-existing behaviour, kept).
+//!         -> BLOCKED rc=1 (pre-existing behaviour, kept). Plain `--offline`
+//!            never asks: it judges no remote policy and says so by name.
 //!   * the monotonicity BASE cannot be resolved (no such ref, a depth-1 clone
 //!     with no `origin/main`, an incoherent base pinning two revisions)
 //!         -> CHECKER ERROR rc=2 unless `--no-base` is passed. An unevaluated
@@ -2501,23 +2502,34 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     #[cfg(test)]
     let remote = config.remote.as_deref().unwrap_or(DEFAULT_REMOTE);
     let base_ref = config.base_ref.as_str();
-    let main_result = query_main(remote);
 
-    let main = match main_result {
-        Ok(main) => main,
-        Err(error) => {
-            loud_header("COULD NOT VERIFY REVERIE MAIN HISTORY - BLOCKED");
-            if let Ok(pin) = unique_pin(&scan) {
-                eprintln!("Hermit pin: {pin}");
+    // Plain --offline never reads main, so it must not ask for it: the
+    // pre-commit hook runs this on hosts that cannot reach the remote, and a
+    // failed lookup there refused every commit before the binding checks below
+    // ran. Every other mode that reaches this point looks main up here, at the
+    // same point as before.
+    let main = if config.offline && !config.update_to_latest {
+        None
+    } else {
+        match query_main(remote) {
+            Ok(main) => Some(main),
+            Err(error) => {
+                loud_header("COULD NOT VERIFY REVERIE MAIN HISTORY - BLOCKED");
+                if let Ok(pin) = unique_pin(&scan) {
+                    eprintln!("Hermit pin: {pin}");
+                }
+                eprintln!("Lookup error: {error}");
+                blocked_instructions();
+                return Ok(1);
             }
-            eprintln!("Lookup error: {error}");
-            blocked_instructions();
-            return Ok(1);
         }
     };
 
     if config.update_to_latest {
-        update_to_latest(&root, &scan, &main, !config.skip_verify_build)?;
+        let main = main
+            .as_deref()
+            .expect("main is looked up for --update-to-latest");
+        update_to_latest(&root, &scan, main, !config.skip_verify_build)?;
         let updated = read_pins(&root)?;
         let updated_pin = unique_pin(&updated)?;
         let cache_code = check_liteinst_cache_keys(&root, updated_pin)?;
@@ -2585,6 +2597,7 @@ fn run_with_config(config: Config) -> Result<i32, String> {
     // regresses the pin below the base, which MONOTONIC refuses. That is the
     // whole point of pairing them -- conflict resolution is precisely where a
     // silent regression would otherwise land unnoticed.
+    let main = main.expect("main is looked up for every run that reaches remote policy");
     if !is_full_sha(&main) {
         return Err(format!("refusing to judge against invalid main {main:?}"));
     }
@@ -3533,6 +3546,85 @@ mod tests {
 
         fs::remove_dir_all(root).expect("remove Hermit fixture repository");
         fs::remove_dir_all(remote).expect("remove Reverie fixture repository");
+    }
+
+    /// A Hermit fixture whose one tracked manifest pins `pin`, plus a remote
+    /// path that is never created, so any lookup of Reverie main fails.
+    fn offline_fixture(label: &str, pin: &str) -> (PathBuf, PathBuf) {
+        let root = temp_path(label);
+        init_fixture_repo(&root);
+        fs::write(
+            root.join("Cargo.toml"),
+            format!(
+                "[dependencies]\nreverie = {{ git = \"https://github.com/rrnewton/reverie.git\", rev = \"{pin}\" }}\n"
+            ),
+        )
+        .expect("write fixture manifest");
+        assert!(
+            git_in(&root, &["add", "Cargo.toml"])
+                .unwrap()
+                .status
+                .success()
+        );
+        let unreachable = temp_path(&format!("{label}-unreachable-reverie"));
+        assert!(!unreachable.exists());
+        (root, unreachable)
+    }
+
+    #[test]
+    fn offline_passes_a_consistent_tree_when_the_remote_cannot_be_reached() {
+        // The pre-commit hook runs --offline on hosts that cannot reach the
+        // remote. Plain --offline never uses Reverie main, so an unreachable
+        // remote must not decide its verdict.
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        let (root, unreachable) = offline_fixture("offline-consistent", pin);
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(unreachable.to_string_lossy().into_owned()),
+            offline: true,
+            ..Config::default()
+        })
+        .expect("offline consistency should be classified");
+        assert_eq!(
+            code, 0,
+            "--offline on a locally consistent tree must pass without reaching the remote"
+        );
+        fs::remove_dir_all(root).expect("remove fixture repository");
+    }
+
+    #[test]
+    fn offline_still_refuses_an_offline_decidable_defect_when_the_remote_cannot_be_reached() {
+        // The Buck compile-time provenance names another pin: a local defect
+        // that --offline must keep blocking without any help from the remote.
+        let pin = "0123456789abcdef0123456789abcdef01234567";
+        let stale = "89abcdef0123456789abcdef0123456789abcdef";
+        let (root, unreachable) = offline_fixture("offline-stale-buck", pin);
+        let buck_dir = root.join("hermit-cli");
+        fs::create_dir_all(&buck_dir).expect("create Buck fixture directory");
+        fs::write(
+            buck_dir.join("BUCK"),
+            format!(
+                "hermit_build_env = {{\n    \"HERMIT_REVERIE_PIN\": \"{stale}\",\n}}\nrust_library(\n    env = hermit_build_env,\n)\nrust_binary(\n    env = hermit_build_env,\n)\n"
+            ),
+        )
+        .expect("write stale Buck binding");
+        assert_eq!(
+            check_buck_build_pin_binding(&root, pin).expect("check stale Buck binding"),
+            1,
+            "fixture must carry exactly the defect under test"
+        );
+        let code = run_with_config(Config {
+            repo: Some(root.clone()),
+            remote: Some(unreachable.to_string_lossy().into_owned()),
+            offline: true,
+            ..Config::default()
+        })
+        .expect("offline defect should be classified");
+        assert_eq!(
+            code, 1,
+            "--offline must still refuse a stale Buck pin binding"
+        );
+        fs::remove_dir_all(root).expect("remove fixture repository");
     }
 
     /// ONE shared Reverie fixture per test process, built once.
