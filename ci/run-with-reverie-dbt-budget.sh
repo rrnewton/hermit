@@ -864,15 +864,7 @@ fi
 # clamp. These two local samples do not replace the original n=3 hosted
 # calibration or satisfy the >=5-sample replacement rule, and they are not a
 # Hermit guest or replay result; fresh validation is required.
-# CARRY TO 2eee28d3f2a32d3cdc6052cb2de60588026df5d4 (2026-10-05): from
-# c8181d43a59a6d1ac602f2fad7615189f4996b41; all seven recorded DynamoRIO build inputs
-# are byte-identical, including build.rs e05db6238bf07c96d8a850c5635a8c48590f20b7
-# and vendor/dynamorio 117d54d744df23921c531d0fe08537249f5a510a.
-# The available-CPU cap, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and
-# 1050 effective-job-second budget carry unchanged with the recorded recipe
-# f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21.
-# This source comparison does not claim a new build timing sample.
-expected_pin=2eee28d3f2a32d3cdc6052cb2de60588026df5d4
+expected_pin=c8181d43a59a6d1ac602f2fad7615189f4996b41
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
