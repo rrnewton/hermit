@@ -50,6 +50,11 @@ struct Corpus {
     /// structured `ci_disabled_reason`, so its run type does not require it.
     #[serde(default)]
     unselected: Vec<CorpusUnselected>,
+    /// A replay cell on the corpus backend that a focused run type adds to
+    /// each row's own test; the default (full) validation does not select
+    /// it.
+    #[serde(default)]
+    replay: Option<CorpusReplay>,
     /// Second tests on the corpus backend that a focused run type adds to the
     /// rows under its own Hermit flags and budget; the default (full)
     /// validation does not select them.
@@ -58,13 +63,35 @@ struct Corpus {
     rows: Vec<CorpusRow>,
 }
 
+/// One focused run type's replay cell (`hermit record start --verify`) on the
+/// corpus backend, in the own test of every row except the named ones, so a
+/// program's verify and replay cells are two cells of one test. The cell
+/// records and replays the row's argv with none of the corpus's verify
+/// settings: no Hermit flags or comparator, which the harness accepts only
+/// on verify, no environment (it declares an empty one rather than
+/// inheriting verify's), and one attempt, as the harness gives every replay
+/// cell. It is never a diagnostic, and its budget is its own.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusReplay {
+    /// The run type, written as the replay cell's label (runner::cell_labels).
+    label: String,
+    timeout_seconds: u64,
+    cpu_timeout_seconds: u64,
+    slow_reason: String,
+    /// Rows without a replay cell, grouped by the reason.
+    #[serde(default)]
+    except: Vec<CorpusRowGroup>,
+    /// Replay cells measured red, as in the corpus's own `unselected`.
+    #[serde(default)]
+    unselected: Vec<CorpusVariantUnselected>,
+}
+
 /// One focused run type's own test of each row except the named ones:
-/// `<bucket>/<id_prefix><id>`, whose one cell, in `mode`, runs on the corpus
-/// backend. A verify cell shares the corpus's environment and comparator; its
-/// Hermit flags, budget and single-attempt reason are its own. A replay cell
-/// (`hermit record start --verify`) takes only the budget: the harness
-/// accepts none of those settings on replay, and runs it once. None of a
-/// variant's cells is a diagnostic.
+/// `<bucket>/<id_prefix><id>`, whose one verify cell runs on the corpus
+/// backend. It shares the corpus's environment and comparator; its Hermit
+/// flags, budget and single-attempt reason are its own, and it is never a
+/// diagnostic.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CorpusVariant {
@@ -75,39 +102,18 @@ struct CorpusVariant {
     /// Prefix of every variant test's description.
     description: String,
     #[serde(default)]
-    mode: VariantMode,
-    #[serde(default)]
     hermit_args: Vec<String>,
     hermit_args_reason: Option<String>,
     timeout_seconds: u64,
     cpu_timeout_seconds: u64,
     slow_reason: String,
-    /// Required of a verify variant; a replay variant has none.
-    no_retry_reason: Option<String>,
+    no_retry_reason: String,
     /// Rows without a variant test, grouped by the reason.
     #[serde(default)]
     except: Vec<CorpusRowGroup>,
     /// Variant cells measured red, as in the corpus's own `unselected`.
     #[serde(default)]
     unselected: Vec<CorpusVariantUnselected>,
-}
-
-/// The mode of a variant's one cell.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum VariantMode {
-    #[default]
-    Verify,
-    Replay,
-}
-
-impl VariantMode {
-    fn name(self) -> &'static str {
-        match self {
-            VariantMode::Verify => "verify",
-            VariantMode::Replay => "replay",
-        }
-    }
 }
 
 /// Rows sharing one reason.
@@ -118,8 +124,8 @@ struct CorpusRowGroup {
     rows: Vec<String>,
 }
 
-/// One failure class of a variant's cells, which all run on the corpus
-/// backend.
+/// One failure class of a variant's or the replay run type's cells, which
+/// all run on the corpus backend.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CorpusVariantUnselected {
@@ -195,8 +201,9 @@ struct CorpusRow {
     #[serde(default)]
     id: Option<String>,
     argv: Vec<String>,
-    /// Run types of the whole test (every cell of it); empty means the
-    /// default (full) validation.
+    /// Run types of the row's verify cells (on the corpus backend and on each
+    /// focused backend); empty means the default (full) validation. A replay
+    /// cell carries only its own run type.
     #[serde(default)]
     labels: Vec<String>,
 }
@@ -252,6 +259,69 @@ fn nonempty(bucket: &str, what: &str, value: &str) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// Check one run type's `except` groups and `unselected` classes against the
+/// corpus rows, and return the rows it excepts. `what` names a field of the
+/// run type in an error, and `missing` is what an excepted row lacks.
+fn check_row_groups<'a>(
+    bucket: &str,
+    what: &dyn Fn(&str) -> String,
+    missing: &str,
+    labels: &BTreeSet<&str>,
+    except: &'a [CorpusRowGroup],
+    unselected: &[CorpusVariantUnselected],
+) -> Result<BTreeSet<&'a str>, String> {
+    let mut excepted = BTreeSet::new();
+    for group in except {
+        nonempty(bucket, &what("except reason"), &group.reason)?;
+        if group.rows.is_empty() {
+            return Err(format!(
+                "{bucket}: corpus {} names no rows",
+                what("except group")
+            ));
+        }
+        for label in &group.rows {
+            if !labels.contains(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus {} names `{label}`, which is no row",
+                    what("except")
+                ));
+            }
+            if !excepted.insert(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus {} names `{label}` twice",
+                    what("except")
+                ));
+            }
+        }
+    }
+    let mut red = BTreeSet::new();
+    for class in unselected {
+        nonempty(bucket, &what("unselected evidence"), &class.evidence)?;
+        nonempty(bucket, &what("unselected reason"), &class.reason)?;
+        if class.rows.is_empty() {
+            return Err(format!(
+                "{bucket}: corpus {} names no rows",
+                what("unselected class")
+            ));
+        }
+        for label in &class.rows {
+            if !labels.contains(label.as_str()) || excepted.contains(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus {} names `{label}`, which has no {missing}",
+                    what("unselected")
+                ));
+            }
+            if !red.insert(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus {} names `{label}` twice",
+                    what("unselected")
+                ));
+            }
+        }
+    }
+    Ok(excepted)
 }
 
 fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
@@ -371,6 +441,22 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             }
         }
     }
+    let replay_excepted = match &corpus.replay {
+        Some(replay) => {
+            let what = |field: &str| format!("replay {field}");
+            nonempty(bucket, &what("label"), &replay.label)?;
+            nonempty(bucket, &what("slow_reason"), &replay.slow_reason)?;
+            check_row_groups(
+                bucket,
+                &what,
+                "replay cell",
+                &labels,
+                &replay.except,
+                &replay.unselected,
+            )?
+        }
+        None => BTreeSet::new(),
+    };
     let mut variant_labels = BTreeSet::new();
     let mut variant_ids = BTreeSet::<String>::new();
     for variant in &corpus.variants {
@@ -385,77 +471,15 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
         nonempty(bucket, &what("id_prefix"), &variant.id_prefix)?;
         nonempty(bucket, &what("description"), &variant.description)?;
         nonempty(bucket, &what("slow_reason"), &variant.slow_reason)?;
-        match (variant.mode, &variant.no_retry_reason) {
-            (VariantMode::Verify, Some(reason)) => {
-                nonempty(bucket, &what("no_retry_reason"), reason)?;
-            }
-            (VariantMode::Verify, None) => {
-                return Err(format!(
-                    "{bucket}: corpus {} is missing",
-                    what("no_retry_reason")
-                ));
-            }
-            (VariantMode::Replay, _) => {
-                if variant.no_retry_reason.is_some()
-                    || !variant.hermit_args.is_empty()
-                    || variant.hermit_args_reason.is_some()
-                {
-                    return Err(format!(
-                        "{bucket}: corpus variant {} is a replay variant, which takes no hermit_args, hermit_args_reason or no_retry_reason",
-                        variant.label
-                    ));
-                }
-            }
-        }
-        let mut excepted = BTreeSet::new();
-        for group in &variant.except {
-            nonempty(bucket, &what("except reason"), &group.reason)?;
-            if group.rows.is_empty() {
-                return Err(format!(
-                    "{bucket}: corpus {} names no rows",
-                    what("except group")
-                ));
-            }
-            for label in &group.rows {
-                if !labels.contains(label.as_str()) {
-                    return Err(format!(
-                        "{bucket}: corpus {} names `{label}`, which is no row",
-                        what("except")
-                    ));
-                }
-                if !excepted.insert(label.as_str()) {
-                    return Err(format!(
-                        "{bucket}: corpus {} names `{label}` twice",
-                        what("except")
-                    ));
-                }
-            }
-        }
-        let mut red = BTreeSet::new();
-        for class in &variant.unselected {
-            nonempty(bucket, &what("unselected evidence"), &class.evidence)?;
-            nonempty(bucket, &what("unselected reason"), &class.reason)?;
-            if class.rows.is_empty() {
-                return Err(format!(
-                    "{bucket}: corpus {} names no rows",
-                    what("unselected class")
-                ));
-            }
-            for label in &class.rows {
-                if !labels.contains(label.as_str()) || excepted.contains(label.as_str()) {
-                    return Err(format!(
-                        "{bucket}: corpus {} names `{label}`, which has no variant test",
-                        what("unselected")
-                    ));
-                }
-                if !red.insert(label.as_str()) {
-                    return Err(format!(
-                        "{bucket}: corpus {} names `{label}` twice",
-                        what("unselected")
-                    ));
-                }
-            }
-        }
+        nonempty(bucket, &what("no_retry_reason"), &variant.no_retry_reason)?;
+        let excepted = check_row_groups(
+            bucket,
+            &what,
+            "variant test",
+            &labels,
+            &variant.except,
+            &variant.unselected,
+        )?;
         for row in corpus
             .rows
             .iter()
@@ -476,6 +500,12 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
         "A {bucket} corpus row runs only its lane's verify cell on {}",
         corpus.backend
     );
+    let replay_unselected = corpus
+        .replay
+        .iter()
+        .flat_map(|replay| &replay.unselected)
+        .flat_map(|class| class.rows.iter().map(move |label| (label.as_str(), class)))
+        .collect::<BTreeMap<_, _>>();
     let mut tests = Vec::with_capacity(corpus.rows.len());
     for row in &corpus.rows {
         let diagnostic = corpus
@@ -533,13 +563,27 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
         )
         .collect::<Vec<_>>();
         let enabled = cells.iter().map(|cell| cell.0).collect::<Vec<_>>();
-        let off_reason = if enabled.len() == 1 {
-            off_reason.clone()
-        } else {
-            format!(
-                "{off_reason}, and a focused run type's verify cell on {}",
+        let replay = corpus
+            .replay
+            .as_ref()
+            .filter(|_| !replay_excepted.contains(row.label.as_str()));
+        let mut also = Vec::new();
+        if enabled.len() > 1 {
+            also.push(format!(
+                "a focused run type's verify cell on {}",
                 enabled[1..].join(" and ")
-            )
+            ));
+        }
+        if replay.is_some() {
+            also.push(format!(
+                "a focused run type's replay cell on {}",
+                corpus.backend
+            ));
+        }
+        let off_reason = match also.as_slice() {
+            [] => off_reason.clone(),
+            [only] => format!("{off_reason}, and {only}"),
+            [init @ .., last] => format!("{off_reason}, {}, and {last}", init.join(", ")),
         };
         let disabled = BACKENDS
             .iter()
@@ -605,14 +649,23 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                 })),
             ));
         }
-        let focused_labels = cells
+        // The row's own run types label each of its verify cells, and a
+        // focused cell carries its focused run type too. They are cell labels,
+        // not test labels, so the row's replay cell carries only its own.
+        let verify_labels = cells
             .iter()
-            .filter_map(|(backend, label, ..)| {
-                label.map(|label| (*backend, strings(&[label.to_string()])))
+            .filter_map(|(backend, focused, ..)| {
+                let mut labels = row.labels.clone();
+                if let Some(focused) =
+                    focused.filter(|focused| !labels.iter().any(|label| label == focused))
+                {
+                    labels.push(focused.to_string());
+                }
+                (!labels.is_empty()).then(|| (*backend, strings(&labels)))
             })
             .collect::<Vec<_>>();
-        if !focused_labels.is_empty() {
-            verify.push(("labels", mapping(focused_labels)));
+        if !verify_labels.is_empty() {
+            verify.push(("labels", mapping(verify_labels)));
         }
         if !corpus.verify.hermit_args.is_empty() {
             verify.push((
@@ -633,14 +686,63 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                 mapping([(corpus.backend.as_str(), string(reason))]),
             ));
         }
+        let mut modes = vec![("verify", verify)];
+        if let Some(replay) = replay {
+            let backend = corpus.backend.as_str();
+            let per_cell = |value: Value| mapping([(backend, value)]);
+            let class = replay_unselected.get(row.label.as_str());
+            let mut recipe = vec![
+                (
+                    "ci",
+                    class.map_or(Value::Bool(true), |_| per_cell(Value::Bool(false))),
+                ),
+                ("backends_enabled", strings(&[backend.to_string()])),
+                (
+                    "backends_disabled",
+                    mapping(
+                        BACKENDS
+                            .iter()
+                            .filter(|other| **other != backend)
+                            .map(|other| (*other, string(&off_reason))),
+                    ),
+                ),
+                (
+                    "timeout_seconds",
+                    per_cell(Value::from(replay.timeout_seconds)),
+                ),
+                (
+                    "cpu_timeout_seconds",
+                    per_cell(Value::from(replay.cpu_timeout_seconds)),
+                ),
+                ("slow_reason", per_cell(string(&replay.slow_reason))),
+            ];
+            if let Some(class) = class {
+                recipe.push((
+                    "ci_disabled_reason",
+                    per_cell(ci_disabled_reason(
+                        class.result,
+                        &class.evidence,
+                        &class.reason,
+                    )),
+                ));
+            }
+            recipe.push((
+                "labels",
+                per_cell(strings(std::slice::from_ref(&replay.label))),
+            ));
+            // Declared empty, so the cell does not inherit the verify cell's
+            // environment (runner::cell_mode_env).
+            recipe.push(("env", Value::Mapping(Mapping::new())));
+            modes.push(("replay", recipe));
+        }
         tests.push(test_recipe(
             corpus,
             &format!("{bucket}/{}", row_id(row)),
             &format!("{} `{}`", corpus.description, row.label),
             row,
-            ("verify", verify),
+            modes,
             &off_reason,
-            &row.labels,
+            &[],
         ));
     }
     for variant in &corpus.variants {
@@ -657,9 +759,8 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             .flat_map(|class| class.rows.iter().map(move |label| (label.as_str(), class)))
             .collect::<BTreeMap<_, _>>();
         let off_reason = format!(
-            "A {bucket} corpus row's {} test runs only its {} cell on {backend}",
-            variant.label,
-            variant.mode.name()
+            "A {bucket} corpus row's {} test runs only its verify cell on {backend}",
+            variant.label
         );
         let per_cell = |value: Value| mapping([(backend, value)]);
         for row in corpus
@@ -703,24 +804,20 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                     )),
                 ));
             }
-            if variant.mode == VariantMode::Verify {
-                if !variant.hermit_args.is_empty() {
-                    recipe.push(("hermit_args", per_cell(strings(&variant.hermit_args))));
-                }
-                if let Some(reason) = &variant.hermit_args_reason {
-                    recipe.push(("hermit_args_reason", string(reason)));
-                }
-                push_shared_verify_settings(&mut recipe, &corpus.verify);
+            if !variant.hermit_args.is_empty() {
+                recipe.push(("hermit_args", per_cell(strings(&variant.hermit_args))));
             }
-            if let Some(reason) = &variant.no_retry_reason {
-                recipe.push(("no_retry_reason", string(reason)));
+            if let Some(reason) = &variant.hermit_args_reason {
+                recipe.push(("hermit_args_reason", string(reason)));
             }
+            push_shared_verify_settings(&mut recipe, &corpus.verify);
+            recipe.push(("no_retry_reason", string(&variant.no_retry_reason)));
             tests.push(test_recipe(
                 corpus,
                 &format!("{bucket}/{}{}", variant.id_prefix, row_id(row)),
                 &format!("{} `{}`", variant.description, row.label),
                 row,
-                (variant.mode.name(), recipe),
+                vec![("verify", recipe)],
                 &off_reason,
                 std::slice::from_ref(&variant.label),
             ));
@@ -767,19 +864,24 @@ fn push_shared_verify_settings(verify: &mut Vec<(&str, Value)>, settings: &Corpu
     }
 }
 
-/// One expanded test: the row's argv under the one enabled mode, with every
-/// other mode off for `off_reason`.
+/// One expanded test: the row's argv under its enabled modes, with every other
+/// mode off for `off_reason`, all in [`MODES`] order.
 fn test_recipe(
     corpus: &Corpus,
     id: &str,
     description: &str,
     row: &CorpusRow,
-    (enabled, recipe): (&str, Vec<(&str, Value)>),
+    mut enabled: Vec<(&str, Vec<(&str, Value)>)>,
     off_reason: &str,
     labels: &[String],
 ) -> Value {
-    let mut modes = vec![(enabled, mapping(recipe))];
-    for mode in MODES.into_iter().filter(|mode| *mode != enabled) {
+    let mut modes = Vec::with_capacity(MODES.len());
+    for mode in MODES {
+        if let Some(index) = enabled.iter().position(|(name, _)| *name == mode) {
+            let (_, recipe) = enabled.remove(index);
+            modes.push((mode, mapping(recipe)));
+            continue;
+        }
         let backends_disabled = if mode == "naked" {
             mapping([("native", string(off_reason))])
         } else {
@@ -799,6 +901,10 @@ fn test_recipe(
             ]),
         ));
     }
+    assert!(
+        enabled.is_empty(),
+        "{id}: an expanded test enables a mode outside {MODES:?}"
+    );
     let mut test = vec![
         ("id", string(id)),
         ("description", string(description)),
@@ -1010,31 +1116,45 @@ mod tests {
         );
     }
 
-    /// compat.yaml's rr variant keeps the retired rr lane's 139 programs
-    /// (the count its RR_COMPAT_EXPECTED guard held before ci/compat/corpus-rr.json
-    /// was retired), and selects only the 51 that record and replay: each of the
-    /// other 88 stays enabled with `ci: false` and the issue of the clock-read
-    /// refusal that stops its recording. A row moved into or out of the variant,
-    /// or an unselected cell quietly reselected, fails here.
+    /// compat.yaml's replay cells keep the retired rr lane's 139 programs (the
+    /// count its RR_COMPAT_EXPECTED guard held before ci/compat/corpus-rr.json
+    /// was retired), each the replay cell of its row's own test, carrying the
+    /// rr run type alone and none of the verify cell's settings, and select
+    /// only the 51 that record and replay: each of the other 88 stays enabled
+    /// with `ci: false` and the issue of the clock-read refusal that stops its
+    /// recording. A row moved into or out of the run type, a second test for a
+    /// program, the rr run type reaching a verify cell, or an unselected cell
+    /// quietly reselected, fails here.
     #[test]
-    fn the_rr_variant_keeps_the_rr_lane_programs_and_gates_only_those_that_replay() {
+    fn the_replay_cells_keep_the_rr_lane_programs_and_gate_only_those_that_replay() {
         let expanded = expand_corpus(serde_yaml::from_str(COMPAT_YAML).unwrap()).unwrap();
         let rr_label = Value::from("rr-compat-only");
-        let variant = tests_of(&expanded)
-            .iter()
-            .filter(|test| {
-                test["labels"]
-                    .as_sequence()
-                    .is_some_and(|labels| labels.contains(&rr_label))
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(variant.len(), 139);
-        let mut gated = 0;
-        let mut refused = 0;
-        for test in variant {
+        let seq = |text: &str| serde_yaml::from_str::<Value>(text).unwrap();
+        let carries_rr = |labels: &Value| {
+            labels
+                .as_sequence()
+                .is_some_and(|labels| labels.contains(&rr_label))
+        };
+        let (mut gated, mut refused) = (0, 0);
+        for test in tests_of(&expanded) {
             let id = test["id"].as_str().unwrap();
-            assert!(id.starts_with("compat/rr-"), "{id}");
+            assert!(!id.starts_with("compat/rr-"), "{id}");
+            assert!(!carries_rr(&test["labels"]), "{id}");
+            if let Some(labels) = test["modes"]["verify"]["labels"].as_mapping() {
+                assert!(!labels.values().any(carries_rr), "{id}");
+            }
             let replay = &test["modes"]["replay"];
+            if replay["backends_enabled"] == seq("[]") {
+                assert!(replay.get("labels").is_none(), "{id}");
+                continue;
+            }
+            assert_eq!(replay["backends_enabled"], seq("[ptrace]"), "{id}");
+            assert_eq!(replay["labels"], seq("{ptrace: [rr-compat-only]}"), "{id}");
+            assert_eq!(replay["env"], seq("{}"), "{id}");
+            assert_eq!(replay["timeout_seconds"], seq("{ptrace: 60}"), "{id}");
+            for absent in ["hermit_args", "comparator", "no_retry_reason", "diagnostic"] {
+                assert!(replay.get(absent).is_none(), "{id}: {absent}");
+            }
             match &replay["ci"] {
                 Value::Bool(true) => gated += 1,
                 ci => {
@@ -1192,11 +1312,16 @@ mod tests {
                 "{sabre: {result: crash-error, evidence: 'https://github.com/rrnewton/hermit/issues/1', reason: fixture execution-path failure}}"
             )
         );
-        // big: the whole test belongs to the focused run type, its ptrace cell
-        // has the heavy budget with its reason and is red.
+        // big: both verify cells belong to the focused run type, by cell
+        // labels rather than test labels, and its ptrace cell has the heavy
+        // budget with its reason and is red.
         let big = by_id("fixture/big");
-        assert_eq!(big["labels"], seq("[sabre-compat-only]"));
+        assert!(big.get("labels").is_none());
         let verify = &big["modes"]["verify"];
+        assert_eq!(
+            verify["labels"],
+            seq("{ptrace: [sabre-compat-only], sabre: [sabre-compat-only]}")
+        );
         assert_eq!(verify["timeout_seconds"], seq("{ptrace: 600, sabre: 60}"));
         assert_eq!(
             verify["cpu_timeout_seconds"],
@@ -1346,94 +1471,188 @@ mod tests {
         );
     }
 
-    /// The variant corpus with its variant in replay mode.
+    /// The focused corpus with a replay run type: one row excepted, one red.
     fn replay_corpus() -> String {
-        variant_corpus()
-            .replace("label: strict-compat-only", "label: rr-compat-only")
-            .replace("id_prefix: strict-", "id_prefix: rr-\n      mode: replay")
-            .replace("      no_retry_reason: strict fixture single run\n", "")
+        focused_corpus().replace(
+            "  rows:\n    - {label: \"echo\"",
+            r#"  replay:
+    label: rr-compat-only
+    timeout_seconds: 30
+    cpu_timeout_seconds: 29
+    slow_reason: replay fixture budget
+    except:
+      - reason: not in the fixture rr corpus
+        rows: [echo]
+    unselected:
+      - result: replay-failure
+        evidence: https://github.com/rrnewton/hermit/issues/4
+        reason: fixture recording refusal
+        rows: [slow]
+  rows:
+    - {label: "echo""#,
+        )
     }
 
     #[test]
-    fn a_replay_variant_runs_only_its_replay_cell_with_its_budget() {
+    fn a_replay_run_type_adds_a_labelled_replay_cell_to_each_rows_own_test() {
         let expanded = expand_corpus(document(&replay_corpus())).unwrap();
         let tests = tests_of(&expanded);
+        let focused = expand_corpus(document(&focused_corpus())).unwrap();
         let seq = |text: &str| serde_yaml::from_str::<Value>(text).unwrap();
-        let gxx = &tests[3];
-        assert_eq!(gxx["id"], "fixture/rr-gxx");
-        assert_eq!(gxx["labels"], seq("[rr-compat-only]"));
-        let modes = gxx["modes"].as_mapping().unwrap();
+        // No test is added: the replay cell is a cell of the row's own test.
         assert_eq!(
-            modes
-                .keys()
+            tests
+                .iter()
+                .map(|test| test["id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            ["fixture/echo", "fixture/gxx", "fixture/slow", "fixture/big"]
+        );
+        // echo is excepted: exactly its test without the run type.
+        assert_eq!(tests[0], tests_of(&focused)[0]);
+        let by_id = |id: &str| {
+            tests
+                .iter()
+                .find(|test| test["id"] == id)
+                .unwrap_or_else(|| panic!("{id}"))
+        };
+        let modes_of = |id: &str| by_id(id)["modes"].as_mapping().unwrap().clone();
+        let gxx = modes_of("fixture/gxx");
+        assert_eq!(
+            gxx.keys()
                 .map(|mode| mode.as_str().unwrap())
                 .collect::<Vec<_>>(),
-            ["replay", "verify", "naked", "chaos", "custom"]
+            MODES
         );
-        let replay = &modes["replay"];
+        let both = "A fixture corpus row runs only its lane's verify cell on ptrace, a focused run type's verify cell on sabre, and a focused run type's replay cell on ptrace";
+        let replay = &gxx["replay"];
         assert_eq!(replay["ci"], true);
         assert_eq!(replay["backends_enabled"], seq("[ptrace]"));
-        assert!(replay["backends_disabled"]["sabre"].as_str().is_some());
+        for backend in ["dbt", "kvm", "sabre", "liteinst"] {
+            assert_eq!(replay["backends_disabled"][backend], both, "{backend}");
+        }
+        assert_eq!(replay["labels"], seq("{ptrace: [rr-compat-only]}"));
         assert_eq!(replay["timeout_seconds"], seq("{ptrace: 30}"));
         assert_eq!(replay["cpu_timeout_seconds"], seq("{ptrace: 29}"));
         assert_eq!(
             replay["slow_reason"],
-            seq("{ptrace: strict fixture budget}")
+            seq("{ptrace: replay fixture budget}")
         );
-        // None of the settings the harness refuses on a replay cell.
+        // An empty environment rather than none, so it does not inherit the
+        // verify cell's TMPDIR, and none of the verify-only settings.
+        assert_eq!(replay["env"], seq("{}"));
         for absent in [
             "hermit_args",
-            "env",
+            "hermit_args_reason",
             "comparator",
+            "comparator_reason",
             "no_retry_reason",
             "diagnostic",
+            "ci_disabled_reason",
         ] {
             assert!(replay.get(absent).is_none(), "{absent}");
         }
-        let off = "A fixture corpus row's rr-compat-only test runs only its replay cell on ptrace";
-        assert_eq!(modes["verify"]["ci"], false);
-        assert_eq!(modes["verify"]["ci_disabled_reason"], off);
-        assert_eq!(modes["verify"]["backends_enabled"], seq("[]"));
-        assert_eq!(modes["verify"]["backends_disabled"]["ptrace"], off);
-        // Its red cell is recorded on replay.
-        let slow = &tests[4]["modes"]["replay"];
-        assert_eq!(slow["ci"], seq("{ptrace: false}"));
+        // Its verify cells keep their settings and run types; only the reason
+        // the other backends are off names the replay cell too.
+        let verify = &gxx["verify"];
+        assert_eq!(verify["labels"], seq("{sabre: [sabre-compat-only]}"));
+        assert_eq!(verify["env"]["TMPDIR"], "/tmp");
+        assert_eq!(verify["backends_disabled"]["dbt"], both);
+        let mut unchanged = verify.clone();
+        unchanged["backends_disabled"] =
+            tests_of(&focused)[1]["modes"]["verify"]["backends_disabled"].clone();
+        assert_eq!(unchanged, tests_of(&focused)[1]["modes"]["verify"]);
+        for mode in ["naked", "chaos", "custom"] {
+            assert_eq!(gxx[mode]["ci_disabled_reason"], both, "{mode}");
+        }
+        // slow: no SaBRe cell, a diagnostic verify cell, and a red replay
+        // cell that is not a diagnostic.
+        let slow = modes_of("fixture/slow");
         assert_eq!(
-            slow["ci_disabled_reason"]["ptrace"]["evidence"],
-            "https://github.com/rrnewton/hermit/issues/3"
+            slow["replay"]["backends_disabled"]["dbt"],
+            "A fixture corpus row runs only its lane's verify cell on ptrace, and a focused run type's replay cell on ptrace"
         );
+        assert_eq!(slow["replay"]["ci"], seq("{ptrace: false}"));
+        assert_eq!(
+            slow["replay"]["ci_disabled_reason"],
+            seq(
+                "{ptrace: {result: replay-failure, evidence: 'https://github.com/rrnewton/hermit/issues/4', reason: fixture recording refusal}}"
+            )
+        );
+        assert!(slow["replay"].get("diagnostic").is_none());
+        assert_eq!(
+            slow["verify"]["diagnostic"]["ptrace"],
+            "a bounded fixture probe"
+        );
+        // big: the row's own run type labels its verify cells and not its
+        // replay cell, which is selected though its ptrace verify cell is red.
+        let big = by_id("fixture/big");
+        assert!(big.get("labels").is_none());
+        let big = modes_of("fixture/big");
+        assert_eq!(
+            big["verify"]["labels"],
+            seq("{ptrace: [sabre-compat-only], sabre: [sabre-compat-only]}")
+        );
+        assert_eq!(big["replay"]["labels"], seq("{ptrace: [rr-compat-only]}"));
+        assert_eq!(big["replay"]["ci"], true);
+        assert_eq!(big["verify"]["ci"], seq("{ptrace: false, sabre: true}"));
     }
 
     #[test]
-    fn a_replay_variant_with_verify_settings_is_refused() {
+    fn a_malformed_replay_run_type_is_refused() {
         let replay = replay_corpus();
         let refused = |from: &str, to: &str| {
             assert!(replay.contains(from), "{from}");
             expand_corpus(document(&replay.replace(from, to))).unwrap_err()
         };
+        assert!(refused("rows: [echo]", "rows: [absent]").contains("which is no row"));
+        assert!(refused("rows: [echo]", "rows: [echo, echo]").contains("twice"));
+        assert!(refused("rows: [echo]", "rows: []").contains("names no rows"));
+        assert!(refused("rows: [slow]", "rows: [echo]").contains("which has no replay cell"));
+        assert!(refused("rows: [slow]", "rows: [absent]").contains("which has no replay cell"));
+        assert!(refused("rows: [slow]", "rows: [slow, slow]").contains("twice"));
+        assert!(refused("rows: [slow]", "rows: []").contains("names no rows"));
+        assert!(
+            refused("slow_reason: replay fixture budget", "slow_reason: \"\"")
+                .contains("replay slow_reason must be nonempty")
+        );
+        assert!(
+            refused("label: rr-compat-only", "label: \"\"")
+                .contains("replay label must be nonempty")
+        );
+        // None of the verify-only settings is accepted on the replay run type.
         for setting in [
             "no_retry_reason: single run",
             "hermit_args: [--fixture-flag]",
-            "hermit_args_reason: fixture reason",
+            "comparator: stripped",
+            "env: {TMPDIR: /tmp}",
         ] {
             assert!(
                 refused(
-                    "      timeout_seconds",
-                    &format!("      {setting}\n      timeout_seconds")
+                    "    timeout_seconds: 30",
+                    &format!("    {setting}\n    timeout_seconds: 30")
                 )
-                .contains("is a replay variant"),
+                .contains("invalid corpus section"),
                 "{setting}"
             );
         }
-        // A verify variant must still give its single-attempt reason.
+        // A variant is a verify test with its single-attempt reason; the
+        // replay variant it once could be is gone.
+        let variant = variant_corpus();
         assert!(
             expand_corpus(document(
-                &variant_corpus().replace("      no_retry_reason: strict fixture single run\n", "")
+                &variant.replace("      no_retry_reason: strict fixture single run\n", "")
             ))
             .unwrap_err()
             .contains("no_retry_reason")
         );
-        assert!(refused("mode: replay", "mode: chaos").contains("invalid corpus section"));
+        assert!(
+            expand_corpus(document(&variant.replace(
+                "id_prefix: strict-",
+                "id_prefix: strict-\n      mode: replay"
+            )))
+            .unwrap_err()
+            .contains("invalid corpus section")
+        );
     }
 
     #[test]
