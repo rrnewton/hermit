@@ -423,80 +423,117 @@ fn trace_version(trace: &[u8]) -> u32 {
     u32::from_le_bytes(trace[start..start + 4].try_into().unwrap())
 }
 
-/// A thread stuck on a full send buffer must not hold back the thread that
-/// the peer waits for. A nonblocking send reports EAGAIN promptly, which
-/// the recording holds so that replay reports it at the same point; a
-/// blocking send yields while it waits. Each recording replays offline
-/// under two schedules at L2.
-#[test]
-fn tcp_backpressure_records_and_replays_without_stalling_other_threads() {
+/// Records `mode` against a live backpressure controller, which checks the
+/// exact outbound stream, and checks the client's output and the trace
+/// version. Returns the trace and the controller port.
+fn record_backpressure(fixture: &Path, evidence: &Path, mode: &str) -> (PathBuf, String) {
     use detcore_model::network_trace::NETWORK_TRACE_VERSION_V2;
     use detcore_model::network_trace::NETWORK_TRACE_VERSION_V3;
 
-    let _guard = super::hermit_record_lock();
-    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
-    let directory = tempfile::tempdir().expect("create backpressure evidence directory");
-    let evidence = directory.path();
-    let mut traces = Vec::new();
-    for mode in BACKPRESSURE_MODES {
-        let trace = evidence.join(format!("{mode}.trace"));
-        let controller_directory = evidence.join(format!("{mode}-controller"));
-        fs::create_dir(&controller_directory).expect("create backpressure controller directory");
-        let (controller, port) =
-            Controller::start_mode(fixture, &controller_directory, "backpressure-controller");
-        let mut arguments = run_arguments(0, 1_000_000);
-        arguments.push(format!("--record-networking={}", trace.display()));
-        let label = format!("record-{mode}");
-        let recorded = hermit_command(
+    let trace = evidence.join(format!("{mode}.trace"));
+    let controller_directory = evidence.join(format!("{mode}-controller"));
+    fs::create_dir(&controller_directory).expect("create backpressure controller directory");
+    let (controller, port) =
+        Controller::start_mode(fixture, &controller_directory, "backpressure-controller");
+    let mut arguments = run_arguments(0, 1_000_000);
+    arguments.push(format!("--record-networking={}", trace.display()));
+    let label = format!("record-{mode}");
+    let recorded = hermit_command(
+        evidence,
+        &label,
+        &arguments,
+        fixture,
+        &["client", &port, mode],
+    );
+    assert_success(&recorded, &label);
+    assert_backpressure_output(&recorded.stdout, mode, &label);
+    assert_backpressure_report(&controller.finish());
+    let bytes = fs::read(&trace).expect("recording omitted its network trace");
+    // Only a nonblocking send can be refused; a blocking one waits.
+    let expected_version = if mode == "backpressure-nonblocking" {
+        NETWORK_TRACE_VERSION_V3
+    } else {
+        NETWORK_TRACE_VERSION_V2
+    };
+    assert_eq!(
+        trace_version(&bytes),
+        expected_version,
+        "{label} recorded the wrong trace version"
+    );
+    (trace, port)
+}
+
+/// Replays a `mode` recording offline under two schedules at L2.
+fn replay_backpressure_at_l2(
+    fixture: &Path,
+    evidence: &Path,
+    mode: &str,
+    trace: &Path,
+    port: &str,
+) {
+    for (seed, max_timeslice) in &REPLAY_CELLS[1..3] {
+        let label = format!("replay-{mode}-seed-{seed}-timeslice-{max_timeslice}");
+        let report = evidence.join(format!("{label}.verify.json"));
+        let mut arguments = run_arguments(*seed, *max_timeslice);
+        arguments.extend([
+            "--verify".into(),
+            "--verify-strict".into(),
+            format!("--verify-json={}", report.display()),
+            format!("--replay-networking={}", trace.display()),
+        ]);
+        let replayed = hermit_command(
             evidence,
             &label,
             &arguments,
             fixture,
-            &["client", &port, mode],
+            &["client", port, mode],
         );
-        assert_success(&recorded, &label);
-        assert_backpressure_output(&recorded.stdout, mode, &label);
-        assert_backpressure_report(&controller.finish());
-        let bytes = fs::read(&trace).expect("recording omitted its network trace");
-        // Only a nonblocking send can be refused; a blocking one waits.
-        let expected_version = if mode == "backpressure-nonblocking" {
-            NETWORK_TRACE_VERSION_V3
-        } else {
-            NETWORK_TRACE_VERSION_V2
-        };
-        assert_eq!(
-            trace_version(&bytes),
-            expected_version,
-            "{label} recorded the wrong trace version"
-        );
-
-        for (seed, max_timeslice) in &REPLAY_CELLS[1..3] {
-            let label = format!("replay-{mode}-seed-{seed}-timeslice-{max_timeslice}");
-            let report = evidence.join(format!("{label}.verify.json"));
-            let mut arguments = run_arguments(*seed, *max_timeslice);
-            arguments.extend([
-                "--verify".into(),
-                "--verify-strict".into(),
-                format!("--verify-json={}", report.display()),
-                format!("--replay-networking={}", trace.display()),
-            ]);
-            let replayed = hermit_command(
-                evidence,
-                &label,
-                &arguments,
-                fixture,
-                &["client", &port, mode],
-            );
-            assert_success(&replayed, &label);
-            assert_backpressure_output(&replayed.stdout, mode, &label);
-            assert_l2_report(&report, &label);
-        }
-        traces.push((trace, port));
+        assert_success(&replayed, &label);
+        assert_backpressure_output(&replayed.stdout, mode, &label);
+        assert_l2_report(&report, &label);
     }
+}
+
+/// A thread stuck on a full send buffer must not hold back the thread that
+/// the peer waits for. A nonblocking send reports EAGAIN promptly, which
+/// the recording holds so that replay reports it at the same point.
+#[test]
+fn tcp_backpressure_nonblocking_records_and_replays_without_stalling_other_threads() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create backpressure evidence directory");
+    let evidence = directory.path();
+    let mode = "backpressure-nonblocking";
+    let (trace, port) = record_backpressure(fixture, evidence, mode);
+    replay_backpressure_at_l2(fixture, evidence, mode, &trace, &port);
+}
+
+/// A thread stuck on a full send buffer must not hold back the thread that
+/// the peer waits for. A blocking send yields while it waits.
+#[test]
+fn tcp_backpressure_blocking_records_and_replays_without_stalling_other_threads() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create backpressure evidence directory");
+    let evidence = directory.path();
+    let mode = "backpressure-blocking";
+    let (trace, port) = record_backpressure(fixture, evidence, mode);
+    replay_backpressure_at_l2(fixture, evidence, mode, &trace, &port);
+}
+
+/// Replay refuses a blocking send where the recording holds a refused
+/// nonblocking one, and record refuses an output event that another thread
+/// makes while a blocking send waits.
+#[test]
+fn tcp_backpressure_refuses_a_diverged_replay_and_an_interleaved_recording() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create backpressure evidence directory");
+    let evidence = directory.path();
 
     // A blocking send where the recording holds a refused nonblocking send
     // diverged from the recording.
-    let (trace, port) = &traces[0];
+    let (trace, port) = record_backpressure(fixture, evidence, "backpressure-nonblocking");
     let mut arguments = run_arguments(0, 1_000_000);
     arguments.push(format!("--replay-networking={}", trace.display()));
     let diverged = hermit_command(
@@ -504,7 +541,7 @@ fn tcp_backpressure_records_and_replays_without_stalling_other_threads() {
         "replay-blocking-at-refusal",
         &arguments,
         fixture,
-        &["client", port, "backpressure-blocking"],
+        &["client", &port, "backpressure-blocking"],
     );
     assert_refused(
         &diverged,
