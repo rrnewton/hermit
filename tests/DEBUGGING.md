@@ -520,6 +520,15 @@ stated explicitly.
   `6ba873cec2316f4f5d662487bf4d2b773795efdd` in draft
   https://github.com/rrnewton/reverie/pull/479 is a candidate change, not a
   proven fix.
+- **Fixed 2026-10-05.** The observations above are kept as written because they
+  record what was measured at the time. Root cause
+  (https://github.com/rrnewton/hermit/issues/1818): on the current DBT runtime
+  callback ABI, Detcore names threads and processes by the client's virtual
+  ids, but `detcore-dbt` still rewrote a guest's own virtual pid and tid in
+  `rt_sigqueueinfo` and `rt_tgsigqueueinfo` to host ids. Detcore found no
+  process with the rewritten `rt_sigqueueinfo` pid and returned `ESRCH`. The
+  rewrite now applies only to the v1 ABI, whose Detcore identities are host
+  ids, and this test runs again in the portable `test.cli` step.
 
 ### `hermit::cli$run_dbt_verifies_self_prlimit`
 
@@ -535,6 +544,14 @@ stated explicitly.
   The clean matched run at `4944fb5b3cc029459056a3b9743f0d0df3ad0209`
   reached the same historical `EPERM` failure in 0.471s and emitted no
   `UnexpectedEnd`; no draft pull request 479 fix is claimed for this case.
+- **Fixed 2026-10-05.** The observations above are kept as written because they
+  record what was measured at the time. Root cause
+  (https://github.com/rrnewton/hermit/issues/2806): the identity rewrite
+  described for the preceding test also turned the guest's virtual pid in
+  `prlimit64` into its host pid. Detcore treats a nonzero target as the caller
+  only when it equals the caller's Detcore pid, which is the virtual pid on the
+  current ABI, so it returned `EPERM`. The rewrite now applies only to the v1
+  ABI, and this test runs again in the portable `test.cli` step.
 
 ### `hermit::cli$run_dbt_verifies_shell_process_lifecycle`
 
