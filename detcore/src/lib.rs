@@ -1884,9 +1884,16 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // A backend that wrote AT_RANDOM before this callback (the loader
         // handoff) emitted no record: emit it here from the bytes it wrote, with
         // no second draw or write, so the record sits where every backend puts
-        // it, after the root thread's seeding records.
-        if let Some(bytes) = initialized {
-            random::record_initial_auxv(guest.thread_state().dettid, &bytes);
+        // it, after the root thread's seeding records. The loader's getrandom
+        // fills (glibc's early initialization makes one) emitted none either:
+        // their records follow, in order, as when this thread's own getrandom
+        // handler serves them after this callback.
+        if let Some((bytes, early_getrandom)) = initialized {
+            let dettid = guest.thread_state().dettid;
+            random::record_initial_auxv(dettid, &bytes);
+            for fill in early_getrandom {
+                random::record_early_getrandom(dettid, fill);
+            }
         } else if let Some(ptr) = auxv.at_random() {
             // It is safe to mutate this address since libc has not yet had a
             // chance to modify or copy the auxv table.

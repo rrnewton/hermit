@@ -82,7 +82,24 @@ pub fn root_prng(seed: u64) -> Pcg64Mcg {
 pub const MAX_INITIAL_STATE_BYTES: usize = 4096;
 
 /// Version 2 carries the AT_RANDOM bytes so that post-exec emits their record.
-const INITIAL_STATE_VERSION: u32 = 2;
+/// Version 3 also carries the loader's getrandom fills, for the same reason.
+const INITIAL_STATE_VERSION: u32 = 3;
+
+/// Most getrandom fills a loader may serve before post-exec. glibc's early
+/// initialization makes one (the malloc tcache key); the bound keeps the
+/// handoff within [`MAX_INITIAL_STATE_BYTES`].
+pub const MAX_EARLY_GETRANDOM: usize = 32;
+
+/// One fill of guest memory from the stream: the bytes written and, in debug
+/// builds, the hash its record logs (zero in release builds, which log none).
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RandomFill {
+    /// Bytes written to guest memory.
+    pub written: usize,
+    /// Hash of the bytes written.
+    pub hash: u64,
+}
 
 /// Identity of the sole initial image whose real auxv was already written.
 /// Backends must authenticate this identity before constructing a handoff.
@@ -132,6 +149,10 @@ pub enum LoaderState {
         /// no record; the thread's post-exec callback emits it from these
         /// bytes (`record_initial_auxv`), where every backend emits it.
         at_random_value: [u8; 16],
+        /// The loader's getrandom fills, in order ([`getrandom_unrecorded`]).
+        /// They emit no record either: post-exec emits theirs after the
+        /// AT_RANDOM record, as on a backend whose own handler serves them.
+        early_getrandom: Vec<RandomFill>,
     },
     /// A later real kernel exec observed in this owned process lineage.
     ObservedExecContinuation,
@@ -159,16 +180,21 @@ fn configuration_identity(config: &crate::Config) -> Result<[u8; 32], Errno> {
     Ok(writer.0.finalize().into())
 }
 
-/// Encode only the actual PRNG, the completed auxv identity and the bytes
-/// written there ([`write_initial_auxv`]). No clock, metadata, chaos RNG,
-/// scheduler state or request history is transferred.
+/// Encode only the actual PRNG, the completed auxv identity, the bytes
+/// written there ([`write_initial_auxv`]) and the loader's getrandom fills
+/// ([`getrandom_unrecorded`]), whose records are still to be emitted. No clock,
+/// metadata, chaos RNG or scheduler state is transferred.
 pub fn encode_initial_state(
     config: &crate::Config,
     image: InitialImage,
     prng: &Pcg64Mcg,
     at_random_value: [u8; 16],
+    early_getrandom: &[RandomFill],
 ) -> Result<Vec<u8>, Errno> {
     image.validate()?;
+    if early_getrandom.len() > MAX_EARLY_GETRANDOM {
+        return Err(Errno::EOVERFLOW);
+    }
     let value = InitialRandomState {
         version: INITIAL_STATE_VERSION,
         configuration: configuration_identity(config)?,
@@ -176,6 +202,7 @@ pub fn encode_initial_state(
         state: LoaderState::InitialRandom {
             prng: prng.clone(),
             at_random_value,
+            early_getrandom: early_getrandom.to_vec(),
         },
     };
     encode_state(value)
@@ -232,16 +259,28 @@ pub fn decode_loader_state(
     Ok(value.state)
 }
 
+/// The decoded initial random state: the stream, the AT_RANDOM bytes and the
+/// loader's getrandom fills whose records post-exec emits.
+pub(crate) type InitialRandom = (Pcg64Mcg, [u8; 16], Vec<RandomFill>);
+
+/// The records post-exec emits for a loader's early random work: the AT_RANDOM
+/// bytes, then the getrandom fills in order.
+pub(crate) type EarlyRandomRecords = ([u8; 16], Vec<RandomFill>);
+
 pub(crate) fn decode_initial_state(
     bytes: &[u8],
     config: &crate::Config,
     expected: InitialImage,
-) -> Result<(Pcg64Mcg, [u8; 16]), Errno> {
+) -> Result<InitialRandom, Errno> {
     match decode_loader_state(bytes, config, expected)? {
         LoaderState::InitialRandom {
             prng,
             at_random_value,
-        } => Ok((prng, at_random_value)),
+            early_getrandom,
+        } if early_getrandom.len() <= MAX_EARLY_GETRANDOM => {
+            Ok((prng, at_random_value, early_getrandom))
+        }
+        LoaderState::InitialRandom { .. } => Err(Errno::EPROTO),
         LoaderState::ObservedExecContinuation | LoaderState::InitialStaticLegacy => {
             Err(Errno::EPROTO)
         }
@@ -307,12 +346,24 @@ pub(crate) fn write_random_chunk(
 /// normal Detcore handler. No syscall/scheduler accounting is performed here.
 pub fn fill_bytes(
     prng: &mut Pcg64Mcg,
-    mut memory: impl MemoryAccess,
+    memory: impl MemoryAccess,
     remote_buf: AddrMut<u8>,
     len: usize,
     dettid: DetTid,
     source: &str,
 ) -> Result<usize, Error> {
+    let fill = fill_bytes_unrecorded(prng, memory, remote_buf, len)?;
+    record_fill(dettid, source, fill);
+    Ok(fill.written)
+}
+
+/// [`fill_bytes`] without its record, returning what the record would log.
+fn fill_bytes_unrecorded(
+    prng: &mut Pcg64Mcg,
+    mut memory: impl MemoryAccess,
+    remote_buf: AddrMut<u8>,
+    len: usize,
+) -> Result<RandomFill, Error> {
     let mut local_words = [0_u64; RANDOM_FILL_CHUNK_BYTES / std::mem::size_of::<u64>()];
     let mut hasher = DefaultHasher::new();
     let mut written = 0;
@@ -353,16 +404,33 @@ pub fn fill_bytes(
         }
     }
 
+    Ok(RandomFill {
+        written,
+        hash: if cfg!(debug_assertions) {
+            hasher.finish()
+        } else {
+            0
+        },
+    })
+}
+
+/// The record of one fill of guest memory, logged in debug builds only.
+fn record_fill(dettid: DetTid, source: &str, fill: RandomFill) {
     if cfg!(debug_assertions) {
         detlog!(
             "[dtid {}] USER RAND [{}] Filled guest memory with {} random bytes, hash of bytes: {}",
             dettid,
             source,
-            written,
-            hasher.finish()
+            fill.written,
+            fill.hash
         );
     }
-    Ok(written)
+}
+
+/// The record of a getrandom fill that a loader served before post-exec
+/// ([`getrandom_unrecorded`]), emitted by post-exec after the AT_RANDOM record.
+pub(crate) fn record_early_getrandom(dettid: DetTid, fill: RandomFill) {
+    record_fill(dettid, "getrandom", fill);
 }
 
 /// Apply getrandom's existing flag, length, null-buffer and fill semantics.
@@ -372,13 +440,31 @@ pub fn getrandom(
     dettid: DetTid,
     call: Getrandom,
 ) -> Result<i64, Error> {
+    let (result, fill) = getrandom_unrecorded(prng, memory, call)?;
+    if let Some(fill) = fill {
+        record_fill(dettid, "getrandom", fill);
+    }
+    Ok(result)
+}
+
+/// [`getrandom`] for a loader that runs before the thread's post-exec
+/// callback: it emits no record and returns the fill, if any, whose record
+/// [`getrandom`] would have emitted. The loader hands the fills over with
+/// [`encode_initial_state`], and post-exec emits their records after the
+/// AT_RANDOM record, where every other backend's handler emits them.
+pub fn getrandom_unrecorded(
+    prng: &mut Pcg64Mcg,
+    memory: impl MemoryAccess,
+    call: Getrandom,
+) -> Result<(i64, Option<RandomFill>), Error> {
     validate_getrandom_flags(call.flags())?;
     let len = getrandom_request_len(call.buflen());
     if len == 0 {
-        return Ok(0);
+        return Ok((0, None));
     }
     let buf = call.buf().ok_or(Errno::EFAULT)?;
-    fill_bytes(prng, memory, buf, len, dettid, "getrandom").map(|n| n as i64)
+    let fill = fill_bytes_unrecorded(prng, memory, buf, len)?;
+    Ok((fill.written as i64, Some(fill)))
 }
 
 /// Draw and write the actual initial auxv bytes. A write failure preserves the
@@ -667,31 +753,121 @@ mod tests {
         let mut ordinary = root_prng(config.rng_seed());
         initialize_auxv(&mut ordinary, OwnMemory, pages.address(64), tid).unwrap();
         assert_eq!(pages.bytes(64, 16), written);
-        guest_getrandom(
+        // A loader's early getrandom draws and writes what the thread's own
+        // handler would have, and returns the fill that handler would have
+        // recorded, for post-exec to record instead.
+        let mut handler = stream.clone();
+        let mut recorded = stream.clone();
+        assert_eq!(
+            guest_getrandom(
+                &mut handler,
+                OwnMemory,
+                tid,
+                call(pages.address(48).as_raw(), 8, 1),
+            ),
+            Ok(8)
+        );
+        let (filled, fill) = getrandom_unrecorded(
             &mut stream,
             OwnMemory,
-            tid,
             call(pages.address(32).as_raw(), 8, 1),
         )
         .unwrap();
-        let encoded = encode_initial_state(&config, image, &stream, written).unwrap();
-        let (decoded, decoded_value) = decode_initial_state(&encoded, &config, image).unwrap();
+        same_state(&stream, &handler);
+        assert_eq!(pages.bytes(32, 8), pages.bytes(48, 8));
+        let fill = fill.expect("a nonempty getrandom fill returns its record");
+        assert_eq!(filled, 8);
+        assert_eq!(
+            fill_bytes_unrecorded(&mut recorded, OwnMemory, pages.address(96), 8).unwrap(),
+            fill,
+            "the fill is what the handler's own record logs"
+        );
+        let mut empty = stream.clone();
+        assert_eq!(
+            getrandom_unrecorded(&mut empty, OwnMemory, call(0, 0, 0)).unwrap(),
+            (0, None),
+            "an empty getrandom has no record"
+        );
+        same_state(&empty, &stream);
+        let encoded = encode_initial_state(&config, image, &stream, written, &[fill]).unwrap();
+        let (decoded, decoded_value, decoded_fills) =
+            decode_initial_state(&encoded, &config, image).unwrap();
         same_state(&decoded, &stream);
         assert_eq!(decoded_value, written);
+        assert_eq!(decoded_fills, [fill]);
+        // The bound on early fills keeps the largest handoff within its limit,
+        // and neither side accepts more.
+        let widest = RandomFill {
+            written: usize::MAX,
+            hash: u64::MAX,
+        };
+        let full = encode_initial_state(
+            &config,
+            image,
+            &stream,
+            written,
+            &[widest; MAX_EARLY_GETRANDOM],
+        )
+        .unwrap();
+        assert_eq!(
+            decode_initial_state(&full, &config, image).unwrap().2,
+            [widest; MAX_EARLY_GETRANDOM]
+        );
+        assert_eq!(
+            encode_initial_state(
+                &config,
+                image,
+                &stream,
+                written,
+                &[fill; MAX_EARLY_GETRANDOM + 1],
+            ),
+            Err(Errno::EOVERFLOW)
+        );
+        let too_many = encode_state(InitialRandomState {
+            version: INITIAL_STATE_VERSION,
+            configuration: configuration_identity(&config).unwrap(),
+            image,
+            state: LoaderState::InitialRandom {
+                prng: stream.clone(),
+                at_random_value: written,
+                early_getrandom: vec![fill; MAX_EARLY_GETRANDOM + 1],
+            },
+        })
+        .unwrap();
+        assert!(matches!(
+            decode_initial_state(&too_many, &config, image),
+            Err(Errno::EPROTO)
+        ));
         for bad in [
             Vec::new(),
             [encoded.as_slice(), b" "].concat(),
-            // Version 1 carried no AT_RANDOM bytes; neither it nor a later
-            // version is accepted.
+            // Version 2 carried no getrandom fills and version 1 no AT_RANDOM
+            // bytes; neither they nor a later version is accepted.
             String::from_utf8(encoded.clone())
                 .unwrap()
-                .replace("\"version\":2", "\"version\":1")
+                .replace("\"version\":3", "\"version\":1")
                 .into_bytes(),
             String::from_utf8(encoded.clone())
                 .unwrap()
-                .replace("\"version\":2", "\"version\":3")
+                .replace("\"version\":3", "\"version\":2")
+                .into_bytes(),
+            String::from_utf8(encoded.clone())
+                .unwrap()
+                .replace("\"version\":3", "\"version\":4")
+                .into_bytes(),
+            // A version 2 body, without the fills, under the current version.
+            String::from_utf8(encoded.clone())
+                .unwrap()
+                .replace(
+                    &format!(
+                        ",\"early_getrandom\":{}",
+                        serde_json::to_string(&[fill]).unwrap()
+                    ),
+                    "",
+                )
                 .into_bytes(),
         ] {
+            assert_ne!(bad, encoded);
             assert!(decode_initial_state(&bad, &config, image).is_err());
         }
         for wrong in [
@@ -810,12 +986,13 @@ mod tests {
         // handle_post_exec sets this before consuming the completion fact.
         state.past_global_first_execve = true;
         // It returns the bytes the early write stored, for post-exec's record,
-        // not what the guest left there since.
+        // not what the guest left there since, and the early fills, in order,
+        // for the records post-exec emits after it.
         assert_eq!(
             state
                 .complete_initial_random_auxv(Some(image.at_random))
                 .unwrap(),
-            Some(written)
+            Some((written, vec![fill]))
         );
         assert_eq!(pages.bytes(0, 16), [0x7c; 16]);
         same_state(&state.prng, &stream);

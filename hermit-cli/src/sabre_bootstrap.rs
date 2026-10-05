@@ -32,9 +32,11 @@ use anyhow::anyhow;
 use anyhow::ensure;
 use detcore::random::InitialImage;
 use detcore::random::LoaderState;
+use detcore::random::MAX_EARLY_GETRANDOM;
+use detcore::random::RandomFill;
 use detcore::random::encode_continuation;
 use detcore::random::encode_initial_state;
-use detcore::random::getrandom;
+use detcore::random::getrandom_unrecorded;
 use detcore::random::root_prng;
 use detcore::random::write_initial_auxv;
 use nix::unistd::Pid;
@@ -1192,6 +1194,9 @@ pub(super) struct Bootstrap {
     prng: rand_pcg::Pcg64Mcg,
     /// The bytes written at AT_RANDOM, for the handoff's post-exec record.
     at_random_value: Option<[u8; 16]>,
+    /// The loader's getrandom fills, in order, for the handoff's post-exec
+    /// records: the root thread's seeding records must precede them.
+    early_getrandom: Vec<RandomFill>,
     taken: bool,
     sigill: Option<SigillOrigin>,
     initial_random: usize,
@@ -1359,6 +1364,7 @@ impl Bootstrap {
             image: None,
             prng,
             at_random_value: None,
+            early_getrandom: Vec::new(),
             taken: false,
             sigill: None,
             initial_random,
@@ -1937,12 +1943,21 @@ impl Bootstrap {
                 let Syscall::Getrandom(call) = call else {
                     unreachable!()
                 };
-                random_response(getrandom(
-                    &mut self.prng,
-                    RemoteMemory(pid),
-                    detcore::types::DetTid::from_raw(pid.as_raw()),
-                    call,
-                ))?
+                ensure!(
+                    self.early_getrandom.len() < MAX_EARLY_GETRANDOM,
+                    "more than {MAX_EARLY_GETRANDOM} early getrandom requests"
+                );
+                // Detcore's root thread does not exist yet, so its seeding
+                // records are still to come: emit no record now. Post-exec
+                // emits this fill's record from the handoff, after them.
+                random_response(
+                    getrandom_unrecorded(&mut self.prng, RemoteMemory(pid), call).map(
+                        |(result, fill)| {
+                            self.early_getrandom.extend(fill);
+                            result
+                        },
+                    ),
+                )?
             }
             bootstrap::TAKE_STATE => {
                 ensure!(
@@ -1954,8 +1969,13 @@ impl Bootstrap {
                 let at_random_value = self
                     .at_random_value
                     .ok_or_else(|| anyhow!("TAKE before the AT_RANDOM write"))?;
-                let bytes =
-                    encode_initial_state(&self.launch.config, image, &self.prng, at_random_value)?;
+                let bytes = encode_initial_state(
+                    &self.launch.config,
+                    image,
+                    &self.prng,
+                    at_random_value,
+                    &self.early_getrandom,
+                )?;
                 let result = Self::write_take(pid, regs, &bytes)?;
                 if result > 0 {
                     self.taken = true;

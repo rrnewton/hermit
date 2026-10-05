@@ -8,6 +8,22 @@ use reverie::syscalls::Getrandom;
 
 use super::*;
 
+/// The bootstrap's getrandom adapter ([`getrandom_unrecorded`]). A request
+/// that writes bytes returns the fill post-exec records, for exactly the bytes
+/// written; any other request returns none.
+fn bootstrap_getrandom(
+    prng: &mut Pcg64Mcg,
+    memory: impl MemoryAccess,
+    call: Getrandom,
+) -> std::result::Result<i64, reverie::Error> {
+    let (result, fill) = getrandom_unrecorded(prng, memory, call)?;
+    assert_eq!(
+        fill.map(|fill| fill.written as i64),
+        (result > 0).then_some(result)
+    );
+    Ok(result)
+}
+
 struct Pages(*mut u8);
 impl Pages {
     fn new() -> Self {
@@ -103,10 +119,9 @@ fn actual_bootstrap_adapter_faults_keep_prefix_and_attempted_prng_cursor() {
         let pages = Pages::new();
         pages.protect_tail();
         let mut actual = root_prng(17);
-        let result = getrandom(
+        let result = bootstrap_getrandom(
             &mut actual,
             RemoteMemory(Pid::this()),
-            detcore::types::DetTid::from_raw(1),
             call(pages.at(PAGE), len),
         );
         assert!(matches!(result, Err(reverie::Error::Errno(Errno::EFAULT))));
@@ -117,10 +132,9 @@ fn actual_bootstrap_adapter_faults_keep_prefix_and_attempted_prng_cursor() {
     let pages = Pages::new();
     pages.protect_tail();
     let mut actual = root_prng(17);
-    let result = getrandom(
+    let result = bootstrap_getrandom(
         &mut actual,
         RemoteMemory(Pid::this()),
-        detcore::types::DetTid::from_raw(1),
         call(pages.at(0), PAGE + 8),
     );
     assert_eq!(random_response(result).unwrap(), PAGE as i64);
@@ -192,13 +206,8 @@ fn bootstrap_bridge_keeps_typed_error_after_real_partial_and_full_effects() {
             calls: Vec::new(),
         };
         let mut actual = root_prng(17);
-        let error = getrandom(
-            &mut actual,
-            &mut memory,
-            detcore::types::DetTid::from_raw(1),
-            call(pages.at(0), len),
-        )
-        .unwrap_err();
+        let error =
+            bootstrap_getrandom(&mut actual, &mut memory, call(pages.at(0), len)).unwrap_err();
         let reverie::Error::Tool(inner) = &error else {
             panic!("fatal copy became guest result: {error:?}")
         };
