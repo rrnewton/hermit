@@ -20,6 +20,7 @@ get the pinned-root container in hybrid and local routing.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -27,6 +28,8 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 
@@ -62,9 +65,28 @@ keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDA
 rsrcs = os.path.join(host(os.environ.get("HERMIT_INSTALL_DIR", "/nonexistent")), "rsrcs")
 links = {n: os.readlink(os.path.join(rsrcs, n)) if os.path.islink(os.path.join(rsrcs, n)) else None
          for n in sorted(os.listdir(rsrcs))} if os.path.isdir(rsrcs) else None
+# With FAKE_KVM_SLOT_DIR: which KVM slot files someone holds locked while the harness runs,
+# and the files behind the descriptors the harness inherited.
+slots = None
+if os.environ.get("FAKE_KVM_SLOT_DIR"):
+    import fcntl
+    slots = {}
+    for n in sorted(os.listdir(os.environ["FAKE_KVM_SLOT_DIR"])):
+        with open(os.path.join(os.environ["FAKE_KVM_SLOT_DIR"], n), "a") as f:
+            try:
+                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                slots[n] = "free"
+            except BlockingIOError:
+                slots[n] = "locked"
+fd_targets = []
+for fd in os.listdir("/proc/self/fd"):
+    try:
+        fd_targets.append(os.readlink("/proc/self/fd/" + fd))
+    except OSError:
+        pass
 with open(os.environ["FAKE_CALLS"], "a") as calls:
     calls.write(json.dumps({"who": "harness", "argv": args, "env": {k: os.environ.get(k) for k in keys},
-                            "rsrcs": links}) + "\n")
+                            "rsrcs": links, "slots": slots, "fd_targets": fd_targets}) + "\n")
 # Like hermit, which writes its private verify summary into its working directory (the
 # repository root when no enclosing checkout ignores `ignored/`), and a write through an
 # existing bundle file, which a hard-linked copy would carry back into the bundle.
@@ -417,6 +439,77 @@ class CellTest(unittest.TestCase):
         self.assertNotIn("HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN", wrapper["forwarded"])
         [harness] = self.calls_by("harness")
         self.assertIsNone(harness["env"]["HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN"])
+
+    # Every KVM ioctl passes a host BPF LSM program that takes one global lock, so a KVM
+    # cell's CPU grows with the KVM cells beside it (timed-progress-bar: 3.6 s of CPU with
+    # 8 at once, 16.6 s with 48, budget 24 s); local KVM cells share a few host-wide slots.
+    def slot_env(self, slots: int, name: str = "kvm-slots") -> dict[str, str]:
+        self.slot_dir = self.tmp / name
+        self.slot_dir.mkdir()
+        return {"HERMIT_E2E_KVM_SLOT_DIR": str(self.slot_dir), "FAKE_KVM_SLOT_DIR": str(self.slot_dir),
+                "HERMIT_E2E_KVM_SLOTS": str(slots)}
+
+    def hold_slot(self, n: int):
+        f = open(self.slot_dir / f"slot.{n}", "a")
+        self.addCleanup(f.close)
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return f
+
+    def assert_slot_free(self, n: int) -> None:
+        with open(self.slot_dir / f"slot.{n}", "a") as f:
+            fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)  # raises if still held
+
+    def assert_no_slot_descriptor(self, harness: dict) -> None:
+        held = [t for t in harness["fd_targets"] if t.startswith(str(self.slot_dir) + "/")]
+        self.assertEqual(held, [], "the harness inherited a KVM slot's descriptor")
+
+    def test_kvm_cell_waits_for_a_free_slot_and_holds_it_for_the_whole_run(self) -> None:
+        for container in ("", "pinned-root"):
+            with self.subTest(container=container):
+                self.calls.write_text("")
+                env = self.slot_env(2, "kvm-slots-" + (container or "host"))
+                self.hold_slot(0)
+                busy = self.hold_slot(1)
+                threading.Timer(1.0, busy.close).start()
+                done, result = self.run_cell("kvm", HERMIT_E2E_CONTAINER=container, CELL_DEADLINE_S="100",
+                                             **env)
+                self.assertEqual(done["status"], "passed", done)
+                # Slot 0 is held throughout and slot 1 only frees after 1 s, so holding slot 1
+                # means the cell waited for it.
+                self.assertEqual(result["kvm_slot"], "1", result)
+                self.assertGreater(result["kvm_slot_wait_ms"], 0, result)
+                # The wait comes out of the harness deadline (in the container, 15 s less again).
+                self.assertLessEqual(result["deadline_s"], 84 if container else 99, result)
+                [harness] = self.calls_by("harness")
+                # slot.0 is the test's; slot.1, released by the test, is now the cell's.
+                self.assertEqual(harness["slots"], {"slot.0": "locked", "slot.1": "locked"})
+                self.assert_no_slot_descriptor(harness)
+                self.assert_slot_free(1)
+
+    def test_kvm_cell_with_no_free_slot_runs_after_half_its_deadline(self) -> None:
+        env = self.slot_env(1)
+        self.hold_slot(0)
+        done, result = self.run_cell("kvm", CELL_DEADLINE_S="10", **env)
+        self.assertEqual(done["status"], "passed", done)
+        self.assertEqual(result["kvm_slot"], "none", result)
+        self.assertGreaterEqual(result["kvm_slot_wait_ms"], 5000, result)
+        self.assertLess(result["kvm_slot_wait_ms"], 9000, result)
+        self.assertEqual(len(self.calls_by("harness")), 1)
+
+    def test_only_local_kvm_cells_take_a_slot(self) -> None:
+        env = self.slot_env(1)
+        self.hold_slot(0)
+        for backend, route in (("ptrace", "local"), ("dbt", "local"), ("kvm", "re")):
+            with self.subTest(backend=backend, route=route):
+                started = time.monotonic()
+                done, result = self.run_cell(backend, HERMIT_E2E_ROUTE=route, **env)
+                self.assertEqual(done["status"], "passed", done)
+                self.assertEqual((result["kvm_slot"], result["kvm_slot_wait_ms"]), ("", 0), result)
+                self.assertLess(time.monotonic() - started, 4, "a cell that takes no slot must not wait")
+
+    def test_bad_kvm_slot_count_is_an_error(self) -> None:
+        done, _ = self.run_cell("kvm", **dict(self.slot_env(1), HERMIT_E2E_KVM_SLOTS="0"))
+        self.assert_error(done, "HERMIT_E2E_KVM_SLOTS must be a positive integer, not '0'")
 
 
     def assert_evidence(self, complete: bool, missing: str = "detlogs", **env: str) -> None:

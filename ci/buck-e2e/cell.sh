@@ -15,6 +15,10 @@
 #        CELL_DEADLINE_S           optional cap on the harness wall time
 #                                  (default: Tpx timeout - 30 s; Tpx returns no
 #                                  artifacts at all from an RE action it kills)
+#        HERMIT_E2E_KVM_SLOTS      how many local KVM cells may run at once on this host
+#                                  (default 8; see acquire_kvm_slot)
+#        HERMIT_E2E_KVM_SLOT_DIR   where their slot files live
+#                                  (default /tmp/hermit-e2e-kvm-slots-UID)
 # stdout: Tpx HPHP-JSON (`type = "json"`): the harness's test_done for the cell, turned
 #         into a failure if its evidence is incomplete, then all_done. Always exits 0.
 set -u
@@ -88,9 +92,69 @@ fi
 extra=()
 # The compat bucket node runs with --diagnostic-results; so does its Buck cell.
 [[ $TEST == compat/* ]] && extra+=(--diagnostic-results)
+
+# A local KVM cell runs only while it holds one of HERMIT_E2E_KVM_SLOTS (default 8) slots
+# shared by every cell on the host. reverie-kvm makes about seven ioctls per guest exit,
+# and on this fleet every ioctl passes a host BPF LSM program on security_file_ioctl that
+# takes one global ring-buffer spin lock (83% of the cycles in a perf profile of 48 cells),
+# so a KVM cell's CPU time grows with the number of KVM cells running beside it. The
+# applications/timed-progress-bar verify cell measured 2.4 s of CPU alone, 3.6 s with 8
+# running at once, 5.3 s with 16 and 16.6 s with 48, against its 24 s budget; Buck starts
+# every runnable local cell at once, while the cargo flow runs at most 8. A slot is an
+# flock on a file in HERMIT_E2E_KVM_SLOT_DIR (default /tmp/hermit-e2e-kvm-slots-UID),
+# held on fd 9 by this script alone (the commands it runs get 9>&-), so it is released
+# when this script exits, however it exits. A cell that finds no free slot within half
+# its deadline runs without one; result.json records the slot and the wait either way.
+kvm_slot='' kvm_slot_wait_ms=0
+acquire_kvm_slot() {
+    [[ $BACKEND == kvm && ${HERMIT_E2E_ROUTE:-} == local ]] || return 0
+    local slots=${HERMIT_E2E_KVM_SLOTS:-8} dir=${HERMIT_E2E_KVM_SLOT_DIR:-/tmp/hermit-e2e-kvm-slots-$(id -u)}
+    local fds=() fd i t
+    [[ $slots =~ ^[1-9][0-9]*$ ]] || emit_fatal "HERMIT_E2E_KVM_SLOTS must be a positive integer, not '$slots'"
+    mkdir -p "$dir" || emit_fatal "cannot create the KVM slot directory $dir"
+    for ((i = 0; i < slots; i++)); do
+        exec {fd}>>"$dir/slot.$i" || emit_fatal "cannot open the KVM slot file $dir/slot.$i"
+        fds+=("$fd")
+    done
+    t=$(date +%s%N)
+    # flock(2) locks the open file description, which this shell shares with the poller,
+    # so a slot the poller locks stays locked after it exits. It polls in-process: one
+    # flock command per try would fork hundreds of processes a second across the waiters.
+    kvm_slot=$(python3 - "$((deadline / 2))" "${fds[@]}" <<'PY'
+import fcntl, os, random, sys, time
+give_up = time.monotonic() + int(sys.argv[1])
+fds = [int(fd) for fd in sys.argv[2:]]
+while True:
+    for i in random.sample(range(len(fds)), len(fds)):
+        try:
+            fcntl.flock(fds[i], fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            continue
+        os.utime(fds[i])  # the host's daily tmp cleaner deletes files untouched for 4 days
+        print(i)
+        sys.exit(0)
+    if time.monotonic() >= give_up:
+        print("none")
+        sys.exit(0)
+    time.sleep(random.uniform(0.1, 0.4))
+PY
+    )
+    kvm_slot_wait_ms=$((($(date +%s%N) - t) / 1000000))
+    if [[ $kvm_slot =~ ^[0-9]+$ ]] && ((kvm_slot < slots)); then
+        exec 9>&"${fds[$kvm_slot]}"
+    else
+        kvm_slot=none
+    fi
+    for fd in "${fds[@]}"; do exec {fd}>&-; done
+}
+
 out=$W/out
 case $container in
 "")
+    acquire_kvm_slot
+    # What is left of the deadline after the setup above and any wait for a KVM slot.
+    deadline=$((deadline - ($(date +%s%N) - t0) / 1000000000))
+    ((deadline > 10)) || deadline=10
     env "${cpu_scan_env[@]}" "${workdir_env[@]}" VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_BUILD_ROOT="$B/build" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
@@ -99,7 +163,7 @@ case $container in
         "$B/bin/test-harness" run --repo-root "$B/src" --source-sha "$SHA" \
         --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --no-retry \
         --results "$out/results.jsonl" --junit "$out/junit.xml" --tpx-json "$out/tpx.jsonl" \
-        "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr"
+        "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
     ;;
 pinned-root)
@@ -156,6 +220,8 @@ exec "$@"'
     # Tpx kills the cell at deadline + 30 s. The wrapper gets what is left of the deadline
     # after the copy above, and the harness that less 15 s for starting and removing the
     # container, so a hung container is stopped here, with its artifacts, before Tpx.
+    # A KVM cell's wait for a slot comes out of the same deadline.
+    acquire_kvm_slot
     outer=$((deadline - ($(date +%s%N) - t0) / 1000000000))
     ((outer > 25)) || outer=25
     deadline=$((outer - 15))
@@ -173,7 +239,7 @@ exec "$@"'
         /src/bundle/bin/test-harness run --repo-root /src/bundle/src --source-sha "$SHA" \
         --test "$TEST" --mode "$MODE" --backend "$BACKEND" --prebuilt --no-retry \
         --results "$o/results.jsonl" --junit "$o/junit.xml" --tpx-json "$o/tpx.jsonl" \
-        "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr"
+        "${extra[@]}" "$@" >"$W/harness.stdout" 2>"$W/harness.stderr" 9>&-
     harness_rc=$?
     ;;
 *) emit_fatal "unknown HERMIT_E2E_CONTAINER '$container' (expected pinned-root or empty)" ;;
@@ -236,6 +302,7 @@ json.dump({
     "container": os.environ.get("HERMIT_E2E_CONTAINER", ""),
     "container_reason": os.environ.get("HERMIT_E2E_CONTAINER_REASON", ""),
     "empty_workdir": "${workdir_env[*]}",
+    "kvm_slot": "$kvm_slot", "kvm_slot_wait_ms": $kvm_slot_wait_ms,
     "harness_rc": $harness_rc, "outcome": "$outcome", "deadline_s": $deadline,
     "tpx_timeout_s": $tpx_timeout, "wall_ms": $(((t1 - t0) / 1000000)),
     "evidence_complete": "$evidence_complete" == "true", "missing": "${missing[*]}".split(),
