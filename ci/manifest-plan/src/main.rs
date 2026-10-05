@@ -1363,6 +1363,10 @@ fn validate_mode_with_cpu(
             "diagnostic",
             "no_retry_reason",
         ]),
+        // A replay cell may restate the environment it records with, an empty
+        // mapping included (runner::cell_mode_env); otherwise it inherits its
+        // verify cell's.
+        "replay" => allowed.push("env"),
         _ => {}
     }
     ensure_keys(spec_value, &allowed, &format!("{id}.modes.{mode}"));
@@ -2086,6 +2090,52 @@ liteinst = "unsupported"
             "custom",
             90,
             &parse_mode(VERIFY_EXTENSIONS),
+            &mut Vec::new(),
+        );
+    }
+
+    /// A replay mode that restates its environment as an empty mapping, as
+    /// compat.yaml's replay cells do so they record without the verify cell's
+    /// TMPDIR.
+    const REPLAY_WITH_ENV: &str = r#"
+ci = true
+backends_enabled = ["ptrace"]
+
+[labels]
+ptrace = ["rr-compat-only"]
+
+[env]
+
+[backends_disabled]
+dbt = "unsupported"
+kvm = "unsupported"
+sabre = "unsupported"
+liteinst = "unsupported"
+"#;
+
+    #[test]
+    fn accepts_an_env_in_a_replay_mode() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "replay",
+            90,
+            &parse_mode(REPLAY_WITH_ENV),
+            &mut Vec::new(),
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "bucket/test.modes.custom: unknown keys: [\"env\"]")]
+    fn rejects_an_env_outside_verify_and_replay() {
+        validate_mode(
+            "bucket/test",
+            "bucket",
+            "portable",
+            "custom",
+            90,
+            &parse_mode(REPLAY_WITH_ENV),
             &mut Vec::new(),
         );
     }
