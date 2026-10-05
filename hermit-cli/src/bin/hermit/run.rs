@@ -2259,6 +2259,69 @@ fn replay_networking_reads_the_trace_before_the_guest_starts() {
 }
 
 #[test]
+fn replay_networking_adopts_the_trace_epoch_and_refuses_another() {
+    let dir = tempfile::tempdir().unwrap();
+    let trace = dir.path().join("net.trace");
+    let recorded = "2026-01-01T00:00:00Z".parse().unwrap();
+    detcore_model::network_engine::NetworkEngine::new_record(recorded)
+        .finish()
+        .unwrap()
+        .write_framed(File::create(&trace).unwrap())
+        .unwrap();
+    let flag = format!("--replay-networking={}", trace.display());
+    let parse = |arguments: &[&str]| {
+        let mut ro = RunOpts::parse_from(arguments);
+        if !arguments
+            .iter()
+            .any(|argument| argument.starts_with("--epoch"))
+        {
+            ro.capture_default_epoch(SystemTime::now);
+        }
+        ro.validate_args_with_perf_support(true).unwrap();
+        ro
+    };
+
+    let mut ro = parse(&["fakehermit", &flag, "fakeprog"]);
+    ro.adopt_replayed_schedule_epoch().unwrap();
+    assert_eq!(ro.det_opts.det_config.epoch, recorded);
+    assert!(ro.epoch_from_recording && !ro.epoch_captured_from_host);
+
+    let mut ro = parse(&[
+        "fakehermit",
+        "--epoch=2026-01-01T00:00:00Z",
+        &flag,
+        "fakeprog",
+    ]);
+    ro.adopt_replayed_schedule_epoch().unwrap();
+    assert_eq!(ro.det_opts.det_config.epoch, recorded);
+
+    let mut ro = parse(&[
+        "fakehermit",
+        "--epoch=2027-01-01T00:00:00Z",
+        &flag,
+        "fakeprog",
+    ]);
+    let error = format!("{:#}", ro.adopt_replayed_schedule_epoch().unwrap_err());
+    assert!(
+        error.contains("the explicit virtual-time epoch 2027-01-01T00:00:00+00:00")
+            && error.contains("pass --epoch=2026-01-01T00:00:00+00:00"),
+        "{error}"
+    );
+
+    // As if a preemption record from another run had fixed the epoch first:
+    // the trace must then agree with it.
+    let mut ro = parse(&["fakehermit", &flag, "fakeprog"]);
+    ro.epoch_from_recording = true;
+    ro.det_opts.det_config.epoch = "2027-01-01T00:00:00Z".parse().unwrap();
+    let error = format!("{:#}", ro.adopt_replayed_schedule_epoch().unwrap_err());
+    assert!(
+        error.contains("adopted from another recording replayed in this run")
+            && error.contains("replay them separately"),
+        "{error}"
+    );
+}
+
+#[test]
 fn network_trace_is_reached_through_a_descriptor_opened_before_the_container() {
     let dir = tempfile::tempdir().unwrap();
     let trace = dir.path().join("net.trace");
@@ -3331,6 +3394,11 @@ impl RunOpts {
     /// epochs were stored carries none and is replayed against this run's epoch
     /// exactly as before.
     ///
+    /// A network trace (`--replay-networking`) is reconciled the same way: it
+    /// releases each recorded input at an absolute virtual time, so replaying
+    /// it from a later epoch would hand the guest every input at once. Two
+    /// recordings replayed together must share one epoch.
+    ///
     /// This holds with `--no-virtualize-time` too: detcore's logical clock, and
     /// so every recorded timeslice end, still starts at the epoch. Only
     /// `--namespace-only`, which bypasses detcore, has nothing to reconcile.
@@ -3339,32 +3407,62 @@ impl RunOpts {
             return Ok(());
         }
         let config = &self.det_opts.det_config;
-        let Some(path) = config
+        let mut recordings = Vec::new();
+        if let Some(path) = config
             .replay_preemptions_from
             .as_ref()
             .or(config.replay_schedule_from.as_ref())
-        else {
-            return Ok(());
-        };
-        let Some(recorded) = detcore::preemptions::read_recorded_epoch(path).map_err(Error::msg)?
-        else {
-            return Ok(());
-        };
-        if self.epoch_omitted {
-            self.det_opts.det_config.epoch = recorded;
-            self.epoch_captured_from_host = false;
-            self.epoch_from_recording = true;
-            return Ok(());
+            && let Some(recorded) =
+                detcore::preemptions::read_recorded_epoch(path).map_err(Error::msg)?
+        {
+            recordings.push((recorded, path.clone()));
         }
-        if config.epoch != recorded {
+        if let (NetworkTraceMode::Replay, Some(path)) =
+            (config.network_trace.mode, &config.network_trace.path)
+        {
+            let file = File::open(path)
+                .with_context(|| format!("cannot open network trace {}", path.display()))?;
+            let trace = NetworkTraceV2::read_framed(std::io::BufReader::new(file))
+                .with_context(|| format!("{} is not a valid network trace", path.display()))?;
+            recordings.push((trace.epoch, path.clone()));
+        }
+        for (recorded, path) in recordings {
+            if self.epoch_omitted && !self.epoch_from_recording {
+                self.det_opts.det_config.epoch = recorded;
+                self.epoch_captured_from_host = false;
+                self.epoch_from_recording = true;
+                continue;
+            }
+            let current = self.det_opts.det_config.epoch;
+            if current == recorded {
+                continue;
+            }
             let recorded = recorded.to_rfc3339();
+            let current = current.to_rfc3339();
+            let (current, remedy) = if self.epoch_from_recording {
+                (
+                    format!(
+                        "the virtual-time epoch {current}, adopted from another recording \
+                         replayed in this run,"
+                    ),
+                    "Replay recordings made in the same run together, or replay them separately."
+                        .to_owned(),
+                )
+            } else {
+                (
+                    format!(
+                        "the explicit virtual-time epoch {current} (from --epoch or HERMIT_EPOCH)"
+                    ),
+                    format!(
+                        "Omit --epoch to replay from the recorded epoch, or pass \
+                         --epoch={recorded}."
+                    ),
+                )
+            };
             return Err(Error::new(PolicyRefusal).context(format!(
-                "the explicit virtual-time epoch {} (from --epoch or HERMIT_EPOCH) differs from \
-                 the epoch {recorded} that {} was recorded under. The recording's timeslice \
-                 ends are absolute virtual times measured from its own epoch, so replaying \
-                 them from another epoch cannot reproduce the run. Omit --epoch to replay \
-                 from the recorded epoch, or pass --epoch={recorded}.",
-                config.epoch.to_rfc3339(),
+                "{current} differs from the epoch {recorded} that {} was recorded under. A \
+                 recording's times are absolute virtual times measured from its own epoch, so \
+                 replaying them from another epoch cannot reproduce the run. {remedy}",
                 path.display(),
             )));
         }
