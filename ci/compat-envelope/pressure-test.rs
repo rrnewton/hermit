@@ -22496,7 +22496,16 @@ mod pressure_sample_tests {
         // candidate did not retain the logs the summary requires: unmeasured
         // with the summary's reason, in the floor as 0, and the golden is
         // still named.
-        let golden_text = golden.to_string_lossy().into_owned();
+        // A parity record names a log below the results directory under the
+        // canonical /results root, as the container's records do
+        // (parity::PostPassConfig::naming_roots), never by its host path.
+        let golden_text = format!(
+            "/results/{}",
+            golden
+                .strip_prefix(&results)
+                .expect("the golden log is below the results directory")
+                .display()
+        );
         let (candidate_run1, candidate_run2) = &run_logs[cell.backend.as_str()];
         let golden = fs::read(candidate_run1).unwrap();
         for retained_run2 in [true, false] {
