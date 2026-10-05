@@ -139,7 +139,10 @@ caller set it. `ci/run-dag.sh` sets it only for `--unsafe-no-cgroups`, the
 privileged workflow only for its unboxed occasional KVM probe step,
 `ci/buck-e2e/cell.sh` only for cells on the RE route (an RE worker's cgroup is
 not writable by the test; local and pinned-root cells drop a caller's marker),
-and `ci/compat-envelope/pressure-test.rs` never.
+and `ci/compat-envelope/pressure-test.rs` never. The boxed-run refusal therefore
+covers only cells executed on the validating host: a boxed
+`--e2e-runner buck-hybrid` run still imports RE rows whose CPU source is
+`agent_utils_paired_pidfd_stat_v1`.
 
 ## Regular Nextest calibration and enclosing budgets
 

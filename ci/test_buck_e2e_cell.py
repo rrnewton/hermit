@@ -483,6 +483,9 @@ class ContainerChoiceTest(unittest.TestCase):
         for cell in self.plan:
             target = targets[self.slug(cell)]
             env, labels = target["env"], target["labels"]
+            # cell.sh grants the CPU-scan marker from this variable, while the
+            # rule's `route` picks the executor; they must name the same route.
+            self.assertEqual(env["HERMIT_E2E_ROUTE"], target["route"], target["name"])
             expected = target["route"] == "local" and (
                 cell["lane"] == "privileged"
                 or cell["backend"] == "dbt"
