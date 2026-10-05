@@ -2057,6 +2057,7 @@ mod tests {
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn: None,
+            first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,

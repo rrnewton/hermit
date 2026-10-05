@@ -1106,17 +1106,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let host_stat = self
                     .add_fd_with_stat(guest, fd, call.flags(), fd_type)
                     .await?;
-                if let (Some(log), Some(stat)) =
-                    (guest.config().host_input_log.as_deref(), &host_stat)
-                {
-                    let thread = guest.thread_state();
-                    crate::host_inputs::record(
-                        log,
-                        thread.dettid.as_raw() as u64,
-                        thread.stats.syscall_count,
-                        &observed_path,
-                        stat,
-                    );
+                if let (true, Some(stat)) = (guest.config().record_host_inputs, &host_stat) {
+                    crate::tool_global::record_host_input(
+                        guest,
+                        observed_path.to_string_lossy().into_owned(),
+                        detcore_model::host_input::HostFileIdentity::from_stat(stat),
+                    )
+                    .await;
                 }
                 if fd_type == FdType::Pipe {
                     self.maybe_set_nonblocking_fd(guest, fd);

@@ -114,9 +114,12 @@ ends. A cause is named only when all of these hold:
   one it had seen before: a replacement, the change that shifts Hermit's later
   inode numbers. A change of size or time alone is not named;
 - in BOTH runs' logs, that open's finish record appears exactly once and before
-  the scheduler commit preceding the first divergent record. A guest that
-  replaces a file itself because it already behaves differently has diverged
-  by then, so its divergence stays a failure.
+  the first divergent record. A guest that replaces a file itself because it
+  already behaves differently has diverged by then, so its divergence stays a
+  failure. Positions are records in the log, so this holds where the log is
+  not one stream in time order: SaBRe appends the records its guest forwards
+  after the coordinator's own, each part is in time order, and the comparator
+  reports the first difference in the earliest part.
 
 Then the report's verdict is `infrastructure_error` with
 `infrastructure_error.kind` `host_input_changed`, naming the run, the path and
@@ -127,9 +130,23 @@ stdout assertion the cell declares; a second divergence stays a failure. The
 row stays its own type, an infrastructure ERROR, and is never counted as a
 pass.
 
-Capture runs where Detcore's configuration arrives in-process: the ptrace and
-KVM backends. Elsewhere (DBT, SaBRe, LiteInst) nothing is recorded, so no cause
-is named and a divergence stays red.
+Each open is reported to Detcore's global state with an observation request
+that carries no logical time and is answered before any clock or scheduler
+accounting; the global state keeps the run's records and writes them when the
+run ends. Detcore sends the same request whether it runs in the tracer or
+inside the guest, so capture reaches the ptrace, KVM and SaBRe backends.
+
+A change is named as the cause only on a backend that observes every guest
+process from its first instruction after exec: ptrace (with or without e9patch
+preprocessing) and KVM. SaBRe's loader runs an exec'd program's
+`.preinit_array` before Detcore starts and forwards those syscalls unobserved,
+so a guest could have made the change in code Hermit never saw, and an
+identical log prefix does not rule that out. There `--verify` prints
+`HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED`, naming the change and the reason, and
+the verdict stays a divergence. In-guest LiteInst records too, but refuses
+`--verify` until it forwards its guest's records to Hermit. DBT has its own
+launcher and verifier, which do not collect the records. On all three a
+divergence stays red.
 
 The one remaining case is a coincidence: a host file replaced during an attempt
 before the divergence, and an unrelated flaky product divergence in that same

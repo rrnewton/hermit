@@ -309,7 +309,7 @@ fn place_host_input_change(
     run1: std::io::Result<HostInputs>,
     path: &Path,
     logs: [&Path; 2],
-) -> Option<(PatternDifference, [Option<Option<u64>>; 2])> {
+) -> Option<(PatternDifference, [Option<usize>; 2])> {
     let read = |result: std::io::Result<HostInputs>| {
         result
             .inspect_err(|error| {
@@ -324,14 +324,7 @@ fn place_host_input_change(
     let run2 = read(read_host_inputs(path))?;
     let difference = find_pattern_difference(&run1, &run2)?;
     let place = |log: &Path, label: &str| {
-        fs::File::open(log)
-            .and_then(|file| {
-                open_position(
-                    std::io::BufReader::new(file),
-                    difference.dtid,
-                    difference.syscall,
-                )
-            })
+        fs::read(log)
             .inspect_err(|error| {
                 eprintln!(
                     "WARNING: the {label} log cannot be read, so a host file change cannot be \
@@ -339,10 +332,35 @@ fn place_host_input_change(
                 )
             })
             .ok()
-            .flatten()
+            .and_then(|bytes| {
+                open_position(
+                    &String::from_utf8_lossy(&bytes),
+                    difference.dtid,
+                    difference.syscall,
+                )
+            })
     };
     let positions = [place(logs[0], "run 1"), place(logs[1], "run 2")];
     Some((difference, positions))
+}
+
+/// Why `backend` can run guest code that Hermit does not observe, or `None`
+/// when Hermit sees every syscall of every guest process from its first
+/// instruction after exec. Under such a backend a host file change found
+/// before the first divergence is not evidence that the guest did not make
+/// the change itself (see `hermit::host_input_change`).
+fn unobserved_guest_execution(backend: Backend) -> Option<&'static str> {
+    match backend {
+        Backend::Ptrace | Backend::E9patch | Backend::Kvm => None,
+        Backend::Sabre => Some(
+            "SaBRe's loader runs an exec'd program's .preinit_array before Detcore starts \
+             and forwards those syscalls unobserved",
+        ),
+        Backend::Liteinst => {
+            Some("in-guest LiteInst's preload starts after an exec'd program's .preinit_array runs")
+        }
+        Backend::Dbt => Some("DBT's launcher does not collect host inputs"),
+    }
 }
 
 fn private_verify_summary() -> Result<tempfile::NamedTempFile, Error> {
@@ -5545,17 +5563,27 @@ impl RunOpts {
         // A divergence that a host file changing during one run explains is
         // named as such: only a divergence is examined, and only a change
         // found before the divergence, by a comparison that compared
-        // everything, explains it.
+        // everything, explains it. On a backend that can run guest code
+        // before Hermit observes it, an identical log prefix does not show
+        // that the guest did not make the change itself, so the change is
+        // reported without being named as the cause.
         let host_input_change = host_input_change
             .filter(|_| outcome.verdict == Verdict::Diverged)
             .filter(|(_, positions)| {
                 explains_divergence(
                     outcome.comparison.is_bitwise_parity(),
                     *positions,
-                    outcome.first_divergent_scheduler_turn,
+                    outcome.first_divergent_record_positions,
                 )
             })
-            .map(|(difference, _)| difference.into_infrastructure_error());
+            .map(|(difference, _)| difference.into_infrastructure_error())
+            .filter(|change| {
+                let unobserved = unobserved_guest_execution(self.selected_backend());
+                if let Some(reason) = unobserved {
+                    eprintln!("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED {change}; not named as the cause: {reason}");
+                }
+                unobserved.is_none()
+            });
 
         // Emit the machine-readable verdict (if requested) before collapsing the
         // outcome to the historical exit-code convention. The verdict is recorded
@@ -5915,6 +5943,7 @@ impl RunOpts {
         // this is in-process only; it reaches the ptrace backend directly and is not
         // carried through the DBT JSON config or `--save-config`.
         config.happens_before = self.resolved_happens_before.clone();
+        config.record_host_inputs = self.host_input_log.is_some();
         config.host_input_log = self.host_input_log.clone();
         config
     }

@@ -35,6 +35,8 @@ use std::time::SystemTime;
 use anyhow::bail;
 use chrono::DateTime;
 use chrono::Utc;
+use detcore_model::host_input::HostFileIdentity;
+use detcore_model::host_input::HostInputRecord;
 use detcore_model::network_engine::NetworkEngine;
 use detcore_model::network_engine::NetworkEngineError;
 use detcore_model::network_engine::NetworkReply;
@@ -531,6 +533,12 @@ pub struct GlobalState {
     // Unsupported syscall names observed across every process in this run.
     unsupported_syscalls: Mutex<BTreeSet<String>>,
 
+    // The host identity of each file the guest opened in this run, in the
+    // order the opens were reported, when `Config::record_host_inputs` is set
+    // (see `detcore_model::host_input`). Written to `Config::host_input_log`
+    // when the run ends normally; dropped with this state otherwise.
+    host_inputs: Mutex<Vec<HostInputRecord>>,
+
     // Optional append-only sink shared by DBT fork descendants.
     unsupported_syscall_report_fd: Option<Mutex<File>>,
 
@@ -635,11 +643,6 @@ impl GlobalState {
     }
 
     fn initialize(cfg: &Config, spawn_scheduler: bool) -> Self {
-        // This run's host-input records start empty, whatever an earlier run
-        // in this process that shared the log's name left behind.
-        if let Some(log) = &cfg.host_input_log {
-            crate::host_inputs::begin(log);
-        }
         let sched = Arc::new(Mutex::new(Scheduler::new(cfg)));
         let global_time = Arc::new(Mutex::new(GlobalTime::new(cfg)));
         let handle = if cfg.sequentialize_threads && spawn_scheduler {
@@ -691,6 +694,7 @@ impl GlobalState {
             next_port: AtomicU16::new(range[0]),
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
+            host_inputs: Mutex::new(Vec::new()),
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
@@ -894,10 +898,6 @@ impl GlobalState {
     /// join error and any requested partial preemption recording's write error
     /// for the caller, without allowing either to replace the backend failure.
     pub async fn clean_up_after_backend_failure(mut self) -> BackendFailureCleanup {
-        // A failed run writes no host-input log; its records are dropped.
-        if let Some(log) = &self.cfg.host_input_log {
-            crate::host_inputs::discard(log);
-        }
         let scheduler = if let Some(handle) = self.sched_handle.take() {
             handle.await
         } else {
@@ -959,7 +959,7 @@ impl GlobalState {
         let recording_destination = self.cfg.record_preemptions_to.clone();
         // The run is over: write what it opened for --verify.
         if let Some(log) = &self.cfg.host_input_log {
-            crate::host_inputs::finish(log);
+            crate::host_inputs::write(log, &self.host_inputs.lock().unwrap());
         }
         let (mut summary, info_reprio_descrip) = self.into_run_summary_for_log().unwrap();
         summary.dispatch_stats = dispatch_stats;
@@ -1179,6 +1179,23 @@ impl GlobalTool for GlobalState {
             }
             _ => {}
         }
+        // An observation for `hermit run --verify`, answered before any clock
+        // or scheduler accounting: it carries no logical time, changes no
+        // scheduler state, and its answer carries no time back.
+        if let GlobalRequest::RecordHostInput {
+            path,
+            syscall,
+            identity,
+        } = request
+        {
+            self.host_inputs.lock().unwrap().push(HostInputRecord {
+                path,
+                dtid: dtid.as_raw() as u64,
+                syscall,
+                identity,
+            });
+            return (None, R::RecordHostInput(()));
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -1377,6 +1394,9 @@ impl GlobalTool for GlobalState {
             }
             GlobalRequest::SignalDequeued { .. } => {
                 unreachable!("consuming path handled before ordinary cancellation")
+            }
+            GlobalRequest::RecordHostInput { .. } => {
+                unreachable!("host-input observation answered before clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
                 let (response, _) = self
@@ -3272,6 +3292,17 @@ pub enum GlobalRequest {
     RobustListWakes(Vec<(DetTid, FutexID)>),
     /// One external network record or replay operation.
     Network(NetworkRequest),
+
+    /// Record that the sending thread, in its syscall number `syscall`, opened
+    /// `path` and found the host file `identity` (see
+    /// `detcore_model::host_input`). An observation for `hermit run --verify`
+    /// only: answered before any clock or scheduler accounting. Last, so that
+    /// adding it left every earlier variant's encoded tag unchanged.
+    RecordHostInput {
+        path: String,
+        syscall: u64,
+        identity: HostFileIdentity,
+    },
 }
 
 /// Responses from the global object
@@ -3347,6 +3378,8 @@ pub enum GlobalResponse {
     PortFull,
     RobustListWakes(Vec<u64>),
     Network(Result<NetworkReply, NetworkEngineError>),
+    /// Last, so that adding it left every earlier variant's tag unchanged.
+    RecordHostInput(()),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3422,6 +3455,30 @@ where
             .unwrap()
             .apply_exec_blocking_overrides(dettid, overrides);
     }
+}
+
+/// Report to the global state that this thread, in its current syscall,
+/// opened `path` and found the host file `identity`, for `hermit run
+/// --verify` (see `detcore_model::host_input`). The answer carries no time.
+pub(crate) async fn record_host_input<G, T>(guest: &mut G, path: String, identity: HostFileIdentity)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let syscall = guest.thread_state().stats.syscall_count;
+    let (time, response) = send_and_update_time(
+        guest,
+        GlobalRequest::RecordHostInput {
+            path,
+            syscall,
+            identity,
+        },
+    )
+    .await;
+    assert_eq!(
+        (time, response),
+        (None, GlobalResponse::RecordHostInput(()))
+    );
 }
 
 // TODO-HUMAN-REVIEW(PR-643): Review the guest-to-global unsupported-syscall report path.
@@ -7344,6 +7401,84 @@ mod tests {
         // Re-determinizing the same host inode is stable, not a fresh mint.
         let (a_again, _) = pool.add_inode(host_a, seen, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+
+    /// A host-input observation belongs to the run whose global state receives
+    /// it. It is answered with no logical time, before any clock accounting,
+    /// so it cannot move the global clock or the sender's, and the run's
+    /// records are written with their end line at normal clean-up. The same
+    /// request reaches this state from every backend: the openat handler sends
+    /// it over the backend's RPC whether Detcore runs in the tracer or inside
+    /// the guest.
+    #[tokio::test]
+    async fn host_input_observations_are_kept_by_the_run_and_written_at_its_end() {
+        use detcore_model::host_input::HostFileIdentity;
+        use detcore_model::host_input::HostInputLogEnd;
+        use detcore_model::host_input::HostInputRecord;
+
+        let directory = tempfile::tempdir().unwrap();
+        let log = directory.path().join("host-inputs");
+        let config = Config {
+            sequentialize_threads: true,
+            record_host_inputs: true,
+            host_input_log: Some(log.clone()),
+            ..Config::default()
+        };
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(17);
+        let identity = HostFileIdentity {
+            dev: 33,
+            ino: 7,
+            size: 100,
+            mtime_sec: 1_700_000_000,
+            mtime_nsec: 5,
+        };
+        let mut sender_time = DetTime::new(&config);
+        sender_time.add_syscall();
+        sender_time.add_syscall();
+        let global_before = state.global_time.lock().unwrap().as_nanos();
+        let response = state
+            .receive_rpc(
+                reverie::Tid::from_raw(dettid.as_raw()),
+                (
+                    sender_time,
+                    MmId::initial(dettid),
+                    GlobalRequest::RecordHostInput {
+                        path: "/etc/ld.so.cache".into(),
+                        syscall: 12,
+                        identity,
+                    },
+                ),
+            )
+            .await;
+        assert_eq!(response, (None, GlobalResponse::RecordHostInput(())));
+        {
+            let global_time = state.global_time.lock().unwrap();
+            assert_eq!(global_time.as_nanos(), global_before, "no clock accounting");
+            assert!(
+                !global_time.contains_thread(dettid),
+                "the sender's clock was not pushed"
+            );
+        }
+        assert!(!log.exists(), "nothing is written while the run goes on");
+
+        state.clean_up(false, &None).await;
+        let text = std::fs::read_to_string(&log).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(
+            serde_json::from_str::<HostInputRecord>(lines[0]).unwrap(),
+            HostInputRecord {
+                path: "/etc/ld.so.cache".into(),
+                dtid: 17,
+                syscall: 12,
+                identity,
+            }
+        );
+        assert_eq!(
+            serde_json::from_str::<HostInputLogEnd>(lines[1]).unwrap(),
+            HostInputLogEnd { records: 1 }
+        );
     }
 
     /// Two files on different filesystems can share an inode number; they

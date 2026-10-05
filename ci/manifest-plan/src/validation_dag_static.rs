@@ -743,7 +743,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest-plan's service_result::tests::
     // delegated_writeback_is_schema_6_only_and_never_changes_the_exit retains
     // all 965 (966, measured by a full validation's executed count).
-    ("test.regular_crates", 966),
+    // detcore-model's config::tests::record_host_inputs_never_enters_the_legacy_form
+    // retains all 966 (967; each was measured as 965 + 1 on its own).
+    ("test.regular_crates", 967),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1007,7 +1009,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_global::tests::files_on_different_devices_with_one_inode_number_stay_distinct
     // and syscalls::namespace::tests::anonymous_object_devices_are_the_pipe_and_socket_filesystems
     // retain all 949 (951, measured with cargo nextest list).
-    ("test.detcore_unit", 951),
+    // tool_global::tests::host_input_observations_are_kept_by_the_run_and_written_at_its_end
+    // retains all 951 (952, measured with cargo nextest list).
+    ("test.detcore_unit", 952),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1205,7 +1209,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
-    ("test.sabre_examples", 9),
+    // sabre_reports_a_replaced_host_file_without_naming_it_the_cause,
+    // sabre_names_no_host_input_change_for_another_divergence and
+    // sabre_names_no_host_input_change_for_a_guest_that_replaced_a_file_after_diverging
+    // retain all 9 (12, measured with cargo nextest list).
+    ("test.sabre_examples", 12),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -1297,8 +1305,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 931: 931 + 16 = 947.
     // The same scheduler backoff and backend-user-address-limit tests retain
     // all 947: 947 + 2 = 949.
-    // The host twin selects the same two inode-identity tests (951).
-    ("test.detcore_unit_on_host", 951),
+    // The host twin selects the same two inode-identity tests (951) and the
+    // host-input observation test (952).
+    ("test.detcore_unit_on_host", 952),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1404,10 +1413,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The fourteen backend-capability controls listed there retain all
     // 951: 951 + 14 = 965.
     // The delegated write-back test listed there retains all 965: 966.
-    ("test.regular_crates_on_host", 966),
+    // The legacy-form host-input test listed there retains all 966: 967.
+    ("test.regular_crates_on_host", 967),
     ("test.rr_suite_contract_on_host", 1),
-    // The host twin also selects the two startup-order tests.
-    ("test.sabre_examples_on_host", 9),
+    // The host twin also selects the two startup-order tests, and the three
+    // SaBRe host-input tests (12).
+    ("test.sabre_examples_on_host", 12),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {

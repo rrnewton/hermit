@@ -544,6 +544,11 @@ pub struct VerificationOutcome {
     /// Scheduler turn at the first log divergence, when a preceding COMMIT
     /// identified the turn.
     pub first_divergent_scheduler_turn: Option<u64>,
+    /// The first different record's position in each run's log, as
+    /// `detcore::logdiff::log_record_events` counts records (`None` for a log
+    /// that ended before it), when the logs were compared and differ. Not part
+    /// of the report: `hermit::host_input_change` places an open against it.
+    pub first_divergent_record_positions: Option<(Option<usize>, Option<usize>)>,
     /// Virtual nanoseconds at that same COMMIT, when the log recorded them.
     pub first_divergent_virtual_nanoseconds: Option<u64>,
     /// 1-based index of the first differing compared record.
@@ -1374,6 +1379,7 @@ fn compare_two_runs_with_unsupported_scan(
     // "compared nothing" from "compared and matched".
     let mut compared_log_messages: Option<ComparedLogCounts> = None;
     let mut first_divergent_scheduler_turn = None;
+    let mut first_divergent_record_positions = None;
     let mut first_divergent_virtual_nanoseconds = None;
     let mut first_divergent_record = None;
     let mut first_divergent_syscall = None;
@@ -1498,6 +1504,7 @@ fn compare_two_runs_with_unsupported_scan(
                     observed_divergence = true;
                 }
                 first_divergent_scheduler_turn = summary.first_divergent_scheduler_turn;
+                first_divergent_record_positions = summary.first_divergent_record_positions;
                 first_divergent_virtual_nanoseconds = summary.first_divergent_virtual_nanoseconds;
                 // Set inside this `diff_found` arm, matching its two siblings
                 // above.
@@ -1629,6 +1636,7 @@ fn compare_two_runs_with_unsupported_scan(
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn,
+            first_divergent_record_positions,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
             first_divergent_syscall,
@@ -1647,6 +1655,7 @@ fn compare_two_runs_with_unsupported_scan(
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn,
+            first_divergent_record_positions,
             first_divergent_virtual_nanoseconds,
             first_divergent_record,
             first_divergent_syscall,
@@ -4221,6 +4230,7 @@ mod tests {
             dbt_counted_branches: None,
             runtime: None,
             first_divergent_scheduler_turn: None,
+            first_divergent_record_positions: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
             first_divergent_syscall: None,

@@ -720,6 +720,18 @@ fn extract_log_messages(contents: &str) -> std::io::Result<Vec<LogMessage<'_>>> 
         .collect()
 }
 
+/// Each record of a Hermit log with its position, as the comparator counts
+/// positions ([`LogDiffSummary::first_divergent_record_positions`]): the
+/// record's human text and its structured DETLOG event, if any.
+pub fn log_record_events(
+    contents: &str,
+) -> std::io::Result<Vec<(usize, &str, Option<DetLogEvent>)>> {
+    Ok(extract_log_messages(contents)?
+        .into_iter()
+        .map(|message| (message.index, message.text, message.event))
+        .collect())
+}
+
 fn is_info(message: &LogMessage<'_>) -> bool {
     message.text.starts_with("INFO ")
 }
@@ -1548,6 +1560,10 @@ pub struct LogDiffSummary {
     /// the first N records" is a bound, not a location, and on a long run the
     /// two are far apart; this is the location.
     pub first_divergent_record: Option<usize>,
+    /// The position of that first different record in each log, as
+    /// [`log_record_events`] counts records, or `None` for a log that ended
+    /// before it. `None` when no difference was found.
+    pub first_divergent_record_positions: Option<(Option<usize>, Option<usize>)>,
     /// Number of leading COMPARED messages that are equal on both sides, in
     /// the same units as [`Self::compared_left`] and [`Self::compared_right`].
     ///
@@ -2092,6 +2108,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             first_divergent_scheduler_turn: None,
             first_divergent_virtual_nanoseconds: None,
             first_divergent_record: None,
+            first_divergent_record_positions: None,
             matched_prefix_messages: None,
             first_divergent_syscall: None,
             first_divergent_left_message: None,
@@ -2239,6 +2256,7 @@ pub fn log_diff_summary_from_strs_with_filter(
             .then_some(first_position_candidate)
             .flatten()
             .map(|(turn, _)| turn),
+        first_divergent_record_positions: diff_found.then_some(first_different).flatten(),
         first_divergent_virtual_nanoseconds: diff_found
             .then_some(first_position_candidate)
             .flatten()

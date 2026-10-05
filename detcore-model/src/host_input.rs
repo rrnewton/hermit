@@ -14,9 +14,11 @@
 //! guest processes, for example) gives that run one more inode than the other
 //! run, and every later inode number differs. `hermit run --verify` then
 //! reports a divergence that the guest did not cause. Each verification run
-//! therefore records one [`HostInputRecord`] per host file the guest opens, in
-//! a side file ([`crate::config::Config::host_input_log`]) written when the run
-//! ends and never part of the compared log, and on a divergence the two runs'
+//! therefore records one [`HostInputRecord`] per host file the guest opens.
+//! Detcore reports each open to its global state
+//! ([`crate::config::Config::record_host_inputs`]), which writes the run's
+//! records to a side file ([`crate::config::Config::host_input_log`]) when the
+//! run ends, never part of the compared log. On a divergence the two runs'
 //! records are compared to name such a change.
 
 use serde::Deserialize;

@@ -633,14 +633,25 @@ pub struct Config {
     #[clap(skip)]
     pub happens_before: Option<HappensBeforeProgram>,
 
-    /// Where each host file the guest opens is recorded, one
-    /// [`crate::host_input::HostInputRecord`] JSON line per open, appended.
-    /// `hermit run --verify` sets a private file for each of its two runs, so
-    /// that a divergence caused by a host file replaced during a run can be
-    /// named (see [`crate::host_input`]). The records are never part of the
-    /// compared log. Set programmatically, like `happens_before`: never a CLI
-    /// flag and never serialized, so it reaches only a backend that receives
-    /// this `Config` in-process.
+    /// Whether Detcore records the host identity of each file the guest
+    /// opens, sending each record to the global state, which writes the run's
+    /// records to [`Self::host_input_log`] when the run ends (see
+    /// [`crate::host_input`]). `hermit run --verify` sets it, so that a
+    /// divergence caused by a host file replaced during a run can be named.
+    /// The records are never part of the compared log. Serialized, so that it
+    /// reaches the Detcore tool on every backend, including one that runs
+    /// inside the guest and receives this `Config` over RPC; never a CLI flag.
+    #[serde(default)]
+    #[clap(skip)]
+    pub record_host_inputs: bool,
+
+    /// Where the global state writes the run's host-input records, one
+    /// [`crate::host_input::HostInputRecord`] JSON line each and a
+    /// [`crate::host_input::HostInputLogEnd`] line, when the run ends.
+    /// `hermit run --verify` sets a private file. A host path, read only by
+    /// the global state, which every backend that hosts it builds from this
+    /// `Config` in-process; so set programmatically, like `happens_before`,
+    /// and never serialized.
     #[serde(skip)]
     #[clap(skip)]
     pub host_input_log: Option<PathBuf>,
@@ -1394,8 +1405,10 @@ impl Default for Config {
 /// In their place, at the same position in the object, are the fifteen
 /// separate backend keys that a serialized configuration carried before,
 /// under the names and in the order it carried them, each with a value
-/// computed from `config`. Every other field is serialized exactly as
-/// `serde_json::to_string(config)` serializes it.
+/// computed from `config`. [`Config::record_host_inputs`], which the legacy
+/// form never had, is left out too, and reads back as false: this form serves
+/// only DBT, whose launcher collects no host inputs. Every other field is
+/// serialized exactly as `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
 /// --backend=dbt` passes the configuration to the in-guest DBT runtime in the
@@ -1667,7 +1680,11 @@ mod legacy_backend_json {
 
     /// The keys `Config` has now that its legacy form did not. The legacy
     /// form ignored them, as it ignored every key it did not name.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 2] = ["backend", "shared_dequeue_timers"];
+    /// `record_host_inputs` has no legacy key and no legacy value: the legacy
+    /// form serves only DBT, whose launcher collects no host inputs, so it is
+    /// never written and always reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 3] =
+        ["backend", "shared_dequeue_timers", "record_host_inputs"];
 
     /// Reads the top-level object or array of a legacy configuration. The
     /// derived `Config` deserializer reads every field; this takes the legacy
@@ -1785,7 +1802,7 @@ mod legacy_backend_json {
                         .map(Some)
                         .map_err(<A::Error as de::Error>::custom)
                 }
-                Some("shared_dequeue_timers") => {
+                Some("shared_dequeue_timers" | "record_host_inputs") => {
                     seed.deserialize(BoolDeserializer::new(false)).map(Some)
                 }
                 _ => self.inner.next_element_seed(seed),
@@ -2028,6 +2045,8 @@ mod legacy_backend_json {
                 }
                 // Written above as `kvm_shared_dequeue_timers`.
                 "shared_dequeue_timers" => Ok(()),
+                // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
+                "record_host_inputs" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -2290,7 +2309,8 @@ mod tests {
 
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
-    /// `shared_dequeue_timers`, which is the key order the encoder writes.
+    /// `shared_dequeue_timers` or `record_host_inputs`, which is the key
+    /// order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2305,7 +2325,7 @@ mod tests {
         for field in &fields {
             match field.as_str() {
                 "backend" => expected.extend(names.map(str::to_owned)),
-                "shared_dequeue_timers" => {}
+                "shared_dequeue_timers" | "record_host_inputs" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -2315,7 +2335,34 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         assert_eq!(keys, expected);
-        assert_eq!(fields.len() + 13, keys.len());
+        // `backend` becomes fifteen keys; `shared_dequeue_timers` and
+        // `record_host_inputs` none.
+        assert_eq!(fields.len() + 12, keys.len());
+    }
+
+    /// `record_host_inputs` never enters the legacy form, whatever its value:
+    /// the guest-visible string stays the legacy bytes, and it reads back as
+    /// false from both the object and the array form.
+    #[test]
+    fn record_host_inputs_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            record_host_inputs: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(!json.contains("record_host_inputs"), "{json}");
+        assert!(!from_legacy_backend_json(&json).unwrap().record_host_inputs);
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(!from_legacy_backend_json(&array).unwrap().record_host_inputs);
     }
 
     /// Serde reads a derived struct from a JSON array by position, so the

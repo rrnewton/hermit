@@ -12,6 +12,9 @@ mod dispatch_stats;
 #[path = "common/run2_log.rs"]
 mod run2_log;
 
+#[path = "common/host_input.rs"]
+mod host_input;
+
 use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::os::unix::process::CommandExt;
@@ -968,4 +971,115 @@ fn sabre_dispatch_record_reports_its_routes_and_tracer_stops() {
         exit_stops <= entry_stops,
         "a syscall exit stop without its entry: {record}"
     );
+}
+
+/// [`host_input::verify_across_host_action`] on the SaBRe backend, or `None`,
+/// with the reason printed, when its artifacts are not built here (an
+/// explicitly configured `HERMIT_SABRE_BINARY` that is missing panics instead).
+fn sabre_verify_across_host_action(
+    name: &str,
+    guest: &str,
+    replace_in_run1: bool,
+    lines: [&str; 2],
+) -> Option<(
+    PathBuf,
+    String,
+    hermit::canonical_verdict::VerificationReport,
+)> {
+    let loader = sabre_loader()?;
+    Some(host_input::verify_across_host_action(
+        &hermit_binary(),
+        &["--backend=sabre"],
+        &[("HERMIT_SABRE_BINARY", &loader)],
+        name,
+        guest,
+        replace_in_run1,
+        lines,
+    ))
+}
+
+/// The sar divergence in miniature on SaBRe, whose Detcore runs inside the
+/// guest: a host file replaced between run 1's two opens of it. The guest's
+/// openat handler reports each open to the coordinator's global state over
+/// SaBRe's RPC, so `--verify` finds the replacement, placed before the
+/// divergence. It reports it without naming it the cause, because SaBRe's
+/// loader runs an exec'd program's `.preinit_array` before Detcore starts:
+/// guest code Hermit does not observe could have made the change. The run
+/// stays a divergence.
+#[test]
+fn sabre_reports_a_replaced_host_file_without_naming_it_the_cause() {
+    let Some((root, stderr, report)) = sabre_verify_across_host_action(
+        "sabre-host-input-replaced",
+        host_input::HOST_INPUT_GUEST,
+        true,
+        ["go", "go"],
+    ) else {
+        return;
+    };
+    assert_eq!(
+        report.verdict,
+        hermit::canonical_verdict::Verdict::Diverged,
+        "{stderr}"
+    );
+    assert_eq!(report.infrastructure_error, None, "{stderr}");
+    let line = stderr
+        .lines()
+        .find(|line| line.starts_with("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED "))
+        .unwrap_or_else(|| panic!("the replacement was not reported\n{stderr}"));
+    assert!(
+        line.contains(&format!(
+            "host input changed during run 1: {}",
+            root.join("F").display()
+        )),
+        "{line}"
+    );
+    assert!(
+        line.contains("SaBRe's loader runs an exec'd program's .preinit_array"),
+        "{line}"
+    );
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED "), "{stderr}");
+}
+
+/// The control on SaBRe: the runs read different lines and no host file
+/// changes. The divergence is not attributed to a host input change.
+#[test]
+fn sabre_names_no_host_input_change_for_another_divergence() {
+    let Some((_root, stderr, report)) = sabre_verify_across_host_action(
+        "sabre-host-input-unchanged",
+        host_input::HOST_INPUT_GUEST,
+        false,
+        ["one", "two"],
+    ) else {
+        return;
+    };
+    assert_eq!(
+        report.verdict,
+        hermit::canonical_verdict::Verdict::Diverged,
+        "{stderr}"
+    );
+    assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGE"), "{stderr}");
+}
+
+/// The counterexample on SaBRe, whose log puts the guest's records after the
+/// coordinator's: the guest replaces `F` itself in run 1 only, after reading a
+/// different line. The patterns differ as a host replacement's would, but the
+/// divergence is recorded first, so the change is not even reported.
+#[test]
+fn sabre_names_no_host_input_change_for_a_guest_that_replaced_a_file_after_diverging() {
+    let Some((_root, stderr, report)) = sabre_verify_across_host_action(
+        "sabre-host-input-self-replaced",
+        host_input::SELF_REPLACING_GUEST,
+        false,
+        ["moveA", "moveB"],
+    ) else {
+        return;
+    };
+    assert_eq!(
+        report.verdict,
+        hermit::canonical_verdict::Verdict::Diverged,
+        "{stderr}"
+    );
+    assert_eq!(report.infrastructure_error, None, "{stderr}"); // Refused by the position rule, before the backend is considered.
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGE"), "{stderr}");
 }

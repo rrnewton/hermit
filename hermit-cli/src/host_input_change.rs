@@ -30,10 +30,16 @@
 //! but that behaviour shows in the compared log before the open. So the
 //! difference names the cause of a divergence only when the comparison
 //! compared everything (one strict enough for bitwise parity) and the open
-//! that found it completed, in BOTH runs' logs, before the scheduler commit
-//! preceding the first divergent record ([`explains_divergence`]): up to that
-//! commit both runs did the same things, so the guest did not cause the
-//! difference.
+//! that found it is recorded, in BOTH runs' logs, before the first divergent
+//! record ([`explains_divergence`]): up to that record both runs did the same
+//! things, so the guest did not cause the difference.
+//!
+//! Positions are records in the log, not times. On a backend whose log is not
+//! one stream in time order, such as SaBRe, which appends the records its
+//! guest forwards after the coordinator's own, each part is still in time
+//! order, and the comparator reports the first difference in the earliest
+//! part. An open in a later part than that difference is therefore refused,
+//! and an open before it in the same part did happen before it.
 //!
 //! Nothing else is concluded. The walk stops at the first open whose path,
 //! thread or syscall differs between the runs and at the first difference that
@@ -43,11 +49,9 @@
 //! metadata is not file content and which Hermit virtualizes separately.
 
 use std::collections::HashMap;
-use std::io::BufRead;
 use std::path::Path;
 
 use detcore::detlog::DetLogEvent;
-use detcore::detlog::DetLogRecord;
 use detcore_model::host_input::HostFileIdentity;
 use detcore_model::host_input::HostInputLogEnd;
 use detcore_model::host_input::HostInputRecord;
@@ -209,47 +213,33 @@ pub fn find_pattern_difference(run1: &HostInputs, run2: &HostInputs) -> Option<P
     None
 }
 
-/// Where an open sits in a run's log: the scheduler turn of the last commit
-/// before the record on which thread `dtid` finished its syscall number
-/// `syscall`, an open. `Some(None)` means no commit precedes that record.
-/// `None` means the log does not show that record exactly once: a log without
-/// it says nothing, and a thread number and syscall count can repeat (a thread
-/// that execs from a non-leader thread takes the leader's number and keeps its
-/// own count), so a repeated one is ambiguous.
+/// Where an open sits in a run's log (`contents`): the position, as the
+/// comparator counts records (`detcore::logdiff::log_record_events`), of the
+/// record on which thread `dtid` finished its syscall number `syscall`, an
+/// open. `None` when the log does not show that record exactly once: a log
+/// without it says nothing, and a thread number and syscall count can repeat
+/// (a thread that execs from a non-leader thread takes the leader's number and
+/// keeps its own count), so a repeated one is ambiguous; also `None` for a log
+/// the comparator could not read either.
 ///
-/// A commit is a record whose `DETLOG_RECORD` is a `scheduler_commit`. The
-/// open's record is a `syscall_result` whose Hermit-written prefix reads
+/// The open's record is a `syscall_result` whose Hermit-written prefix reads
 /// `[syscall][detcore, dtid D] finish syscall #N: ` followed by `openat(`,
 /// `open(` or `creat(`, the calls Detcore's openat handler serves. The prefix
-/// is read where it first occurs in the line, before any guest-chosen text
+/// is read where it first occurs in the record, before any guest-chosen text
 /// such as a path.
-pub fn open_position(
-    log: impl BufRead,
-    dtid: u64,
-    syscall: u64,
-) -> std::io::Result<Option<Option<u64>>> {
-    let mut last_commit = None;
+pub fn open_position(contents: &str, dtid: u64, syscall: u64) -> Option<usize> {
     let mut found = None;
-    for line in log.split(b'\n') {
-        let line = line?;
-        let line = String::from_utf8_lossy(&line);
-        let Ok((human, Some(record))) = DetLogRecord::split(&line) else {
-            continue;
-        };
-        match record.event {
-            DetLogEvent::SchedulerCommit { scheduler_turn, .. } => {
-                last_commit = Some(scheduler_turn);
+    for (position, human, event) in detcore::logdiff::log_record_events(contents).ok()? {
+        if matches!(event, Some(DetLogEvent::SyscallResult { .. }))
+            && finished_open(human) == Some((dtid, syscall))
+        {
+            if found.is_some() {
+                return None;
             }
-            DetLogEvent::SyscallResult { .. } if finished_open(human) == Some((dtid, syscall)) => {
-                if found.is_some() {
-                    return Ok(None);
-                }
-                found = Some(last_commit);
-            }
-            _ => {}
+            found = Some(position);
         }
     }
-    Ok(found)
+    found
 }
 
 /// The thread and that thread's syscall number of a finished open's record,
@@ -272,24 +262,21 @@ fn finished_open(human: &str) -> Option<(u64, u64)> {
 
 /// Whether a pattern difference explains a divergence: the comparison was one
 /// strict enough for bitwise parity (`complete_comparison`), and the open that
-/// found the difference (placed by [`open_position`] in each run's log)
-/// completed in both runs before the scheduler commit preceding the first
-/// divergent record, turn `first_divergent_turn`, so the two runs had done the
-/// same things up to that open. Without every position nothing is attributed.
+/// found the difference (placed by [`open_position`] in each run's log) is
+/// recorded before the first divergent record in both logs
+/// (`first_divergent_positions`, the comparator's positions of that record),
+/// so the two runs had done the same things up to that open. Without every
+/// position nothing is attributed.
 pub fn explains_divergence(
     complete_comparison: bool,
-    open_positions: [Option<Option<u64>>; 2],
-    first_divergent_turn: Option<u64>,
+    open_positions: [Option<usize>; 2],
+    first_divergent_positions: Option<(Option<usize>, Option<usize>)>,
 ) -> bool {
-    let Some(divergent_turn) = first_divergent_turn else {
+    let Some((Some(left), Some(right))) = first_divergent_positions else {
         return false;
     };
     complete_comparison
-        && open_positions.iter().all(|position| match position {
-            Some(None) => true,
-            Some(Some(open_turn)) => *open_turn < divergent_turn,
-            None => false,
-        })
+        && matches!(open_positions, [Some(open1), Some(open2)] if open1 < left && open2 < right)
 }
 
 #[cfg(test)]
@@ -470,8 +457,14 @@ mod tests {
         assert!(!absent.complete);
     }
 
+    /// A log record as Hermit writes it: a wall-clock prefix, then the
+    /// record, which is how the comparator separates records.
+    fn record(text: &str) -> String {
+        format!("2026-10-05T19:00:00.000000Z {text}")
+    }
+
     fn commit(turn: u64) -> String {
-        format!(
+        record(&format!(
             "INFO detcore::scheduler: COMMIT turn {turn}{}",
             record_suffix(DetLogEvent::SchedulerCommit {
                 scheduler_turn: turn,
@@ -479,40 +472,36 @@ mod tests {
                 internal_io_poll: false,
                 runtime_maps_read: false,
             })
-        )
+        ))
     }
 
     fn finished(dtid: u64, syscall: u64, call: &str) -> String {
-        format!(
+        record(&format!(
             "INFO detcore: DETLOG [syscall][detcore, dtid {dtid}] finish syscall #{syscall}: {call} = Ok(3){}",
             record_suffix(DetLogEvent::SyscallResult {
                 finished_syscall_number: syscall,
             })
-        )
+        ))
     }
 
     fn finish(dtid: u64, syscall: u64) -> String {
         finished(dtid, syscall, "openat(-100, \"/etc/a\", O_RDONLY)")
     }
 
-    /// An open is placed by the last commit before its own finish record.
+    /// An open is placed at its own finish record's position, as the
+    /// comparator counts records (from 1: the first record follows the empty
+    /// text before the first wall-clock prefix).
     #[test]
-    fn an_open_is_placed_by_the_commit_before_it() {
+    fn an_open_is_placed_at_its_finish_record() {
         let log = [commit(4), finish(3, 12), commit(5), finish(5, 12)].join("\n");
-        let place = |dtid, syscall| open_position(log.as_bytes(), dtid, syscall).unwrap();
-        assert_eq!(place(3, 12), Some(Some(4)));
-        assert_eq!(place(5, 12), Some(Some(5)));
-        assert_eq!(place(3, 13), None);
-        let first = finish(3, 12);
-        assert_eq!(open_position(first.as_bytes(), 3, 12).unwrap(), Some(None));
+        assert_eq!(open_position(&log, 3, 12), Some(2));
+        assert_eq!(open_position(&log, 5, 12), Some(4));
+        assert_eq!(open_position(&log, 3, 13), None);
         for call in ["open(\"/etc/a\", O_RDONLY)", "creat(\"/etc/a\", 0644)"] {
-            let line = finished(3, 12, call);
-            assert_eq!(
-                open_position(line.as_bytes(), 3, 12).unwrap(),
-                Some(None),
-                "{call}"
-            );
+            let log = [commit(4), finished(3, 12, call)].join("\n");
+            assert_eq!(open_position(&log, 3, 12), Some(2), "{call}");
         }
+        assert_eq!(open_position("not a Hermit log", 3, 12), None);
     }
 
     /// Only a structured record of a finished open, read at Hermit's own
@@ -523,11 +512,13 @@ mod tests {
     #[test]
     fn only_one_anchored_open_record_places_an_open() {
         let repeated = [commit(4), finish(3, 12), commit(12), finish(3, 12)].join("\n");
-        assert_eq!(open_position(repeated.as_bytes(), 3, 12).unwrap(), None);
+        assert_eq!(open_position(&repeated, 3, 12), None);
         let not_an_open = [commit(4), finished(3, 12, "stat(\"/etc/a\")")].join("\n");
-        assert_eq!(open_position(not_an_open.as_bytes(), 3, 12).unwrap(), None);
-        let prose_only = "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #12: openat(..) = Ok(3)";
-        assert_eq!(open_position(prose_only.as_bytes(), 3, 12).unwrap(), None);
+        assert_eq!(open_position(&not_an_open, 3, 12), None);
+        let prose_only = record(
+            "INFO detcore: DETLOG [syscall][detcore, dtid 3] finish syscall #12: openat(..) = Ok(3)",
+        );
+        assert_eq!(open_position(&prose_only, 3, 12), None);
         // dtid 3's syscall 7 opens a file whose name spells dtid 3's syscall 12.
         let spoofed = finished(
             3,
@@ -535,46 +526,36 @@ mod tests {
             "openat(-100, \"[syscall][detcore, dtid 3] finish syscall #12: openat(\")",
         );
         let log = [commit(2), spoofed, commit(9), finish(3, 12)].join("\n");
-        assert_eq!(open_position(log.as_bytes(), 3, 12).unwrap(), Some(Some(9)));
-        assert_eq!(open_position(log.as_bytes(), 3, 7).unwrap(), Some(Some(2)));
+        assert_eq!(open_position(&log, 3, 12), Some(4));
+        assert_eq!(open_position(&log, 3, 7), Some(2));
     }
 
     /// A pattern difference explains a divergence only when the comparison
-    /// compared everything and its open came, in both runs, before the commit
-    /// that precedes the first divergent record. A guest that behaved
-    /// differently first, such as one that truncated the file in one run
-    /// only, has diverged by the open, and is not explained.
+    /// compared everything and its open is recorded, in both runs, before
+    /// the first divergent record. A guest that behaved differently first,
+    /// such as one that replaced the file in one run only, has diverged by
+    /// the open, and is not explained.
     #[test]
     fn only_an_open_before_the_divergence_in_both_runs_explains_it() {
-        assert!(explains_divergence(
-            true,
-            [Some(Some(4)), Some(Some(4))],
-            Some(5)
-        ));
-        assert!(explains_divergence(true, [Some(None), Some(None)], Some(5)));
-        assert!(!explains_divergence(
-            false,
-            [Some(Some(4)), Some(Some(4))],
-            Some(5)
-        ));
+        let divergent = Some((Some(40), Some(42)));
+        assert!(explains_divergence(true, [Some(10), Some(10)], divergent));
+        assert!(explains_divergence(true, [Some(39), Some(41)], divergent));
+        assert!(!explains_divergence(false, [Some(10), Some(10)], divergent));
+        assert!(!explains_divergence(true, [Some(40), Some(10)], divergent));
+        assert!(!explains_divergence(true, [Some(10), Some(42)], divergent));
+        assert!(!explains_divergence(true, [None, Some(10)], divergent));
+        assert!(!explains_divergence(true, [Some(10), None], divergent));
+        assert!(!explains_divergence(true, [Some(10), Some(10)], None));
         assert!(!explains_divergence(
             true,
-            [Some(Some(5)), Some(Some(4))],
-            Some(5)
+            [Some(10), Some(10)],
+            Some((None, Some(42)))
         ));
         assert!(!explains_divergence(
             true,
-            [Some(Some(4)), Some(Some(6))],
-            Some(5)
+            [Some(10), Some(10)],
+            Some((Some(40), None))
         ));
-        assert!(!explains_divergence(true, [None, Some(Some(4))], Some(5)));
-        assert!(!explains_divergence(true, [Some(Some(4)), None], Some(5)));
-        assert!(!explains_divergence(
-            true,
-            [Some(Some(4)), Some(Some(4))],
-            None
-        ));
-        assert!(!explains_divergence(true, [Some(None), Some(None)], None));
     }
 
     /// A change of size or time that keeps the host inode is not the
