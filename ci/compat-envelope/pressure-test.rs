@@ -375,7 +375,12 @@ Selection and bounded-batch options (run and plan):
                            unless the sample holds it, so the parity post-pass
                            can score the pair. References are extra: COUNT
                            stays the sampled cells, and run.json and
-                           summary.json list references apart.
+                           summary.json list references apart. The draw
+                           excludes, and names as not sampleable under the
+                           --run-timeout limit, every cell whose declared
+                           path after the shared builds (fixture node, test
+                           preparation, cell, summary) cannot fit it; an
+                           exact or cells-file request for one is refused.
   --green                  With --repetitions, select cells selected by full instead
                            of red cells. Exact --test/--mode/--backend, --mode,
                            and --sample filters are retained in run.json. A sample
@@ -664,6 +669,23 @@ struct PressureCells {
     references: Vec<TrackedCell>,
     /// The parity cells of the sampled candidates, `<test-id>@<backend>`.
     parity_pairs: Vec<String>,
+    /// The population a sample draws from before cells that cannot fit the
+    /// run's limit are excluded; `eligible_cells` counts what remains.
+    population_cells: usize,
+    /// The cells excluded from a sample's draw ([`UnsampleableCell`]).
+    unsampleable: Vec<UnsampleableCell>,
+}
+
+/// A cell a seeded sample does not draw, because its own declared critical
+/// path after the shared builds cannot fit the run's limit
+/// ([`DeclaredChain::path`]); an exact or cells-file request for it is
+/// refused instead.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct UnsampleableCell {
+    cell: CellId,
+    seconds: i64,
+    reason: String,
 }
 
 /// A sample's parity references (owner ruling: one parity mechanism in
@@ -951,6 +973,11 @@ struct CellSelection {
     /// run without depending on the continued existence of its source file.
     #[serde(skip)]
     retained_cells_file_cells: Option<Vec<CellId>>,
+    /// The timeout policy a sample's draw measures declared paths with: the
+    /// plan's own, or a retained run's. Without one no cell is excluded from
+    /// the draw (an unsampled selection, or a run that predates the rule).
+    #[serde(skip)]
+    timeout_policy: Option<PressureTimeoutPolicy>,
 }
 
 impl CellSelection {
@@ -1978,6 +2005,15 @@ struct RunMetadata {
     /// Their pairs stay in `parity_pairs` and are reported reference-missing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     skipped_references: Vec<SkippedReference>,
+    /// A sample's population before the cells that cannot fit the run's
+    /// limit are excluded; `eligible_cells` counts the cells the draw chose
+    /// from. Absent for unsampled selections and older runs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    population_cells: Option<usize>,
+    /// The cells a sample's draw excluded, each "not sampleable under the N
+    /// s limit" with its declared path.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    unsampleable_cells: Vec<UnsampleableCell>,
     /// The parity cells (`<test-id>@<backend>`) of the sampled candidates, in
     /// canonical order. The post-pass reports them besides the committed
     /// selection and `--parity-select`.
@@ -3228,11 +3264,32 @@ fn print_sample(metadata: &RunMetadata) {
             "Sample: selected {count} cell(s), eligible count not retained by this older run, seed {}",
             metadata.seed.unwrap_or(0)
         );
+    } else if let Some(population) = metadata.population_cells {
+        println!(
+            "Sample: selected {count} of {} cell(s) eligible for the draw ({population} in the population, {} not sampleable under the {} s limit), seed {}",
+            metadata.eligible_cells,
+            metadata.unsampleable_cells.len(),
+            metadata.run_timeout_seconds,
+            metadata.seed.unwrap_or(0)
+        );
     } else {
         println!(
             "Sample: selected {count} of {} eligible cell(s), seed {}",
             metadata.eligible_cells,
             metadata.seed.unwrap_or(0)
+        );
+    }
+    if !metadata.unsampleable_cells.is_empty() {
+        println!(
+            "Not sampleable under the {} s limit ({} cell(s), listed with their declared paths in run.json unsampleable_cells): {}",
+            metadata.run_timeout_seconds,
+            metadata.unsampleable_cells.len(),
+            metadata
+                .unsampleable_cells
+                .iter()
+                .map(|cell| format!("{} ({}s)", display_id(&cell.cell), cell.seconds))
+                .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     for cell in &metadata.cells {
@@ -4356,8 +4413,78 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             },
         );
     }
+    // The harness selects a cell only through its run types and its enabled
+    // state, so every generated command takes them from the manifest.
+    let all_facts = manifest_cell_facts(&ManifestSet::load(root)?)?;
+    // A sample draws only from cells whose own declared path fits the run's
+    // limit, so the draw can never produce a plan the limit must refuse. The
+    // excluded cells are named, and the draw stays reproducible from the seed
+    // and the remaining set.
+    let population_cells = selected_cells.len();
+    let mut unsampleable = Vec::new();
+    if let (Some(_), Some(policy)) = (selection.sample, selection.timeout_policy) {
+        let preparation_by_test: BTreeMap<String, CellId> = selected_cells
+            .iter()
+            .filter_map(|cell| {
+                applicable_by_test
+                    .get(&cell.id.test)
+                    .map(|prepared_with: &CellId| (cell.id.test.clone(), prepared_with.clone()))
+            })
+            .collect();
+        let keys = selected_cells
+            .iter()
+            .map(|cell| &cell.id)
+            .chain(preparation_by_test.values())
+            .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+            .collect();
+        let resolved = resolve_budgets(budgets.clone(), policy, &keys)?;
+        let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
+            .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
+        let canonical =
+            dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
+        let limit = selection
+            .run_timeout_seconds
+            .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
+        let declared = DeclaredChain {
+            budgets: &resolved,
+            manifest_facts: &all_facts,
+            preparation_by_test: &preparation_by_test,
+            cell_timeout_seconds: selection.cell_timeout_seconds,
+            run_timeout_seconds: limit,
+            fixture_seconds: compat_fixture_seconds(&canonical)?,
+        };
+        let mut drawable = Vec::with_capacity(selected_cells.len());
+        for cell in selected_cells {
+            // The fixture node is on every path of a sample that reads the
+            // fixtures, and the draw cannot know whether it will, so it is
+            // counted for every cell.
+            let (seconds, composition) = declared.path(&cell.id, true)?;
+            if declared.fits(seconds) {
+                drawable.push(cell);
+            } else {
+                unsampleable.push(UnsampleableCell {
+                    reason: format!(
+                        "not sampleable under the {limit} s limit: its declared critical path after the shared builds is {seconds}s ({composition}), counting the fixture node any sample may need"
+                    ),
+                    cell: cell.id,
+                    seconds,
+                });
+            }
+        }
+        selected_cells = drawable;
+    }
     let eligible_cells = selected_cells.len();
     if let Some(count) = selection.sample {
+        if count > selected_cells.len() && !unsampleable.is_empty() {
+            return Err(format!(
+                "--sample {count} exceeds the {} cells eligible for the draw: {population_cells} in the population, {} not sampleable under the {}s limit",
+                selected_cells.len(),
+                unsampleable.len(),
+                selection
+                    .run_timeout_seconds
+                    .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS)
+            ));
+        }
         if count > selected_cells.len() {
             return Err(if selection.selects_green_population() {
                 format!(
@@ -4421,10 +4548,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             .entry(cell.id.test.clone())
             .or_insert_with(|| prepared_with.clone());
     }
-    // The harness selects a cell only through its run types and its enabled
-    // state, so every generated command takes them from the manifest. The
-    // preparation cell is applicable by construction.
-    let all_facts = manifest_cell_facts(&ManifestSet::load(root)?)?;
+    // The preparation cell is applicable by construction.
     let mut manifest_facts = BTreeMap::new();
     for (id, applicable) in selected_cells
         .iter()
@@ -4446,6 +4570,8 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         manifest_facts,
         references,
         parity_pairs,
+        population_cells,
+        unsampleable,
     })
 }
 
@@ -5355,12 +5481,16 @@ impl DeclaredChain<'_> {
 /// so a reference never costs the sample its evidence. A reference is skipped
 /// when its own declared path cannot fit the run bound, or when it alone
 /// would add the fixture node and that would push a path already kept past
-/// the bound. The sampled cells' own fit is checked separately and refuses
-/// the plan.
+/// the bound. Then, when the sampled cells alone fit the run's declared
+/// occupancy floor (`occupancy`) but the kept references push it over,
+/// references are skipped, the one with the largest declared path first,
+/// until it fits. The sampled cells' own fit is checked separately and
+/// refuses the plan.
 fn partition_references(
     sampled: &[TrackedCell],
     references: Vec<TrackedCell>,
     declared: &DeclaredChain<'_>,
+    occupancy: &dyn Fn(&[TrackedCell]) -> Result<(), String>,
 ) -> Result<(Vec<TrackedCell>, Vec<SkippedReference>), String> {
     let mut fixtures = false;
     for tracked in sampled {
@@ -5405,6 +5535,30 @@ fn partition_references(
                 fixtures |= reads;
                 kept.push(reference);
             }
+        }
+    }
+    if occupancy(sampled).is_ok() {
+        loop {
+            let planned: Vec<TrackedCell> = sampled.iter().chain(&kept).cloned().collect();
+            if kept.is_empty() || occupancy(&planned).is_ok() {
+                break;
+            }
+            let mut largest: Option<(i64, usize)> = None;
+            for (index, reference) in kept.iter().enumerate() {
+                let (seconds, _) = declared.path(&reference.id, fixtures)?;
+                if largest.is_none_or(|(best, _)| seconds > best) {
+                    largest = Some((seconds, index));
+                }
+            }
+            let (_, index) = largest.expect("kept references are not empty");
+            let reference = kept.remove(index);
+            skipped.push(SkippedReference {
+                cell: reference.id,
+                reason: format!(
+                    "reference not run: its declared budget does not fit the run bound: with it, the run's declared worst-case cell occupancy cannot fit the {}s run bound, which the sampled cells alone fit",
+                    declared.run_timeout_seconds
+                ),
+            });
         }
     }
     Ok((kept, skipped))
@@ -5588,6 +5742,12 @@ fn write_plan_after_scorecard_check(
     // compared by the parity post-pass would give their guests different
     // clocks. An inherited HERMIT_EPOCH is kept verbatim.
     let hermit_epoch = run_epoch_from_env()?;
+    let timeout_policy = PressureTimeoutPolicy::from_env()?;
+    // A sample's draw measures declared paths with this plan's own policy.
+    let drawn_selection = CellSelection {
+        timeout_policy: Some(timeout_policy),
+        ..selection.clone()
+    };
     let PressureCells {
         selected: sampled,
         unavailable,
@@ -5597,13 +5757,14 @@ fn write_plan_after_scorecard_check(
         manifest_facts,
         references,
         parity_pairs,
-    } = pressure_cells(root, selection)?;
+        population_cells,
+        unsampleable,
+    } = pressure_cells(root, &drawn_selection)?;
     let preparation_by_test = if selection.uses_shared_preparation() {
         all_preparations
     } else {
         BTreeMap::new()
     };
-    let timeout_policy = PressureTimeoutPolicy::from_env()?;
     let selected_budgets = sampled
         .iter()
         .chain(&references)
@@ -5630,7 +5791,27 @@ fn write_plan_after_scorecard_check(
     // A reference must never cost the sample its evidence: one whose declared
     // chain cannot fit the run bound is not run, and its pair is reported
     // reference-missing with the reason.
-    let (references, skipped_references) = partition_references(&sampled, references, &declared)?;
+    let exclusive = |cell: &CellId| {
+        exclusive_test_resources(
+            cell,
+            manifest_facts.get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone())),
+        )
+    };
+    let occupancy = |cells: &[TrackedCell]| {
+        require_cell_occupancy_fits(
+            cells,
+            &exclusive,
+            &budgets,
+            selection.cell_timeout_seconds,
+            run_timeout_seconds,
+            selection.run_count(),
+            selection.scheduler_jobs(),
+            selection.manifest_guest_cap(),
+            selection.kvm_guest_cap(),
+        )
+    };
+    let (references, skipped_references) =
+        partition_references(&sampled, references, &declared, &occupancy)?;
     // Every cell the graph runs: the selected population and, for a sample,
     // its parity references. Only `sampled` is the run's selected population.
     let mut cells: Vec<TrackedCell> = sampled.iter().chain(&references).cloned().collect();
@@ -5668,12 +5849,6 @@ fn write_plan_after_scorecard_check(
         preparation_by_test.len(),
         required_builds.len() + usize::from(reads_compat_fixtures),
     )?;
-    let exclusive = |cell: &CellId| {
-        exclusive_test_resources(
-            cell,
-            manifest_facts.get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone())),
-        )
-    };
     require_cell_occupancy_fits(
         &cells,
         &exclusive,
@@ -6215,6 +6390,8 @@ fn write_plan_after_scorecard_check(
         reference_cells,
         skipped_references,
         parity_pairs,
+        population_cells: selection.sample.map(|_| population_cells),
+        unsampleable_cells: unsampleable,
         cells: selected_cells,
     };
     let mut metadata_text = serde_json::to_string_pretty(&metadata)
@@ -6474,6 +6651,7 @@ fn validate_run_contract(
         cells_file: None,
         parity_select: metadata.parity_select.clone(),
         retained_cells_file_cells: metadata.cells_file.as_ref().map(|_| metadata.cells.clone()),
+        timeout_policy: metadata.timeout_policy,
     };
     let pressure_cells = pressure_cells(root, &selection)?;
     let planned: Vec<TrackedCell> = pressure_cells
@@ -6517,6 +6695,20 @@ fn validate_run_contract(
             pressure_cells.unavailable.len()
         ));
     }
+    // A sample's excluded cells and population count follow from its seed,
+    // recorded limit, cell cap and timeout policy, exactly as at plan time.
+    let expected_population = metadata.sample.map(|_| pressure_cells.population_cells);
+    if metadata.unsampleable_cells != pressure_cells.unsampleable
+        || metadata.population_cells != expected_population
+    {
+        return Err(format!(
+            "run metadata records population {:?} with not-sampleable cells {:?}, but its selection derives population {:?} with {:?}",
+            metadata.population_cells,
+            metadata.unsampleable_cells,
+            expected_population,
+            pressure_cells.unsampleable
+        ));
+    }
     let expected_cells = pressure_cells.selected;
     let expected_pairs = pressure_cells.parity_pairs;
     // Which references a retained sample ran and which it skipped follows
@@ -6549,7 +6741,36 @@ fn validate_run_contract(
                 run_timeout_seconds: metadata.run_timeout_seconds,
                 fixture_seconds: compat_fixture_seconds(&canonical)?,
             };
-            partition_references(&expected_cells, pressure_cells.references, &declared)?
+            let manifest_facts = &pressure_cells.manifest_facts;
+            let exclusive = |cell: &CellId| {
+                exclusive_test_resources(
+                    cell,
+                    manifest_facts.get(&(
+                        cell.test.clone(),
+                        cell.mode.clone(),
+                        cell.backend.clone(),
+                    )),
+                )
+            };
+            let occupancy = |cells: &[TrackedCell]| {
+                require_cell_occupancy_fits(
+                    cells,
+                    &exclusive,
+                    &budgets,
+                    metadata.cell_timeout_seconds,
+                    metadata.run_timeout_seconds,
+                    metadata.repetitions.unwrap_or(1),
+                    metadata.jobs,
+                    metadata.manifest_guest_cap,
+                    metadata.kvm_guest_cap,
+                )
+            };
+            partition_references(
+                &expected_cells,
+                pressure_cells.references,
+                &declared,
+                &occupancy,
+            )?
         }
         _ => (pressure_cells.references, Vec::new()),
     };
@@ -8513,7 +8734,13 @@ fn verify_repetition_summary_json(
         .iter()
         .filter_map(|row| serde_json::from_value(row.get("cell")?.clone()).ok())
         .collect();
-    for reference in references {
+    let skipped_references = match summary.get("skipped_reference_cells") {
+        None => &no_references,
+        Some(value) => value
+            .as_array()
+            .ok_or("summary JSON skipped parity references are not an array")?,
+    };
+    for reference in references.iter().chain(skipped_references) {
         let cell: CellId = reference
             .get("cell")
             .cloned()
@@ -9903,6 +10130,8 @@ fn summarize(
         "rows": rows,
         "parity_pairs": metadata.parity_pairs,
         "reference_cells": reference_rows,
+        "population_cells": metadata.population_cells,
+        "unsampleable_cells": metadata.unsampleable_cells,
         "skipped_reference_cells": metadata
             .skipped_references
             .iter()
@@ -12807,6 +13036,163 @@ fn compat_fixture_step_refusal_self_test(root: &Path) -> Result<(), String> {
     }
 }
 
+/// The recurring scheduler's whole-run bound, at which some red cells'
+/// declared paths cannot fit.
+const UNSAMPLEABLE_FIXTURE_RUN_TIMEOUT_SECONDS: i64 = 2700;
+
+/// A seeded sample draws only from cells whose own declared path fits the
+/// run's limit, so a draw can never produce a plan the limit must refuse.
+/// Every excluded cell is named in run.json as not sampleable, the counts say
+/// what they count (red population, not sampleable, eligible for the draw),
+/// a seed whose unrestricted draw would hit an excluded cell draws from the
+/// remaining cells by the same seeded order, a re-summary refuses an altered
+/// excluded set or count, and an exact request for an excluded cell is still
+/// refused when it is planned.
+fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
+    const SAMPLE: usize = 10;
+    let limit = UNSAMPLEABLE_FIXTURE_RUN_TIMEOUT_SECONDS;
+    let checked = CheckedScorecard {
+        root,
+        enforce_host_capabilities: false,
+        memory_budget_override: Some(i64::MAX),
+    };
+    let population: Vec<CellId> = pressure_cells(root, &CellSelection::default())?
+        .selected
+        .into_iter()
+        .map(|cell| cell.id)
+        .filter(|cell| matches!(cell.mode.as_str(), "verify" | "replay" | "chaos"))
+        .collect();
+    let draw = |cells: &[CellId], seed: u64| -> BTreeSet<CellId> {
+        let mut scored: Vec<(u64, &CellId)> = cells
+            .iter()
+            .map(|cell| (sample_score(cell, seed), cell))
+            .collect();
+        scored.sort();
+        scored
+            .into_iter()
+            .take(SAMPLE)
+            .map(|(_, cell)| cell.clone())
+            .collect()
+    };
+    let plan = |label: &str, selection: CellSelection| {
+        let results = scratch.join(format!("unsampleable-{label}"));
+        write_plan_after_scorecard_check(&checked, &results, &results.join("dag.json"), &selection)
+            .map(|planned| (planned, results))
+    };
+    let sample = |seed: u64| CellSelection {
+        sample: Some(SAMPLE),
+        seed: Some(seed),
+        run_timeout_seconds: Some(limit),
+        ..CellSelection::default()
+    };
+    // Any seed names the excluded set; read it from the first plan.
+    let ((first, _), _) = plan("seed-0", sample(0))?;
+    let first_json = serde_json::to_value(&first).map_err(|e| e.to_string())?;
+    let excluded: Vec<CellId> = serde_json::from_value(
+        first_json
+            .get("unsampleable_cells")
+            .and_then(|cells| {
+                cells
+                    .as_array()
+                    .map(|cells| cells.iter().map(|cell| cell["cell"].clone()).collect())
+            })
+            .unwrap_or_else(|| json!([])),
+    )
+    .map_err(|e| format!("run.json unsampleable_cells: {e}"))?;
+    if excluded.is_empty() {
+        return Err(format!(
+            "a {SAMPLE}-cell sample under the {limit}s limit names no cell as not sampleable"
+        ));
+    }
+    for entry in first_json["unsampleable_cells"]
+        .as_array()
+        .into_iter()
+        .flatten()
+    {
+        let reason = entry["reason"].as_str().unwrap_or_default();
+        if !reason.contains(&format!("not sampleable under the {limit} s limit")) {
+            return Err(format!("unsampleable entry without its reason: {entry}"));
+        }
+    }
+    let excluded_set: BTreeSet<CellId> = excluded.iter().cloned().collect();
+    let drawable: Vec<CellId> = population
+        .iter()
+        .filter(|cell| !excluded_set.contains(cell))
+        .cloned()
+        .collect();
+    if first_json["population_cells"] != json!(population.len())
+        || first_json["eligible_cells"] != json!(drawable.len())
+        || drawable.len() + excluded.len() != population.len()
+    {
+        return Err(format!(
+            "sample counts do not say what they count: population {}, not sampleable {}, eligible {}; expected {}, {}, {}",
+            first_json["population_cells"],
+            excluded.len(),
+            first_json["eligible_cells"],
+            population.len(),
+            excluded.len(),
+            drawable.len()
+        ));
+    }
+    // A seed whose unrestricted draw would hit an excluded cell.
+    let seed = (0..1_000_000u64)
+        .find(|seed| {
+            draw(&population, *seed)
+                .iter()
+                .any(|cell| excluded_set.contains(cell))
+        })
+        .ok_or("no seed's unrestricted draw reaches a cell that is not sampleable")?;
+    let ((metadata, _), results) = plan("hit", sample(seed))?;
+    let drawn: BTreeSet<CellId> = metadata.cells.iter().cloned().collect();
+    if drawn != draw(&drawable, seed) || drawn.iter().any(|cell| excluded_set.contains(cell)) {
+        return Err(format!(
+            "seed {seed} drew {drawn:?}; expected the seeded draw over the {} sampleable cells",
+            drawable.len()
+        ));
+    }
+    // A re-summary re-derives the excluded set and the counts.
+    let mut retained = metadata.clone();
+    retained.source_tree_dirty = false;
+    validate_run_contract(root, &results, &retained, false)
+        .map_err(|e| format!("the retained sample was refused: {e}"))?;
+    let mut value = serde_json::to_value(&retained).map_err(|e| e.to_string())?;
+    let forged_set = {
+        let mut forged = value.clone();
+        if let Some(cells) = forged["unsampleable_cells"].as_array_mut() {
+            cells.pop();
+        }
+        forged
+    };
+    value["population_cells"] = json!(population.len() + 1);
+    for (label, forged) in [("excluded set", forged_set), ("population count", value)] {
+        let forged: RunMetadata =
+            serde_json::from_value(forged).map_err(|e| format!("{label}: {e}"))?;
+        if validate_run_contract(root, &results, &forged, false).is_ok() {
+            return Err(format!("a re-summary accepted an altered {label}"));
+        }
+    }
+    // An exact request for an excluded cell is still refused when planned.
+    let cell = &excluded[0];
+    match plan(
+        "exact",
+        CellSelection {
+            test: Some(cell.test.clone()),
+            mode: Some(cell.mode.clone()),
+            backend: Some(cell.backend.clone()),
+            repetitions: Some(1),
+            run_timeout_seconds: Some(limit),
+            ..CellSelection::default()
+        },
+    ) {
+        Err(error) if error.contains("cannot fit") => Ok(()),
+        other => Err(format!(
+            "an exact request for {} under the {limit}s limit was not refused: {:?}",
+            display_id(cell),
+            other.map(|_| ())
+        )),
+    }
+}
+
 /// Two runs of one test whose argv writes below VALIDATE_RUN_STATE outside
 /// the shared fixture root (compat.yaml's shell-build and top rows name
 /// fixed scratch directories there) must never overlap: the shell-build
@@ -15090,6 +15476,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     validate_run_state_self_test(root, &scratch)?;
     parity_reference_sample_self_test(root, &scratch)?;
     run_state_exclusive_self_test(root, &scratch)?;
+    unsampleable_sample_self_test(root, &scratch)?;
 
     let cells_file_results = scratch.join("cells-file-plan");
     let cells_file_budget_keys = cells_file_ids
@@ -16977,6 +17364,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         reference_cells: Vec::new(),
         skipped_references: Vec::new(),
         parity_pairs: Vec::new(),
+        population_cells: None,
+        unsampleable_cells: Vec::new(),
         cells: vec![sample_a.clone()],
     };
     if current_result_policy(&sample_metadata, false)?
@@ -19805,7 +20194,33 @@ fn self_test(root: &Path) -> Result<(), String> {
         .as_object_mut()
         .expect("reference fixture is an object")
         .remove("role");
+    // A skipped reference, which summary.json lists apart, is checked the
+    // same way.
+    let other_reference = CellId {
+        test: "sample/b".into(),
+        ..reference_cell.clone()
+    };
+    let mut with_skipped = with_reference.clone();
+    with_skipped["skipped_reference_cells"] = json!([{
+        "cell": other_reference,
+        "reason": "reference not run: fixture",
+        "role": "reference",
+    }]);
+    verify_repetition_summary_json(&with_skipped, 3, 1)
+        .map_err(|e| format!("a summary with a skipped parity reference was refused: {e}"))?;
+    let mut candidate_as_skipped = with_skipped.clone();
+    candidate_as_skipped["skipped_reference_cells"][0]["cell"]["backend"] = json!("kvm");
+    let mut sampled_skipped = with_skipped.clone();
+    sampled_skipped["rows"] = json!([{"cell": candidate_cell}, {"cell": other_reference}]);
+    let mut untagged_skipped = with_skipped.clone();
+    untagged_skipped["skipped_reference_cells"][0]
+        .as_object_mut()
+        .expect("skipped reference fixture is an object")
+        .remove("role");
     for (label, forged) in [
+        ("skipped candidate-backend", &candidate_as_skipped),
+        ("skipped sampled-row", &sampled_skipped),
+        ("skipped untagged", &untagged_skipped),
         ("untagged", &untagged_reference),
         ("candidate backend", &candidate_as_reference),
         ("sampled row", &sampled_reference),
@@ -20437,7 +20852,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     clone_source_cleanup.remove()?;
     scratch_cleanup.remove()?;
     println!(
-        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, run-type harness selection, VALIDATE_RUN_STATE and fixture preparation, sampled parity references, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
+        "compatibility pressure-test self-test: no-hardlinks exact checkout (clean and under inherited Git locations), scorecard/manifest refusal, direct scheduler, multi-failure continuation, red/green and cells-file selection, run-type harness selection, VALIDATE_RUN_STATE and fixture preparation, sampled parity references, sample fit filter, exact and batch repetitions, retry/attempt/JSON accounting, minimum shared build/preparation, sampling, timeout/OOM classification, generated-DAG mutation, cleanup, retained-runner/result identity, and golden-only/pair verify-log brackets pass"
     );
     Ok(())
 }
@@ -25059,11 +25474,230 @@ mod pressure_sample_tests {
         );
         skipped_cleanup.remove().unwrap();
 
-        // The sample's own cell cannot fit: the plan is refused.
-        let (refused, _, refused_cleanup) = plan("fit-refused", sampled_chain);
-        let error = refused.err().expect("a sample that cannot fit was planned");
+        // The candidate itself cannot fit: a seeded draw no longer selects it
+        // (unsampleable_sample_self_test), and an exact request for it, with
+        // the same shared preparation as the sample, is refused when planned.
+        let (results, refused_cleanup) = parity_self_test_results("fit-refused");
+        let refused = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &CellSelection {
+                test: Some(candidate.test.clone()),
+                mode: Some(candidate.mode.clone()),
+                backend: Some(candidate.backend.clone()),
+                repetitions: Some(1),
+                run_timeout_seconds: Some(sampled_chain),
+                ..CellSelection::default()
+            },
+        );
+        let error = refused
+            .err()
+            .expect("an exact cell that cannot fit was planned");
         assert!(error.contains("cannot fit"), "{error}");
         refused_cleanup.remove().unwrap();
+    }
+
+    /// A cell's draw-time path assumes the fixture node, which lands on every
+    /// path as soon as any sampled cell reads the fixtures. A cell that does
+    /// not read them and fits only without that node is excluded and named,
+    /// with the fixture node counted in its declared seconds.
+    #[test]
+    fn a_cell_that_fits_only_without_the_fixture_node_is_not_sampleable() {
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let facts = manifest_cell_facts(&ManifestSet::load(&root).unwrap()).unwrap();
+        let budgets = load_budgets(&root).unwrap();
+        let key = |cell: &CellId| (cell.test.clone(), cell.mode.clone(), cell.backend.clone());
+        // The red sample-eligible cell that does not read the fixtures and
+        // declares the longest wall, so most other cells stay drawable.
+        let cell = pressure_cells(&root, &CellSelection::default())
+            .unwrap()
+            .selected
+            .into_iter()
+            .map(|cell| cell.id)
+            .filter(|cell| matches!(cell.mode.as_str(), "verify" | "replay" | "chaos"))
+            .filter(|cell| !facts[&key(cell)].reads_compat_fixtures)
+            .max_by_key(|cell| (budgets[&key(cell)].timeout_seconds, cell.clone()))
+            .unwrap();
+        // Its path in a graph without the fixture node: an exact cell with the
+        // shared preparation a sample gives it.
+        let (results, cleanup) = parity_self_test_results("fixture-assumed");
+        let (_, dag) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &CellSelection {
+                test: Some(cell.test.clone()),
+                mode: Some(cell.mode.clone()),
+                backend: Some(cell.backend.clone()),
+                repetitions: Some(1),
+                run_timeout_seconds: Some(1_000_000),
+                ..CellSelection::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            !dag.steps
+                .iter()
+                .any(|step| step.tag() == VALIDATE_FIXTURE_STEP),
+            "{} reads no fixtures",
+            display_id(&cell)
+        );
+        let finish = post_build_finish(&dag);
+        let without_fixture = finish["pressure.summarize"].max(
+            finish[&format!("cell.{}", cell_run_slug(&cell, Some(1)))]
+                + PRESSURE_SUMMARY_TIMEOUT_SECONDS,
+        );
+        cleanup.remove().unwrap();
+        let canonical =
+            dag_from_json(&fs::read_to_string(root.join(PORTABLE_DAG)).unwrap()).unwrap();
+        let fixture = compat_fixture_seconds(&canonical).unwrap();
+        // A limit it fits only without the fixture node.
+        let limit = without_fixture + 1;
+        let drawn = pressure_cells(
+            &root,
+            &CellSelection {
+                sample: Some(1),
+                seed: Some(0),
+                run_timeout_seconds: Some(limit),
+                timeout_policy: Some(PressureTimeoutPolicy::from_env().unwrap()),
+                ..CellSelection::default()
+            },
+        )
+        .unwrap();
+        let named = drawn
+            .unsampleable
+            .iter()
+            .find(|entry| entry.cell == cell)
+            .unwrap_or_else(|| {
+                panic!(
+                    "{} fits the {limit}s limit only without the fixture node and was not excluded",
+                    display_id(&cell)
+                )
+            });
+        assert_eq!(named.seconds, without_fixture + fixture, "{named:?}");
+        assert!(
+            named
+                .reason
+                .contains(&format!("not sampleable under the {limit} s limit")),
+            "{named:?}"
+        );
+        assert!(!drawn.selected.iter().any(|tracked| tracked.id == cell));
+    }
+
+    /// A reference never costs the sample its run through the occupancy
+    /// floor either. With one scheduler slot and repeated runs, the sampled
+    /// cell's runs alone fit the run bound's occupancy, but its reference's
+    /// runs would not: the reference is skipped with a recorded reason, and
+    /// the plan is not refused.
+    #[test]
+    fn a_reference_that_would_overflow_the_occupancy_floor_is_skipped() {
+        const REPETITIONS: usize = 20;
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let pairs = snapshot_parity_pairs(&root).unwrap();
+        let (seed, candidate) = one_cell_sample_seed(&root, |cell| {
+            cell.mode == parity::PARITY_MODE
+                && parity::ParityBackend::parse(&cell.backend)
+                    .is_ok_and(|backend| backend.inputs_not_equalizable().is_none())
+                && pairs.contains(&(cell.test.clone(), cell.backend.clone()))
+        });
+        let reference = reference_of(&candidate);
+        let plan = |label: &str, run_timeout: i64| {
+            let (results, cleanup) = parity_self_test_results(label);
+            let planned = write_plan_after_scorecard_check(
+                &checked,
+                &results,
+                &results.join("dag.json"),
+                &CellSelection {
+                    sample: Some(1),
+                    seed: Some(seed),
+                    repetitions: Some(REPETITIONS),
+                    jobs: Some(1),
+                    run_timeout_seconds: Some(run_timeout),
+                    ..CellSelection::default()
+                },
+            );
+            (planned, cleanup)
+        };
+        let (wide, wide_cleanup) = plan("occupancy-wide", 10_000_000);
+        let (wide, wide_dag) = wide.unwrap();
+        assert_eq!(wide.reference_cells, vec![reference.clone()]);
+        let wall = |cell: &CellId| {
+            wide_dag
+                .steps
+                .iter()
+                .find(|step| step.job == cell_run_slug(cell, Some(1)))
+                .unwrap()
+                .timeout
+        };
+        let finish = post_build_finish(&wide_dag);
+        let fixture_present = wide_dag
+            .steps
+            .iter()
+            .any(|step| step.tag() == VALIDATE_FIXTURE_STEP);
+        let canonical =
+            dag_from_json(&fs::read_to_string(root.join(PORTABLE_DAG)).unwrap()).unwrap();
+        let fixture = compat_fixture_seconds(&canonical).unwrap();
+        let path = |cell: &CellId| {
+            finish[&format!("cell.{}", cell_run_slug(cell, Some(1)))]
+                + PRESSURE_SUMMARY_TIMEOUT_SECONDS
+                + if fixture_present { 0 } else { fixture }
+        };
+        let longest_step = wide_dag
+            .steps
+            .iter()
+            .map(|step| step.timeout)
+            .max()
+            .unwrap();
+        let repetitions = REPETITIONS as i64;
+        let limit = [
+            longest_step + 1,
+            repetitions * wall(&candidate) + 1,
+            path(&candidate) + 1,
+            path(&reference) + 1,
+        ]
+        .into_iter()
+        .max()
+        .unwrap();
+        assert!(
+            limit <= repetitions * (wall(&candidate) + wall(&reference)),
+            "fixture walls {} and {} leave no limit between the two occupancies",
+            wall(&candidate),
+            wall(&reference)
+        );
+        wide_cleanup.remove().unwrap();
+        let (fits, fits_cleanup) = plan("occupancy-fits", limit);
+        let (fits, _) = fits.expect("the reference must not cost the sample its plan");
+        let retained = serde_json::to_value(&fits).unwrap();
+        assert_eq!(
+            retained
+                .get("reference_cells")
+                .cloned()
+                .unwrap_or(json!([])),
+            json!([])
+        );
+        assert_eq!(
+            retained["skipped_references"][0]["cell"],
+            json!(reference),
+            "{retained}"
+        );
+        assert!(
+            retained["skipped_references"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("occupancy")),
+            "{retained}"
+        );
+        fits_cleanup.remove().unwrap();
     }
 }
 
@@ -26623,6 +27257,34 @@ mod run_state_exclusive_tests {
         fs::create_dir(&path).unwrap();
         let cleanup = SelfTestDirectory::new(path.clone());
         run_state_exclusive_self_test(&root, &path).unwrap();
+        cleanup.remove().unwrap();
+    }
+}
+
+#[cfg(test)]
+mod unsampleable_sample_tests {
+    use super::*;
+
+    #[test]
+    fn a_sample_never_draws_a_cell_whose_declared_path_cannot_fit_and_names_it() {
+        let root = Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf();
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-unsampleable-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let cleanup = SelfTestDirectory::new(path.clone());
+        unsampleable_sample_self_test(&root, &path).unwrap();
         cleanup.remove().unwrap();
     }
 }
