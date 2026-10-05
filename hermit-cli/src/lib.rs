@@ -2509,13 +2509,11 @@ fn prepare_kvm_mountinfo_config(
 /// checks: `set_file_times` confirms that `utimensat` stored the requested
 /// mtime. KVM replaces those timestamps with a fixed value unless the run asks
 /// for the stored ones. The backend refuses this setting unless Detcore owns
-/// every guest thread. The stored values sit in the guest's buffer until
-/// Detcore rewrites them, so the run must also sequentialize threads: then no
-/// other guest thread runs in that interval.
+/// every guest thread, which `run_kvm` never opts out of. The stored values sit
+/// in the guest's buffer until Detcore rewrites them, so the run must also
+/// sequentialize threads: then no other guest thread runs in that interval.
 fn kvm_reports_stored_metadata_timestamps(config: &DetConfig) -> bool {
-    config.virtualize_metadata
-        && config.backend_dispatches_thread_tools
-        && config.sequentialize_threads
+    config.virtualize_metadata && config.sequentialize_threads
 }
 
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
@@ -2622,19 +2620,14 @@ async fn run_kvm(
     backend
         .set_random_seed(random_seed)
         .map_err(|error| anyhow!("failed to configure KVM guest random seed: {error}"))?;
-    // The KVM backend now defaults to Tool-owned guest threads: CLONE_THREAD
+    // The KVM backend defaults to Tool-owned guest threads: CLONE_THREAD
     // workers are driven through the Detcore tool loop and their futex/CLEARTID
     // synchronization routes to Detcore, matching the golden ptrace model
-    // ("follow children"). Detcore's own clone logic treats a CLONE_THREAD as
-    // backend-uninstrumented iff `backend_dispatches_thread_tools` is false (see
-    // detcore/src/syscalls/threads.rs), so in exactly that case opt the backend
-    // out to host-owned threads to keep worker execution and futex ownership in
-    // one synchronization domain (mixing them deadlocks pthread_join). In the
-    // default (true) case the backend already follows children, so no call is
-    // needed.
-    if !config.backend_dispatches_thread_tools {
-        backend.unmonitored_threads();
-    }
+    // ("follow children"). Detcore registers every cloned thread as a tool
+    // thread (detcore/src/syscalls/threads.rs), so the backend must stay in
+    // that mode: host-owned threads would split worker execution and futex
+    // ownership across two synchronization domains, which deadlocks
+    // pthread_join.
     if kvm_reports_stored_metadata_timestamps(&config) {
         backend
             .set_host_metadata_timestamps(true)
@@ -2970,11 +2963,20 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     let in_guest_liteinst =
         backend == Backend::Liteinst && liteinst_runtime == LiteinstRuntime::InGuest;
     config.discover_live_file_metadata = backend == Backend::Sabre;
-    // Guest-visible wall and monotonic clocks must stay in the same global
-    // virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
-    // per-thread execution clock does not advance when the scheduler skips
-    // global time while a thread is blocked.
-    config.use_thread_local_clock_reads = false;
+    // Three properties hold on every backend, so Config carries no switch for
+    // them:
+    // - Guest-visible wall and monotonic clocks stay in the same global
+    //   virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
+    //   per-thread execution clock does not advance when the scheduler skips
+    //   global time while a thread is blocked.
+    // - A forked process child runs concurrently with its parent. Detcore
+    //   blocks the parent only for CLONE_VFORK.
+    // - Detcore dispatches every cloned thread's syscalls through its tool.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-local guest clock observations.
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend thread callback coverage.
+    // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     // Wake pending RPCs on logical removal, reject stale requests, and account
@@ -2986,9 +2988,6 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     config.cancel_killed_thread_rpcs =
         in_guest_liteinst || matches!(backend, Backend::Sabre | Backend::Dbt | Backend::Kvm);
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
-    // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
-    config.backend_serializes_fork_children = false;
-    config.backend_dispatches_thread_tools = true;
     config.backend_tracks_process_children = backend != Backend::Dbt;
     // Ptrace reports the task exit after Linux has atomically updated every
     // robust owner word. DBT and SaBRe report tool exit before executing the
@@ -5337,13 +5336,10 @@ mod tests {
         let config = super::DetConfig::default();
         let sabre = prepare_backend_config(config.clone(), Backend::Sabre);
         assert!(sabre.discover_live_file_metadata);
-        assert!(!sabre.use_thread_local_clock_reads);
         assert!(sabre.detect_host_clock_futex_timeouts);
         assert!(sabre.syscall_clobbers_virtualized_by_backend);
         assert!(sabre.cancel_killed_thread_rpcs);
         assert!(sabre.backend_reports_physical_process_exits);
-        assert!(!sabre.backend_serializes_fork_children);
-        assert!(sabre.backend_dispatches_thread_tools);
         assert!(sabre.backend_tracks_process_children);
         assert!(!sabre.backend_runs_exit_robust_list);
         assert!(!sabre.backend_requires_thread_directed_process_signals);
@@ -5351,13 +5347,10 @@ mod tests {
         assert!(!sabre.backend_defers_vfork_child_registration);
         let ptrace = prepare_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
-        assert!(!ptrace.use_thread_local_clock_reads);
         assert!(!ptrace.detect_host_clock_futex_timeouts);
         assert!(!ptrace.syscall_clobbers_virtualized_by_backend);
         assert!(!ptrace.cancel_killed_thread_rpcs);
         assert!(!ptrace.backend_reports_physical_process_exits);
-        assert!(!ptrace.backend_serializes_fork_children);
-        assert!(ptrace.backend_dispatches_thread_tools);
         assert!(ptrace.backend_tracks_process_children);
         assert!(ptrace.backend_runs_exit_robust_list);
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
@@ -5375,7 +5368,6 @@ mod tests {
             },
             Backend::Kvm,
         );
-        assert!(sequential.backend_dispatches_thread_tools);
         assert!(super::kvm_reports_stored_metadata_timestamps(&sequential));
 
         // Another guest thread could read the stored values before Detcore
@@ -5389,19 +5381,10 @@ mod tests {
         // Nothing rewrites the stored values.
         let host_metadata = super::DetConfig {
             virtualize_metadata: false,
-            ..sequential.clone()
-        };
-        assert!(!super::kvm_reports_stored_metadata_timestamps(
-            &host_metadata
-        ));
-
-        // The backend owns the threads, so no Detcore rewrite runs on them.
-        let host_threads = super::DetConfig {
-            backend_dispatches_thread_tools: false,
             ..sequential
         };
         assert!(!super::kvm_reports_stored_metadata_timestamps(
-            &host_threads
+            &host_metadata
         ));
     }
 
@@ -5420,8 +5403,6 @@ mod tests {
         let kvm = prepare_backend_config(config, Backend::Kvm);
         assert!(kvm.cancel_killed_thread_rpcs);
         assert!(kvm.kvm_shared_dequeue_timers);
-        assert!(!kvm.backend_serializes_fork_children);
-        assert!(kvm.backend_dispatches_thread_tools);
         assert!(kvm.backend_tracks_process_children);
         assert!(!kvm.backend_runs_exit_robust_list);
         assert!(!kvm.backend_requires_thread_directed_process_signals);

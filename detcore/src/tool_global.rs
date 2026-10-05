@@ -1109,9 +1109,7 @@ impl GlobalTool for GlobalState {
             let mut sched = self.lock_rpc_scheduler(false).await;
             if sched.transferred_exec_tid_requires_registration(dtid) {
                 if *child != dtid
-                    || !(flags.contains(CloneFlags::CLONE_VFORK)
-                        || (self.cfg.backend_serializes_fork_children
-                            && !flags.contains(CloneFlags::CLONE_THREAD)))
+                    || !flags.contains(CloneFlags::CLONE_VFORK)
                     || !sched.pending_vfork_registration_matches(
                         *parent,
                         *process,

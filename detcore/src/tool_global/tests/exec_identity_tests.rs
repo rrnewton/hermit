@@ -201,14 +201,13 @@ impl Fixture {
     }
 
     async fn with_leader_retired(retire_leader: bool) -> Self {
-        Self::configured(retire_leader, false).await
+        Self::configured(retire_leader).await
     }
 
-    async fn configured(retire_leader: bool, backend_serializes_fork_children: bool) -> Self {
+    async fn configured(retire_leader: bool) -> Self {
         let config = Config {
             sequentialize_threads: true,
             cancel_killed_thread_rpcs: false,
-            backend_serializes_fork_children,
             max_timeslice: std::num::NonZeroU64::new(200_000_000),
             ..Config::default()
         };
@@ -1453,20 +1452,27 @@ async fn reused_exec_worker_start_waits_for_parent_registration_before_clock_or_
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 3);
     assert_eq!(fixture.state.global_time.lock().unwrap().as_nanos(), total);
 
-    for flags in [
-        CloneFlags::CLONE_VFORK,
-        CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
+    for (valid_flags, wrong_flags) in [
+        (CloneFlags::CLONE_VFORK, CloneFlags::empty()),
+        (
+            CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
+            CloneFlags::CLONE_VM,
+        ),
+        (
+            CloneFlags::CLONE_VFORK | CloneFlags::CLONE_VM,
+            CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM,
+        ),
     ] {
-        reused_exec_worker_vfork_registration_requires_creation_mode(flags, false).await;
+        reused_exec_worker_vfork_registration_requires_creation_mode(valid_flags, wrong_flags)
+            .await;
     }
-    reused_exec_worker_vfork_registration_requires_creation_mode(CloneFlags::empty(), true).await;
 }
 
 async fn reused_exec_worker_vfork_registration_requires_creation_mode(
     valid_flags: CloneFlags,
-    backend_serializes_fork_children: bool,
+    wrong_flags: CloneFlags,
 ) {
-    let fixture = Fixture::configured(true, backend_serializes_fork_children).await;
+    let fixture = Fixture::configured(true).await;
     let mut parent = fixture.guest(Gate::None);
     {
         let mut reconnect = Box::pin(super::super::reconnect_exec(&mut parent));
@@ -1518,13 +1524,9 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
     assert_eq!(fixture.state.sched.lock().unwrap().turn, 2);
 
     // The parent/mm proof is genuinely valid here. Only the creation mode is
-    // wrong: ordinary clones cannot borrow a vfork grant, and a backend that
-    // serializes process forks does not thereby authorize thread clones.
-    let wrong_flags = if backend_serializes_fork_children {
-        CloneFlags::CLONE_THREAD | CloneFlags::CLONE_VM
-    } else {
-        valid_flags & !CloneFlags::CLONE_VFORK
-    };
+    // wrong: neither an ordinary process clone nor a thread clone can borrow a
+    // vfork grant.
+    assert!(!wrong_flags.contains(CloneFlags::CLONE_VFORK));
     let wrong_mm = MmId::for_clone(
         parent_mm,
         WORKER,
@@ -1589,8 +1591,8 @@ async fn reused_exec_worker_vfork_registration_requires_creation_mode(
         ));
     }
 
-    // The same, still-unconsumed grant admits the valid raw-vfork mode or the
-    // configured serialized-process-fork mode, without double-counting ancestry.
+    // The same, still-unconsumed grant admits the valid raw-vfork mode without
+    // double-counting ancestry.
     let created = fixture
         .state
         .receive_rpc(
