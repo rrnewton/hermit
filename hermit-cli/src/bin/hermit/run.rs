@@ -4977,10 +4977,15 @@ impl RunOpts {
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
+            let resources = if network_trace.is_some() {
+                "held summary/output and network trace descriptors; no PID namespace"
+            } else {
+                "held summary/output descriptors; no PID namespace"
+            };
             return super::owned_container::run(
                 &mut process,
                 (summary_output, network_trace),
-                "held summary/output and network trace descriptors; no PID namespace".into(),
+                resources.into(),
                 false,
                 "with_container",
                 timeout,
@@ -4998,10 +5003,17 @@ impl RunOpts {
         }
         let tmpfs = self.tmpfs()?;
         let (mut container, identity) = self.container(tmpfs.path())?;
-        let resources = format!(
-            "private tmp {}, identity mounts, summary/output and network trace descriptors",
-            tmpfs.path().display()
-        );
+        let resources = if network_trace.is_some() {
+            format!(
+                "private tmp {}, identity mounts, summary/output and network trace descriptors",
+                tmpfs.path().display()
+            )
+        } else {
+            format!(
+                "private tmp {}, identity mounts and summary/output descriptors",
+                tmpfs.path().display()
+            )
+        };
         super::owned_container::run(
             &mut container,
             (tmpfs, identity, summary_output, network_trace),
@@ -5616,10 +5628,15 @@ impl RunOpts {
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
+            let resources = if network_trace.is_some() {
+                "verification log and network trace descriptors; no PID namespace"
+            } else {
+                "verification log descriptor; no PID namespace"
+            };
             return super::owned_container::run(
                 &mut process,
                 (Some(log_file), network_trace),
-                "verification log and network trace descriptors; no PID namespace".into(),
+                resources.into(),
                 false,
                 "with_container",
                 None,
@@ -5629,10 +5646,17 @@ impl RunOpts {
         }
         let tmpfs = self.tmpfs()?;
         let (mut container, identity) = self.container(tmpfs.path())?;
-        let resources = format!(
-            "private tmp {}, identity mounts, verification log and network trace descriptors",
-            tmpfs.path().display()
-        );
+        let resources = if network_trace.is_some() {
+            format!(
+                "private tmp {}, identity mounts, verification log and network trace descriptors",
+                tmpfs.path().display()
+            )
+        } else {
+            format!(
+                "private tmp {}, identity mounts and verification log",
+                tmpfs.path().display()
+            )
+        };
         super::owned_container::run(
             &mut container,
             (tmpfs, identity, Some(log_file), network_trace),

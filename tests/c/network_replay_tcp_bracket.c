@@ -17,12 +17,21 @@
  *
  * The other client modes each do one thing network record/replay must
  * refuse: end before sending the whole request, send with sendmsg or
- * sendfile, connect to the unspecified address, send UDP, or listen. The
+ * sendfile, select or pselect6 on an alias of the socket above FD_SETSIZE,
+ * connect to the unspecified address, send UDP, or listen. The
  * guard modes each try a way around the channel before any connection: a
  * 24-byte IPv6 connect, a netlink socket, an abstract AF_UNIX connect, a
  * socket receive timeout, a negative (immediate) receive timeout, an IPv4
  * socket received through SCM_RIGHTS, epoll registration, signal-driven
  * I/O, an interface ioctl on an AF_UNIX socket, or opening /proc/net/dev.
+ *
+ * The backpressure controller reads nothing from a data connection until a
+ * second, control connection says "go". The backpressure clients fill the
+ * data connection from one thread, past what the small socket buffers hold,
+ * while a second thread sends "go" only after the first is stuck: after a
+ * nonblocking send reported EAGAIN, or while a blocking send waits. Linux
+ * completes both; so must record, which may not hold the second thread back
+ * while the first waits for buffer space.
  */
 
 #include <arpa/inet.h>
@@ -41,8 +50,11 @@
 #include <sys/sendfile.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <sys/un.h>
 #include <sys/uio.h>
 #include <sys/time.h>
@@ -52,6 +64,12 @@
 #define PAYLOAD_SIZE 3
 #define FIXTURE_DEADLINE_SECONDS 8
 #define CONTROLLER_ACCEPT_DEADLINE_SECONDS 30
+#define ADDRESS_LENGTH_SENTINEL 123
+/* Above FD_SETSIZE, so only a raw select bitmap can name it. */
+#define HIGH_ALIAS_FD 1100
+/* Far more than the small socket buffers below hold. */
+#define BACKPRESSURE_BYTES (256 * 1024)
+#define BACKPRESSURE_SOCKET_BUFFER 4096
 
 static const char REQUEST[] = "request\n";
 static const char PROGRESS[] = "next\n";
@@ -59,6 +77,8 @@ static const char COMPLETION[] = "done\n";
 static const char FIRST_INPUT[] = "abc";
 static const char SECOND_INPUT[] = "def";
 static const char OUTBOUND_HEX[] = "726571756573740a6e6578740a646f6e650a";
+static const char GO[] = "go\n";
+static const char DRAINED[] = "ok\n";
 
 static void fail(const char *operation) {
   perror(operation);
@@ -271,11 +291,18 @@ static void *run_reader(void *raw) {
     return NULL;
   }
 
+  /* Linux ignores the address length when no address is requested. */
+  socklen_t ignored_length = ADDRESS_LENGTH_SENTINEL;
   do {
-    reader->received = recv(reader->fd, reader->bytes, PAYLOAD_SIZE, 0);
+    reader->received = recvfrom(reader->fd, reader->bytes, PAYLOAD_SIZE, 0, NULL,
+                                &ignored_length);
   } while (reader->received < 0 && errno == EINTR);
   if (reader->received < 0) {
     reader->error = errno;
+    return NULL;
+  }
+  if (ignored_length != ADDRESS_LENGTH_SENTINEL) {
+    reader->error = EPROTO;
     return NULL;
   }
   if (reader->received == PAYLOAD_SIZE)
@@ -418,6 +445,36 @@ static int run_guard_probe(uint16_t port, const char *mode) {
   return 0;
 }
 
+/* Select on an alias of `fd` above FD_SETSIZE through a raw bitmap of
+ * HIGH_ALIAS_FD + 1 bits that names only the alias. */
+static void select_high_alias(int fd, int pselect) {
+  struct rlimit limit;
+  if (getrlimit(RLIMIT_NOFILE, &limit) != 0)
+    fail("getrlimit");
+  if (limit.rlim_cur <= HIGH_ALIAS_FD) {
+    if (limit.rlim_max <= HIGH_ALIAS_FD)
+      fail_message("RLIMIT_NOFILE hard limit is too low for the high alias");
+    limit.rlim_cur = HIGH_ALIAS_FD + 1;
+    if (setrlimit(RLIMIT_NOFILE, &limit) != 0)
+      fail("setrlimit");
+  }
+  if (dup2(fd, HIGH_ALIAS_FD) != HIGH_ALIAS_FD)
+    fail("dup2 high alias");
+  enum { BITS = 8 * sizeof(unsigned long) };
+  unsigned long readable[HIGH_ALIAS_FD / BITS + 1] = {0};
+  readable[HIGH_ALIAS_FD / BITS] = 1UL << (HIGH_ALIAS_FD % BITS);
+  long ready;
+  if (pselect) {
+    struct timespec zero = {0};
+    ready = syscall(SYS_pselect6, HIGH_ALIAS_FD + 1, readable, NULL, NULL, &zero, NULL);
+  } else {
+    struct timeval zero = {0};
+    ready = syscall(SYS_select, HIGH_ALIAS_FD + 1, readable, NULL, NULL, &zero);
+  }
+  if (ready < 0)
+    fail("select high alias");
+}
+
 static int run_refused_client(const char *port_text, const char *mode) {
   set_deadline();
   if (run_guard_probe(parse_port(port_text), mode) == 0)
@@ -465,9 +522,31 @@ static int run_refused_client(const char *port_text, const char *mode) {
       fail("open /dev/zero");
     if (sendfile(socket_fd, source, NULL, 1) < 0)
       fail("sendfile client");
+  } else if (strcmp(mode, "select-high") == 0 || strcmp(mode, "pselect-high") == 0) {
+    select_high_alias(socket_fd, strcmp(mode, "pselect-high") == 0);
   }
   close(socket_fd);
   return 0;
+}
+
+/* Nothing has arrived before the request is sent, so each receive fails with
+ * EAGAIN. Linux copies out no address length on failure, and ignores the
+ * length pointer, even an invalid one, when no address is requested. */
+static void check_failed_recvfrom_leaves_address_length(int fd) {
+  char byte;
+  struct sockaddr_storage source;
+  socklen_t length = ADDRESS_LENGTH_SENTINEL;
+  if (recvfrom(fd, &byte, 1, MSG_DONTWAIT, NULL, &length) != -1 || errno != EAGAIN)
+    fail("recvfrom without an address before any input");
+  if (length != ADDRESS_LENGTH_SENTINEL)
+    fail_message("a failed recvfrom without an address wrote its length");
+  if (recvfrom(fd, &byte, 1, MSG_DONTWAIT, NULL, (socklen_t *)8) != -1 || errno != EAGAIN)
+    fail("recvfrom with an ignored invalid length pointer");
+  if (recvfrom(fd, &byte, 1, MSG_DONTWAIT, (struct sockaddr *)&source, &length) != -1 ||
+      errno != EAGAIN)
+    fail("recvfrom with an address before any input");
+  if (length != ADDRESS_LENGTH_SENTINEL)
+    fail_message("a failed recvfrom with an address wrote its length");
 }
 
 static int run_client(const char *port_text, int mismatch) {
@@ -484,6 +563,7 @@ static int run_client(const char *port_text, int mismatch) {
   struct sockaddr_in address = loopback_address(port);
   if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
     fail("connect client");
+  check_failed_recvfrom_leaves_address_length(socket_fd);
 
   int alias = dup(socket_fd);
   if (alias < 0)
@@ -538,11 +618,18 @@ static int run_client(const char *port_text, int mismatch) {
 
   char eof_byte;
   ssize_t eof;
+  struct sockaddr_storage source;
+  socklen_t source_length;
   do {
-    eof = recv(socket_fd, &eof_byte, 1, 0);
+    source_length = sizeof(source);
+    eof = recvfrom(socket_fd, &eof_byte, 1, 0, (struct sockaddr *)&source,
+                   &source_length);
   } while (eof < 0 && errno == EINTR);
   if (eof != 0)
     fail_message("peer half-close did not produce EOF after abcdef");
+  /* A successful receive that asks for an address gets a TCP socket's: none. */
+  if (source_length != 0)
+    fail_message("recvfrom on a connected TCP socket reported a source address");
 
   printf("aggregate=abcdef readiness=pollin,pollin eof=1 outbound_hex=%s "
          "outbound_fnv1a64=%016llx\n",
@@ -554,27 +641,231 @@ static int run_client(const char *port_text, int mismatch) {
   return 0;
 }
 
+static unsigned char backpressure_byte(size_t index) {
+  return (unsigned char)(index * 131 + (index >> 9));
+}
+
+static uint64_t backpressure_digest(void) {
+  uint64_t digest = UINT64_C(14695981039346656037);
+  for (size_t index = 0; index < BACKPRESSURE_BYTES; ++index) {
+    unsigned char byte = backpressure_byte(index);
+    digest = fnv1a64_update(digest, &byte, 1);
+  }
+  return digest;
+}
+
+static void expect_eof(int fd, const char *what) {
+  char unexpected;
+  for (;;) {
+    ssize_t received = recv(fd, &unexpected, 1, 0);
+    if (received < 0 && errno == EINTR)
+      continue;
+    if (received < 0)
+      fail(what);
+    if (received != 0)
+      fail_message("unexpected bytes followed the backpressure protocol");
+    return;
+  }
+}
+
+static int run_backpressure_controller(const char *port_path,
+                                       const char *report_path,
+                                       const char *contact_path) {
+  signal(SIGPIPE, SIG_IGN);
+  alarm(CONTROLLER_ACCEPT_DEADLINE_SECONDS);
+  int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (listener < 0)
+    fail("socket backpressure controller");
+  // Accepted sockets inherit the small receive buffer.
+  int buffer = BACKPRESSURE_SOCKET_BUFFER;
+  if (setsockopt(listener, SOL_SOCKET, SO_RCVBUF, &buffer, sizeof(buffer)) != 0)
+    fail("setsockopt SO_RCVBUF");
+  struct sockaddr_in address = loopback_address(0);
+  if (bind(listener, (struct sockaddr *)&address, sizeof(address)) != 0)
+    fail("bind backpressure controller");
+  socklen_t address_length = sizeof(address);
+  if (getsockname(listener, (struct sockaddr *)&address, &address_length) != 0)
+    fail("getsockname backpressure controller");
+  if (listen(listener, 2) != 0)
+    fail("listen backpressure controller");
+  char port[32];
+  int port_length = snprintf(port, sizeof(port), "%u\n", ntohs(address.sin_port));
+  if (port_length <= 0 || (size_t)port_length >= sizeof(port))
+    fail_message("controller port did not fit its publication buffer");
+  publish_text(port_path, port);
+
+  // The client connects the data connection first.
+  int data = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+  if (data < 0)
+    fail("accept data connection");
+  alarm(FIXTURE_DEADLINE_SECONDS);
+  publish_text(contact_path, "accepted\n");
+  int control = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+  if (control < 0)
+    fail("accept control connection");
+  set_socket_timeouts(data);
+  set_socket_timeouts(control);
+  close(listener);
+
+  char go[sizeof(GO) - 1];
+  receive_exact(control, go, sizeof(go));
+  if (memcmp(go, GO, sizeof(go)) != 0)
+    fail_message("control connection mismatch");
+  uint64_t digest = UINT64_C(14695981039346656037);
+  for (size_t received = 0; received < BACKPRESSURE_BYTES;) {
+    unsigned char bytes[BACKPRESSURE_SOCKET_BUFFER];
+    size_t wanted = BACKPRESSURE_BYTES - received;
+    if (wanted > sizeof(bytes))
+      wanted = sizeof(bytes);
+    receive_exact(data, bytes, wanted);
+    digest = fnv1a64_update(digest, bytes, wanted);
+    received += wanted;
+  }
+  if (digest != backpressure_digest())
+    fail_message("backpressure data mismatch");
+  send_all(data, DRAINED, sizeof(DRAINED) - 1);
+  expect_eof(data, "recv data tail");
+  expect_eof(control, "recv control tail");
+  close(data);
+  close(control);
+
+  char report[256];
+  int report_length = snprintf(
+      report, sizeof(report), "controller=backpressure\nbytes=%d\nfnv1a64=%016llx\n",
+      BACKPRESSURE_BYTES, (unsigned long long)backpressure_digest());
+  if (report_length <= 0 || (size_t)report_length >= sizeof(report))
+    fail_message("controller report did not fit its fixed buffer");
+  publish_text(report_path, report);
+  return 0;
+}
+
+struct backpressure {
+  int control;
+  int blocking;
+  pthread_mutex_t lock;
+  pthread_cond_t stuck_cond;
+  int stuck;
+};
+
+static void announce_stuck(struct backpressure *state) {
+  pthread_mutex_lock(&state->lock);
+  state->stuck = 1;
+  pthread_cond_signal(&state->stuck_cond);
+  pthread_mutex_unlock(&state->lock);
+}
+
+/* Sends "go" once the data thread is stuck; the controller drains nothing
+ * before it, so the data thread finishes only if this thread runs. */
+static void *run_go_sender(void *raw) {
+  struct backpressure *state = raw;
+  pthread_mutex_lock(&state->lock);
+  while (!state->stuck)
+    pthread_cond_wait(&state->stuck_cond, &state->lock);
+  pthread_mutex_unlock(&state->lock);
+  if (state->blocking) {
+    // Let the data thread reach its blocking wait first.
+    const struct timespec delay = {.tv_sec = 0, .tv_nsec = 50 * 1000 * 1000};
+    nanosleep(&delay, NULL);
+  }
+  send_all(state->control, GO, sizeof(GO) - 1);
+  return NULL;
+}
+
+static int connect_loopback(uint16_t port, int send_buffer) {
+  int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    fail("socket backpressure client");
+  if (send_buffer != 0 &&
+      setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) != 0)
+    fail("setsockopt SO_SNDBUF");
+  struct sockaddr_in address = loopback_address(port);
+  if (connect(fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+    fail("connect backpressure client");
+  return fd;
+}
+
+static int run_backpressure_client(const char *port_text, int blocking) {
+  set_deadline();
+  uint16_t port = parse_port(port_text);
+  int data = connect_loopback(port, BACKPRESSURE_SOCKET_BUFFER);
+  int control = connect_loopback(port, 0);
+  static unsigned char bytes[BACKPRESSURE_BYTES];
+  for (size_t index = 0; index < BACKPRESSURE_BYTES; ++index)
+    bytes[index] = backpressure_byte(index);
+
+  struct backpressure state = {.control = control, .blocking = blocking};
+  if (pthread_mutex_init(&state.lock, NULL) != 0 ||
+      pthread_cond_init(&state.stuck_cond, NULL) != 0)
+    fail_message("backpressure synchronization setup failed");
+  pthread_t go_sender;
+  if (pthread_create(&go_sender, NULL, run_go_sender, &state) != 0)
+    fail_message("pthread_create go sender failed");
+
+  if (blocking) {
+    announce_stuck(&state);
+    send_all(data, bytes, BACKPRESSURE_BYTES);
+  } else {
+    int refused = 0;
+    for (size_t sent = 0; sent < BACKPRESSURE_BYTES;) {
+      ssize_t accepted = send(data, bytes + sent, BACKPRESSURE_BYTES - sent,
+                              MSG_DONTWAIT | MSG_NOSIGNAL);
+      if (accepted > 0) {
+        sent += (size_t)accepted;
+      } else if (accepted < 0 && errno == EAGAIN) {
+        if (!refused)
+          announce_stuck(&state);
+        refused = 1;
+        const struct timespec pause = {.tv_sec = 0, .tv_nsec = 1000 * 1000};
+        nanosleep(&pause, NULL);
+      } else if (!(accepted < 0 && errno == EINTR)) {
+        fail("send nonblocking");
+      }
+    }
+    if (!refused)
+      fail_message("a nonblocking send on a full buffer never reported EAGAIN");
+  }
+  char reply[sizeof(DRAINED) - 1];
+  receive_exact(data, reply, sizeof(reply));
+  if (memcmp(reply, DRAINED, sizeof(reply)) != 0)
+    fail_message("backpressure reply mismatch");
+  if (pthread_join(go_sender, NULL) != 0)
+    fail_message("pthread_join go sender failed");
+  close(data);
+  close(control);
+  printf("backpressure=%s bytes=%d reply=ok\n", blocking ? "blocking" : "nonblocking",
+         BACKPRESSURE_BYTES);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc == 5 && strcmp(argv[1], "controller") == 0)
     return run_controller(argv[2], argv[3], argv[4]);
+  if (argc == 5 && strcmp(argv[1], "backpressure-controller") == 0)
+    return run_backpressure_controller(argv[2], argv[3], argv[4]);
   if (argc == 4 && strcmp(argv[1], "client") == 0) {
     if (strcmp(argv[3], "match") == 0)
       return run_client(argv[2], 0);
     if (strcmp(argv[3], "mismatch") == 0)
       return run_client(argv[2], 1);
+    if (strcmp(argv[3], "backpressure-nonblocking") == 0)
+      return run_backpressure_client(argv[2], 0);
+    if (strcmp(argv[3], "backpressure-blocking") == 0)
+      return run_backpressure_client(argv[2], 1);
     const char *refused[] = {"truncated", "sendmsg",    "sendfile", "unspecified",
                              "udp",       "listen",     "ipv6-24",  "netlink",
                              "abstract",  "rcvtimeo",   "scm-rights", "epoll",
-                             "async",     "rcvtimeo-negative", "ifindex", "procnet"};
+                             "async",     "rcvtimeo-negative", "ifindex", "procnet",
+                             "select-high", "pselect-high"};
     for (size_t index = 0; index < sizeof(refused) / sizeof(refused[0]); ++index)
       if (strcmp(argv[3], refused[index]) == 0)
         return run_refused_client(argv[2], argv[3]);
   }
   fprintf(stderr,
-          "usage: %s controller PORT_FILE REPORT_FILE CONTACT_FILE | client PORT "
-          "match|mismatch|truncated|sendmsg|sendfile|unspecified|udp|listen|"
+          "usage: %s controller|backpressure-controller PORT_FILE REPORT_FILE "
+          "CONTACT_FILE | client PORT "
+          "match|mismatch|backpressure-nonblocking|backpressure-blocking|truncated|sendmsg|sendfile|unspecified|udp|listen|"
           "ipv6-24|netlink|abstract|rcvtimeo|scm-rights|epoll|async|"
-          "rcvtimeo-negative|ifindex|procnet\n",
+          "rcvtimeo-negative|ifindex|procnet|select-high|pselect-high\n",
           argv[0]);
   return 2;
 }

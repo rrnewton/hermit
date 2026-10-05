@@ -101,6 +101,18 @@ pub enum NetworkEngineError {
         channel: OpenFileId,
         offset: u64,
     },
+    /// Replay made a blocking send where the recording holds a nonblocking
+    /// send that Linux refused with `EAGAIN`.
+    BlockingSendAtRefusal {
+        channel: OpenFileId,
+        offset: u64,
+    },
+    /// Record: another send reached the stream while a blocking send waited
+    /// for buffer space, so the stream interleaves the two.
+    InterleavedSend {
+        channel: OpenFileId,
+        offset: u64,
+    },
     /// The recorder fed an arrival after the stream ended, or an empty one.
     InvalidArrival(OpenFileId),
     /// The finished recording failed validation.
@@ -122,6 +134,12 @@ pub enum NetworkEngineError {
         channel: OpenFileId,
         sent: u64,
         recorded: u64,
+    },
+    /// Replay ended without the nonblocking send that the recording holds,
+    /// refused with `EAGAIN`, at stream offset `offset`.
+    ReplayUnrefused {
+        channel: OpenFileId,
+        offset: u64,
     },
 }
 
@@ -145,9 +163,16 @@ impl NetworkEngineError {
             | Self::PeerMismatch { .. }
             | Self::OutboundMismatch { .. }
             | Self::OutboundBeyondRecording { .. }
+            | Self::BlockingSendAtRefusal { .. }
             | Self::ReplayStalled { .. }
             | Self::ReplayUnconnected(_)
-            | Self::ReplayUnsent { .. } => DIVERGED_REMEDY,
+            | Self::ReplayUnsent { .. }
+            | Self::ReplayUnrefused { .. } => DIVERGED_REMEDY,
+            Self::InterleavedSend { .. } => {
+                "Network record/replay does not model two threads sending on one socket \
+                 while one waits for buffer space; send from one thread at a time, or run \
+                 without --record-networking."
+            }
             Self::UntraceablePeer(_) => {
                 "Connect to a specific host address and nonzero port, for example \
                  127.0.0.1 instead of 0.0.0.0, or run without --record-networking."
@@ -193,6 +218,16 @@ impl fmt::Display for NetworkEngineError {
                 f,
                 "network outbound mismatch: {channel} sent bytes past the end of the recording at stream offset {offset}"
             ),
+            Self::BlockingSendAtRefusal { channel, offset } => write!(
+                f,
+                "network outbound mismatch: {channel} made a blocking send at stream offset \
+                 {offset}, where the recording holds a nonblocking send refused with EAGAIN"
+            ),
+            Self::InterleavedSend { channel, offset } => write!(
+                f,
+                "network record: another send on {channel} reached stream offset {offset} \
+                 while a blocking send waited for buffer space"
+            ),
             Self::InvalidArrival(id) => write!(
                 f,
                 "network record received input for {id} after its stream ended"
@@ -225,6 +260,11 @@ impl fmt::Display for NetworkEngineError {
                 f,
                 "network replay ended after {channel} sent {sent} of the {recorded} bytes the \
                  recording sent"
+            ),
+            Self::ReplayUnrefused { channel, offset } => write!(
+                f,
+                "network replay ended before {channel} made the nonblocking send at stream \
+                 offset {offset} that the recording holds, refused with EAGAIN"
             ),
         }
     }
@@ -270,9 +310,19 @@ pub enum NetworkRequest {
     /// See [`NetworkEngine::send_failure`].
     SendFailure(OpenFileId),
     /// See [`NetworkEngine::record_send`].
-    RecordSend { id: OpenFileId, bytes: Vec<u8> },
+    RecordSend {
+        id: OpenFileId,
+        bytes: Vec<u8>,
+        at: Option<u64>,
+    },
+    /// See [`NetworkEngine::record_refused_send`].
+    RecordRefusedSend(OpenFileId),
     /// See [`NetworkEngine::replay_send`].
-    ReplaySend { id: OpenFileId, bytes: Vec<u8> },
+    ReplaySend {
+        id: OpenFileId,
+        bytes: Vec<u8>,
+        nonblocking: bool,
+    },
     /// See [`NetworkEngine::shutdown`].
     Shutdown { id: OpenFileId, how: i32 },
     /// See [`NetworkEngine::addresses`].
@@ -290,6 +340,10 @@ pub enum NetworkReply {
     /// Poll events, one per requested channel.
     Events(Vec<i16>),
     Sent(usize),
+    /// The outbound stream offset after a recorded send.
+    Recorded(u64),
+    /// A nonblocking send that the recording refused with `EAGAIN`.
+    WouldBlock,
     /// Local (if connected) and peer address, or `None` for an unknown channel.
     Addresses(Option<(Option<NetworkAddressV1>, NetworkAddressV1)>),
 }
@@ -677,25 +731,47 @@ impl NetworkEngine {
         Ok(events)
     }
 
-    /// Consume and return the pending socket error, as `SO_ERROR` does;
-    /// `0` when there is none.
-    pub fn take_error(&mut self, id: OpenFileId) -> Result<i32, NetworkEngineError> {
-        Ok(self.channel(id)?.pending_error.take().unwrap_or(0))
+    /// Consume and return the pending socket error at global time `now`, as
+    /// `SO_ERROR` does; `0` when there is none. Inputs due by `now` are
+    /// released first, so the first observer of a recorded error sees it
+    /// whichever operation it uses.
+    pub fn take_error(
+        &mut self,
+        id: OpenFileId,
+        now: LogicalTime,
+    ) -> Result<i32, NetworkEngineError> {
+        let channel = self.channel(id)?;
+        channel.release(now);
+        Ok(channel.pending_error.take().unwrap_or(0))
     }
 
-    /// The errno a guest send fails with before transmitting anything, or
-    /// `None` when the send may proceed. A pending error is consumed first;
+    /// The errno a guest send at global time `now` fails with before
+    /// transmitting anything, or `None` when the send may proceed. Inputs due
+    /// by `now` are released first. A pending error is consumed first;
     /// otherwise a socket shut down for writing fails with `EPIPE`.
-    pub fn send_failure(&mut self, id: OpenFileId) -> Result<Option<i32>, NetworkEngineError> {
+    pub fn send_failure(
+        &mut self,
+        id: OpenFileId,
+        now: LogicalTime,
+    ) -> Result<Option<i32>, NetworkEngineError> {
         let channel = self.channel(id)?;
+        channel.release(now);
         if channel.reset || channel.shut_wr {
             return Ok(Some(channel.pending_error.take().unwrap_or(libc::EPIPE)));
         }
         Ok(None)
     }
 
-    /// Record the bytes a host send accepted.
-    pub fn record_send(&mut self, id: OpenFileId, sent: &[u8]) -> Result<(), NetworkEngineError> {
+    /// Record the bytes a host send accepted and return the stream offset
+    /// after them. `at` is where a send that already accepted bytes, and
+    /// then waited for buffer space, left the stream; another send reaching
+    /// the stream in the meantime is refused.
+    pub fn record_send(
+        &mut self,
+        id: OpenFileId,
+        sent: &[u8],
+        at: Option<u64>,
+    ) -> Result<u64, NetworkEngineError> {
         let channel = self
             .channels
             .get_mut(&id)
@@ -703,8 +779,16 @@ impl NetworkEngine {
         let Mode::Record { outputs, .. } = &mut self.mode else {
             return Err(NetworkEngineError::WrongMode);
         };
+        if let Some(at) = at
+            && at != channel.tx
+        {
+            return Err(NetworkEngineError::InterleavedSend {
+                channel: id,
+                offset: at,
+            });
+        }
         if sent.is_empty() {
-            return Ok(());
+            return Ok(channel.tx);
         }
         outputs.push(NetworkOutputV1 {
             channel: id,
@@ -712,24 +796,44 @@ impl NetworkEngine {
             bytes: sent.to_vec(),
         });
         channel.tx += sent.len() as u64;
+        Ok(channel.tx)
+    }
+
+    /// Record a nonblocking send that the host refused with `EAGAIN`, as an
+    /// empty fragment at the current stream offset.
+    pub fn record_refused_send(&mut self, id: OpenFileId) -> Result<(), NetworkEngineError> {
+        let channel = self
+            .channels
+            .get(&id)
+            .ok_or(NetworkEngineError::UnknownChannel(id))?;
+        let Mode::Record { outputs, .. } = &mut self.mode else {
+            return Err(NetworkEngineError::WrongMode);
+        };
+        outputs.push(NetworkOutputV1 {
+            channel: id,
+            stream_offset: channel.tx,
+            bytes: Vec::new(),
+        });
         Ok(())
     }
 
     /// Match a guest send against the recording and return how many bytes
     /// it transmits: the bytes left in the current recorded fragment, at
     /// most `bytes.len()`. A recorded short write therefore replays as the
-    /// same short write.
+    /// same short write. `None` is a nonblocking send that the recording
+    /// refused with `EAGAIN`; a blocking send at that point diverged.
     pub fn replay_send(
         &mut self,
         id: OpenFileId,
         bytes: &[u8],
-    ) -> Result<usize, NetworkEngineError> {
+        nonblocking: bool,
+    ) -> Result<Option<usize>, NetworkEngineError> {
         if self.is_record() {
             return Err(NetworkEngineError::WrongMode);
         }
         let channel = self.channel(id)?;
         if bytes.is_empty() {
-            return Ok(0);
+            return Ok(Some(0));
         }
         let offset = channel.tx;
         let fragment = channel.expected_outputs.front().ok_or(
@@ -738,6 +842,16 @@ impl NetworkEngine {
                 offset,
             },
         )?;
+        if fragment.bytes.is_empty() {
+            if !nonblocking {
+                return Err(NetworkEngineError::BlockingSendAtRefusal {
+                    channel: id,
+                    offset,
+                });
+            }
+            channel.expected_outputs.pop_front();
+            return Ok(None);
+        }
         let start = (offset - fragment.stream_offset) as usize;
         let remaining = &fragment.bytes[start..];
         let len = remaining.len().min(bytes.len());
@@ -756,7 +870,7 @@ impl NetworkEngine {
         if len == remaining.len() {
             channel.expected_outputs.pop_front();
         }
-        Ok(len)
+        Ok(Some(len))
     }
 
     /// Apply `shutdown(how)`; returns `0` or the errno the guest sees.
@@ -831,15 +945,23 @@ impl NetworkEngine {
                 }
                 NetworkReply::Events(events)
             }
-            NetworkRequest::TakeError(id) => NetworkReply::Errno(self.take_error(id)?),
-            NetworkRequest::SendFailure(id) => NetworkReply::Failure(self.send_failure(id)?),
-            NetworkRequest::RecordSend { id, bytes } => {
-                self.record_send(id, &bytes)?;
-                NetworkReply::Sent(bytes.len())
+            NetworkRequest::TakeError(id) => NetworkReply::Errno(self.take_error(id, now)?),
+            NetworkRequest::SendFailure(id) => NetworkReply::Failure(self.send_failure(id, now)?),
+            NetworkRequest::RecordSend { id, bytes, at } => {
+                NetworkReply::Recorded(self.record_send(id, &bytes, at)?)
             }
-            NetworkRequest::ReplaySend { id, bytes } => {
-                NetworkReply::Sent(self.replay_send(id, &bytes)?)
+            NetworkRequest::RecordRefusedSend(id) => {
+                self.record_refused_send(id)?;
+                NetworkReply::WouldBlock
             }
+            NetworkRequest::ReplaySend {
+                id,
+                bytes,
+                nonblocking,
+            } => match self.replay_send(id, &bytes, nonblocking)? {
+                Some(sent) => NetworkReply::Sent(sent),
+                None => NetworkReply::WouldBlock,
+            },
             NetworkRequest::Shutdown { id, how } => NetworkReply::Errno(self.shutdown(id, how)?),
             NetworkRequest::Addresses(id) => NetworkReply::Addresses(
                 self.addresses(id)
@@ -849,8 +971,8 @@ impl NetworkEngine {
     }
 
     /// End a replay: fail if the guest left part of the recording unused, by
-    /// never connecting a recorded socket or by sending fewer bytes than the
-    /// recording holds. Inputs the guest never read are not checked: when an
+    /// never connecting a recorded socket, by sending fewer bytes than the
+    /// recording holds, or by never making a recorded refused send. Inputs the guest never read are not checked: when an
     /// input is released depends on the schedule, so a replay may end before
     /// a final input the recording happened to observe.
     pub fn finish_replay(self) -> Result<(), NetworkEngineError> {
@@ -862,10 +984,18 @@ impl NetworkEngine {
         }
         for (id, channel) in self.channels {
             if let Some(last) = channel.expected_outputs.back() {
-                return Err(NetworkEngineError::ReplayUnsent {
-                    channel: id,
-                    sent: channel.tx,
-                    recorded: last.stream_offset + last.bytes.len() as u64,
+                let recorded = last.stream_offset + last.bytes.len() as u64;
+                return Err(if recorded > channel.tx {
+                    NetworkEngineError::ReplayUnsent {
+                        channel: id,
+                        sent: channel.tx,
+                        recorded,
+                    }
+                } else {
+                    NetworkEngineError::ReplayUnrefused {
+                        channel: id,
+                        offset: channel.tx,
+                    }
                 });
             }
         }
@@ -948,7 +1078,7 @@ mod tests {
             engine.recv(id, at(10), 64, 1, false),
             Ok(NetworkRecvOutcome::WouldBlock)
         );
-        engine.record_send(id, b"req").unwrap();
+        engine.record_send(id, b"req", None).unwrap();
         engine
             .record_arrival(id, at(20), NetworkArrival::Bytes(b"abcdef".to_vec()))
             .unwrap();
@@ -993,7 +1123,7 @@ mod tests {
             engine.recv(id, at(10), 64, 1, false),
             Ok(NetworkRecvOutcome::WouldBlock)
         );
-        assert_eq!(engine.replay_send(id, b"req"), Ok(3));
+        assert_eq!(engine.replay_send(id, b"req", false), Ok(Some(3)));
         assert_eq!(engine.recv(id, at(20), 3, 1, false), Ok(data(b"abc")));
         assert_eq!(engine.recv(id, at(30), 64, 1, false), Ok(data(b"def")));
         assert_eq!(
@@ -1012,7 +1142,7 @@ mod tests {
             engine.recv(id, at(1_000), 64, 1, false),
             Ok(NetworkRecvOutcome::WouldBlock)
         );
-        assert_eq!(engine.replay_send(id, b"req"), Ok(3));
+        assert_eq!(engine.replay_send(id, b"req", false), Ok(Some(3)));
         // Sent, but too early.
         assert_eq!(
             engine.recv(id, at(19), 64, 1, false),
@@ -1100,8 +1230,52 @@ mod tests {
             engine.recv(id, at(1), 64, 1, false),
             Ok(NetworkRecvOutcome::Eof)
         );
-        assert_eq!(engine.send_failure(id), Ok(Some(libc::EPIPE)));
+        assert_eq!(engine.send_failure(id, at(1)), Ok(Some(libc::EPIPE)));
         engine.finish().unwrap();
+    }
+
+    /// A reset pulled at time 20, after the guest sent "req".
+    fn recorded_reset() -> NetworkTraceV2 {
+        let mut engine = NetworkEngine::new_record(epoch());
+        let id = sock(0);
+        engine
+            .record_connect(id, peer(), local(), 0, false)
+            .unwrap();
+        engine.record_send(id, b"req", None).unwrap();
+        engine
+            .record_arrival(id, at(20), NetworkArrival::Error(libc::ECONNRESET))
+            .unwrap();
+        assert_eq!(engine.take_error(id, at(20)), Ok(libc::ECONNRESET));
+        engine.finish().unwrap()
+    }
+
+    #[test]
+    fn so_error_and_send_release_a_due_error_as_its_first_observer() {
+        let id = sock(0);
+        // SO_ERROR first: not before the recorded time, then exactly once.
+        let mut engine = NetworkEngine::new_replay(recorded_reset());
+        engine.replay_connect(id, &peer(), false).unwrap();
+        assert_eq!(engine.replay_send(id, b"req", false), Ok(Some(3)));
+        assert_eq!(engine.take_error(id, at(19)), Ok(0));
+        assert_eq!(
+            engine.apply(at(20), NetworkRequest::TakeError(id)),
+            Ok(NetworkReply::Errno(libc::ECONNRESET))
+        );
+        assert_eq!(engine.take_error(id, at(21)), Ok(0));
+
+        // A send first: not before "req" is sent, then the error once, then
+        // EPIPE, without matching any byte against the recording.
+        let mut engine = NetworkEngine::new_replay(recorded_reset());
+        engine.replay_connect(id, &peer(), false).unwrap();
+        assert_eq!(engine.send_failure(id, at(99)), Ok(None));
+        assert_eq!(engine.replay_send(id, b"req", false), Ok(Some(3)));
+        assert_eq!(engine.send_failure(id, at(19)), Ok(None));
+        assert_eq!(
+            engine.apply(at(20), NetworkRequest::SendFailure(id)),
+            Ok(NetworkReply::Failure(Some(libc::ECONNRESET)))
+        );
+        assert_eq!(engine.send_failure(id, at(21)), Ok(Some(libc::EPIPE)));
+        assert_eq!(engine.take_error(id, at(21)), Ok(0));
     }
 
     #[test]
@@ -1122,7 +1296,7 @@ mod tests {
             engine.replay_connect(sock(0), &peer(), false),
             Ok(libc::ECONNREFUSED)
         );
-        assert_eq!(engine.take_error(sock(0)), Ok(0));
+        assert_eq!(engine.take_error(sock(0), at(1)), Ok(0));
         assert_eq!(
             engine.replay_connect(sock(1), &peer(), true),
             Ok(libc::EINPROGRESS)
@@ -1132,8 +1306,8 @@ mod tests {
             readiness & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP),
             libc::POLLOUT | libc::POLLERR | libc::POLLHUP
         );
-        assert_eq!(engine.take_error(sock(1)), Ok(libc::ECONNREFUSED));
-        assert_eq!(engine.take_error(sock(1)), Ok(0));
+        assert_eq!(engine.take_error(sock(1), at(1)), Ok(libc::ECONNREFUSED));
+        assert_eq!(engine.take_error(sock(1), at(1)), Ok(0));
         assert_eq!(engine.shutdown(sock(1), libc::SHUT_WR), Ok(libc::ENOTCONN));
     }
 
@@ -1167,17 +1341,17 @@ mod tests {
             .record_connect(id, peer(), local(), 0, false)
             .unwrap();
         // A short write: the host accepted 4 of the guest's 8 bytes.
-        engine.record_send(id, b"requ").unwrap();
-        engine.record_send(id, b"est\n").unwrap();
+        engine.record_send(id, b"requ", None).unwrap();
+        engine.record_send(id, b"est\n", None).unwrap();
         let trace = engine.finish().unwrap();
 
         let mut engine = NetworkEngine::new_replay(trace.clone());
         engine.replay_connect(id, &peer(), false).unwrap();
-        assert_eq!(engine.replay_send(id, b"request\n"), Ok(4));
-        assert_eq!(engine.replay_send(id, b"es"), Ok(2));
-        assert_eq!(engine.replay_send(id, b"t\n"), Ok(2));
+        assert_eq!(engine.replay_send(id, b"request\n", false), Ok(Some(4)));
+        assert_eq!(engine.replay_send(id, b"es", false), Ok(Some(2)));
+        assert_eq!(engine.replay_send(id, b"t\n", false), Ok(Some(2)));
         assert_eq!(
-            engine.replay_send(id, b"more"),
+            engine.replay_send(id, b"more", false),
             Err(NetworkEngineError::OutboundBeyondRecording {
                 channel: id,
                 offset: 8
@@ -1186,7 +1360,7 @@ mod tests {
 
         let mut engine = NetworkEngine::new_replay(trace);
         engine.replay_connect(id, &peer(), false).unwrap();
-        let error = engine.replay_send(id, b"reqX").unwrap_err();
+        let error = engine.replay_send(id, b"reqX", false).unwrap_err();
         assert_eq!(
             error,
             NetworkEngineError::OutboundMismatch {
@@ -1201,15 +1375,127 @@ mod tests {
     }
 
     #[test]
+    fn refused_nonblocking_sends_replay_as_eagain_at_the_same_offset() {
+        let mut engine = NetworkEngine::new_record(epoch());
+        let id = sock(0);
+        engine
+            .record_connect(id, peer(), local(), 0, false)
+            .unwrap();
+        // The host accepted a prefix of a nonblocking send, then refused
+        // the next two attempts with EAGAIN before accepting the rest.
+        assert_eq!(engine.record_send(id, b"re", None), Ok(2));
+        engine.record_refused_send(id).unwrap();
+        engine.record_refused_send(id).unwrap();
+        assert_eq!(engine.record_send(id, b"q", None), Ok(3));
+        engine.record_refused_send(id).unwrap();
+        let trace = engine.finish().unwrap();
+        assert!(trace.records_refused_sends());
+
+        let mut engine = NetworkEngine::new_replay(trace.clone());
+        engine.replay_connect(id, &peer(), false).unwrap();
+        assert_eq!(engine.replay_send(id, b"req", true), Ok(Some(2)));
+        assert_eq!(engine.replay_send(id, b"q", true), Ok(None));
+        assert_eq!(engine.replay_send(id, b"q", true), Ok(None));
+        assert_eq!(engine.replay_send(id, b"q", true), Ok(Some(1)));
+        // The final refusal is part of the recording, too.
+        let unfinished = NetworkEngineError::ReplayUnrefused {
+            channel: id,
+            offset: 3,
+        };
+        assert_eq!(unfinished.remedy(), DIVERGED_REMEDY);
+        assert!(unfinished.to_string().contains("EAGAIN"), "{unfinished}");
+        let mut finished = NetworkEngine::new_replay(trace.clone());
+        finished.replay_connect(id, &peer(), false).unwrap();
+        for (bytes, expected) in [(&b"req"[..], Some(2)), (b"q", None), (b"q", None)] {
+            assert_eq!(finished.replay_send(id, bytes, true), Ok(expected));
+        }
+        assert_eq!(finished.replay_send(id, b"q", true), Ok(Some(1)));
+        assert_eq!(finished.replay_send(id, b"x", true), Ok(None));
+        assert_eq!(finished.finish_replay(), Ok(()));
+
+        // A blocking send cannot reproduce a refusal: it diverged.
+        let mut engine = NetworkEngine::new_replay(trace);
+        engine.replay_connect(id, &peer(), false).unwrap();
+        assert_eq!(engine.replay_send(id, b"req", false), Ok(Some(2)));
+        let error = engine.replay_send(id, b"q", false).unwrap_err();
+        assert_eq!(
+            error,
+            NetworkEngineError::BlockingSendAtRefusal {
+                channel: id,
+                offset: 2
+            }
+        );
+        assert_eq!(error.remedy(), DIVERGED_REMEDY);
+        assert_eq!(
+            engine.finish_replay(),
+            Err(NetworkEngineError::ReplayUnsent {
+                channel: id,
+                sent: 2,
+                recorded: 3,
+            })
+        );
+    }
+
+    #[test]
+    fn finished_replay_refuses_an_unmade_refused_send() {
+        let mut engine = NetworkEngine::new_record(epoch());
+        let id = sock(0);
+        engine
+            .record_connect(id, peer(), local(), 0, false)
+            .unwrap();
+        engine.record_send(id, b"req", None).unwrap();
+        engine.record_refused_send(id).unwrap();
+        let mut engine = NetworkEngine::new_replay(engine.finish().unwrap());
+        engine.replay_connect(id, &peer(), false).unwrap();
+        assert_eq!(engine.replay_send(id, b"req", true), Ok(Some(3)));
+        assert_eq!(
+            engine.finish_replay(),
+            Err(NetworkEngineError::ReplayUnrefused {
+                channel: id,
+                offset: 3
+            })
+        );
+    }
+
+    #[test]
+    fn record_refuses_a_send_interleaved_with_a_waiting_send() {
+        let mut engine = NetworkEngine::new_record(epoch());
+        let id = sock(0);
+        engine
+            .record_connect(id, peer(), local(), 0, false)
+            .unwrap();
+        // A blocking send accepted a prefix and waits; its continuation
+        // lands where it left the stream.
+        assert_eq!(engine.record_send(id, b"ab", None), Ok(2));
+        assert_eq!(engine.record_send(id, b"cd", Some(2)), Ok(4));
+        // Another send reached the stream while it waited.
+        assert_eq!(engine.record_send(id, b"xy", None), Ok(6));
+        let error = engine.record_send(id, b"ef", Some(4)).unwrap_err();
+        assert_eq!(
+            error,
+            NetworkEngineError::InterleavedSend {
+                channel: id,
+                offset: 4
+            }
+        );
+        assert!(error.remedy().contains("one thread at a time"));
+        assert_eq!(
+            engine.finish().unwrap().outputs.len(),
+            3,
+            "a refused continuation must not be recorded"
+        );
+    }
+
+    #[test]
     fn shutdown_follows_linux() {
         let mut engine = NetworkEngine::new_record(epoch());
         let id = sock(0);
         engine
             .record_connect(id, peer(), local(), 0, false)
             .unwrap();
-        assert_eq!(engine.send_failure(id), Ok(None));
+        assert_eq!(engine.send_failure(id, at(1)), Ok(None));
         assert_eq!(engine.shutdown(id, libc::SHUT_WR), Ok(0));
-        assert_eq!(engine.send_failure(id), Ok(Some(libc::EPIPE)));
+        assert_eq!(engine.send_failure(id, at(1)), Ok(Some(libc::EPIPE)));
         assert_eq!(engine.shutdown(id, 7), Ok(libc::EINVAL));
         assert_eq!(engine.shutdown(id, libc::SHUT_RD), Ok(0));
         assert_eq!(
@@ -1346,7 +1632,7 @@ mod tests {
         let mut engine = NetworkEngine::new_replay(recorded_exchange());
         let id = sock(0);
         engine.replay_connect(id, &peer(), false).unwrap();
-        assert_eq!(engine.replay_send(id, b"req"), Ok(3));
+        assert_eq!(engine.replay_send(id, b"req", false), Ok(Some(3)));
         assert_eq!(
             engine.recv(id, after_secs(3_600), 64, 1, false),
             Ok(data(b"abcdef"))
@@ -1358,7 +1644,7 @@ mod tests {
         let mut engine = NetworkEngine::new_replay(recorded_exchange());
         let id = sock(0);
         engine.replay_connect(id, &peer(), false).unwrap();
-        assert_eq!(engine.replay_send(id, b"req"), Ok(3));
+        assert_eq!(engine.replay_send(id, b"req", false), Ok(Some(3)));
         // The response was never read: release depends on the schedule.
         assert_eq!(engine.finish_replay(), Ok(()));
     }
@@ -1368,7 +1654,7 @@ mod tests {
         let mut engine = NetworkEngine::new_replay(recorded_exchange());
         let id = sock(0);
         engine.replay_connect(id, &peer(), false).unwrap();
-        assert_eq!(engine.replay_send(id, b"r"), Ok(1));
+        assert_eq!(engine.replay_send(id, b"r", false), Ok(Some(1)));
         assert_eq!(
             engine.finish_replay(),
             Err(NetworkEngineError::ReplayUnsent {

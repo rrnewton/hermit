@@ -694,7 +694,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // network_trace::tests::traceable_peer_names_one_host_including_ipv4_mapped_addresses
     // and fd::tests::open_file_ids_display_their_kind_sequence_and_creator
     // (923 + 10 = 933, measured with cargo nextest list --profile ci).
-    ("test.regular_crates", 933),
+    // The post-facto network replay fixes add five tests and retain all
+    // 933 prior identities: four network_engine::tests
+    // (so_error_and_send_release_a_due_error_as_its_first_observer,
+    // refused_nonblocking_sends_replay_as_eagain_at_the_same_offset,
+    // finished_replay_refuses_an_unmade_refused_send and
+    // record_refuses_a_send_interleaved_with_a_waiting_send) and
+    // network_trace::tests::network_trace_v3_holds_refused_sends_that_v2_rejects
+    // (933 + 5 = 938).
+    ("test.regular_crates", 938),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1312,8 +1320,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two timed-out-match stress_series tests listed there: 905 + 2 = 907.
     // The 16 https://github.com/rrnewton/hermit/pull/3777 tests listed there
     // retain all 907, and the ten https://github.com/rrnewton/hermit/pull/3778
-    // tests listed there retain all 923: 923 + 10 = 933.
-    ("test.regular_crates_on_host", 933),
+    // tests listed there retain all 923: 923 + 10 = 933. The five post-facto
+    // network replay fix tests listed there retain all 933: 933 + 5 = 938.
+    ("test.regular_crates_on_host", 938),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.

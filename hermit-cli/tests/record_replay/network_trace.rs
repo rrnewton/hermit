@@ -107,13 +107,18 @@ struct Controller {
 
 impl Controller {
     fn start(program: &Path, directory: &Path) -> (Self, String) {
+        Self::start_mode(program, directory, "controller")
+    }
+
+    /// Starts the fixture's controller `mode`.
+    fn start_mode(program: &Path, directory: &Path, mode: &str) -> (Self, String) {
         let port_path = directory.join("controller.port");
         let contact_path = directory.join("controller.contact");
         let report_path = directory.join("controller.report");
         let child = Command::new("timeout")
             .args(["--kill-after=1s", &format!("{CONTROLLER_WALL_SECONDS}s")])
             .arg(program)
-            .arg("controller")
+            .arg(mode)
             .arg(&port_path)
             .arg(&report_path)
             .arg(&contact_path)
@@ -365,6 +370,145 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     assert_success(&output, "native TCP bracket client");
     assert_guest_invariants(&output.stdout, "native TCP bracket client");
     assert_controller_report(&controller.finish());
+
+    for mode in BACKPRESSURE_MODES {
+        let directory = evidence.path().join(mode);
+        fs::create_dir(&directory).expect("create native backpressure directory");
+        let (controller, port) =
+            Controller::start_mode(fixture, &directory, "backpressure-controller");
+        let output = bounded_command(
+            fixture,
+            &[OsStr::new("client"), OsStr::new(&port), OsStr::new(mode)],
+            NATIVE_CLIENT_WALL_SECONDS,
+        );
+        let label = format!("native {mode} client");
+        assert_success(&output, &label);
+        assert_backpressure_output(&output.stdout, mode, &label);
+        assert_backpressure_report(&controller.finish());
+    }
+}
+
+/// The client modes in which one thread fills a connection whose peer
+/// drains it only after a second thread sends on another connection.
+const BACKPRESSURE_MODES: [&str; 2] = ["backpressure-nonblocking", "backpressure-blocking"];
+const BACKPRESSURE_BYTES: usize = 256 * 1024;
+
+fn assert_backpressure_output(stdout: &[u8], mode: &str, label: &str) {
+    let kind = mode.strip_prefix("backpressure-").unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(stdout),
+        format!("backpressure={kind} bytes={BACKPRESSURE_BYTES} reply=ok\n"),
+        "{label} did not complete the backpressure protocol"
+    );
+}
+
+fn assert_backpressure_report(report: &str) {
+    let digest = fnv1a64(
+        &(0..BACKPRESSURE_BYTES)
+            .map(|index| (index * 131 + (index >> 9)) as u8)
+            .collect::<Vec<_>>(),
+    );
+    assert_eq!(
+        report,
+        format!("controller=backpressure\nbytes={BACKPRESSURE_BYTES}\nfnv1a64={digest:016x}\n"),
+        "backpressure controller observed a changed data stream"
+    );
+}
+
+fn trace_version(trace: &[u8]) -> u32 {
+    let start = detcore_model::network_trace::NETWORK_TRACE_MAGIC.len();
+    u32::from_le_bytes(trace[start..start + 4].try_into().unwrap())
+}
+
+/// A thread stuck on a full send buffer must not hold back the thread that
+/// the peer waits for. A nonblocking send reports EAGAIN promptly, which
+/// the recording holds so that replay reports it at the same point; a
+/// blocking send yields while it waits. Each recording replays offline
+/// under two schedules at L2.
+#[test]
+fn tcp_backpressure_records_and_replays_without_stalling_other_threads() {
+    use detcore_model::network_trace::NETWORK_TRACE_VERSION_V2;
+    use detcore_model::network_trace::NETWORK_TRACE_VERSION_V3;
+
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create backpressure evidence directory");
+    let evidence = directory.path();
+    let mut traces = Vec::new();
+    for mode in BACKPRESSURE_MODES {
+        let trace = evidence.join(format!("{mode}.trace"));
+        let controller_directory = evidence.join(format!("{mode}-controller"));
+        fs::create_dir(&controller_directory).expect("create backpressure controller directory");
+        let (controller, port) =
+            Controller::start_mode(fixture, &controller_directory, "backpressure-controller");
+        let mut arguments = run_arguments(0, 1_000_000);
+        arguments.push(format!("--record-networking={}", trace.display()));
+        let label = format!("record-{mode}");
+        let recorded = hermit_command(
+            evidence,
+            &label,
+            &arguments,
+            fixture,
+            &["client", &port, mode],
+        );
+        assert_success(&recorded, &label);
+        assert_backpressure_output(&recorded.stdout, mode, &label);
+        assert_backpressure_report(&controller.finish());
+        let bytes = fs::read(&trace).expect("recording omitted its network trace");
+        // Only a nonblocking send can be refused; a blocking one waits.
+        let expected_version = if mode == "backpressure-nonblocking" {
+            NETWORK_TRACE_VERSION_V3
+        } else {
+            NETWORK_TRACE_VERSION_V2
+        };
+        assert_eq!(
+            trace_version(&bytes),
+            expected_version,
+            "{label} recorded the wrong trace version"
+        );
+
+        for (seed, max_timeslice) in &REPLAY_CELLS[1..3] {
+            let label = format!("replay-{mode}-seed-{seed}-timeslice-{max_timeslice}");
+            let report = evidence.join(format!("{label}.verify.json"));
+            let mut arguments = run_arguments(*seed, *max_timeslice);
+            arguments.extend([
+                "--verify".into(),
+                "--verify-strict".into(),
+                format!("--verify-json={}", report.display()),
+                format!("--replay-networking={}", trace.display()),
+            ]);
+            let replayed = hermit_command(
+                evidence,
+                &label,
+                &arguments,
+                fixture,
+                &["client", &port, mode],
+            );
+            assert_success(&replayed, &label);
+            assert_backpressure_output(&replayed.stdout, mode, &label);
+            assert_l2_report(&report, &label);
+        }
+        traces.push((trace, port));
+    }
+
+    // A blocking send where the recording holds a refused nonblocking send
+    // diverged from the recording.
+    let (trace, port) = &traces[0];
+    let mut arguments = run_arguments(0, 1_000_000);
+    arguments.push(format!("--replay-networking={}", trace.display()));
+    let diverged = hermit_command(
+        evidence,
+        "replay-blocking-at-refusal",
+        &arguments,
+        fixture,
+        &["client", port, "backpressure-blocking"],
+    );
+    assert_refused(
+        &diverged,
+        "replay-blocking-at-refusal",
+        "where the recording holds a nonblocking send refused with EAGAIN",
+        "diverged from the recording",
+    );
 }
 
 /// Records the fixture's `match` client against a live controller, which
@@ -557,6 +701,18 @@ fn tcp_replay_refuses_divergence_and_operations_outside_a_channel() {
         (
             "sendfile",
             "does not model sendfile on a recorded socket",
+            "--network=host",
+        ),
+        // Linux select reads nfds bits, so an alias above FD_SETSIZE names
+        // the channel too.
+        (
+            "select-high",
+            "does not model select on a recorded socket",
+            "--network=host",
+        ),
+        (
+            "pselect-high",
+            "does not model pselect6 on a recorded socket",
             "--network=host",
         ),
         (

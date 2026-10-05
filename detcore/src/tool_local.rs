@@ -2767,6 +2767,20 @@ impl<T> ThreadState<T> {
         fds
     }
 
+    /// Descriptors in this table that name a network record/replay channel,
+    /// sorted.
+    pub(crate) fn network_channel_fds(&self) -> Vec<RawFd> {
+        let mut fds: Vec<RawFd> = self
+            .metadata()
+            .file_handles
+            .iter()
+            .filter(|(_, detfd)| detfd.is_network_channel())
+            .map(|(&fd, _)| fd)
+            .collect();
+        fds.sort_unstable();
+        fds
+    }
+
     pub(crate) fn count_open_files_at_paths(&self, paths: &[&Path]) -> usize {
         self.metadata().count_open_files_at_paths(paths)
     }

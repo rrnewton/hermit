@@ -294,6 +294,9 @@ pub struct NetworkInputEventV1 {
 }
 
 /// One contiguous recorded fragment of the expected outbound TCP byte stream.
+///
+/// From v3 on, a fragment with no bytes records a nonblocking send that
+/// Linux refused with `EAGAIN` when the stream had reached `stream_offset`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkOutputV1 {
@@ -449,7 +452,13 @@ fn read_frame<R: Read>(mut reader: R) -> Result<(u32, Vec<u8>), NetworkTraceCode
             .try_into()
             .expect("fixed-size version field"),
     );
-    if version != NETWORK_TRACE_VERSION_V1 && version != NETWORK_TRACE_VERSION_V2 {
+    if ![
+        NETWORK_TRACE_VERSION_V1,
+        NETWORK_TRACE_VERSION_V2,
+        NETWORK_TRACE_VERSION_V3,
+    ]
+    .contains(&version)
+    {
         return Err(NetworkTraceCodecError::UnsupportedVersion(version));
     }
     let len_start = version_start + 4;
@@ -501,8 +510,13 @@ fn write_frame<W: Write, T: Serialize>(
     Ok(())
 }
 
-/// The trace format written by the runtime recorder.
+/// The trace format written by the runtime recorder when no nonblocking send
+/// was refused.
 pub const NETWORK_TRACE_VERSION_V2: u32 = 2;
+/// The v2 format, extended with empty outbound fragments that record a
+/// nonblocking send refused with `EAGAIN`. The recorder writes it only for a
+/// trace that holds one, so a reader that predates it rejects only those.
+pub const NETWORK_TRACE_VERSION_V3: u32 = 3;
 
 /// One outbound TCP client connection in a v2 trace.
 ///
@@ -595,9 +609,6 @@ impl NetworkTraceV2 {
             if channel.connect_errno != 0 {
                 return Err(NetworkTraceValidationError::TrafficOnFailedChannel);
             }
-            if output.bytes.is_empty() {
-                return Err(NetworkTraceValidationError::EmptyByteChunk);
-            }
             let offset = total_output.entry(output.channel).or_default();
             if output.stream_offset != *offset {
                 return Err(NetworkTraceValidationError::NonContiguousOutput);
@@ -650,14 +661,27 @@ impl NetworkTraceV2 {
         Ok(())
     }
 
-    /// Write one complete, length-delimited v2 trace.
-    pub fn write_framed<W: Write>(&self, writer: W) -> Result<(), NetworkTraceCodecError> {
-        self.validate()?;
-        write_frame(writer, NETWORK_TRACE_VERSION_V2, self)
+    /// Whether the trace records a nonblocking send refused with `EAGAIN`,
+    /// which only v3 can hold.
+    pub fn records_refused_sends(&self) -> bool {
+        self.outputs.iter().any(|output| output.bytes.is_empty())
     }
 
-    /// Read exactly one complete v1 or v2 trace. A v1 trace is upgraded to
-    /// the equivalent v2 trace after passing v1 validation.
+    /// Write one complete, length-delimited trace: v3 when it records a
+    /// refused send, otherwise v2.
+    pub fn write_framed<W: Write>(&self, writer: W) -> Result<(), NetworkTraceCodecError> {
+        self.validate()?;
+        let version = if self.records_refused_sends() {
+            NETWORK_TRACE_VERSION_V3
+        } else {
+            NETWORK_TRACE_VERSION_V2
+        };
+        write_frame(writer, version, self)
+    }
+
+    /// Read exactly one complete v1, v2 or v3 trace. A v1 trace is upgraded
+    /// to the equivalent v2 trace after passing v1 validation; a v2 trace may
+    /// not hold the refused sends that v3 added.
     pub fn read_framed<R: Read>(reader: R) -> Result<Self, NetworkTraceCodecError> {
         let (version, payload) = read_frame(reader)?;
         let trace = if version == NETWORK_TRACE_VERSION_V1 {
@@ -667,6 +691,9 @@ impl NetworkTraceV2 {
         } else {
             decode_payload(&payload)?
         };
+        if version != NETWORK_TRACE_VERSION_V3 && trace.records_refused_sends() {
+            return Err(NetworkTraceValidationError::EmptyByteChunk.into());
+        }
         trace.validate()?;
         Ok(trace)
     }
@@ -1467,10 +1494,42 @@ mod tests {
         let mut bytes = Vec::new();
         valid_trace_v2().write_framed(&mut bytes).unwrap();
         let start = NETWORK_TRACE_MAGIC.len();
-        bytes[start..start + 4].copy_from_slice(&3u32.to_le_bytes());
+        bytes[start..start + 4].copy_from_slice(&4u32.to_le_bytes());
         assert!(matches!(
             NetworkTraceV2::read_framed(Cursor::new(bytes)),
-            Err(NetworkTraceCodecError::UnsupportedVersion(3))
+            Err(NetworkTraceCodecError::UnsupportedVersion(4))
+        ));
+    }
+
+    #[test]
+    fn network_trace_v3_holds_refused_sends_that_v2_rejects() {
+        let mut trace = valid_trace_v2();
+        let first = trace.channels[0].id;
+        trace.outputs.insert(
+            0,
+            NetworkOutputV1 {
+                channel: first,
+                stream_offset: 0,
+                bytes: Vec::new(),
+            },
+        );
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        let start = NETWORK_TRACE_MAGIC.len();
+        assert_eq!(
+            bytes[start..start + 4],
+            NETWORK_TRACE_VERSION_V3.to_le_bytes()
+        );
+        assert_eq!(
+            NetworkTraceV2::read_framed(Cursor::new(bytes.clone())).unwrap(),
+            trace
+        );
+        bytes[start..start + 4].copy_from_slice(&NETWORK_TRACE_VERSION_V2.to_le_bytes());
+        assert!(matches!(
+            NetworkTraceV2::read_framed(Cursor::new(bytes)),
+            Err(NetworkTraceCodecError::Validation(
+                NetworkTraceValidationError::EmptyByteChunk
+            ))
         ));
     }
 

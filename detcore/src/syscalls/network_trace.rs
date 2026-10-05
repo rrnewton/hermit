@@ -117,9 +117,6 @@ use crate::types::LogicalTime;
 /// How long record mode waits for the host to finish a TCP handshake.
 const CONNECT_WAIT_MILLIS: i32 = 60_000;
 
-/// How long record mode waits for a full host send buffer to drain.
-const SEND_WAIT_MILLIS: i32 = 60_000;
-
 /// Size of the scratch buffer a readiness check pulls into.
 const POLL_PULL_BYTES: usize = 512;
 
@@ -648,23 +645,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// Whether a `select` descriptor set below `nfds` names a channel.
+    /// Whether a `select` descriptor set below `nfds` names a channel. Linux
+    /// reads `nfds` bits, not a fixed `fd_set`, so a channel at or above
+    /// `FD_SETSIZE` counts too. Only the word holding each channel's bit is
+    /// read, which bounds the reads by the open channels rather than `nfds`.
+    /// An unreadable word leaves the call to its ordinary path, where Linux
+    /// fails it with `EFAULT`.
     fn select_names_channel<G: Guest<Self>>(
         guest: &mut G,
         nfds: i32,
         sets: [Option<AddrMut<'_, libc::fd_set>>; 3],
     ) -> bool {
-        let nfds = nfds.clamp(0, libc::FD_SETSIZE as i32);
-        sets.into_iter().flatten().any(|set| {
-            let Ok(set) = guest.memory().read_value(set) else {
-                return false;
-            };
-            (0..nfds).any(|fd| {
-                // SAFETY: `fd` is below FD_SETSIZE.
-                let named = unsafe { libc::FD_ISSET(fd, &set) };
-                named && Self::is_network_channel(guest, fd)
+        const WORD_BITS: usize = u64::BITS as usize;
+        let channels = guest.thread_state().network_channel_fds();
+        channels
+            .into_iter()
+            .filter(|&fd| fd >= 0 && fd < nfds)
+            .any(|fd| {
+                let fd = fd as usize;
+                sets.into_iter().flatten().any(|set| {
+                    // SAFETY: only read through guest memory access, which
+                    // fails on an unmapped address.
+                    let word = unsafe { set.cast::<u64>().add(fd / WORD_BITS) };
+                    guest
+                        .memory()
+                        .read_value(word)
+                        .is_ok_and(|word| word & (1 << (fd % WORD_BITS)) != 0)
+                })
             })
-        })
     }
 
     /// Handle a call that [`Self::network_trace_owns`] accepted.
@@ -764,19 +772,34 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
             }
             Syscall::Recvfrom(c) => {
-                // A connected TCP socket reports no source address.
-                if let Some(length) = c.addr_len() {
-                    guest.memory().write_value(length, &0u32)?;
+                let received = self
+                    .network_recv(
+                        guest,
+                        c.fd(),
+                        c.buf(),
+                        c.len(),
+                        c.flags(),
+                        c.signal_interrupt_errno(),
+                    )
+                    .await?;
+                // As Linux does, copy out a source address only after a
+                // successful receive that asked for one. A connected TCP
+                // socket reports none: its length is zero.
+                if c.addr().is_some() {
+                    let length = c.addr_len().ok_or(Errno::EFAULT)?;
+                    let requested: i32 = guest
+                        .memory()
+                        .read_value(length.cast())
+                        .map_err(|_| Errno::EFAULT)?;
+                    if requested < 0 {
+                        return Err(Errno::EINVAL.into());
+                    }
+                    guest
+                        .memory()
+                        .write_value(length, &0u32)
+                        .map_err(|_| Errno::EFAULT)?;
                 }
-                self.network_recv(
-                    guest,
-                    c.fd(),
-                    c.buf(),
-                    c.len(),
-                    c.flags(),
-                    c.signal_interrupt_errno(),
-                )
-                .await
+                Ok(received)
             }
             Syscall::Write(c) => self.network_send(guest, c.fd(), c.buf(), c.len(), 0).await,
             Syscall::Sendto(c) => {
@@ -1526,8 +1549,15 @@ impl<T: RecordOrReplay> Detcore<T> {
         let buffer = buffer.ok_or(Errno::EFAULT)?;
         let mut sent = 0;
         if self.network_mode() == NetworkTraceMode::Record {
-            // Never report EAGAIN: replay could not reproduce it. A nonblocking
-            // send waits for some progress, a blocking one for all of it.
+            // A nonblocking send the host refuses reports EAGAIN, and the
+            // recording holds the refusal so that replay reports it at the
+            // same stream offset. A blocking send yields to the scheduler
+            // until the host accepts all of it, so that other guest threads,
+            // which may be what the peer waits for, keep running.
+            let mut rsrc = Resources::new(guest.thread_state().dettid);
+            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+            rsrc.fyi("network send");
+            let mut at = None;
             while sent < len && !(nonblocking && sent > 0) {
                 let call = syscalls::Sendto::new()
                     .with_fd(fd)
@@ -1538,18 +1568,41 @@ impl<T: RecordOrReplay> Detcore<T> {
                         (flags & libc::MSG_MORE | libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL) as u32,
                     );
                 match guest.inject(call).await {
-                    Ok(written) => sent += written as usize,
+                    Ok(written) => {
+                        let written = written as usize;
+                        let request = NetworkRequest::RecordSend {
+                            id,
+                            bytes: bytes[sent..sent + written].to_vec(),
+                            at,
+                        };
+                        let NetworkReply::Recorded(end) =
+                            self.network_request(guest, request).await
+                        else {
+                            unreachable!()
+                        };
+                        at = Some(end);
+                        sent += written;
+                    }
                     Err(Errno::EINTR) => {}
+                    Err(Errno::EAGAIN) if nonblocking => {
+                        self.network_request(guest, NetworkRequest::RecordRefusedSend(id))
+                            .await;
+                        return Err(Errno::EAGAIN.into());
+                    }
                     Err(Errno::EAGAIN) => {
-                        if self
-                            .network_host_wait(guest, fd, libc::POLLOUT, SEND_WAIT_MILLIS)
-                            .await?
-                            .is_none()
-                        {
+                        rsrc.poll_attempt += 1;
+                        record_retry_event(guest, syscalls::Sendto::new().with_fd(fd)).await;
+                        if matches!(
+                            resource_request(guest, rsrc.clone()).await,
+                            ResumeStatus::Signaled(_)
+                        ) {
+                            // Replay never waits here, so it could not
+                            // reproduce the interruption.
                             self.network_refuse(
                                 guest,
-                                "network send did not drain in time",
-                                HOST_REMEDY,
+                                "network record does not model a signal interrupting a send \
+                                 that waits for buffer space",
+                                UNSUPPORTED_REMEDY,
                             )
                             .await
                         }
@@ -1564,22 +1617,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                     }
                 }
             }
-            let request = NetworkRequest::RecordSend {
-                id,
-                bytes: bytes[..sent].to_vec(),
-            };
-            self.network_request(guest, request).await;
         } else {
             while sent < len && !(nonblocking && sent > 0) {
                 let request = NetworkRequest::ReplaySend {
                     id,
                     bytes: bytes[sent..].to_vec(),
+                    nonblocking,
                 };
-                let NetworkReply::Sent(accepted) = self.network_request(guest, request).await
-                else {
-                    unreachable!()
-                };
-                sent += accepted;
+                match self.network_request(guest, request).await {
+                    NetworkReply::Sent(accepted) => sent += accepted,
+                    NetworkReply::WouldBlock => return Err(Errno::EAGAIN.into()),
+                    _ => unreachable!(),
+                }
             }
         }
         Ok(sent as i64)
