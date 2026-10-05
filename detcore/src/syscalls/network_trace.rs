@@ -29,15 +29,28 @@
 //!
 //! Host waits that the guest cannot observe as time passing -- the connect
 //! handshake and a full send buffer -- block the thread without yielding, so
-//! record and replay take the same scheduler turns.
+//! record and replay take the same scheduler turns. They are wall-clock
+//! waits of up to a minute each, unlike the virtual-time stall limit replay
+//! applies.
 //!
 //! Anything the engine cannot answer ends the run with the policy-refusal
 //! status, naming the reason and the remedy; replay never falls back to the
-//! host. That includes every IPv4 or IPv6 operation that could reach the
-//! network outside a channel: a UDP or raw send, `bind`, `listen`, a TCP Fast
-//! Open send, a packet socket, and `epoll` registration of an IPv4 or IPv6
-//! socket. Creating such a socket and closing it stays allowed, because
-//! resolvers probe for IPv6 support that way.
+//! host. That includes every operation that could reach the network outside a
+//! channel, because a recording shares the host's network namespace:
+//!
+//! - on an IPv4 or IPv6 socket, a UDP send, `bind`, `listen`, a TCP Fast Open
+//!   send, `epoll` registration, signal-driven I/O, and a nonzero send or
+//!   receive timeout, which Linux would apply in wall-clock time;
+//! - a socket of any family but `AF_UNIX`, `AF_INET` and `AF_INET6`, such as
+//!   netlink or packet sockets, and a raw IPv4 or IPv6 socket;
+//! - an abstract `AF_UNIX` address, which names the network namespace rather
+//!   than the file system;
+//! - receiving a socket of another family than `AF_UNIX` through
+//!   `SCM_RIGHTS`, which this module could not classify.
+//!
+//! Creating an IPv4 or IPv6 socket and closing it stays allowed, because
+//! resolvers probe for IPv6 support that way. The checks are the same in both
+//! modes, so a run that records is a run that replays.
 
 use std::os::unix::io::RawFd;
 use std::time::Duration;
@@ -58,9 +71,11 @@ use reverie::Stack;
 use reverie::syscalls;
 use reverie::syscalls::Addr;
 use reverie::syscalls::AddrMut;
+use reverie::syscalls::FcntlCmd;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::ioctl::Request;
 
 use super::io::ppoll_timeout_duration;
 use crate::fd::FdType;
@@ -102,10 +117,31 @@ const RECV_FLAGS: i32 =
 /// `send` flags with a modelled meaning.
 const SEND_FLAGS: i32 = libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT | libc::MSG_MORE;
 
+/// The shortest IPv6 `sockaddr` Linux accepts: RFC 2133's, without
+/// `sin6_scope_id` (`SIN6_LEN_RFC2133`).
+const SOCKADDR_IN6_RFC2133_LEN: usize = 24;
+
+/// The longest `sockaddr` Linux copies in (`sizeof(struct sockaddr_storage)`).
+const SOCKADDR_STORAGE_LEN: usize = 128;
+
+/// Bytes of an `SCM_RIGHTS` control buffer this module inspects; Linux caps
+/// ancillary data at `net.core.optmem_max`, which defaults to far less.
+const MAX_CONTROL_BYTES: usize = 64 * 1024;
+
+/// `SO_RCVTIMEO_OLD`, `SO_SNDTIMEO_OLD`, `SO_RCVTIMEO_NEW` and
+/// `SO_SNDTIMEO_NEW` on x86_64.
+const TIMEOUT_OPTIONS: [i32; 4] = [20, 21, 66, 67];
+
 /// The remedy for an operation network record/replay does not model.
 const UNSUPPORTED_REMEDY: &str = "Network record/replay supports only outbound TCP clients. To \
      let this program use the network without recording it, run it without \
      --record-networking or --replay-networking, with --network=host and without --strict.";
+
+/// The remedy for an operation that would reach the host network namespace.
+const NAMESPACE_REMEDY: &str = "Network record/replay supports only outbound TCP clients and \
+     AF_UNIX sockets bound to file-system paths. To let this program use the network without \
+     recording it, run it without --record-networking or --replay-networking, with \
+     --network=host and without --strict.";
 
 /// The remedy for a record run that the host network failed.
 const HOST_REMEDY: &str = "Check that the peer is reachable and responding, then record again.";
@@ -115,6 +151,7 @@ const HOST_REMEDY: &str = "Check that the peer is reachable and responding, then
 /// Linux fixes, rather than the state of the connection.
 fn is_configuration_option(level: i32, name: i32) -> bool {
     match level {
+        // A timeout reads back as zero: a nonzero one is refused.
         libc::SOL_SOCKET => matches!(
             name,
             libc::SO_TYPE
@@ -188,7 +225,7 @@ fn reaches_network_outside_channel(call: &Syscall, kind: NetworkSocketKind) -> b
                 | Syscall::Sendmsg(_)
                 | Syscall::Sendmmsg(_)
         ),
-        NetworkSocketKind::InetStream => match call {
+        NetworkSocketKind::InetStream { .. } => match call {
             Syscall::Bind(_) | Syscall::Listen(_) => true,
             Syscall::Sendto(c) => fast_open(c.flags() as i32),
             Syscall::Sendmsg(c) => fast_open(c.flags()),
@@ -201,8 +238,30 @@ fn reaches_network_outside_channel(call: &Syscall, kind: NetworkSocketKind) -> b
     }
 }
 
+/// Whether `call` asks for signal-driven I/O, whose `SIGIO` Linux would send
+/// when the host socket becomes ready, a moment replay cannot reproduce.
+fn requests_signal_driven_io(call: &Syscall) -> bool {
+    match call {
+        Syscall::Fcntl(c) => {
+            matches!(
+                c.cmd(),
+                FcntlCmd::F_SETFL(flags) if flags & libc::O_ASYNC != 0
+            ) || matches!(
+                c.cmd(),
+                FcntlCmd::F_SETOWN | FcntlCmd::F_SETOWN_EX(_) | FcntlCmd::F_SETSIG(_)
+            )
+        }
+        Syscall::Ioctl(c) => matches!(
+            c.request(),
+            Request::FIOASYNC(_) | Request::FIOSETOWN(_) | Request::SIOCSPGRP(_)
+        ),
+        _ => false,
+    }
+}
+
 /// The traced address of an IPv4 or IPv6 `sockaddr`, or `None` for any other
-/// family or a short buffer.
+/// family or a buffer shorter than Linux accepts. An IPv6 address without
+/// `sin6_scope_id` has scope zero, as in Linux.
 fn address_from_sockaddr(bytes: &[u8]) -> Option<NetworkAddressV1> {
     let family = u16::from_ne_bytes(bytes.get(..2)?.try_into().ok()?);
     if family == libc::AF_INET as u16 && bytes.len() >= size_of::<libc::sockaddr_in>() {
@@ -210,16 +269,95 @@ fn address_from_sockaddr(bytes: &[u8]) -> Option<NetworkAddressV1> {
             port: u16::from_be_bytes(bytes[2..4].try_into().ok()?),
             address: bytes[4..8].try_into().ok()?,
         })
-    } else if family == libc::AF_INET6 as u16 && bytes.len() >= size_of::<libc::sockaddr_in6>() {
+    } else if family == libc::AF_INET6 as u16 && bytes.len() >= SOCKADDR_IN6_RFC2133_LEN {
+        let scope_id = match bytes.get(24..28) {
+            Some(scope_id) => u32::from_ne_bytes(scope_id.try_into().ok()?),
+            None => 0,
+        };
         Some(NetworkAddressV1::Inet6 {
             port: u16::from_be_bytes(bytes[2..4].try_into().ok()?),
             flowinfo: u32::from_be_bytes(bytes[4..8].try_into().ok()?),
             address: bytes[8..24].try_into().ok()?,
-            scope_id: u32::from_ne_bytes(bytes[24..28].try_into().ok()?),
+            scope_id,
         })
     } else {
         None
     }
+}
+
+/// Copy in a `sockaddr` as Linux's `move_addr_to_kernel` does: a length
+/// beyond `sockaddr_storage` or below zero fails with `EINVAL`, and a zero
+/// length copies nothing.
+fn read_sockaddr<M: MemoryAccess>(
+    memory: &M,
+    address: Option<AddrMut<'_, libc::sockaddr>>,
+    addrlen: i32,
+) -> Result<Vec<u8>, Errno> {
+    let length = usize::try_from(addrlen)
+        .ok()
+        .filter(|length| *length <= SOCKADDR_STORAGE_LEN)
+        .ok_or(Errno::EINVAL)?;
+    let mut bytes = vec![0; length];
+    if length > 0 {
+        let address = address.ok_or(Errno::EFAULT)?;
+        memory.read_exact(Addr::from(address.cast::<u8>()), &mut bytes)?;
+    }
+    Ok(bytes)
+}
+
+/// Whether a `setsockopt` timeout value sets a timeout. Zero clears it, a
+/// negative one is treated as zero, and a microsecond count out of range
+/// fails with `EDOM`, all without reaching the network.
+fn sets_a_timeout(timeout: libc::timeval) -> bool {
+    (0..1_000_000).contains(&timeout.tv_usec)
+        && (timeout.tv_sec > 0 || (timeout.tv_sec == 0 && timeout.tv_usec > 0))
+}
+
+/// Whether the first `addrlen` bytes of a `sockaddr`, of which `bytes` holds
+/// at least the first three, name an abstract `AF_UNIX` address, which lives
+/// in the network namespace. With `binding`, a bare family also does: `bind`
+/// then picks an abstract name itself.
+fn names_abstract_unix_address(bytes: &[u8], addrlen: usize, binding: bool) -> bool {
+    let Some(family) = bytes.get(..2) else {
+        return false;
+    };
+    if u16::from_ne_bytes([family[0], family[1]]) != libc::AF_UNIX as u16 {
+        return false;
+    }
+    match addrlen {
+        2 => binding,
+        _ => bytes.get(2) == Some(&0),
+    }
+}
+
+/// The descriptors carried by the `SCM_RIGHTS` messages in a received
+/// control buffer.
+fn received_descriptors(control: &[u8]) -> Vec<RawFd> {
+    const HEADER: usize = size_of::<libc::cmsghdr>();
+    let align = |length: usize| length.next_multiple_of(size_of::<usize>());
+    let mut descriptors = Vec::new();
+    let mut offset = 0;
+    while let Some(header) = control.get(offset..offset + HEADER) {
+        let length = usize::from_ne_bytes(header[..8].try_into().unwrap());
+        let level = i32::from_ne_bytes(header[8..12].try_into().unwrap());
+        let kind = i32::from_ne_bytes(header[12..16].try_into().unwrap());
+        let Some(data) = control.get(offset + HEADER..offset.saturating_add(length)) else {
+            break;
+        };
+        if level == libc::SOL_SOCKET && kind == libc::SCM_RIGHTS {
+            descriptors.extend(
+                data.as_chunks::<{ size_of::<RawFd>() }>()
+                    .0
+                    .iter()
+                    .map(|fd| RawFd::from_ne_bytes(*fd)),
+            );
+        }
+        if length < HEADER {
+            break;
+        }
+        offset += align(length);
+    }
+    descriptors
 }
 
 /// The `sockaddr` bytes Linux reports for `address`.
@@ -325,9 +463,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A connect may create a channel and a poll may name one; each
             // falls back to its ordinary handler otherwise.
             Syscall::Connect(_) | Syscall::Poll(_) | Syscall::Ppoll(_) => true,
-            Syscall::Socket(c) => {
-                matches!(c.family(), libc::AF_INET | libc::AF_INET6 | libc::AF_PACKET)
-            }
+            // A received descriptor may be a socket this module never saw.
+            Syscall::Recvmsg(_) | Syscall::Recvmmsg(_) => true,
+            // Only AF_UNIX sockets stay out of the host's network namespace.
+            Syscall::Socket(c) => c.family() != libc::AF_UNIX,
             Syscall::Select(c) => Self::select_names_channel(
                 guest,
                 c.nfds(),
@@ -344,10 +483,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 true
             }
-            // A registration outlives the connect, so refuse it on any IPv4 or
-            // IPv6 socket rather than only on a channel.
+            // A registration, timeout or signal owner outlives the connect, so
+            // refuse it on any IPv4 or IPv6 socket rather than only on a
+            // channel.
             Syscall::EpollCtl(c) => {
                 Self::network_socket_state(guest, c.fd()).1 != NetworkSocketKind::NotInet
+            }
+            Syscall::Setsockopt(c)
+                if c.level() == libc::SOL_SOCKET && TIMEOUT_OPTIONS.contains(&c.optname()) =>
+            {
+                Self::network_socket_state(guest, c.fd()).1 != NetworkSocketKind::NotInet
+            }
+            Syscall::Fcntl(_) | Syscall::Ioctl(_) if requests_signal_driven_io(call) => {
+                get_fd(*call).is_some_and(|fd| {
+                    Self::network_socket_state(guest, fd).1 != NetworkSocketKind::NotInet
+                })
             }
             Syscall::Sendfile(c) => Self::names_channel(guest, [c.out_fd(), c.in_fd()]),
             Syscall::Splice(c) => Self::names_channel(guest, [c.fd_in(), c.fd_out()]),
@@ -359,9 +509,65 @@ impl<T: RecordOrReplay> Detcore<T> {
                 };
                 match Self::network_socket_state(guest, fd) {
                     (true, _) => !channel_call_takes_ordinary_path(call),
+                    (false, NetworkSocketKind::NotInet) => {
+                        Self::names_abstract_unix_destination(guest, call)
+                    }
                     (false, kind) => reaches_network_outside_channel(call, kind),
                 }
             }
+        }
+    }
+
+    /// Whether `call`, a `bind` or send, names an abstract `AF_UNIX` address.
+    /// An address the guest cannot read fails in Linux before any effect.
+    fn names_abstract_unix_destination<G: Guest<Self>>(guest: &mut G, call: &Syscall) -> bool {
+        let names = |guest: &mut G, address: Option<Addr<'_, u8>>, length: usize, binding| {
+            let mut bytes = [0u8; 3];
+            let prefix = &mut bytes[..length.min(3)];
+            address.is_some_and(|address| guest.memory().read_exact(address, prefix).is_ok())
+                && names_abstract_unix_address(prefix, length, binding)
+        };
+        let message_names = |guest: &mut G, header: Option<Addr<'_, libc::msghdr>>| {
+            let Some(header) = header.and_then(|header| guest.memory().read_value(header).ok())
+            else {
+                return false;
+            };
+            let header: libc::msghdr = header;
+            names(
+                guest,
+                Addr::from_raw(header.msg_name as usize),
+                header.msg_namelen as usize,
+                false,
+            )
+        };
+        let length = |addrlen: i32| usize::try_from(addrlen).unwrap_or(0);
+        match call {
+            Syscall::Bind(c) => names(
+                guest,
+                c.umyaddr().map(|a| Addr::from(a.cast())),
+                length(c.addrlen()),
+                true,
+            ),
+            Syscall::Sendto(c) => names(
+                guest,
+                c.addr().map(|a| Addr::from(a.cast())),
+                length(c.addr_len()),
+                false,
+            ),
+            Syscall::Sendmsg(c) => message_names(guest, c.msg()),
+            Syscall::Sendmmsg(c) => {
+                let Some(vector) = c.msgvec() else {
+                    return false;
+                };
+                let vector = vector.cast::<libc::mmsghdr>();
+                (0..c.vlen().min(libc::UIO_MAXIOV as u32) as usize).any(|index| {
+                    // SAFETY: only read through guest memory access, which
+                    // fails on an unmapped address.
+                    let entry = unsafe { vector.add(index) };
+                    message_names(guest, Some(entry.cast()))
+                })
+            }
+            _ => false,
         }
     }
 
@@ -396,6 +602,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             Syscall::Poll(c) => return self.network_poll(guest, c).await,
             Syscall::Ppoll(c) => return self.network_ppoll(guest, c).await,
             Syscall::Setsockopt(c) => return self.network_setsockopt(guest, c).await,
+            Syscall::Recvmsg(c) if !Self::is_network_channel(guest, c.sockfd()) => {
+                return self.network_recv_outside_channel(guest, call).await;
+            }
+            Syscall::Recvmmsg(c) if !Self::is_network_channel(guest, c.fd()) => {
+                return self.network_recv_outside_channel(guest, call).await;
+            }
+            Syscall::Fcntl(_) | Syscall::Ioctl(_) if requests_signal_driven_io(&call) => {
+                self.network_refuse(
+                    guest,
+                    "network record/replay does not model signal-driven I/O (O_ASYNC, F_SETOWN, \
+                     F_SETSIG) on an IPv4 or IPv6 socket",
+                    UNSUPPORTED_REMEDY,
+                )
+                .await
+            }
             Syscall::EpollCtl(_) => {
                 self.network_refuse(
                     guest,
@@ -415,7 +636,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         // Every other call the trace owns names one socket.
         let fd = get_fd(call).expect("an owned call names a descriptor");
-        if !Self::is_network_channel(guest, fd) {
+        let (channel, kind) = Self::network_socket_state(guest, fd);
+        if !channel && kind == NetworkSocketKind::NotInet {
+            self.network_refuse(
+                guest,
+                &format!(
+                    "network record/replay does not model {} to an abstract AF_UNIX address, \
+                     which names the host's network namespace rather than a file",
+                    call.name()
+                ),
+                NAMESPACE_REMEDY,
+            )
+            .await
+        }
+        if !channel {
             self.network_refuse(
                 guest,
                 &format!(
@@ -531,26 +765,47 @@ impl<T: RecordOrReplay> Detcore<T> {
         .await
     }
 
-    /// `socket`: refuse packet sockets, which receive from every interface,
-    /// and classify IPv4 and IPv6 sockets for later calls.
+    /// `socket`: refuse every family but IPv4 and IPv6, whose sockets reach
+    /// the host's network namespace, and raw sockets, and classify IPv4 and
+    /// IPv6 sockets for later calls.
     async fn network_socket<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Socket,
     ) -> Result<i64, Error> {
-        if call.family() == libc::AF_PACKET {
+        let family = call.family();
+        if family != libc::AF_INET && family != libc::AF_INET6 {
+            let sockets = match family {
+                libc::AF_NETLINK => "netlink sockets".to_owned(),
+                libc::AF_PACKET => "packet sockets".to_owned(),
+                other => format!("sockets of address family {other}"),
+            };
             self.network_refuse(
                 guest,
-                "network record/replay does not model packet sockets",
+                &format!(
+                    "network record/replay does not model {sockets}, which reach the host's \
+                     network namespace"
+                ),
+                NAMESPACE_REMEDY,
+            )
+            .await
+        }
+        let socket_type = call.r#type() & 0xf;
+        if socket_type == libc::SOCK_RAW {
+            self.network_refuse(
+                guest,
+                "network record/replay does not model raw IPv4 or IPv6 sockets",
                 UNSUPPORTED_REMEDY,
             )
             .await
         }
         let fd = self.handle_socket(guest, call).await?;
-        let stream = call.r#type() & 0xf == libc::SOCK_STREAM
-            && matches!(call.protocol(), 0 | libc::IPPROTO_TCP);
+        let stream =
+            socket_type == libc::SOCK_STREAM && matches!(call.protocol(), 0 | libc::IPPROTO_TCP);
         let kind = if stream {
-            NetworkSocketKind::InetStream
+            NetworkSocketKind::InetStream {
+                ipv6: family == libc::AF_INET6,
+            }
         } else {
             NetworkSocketKind::InetOther
         };
@@ -558,6 +813,104 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(fd as RawFd, |detfd| detfd.set_network_socket(kind))?;
         Ok(fd)
+    }
+
+    /// `recvmsg` or `recvmmsg` outside a channel: take the ordinary path, then
+    /// refuse if it delivered through `SCM_RIGHTS` a socket of another family
+    /// than `AF_UNIX`, which this module never classified and so could not
+    /// keep from the network. A descriptor that is no socket stays untraced.
+    async fn network_recv_outside_channel<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+    ) -> Result<i64, Error> {
+        // Raw addresses: a typed address is not `Send` across the receive.
+        let headers: Vec<usize> = match &call {
+            Syscall::Recvmsg(c) => c.msg().map(AddrMut::as_raw).into_iter().collect(),
+            Syscall::Recvmmsg(c) => c.mmsg().map_or_else(Vec::new, |vector| {
+                (0..c.vlen().min(libc::UIO_MAXIOV as u32) as usize)
+                    // SAFETY: only read through guest memory access, which
+                    // fails on an unmapped address.
+                    .map(|index| unsafe { vector.add(index) }.as_raw())
+                    .collect()
+            }),
+            _ => unreachable!("only receives with ancillary data reach here"),
+        };
+        // The control buffers the guest offered, before Linux overwrites
+        // their lengths with what it delivered.
+        let offered: Vec<Option<(usize, usize)>> = headers
+            .iter()
+            .map(|header| {
+                let header = Addr::<libc::msghdr>::from_raw(*header)?;
+                let header: libc::msghdr = guest.memory().read_value(header).ok()?;
+                Some((header.msg_control as usize, header.msg_controllen))
+            })
+            .collect();
+        let (result, received) = match call {
+            Syscall::Recvmsg(c) => (self.handle_recvmsg(guest, c).await?, 1),
+            Syscall::Recvmmsg(c) => {
+                let result = self.handle_recvmmsg(guest, c).await?;
+                (result, result as usize)
+            }
+            _ => unreachable!("only receives with ancillary data reach here"),
+        };
+        for (header, offered) in headers.into_iter().zip(offered).take(received) {
+            let Some((control, capacity)) = offered else {
+                continue;
+            };
+            let delivered = Addr::<libc::msghdr>::from_raw(header)
+                .ok_or(Errno::EFAULT)
+                .and_then(|header| guest.memory().read_value(header))
+                .map(|header: libc::msghdr| {
+                    header.msg_controllen.min(capacity).min(MAX_CONTROL_BYTES)
+                });
+            let mut bytes = vec![0; *delivered.as_ref().unwrap_or(&0)];
+            let readable = delivered.is_ok()
+                && (bytes.is_empty()
+                    || Addr::<u8>::from_raw(control).is_some_and(|control| {
+                        guest.memory().read_exact(control, &mut bytes).is_ok()
+                    }));
+            if !readable {
+                self.network_refuse(
+                    guest,
+                    "network record/replay could not read the ancillary data Linux delivered, \
+                     so cannot check it for sockets",
+                    "The program changed its receive buffers during the call; fix the program.",
+                )
+                .await
+            }
+            for fd in received_descriptors(&bytes) {
+                match self
+                    .network_host_int_option(guest, fd, libc::SO_DOMAIN)
+                    .await
+                {
+                    Ok(libc::AF_UNIX) | Err(Errno::ENOTSOCK) => {}
+                    Ok(domain) => {
+                        self.network_refuse(
+                            guest,
+                            &format!(
+                                "network record/replay does not model a socket of address \
+                                 family {domain} received through SCM_RIGHTS"
+                            ),
+                            UNSUPPORTED_REMEDY,
+                        )
+                        .await
+                    }
+                    Err(errno) => {
+                        self.network_refuse(
+                            guest,
+                            &format!(
+                                "network record/replay could not classify descriptor {fd} \
+                                 received through SCM_RIGHTS: {errno}"
+                            ),
+                            UNSUPPORTED_REMEDY,
+                        )
+                        .await
+                    }
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Perform one engine operation at the current global time.
@@ -706,7 +1059,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `connect`: an outbound TCP connect to an IPv4 or IPv6 peer becomes a
-    /// channel; any other connect takes the ordinary path.
+    /// channel. Linux's argument checks run here, in the same order, so record
+    /// and replay fail them alike before the host is reached. A connect on any
+    /// other socket takes the ordinary path, unless it names an abstract
+    /// `AF_UNIX` address.
     async fn network_connect<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -727,11 +1083,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             })
             .ok()
             .flatten();
-        let Some((id, nonblocking, already_channel, kind)) = socket else {
-            return self.handle_connect(guest, call).await;
-        };
-        match kind {
-            NetworkSocketKind::NotInet => return self.handle_connect(guest, call).await,
+        let kind = socket.map_or(NetworkSocketKind::NotInet, |socket| socket.3);
+        let ipv6 = match kind {
+            NetworkSocketKind::NotInet => {
+                if let Ok(bytes) = read_sockaddr(&guest.memory(), call.uservaddr(), call.addrlen())
+                    && names_abstract_unix_address(&bytes, bytes.len(), false)
+                {
+                    self.network_refuse(
+                        guest,
+                        "network record/replay does not model connect to an abstract AF_UNIX \
+                         address, which names the host's network namespace rather than a file",
+                        NAMESPACE_REMEDY,
+                    )
+                    .await
+                }
+                return self.handle_connect(guest, call).await;
+            }
             NetworkSocketKind::InetOther => {
                 self.network_refuse(
                     guest,
@@ -741,7 +1108,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await
             }
-            NetworkSocketKind::InetStream => {}
+            NetworkSocketKind::InetStream { ipv6 } => ipv6,
+        };
+        let (id, nonblocking, already_channel, _) =
+            socket.expect("an IPv4 or IPv6 socket is tracked");
+        let bytes = read_sockaddr(&guest.memory(), call.uservaddr(), call.addrlen())?;
+        let family = match bytes.get(..2) {
+            Some(family) => u16::from_ne_bytes([family[0], family[1]]),
+            None => return Err(Errno::EINVAL.into()),
+        };
+        if family == libc::AF_UNSPEC as u16 {
+            self.network_refuse(
+                guest,
+                "network record/replay does not model disconnecting a socket with an AF_UNSPEC \
+                 connect",
+                UNSUPPORTED_REMEDY,
+            )
+            .await
         }
         if already_channel {
             // Linux reports a finished connect's error once, then EISCONN.
@@ -753,18 +1136,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
             return Err(Errno::new(if errno == 0 { libc::EISCONN } else { errno }).into());
         }
-        let peer = (|| {
-            let address = call.uservaddr()?;
-            let length = usize::try_from(call.addrlen()).ok()?;
-            let mut bytes = vec![0; length.min(size_of::<libc::sockaddr_in6>())];
-            guest.memory().read_exact(address.cast(), &mut bytes).ok()?;
-            address_from_sockaddr(&bytes)
-        })();
-        // An address of another family, or a short one, fails in Linux
-        // before any network effect.
-        let Some(peer) = peer else {
-            return self.handle_connect(guest, call).await;
+        let (minimum, expected) = if ipv6 {
+            (SOCKADDR_IN6_RFC2133_LEN, libc::AF_INET6)
+        } else {
+            (size_of::<libc::sockaddr_in>(), libc::AF_INET)
         };
+        if bytes.len() < minimum {
+            return Err(Errno::EINVAL.into());
+        }
+        if family != expected as u16 {
+            return Err(Errno::EAFNOSUPPORT.into());
+        }
+        let peer = address_from_sockaddr(&bytes).ok_or(Errno::EINVAL)?;
 
         let request = if self.network_mode() == NetworkTraceMode::Record {
             if !peer.is_traceable_peer() {
@@ -791,15 +1174,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     self.network_host_int_option(guest, fd, libc::SO_ERROR)
                         .await?
                 }
-                // Argument errors precede any network effect and need no record.
-                Err(
-                    errno @ (Errno::EBADF
-                    | Errno::EFAULT
-                    | Errno::EINVAL
-                    | Errno::EAFNOSUPPORT
-                    | Errno::EALREADY
-                    | Errno::EISCONN),
-                ) => return Err(errno.into()),
+                // The argument checks above already ran, so every other
+                // error is the host network's answer, which replay repeats.
                 Err(errno) => errno.into_raw(),
             };
             let local = if errno == 0 {
@@ -845,7 +1221,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `setsockopt`: track `SO_RCVLOWAT`, which the engine needs for receive
-    /// targets and readiness. The host socket applies every option.
+    /// targets and readiness, and refuse a send or receive timeout, which
+    /// Linux would apply in wall-clock time. The host socket applies every
+    /// other option, and fails a malformed timeout as Linux does.
     async fn network_setsockopt<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -855,6 +1233,21 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.network_refuse(
                 guest,
                 "network record/replay does not model TCP Fast Open",
+                UNSUPPORTED_REMEDY,
+            )
+            .await
+        }
+        if call.level() == libc::SOL_SOCKET
+            && TIMEOUT_OPTIONS.contains(&call.optname())
+            && call.optlen() as usize >= size_of::<libc::timeval>()
+            && let Some(value) = call.optval()
+            && let Ok(timeout) = guest.memory().read_value::<_, libc::timeval>(value.cast())
+            && sets_a_timeout(timeout)
+        {
+            self.network_refuse(
+                guest,
+                "network record/replay does not model socket send or receive timeouts \
+                 (SO_RCVTIMEO, SO_SNDTIMEO)",
                 UNSUPPORTED_REMEDY,
             )
             .await
@@ -1504,14 +1897,14 @@ mod tests {
         }
         for call in [&bind, &listen, &fast_open, &fast_open_option] {
             assert!(
-                reaches_network_outside_channel(call, InetStream),
+                reaches_network_outside_channel(call, InetStream { ipv6: false }),
                 "{call:?}"
             );
         }
         // An unconnected TCP socket fails these in Linux without a packet.
         for call in [&send, &read] {
             assert!(
-                !reaches_network_outside_channel(call, InetStream),
+                !reaches_network_outside_channel(call, InetStream { ipv6: false }),
                 "{call:?}"
             );
         }
@@ -1545,6 +1938,126 @@ mod tests {
             (libc::SOL_SOCKET, libc::SO_ERROR),
         ] {
             assert!(!is_configuration_option(level, name), "{level} {name}");
+        }
+    }
+
+    #[test]
+    fn ipv6_addresses_without_a_scope_id_are_traced_as_linux_accepts_them() {
+        let v6 = NetworkAddressV1::Inet6 {
+            address: [0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+            port: 443,
+            flowinfo: 0,
+            scope_id: 0,
+        };
+        let bytes = sockaddr_bytes(&v6);
+        assert_eq!(
+            address_from_sockaddr(&bytes[..SOCKADDR_IN6_RFC2133_LEN]),
+            Some(v6)
+        );
+        assert_eq!(
+            address_from_sockaddr(&bytes[..SOCKADDR_IN6_RFC2133_LEN - 1]),
+            None
+        );
+    }
+
+    #[test]
+    fn sockaddr_copy_in_follows_linux() {
+        use reverie::syscalls::LocalMemory;
+        let memory = LocalMemory::new();
+        let mut storage = [7u8; SOCKADDR_STORAGE_LEN + 1];
+        let address = AddrMut::from_ptr(storage.as_mut_ptr().cast::<libc::sockaddr>());
+        assert_eq!(read_sockaddr(&memory, address, 3), Ok(vec![7; 3]));
+        assert_eq!(read_sockaddr(&memory, None, 0), Ok(Vec::new()));
+        assert_eq!(read_sockaddr(&memory, None, 2), Err(Errno::EFAULT));
+        assert_eq!(read_sockaddr(&memory, address, -1), Err(Errno::EINVAL));
+        assert_eq!(
+            read_sockaddr(&memory, address, SOCKADDR_STORAGE_LEN as i32).map(|b| b.len()),
+            Ok(SOCKADDR_STORAGE_LEN)
+        );
+        assert_eq!(
+            read_sockaddr(&memory, address, SOCKADDR_STORAGE_LEN as i32 + 1),
+            Err(Errno::EINVAL)
+        );
+    }
+
+    #[test]
+    fn abstract_unix_addresses_are_recognised() {
+        let family = (libc::AF_UNIX as u16).to_ne_bytes();
+        let abstract_name = [family[0], family[1], 0];
+        let path = [family[0], family[1], b'/'];
+        assert!(names_abstract_unix_address(&abstract_name, 10, false));
+        assert!(!names_abstract_unix_address(&path, 10, false));
+        // A bare family autobinds to an abstract name, and fails a connect.
+        assert!(names_abstract_unix_address(&family, 2, true));
+        assert!(!names_abstract_unix_address(&family, 2, false));
+        let inet = (libc::AF_INET as u16).to_ne_bytes();
+        assert!(!names_abstract_unix_address(
+            &[inet[0], inet[1], 0],
+            16,
+            false
+        ));
+        assert!(!names_abstract_unix_address(&[], 0, true));
+    }
+
+    #[test]
+    fn rights_are_found_in_every_control_message() {
+        fn message(level: i32, kind: i32, fds: &[RawFd]) -> Vec<u8> {
+            let length = size_of::<libc::cmsghdr>() + size_of_val(fds);
+            let mut bytes = Vec::new();
+            bytes.extend_from_slice(&length.to_ne_bytes());
+            bytes.extend_from_slice(&level.to_ne_bytes());
+            bytes.extend_from_slice(&kind.to_ne_bytes());
+            fds.iter()
+                .for_each(|fd| bytes.extend_from_slice(&fd.to_ne_bytes()));
+            bytes.resize(length.next_multiple_of(size_of::<usize>()), 0);
+            bytes
+        }
+        let mut control = message(libc::SOL_SOCKET, libc::SCM_CREDENTIALS, &[1, 2, 3]);
+        control.extend(message(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[5]));
+        control.extend(message(libc::SOL_SOCKET, libc::SCM_RIGHTS, &[6, 7]));
+        assert_eq!(received_descriptors(&control), vec![5, 6, 7]);
+        // A truncated message carries nothing.
+        assert_eq!(received_descriptors(&control[..control.len() - 8]), vec![5]);
+        let mut zero_length = control.clone();
+        zero_length[..8].copy_from_slice(&0usize.to_ne_bytes());
+        assert_eq!(received_descriptors(&zero_length), Vec::<RawFd>::new());
+        assert_eq!(received_descriptors(&[]), Vec::<RawFd>::new());
+    }
+
+    #[test]
+    fn only_a_positive_timeout_sets_one() {
+        let timeout = |tv_sec, tv_usec| libc::timeval { tv_sec, tv_usec };
+        assert!(sets_a_timeout(timeout(1, 0)));
+        assert!(sets_a_timeout(timeout(0, 1)));
+        assert!(!sets_a_timeout(timeout(0, 0)));
+        assert!(!sets_a_timeout(timeout(-1, 5)));
+        assert!(!sets_a_timeout(timeout(1, 1_000_000)));
+        assert!(!sets_a_timeout(timeout(1, -1)));
+        for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
+            assert!(TIMEOUT_OPTIONS.contains(&option));
+        }
+    }
+
+    #[test]
+    fn signal_driven_io_requests_are_recognised() {
+        let fcntl = |cmd| Syscall::Fcntl(syscalls::Fcntl::new().with_cmd(cmd));
+        let ioctl = |request| Syscall::Ioctl(syscalls::Ioctl::new().with_request(request));
+        for call in [
+            fcntl(FcntlCmd::F_SETFL(libc::O_ASYNC | libc::O_NONBLOCK)),
+            fcntl(FcntlCmd::F_SETOWN),
+            fcntl(FcntlCmd::F_SETSIG(libc::SIGIO)),
+            ioctl(Request::FIOASYNC(None)),
+            ioctl(Request::FIOSETOWN(None)),
+            ioctl(Request::SIOCSPGRP(None)),
+        ] {
+            assert!(requests_signal_driven_io(&call), "{call:?}");
+        }
+        for call in [
+            fcntl(FcntlCmd::F_SETFL(libc::O_NONBLOCK)),
+            fcntl(FcntlCmd::F_GETFL),
+            ioctl(Request::FIONREAD(None)),
+        ] {
+            assert!(!requests_signal_driven_io(&call), "{call:?}");
         }
     }
 }

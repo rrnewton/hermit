@@ -17,7 +17,11 @@
  *
  * The other client modes each do one thing network record/replay must
  * refuse: end before sending the whole request, send with sendmsg or
- * sendfile, connect to the unspecified address, send UDP, or listen.
+ * sendfile, connect to the unspecified address, send UDP, or listen. The
+ * guard modes each try a way around the channel before any connection: a
+ * 24-byte IPv6 connect, a netlink socket, an abstract AF_UNIX connect, a
+ * socket receive timeout, an IPv4 socket received through SCM_RIGHTS, epoll
+ * registration, or signal-driven I/O.
  */
 
 #include <arpa/inet.h>
@@ -27,13 +31,16 @@
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/sendfile.h>
+#include <sys/epoll.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/uio.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -296,8 +303,100 @@ static struct sockaddr_in loopback_address(uint16_t port) {
 
 /* A client that each mode ends differently, all of them refused by network
  * record/replay. Returns only if no refusal ended the run. */
+/* Pass `fd` across a socket pair with SCM_RIGHTS and return the copy. */
+static int pass_descriptor(int fd) {
+  int pair[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) != 0)
+    fail("socketpair");
+  char byte = 'x';
+  struct iovec part = {.iov_base = &byte, .iov_len = 1};
+  union {
+    struct cmsghdr header;
+    char bytes[CMSG_SPACE(sizeof(int))];
+  } control;
+  memset(&control, 0, sizeof(control));
+  struct msghdr message = {.msg_iov = &part,
+                           .msg_iovlen = 1,
+                           .msg_control = control.bytes,
+                           .msg_controllen = sizeof(control.bytes)};
+  struct cmsghdr *header = CMSG_FIRSTHDR(&message);
+  header->cmsg_level = SOL_SOCKET;
+  header->cmsg_type = SCM_RIGHTS;
+  header->cmsg_len = CMSG_LEN(sizeof(int));
+  memcpy(CMSG_DATA(header), &fd, sizeof(int));
+  if (sendmsg(pair[0], &message, 0) != 1)
+    fail("sendmsg SCM_RIGHTS");
+  memset(&control, 0, sizeof(control));
+  message.msg_controllen = sizeof(control.bytes);
+  if (recvmsg(pair[1], &message, MSG_CMSG_CLOEXEC) != 1)
+    fail("recvmsg SCM_RIGHTS");
+  header = CMSG_FIRSTHDR(&message);
+  if (header == NULL || header->cmsg_type != SCM_RIGHTS)
+    fail_message("no descriptor received");
+  int received;
+  memcpy(&received, CMSG_DATA(header), sizeof(int));
+  return received;
+}
+
+/* Try one way around the channel; returns 1 if `mode` is not a guard mode. */
+static int run_guard_probe(uint16_t port, const char *mode) {
+  if (strcmp(mode, "ipv6-24") == 0) {
+    /* Linux accepts the RFC 2133 length, without sin6_scope_id. */
+    int fd = socket(AF_INET6, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_in6 address = {.sin6_family = AF_INET6,
+                                   .sin6_port = htons(port)};
+    if (fd < 0)
+      fail("socket ipv6");
+    if (connect(fd, (struct sockaddr *)&address, 24) != 0)
+      fail("connect ipv6-24");
+    return 0;
+  }
+  if (strcmp(mode, "netlink") == 0) {
+    if (socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, 0) < 0)
+      fail("socket netlink");
+    return 0;
+  }
+  if (strcmp(mode, "abstract") == 0) {
+    int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+    struct sockaddr_un address = {.sun_family = AF_UNIX};
+    static const char name[] = "hermit-network-replay-probe";
+    if (fd < 0)
+      fail("socket unix");
+    memcpy(address.sun_path + 1, name, sizeof(name) - 1);
+    connect(fd, (struct sockaddr *)&address,
+            offsetof(struct sockaddr_un, sun_path) + sizeof(name));
+    return 0;
+  }
+  /* Other modes must not open a socket here: replay matches sockets by
+     their creation order. */
+  if (strcmp(mode, "rcvtimeo") != 0 && strcmp(mode, "scm-rights") != 0 &&
+      strcmp(mode, "epoll") != 0 && strcmp(mode, "async") != 0)
+    return 1;
+  int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (fd < 0)
+    fail("socket guard");
+  if (strcmp(mode, "rcvtimeo") == 0) {
+    set_socket_timeouts(fd);
+  } else if (strcmp(mode, "scm-rights") == 0) {
+    pass_descriptor(fd);
+  } else if (strcmp(mode, "epoll") == 0) {
+    int epoll = epoll_create1(EPOLL_CLOEXEC);
+    struct epoll_event event = {.events = EPOLLIN};
+    if (epoll < 0)
+      fail("epoll_create1");
+    if (epoll_ctl(epoll, EPOLL_CTL_ADD, fd, &event) != 0)
+      fail("epoll_ctl");
+  } else {
+    if (fcntl(fd, F_SETFL, O_ASYNC) != 0)
+      fail("fcntl O_ASYNC");
+  }
+  return 0;
+}
+
 static int run_refused_client(const char *port_text, const char *mode) {
   set_deadline();
+  if (run_guard_probe(parse_port(port_text), mode) == 0)
+    return 0;
   struct sockaddr_in address = loopback_address(parse_port(port_text));
   if (strcmp(mode, "udp") == 0) {
     /* A resolver's IPv6 probe: creating and closing a socket stays allowed. */
@@ -353,7 +452,6 @@ static int run_client(const char *port_text, int mismatch) {
   int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (socket_fd < 0)
     fail("socket client");
-  set_socket_timeouts(socket_fd);
   int low_water = PAYLOAD_SIZE;
   if (setsockopt(socket_fd, SOL_SOCKET, SO_RCVLOWAT, &low_water,
                  sizeof(low_water)) != 0)
@@ -439,15 +537,18 @@ int main(int argc, char **argv) {
       return run_client(argv[2], 0);
     if (strcmp(argv[3], "mismatch") == 0)
       return run_client(argv[2], 1);
-    const char *refused[] = {"truncated", "sendmsg",  "sendfile",
-                             "unspecified", "udp", "listen"};
+    const char *refused[] = {"truncated", "sendmsg",    "sendfile", "unspecified",
+                             "udp",       "listen",     "ipv6-24",  "netlink",
+                             "abstract",  "rcvtimeo",   "scm-rights", "epoll",
+                             "async"};
     for (size_t index = 0; index < sizeof(refused) / sizeof(refused[0]); ++index)
       if (strcmp(argv[3], refused[index]) == 0)
         return run_refused_client(argv[2], argv[3]);
   }
   fprintf(stderr,
           "usage: %s controller PORT_FILE REPORT_FILE CONTACT_FILE | client PORT "
-          "match|mismatch|truncated|sendmsg|sendfile|unspecified|udp|listen\n",
+          "match|mismatch|truncated|sendmsg|sendfile|unspecified|udp|listen|"
+          "ipv6-24|netlink|abstract|rcvtimeo|scm-rights|epoll|async\n",
           argv[0]);
   return 2;
 }

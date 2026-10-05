@@ -339,6 +339,19 @@ fn assert_fails_naming(output: &Output, label: &str, required: &str) {
     );
 }
 
+/// Requires the policy-refusal exit status and output naming `reason` and
+/// `remedy`.
+fn assert_refused(output: &Output, label: &str, reason: &str, remedy: &str) {
+    assert_fails_naming(output, label, reason);
+    assert_fails_naming(output, label, remedy);
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "{label} did not exit with the policy-refusal status\n{}",
+        output_text(output)
+    );
+}
+
 #[test]
 fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     let fixture = &super::workload("c_network_replay_tcp_bracket").path;
@@ -480,12 +493,12 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
             fixture,
             &["client", &port, mode],
         );
-        assert_fails_naming(&refused, &label, reason);
-        assert_fails_naming(&refused, &label, remedy);
+        assert_refused(&refused, &label, reason, remedy);
     }
 
     // Record refuses, before touching the host, anything that would reach
-    // the network outside an outbound TCP channel. No server is listening.
+    // the network outside an outbound TCP channel, or the host's network
+    // namespace at all, or wait in wall-clock time. No server is listening.
     let record_refusals = [
         (
             "udp",
@@ -498,6 +511,38 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
             "--network=host",
         ),
         ("unspecified", "names no single host", "nonzero port"),
+        // A 24-byte IPv6 address, without sin6_scope_id, is still traced.
+        ("ipv6-24", "names no single host", "nonzero port"),
+        (
+            "netlink",
+            "does not model netlink sockets",
+            "--network=host",
+        ),
+        (
+            "abstract",
+            "does not model connect to an abstract AF_UNIX address",
+            "--network=host",
+        ),
+        (
+            "rcvtimeo",
+            "does not model socket send or receive timeouts",
+            "--network=host",
+        ),
+        (
+            "scm-rights",
+            "does not model a socket of address family 2 received through SCM_RIGHTS",
+            "--network=host",
+        ),
+        (
+            "epoll",
+            "does not model epoll registration of an IPv4 or IPv6 socket",
+            "--network=host",
+        ),
+        (
+            "async",
+            "does not model signal-driven I/O",
+            "--network=host",
+        ),
     ];
     for (mode, reason, remedy) in record_refusals {
         let label = format!("record-refuses-{mode}");
@@ -513,8 +558,7 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
             fixture,
             &["client", &port, mode],
         );
-        assert_fails_naming(&refused, &label, reason);
-        assert_fails_naming(&refused, &label, remedy);
+        assert_refused(&refused, &label, reason, remedy);
     }
 
     // A missing trace is refused before the guest starts.

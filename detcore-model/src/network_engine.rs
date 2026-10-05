@@ -125,9 +125,10 @@ pub enum NetworkEngineError {
     },
 }
 
-/// How long past an input's recorded arrival, in global time, replay waits
-/// for the guest to send the bytes that gate it before declaring that the
-/// guest diverged. Matches the host waits of record mode.
+/// How long past an input's recorded arrival, in global (virtual) time,
+/// replay waits for the guest to send the bytes that gate it before declaring
+/// that the guest diverged. It has the same length as the host waits of record
+/// mode, but those are wall-clock waits.
 pub const REPLAY_STALL_LIMIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The remedy for a replay whose guest did something other than what the
@@ -208,7 +209,9 @@ impl fmt::Display for NetworkEngineError {
             } => write!(
                 f,
                 "network replay stalled: {channel} is waiting for input that the recording \
-                 delivered after {needed} bytes were sent, but this replay has sent {sent}"
+                 delivered after {needed} bytes were sent, but this replay has sent {sent} \
+                 after {} seconds of virtual time past the recorded arrival",
+                REPLAY_STALL_LIMIT.as_secs()
             ),
             Self::ReplayUnconnected(id) => write!(
                 f,
@@ -612,13 +615,13 @@ impl NetworkEngine {
     ) -> Result<NetworkRecvOutcome, NetworkEngineError> {
         let channel = self.channel(id)?;
         channel.release(now);
-        if channel.shut_rd {
-            return Ok(NetworkRecvOutcome::Eof);
-        }
         let available = channel.rx.len();
+        // After `SHUT_RD` Linux still delivers the bytes already queued, then
+        // reports end of file without waiting.
         if available > 0
             && (available >= target.max(1)
                 || channel.input_ended()
+                || channel.shut_rd
                 || channel.pending_error.is_some())
         {
             let len = available.min(max_len);
@@ -634,7 +637,7 @@ impl NetworkEngine {
             if let Some(errno) = channel.pending_error.take() {
                 return Ok(NetworkRecvOutcome::Error(errno));
             }
-            if channel.input_ended() {
+            if channel.input_ended() || channel.shut_rd {
                 return Ok(NetworkRecvOutcome::Eof);
             }
         }
@@ -1216,6 +1219,27 @@ mod tests {
         assert_eq!(
             engine.readiness(id, at(1), 1).unwrap() & libc::POLLHUP,
             libc::POLLHUP
+        );
+    }
+
+    #[test]
+    fn shut_rd_delivers_queued_bytes_before_end_of_file() {
+        let mut engine = NetworkEngine::new_record(epoch());
+        let id = sock(0);
+        engine
+            .record_connect(id, peer(), local(), 0, false)
+            .unwrap();
+        engine
+            .record_arrival(id, at(1), NetworkArrival::Bytes(b"abc".to_vec()))
+            .unwrap();
+        assert_eq!(engine.shutdown(id, libc::SHUT_RD), Ok(0));
+        // A blocking receive whose target exceeds the queue still returns it.
+        assert_eq!(engine.recv(id, at(2), 64, 64, true), Ok(data(b"abc")));
+        assert_eq!(engine.recv(id, at(2), 2, 64, false), Ok(data(b"ab")));
+        assert_eq!(engine.recv(id, at(2), 64, 64, false), Ok(data(b"c")));
+        assert_eq!(
+            engine.recv(id, at(3), 64, 64, false),
+            Ok(NetworkRecvOutcome::Eof)
         );
     }
 

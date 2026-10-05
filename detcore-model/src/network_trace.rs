@@ -186,6 +186,12 @@ impl NetworkAddressV1 {
             }
             Self::Inet6 { address, .. } => {
                 let address = Ipv6Addr::from(*address);
+                // Linux connects an IPv4-mapped address over IPv4.
+                if let Some(mapped) = address.to_ipv4_mapped() {
+                    return mapped.is_unspecified()
+                        || mapped.is_multicast()
+                        || mapped.is_broadcast();
+                }
                 address.is_unspecified() || address.is_multicast()
             }
         }
@@ -924,6 +930,27 @@ mod tests {
         bytes.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         bytes.extend_from_slice(&payload);
         bytes
+    }
+
+    #[test]
+    fn traceable_peer_names_one_host_including_ipv4_mapped_addresses() {
+        let inet6 = |address: Ipv6Addr| NetworkAddressV1::Inet6 {
+            port: 80,
+            flowinfo: 0,
+            address: address.octets(),
+            scope_id: 0,
+        };
+        let mapped = |v4: Ipv4Addr| inet6(v4.to_ipv6_mapped());
+        assert!(mapped(Ipv4Addr::LOCALHOST).is_traceable_peer());
+        assert!(inet6(Ipv6Addr::LOCALHOST).is_traceable_peer());
+        for v4 in [
+            Ipv4Addr::UNSPECIFIED,
+            Ipv4Addr::BROADCAST,
+            Ipv4Addr::new(224, 0, 0, 1),
+        ] {
+            assert!(!mapped(v4).is_traceable_peer(), "{v4} names no single host");
+        }
+        assert!(!inet6(Ipv6Addr::UNSPECIFIED).is_traceable_peer());
     }
 
     #[test]

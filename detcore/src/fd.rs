@@ -79,8 +79,12 @@ pub(crate) enum NetworkSocketKind {
     /// Not an IPv4 or IPv6 socket, or no network trace mode was active.
     #[default]
     NotInet,
-    /// An IPv4 or IPv6 TCP stream socket.
-    InetStream,
+    /// An IPv4 or IPv6 TCP stream socket. `connect` checks the address
+    /// against the socket's family, as Linux does.
+    InetStream {
+        /// Whether the socket is `AF_INET6`.
+        ipv6: bool,
+    },
     /// Any other IPv4 or IPv6 socket, such as UDP or raw.
     InetOther,
 }

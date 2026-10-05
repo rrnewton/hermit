@@ -684,12 +684,20 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // network_trace::tests::network_trace_v2_* tests and ten
     // network_engine::tests (907 + 16 = 923).
     // Opt-in network record and replay
-    // (https://github.com/rrnewton/hermit/pull/3778) adds
-    // network_engine::tests::requests_record_pulls_at_the_time_they_answer and
-    // fd::tests::open_file_ids_display_their_kind_sequence_and_creator and
-    // retains all 923 prior identities (923 + 2 = 925, measured with
-    // cargo nextest list --profile ci).
-    ("test.regular_crates", 925),
+    // (https://github.com/rrnewton/hermit/pull/3778) adds ten tests and
+    // retains all 923 prior identities: eight network_engine::tests
+    // (requests_record_pulls_at_the_time_they_answer,
+    // shut_rd_delivers_queued_bytes_before_end_of_file,
+    // every_error_names_a_remedy,
+    // finished_replay_accepts_a_complete_run_even_with_input_unread,
+    // finished_replay_refuses_unsent_output_and_unmade_connections,
+    // record_refuses_a_peer_naming_no_single_host,
+    // replay_refuses_an_input_held_back_by_bytes_never_sent and
+    // replay_that_sends_what_gates_an_input_never_stalls),
+    // network_trace::tests::traceable_peer_names_one_host_including_ipv4_mapped_addresses
+    // and fd::tests::open_file_ids_display_their_kind_sequence_and_creator
+    // (923 + 10 = 933, measured with cargo nextest list --profile ci).
+    ("test.regular_crates", 933),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -900,14 +908,21 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_local::timeslice_tests::
     // child_cpu_publication_replacement_rejects_stale_owner_and_snapshot)
     // retain all 904 prior identities: measured 931 = 904 + 27.
-    // The six syscalls::network_trace::tests of
+    // The fourteen syscalls::network_trace::tests of
     // https://github.com/rrnewton/hermit/pull/3778 (sockaddr_round_trips_both_families,
     // sockaddr_matches_the_libc_layout, other_families_and_short_buffers_are_not_traced,
     // lowat_normalisation_follows_linux,
-    // poll_reports_requested_events_and_the_unmaskable_ones and
-    // host_pulls_classify_like_the_recorder) retain all 931 prior identities
-    // (the validate node at 27ee682e6475 executed 937, all passing).
-    ("test.detcore_unit", 937),
+    // poll_reports_requested_events_and_the_unmaskable_ones,
+    // host_pulls_classify_like_the_recorder,
+    // sockets_outside_a_channel_are_refused_only_where_they_reach_the_network,
+    // a_channel_admits_only_descriptor_and_configuration_calls,
+    // ipv6_addresses_without_a_scope_id_are_traced_as_linux_accepts_them,
+    // sockaddr_copy_in_follows_linux, abstract_unix_addresses_are_recognised,
+    // rights_are_found_in_every_control_message,
+    // only_a_positive_timeout_sets_one and
+    // signal_driven_io_requests_are_recognised) retain all 931 prior
+    // identities (931 + 14 = 945, measured with cargo nextest list --profile ci).
+    ("test.detcore_unit", 945),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1140,9 +1155,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3226): 881 + 23 = 904.
     // The same 27 https://github.com/rrnewton/hermit/pull/3266 tests as
     // test.detcore_unit retain all 904 prior identities: measured 931.
-    // The same six https://github.com/rrnewton/hermit/pull/3778 tests retain
-    // all 931.
-    ("test.detcore_unit_on_host", 937),
+    // The same fourteen https://github.com/rrnewton/hermit/pull/3778 tests
+    // retain all 931: 931 + 14 = 945.
+    ("test.detcore_unit_on_host", 945),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1236,9 +1251,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // so 899 of the 902 prior identities are retained (+3).
     // The two timed-out-match stress_series tests listed there: 905 + 2 = 907.
     // The 16 https://github.com/rrnewton/hermit/pull/3777 tests listed there
-    // retain all 907, and the two https://github.com/rrnewton/hermit/pull/3778
-    // tests listed there retain all 923.
-    ("test.regular_crates_on_host", 925),
+    // retain all 907, and the ten https://github.com/rrnewton/hermit/pull/3778
+    // tests listed there retain all 923: 923 + 10 = 933.
+    ("test.regular_crates_on_host", 933),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
