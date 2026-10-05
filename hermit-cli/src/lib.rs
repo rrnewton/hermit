@@ -2509,13 +2509,11 @@ fn prepare_kvm_mountinfo_config(
 /// checks: `set_file_times` confirms that `utimensat` stored the requested
 /// mtime. KVM replaces those timestamps with a fixed value unless the run asks
 /// for the stored ones. The backend refuses this setting unless Detcore owns
-/// every guest thread. The stored values sit in the guest's buffer until
-/// Detcore rewrites them, so the run must also sequentialize threads: then no
-/// other guest thread runs in that interval.
+/// every guest thread, which `run_kvm` never opts out of. The stored values sit
+/// in the guest's buffer until Detcore rewrites them, so the run must also
+/// sequentialize threads: then no other guest thread runs in that interval.
 fn kvm_reports_stored_metadata_timestamps(config: &DetConfig) -> bool {
-    config.virtualize_metadata
-        && config.backend_dispatches_thread_tools
-        && config.sequentialize_threads
+    config.virtualize_metadata && config.sequentialize_threads
 }
 
 /// Dispatch a command onto the real reverie-kvm Tool runtime.
@@ -2622,19 +2620,14 @@ async fn run_kvm(
     backend
         .set_random_seed(random_seed)
         .map_err(|error| anyhow!("failed to configure KVM guest random seed: {error}"))?;
-    // The KVM backend now defaults to Tool-owned guest threads: CLONE_THREAD
+    // The KVM backend defaults to Tool-owned guest threads: CLONE_THREAD
     // workers are driven through the Detcore tool loop and their futex/CLEARTID
     // synchronization routes to Detcore, matching the golden ptrace model
-    // ("follow children"). Detcore's own clone logic treats a CLONE_THREAD as
-    // backend-uninstrumented iff `backend_dispatches_thread_tools` is false (see
-    // detcore/src/syscalls/threads.rs), so in exactly that case opt the backend
-    // out to host-owned threads to keep worker execution and futex ownership in
-    // one synchronization domain (mixing them deadlocks pthread_join). In the
-    // default (true) case the backend already follows children, so no call is
-    // needed.
-    if !config.backend_dispatches_thread_tools {
-        backend.unmonitored_threads();
-    }
+    // ("follow children"). Detcore registers every cloned thread as a tool
+    // thread (detcore/src/syscalls/threads.rs), so the backend must stay in
+    // that mode: host-owned threads would split worker execution and futex
+    // ownership across two synchronization domains, which deadlocks
+    // pthread_join.
     if kvm_reports_stored_metadata_timestamps(&config) {
         backend
             .set_host_metadata_timestamps(true)
@@ -2738,6 +2731,290 @@ fn dbt_client_thread_start_failed(status: &std::process::ExitStatus) -> bool {
     status.code() == Some(reverie_dbt::CLIENT_THREAD_START_FAILURE_EXIT_CODE)
 }
 
+/// Keys that `HERMIT_DBT_DETCONFIG` still carries although [`DetConfig`] no
+/// longer has the switches they named. Each entry is the key, its fixed value,
+/// and the key it preceded in the old field order.
+///
+/// These are serialization constants. Nothing reads them back: the DBT runtime
+/// deserializes the variable into [`DetConfig`], which ignores unknown keys.
+/// The values are the only ones the deleted switches ever took on any backend.
+const LEGACY_DBT_DETCONFIG_KEYS: [(&str, bool, &str); 3] = [
+    (
+        "use_thread_local_clock_reads",
+        false,
+        "detect_host_clock_futex_timeouts",
+    ),
+    (
+        "backend_serializes_fork_children",
+        false,
+        "backend_tracks_process_children",
+    ),
+    (
+        "backend_dispatches_thread_tools",
+        true,
+        "backend_tracks_process_children",
+    ),
+];
+
+/// Serialize `config` for the DBT runtime's `HERMIT_DBT_DETCONFIG` variable.
+///
+/// This is not plain `serde_json::to_string` because the variable sits in the
+/// guest's own environment. A guest can read it through `getenv`, `printenv`
+/// or `/proc/self/environ`, so its bytes are guest-visible. Deleting three
+/// always-constant switches from [`DetConfig`] would otherwise have shortened
+/// the variable by 117 bytes and changed what every DBT guest observes. The
+/// keys in `LEGACY_DBT_DETCONFIG_KEYS` are re-inserted at their old
+/// positions, so the output is byte-identical to what the same config produced
+/// before the deletion. That is pinned by golden bytes in the tests below.
+///
+/// Remove this shim when the config reaches the DBT runtime through a private
+/// channel that is stripped before the guest starts. SaBRe already works that
+/// way: its plugin receives the config over the coordinator RPC handshake and
+/// removes its own variables with `take_private_env` before guest code runs.
+/// After that, the variable is no longer guest-visible and its bytes stop
+/// mattering.
+#[doc(hidden)]
+pub fn dbt_detconfig_json(config: &DetConfig) -> serde_json::Result<String> {
+    insert_legacy_dbt_detconfig_keys(&serde_json::to_string(config)?)
+}
+
+/// Re-insert [`LEGACY_DBT_DETCONFIG_KEYS`] into a serialized [`DetConfig`].
+///
+/// The insertion works on the parsed top-level object, never on substrings,
+/// so string values that happen to contain a key name cannot move it. It
+/// refuses, rather than guessing, when an anchor key is missing or repeated or
+/// when a legacy key is already present.
+fn insert_legacy_dbt_detconfig_keys(serialized: &str) -> serde_json::Result<String> {
+    use serde::de::MapAccess;
+    use serde::ser::Error as _;
+    use serde::ser::SerializeMap;
+    use serde_json::value::RawValue;
+
+    /// The top-level members of a JSON object in document order, each value
+    /// kept as its exact serialized bytes.
+    struct Members<'a>(Vec<(&'a str, &'a RawValue)>);
+
+    impl<'de> serde::Deserialize<'de> for Members<'de> {
+        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+            struct MembersVisitor;
+            impl<'de> serde::de::Visitor<'de> for MembersVisitor {
+                type Value = Members<'de>;
+                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                    formatter.write_str("a serialized Detcore config object")
+                }
+                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                    let mut members = Vec::new();
+                    while let Some(member) = map.next_entry()? {
+                        members.push(member);
+                    }
+                    Ok(Members(members))
+                }
+            }
+            deserializer.deserialize_map(MembersVisitor)
+        }
+    }
+
+    impl serde::Serialize for Members<'_> {
+        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+            let mut map = serializer.serialize_map(None)?;
+            for (key, value) in &self.0 {
+                for (legacy_key, fixed_value, anchor) in LEGACY_DBT_DETCONFIG_KEYS {
+                    if anchor == *key {
+                        map.serialize_entry(legacy_key, &fixed_value)?;
+                    }
+                }
+                map.serialize_entry(key, value)?;
+            }
+            map.end()
+        }
+    }
+
+    let members: Members<'_> = serde_json::from_str(serialized)?;
+    for (legacy_key, _, anchor) in LEGACY_DBT_DETCONFIG_KEYS {
+        let anchors = members.0.iter().filter(|(key, _)| *key == anchor).count();
+        if anchors != 1 {
+            return Err(serde_json::Error::custom(format!(
+                "cannot place legacy DBT config key {legacy_key:?}: its anchor key {anchor:?} \
+                 appears {anchors} times, expected exactly once"
+            )));
+        }
+        if members.0.iter().any(|(key, _)| *key == legacy_key) {
+            return Err(serde_json::Error::custom(format!(
+                "legacy DBT config key {legacy_key:?} is already present; it must come only \
+                 from the fixed legacy table"
+            )));
+        }
+    }
+    serde_json::to_string(&members)
+}
+
+#[cfg(test)]
+mod dbt_detconfig_tests {
+    use std::path::PathBuf;
+
+    use clap::Parser;
+    use detcore_model::config::MountInfoRootRewrite;
+
+    use super::Backend;
+    use super::DetConfig;
+    use super::dbt_detconfig_json;
+    use super::insert_legacy_dbt_detconfig_keys;
+    use super::prepare_backend_config;
+
+    /// `HERMIT_DBT_DETCONFIG` bytes for each config below, captured with
+    /// `serde_json::to_string` from a build of
+    /// 806cf2fa38d13b806195d54aeba22d282d79f33d, which still had the legacy
+    /// switches. Any later change to `DetConfig`'s serialized fields also
+    /// changes this guest-visible variable, so this test is meant to fail on
+    /// it and make that change a deliberate one.
+    const GOLDEN: [(&str, &str); 3] = [
+        (
+            "default",
+            include_str!("../tests/fixtures/dbt/detconfig-806cf2fa-default.json"),
+        ),
+        (
+            "dbt",
+            include_str!("../tests/fixtures/dbt/detconfig-806cf2fa-dbt.json"),
+        ),
+        (
+            "rich_dbt",
+            include_str!("../tests/fixtures/dbt/detconfig-806cf2fa-rich_dbt.json"),
+        ),
+    ];
+
+    /// `Config::default()` with its three environment-backed fields
+    /// (`HERMIT_EPOCH`, `HERMIT_PRNG`, `HERMIT_SCHED_SEED`) pinned, so the
+    /// result does not depend on the test process's environment.
+    fn env_free(epoch: &str, seed: &str) -> DetConfig {
+        let mut config = DetConfig::parse_from(["hermit", epoch, seed, "--sched-seed=0"]);
+        config.sched_seed = None;
+        config
+    }
+
+    fn default_config() -> DetConfig {
+        env_free("--epoch=2026-01-01T00:00:00Z", "--seed=0")
+    }
+
+    /// Non-default values in fields that serialize as strings, floats,
+    /// options, and nested arrays. The path holds legacy anchor key names, so
+    /// a substring-based insertion would put a key inside a string value.
+    fn rich_config() -> DetConfig {
+        let mut config = env_free("--epoch=2000-12-31T23:59:59Z", "--seed=7");
+        config.rng_seed = Some(13);
+        config.sched_seed = Some(11);
+        config.clock_multiplier = Some(1.5);
+        config.chaos = true;
+        config.record_preemptions_to = Some(PathBuf::from(
+            "/tmp/a,\"detect_host_clock_futex_timeouts\":true,\"backend_tracks_process_children\":{",
+        ));
+        config.mountinfo_root_rewrites = vec![MountInfoRootRewrite {
+            raw_mount_id: 41,
+            deterministic_root: b"/".to_vec(),
+            raw_root_prefix: Some(b"/tmp/x".to_vec()),
+            deterministic_root_prefix: Some(b"/tmp".to_vec()),
+            raw_mountpoint_prefix: None,
+            deterministic_mountpoint_prefix: None,
+        }];
+        config.stacktrace_event = vec![(3, Some(PathBuf::from("/s")))];
+        config
+    }
+
+    fn cases() -> [(&'static str, DetConfig); 3] {
+        [
+            ("default", default_config()),
+            (
+                "dbt",
+                prepare_backend_config(default_config(), Backend::Dbt),
+            ),
+            (
+                "rich_dbt",
+                prepare_backend_config(rich_config(), Backend::Dbt),
+            ),
+        ]
+    }
+
+    #[test]
+    fn default_case_is_config_default_with_pinned_environment_fields() {
+        let pinned = default_config();
+        let from_default = DetConfig {
+            epoch: pinned.epoch,
+            seed: pinned.seed,
+            sched_seed: pinned.sched_seed,
+            ..DetConfig::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&from_default).unwrap(),
+            serde_json::to_string(&pinned).unwrap()
+        );
+    }
+
+    #[test]
+    fn dbt_detconfig_matches_806cf2fa_bytes() {
+        for ((name, config), (golden_name, golden)) in cases().into_iter().zip(GOLDEN) {
+            assert_eq!(name, golden_name);
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert_eq!(
+                encoded, golden,
+                "HERMIT_DBT_DETCONFIG for the {name} config differs from the 806cf2fa bytes"
+            );
+        }
+    }
+
+    /// The DBT runtime deserializes the variable into `DetConfig` and falls
+    /// back to its default config on a parse error. The legacy keys must be
+    /// accepted and ignored, so the runtime sees exactly the config that was
+    /// encoded.
+    #[test]
+    fn dbt_detconfig_decodes_to_the_encoded_config() {
+        for (name, config) in cases() {
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            let decoded: DetConfig = serde_json::from_str(&encoded)
+                .unwrap_or_else(|error| panic!("{name}: DBT config does not decode: {error}"));
+            assert_eq!(
+                serde_json::to_string(&decoded).unwrap(),
+                serde_json::to_string(&config).unwrap(),
+                "{name}: decoded config differs from the encoded one"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_key_insertion_refuses_a_missing_repeated_or_present_key() {
+        let complete = r#"{"a":1,"detect_host_clock_futex_timeouts":false,"backend_tracks_process_children":true}"#;
+        assert_eq!(
+            insert_legacy_dbt_detconfig_keys(complete).unwrap(),
+            concat!(
+                r#"{"a":1,"use_thread_local_clock_reads":false,"#,
+                r#""detect_host_clock_futex_timeouts":false,"#,
+                r#""backend_serializes_fork_children":false,"#,
+                r#""backend_dispatches_thread_tools":true,"#,
+                r#""backend_tracks_process_children":true}"#,
+            )
+        );
+
+        let missing = r#"{"detect_host_clock_futex_timeouts":false}"#;
+        let error = insert_legacy_dbt_detconfig_keys(missing).unwrap_err();
+        assert!(
+            error.to_string().contains("appears 0 times"),
+            "unexpected error: {error}"
+        );
+
+        let repeated = r#"{"detect_host_clock_futex_timeouts":false,"detect_host_clock_futex_timeouts":false,"backend_tracks_process_children":true}"#;
+        let error = insert_legacy_dbt_detconfig_keys(repeated).unwrap_err();
+        assert!(
+            error.to_string().contains("appears 2 times"),
+            "unexpected error: {error}"
+        );
+
+        let present = r#"{"use_thread_local_clock_reads":true,"detect_host_clock_futex_timeouts":false,"backend_tracks_process_children":true}"#;
+        let error = insert_legacy_dbt_detconfig_keys(present).unwrap_err();
+        assert!(
+            error.to_string().contains("already present"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-737): Review public DBT dispatch and child environment ownership.
 /// Dispatch a command onto the Detcore-linked reverie-dbt runtime.
@@ -2755,7 +3032,7 @@ async fn run_dbt(
         ));
     }
 
-    let config_json = serde_json::to_string(&config)
+    let config_json = dbt_detconfig_json(&config)
         .map_err(|error| anyhow!("failed to serialize the Detcore config for DBT: {error}"))?;
     let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
     let (drrun, client) = detcore_dbt::prepare_native_client()
@@ -2970,11 +3247,20 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     let in_guest_liteinst =
         backend == Backend::Liteinst && liteinst_runtime == LiteinstRuntime::InGuest;
     config.discover_live_file_metadata = backend == Backend::Sabre;
-    // Guest-visible wall and monotonic clocks must stay in the same global
-    // virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
-    // per-thread execution clock does not advance when the scheduler skips
-    // global time while a thread is blocked.
-    config.use_thread_local_clock_reads = false;
+    // Three properties hold on every backend, so Config carries no switch for
+    // them:
+    // - Guest-visible wall and monotonic clocks stay in the same global
+    //   virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
+    //   per-thread execution clock does not advance when the scheduler skips
+    //   global time while a thread is blocked.
+    // - A forked process child runs concurrently with its parent. Detcore
+    //   blocks the parent only for CLONE_VFORK.
+    // - Detcore dispatches every cloned thread's syscalls through its tool.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(PR-845): Review backend-local guest clock observations.
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
+    // TODO-HUMAN-REVIEW(PR-1013): Review backend thread callback coverage.
+    // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
     config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
     // Wake pending RPCs on logical removal, reject stale requests, and account
@@ -2986,9 +3272,6 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     config.cancel_killed_thread_rpcs =
         in_guest_liteinst || matches!(backend, Backend::Sabre | Backend::Dbt | Backend::Kvm);
     config.backend_reports_physical_process_exits = backend == Backend::Sabre;
-    // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
-    config.backend_serializes_fork_children = false;
-    config.backend_dispatches_thread_tools = true;
     config.backend_tracks_process_children = backend != Backend::Dbt;
     // Ptrace reports the task exit after Linux has atomically updated every
     // robust owner word. DBT and SaBRe report tool exit before executing the
@@ -5337,13 +5620,10 @@ mod tests {
         let config = super::DetConfig::default();
         let sabre = prepare_backend_config(config.clone(), Backend::Sabre);
         assert!(sabre.discover_live_file_metadata);
-        assert!(!sabre.use_thread_local_clock_reads);
         assert!(sabre.detect_host_clock_futex_timeouts);
         assert!(sabre.syscall_clobbers_virtualized_by_backend);
         assert!(sabre.cancel_killed_thread_rpcs);
         assert!(sabre.backend_reports_physical_process_exits);
-        assert!(!sabre.backend_serializes_fork_children);
-        assert!(sabre.backend_dispatches_thread_tools);
         assert!(sabre.backend_tracks_process_children);
         assert!(!sabre.backend_runs_exit_robust_list);
         assert!(!sabre.backend_requires_thread_directed_process_signals);
@@ -5351,13 +5631,10 @@ mod tests {
         assert!(!sabre.backend_defers_vfork_child_registration);
         let ptrace = prepare_backend_config(config, Backend::Ptrace);
         assert!(!ptrace.discover_live_file_metadata);
-        assert!(!ptrace.use_thread_local_clock_reads);
         assert!(!ptrace.detect_host_clock_futex_timeouts);
         assert!(!ptrace.syscall_clobbers_virtualized_by_backend);
         assert!(!ptrace.cancel_killed_thread_rpcs);
         assert!(!ptrace.backend_reports_physical_process_exits);
-        assert!(!ptrace.backend_serializes_fork_children);
-        assert!(ptrace.backend_dispatches_thread_tools);
         assert!(ptrace.backend_tracks_process_children);
         assert!(ptrace.backend_runs_exit_robust_list);
         assert!(!ptrace.backend_requires_thread_directed_process_signals);
@@ -5375,7 +5652,6 @@ mod tests {
             },
             Backend::Kvm,
         );
-        assert!(sequential.backend_dispatches_thread_tools);
         assert!(super::kvm_reports_stored_metadata_timestamps(&sequential));
 
         // Another guest thread could read the stored values before Detcore
@@ -5389,19 +5665,10 @@ mod tests {
         // Nothing rewrites the stored values.
         let host_metadata = super::DetConfig {
             virtualize_metadata: false,
-            ..sequential.clone()
-        };
-        assert!(!super::kvm_reports_stored_metadata_timestamps(
-            &host_metadata
-        ));
-
-        // The backend owns the threads, so no Detcore rewrite runs on them.
-        let host_threads = super::DetConfig {
-            backend_dispatches_thread_tools: false,
             ..sequential
         };
         assert!(!super::kvm_reports_stored_metadata_timestamps(
-            &host_threads
+            &host_metadata
         ));
     }
 
@@ -5420,8 +5687,6 @@ mod tests {
         let kvm = prepare_backend_config(config, Backend::Kvm);
         assert!(kvm.cancel_killed_thread_rpcs);
         assert!(kvm.kvm_shared_dequeue_timers);
-        assert!(!kvm.backend_serializes_fork_children);
-        assert!(kvm.backend_dispatches_thread_tools);
         assert!(kvm.backend_tracks_process_children);
         assert!(!kvm.backend_runs_exit_robust_list);
         assert!(!kvm.backend_requires_thread_directed_process_signals);
