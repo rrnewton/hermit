@@ -58,7 +58,6 @@ pselect6_simulation	none-recorded	No reason was recorded when this binary was le
 ptrace_refusal	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 random_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 random_uuid_determinism	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
-record_replay	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 redis_strict	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 relaxed_flag_matrix	none-recorded	No reason was recorded when this binary was left out of the CI DAG.
 remap_file_pages_refusal	none-recorded	No reason was recorded when this binary was left out of the CI DAG.

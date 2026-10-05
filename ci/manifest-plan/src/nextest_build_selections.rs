@@ -268,7 +268,7 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "pselect6_simulation",
         ]),
-        "super.record_replay_matrix_diagnostic" => Some(&[
+        "test.record_replay" | "super.record_replay_matrix_diagnostic" => Some(&[
             "-p",
             "hermit",
             "--features",

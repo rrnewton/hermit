@@ -137,6 +137,7 @@ pub(super) const NEXTEST_RESULT_PRODUCERS: &[&str] = &[
     "test.arbitrary_binaries",
     "test.cli",
     "test.cli_on_host",
+    "test.record_replay",
     "test.command_strict_verify",
     "test.detcore_misc",
     "test.detcore_parallel",
@@ -1005,6 +1006,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // prior identities.
     ("test.hermit_integration", 195),
     ("test.arbitrary_binaries", 4),
+    // Every record_replay identity but record_node_eventfd_epoll_sequence
+    // (`cargo nextest list` lists 94; the --skip waiver of
+    // https://github.com/rrnewton/hermit/issues/3782 leaves 93).
+    ("test.record_replay", 93),
     // Seven proc-fallback, warning, and record/replay tests retain all 80
     // selected identities under the unchanged shipped CLI skip filters.
     // The successful-exec POSIX timer regression retains all 87 prior CLI cases.
@@ -3887,6 +3892,38 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         engine_only: false,
         timeout: 900,
         cpu_timeout: 7200,
+        jobs_flag: None,
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"test"########,
+        job: r########"record_replay"########,
+        desc: r########"Record/replay integration tests"########,
+        description: r########"Runs every test in hermit-cli/tests/record_replay.rs except one, 93 of its 94 Nextest identities, on one thread in the pinned root. Most tests run `hermit record start --verify` (some with --strict --verify-strict and a --verify-json verdict, some as separate record and `replay --autopilot` invocations) under a `timeout --kill-after=5s 45s` wrapper with --record-timeout=30, against the C and Rust workloads that build.workspace_in_pinned_root prepares and the prepared Nextest runner names in HERMIT_PREPARED_RECORD_WORKLOADS, and against host programs such as sh, bash, find, sqlite3 and coreutils pipelines; they require exit 0 and "Success: replay matched recording.", and the strict ones require verified and bitwise_parity in the verdict. They protect record/replay of file-system side effects, fork and exec chains, pipes, poll, select, ppoll and pselect copy-outs, futexes, clocks and RDTSC; record timeouts that kill the guest and its descendants without committing a partial recording; replay bootstrap from the recorded executable and interpreter; refusal of an unsupported syscall by name in both phases; and replay output that cannot create a host file through /proc/<pid>/root or truncate stdout through /dev/fd. Seven record_workloads unit tests check how those workloads are built and handed over, including that a consumer refuses a prepared workload whose bytes, path or alias set changed after preparation. record_replay_matrix is also what super.record_replay_matrix_diagnostic runs alone. Record/replay does not enable PMU preemption, so the node needs no performance counters. A replay that diverges from its recording, a recording or replay that hangs until its timeout, a prepared workload that fails that check, or a run that executes other than 93 tests fails the node. WAIVER: `--skip record_node_eventfd_epoll_sequence` excludes the one test that records and replays `node -e console.log(42)` under --backend=ptrace --strict --verify --verify-strict. At hermit d1744e9fc07e it diverges deterministically at scheduler turn 144: the recording commits DetPid(3) there, while the replay first reschedules the backgrounded DetPid(5) and commits it, so the INFO log comparison stops at that line and Hermit exits 1 (https://github.com/rrnewton/hermit/issues/3782). Run alone with this node's runner, the test fails and the runner exits 100. Remove the skip and raise the expected count to 94 when that issue is fixed. MEASURED 2026-10-05 on devbig030 at hermit d1744e9fc07e, outside the pinned root, with the debug-profile Hermit that `cargo nextest run -p hermit --features third-party-backends --test record_replay -j 1 -- --skip record_node_eventfd_epoll_sequence` builds (this node runs the validate-profile build instead): 93 passed in two runs. The first, under /usr/bin/time -v, took 239.6 s wall and 284.8 CPU-s and peaked at 1.37 GiB in one process, because the standalone test compiled its record workloads on first use, which this prepared node never does. The second, with those workloads cached, ran in a systemd user unit with memory accounting: 210.8 s wall, 204.4 CPU-s, cgroup memory peak 378.5 MiB. est_duration_s is the larger wall. The 1-GiB baseline rounds the cgroup peak up and the 3-GiB hard cap adds 2 GiB. The 600-second wall timeout is 1.5 times the larger wall rounded up to the next 300-second bucket; the 900-second CPU cap is one bucket more than that rule gives for 284.8 CPU-s, because neither sample ran in the pinned root."########,
+        labels: &[r########"full"########, r########"portable"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test record_replay -j 1 -- --skip record_node_eventfd_epoll_sequence"########,
+        cmdtype: CmdType::Unknown,
+        manifest: None,
+        integration_test_binaries: Some(&[r########"record_replay"########]),
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"setup.nextest"########,
+        ],
+        env: &[],
+        hint: HintSpec {
+            resources: &[],
+            est_duration_s: 240.0,
+            rss_baseline_bytes: Some(1073741824),
+            hard_mem_max_bytes: Some(3221225472),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: None,
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 600,
+        cpu_timeout: 900,
         jobs_flag: None,
         jobs_env: None,
     },

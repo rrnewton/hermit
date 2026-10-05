@@ -281,6 +281,7 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "test.detcore_time",
     "test.hermit_integration",
     "test.arbitrary_binaries",
+    "test.record_replay",
     "test.cli",
     "test.isolated_dbt_workdir",
     "test.isolated_detcore_workdir",
@@ -385,6 +386,10 @@ struct Profile {
 // tests_time cases that need a PMU left test.detcore_time and its hosted twin
 // (https://github.com/rrnewton/hermit/issues/3663): 87/88 before. portable and
 // hosted-portable are unchanged because the node carries only the full label.
+// full and portable then gained test.record_replay, the first node to run
+// hermit-cli/tests/record_replay.rs outside the super diagnostics: 88/89 and
+// 74/75 before. hosted-portable is unchanged because the node has no hosted
+// twin.
 // full-buck-e2e is only the Buck E2E nodes; a Buck full run selects it with a
 // pruned full (buck_e2e_selection), which assert_buck_e2e_selection counts.
 const PROFILES: [Profile; 12] = [
@@ -392,16 +397,17 @@ const PROFILES: [Profile; 12] = [
     // its twin test.liteinst_strict_on_host, and super lost
     // super.liteinst_python3_verify_diagnostics when the LiteInst host hybrid
     // was retired (https://github.com/rrnewton/hermit/issues/3520): 88/89,
-    // 74/75, 68/68 and 56/57 before.
+    // 74/75, 68/68 and 56/57 before. full and portable each gained
+    // test.record_replay afterwards: 87/88 and 73/74 before.
     Profile {
         label: "full",
-        direct_steps: 87,
-        selected_steps: 88,
+        direct_steps: 88,
+        selected_steps: 89,
     },
     Profile {
         label: "portable",
-        direct_steps: 73,
-        selected_steps: 74,
+        direct_steps: 74,
+        selected_steps: 75,
     },
     Profile {
         label: "quick",
@@ -2081,10 +2087,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // the 16 Buck import twins. 133 since test.liteinst_strict, its hosted
     // twin, liteinst.strict and super.liteinst_python3_verify_diagnostics
     // were retired with the LiteInst host hybrid
-    // (https://github.com/rrnewton/hermit/issues/3520).
-    if expected.len() != 133 {
+    // (https://github.com/rrnewton/hermit/issues/3520). 134 since
+    // test.record_replay joined the Nextest producers.
+    if expected.len() != 134 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 133",
+            "structured result producer registry has {} entries, expected 134",
             expected.len()
         ));
     }
@@ -2096,10 +2103,11 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // 43 since privileged-test.pmu_detcore_time_cases joined it
     // (https://github.com/rrnewton/hermit/issues/3663). 41 since
     // test.liteinst_strict and test.liteinst_strict_on_host were retired with
-    // the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520).
-    if expected_counts.len() != 41 {
+    // the LiteInst host hybrid (https://github.com/rrnewton/hermit/issues/3520);
+    // 42 since test.record_replay joined it.
+    if expected_counts.len() != 42 {
         return Err(format!(
-            "Nextest expected-count registry has {} entries, expected 41",
+            "Nextest expected-count registry has {} entries, expected 42",
             expected_counts.len()
         ));
     }
@@ -2234,8 +2242,9 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // the 16 Buck import twins. Nextest 68 since test.liteinst_strict, its
     // hosted twin, liteinst.strict and super.liteinst_python3_verify_diagnostics
     // were retired with the LiteInst host hybrid
-    // (https://github.com/rrnewton/hermit/issues/3520).
-    if actual_group_counts != [68, 56, 7, 2] {
+    // (https://github.com/rrnewton/hermit/issues/3520), and 69 with
+    // test.record_replay.
+    if actual_group_counts != [69, 56, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -3011,9 +3020,10 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // (https://github.com/rrnewton/hermit/issues/3520): test.liteinst_strict,
     // test.liteinst_strict_on_host, liteinst.strict, liteinst.hermit_release,
     // liteinst.runtime and super.liteinst_python3_verify_diagnostics (436 - 6).
-    if cfg.steps.len() != 430 {
+    // 431 with test.record_replay (430 + 1).
+    if cfg.steps.len() != 431 {
         return Err(format!(
-            "superset has {} steps, expected 430",
+            "superset has {} steps, expected 431",
             cfg.steps.len()
         ));
     }
@@ -5186,12 +5196,13 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         assert_buck_e2e_selection(&committed, &cells).unwrap();
-        // 88 full nodes (89 before test.liteinst_strict was retired with the
-        // LiteInst host hybrid, https://github.com/rrnewton/hermit/issues/3520;
-        // 87 before test.detcore_time joined full, 88 before
+        // 89 full nodes (88 before test.record_replay joined full, 89 before
+        // test.liteinst_strict was retired with the LiteInst host hybrid,
+        // https://github.com/rrnewton/hermit/issues/3520; 87 before
+        // test.detcore_time joined full, 88 before
         // privileged-test.pmu_detcore_time_cases did) - 22 replaced + 18
         // full-buck-e2e nodes.
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 84);
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 85);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
