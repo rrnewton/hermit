@@ -77,9 +77,11 @@ cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p de
 cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
     --features hermit/third-party-backends --target-dir "$target_dir"
 # hermit-install's build script stages install_pkg/ next to the profile directories and
-# links libdetcore_sabre.so into it (`--bin hermit` above filters both packages out).
+# links libdetcore_sabre.so and libdetcore_liteinst.so into it (`--bin hermit` above
+# filters these packages out). The links resolve only when this invocation also builds
+# both cdylibs; publish-hermit-e2e-artifact.sh requires every one of them.
 cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
-    --target-dir "$target_dir"
+    -p detcore-liteinst --target-dir "$target_dir"
 mkdir -p "$staged/bin"
 for b in test-harness hermit-manifest-plan; do
     strip --strip-debug -o "$staged/bin/$b" "$target_dir/release/$b"
