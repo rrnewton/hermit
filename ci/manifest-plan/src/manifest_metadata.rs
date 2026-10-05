@@ -288,8 +288,19 @@ fn cell_metadata(cell: &SelectedCell, selected_by_full: bool) -> Result<CellMeta
             ),
         )
     };
-    let (current_reproducer, current_reproducer_unavailable_reason) =
-        exact_cell_reproducer(&cell.id.test, &cell.id.mode, &backend, cell.enabled);
+    // The run types the harness's own selection gives this cell; a cell of
+    // any but the default one is selected only with `--label`.
+    let run_types: Vec<&str> =
+        crate::runner::cell_labels(&cell.test, recipe, cell.id.backend.as_deref())
+            .into_iter()
+            .collect();
+    let (current_reproducer, current_reproducer_unavailable_reason) = exact_cell_reproducer(
+        &cell.id.test,
+        &cell.id.mode,
+        &backend,
+        cell.enabled,
+        &run_types,
+    );
 
     Ok(CellMetadata {
         test: cell.id.test.clone(),
@@ -318,11 +329,16 @@ fn configured_selection(recipe: &ModeRecipe) -> Result<CiSelection, String> {
     )
 }
 
+/// The exact-cell `test-harness run` command for one cell. `run_types` are the
+/// cell's run types ([`crate::runner::cell_labels`]); a selection without
+/// `--label` admits only [`crate::runner::DEFAULT_RUN_TYPE`] cells, so a cell
+/// of any other run type adds `--label` naming its run types.
 fn exact_cell_reproducer(
     test: &str,
     mode: &str,
     backend: &str,
     applicable: bool,
+    run_types: &[&str],
 ) -> (Option<CurrentReproducer>, Option<String>) {
     if !applicable && mode == "naked" && backend == "native" {
         return (
@@ -350,6 +366,9 @@ fn exact_cell_reproducer(
     ];
     if backend != "native" {
         argv.extend(["--backend".to_string(), backend.to_string()]);
+    }
+    if !run_types.contains(&crate::runner::DEFAULT_RUN_TYPE) && !run_types.is_empty() {
+        argv.extend(["--label".to_string(), run_types.join(",")]);
     }
     let shell_command = argv
         .iter()
@@ -790,7 +809,8 @@ test:
 
     #[test]
     fn current_reproducer_uses_only_the_exact_harness_front_door() {
-        let (applicable, missing) = exact_cell_reproducer("bucket/test", "verify", "ptrace", true);
+        let (applicable, missing) =
+            exact_cell_reproducer("bucket/test", "verify", "ptrace", true, &["full"]);
         assert!(missing.is_none());
         let applicable = applicable.unwrap();
         assert_eq!(applicable.argv[0], "target/debug/test-harness");
@@ -816,7 +836,7 @@ test:
         );
 
         let (not_applicable, missing) =
-            exact_cell_reproducer("bucket/test", "verify", "sabre", false);
+            exact_cell_reproducer("bucket/test", "verify", "sabre", false, &["full"]);
         assert!(missing.is_none());
         let not_applicable = not_applicable.unwrap();
         assert!(
@@ -832,12 +852,13 @@ test:
                 .any(|arg| arg == "--include-manual")
         );
 
-        let (native, missing) = exact_cell_reproducer("bucket/test", "naked", "native", true);
+        let (native, missing) =
+            exact_cell_reproducer("bucket/test", "naked", "native", true, &["full"]);
         assert!(missing.is_none());
         assert!(!native.unwrap().argv.iter().any(|arg| arg == "--backend"));
 
         let (not_applicable_native, missing) =
-            exact_cell_reproducer("bucket/test", "naked", "native", false);
+            exact_cell_reproducer("bucket/test", "naked", "native", false, &["full"]);
         assert!(not_applicable_native.is_none());
         assert!(missing.unwrap().contains("does not accept native"));
     }
@@ -846,8 +867,13 @@ test:
     fn shell_command_quotes_untrusted_arguments() {
         assert_eq!(shell_quote(""), "''");
         assert_eq!(shell_quote("one'word"), "'one'\"'\"'word'");
-        let (reproducer, missing) =
-            exact_cell_reproducer("bucket/test with space", "verify", "ptrace", true);
+        let (reproducer, missing) = exact_cell_reproducer(
+            "bucket/test with space",
+            "verify",
+            "ptrace",
+            true,
+            &["full"],
+        );
         assert!(missing.is_none());
         assert!(
             reproducer
@@ -1321,6 +1347,100 @@ test:
                 .selected_by_full_custom_commands
                 .iter()
                 .all(|cell| cell.mode == "custom" && cell.selected_by_full)
+        );
+    }
+
+    /// A cell's published reproducer selects exactly that cell through the
+    /// harness's own selection: a cell of a focused run type (compat/java
+    /// verify on ptrace carries the test-level label sabre-compat-only) needs
+    /// `--label`, and a `full` cell's reproducer keeps its exact form. The
+    /// argv is parsed the way test-harness parses it.
+    #[test]
+    fn a_reproducer_selects_exactly_its_cell_including_focused_run_types() {
+        let root = root();
+        let export = build_export(&root).unwrap();
+        let manifests = ManifestSet::load(&root).unwrap();
+        let reproducer = |test: &str, mode: &str, backend: &str| {
+            export
+                .cells
+                .iter()
+                .find(|cell| cell.test == test && cell.mode == mode && cell.backend == backend)
+                .unwrap_or_else(|| panic!("no exported cell {test}/{mode}@{backend}"))
+                .current_reproducer
+                .as_ref()
+                .unwrap_or_else(|| panic!("{test}/{mode}@{backend} has no reproducer"))
+        };
+        let selected = |argv: &[String]| {
+            assert_eq!(argv[..2], ["target/debug/test-harness", "run"]);
+            let mut selection = Selection::default();
+            let mut words = argv[2..].iter();
+            while let Some(word) = words.next() {
+                match word.as_str() {
+                    "--include-manual" => selection.include_manual = true,
+                    "--include-occasional" => selection.include_occasional = true,
+                    "--probe-disabled" => selection.population = Some(Population::Disabled),
+                    "--test" => selection.test = words.next().cloned(),
+                    "--mode" => selection.mode = words.next().cloned(),
+                    "--backend" => selection.backend = words.next().cloned(),
+                    "--label" => selection
+                        .labels
+                        .extend(words.next().unwrap().split(',').map(str::to_string)),
+                    other => panic!("unexpected reproducer word {other}"),
+                }
+            }
+            if selection.population.is_none() {
+                selection.population = Some(if selection.include_manual {
+                    Population::Enabled
+                } else {
+                    Population::Required
+                });
+            }
+            manifests
+                .select(&selection)
+                .unwrap()
+                .into_iter()
+                .map(|cell| {
+                    (
+                        cell.id.test,
+                        cell.id.mode,
+                        cell.id.backend.unwrap_or_else(|| "native".into()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for (test, mode, backend) in [
+            ("compat/java", "verify", "ptrace"),
+            ("compat/comm", "verify", "sabre"),
+            ("compat/strict-du", "verify", "sabre"),
+            ("compat/comm", "verify", "ptrace"),
+        ] {
+            let argv = &reproducer(test, mode, backend).argv;
+            assert_eq!(
+                selected(argv),
+                vec![(test.to_string(), mode.to_string(), backend.to_string())],
+                "{argv:?}"
+            );
+        }
+        // A cell of the default run type keeps its exact reproducer.
+        let full = reproducer("compat/comm", "verify", "ptrace");
+        assert_eq!(
+            full.argv,
+            [
+                "target/debug/test-harness",
+                "run",
+                "--include-manual",
+                "--include-occasional",
+                "--test",
+                "compat/comm",
+                "--mode",
+                "verify",
+                "--backend",
+                "ptrace",
+            ]
+        );
+        assert_eq!(
+            full.shell_command,
+            "target/debug/test-harness run --include-manual --include-occasional --test compat/comm --mode verify --backend ptrace"
         );
     }
 }
