@@ -683,6 +683,126 @@ fn sabre_scheduler_empty_info_precedes_fallback_completed_info() {
     std::fs::remove_file(&capture).expect("failed to remove run 2's checked log");
 }
 
+/// The DETLOG records of a log in order, as text that does not depend on the
+/// backend: the timestamp a host-side record carries, and a record forwarded
+/// from a SaBRe guest lacks, is dropped, and so is the structured suffix.
+fn detlog_records(log: &str) -> Vec<String> {
+    log.lines()
+        .filter(|line| line.contains("DETLOG"))
+        .map(|line| {
+            let line = line.split(" DETLOG_RECORD=").next().unwrap_or(line);
+            match line.find("INFO ") {
+                Some(at)
+                    if line[..at]
+                        .chars()
+                        .all(|c| c.is_ascii_digit() || "-T:.Z ".contains(c)) =>
+                {
+                    line[at..].to_owned()
+                }
+                _ => line.trim_start().to_owned(),
+            }
+        })
+        .collect()
+}
+
+#[test]
+fn detlog_records_drop_only_the_timestamp_and_suffix() {
+    let log = "2026-10-05T16:16:43.126985Z  INFO detcore::tool_local: DETLOG USER RAND: seed 0 DETLOG_RECORD={}\n\
+               INFO detcore::tool_local: DETLOG USER RAND: seed 0 DETLOG_RECORD={}\n\
+               not a record\n \
+               COMMIT turn 0, dettid 3 DETLOG_RECORD={}";
+    assert_eq!(
+        detlog_records(log),
+        [
+            "INFO detcore::tool_local: DETLOG USER RAND: seed 0",
+            "INFO detcore::tool_local: DETLOG USER RAND: seed 0",
+            "COMMIT turn 0, dettid 3",
+        ]
+    );
+}
+
+/// Every backend's root thread logs its seeding before the guest's first
+/// post-exec record. SaBRe's loader writes AT_RANDOM before Detcore runs in the
+/// guest, and that write used to log at once, ahead of the seeding records and
+/// the first two scheduler commits.
+#[test]
+fn sabre_and_ptrace_detlogs_agree_through_post_exec() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+    // The live INFO stream, where the host and the SaBRe guest both write their
+    // records as they happen. (A verification's run log does not yet keep that
+    // order: it appends the guest's forwarded records after the host's.)
+    let run = |backend: Option<&Path>, label: &str| {
+        let mut command = Command::new(hermit_binary());
+        command.arg("--log=info");
+        if let Some(loader) = backend {
+            command
+                .env("HERMIT_SABRE_BINARY", loader)
+                .args(["--backend", "sabre"]);
+        }
+        command
+            .arg("run")
+            .args([
+                "--strict",
+                "--no-virtualize-cpuid",
+                "--max-timeslice=disabled",
+                COMPARISON_EPOCH,
+            ])
+            .args(["--", "/bin/true"]);
+        // The INFO stream goes to a file: run_bounded reads its pipes only after
+        // the run exits, and a full stderr pipe stalls the run until it is killed.
+        let stream = tempfile::Builder::new()
+            .prefix("sabre-startup-order-")
+            .tempfile_in(env!("CARGO_TARGET_TMPDIR"))
+            .expect("failed to create the INFO stream file");
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(
+                stream
+                    .reopen()
+                    .expect("failed to reopen the INFO stream file"),
+            )
+            .process_group(0);
+        let mut child = command
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to start {label}: {error}"));
+        let started = Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("failed to poll the run") {
+                break status;
+            }
+            if started.elapsed() >= Duration::from_secs(45) {
+                kill_process_group(child.id(), label);
+                panic!("{label} did not finish within 45 s");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let text = std::fs::read_to_string(stream.path())
+            .unwrap_or_else(|error| panic!("failed to read the {label} INFO stream: {error}"));
+        assert!(status.success(), "{label} failed: {status}\n{text}");
+        detlog_records(&text)
+    };
+    let through_post_exec = |records: &[String], label: &str| {
+        let end = records
+            .iter()
+            .position(|record| record.contains("] init auxv AT_RANDOM value to "))
+            .unwrap_or_else(|| panic!("{label} logged no AT_RANDOM record: {records:#?}"));
+        records[..=end].to_vec()
+    };
+    let ptrace = run(None, "ptrace /bin/true");
+    let sabre = run(Some(&loader), "SaBRe /bin/true");
+    let expected = through_post_exec(&ptrace, "ptrace");
+    assert!(
+        expected
+            .iter()
+            .any(|record| record.contains("USER RAND: seeding PRNG for root thread")),
+        "ptrace logged no root-thread seeding before post-exec: {expected:#?}"
+    );
+    assert_eq!(through_post_exec(&sabre, "SaBRe"), expected);
+}
+
 #[test]
 fn sabre_non_racy_examples_verify_current_envelope() {
     let Some(loader) = sabre_loader() else {

@@ -35,8 +35,8 @@ use detcore::random::LoaderState;
 use detcore::random::encode_continuation;
 use detcore::random::encode_initial_state;
 use detcore::random::getrandom;
-use detcore::random::initialize_auxv;
 use detcore::random::root_prng;
+use detcore::random::write_initial_auxv;
 use nix::unistd::Pid;
 use object::Object;
 use object::ObjectSegment;
@@ -1190,6 +1190,8 @@ pub(super) struct Bootstrap {
     generation: u64,
     image: Option<InitialImage>,
     prng: rand_pcg::Pcg64Mcg,
+    /// The bytes written at AT_RANDOM, for the handoff's post-exec record.
+    at_random_value: Option<[u8; 16]>,
     taken: bool,
     sigill: Option<SigillOrigin>,
     initial_random: usize,
@@ -1356,6 +1358,7 @@ impl Bootstrap {
             generation,
             image: None,
             prng,
+            at_random_value: None,
             taken: false,
             sigill: None,
             initial_random,
@@ -1514,12 +1517,12 @@ impl Bootstrap {
             row.permissions.contains('x'),
             "interpreter entry not executable"
         );
-        initialize_auxv(
+        // No record here: the guest's post-exec emits it from the handoff.
+        self.at_random_value = Some(write_initial_auxv(
             &mut self.prng,
             RemoteMemory(pid),
             AddrMut::from_raw(random).ok_or_else(|| anyhow!("null final AT_RANDOM"))?,
-            detcore::types::DetTid::from_raw(pid.as_raw()),
-        )?;
+        )?);
         self.image = Some(InitialImage {
             pid: pid.as_raw(),
             start_time_ticks: self.generation,
@@ -1948,7 +1951,11 @@ impl Bootstrap {
                 );
                 let image = self.image.ok_or_else(|| anyhow!("TAKE before IMAGE"))?;
                 self.check_current_auxv(pid, &rows, image)?;
-                let bytes = encode_initial_state(&self.launch.config, image, &self.prng)?;
+                let at_random_value = self
+                    .at_random_value
+                    .ok_or_else(|| anyhow!("TAKE before the AT_RANDOM write"))?;
+                let bytes =
+                    encode_initial_state(&self.launch.config, image, &self.prng, at_random_value)?;
                 let result = Self::write_take(pid, regs, &bytes)?;
                 if result > 0 {
                     self.taken = true;
