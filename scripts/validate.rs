@@ -2155,28 +2155,54 @@ fn run_scorecard_owner_reexec_probe(
     // state exact test counts, and this probe ran none.
     summary.executed_tests = Some(0);
     summary.passed_tests = Some(0);
+    // Record the write-back through the decision a full run makes. The probe
+    // has no finalized ledger row, so a run that still owns its write-back
+    // reaches the real projection and records that refusal before it touches
+    // any file; a delegated run records the delegation instead.
+    let scratch = match tempfile::tempdir() {
+        Ok(scratch) => scratch,
+        Err(error) => {
+            return RunSummary::new(
+                Verdict::Fail,
+                2,
+                LABEL,
+                vec![format!("cannot create write-back scratch: {error}")],
+            );
+        }
+    };
+    let writeback = local_scorecard_writeback(
+        scratch.path(),
+        scratch.path(),
+        false,
+        false,
+        &ScorecardPublication {
+            parent: None,
+            tool_root: None,
+            expected_head: "",
+            finalized_row: None,
+            delegated: scorecard_delegated,
+            release_builder: RELEASE_BUILDER_CARGO,
+        },
+    );
+    record_scorecard_writeback(&mut summary, writeback);
     summary
 }
 
-/// A ci-hub unit hands validate a service result path and the post-verdict
-/// owner, and the unit's own follow-on publishes the scorecard. Drive the real
-/// boxing re-exec with both set and require the replacement process to still
-/// be delegated. Testing `parent_owns_scorecard_writeback` alone missed that
-/// the re-exec dropped the owner, so every unit published in-unit.
-fn scorecard_owner_reexec_self_test() -> Result<String, String> {
-    let exe = std::env::current_exe()
-        .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
-    let scratch = tempfile::tempdir()
-        .map_err(|error| format!("scorecard owner self-test: cannot create scratch: {error}"))?;
-    let result_path = scratch.path().join("service-result.json");
-    let output = Command::new("timeout")
+/// One child of [`scorecard_owner_reexec_self_test`]: the real boxing re-exec
+/// with a service result path, and the post-verdict owner only when `delegated`.
+fn scorecard_owner_reexec_child(
+    exe: &Path,
+    result_path: &Path,
+    delegated: bool,
+) -> Result<(std::process::Output, serde_json::Value), String> {
+    let mut command = Command::new("timeout");
+    command
         .arg("--kill-after=5s")
         .arg(format!("{NESTED_WRAPPER_TIMEOUT_S}s"))
         .arg(exe)
         .arg("--self-test")
         .env(NESTED_SCOPE_SELF_TEST_ENV, NESTED_SCOPE_SCORECARD_OWNER)
-        .env(VALIDATE_SERVICE_RESULT_PATH_ENV, &result_path)
-        .env(SCORECARD_WRITEBACK_OWNER_ENV, SCORECARD_WRITEBACK_OWNER)
+        .env(VALIDATE_SERVICE_RESULT_PATH_ENV, result_path)
         .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
         .env_remove("DAGRUN_IN_SCOPE")
         .env_remove("DAGRUN_SCOPE_UNIT")
@@ -2189,48 +2215,100 @@ fn scorecard_owner_reexec_self_test() -> Result<String, String> {
         .env_remove(safe_ci_scope::CPU_PLACEMENT_ALLOWED_ENV)
         .env_remove(safe_ci_scope::CPU_PLACEMENT_EXCLUDED_ENV)
         .env_remove(safe_ci_scope::CPU_PLACEMENT_SOURCE_ENV)
-        .stdin(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null());
+    if delegated {
+        command.env(SCORECARD_WRITEBACK_OWNER_ENV, SCORECARD_WRITEBACK_OWNER);
+    } else {
+        command.env_remove(SCORECARD_WRITEBACK_OWNER_ENV);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("cannot launch scorecard owner self-test: {error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() {
-        return Err(format!(
-            "scorecard owner self-test failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
-            output.status
-        ));
-    }
-    for required in [
-        "re-exec inside transient systemd scope",
-        "validate: cgroup boxing ACTIVE",
-        "scorecard owner after scope re-exec: service_result_path=true delegated=true",
+    let published = std::fs::read(result_path)
+        .map_err(|error| format!("no service result: {error}"))
+        .and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes)
+                .map_err(|error| format!("unreadable service result: {error}"))
+        })
+        .map_err(|error| {
+            format!(
+                "scorecard owner self-test (delegated={delegated}): {error}\nstdout:\n{}\nstderr:\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        })?;
+    Ok((output, published))
+}
+
+/// A ci-hub unit hands validate a service result path and the post-verdict
+/// owner, and the unit's own follow-on publishes the scorecard. Drive the real
+/// boxing re-exec with both set and require the replacement process to still
+/// be delegated. Testing `parent_owns_scorecard_writeback` alone missed that
+/// the re-exec dropped the owner, so every unit published in-unit. The inverse
+/// child has the path but no owner, and must not become delegated across the
+/// same re-exec: the owner comes from the launcher, never from the path alone.
+fn scorecard_owner_reexec_self_test() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
+    let scratch = tempfile::tempdir()
+        .map_err(|error| format!("scorecard owner self-test: cannot create scratch: {error}"))?;
+    let no_record_error = "no durable finalized ledger row; scorecard writeback did not run";
+    for (delegated, expected_exit, expected_writeback) in [
+        (true, 0, serde_json::json!({"status": "delegated"})),
+        // The owning child reaches the real projection, which refuses the
+        // probe's absent ledger row: the loud write-back failure exit.
+        (
+            false,
+            i32::from(COULD_NOT_RUN_EXIT_CODE),
+            serde_json::json!({"status": "failed", "error": no_record_error}),
+        ),
     ] {
-        if !stdout.contains(required) && !stderr.contains(required) {
+        let result_path = scratch
+            .path()
+            .join(format!("service-result-delegated-{delegated}.json"));
+        let (output, published) = scorecard_owner_reexec_child(&exe, &result_path, delegated)?;
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() != Some(expected_exit) {
             return Err(format!(
-                "scorecard owner self-test exited successfully without required evidence \
-                 {required:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                "scorecard owner self-test (delegated={delegated}) exited {} instead of \
+                 {expected_exit}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+                output.status
+            ));
+        }
+        for required in [
+            "re-exec inside transient systemd scope".to_string(),
+            "validate: cgroup boxing ACTIVE".to_string(),
+            format!(
+                "scorecard owner after scope re-exec: service_result_path=true delegated={delegated}"
+            ),
+        ] {
+            if !stdout.contains(&required) && !stderr.contains(&required) {
+                return Err(format!(
+                    "scorecard owner self-test (delegated={delegated}) lacks required evidence \
+                     {required:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+                ));
+            }
+        }
+        // The `delegated=` line above tells the two cases apart. This checks
+        // the other half of the contract: the replacement publishes a PASSED
+        // result to the path it inherited, naming the delegation only when the
+        // launcher owns publication.
+        if published.get("final_validate_status") != Some(&serde_json::json!("PASSED"))
+            || published.get("exit_code") != Some(&serde_json::json!(expected_exit))
+            || published.get("scorecard_writeback") != Some(&expected_writeback)
+        {
+            return Err(format!(
+                "scorecard owner self-test (delegated={delegated}): service result is not a \
+                 PASSED result with scorecard_writeback {expected_writeback}: {published}"
             ));
         }
     }
-    // The `delegated=true` line above is what tells the two cases apart. This
-    // checks the other half of the contract: the replacement still publishes a
-    // PASSED result to the path it inherited, with no write-back recorded,
-    // which is the shape the unit's launcher reads for a delegated run.
-    let published = std::fs::read(&result_path)
-        .map_err(|error| format!("scorecard owner self-test: no service result: {error}"))
-        .and_then(|bytes| {
-            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
-                format!("scorecard owner self-test: unreadable service result: {error}")
-            })
-        })?;
-    if published.get("final_validate_status") != Some(&serde_json::json!("PASSED"))
-        || published.get("scorecard_writeback") != Some(&serde_json::Value::Null)
-    {
-        return Err(format!(
-            "scorecard owner self-test: service result is not a PASSED, delegated result: {published}"
-        ));
-    }
-    Ok("scorecard owner: a delegated run is still delegated after the real scope re-exec".into())
+    Ok(
+        "scorecard owner: a delegated run is still delegated after the real scope re-exec, \
+         and a run without the owner is not"
+            .into(),
+    )
 }
 
 /// Inert two-sided bracket for [`nested_scope_placement_evidence`].
@@ -3727,7 +3805,12 @@ fn self_test() -> Result<(), String> {
     let mut writeback_failed = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
     writeback_failed.executed_tests = Some(1);
     writeback_failed.passed_tests = Some(1);
-    record_scorecard_writeback(&mut writeback_failed, Some(Err("fixture refusal".into())));
+    record_scorecard_writeback(
+        &mut writeback_failed,
+        Some(ScorecardWriteback::Failed {
+            error: "fixture refusal".into(),
+        }),
+    );
     let lines = run_summary_lines(&writeback_failed, std::time::Instant::now());
     if (writeback_failed.verdict, writeback_failed.exit_code)
         != (Verdict::Pass, COULD_NOT_RUN_EXIT_CODE)
@@ -3761,6 +3844,39 @@ fn self_test() -> Result<(), String> {
     {
         return Err(format!(
             "summary: scorecard write-back refusal did not preserve the validation verdict and carry its own typed failure: {writeback_result:?}"
+        ));
+    }
+    // A delegated write-back is neither a completion nor a failure: the PASSED
+    // command still exits 0, prints no write-back line, and the service result
+    // names the delegation instead of writing null.
+    let mut writeback_delegated = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+    writeback_delegated.executed_tests = Some(1);
+    writeback_delegated.passed_tests = Some(1);
+    record_scorecard_writeback(
+        &mut writeback_delegated,
+        Some(ScorecardWriteback::Delegated),
+    );
+    let delegated_lines = run_summary_lines(&writeback_delegated, std::time::Instant::now());
+    let delegated_path = writeback_result_dir.path().join("delegated.json");
+    write_validation_service_result(&delegated_path, &writeback_delegated)?;
+    let delegated_bytes = std::fs::read(&delegated_path)
+        .map_err(|error| format!("summary: cannot read delegated result: {error}"))?;
+    let delegated_result = ValidationServiceResult::from_json_slice(&delegated_bytes)?;
+    let delegated_value: serde_json::Value = serde_json::from_slice(&delegated_bytes)
+        .map_err(|error| format!("summary: unreadable delegated result: {error}"))?;
+    if (writeback_delegated.verdict, writeback_delegated.exit_code) != (Verdict::Pass, 0)
+        || !writeback_delegated.detail.is_empty()
+        || delegated_lines.last().map(String::as_str) != Some("FINAL_VALIDATE_STATUS: PASSED")
+        || delegated_result.final_validate_status != FinalValidateStatus::Passed
+        || delegated_result.exit_code != 0
+        || delegated_result.scorecard_writeback != Some(ScorecardWriteback::Delegated)
+        || delegated_value.get("scorecard_writeback")
+            != Some(&serde_json::json!({"status": "delegated"}))
+    {
+        return Err(format!(
+            "summary: a delegated scorecard write-back changed the command exit or detail, or \
+             was not recorded as delegated: command_exit={} detail={:?} result={delegated_value}",
+            writeback_delegated.exit_code, writeback_delegated.detail,
         ));
     }
     let refusal_detail = verdict_refusals(None, 0, Some(0))
@@ -8582,19 +8698,30 @@ struct ScorecardPublication<'a> {
     release_builder: &'a str,
 }
 
+/// The scorecard write-back this process records in its service result.
+/// `None` means no write-back applies to this run at all (nested,
+/// off-the-record, or a Buck payload), so the result keeps null. A run that
+/// would otherwise write back but whose launcher owns publication records
+/// `Delegated`: it publishes nothing here and claims no completion.
 fn local_scorecard_writeback(
     root: &Path,
     result_root: &Path,
     nested: bool,
     off_the_record: bool,
     publication: &ScorecardPublication<'_>,
-) -> Option<Result<(), String>> {
-    if !should_write_scorecard(nested, off_the_record, publication.release_builder)
-        || publication.delegated
-    {
+) -> Option<ScorecardWriteback> {
+    if !should_write_scorecard(nested, off_the_record, publication.release_builder) {
         return None;
     }
-    Some(project_local_scorecard(root, result_root, publication))
+    if publication.delegated {
+        return Some(ScorecardWriteback::Delegated);
+    }
+    Some(
+        match project_local_scorecard(root, result_root, publication) {
+            Ok(()) => ScorecardWriteback::Completed,
+            Err(error) => ScorecardWriteback::Failed { error },
+        },
+    )
 }
 
 fn project_local_scorecard(
@@ -8712,26 +8839,26 @@ fn refusal_detail(stderr: &[u8], stdout: &[u8]) -> String {
     )
 }
 
-fn record_scorecard_writeback(summary: &mut RunSummary, writeback: Option<Result<(), String>>) {
+fn record_scorecard_writeback(summary: &mut RunSummary, writeback: Option<ScorecardWriteback>) {
     let Some(writeback) = writeback else { return };
-    let detail = match writeback {
-        Ok(()) => {
-            summary.scorecard_writeback = Some(ScorecardWriteback::Completed);
-            "scorecard history published to hermit_test_ledger; Hermit catalogue unchanged".into()
-        }
-        Err(error) => {
+    let detail = match &writeback {
+        // Delegation leaves the command exit and the detail exactly as a
+        // delegated run left them before schema 6 named it.
+        ScorecardWriteback::Delegated => None,
+        ScorecardWriteback::Completed => Some(
+            "scorecard history published to hermit_test_ledger; Hermit catalogue unchanged".into(),
+        ),
+        ScorecardWriteback::Failed { error } => {
             if summary.exit_code == 0 {
                 summary.exit_code = COULD_NOT_RUN_EXIT_CODE;
             }
-            summary.scorecard_writeback = Some(ScorecardWriteback::Failed {
-                error: error.clone(),
-            });
-            format!(
+            Some(format!(
                 "scorecard write-back FAILED after validation evidence was finalized: {error}; the validation verdict above is unchanged"
-            )
+            ))
         }
     };
-    summary.detail.push(detail);
+    summary.scorecard_writeback = Some(writeback);
+    summary.detail.extend(detail);
 }
 
 /// The descriptor stays owned by DurableLog until tee has terminated. The
@@ -31118,7 +31245,8 @@ mod final_validate_status_tests {
         let refused_result =
             ValidationServiceResult::from_json_slice(&std::fs::read(&refused_path).unwrap())
                 .unwrap();
-        assert_eq!(refused_result.schema_version, 5);
+        // Detail arrived in schema 5; schema 6 added the delegated write-back.
+        assert_eq!(refused_result.schema_version, 6);
         assert_eq!(
             refused_result.final_validate_status,
             FinalValidateStatus::CouldNotRun
@@ -31933,9 +32061,13 @@ mod refusal_detail_tests {
             release_builder: RELEASE_BUILDER_CARGO,
         };
 
-        let error = local_scorecard_writeback(&root, &root, false, false, &publication)
-            .expect("the writeback runs when not nested and on the record")
-            .expect_err("a refusing tool must produce an error");
+        let Some(ScorecardWriteback::Failed { error }) =
+            local_scorecard_writeback(&root, &root, false, false, &publication)
+        else {
+            panic!(
+                "the writeback runs when not nested and on the record, and a refusing tool must produce an error"
+            );
+        };
 
         // The status is still there...
         assert!(error.contains("exit status: 2"), "{error}");
@@ -31949,9 +32081,11 @@ mod refusal_detail_tests {
         // error at all, so the assertions above are not passing because every
         // path errors.
         std::fs::write(&script, "import sys\nassert '--source-checkout' in sys.argv and '--results' in sys.argv and '--target' in sys.argv and '--finalized-run-id' in sys.argv\n").expect("rewrite the tool");
-        local_scorecard_writeback(&root, &root, false, false, &publication)
-            .expect("still runs")
-            .expect("a succeeding tool must not error");
+        assert_eq!(
+            local_scorecard_writeback(&root, &root, false, false, &publication),
+            Some(ScorecardWriteback::Completed),
+            "a succeeding tool must not error"
+        );
 
         // And the gate is still a gate: nested or off-the-record runs do not
         // invoke the tool at all.
@@ -32261,12 +32395,13 @@ with (root/'calls.jsonl').open('a') as out:
             assert_eq!(publication.delegated, delegated);
             let result = local_scorecard_writeback(root, root, false, false, &publication);
             if delegated {
-                assert!(
-                    result.is_none(),
+                assert_eq!(
+                    result,
+                    Some(ScorecardWriteback::Delegated),
                     "delegation must never claim child completion"
                 );
             } else {
-                result.unwrap().unwrap();
+                assert_eq!(result, Some(ScorecardWriteback::Completed));
                 local_calls += 1;
             }
             assert_eq!(
@@ -32287,9 +32422,11 @@ with (root/'calls.jsonl').open('a') as out:
             delegated: false,
             release_builder: RELEASE_BUILDER_CARGO,
         };
-        let error = local_scorecard_writeback(root, root, false, false, &publication)
-            .unwrap()
-            .unwrap_err();
+        let Some(ScorecardWriteback::Failed { error }) =
+            local_scorecard_writeback(root, root, false, false, &publication)
+        else {
+            panic!("an owned write-back without a finalized row must fail");
+        };
         assert!(error.contains("no durable finalized ledger row"));
         assert_eq!(
             std::fs::read_to_string(root.join("calls.jsonl"))

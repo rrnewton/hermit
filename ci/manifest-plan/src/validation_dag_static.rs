@@ -740,7 +740,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // config::tests::a_legacy_configuration_decodes_whatever_the_ambient_hermit_settings
     // and config::tests::keys_the_legacy_form_did_not_name_are_ignored)
     // retain all 951 prior identities: 951 + 14 = 965.
-    ("test.regular_crates", 965),
+    // manifest-plan's service_result::tests::
+    // delegated_writeback_is_schema_6_only_and_never_changes_the_exit retains
+    // all 965 (966, measured by a full validation's executed count).
+    ("test.regular_crates", 966),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1400,7 +1403,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests listed there retain all 948: 951.
     // The fourteen backend-capability controls listed there retain all
     // 951: 951 + 14 = 965.
-    ("test.regular_crates_on_host", 965),
+    // The delegated write-back test listed there retains all 965: 966.
+    ("test.regular_crates_on_host", 966),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests.
     ("test.sabre_examples_on_host", 9),
