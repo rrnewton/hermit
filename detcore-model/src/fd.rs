@@ -15,8 +15,46 @@ use crate::pid::DetTid;
 // (Workaround: reexporting this type directly triggers a rust-anlazer glitch.)
 pub type RawFd = std::os::unix::io::RawFd;
 
-/// Nondeterministic "physical" inode
-pub type RawInode = u64;
+/// Nondeterministic "physical" inode: a host file's identity, its device and
+/// its inode number on that device.
+///
+/// An inode number alone does not name a file: each filesystem numbers its own
+/// inodes, so a file in `/sys` and one on the root filesystem can share a
+/// number. Keyed by the number alone, Hermit gave two such files ONE
+/// deterministic inode, so a guest comparing inode numbers could take them for
+/// the same file, and which files merged depended on how the host happened to
+/// number them.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    Serialize,
+    Deserialize
+)]
+pub struct RawInode {
+    /// The host `st_dev`.
+    pub dev: u64,
+    /// The host `st_ino` on that device.
+    pub ino: u64,
+}
+
+impl RawInode {
+    /// The host file identified by device `dev` and inode number `ino`.
+    pub const fn new(dev: u64, ino: u64) -> Self {
+        Self { dev, ino }
+    }
+}
+
+impl std::fmt::Display for RawInode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}", self.dev, self.ino)
+    }
+}
 
 /// Deterministic "virtual" inode.
 ///
@@ -43,7 +81,7 @@ pub type RawInode = u64;
     Serialize,
     Deserialize
 )]
-pub struct DetInode(RawInode);
+pub struct DetInode(u64);
 
 impl DetInode {
     /// Assert that `value` is a deterministic inode.
@@ -51,12 +89,12 @@ impl DetInode {
     /// Reserved for the determinization boundary and for compile-time
     /// constants. Passing a host inode here reintroduces the leak this newtype
     /// exists to prevent.
-    pub const fn mint(value: RawInode) -> Self {
+    pub const fn mint(value: u64) -> Self {
         Self(value)
     }
 
     /// The underlying integer, for writing into guest-visible stat buffers.
-    pub const fn as_raw(self) -> RawInode {
+    pub const fn as_raw(self) -> u64 {
         self.0
     }
 }

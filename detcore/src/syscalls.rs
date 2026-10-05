@@ -19,6 +19,7 @@ mod io;
 mod memory;
 mod misc;
 mod namespace;
+pub(crate) use namespace::anonymous_object_devices;
 mod network_trace;
 pub(crate) mod robust_list;
 mod signal;

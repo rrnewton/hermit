@@ -1327,6 +1327,11 @@ pub const CONFIG_FINGERPRINT_ENV: &str = "REVERIE_SABRE_HERMIT_CONFIG_FINGERPRIN
 
 const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
     include_bytes!("config.rs"),
+    // `RawInode`, the host identity the inode RPCs (`DeterminizeInode`,
+    // `TouchFile`, `SetFileMtime`) carry. Its layout changed from one `u64`
+    // to a device and an inode number, which neither encoding of `Config`
+    // shows.
+    include_bytes!("fd.rs"),
     include_bytes!("happens_before.rs"),
     include_bytes!("network_trace.rs"),
     include_bytes!("pid.rs"),
@@ -1359,10 +1364,11 @@ const CONFIG_DEFINITION_SOURCES: &[&[u8]] = &[
 ///   such as `u32` to `u64` even when both default to JSON number zero; and
 /// - the JSON encoding, which carries every field name and makes a pure rename
 ///   visible even though bincode is positional; and
-/// - the source files defining `Config`, its local serialized field types, and
-///   `DetTime`, which catch wire-incompatible changes hidden by a default such
-///   as `Option<u64>::None` to `Option<u32>::None`, or an added clock field that
-///   leaves both encodings of `Config` unchanged.
+/// - the source files defining `Config`, its local serialized field types,
+///   `DetTime`, and the `RawInode` the inode RPCs carry, which catch
+///   wire-incompatible changes hidden by a default such as `Option<u64>::None`
+///   to `Option<u32>::None`, or an added clock or inode field that leaves both
+///   encodings of `Config` unchanged.
 ///
 /// The source and JSON domains are deliberately stricter than the wire format
 /// strictly requires. A documentation-only edit in one of these files can
@@ -1716,6 +1722,37 @@ mod tests {
             fingerprint_of_config_material(&wire, &named_shape, &changed_sources),
             current,
             "a clock-only serialized field change must invalidate the fingerprint"
+        );
+    }
+
+    /// The inode RPCs carry `RawInode`, whose layout neither encoding of
+    /// `Config` shows. A plugin built before `RawInode` gained its device
+    /// sends one `u64` where the coordinator decodes two, so a change to its
+    /// definition must invalidate the fingerprint.
+    #[test]
+    fn config_fingerprint_includes_the_inode_rpc_identity() {
+        let config = config_wire_default();
+        let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+        let named_shape = serde_json::to_string(&config).unwrap();
+        let current = config_wire_fingerprint();
+        let inode_source = include_bytes!("fd.rs").as_slice();
+        assert!(CONFIG_DEFINITION_SOURCES.contains(&inode_source));
+        let without_device = include_str!("fd.rs").replacen("    pub dev: u64,\n", "", 1);
+        assert_ne!(without_device.as_bytes(), inode_source);
+        let changed_sources: Vec<_> = CONFIG_DEFINITION_SOURCES
+            .iter()
+            .map(|source| {
+                if *source == inode_source {
+                    without_device.as_bytes()
+                } else {
+                    *source
+                }
+            })
+            .collect();
+        assert_ne!(
+            fingerprint_of_config_material(&wire, &named_shape, &changed_sources),
+            current,
+            "an inode-identity layout change must invalidate the fingerprint"
         );
     }
 

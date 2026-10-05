@@ -80,6 +80,14 @@ pub struct DetStat {
     pub mtime: Timespec,
 }
 
+impl DetStat {
+    /// The host file identity, device and inode, of a stat not yet
+    /// determinized.
+    pub fn raw_inode(&self) -> detcore_model::fd::RawInode {
+        detcore_model::fd::RawInode::new(self.dev, self.inode)
+    }
+}
+
 impl Default for DetStat {
     fn default() -> Self {
         let statx: libc::statx = unsafe { std::mem::zeroed() };

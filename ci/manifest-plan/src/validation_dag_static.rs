@@ -717,7 +717,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and test-harness's
     // tests::a_host_input_change_earns_one_retry_even_on_a_no_retry_cell)
     // retain all 944 prior identities (947, measured with cargo nextest list).
-    ("test.regular_crates", 947),
+    // detcore-model's config::tests::config_fingerprint_includes_the_inode_rpc_identity
+    // retains all 947 (948, measured with cargo nextest list).
+    ("test.regular_crates", 948),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -972,7 +974,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // scheduler::test::backoff_sleep_doubles_each_round_then_caps retains all
     // 947 prior identities: 947 + 1 = 948, measured with cargo nextest list
     // --profile ci -p hermit-detcore --lib --bins.
-    ("test.detcore_unit", 948),
+    // tool_global::tests::files_on_different_devices_with_one_inode_number_stay_distinct
+    // and syscalls::namespace::tests::anonymous_object_devices_are_the_pipe_and_socket_filesystems
+    // retain all 948 (950, measured with cargo nextest list).
+    ("test.detcore_unit", 950),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1260,7 +1265,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same sixteen https://github.com/rrnewton/hermit/pull/3778 tests
     // retain all 931: 931 + 16 = 947.
     // The same scheduler backoff test retains all 947: 947 + 1 = 948.
-    ("test.detcore_unit_on_host", 948),
+    // The host twin selects the same two inode-identity tests (950).
+    ("test.detcore_unit_on_host", 950),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1358,8 +1364,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The four tests of the fixes to the post-facto review of
     // https://github.com/rrnewton/hermit/pull/3791 listed there retain all
     // 940: 940 + 4 = 944.
-    // The three host-input-change retry tests listed there (947).
-    ("test.regular_crates_on_host", 947),
+    // The three host-input-change retry tests listed there (947), and the
+    // inode-RPC fingerprint test (948).
+    ("test.regular_crates_on_host", 948),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.

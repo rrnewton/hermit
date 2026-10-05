@@ -1155,6 +1155,10 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     fn new(pid: Pid, cfg: &Config) -> Self {
         let detpid = DetPid::from_raw(pid.into()); // TODO(T78538674): virtualize pid.
         cfg.validate_invariants();
+        // Read before any guest syscall, so a readlink of another process's
+        // pipe or socket never depends on the tracer's descriptors then. The
+        // outcome is kept; a failure is reported only if a guest needs it.
+        let _ = syscalls::anonymous_object_devices();
         Self {
             detpid,
             cfg: cfg.clone(),

@@ -153,7 +153,70 @@ fn host_self_proc_fd_alias(path: &Path, current_pid: i64) -> Option<PathBuf> {
 #[derive(Debug, Eq, PartialEq)]
 struct AnonymousProcFdIdentity {
     kind: &'static str,
-    raw_inode: RawInode,
+    /// The inode number the link names. Its device is the kernel's pipe or
+    /// socket filesystem ([`anonymous_object_device`]).
+    raw_inode: u64,
+}
+
+/// The host devices of the kernel's pipe and socket filesystems, on which
+/// every `pipe:[N]` or `socket:[N]` link's inode lives. Each is one
+/// kernel-wide superblock, so a pipe and a socket made here show them. A host
+/// inode is identified by device AND number, and a pipe's `fstat` reports this
+/// device, so the identity a link names must carry it too.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AnonymousObjectDevices {
+    pipe: u64,
+    socket: u64,
+}
+
+/// The [`AnonymousObjectDevices`], read once per process, or why they could
+/// not be read. Detcore reads them when it starts in a process
+/// ([`crate::Detcore`]'s `Tool::new`), before any guest syscall, so a guest's
+/// readlink never depends on whether the tracer can make a pipe or socket at
+/// that moment, and keeps the outcome either way: a later call neither retries
+/// nor panics.
+pub(crate) fn anonymous_object_devices() -> &'static Result<AnonymousObjectDevices, String> {
+    static DEVICES: std::sync::OnceLock<Result<AnonymousObjectDevices, String>> =
+        std::sync::OnceLock::new();
+    DEVICES.get_or_init(|| probe_anonymous_object_devices().map_err(|error| error.to_string()))
+}
+
+fn probe_anonymous_object_devices() -> std::io::Result<AnonymousObjectDevices> {
+    use std::os::fd::AsFd;
+    let device_of = |fd: std::os::fd::BorrowedFd<'_>| {
+        nix::sys::stat::fstat(fd)
+            .map(|stat| stat.st_dev)
+            .map_err(std::io::Error::from)
+    };
+    let (reader, _writer) = nix::unistd::pipe().map_err(std::io::Error::from)?;
+    let (socket, _peer) = std::os::unix::net::UnixDatagram::pair()?;
+    Ok(AnonymousObjectDevices {
+        pipe: device_of(reader.as_fd())?,
+        socket: device_of(socket.as_fd())?,
+    })
+}
+
+/// The device of a `kind` ("pipe" or "socket") link's inode, from the
+/// devices read at start (`devices`). When they could not be read, this is a
+/// tool error, not an errno: Detcore cannot give the link a faithful identity,
+/// so the run fails as an infrastructure failure through the backend's own
+/// failure handling, rather than a link identity getting an invented device or
+/// a guest getting an error Linux would not return.
+fn anonymous_object_device(
+    devices: &Result<AnonymousObjectDevices, String>,
+    kind: &str,
+) -> Result<u64, Error> {
+    let devices = devices.as_ref().map_err(|error| {
+        Error::Tool(anyhow::anyhow!(
+            "Detcore could not read the pipe and socket filesystem devices when it started \
+             ({error}), so it cannot identify the {kind} a /proc fd link names"
+        ))
+    })?;
+    Ok(match kind {
+        "pipe" => devices.pipe,
+        "socket" => devices.socket,
+        _ => unreachable!("anonymous_proc_fd_identity names only pipes and sockets, not {kind}"),
+    })
 }
 
 // Long enough for `socket:[` + every decimal u64 inode + `]`.
@@ -232,14 +295,18 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .thread_state()
                 .with_detfd(fd, |detfd| {
                     deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
-                    detfd.stat().map(|stat| stat.inode)
+                    detfd.stat().map(|stat| stat.raw_inode())
                 })
                 .ok()
                 .flatten();
         }
-        let inode = match deterministic_stdio_inode_for_raw(identity.raw_inode, &stdio_raw_inodes) {
+        let raw_inode = RawInode::new(
+            anonymous_object_device(anonymous_object_devices(), identity.kind)?,
+            identity.raw_inode,
+        );
+        let inode = match deterministic_stdio_inode_for_raw(raw_inode, &stdio_raw_inodes) {
             Some(inode) => inode,
-            None => determinize_inode(guest, identity.raw_inode).await.0,
+            None => determinize_inode(guest, raw_inode).await.0,
         };
         let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
         let buffer = buffer.ok_or(Errno::EFAULT)?;
@@ -314,7 +381,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .flatten();
             let inode = match inode_override {
                 Some(inode) => inode,
-                None => determinize_inode(guest, stat.st_ino).await.0,
+                None => {
+                    determinize_inode(guest, RawInode::new(stat.st_dev, stat.st_ino))
+                        .await
+                        .0
+                }
             };
             format!("{kind}:[{inode}]").into_bytes()
         } else {
@@ -528,6 +599,30 @@ impl<T: RecordOrReplay> Detcore<T> {
 mod tests {
     use super::*;
 
+    /// The devices read once are the pipe and socket filesystems' own: a
+    /// fresh pipe and socket show the same ones, and the two differ.
+    #[test]
+    fn anonymous_object_devices_are_the_pipe_and_socket_filesystems() {
+        let read = anonymous_object_devices();
+        let devices = read.as_ref().unwrap();
+        assert_eq!(&probe_anonymous_object_devices().unwrap(), devices);
+        assert_ne!(devices.pipe, devices.socket);
+        assert_eq!(anonymous_object_device(read, "pipe").unwrap(), devices.pipe);
+        assert_eq!(
+            anonymous_object_device(read, "socket").unwrap(),
+            devices.socket
+        );
+        // Devices that could not be read at start, as with the process's
+        // descriptors exhausted, fail the run as a tool error and never
+        // reach the guest as an errno.
+        let unread = Err("Too many open files (os error 24)".to_string());
+        for kind in ["pipe", "socket"] {
+            let error = anonymous_object_device(&unread, kind).unwrap_err();
+            assert!(matches!(error, Error::Tool(_)), "{error:?}");
+            assert!(error.to_string().contains("os error 24"), "{error}");
+        }
+    }
+
     #[test]
     fn recognizes_process_and_thread_namespace_links() {
         assert_eq!(
@@ -642,29 +737,35 @@ mod tests {
         assert!(needs_anonymous_proc_fd_scratch(true, 31));
         assert!(!needs_anonymous_proc_fd_scratch(true, 32));
 
-        let maximum = format!("socket:[{}]", RawInode::MAX);
+        let maximum = format!("socket:[{}]", u64::MAX);
         assert!(maximum.len() < ANONYMOUS_PROC_FD_TARGET_CAPACITY);
         assert_eq!(
             anonymous_proc_fd_identity(maximum.as_bytes()),
             Some(AnonymousProcFdIdentity {
                 kind: "socket",
-                raw_inode: RawInode::MAX,
+                raw_inode: u64::MAX,
             })
         );
     }
 
     #[test]
     fn stdio_identity_requires_a_raw_inode_match_and_preserves_alias_precedence() {
-        let stdio = [Some(11), Some(22), Some(33)];
+        let raw = |ino| RawInode::new(9, ino);
+        let stdio = [Some(raw(11)), Some(raw(22)), Some(raw(33))];
         assert_eq!(
-            deterministic_stdio_inode_for_raw(22, &stdio),
+            deterministic_stdio_inode_for_raw(raw(22), &stdio),
             Some(DetInode::mint(1001))
         );
-        assert_eq!(deterministic_stdio_inode_for_raw(44, &stdio), None);
-
-        let aliased = [None, Some(55), Some(55)];
+        assert_eq!(deterministic_stdio_inode_for_raw(raw(44), &stdio), None);
+        // The same number on another device is another file.
         assert_eq!(
-            deterministic_stdio_inode_for_raw(55, &aliased),
+            deterministic_stdio_inode_for_raw(RawInode::new(10, 22), &stdio),
+            None
+        );
+
+        let aliased = [None, Some(raw(55)), Some(raw(55))];
+        assert_eq!(
+            deterministic_stdio_inode_for_raw(raw(55), &aliased),
             Some(DetInode::mint(1002))
         );
     }

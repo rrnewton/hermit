@@ -7312,19 +7312,62 @@ mod tests {
         let t = LogicalTime::from_nanos(0);
         let seen = super::ObservedMtime::Unobserved;
 
-        let host_a = 221_742_951; // the value observed leaking into FileContents
-        let host_b = 998_877_665;
+        // 221_742_951 is the value observed leaking into FileContents.
+        let host_a = crate::types::RawInode::new(33, 221_742_951);
+        let host_b = crate::types::RawInode::new(33, 998_877_665);
         let (a, _) = pool.add_inode(host_a, seen, t);
         let (b, _) = pool.add_inode(host_b, seen, t);
 
-        assert_ne!(a.as_raw(), host_a, "det inode must not be the host inode");
-        assert_ne!(b.as_raw(), host_b, "det inode must not be the host inode");
+        assert_ne!(
+            a.as_raw(),
+            host_a.ino,
+            "det inode must not be the host inode"
+        );
+        assert_ne!(
+            b.as_raw(),
+            host_b.ino,
+            "det inode must not be the host inode"
+        );
         assert_eq!(a, DetInode::mint(1), "minting starts at 1");
         assert_eq!(b, DetInode::mint(2), "minting is monotonic");
 
         // Re-determinizing the same host inode is stable, not a fresh mint.
         let (a_again, _) = pool.add_inode(host_a, seen, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+
+    /// Two files on different filesystems can share an inode number; they
+    /// are different files and must get different deterministic inodes, with
+    /// first-seen mtimes of their own. Keyed by the number alone they shared
+    /// one, so a guest comparing inode numbers took them for the same file,
+    /// and the second file reported the first one's mtime.
+    #[test]
+    fn files_on_different_devices_with_one_inode_number_stay_distinct() {
+        use super::ObservedMtime;
+
+        let epoch = LogicalTime::from_secs(1_798_761_600);
+        let mut pool = super::InodePool::new();
+        // 76927 was /sys/bus/i2c/devices on the host that motivated this.
+        let sysfs = crate::types::RawInode::new(23, 76_927);
+        let rootfs = crate::types::RawInode::new(33, 76_927);
+
+        let (on_sysfs, sysfs_mtime) = pool.add_inode(sysfs, ObservedMtime::HostSpecific, epoch);
+        let (on_rootfs, rootfs_mtime) = pool.add_inode(
+            rootfs,
+            ObservedMtime::Canonical(LogicalTime::from_secs(1)),
+            epoch,
+        );
+        assert_ne!(on_sysfs, on_rootfs, "different files, different det inodes");
+        assert_eq!(sysfs_mtime, epoch);
+        assert_eq!(rootfs_mtime, LogicalTime::from_secs(1), "its own mtime");
+        assert_eq!(
+            pool.add_inode(sysfs, ObservedMtime::Unobserved, epoch).0,
+            on_sysfs
+        );
+        assert_eq!(
+            pool.add_inode(rootfs, ObservedMtime::Unobserved, epoch).0,
+            on_rootfs
+        );
     }
 
     /// Only an exact whole-second 0 or 1 host mtime is canonical
@@ -7361,22 +7404,34 @@ mod tests {
         let mut pool = super::InodePool::new();
 
         // An ordinary file reports the epoch.
-        let (_, mtime) = pool.add_inode(10, ObservedMtime::HostSpecific, epoch);
+        let (_, mtime) = pool.add_inode(
+            crate::types::RawInode::new(1, 10),
+            ObservedMtime::HostSpecific,
+            epoch,
+        );
         assert_eq!(mtime, epoch);
         // A canonical file keeps its mtime.
-        let (_, mtime) = pool.add_inode(11, canonical, epoch);
+        let (_, mtime) = pool.add_inode(crate::types::RawInode::new(1, 11), canonical, epoch);
         assert_eq!(mtime, LogicalTime::from_secs(1));
 
         // A read or getdents mints the inode first; the later stat decides.
-        let (_, mtime) = pool.add_inode(12, ObservedMtime::Unobserved, epoch);
+        let (_, mtime) = pool.add_inode(
+            crate::types::RawInode::new(1, 12),
+            ObservedMtime::Unobserved,
+            epoch,
+        );
         assert_eq!(mtime, epoch, "an unresolved mtime reads as the epoch");
-        let (_, mtime) = pool.add_inode(12, canonical, epoch);
+        let (_, mtime) = pool.add_inode(crate::types::RawInode::new(1, 12), canonical, epoch);
         assert_eq!(mtime, LogicalTime::from_secs(1));
 
         // Once resolved, a later observation does not change it.
-        let (_, mtime) = pool.add_inode(10, canonical, epoch);
+        let (_, mtime) = pool.add_inode(crate::types::RawInode::new(1, 10), canonical, epoch);
         assert_eq!(mtime, epoch);
-        let (_, mtime) = pool.add_inode(11, ObservedMtime::HostSpecific, epoch);
+        let (_, mtime) = pool.add_inode(
+            crate::types::RawInode::new(1, 11),
+            ObservedMtime::HostSpecific,
+            epoch,
+        );
         assert_eq!(mtime, LogicalTime::from_secs(1));
     }
 }
