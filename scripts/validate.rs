@@ -2434,7 +2434,7 @@ impl SubmoduleFixtureChild {
         // The child validate finds this fixture checkout from its working
         // directory, so it must not inherit a caller's repository location.
         without_repository_location(&mut command)
-            .args(["--signal=TERM", "300"])
+            .args(["--signal=TERM", "--kill-after=10s", "300"])
             .arg(
                 prepared_source_root
                     .unwrap_or(checkout)
