@@ -907,6 +907,12 @@
       "why": "tests/c/netns_cookie_udp4.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/network_replay_tcp_bracket.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/network_replay_tcp_bracket.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this TCP client and its loopback controller, records the exchange with --record-networking, and replays it offline under several schedules at L2, checking that the outbound stream and result stay fixed while the competing reader changes."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/no_new_privs_refusal.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -2109,8 +2115,8 @@
     {
       "disposition": "guest-fixture",
       "path": "tests/compat/localhost_http_server.c",
-      "runner": "tests/compat/prepare_real_compat_fixtures.sh",
-      "why": "tests/compat/localhost_http_server.c is owned by tests/compat/prepare_real_compat_fixtures.sh: The compatibility fixture builder compiles this loopback server into an immutable input for networked application probes; the surrounding driver owns its lifecycle and observations."
+      "runner": "tests/compat/prepare_real_compat_fixtures.sh and hermit-cli/tests/record_replay.rs",
+      "why": "tests/compat/localhost_http_server.c is owned by tests/compat/prepare_real_compat_fixtures.sh and hermit-cli/tests/record_replay.rs: The compatibility fixture builder compiles this loopback server into an immutable input for networked application probes; the surrounding driver owns its lifecycle and observations. The record/replay integration suite also compiles it as the one-shot HTTP peer that a real curl is recorded against with --record-networking and then replayed offline without."
     },
     {
       "disposition": "guest-fixture",

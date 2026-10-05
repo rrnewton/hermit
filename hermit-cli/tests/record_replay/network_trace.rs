@@ -8,7 +8,9 @@
 
 //! Network record/replay acceptance: `hermit run --record-networking` against
 //! a loopback controller, then offline `--replay-networking` under several
-//! schedules, each verified at L2. Ad-hoc runs set `HERMIT_SAFEHERMIT` to the
+//! schedules, each verified at L2; and a real curl fetch from a loopback HTTP
+//! server, recorded, then replayed offline with the record and replay logs
+//! compared by `hermit log-diff`. Ad-hoc runs set `HERMIT_SAFEHERMIT` to the
 //! dev-hermit `bin/safehermit` wrapper; without it Hermit runs under the same
 //! `timeout` bound as the rest of this file.
 
@@ -470,4 +472,167 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
         !String::from_utf8_lossy(&missing.stdout).contains("aggregate="),
         "the guest ran without its network trace"
     );
+}
+
+const HTTP_RESPONSE: &[u8] =
+    b"HTTP/1.1 200 OK\r\nContent-Length: 12\r\nConnection: close\r\n\r\nhello world\n";
+
+/// The host's curl, which this test runs unmodified as the guest.
+fn curl() -> PathBuf {
+    std::env::var_os("PATH")
+        .iter()
+        .flat_map(std::env::split_paths)
+        .map(|directory| directory.join("curl"))
+        .find(|candidate| candidate.is_file())
+        .expect("curl is not on PATH; install curl to run the curl network record/replay test")
+}
+
+/// Starts the one-shot loopback HTTP server and returns it with its port.
+fn start_http_server(directory: &Path) -> (Child, String) {
+    let server = &super::workload("c_localhost_http_server").path;
+    let port_path = directory.join("http.port");
+    let response_path = directory.join("http.response");
+    fs::write(&response_path, HTTP_RESPONSE).expect("write HTTP response");
+    let mut child = Command::new("timeout")
+        .args(["--kill-after=1s", &format!("{CONTROLLER_WALL_SECONDS}s")])
+        .arg(server)
+        .arg(&port_path)
+        .arg(&response_path)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start bounded HTTP server");
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        if let Ok(port) = fs::read_to_string(&port_path)
+            && let Ok(number) = port.trim().parse::<u16>()
+            && number != 0
+        {
+            return (child, number.to_string());
+        }
+        if child
+            .try_wait()
+            .expect("failed to inspect HTTP server")
+            .is_some()
+        {
+            let output = child.wait_with_output().expect("collect HTTP server");
+            panic!(
+                "HTTP server exited before publishing its port: {}\nstderr:\n{}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert!(
+            Instant::now() < deadline,
+            "HTTP server did not publish its port within two seconds"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn curl_arguments(log: &Path, network_flag: String) -> Vec<String> {
+    vec![
+        "--backend=ptrace".into(),
+        "--log=info".into(),
+        format!("--log-file={}", log.display()),
+        "run".into(),
+        "--strict".into(),
+        network_flag,
+    ]
+}
+
+#[test]
+fn curl_recording_replays_offline_with_identical_logs() {
+    let _guard = super::hermit_record_lock();
+    let curl = curl();
+    let directory = tempfile::tempdir().expect("create curl network replay directory");
+    let evidence = directory.path();
+    let trace = evidence.join("curl.trace");
+    let record_log = evidence.join("record.log");
+    let replay_log = evidence.join("replay.log");
+
+    let (server, port) = start_http_server(evidence);
+    let url = format!("http://127.0.0.1:{port}/");
+    let curl_arguments_for =
+        |log: &Path, flag: &str| curl_arguments(log, format!("{flag}={}", trace.display()));
+    let recorded = hermit_command(
+        evidence,
+        "curl-record",
+        &curl_arguments_for(&record_log, "--record-networking"),
+        &curl,
+        &["-sS", &url],
+    );
+    let server = server
+        .wait_with_output()
+        .expect("collect bounded HTTP server");
+    assert_success(&recorded, "curl recording");
+    assert!(
+        server.status.success(),
+        "HTTP server failed with {}\nstderr:\n{}",
+        server.status,
+        String::from_utf8_lossy(&server.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.stdout),
+        "hello world\n",
+        "curl recording did not print the served body"
+    );
+
+    // The server has served its one connection and exited, so replay can
+    // only succeed from the trace.
+    let replayed = hermit_command(
+        evidence,
+        "curl-replay",
+        &curl_arguments_for(&replay_log, "--replay-networking"),
+        &curl,
+        &["-sS", &url],
+    );
+    assert_success(&replayed, "curl replay");
+    assert_eq!(
+        replayed.stdout, recorded.stdout,
+        "curl replay printed different output from the recording"
+    );
+
+    let diff_report = evidence.join("record-vs-replay.json");
+    let diff = Command::new("timeout")
+        .args(["--kill-after=1s", &format!("{NATIVE_CLIENT_WALL_SECONDS}s")])
+        .arg(env!("CARGO_BIN_EXE_hermit"))
+        .arg("log-diff")
+        .arg(format!("--json={}", diff_report.display()))
+        .arg(&record_log)
+        .arg(&replay_log)
+        .output()
+        .expect("failed to start hermit log-diff");
+    assert_success(&diff, "log-diff of the curl record and replay logs");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&diff_report).expect("log-diff omitted its JSON report"))
+            .expect("log-diff JSON was malformed");
+    assert_eq!(report["verdict"], "matched", "log-diff report: {report}");
+    for side in ["left", "right"] {
+        assert!(
+            report["selected_messages"][side]
+                .as_u64()
+                .is_some_and(|count| count > 0),
+            "log-diff compared no INFO messages on {side}: {report}"
+        );
+    }
+
+    let verify_report = evidence.join("curl-replay.verify.json");
+    let mut verify_arguments =
+        curl_arguments_for(&evidence.join("verify.log"), "--replay-networking");
+    verify_arguments.extend([
+        "--verify".into(),
+        "--verify-strict".into(),
+        format!("--verify-json={}", verify_report.display()),
+    ]);
+    let verified = hermit_command(
+        evidence,
+        "curl-replay-verify",
+        &verify_arguments,
+        &curl,
+        &["-sS", &url],
+    );
+    assert_success(&verified, "curl replay under --verify-strict");
+    assert_eq!(verified.stdout, recorded.stdout);
+    assert_l2_report(&verify_report, "curl replay under --verify-strict");
 }
