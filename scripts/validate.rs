@@ -718,6 +718,7 @@ const SUMMARY_EPILOGUE_SELF_TEST_ENV: &str = "HERMIT_VALIDATE_SUMMARY_EPILOGUE_S
 const NESTED_SCOPE_OUTER: &str = "outer";
 const NESTED_SCOPE_INNER: &str = "inner";
 const NESTED_SCOPE_SIGNAL: &str = "signal";
+const NESTED_SCOPE_SCORECARD_OWNER: &str = "scorecard-owner";
 const NESTED_INNER_STEP_S: i64 = 2;
 const NESTED_INNER_RUN_S: i64 = 5;
 const NESTED_OUTER_CHILD_STEP_S: i64 = 10;
@@ -2104,6 +2105,132 @@ fn nested_scope_self_test() -> Result<String, String> {
     Ok(format!(
         "safe-ci scope: real outer -> step child -> nested boxed step passed{placement}"
     ))
+}
+
+/// The child half of [`scorecard_owner_reexec_self_test`]. The first entry
+/// calls validate's own `resolve_cgroups`, the call a full run makes, and is
+/// replaced by a process in a fresh scope. That process's `main` captures the
+/// service result path and the post-verdict owner again, and only it reaches
+/// the report below, so the report states what the replacement inherited.
+fn run_scorecard_owner_reexec_probe(
+    service_result_path: Option<&Path>,
+    scorecard_delegated: bool,
+) -> RunSummary {
+    const LABEL: &str = "scorecard owner re-exec self-test";
+    let Some(deadline_ns) =
+        monotonic_now_ns().map(|now| now + NESTED_SCOPE_RUNTIME_S as u64 * 1_000_000_000)
+    else {
+        return RunSummary::new(
+            Verdict::Fail,
+            2,
+            LABEL,
+            vec!["CLOCK_MONOTONIC is unavailable".into()],
+        );
+    };
+    if let Err(code) = resolve_cgroups(
+        false,
+        Some(NESTED_SCOPE_RUNTIME_S),
+        Some(deadline_ns),
+        service_result_path,
+        scorecard_delegated,
+    ) {
+        return RunSummary::new(
+            Verdict::Fail,
+            2,
+            LABEL,
+            vec![format!("cgroup setup refused with exit {code}")],
+        );
+    }
+    let mut summary = RunSummary::new(
+        Verdict::SelfTest,
+        0,
+        LABEL,
+        vec![format!(
+            "scorecard owner after scope re-exec: service_result_path={} delegated={scorecard_delegated}",
+            service_result_path.is_some()
+        )],
+    );
+    // `main` publishes this summary to the service result path, which the
+    // parent bracket reads as the unit's launcher would. A PASSED result must
+    // state exact test counts, and this probe ran none.
+    summary.executed_tests = Some(0);
+    summary.passed_tests = Some(0);
+    summary
+}
+
+/// A ci-hub unit hands validate a service result path and the post-verdict
+/// owner, and the unit's own follow-on publishes the scorecard. Drive the real
+/// boxing re-exec with both set and require the replacement process to still
+/// be delegated. Testing `parent_owns_scorecard_writeback` alone missed that
+/// the re-exec dropped the owner, so every unit published in-unit.
+fn scorecard_owner_reexec_self_test() -> Result<String, String> {
+    let exe = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve self-test executable: {error}"))?;
+    let scratch = tempfile::tempdir()
+        .map_err(|error| format!("scorecard owner self-test: cannot create scratch: {error}"))?;
+    let result_path = scratch.path().join("service-result.json");
+    let output = Command::new("timeout")
+        .arg("--kill-after=5s")
+        .arg(format!("{NESTED_WRAPPER_TIMEOUT_S}s"))
+        .arg(exe)
+        .arg("--self-test")
+        .env(NESTED_SCOPE_SELF_TEST_ENV, NESTED_SCOPE_SCORECARD_OWNER)
+        .env(VALIDATE_SERVICE_RESULT_PATH_ENV, &result_path)
+        .env(SCORECARD_WRITEBACK_OWNER_ENV, SCORECARD_WRITEBACK_OWNER)
+        .env("DAGRUN_FORCE_SCOPE_ATTEMPT", "1")
+        .env_remove("DAGRUN_IN_SCOPE")
+        .env_remove("DAGRUN_SCOPE_UNIT")
+        .env_remove("DAGRUN_EXPECTED_OUTER_MEMORY_MAX_BYTES")
+        .env_remove("DAGRUN_EXPECTED_OUTER_CPU_COUNT")
+        .env_remove("DAGRUN_EXPECTED_RUNTIME_MAX_SEC")
+        .env_remove(OWN_SCOPE_DEADLINE_ENV)
+        .env_remove(RUN_STATE_SCOPE_REEXEC_ENV)
+        .env_remove("VALIDATE_RUN_STATE")
+        .env_remove(safe_ci_scope::CPU_PLACEMENT_ALLOWED_ENV)
+        .env_remove(safe_ci_scope::CPU_PLACEMENT_EXCLUDED_ENV)
+        .env_remove(safe_ci_scope::CPU_PLACEMENT_SOURCE_ENV)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|error| format!("cannot launch scorecard owner self-test: {error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() {
+        return Err(format!(
+            "scorecard owner self-test failed with {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        ));
+    }
+    for required in [
+        "re-exec inside transient systemd scope",
+        "validate: cgroup boxing ACTIVE",
+        "scorecard owner after scope re-exec: service_result_path=true delegated=true",
+    ] {
+        if !stdout.contains(required) && !stderr.contains(required) {
+            return Err(format!(
+                "scorecard owner self-test exited successfully without required evidence \
+                 {required:?}\nstdout:\n{stdout}\nstderr:\n{stderr}"
+            ));
+        }
+    }
+    // The `delegated=true` line above is what tells the two cases apart. This
+    // checks the other half of the contract: the replacement still publishes a
+    // PASSED result to the path it inherited, with no write-back recorded,
+    // which is the shape the unit's launcher reads for a delegated run.
+    let published = std::fs::read(&result_path)
+        .map_err(|error| format!("scorecard owner self-test: no service result: {error}"))
+        .and_then(|bytes| {
+            serde_json::from_slice::<serde_json::Value>(&bytes).map_err(|error| {
+                format!("scorecard owner self-test: unreadable service result: {error}")
+            })
+        })?;
+    if published.get("final_validate_status") != Some(&serde_json::json!("PASSED"))
+        || published.get("scorecard_writeback") != Some(&serde_json::Value::Null)
+    {
+        return Err(format!(
+            "scorecard owner self-test: service result is not a PASSED, delegated result: {published}"
+        ));
+    }
+    Ok("scorecard owner: a delegated run is still delegated after the real scope re-exec".into())
 }
 
 /// Inert two-sided bracket for [`nested_scope_placement_evidence`].
@@ -4384,6 +4511,7 @@ fn self_test() -> Result<(), String> {
         safe_ci_scope::self_test()?,
         nested_scope_placement_bracket()?,
         nested_scope_self_test()?,
+        scorecard_owner_reexec_self_test()?,
         retry_timeout_bound_bracket(&root)?,
         scheduler_accounting_bracket()?,
         process_group_scan_marker_bracket()?,
@@ -6929,6 +7057,7 @@ fn resolve_cgroups(
     run_timeout_s: Option<i64>,
     deadline_ns: Option<u64>,
     service_result_path: Option<&Path>,
+    scorecard_delegated: bool,
 ) -> Result<BoxedCgroups, u8> {
     let owns_request = owns_scope_request(deadline_ns);
     if is_in_scope() && run_timeout_s.is_some() && !owns_request {
@@ -6952,12 +7081,23 @@ fn resolve_cgroups(
     // The one legitimate descendant is our own systemd scope replacement.
     // Expose the stored path only across that exec boundary; if setup returns,
     // remove it again before any DAG payload can be launched.
+    //
+    // The post-verdict owner crosses the same boundary for the same reason.
+    // `main` removed it too, so without this the replacement process sees a
+    // service result path and no owner, decides it is not delegated, and runs
+    // the scorecard write-back inside the unit that was meant to defer it.
+    // Every ci-hub unit did exactly that from
+    // https://github.com/rrnewton/hermit/pull/3126 until this line.
     if let Some(path) = service_result_path {
         std::env::set_var(VALIDATE_SERVICE_RESULT_PATH_ENV, path);
+        if scorecard_delegated {
+            std::env::set_var(SCORECARD_WRITEBACK_OWNER_ENV, SCORECARD_WRITEBACK_OWNER);
+        }
     }
     let result =
         safe_ci_scope::resolve_cgroups("validate", allow_failure, scope_runtime_s, owns_request);
     std::env::remove_var(VALIDATE_SERVICE_RESULT_PATH_ENV);
+    std::env::remove_var(SCORECARD_WRITEBACK_OWNER_ENV);
     safe_ci_scope::propagate_result(result)
 }
 
@@ -26099,6 +26239,10 @@ fn run(
     }
 
     if nested_scope_probe_selected(args.self_test, nested_scope_probe_requested()) {
+        if std::env::var(NESTED_SCOPE_SELF_TEST_ENV).as_deref() == Ok(NESTED_SCOPE_SCORECARD_OWNER)
+        {
+            return run_scorecard_owner_reexec_probe(service_result_path, scorecard_delegated);
+        }
         return match run_nested_scope_probe() {
             Ok(detail) => RunSummary::new(
                 Verdict::SelfTest,
@@ -27268,6 +27412,7 @@ fn run(
         run_timeout,
         deadline_ns,
         service_result_path,
+        scorecard_delegated,
     );
     std::env::remove_var(RUN_STATE_SCOPE_REEXEC_ENV);
     let cgroups: BoxedCgroups = match cgroup_result {
