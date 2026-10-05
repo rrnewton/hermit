@@ -167,6 +167,19 @@ impl OpenFileId {
     }
 }
 
+/// Names the identity for diagnostics, without the socket-domain bit.
+impl std::fmt::Display for OpenFileId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let kind = if self.is_socket() { "socket" } else { "file" };
+        write!(
+            f,
+            "{kind} {} opened by thread {}",
+            self.sequence & !SOCKET_SEQUENCE_DOMAIN,
+            self.creator.as_raw()
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -195,5 +208,17 @@ mod tests {
         );
         assert_ne!(first, OpenFileId::new(DetTid::from_raw(3), 7));
         assert_eq!(first.deterministic_socket_cookie(), (3_u64 << 32) | 7);
+    }
+
+    #[test]
+    fn open_file_ids_display_their_kind_sequence_and_creator() {
+        assert_eq!(
+            OpenFileId::new_socket(DetTid::from_raw(3), 0).to_string(),
+            "socket 0 opened by thread 3"
+        );
+        assert_eq!(
+            OpenFileId::new(DetTid::from_raw(4), 7).to_string(),
+            "file 7 opened by thread 4"
+        );
     }
 }

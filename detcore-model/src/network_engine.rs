@@ -111,34 +111,31 @@ impl fmt::Display for NetworkEngineError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WrongMode => write!(f, "network engine called in the wrong mode"),
-            Self::UnknownChannel(id) => write!(f, "network channel {id:?} is not connected"),
+            Self::UnknownChannel(id) => write!(f, "network trace: {id} is not connected"),
             Self::ChannelExists(id) => write!(
                 f,
-                "network channel {id:?} connected twice, which network record/replay does not support"
+                "network trace: {id} connected twice, which network record/replay does not support"
             ),
-            Self::NotInTrace(id) => write!(
-                f,
-                "network trace has no recorded connection for socket {id:?}"
-            ),
+            Self::NotInTrace(id) => write!(f, "network trace has no recorded connection for {id}"),
             Self::PeerMismatch {
                 channel,
                 recorded,
                 attempted,
             } => write!(
                 f,
-                "network trace mismatch: socket {channel:?} connected to {attempted:?}, but the recording connected it to {recorded:?}"
+                "network trace mismatch: {channel} connected to {attempted:?}, but the recording connected it to {recorded:?}"
             ),
             Self::OutboundMismatch { channel, offset } => write!(
                 f,
-                "network outbound mismatch: socket {channel:?} sent different bytes than the recording at stream offset {offset}"
+                "network outbound mismatch: {channel} sent different bytes than the recording at stream offset {offset}"
             ),
             Self::OutboundBeyondRecording { channel, offset } => write!(
                 f,
-                "network outbound mismatch: socket {channel:?} sent bytes past the end of the recording at stream offset {offset}"
+                "network outbound mismatch: {channel} sent bytes past the end of the recording at stream offset {offset}"
             ),
             Self::InvalidArrival(id) => write!(
                 f,
-                "network record received input for socket {id:?} after its stream ended"
+                "network record received input for {id} after its stream ended"
             ),
             Self::Trace(error) => write!(f, "network trace: {error}"),
         }
