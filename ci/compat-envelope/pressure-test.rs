@@ -9840,8 +9840,12 @@ fn pressure_parity(
     parity::post_pass(config, &scope.cells, rows).map(Some)
 }
 
-/// [`parity::resolve_scope`] over the verify cells of one series, including
-/// its parity references, and its `--parity-select` cells and sampled pairs.
+/// [`parity::resolve_scope`] over the verify cells the series selected, and
+/// its `--parity-select` cells and sampled pairs. A parity reference is not a
+/// planned side here: it contributes only the pair it was added for, which
+/// `parity_pairs` names, and never pulls its test's other committed
+/// selection cells into the scope as `candidate-missing` rows. Its rows still
+/// reach the post-pass as that pair's reference operand.
 fn series_parity_scope(
     root: &Path,
     metadata: &RunMetadata,
@@ -9850,7 +9854,6 @@ fn series_parity_scope(
     let planned = metadata
         .cells
         .iter()
-        .chain(&metadata.reference_cells)
         .filter(|cell| cell.mode == parity::PARITY_MODE)
         .map(|cell| (cell.test.clone(), cell.backend.clone()))
         .collect();
@@ -24406,6 +24409,64 @@ mod pressure_sample_tests {
         assert_eq!(with_verdicts["cells"], without_verdicts["cells"]);
         with_cleanup.remove().unwrap();
         without_cleanup.remove().unwrap();
+    }
+
+    /// A parity reference contributes only the pair it was added for. Its
+    /// ptrace side must not pull its test's other committed selection cells
+    /// into the scope, where each would be a `candidate-missing` row; cells
+    /// whose side the sample itself ran keep the selection's rule.
+    #[test]
+    fn a_reference_contributes_only_its_own_pair_to_the_parity_scope() {
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let manifests = ManifestSet::load(&root).unwrap();
+        let matrix = parity::ParityMatrix::derive(&manifests).unwrap();
+        let selection = parity::ParitySelection::load(&root, &matrix).unwrap().cells;
+        let pairs = snapshot_parity_pairs(&root).unwrap();
+        let (seed, candidate) = one_cell_sample_seed(&root, |cell| {
+            cell.mode == parity::PARITY_MODE
+                && parity::ParityBackend::parse(&cell.backend)
+                    .is_ok_and(|backend| backend.inputs_not_equalizable().is_none())
+                && pairs.contains(&(cell.test.clone(), cell.backend.clone()))
+                && selection.iter().any(|other| {
+                    other.test_id == cell.test && other.backend.as_str() != cell.backend
+                })
+        });
+        let (results, cleanup) = parity_self_test_results("reference-scope");
+        let (metadata, _) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &CellSelection {
+                sample: Some(1),
+                seed: Some(seed),
+                run_timeout_seconds: Some(1_000_000),
+                ..CellSelection::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(metadata.cells, vec![candidate.clone()]);
+        let own = parity::ParityCellId {
+            test_id: candidate.test.clone(),
+            backend: parity::ParityBackend::parse(&candidate.backend).unwrap(),
+        };
+        let scope = series_parity_scope(&root, &metadata).unwrap();
+        assert!(scope.cells.contains(&own), "{:?}", scope.cells);
+        let foreign: Vec<_> = scope
+            .cells
+            .iter()
+            .filter(|cell| cell.test_id == candidate.test && **cell != own)
+            .collect();
+        assert!(
+            foreign.is_empty(),
+            "the reference of {} pulled its test's other selection cells into the scope: {foreign:?}",
+            candidate.test
+        );
+        cleanup.remove().unwrap();
     }
 }
 
