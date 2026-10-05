@@ -1910,6 +1910,11 @@ struct RunMetadata {
     /// before references existed, and for every unsampled selection.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     reference_cells: Vec<CellId>,
+    /// The parity references the sample derived but did not run, because
+    /// their declared chain cannot fit the run bound, each with that reason.
+    /// Their pairs stay in `parity_pairs` and are reported reference-missing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    skipped_references: Vec<SkippedReference>,
     /// The parity cells (`<test-id>@<backend>`) of the sampled candidates, in
     /// canonical order. The post-pass reports them besides the committed
     /// selection and `--parity-select`.
@@ -3178,6 +3183,13 @@ fn print_sample(metadata: &RunMetadata) {
         for cell in &metadata.reference_cells {
             println!("  REFERENCE {}", display_id(cell));
         }
+    }
+    for skipped in &metadata.skipped_references {
+        println!(
+            "  REFERENCE NOT RUN {}: {}",
+            display_id(&skipped.cell),
+            skipped.reason
+        );
     }
 }
 
@@ -5182,6 +5194,158 @@ fn retain_required_build_dependencies(
     Ok(())
 }
 
+/// The wall bound of the pressure graph's summary node, the last node of
+/// every critical path.
+const PRESSURE_SUMMARY_TIMEOUT_SECONDS: i64 = 120;
+
+/// A parity reference the sample derived but did not run, and why.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SkippedReference {
+    cell: CellId,
+    reason: String,
+}
+
+/// The declared wall bound of validation's fixture node, copied unchanged
+/// into the graph when a cell reads the fixtures.
+fn compat_fixture_seconds(canonical: &DagConfig) -> Result<i64, String> {
+    canonical
+        .steps
+        .iter()
+        .find(|step| step.tag() == VALIDATE_FIXTURE_STEP)
+        .map(|step| step.timeout)
+        .ok_or_else(|| format!("{PORTABLE_DAG} has no {VALIDATE_FIXTURE_STEP}"))
+}
+
+/// The declared wall budgets of a plan's post-build critical paths. Each cell
+/// run's path is the fixture node when the graph has one, then its test's
+/// shared preparation when there is one, then the cell, then the summary
+/// node: exactly its chain of dependencies after the shared builds, which
+/// every path starts with. A path that is not below the run bound can run
+/// the whole graph into that bound.
+struct DeclaredChain<'a> {
+    budgets: &'a BTreeMap<(String, String, String), CellBudget>,
+    manifest_facts: &'a BTreeMap<(String, String, String), ManifestCellFacts>,
+    preparation_by_test: &'a BTreeMap<String, CellId>,
+    cell_timeout_seconds: Option<i64>,
+    run_timeout_seconds: i64,
+    fixture_seconds: i64,
+}
+
+impl DeclaredChain<'_> {
+    fn budget(&self, cell: &CellId) -> Result<&CellBudget, String> {
+        self.budgets
+            .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+            .ok_or_else(|| format!("no manifest budget for {}", display_id(cell)))
+    }
+
+    fn reads_fixtures(&self, cell: &CellId) -> Result<bool, String> {
+        self.manifest_facts
+            .get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+            .map(|facts| facts.reads_compat_fixtures)
+            .ok_or_else(|| format!("no manifest facts for {}", display_id(cell)))
+    }
+
+    /// The declared seconds of `cell`'s path and how they add up.
+    fn path(&self, cell: &CellId, fixtures: bool) -> Result<(i64, String), String> {
+        let fixture = if fixtures { self.fixture_seconds } else { 0 };
+        let preparation = match self.preparation_by_test.get(&cell.test) {
+            Some(prepared_with) => preparation_node_timeout(self.budget(prepared_with)?)?,
+            None => 0,
+        };
+        let run = pressure_timeout(self.budget(cell)?, self.cell_timeout_seconds)?;
+        let total = fixture
+            .checked_add(preparation)
+            .and_then(|seconds| seconds.checked_add(run))
+            .and_then(|seconds| seconds.checked_add(PRESSURE_SUMMARY_TIMEOUT_SECONDS))
+            .ok_or("declared critical path exceeds the supported integer range")?;
+        Ok((
+            total,
+            format!(
+                "fixture preparation {fixture}s, test preparation {preparation}s, cell {run}s, summary {PRESSURE_SUMMARY_TIMEOUT_SECONDS}s"
+            ),
+        ))
+    }
+
+    fn fits(&self, seconds: i64) -> bool {
+        seconds < self.run_timeout_seconds
+    }
+
+    /// Refuse a plan any of whose `cells` cannot fit the run bound.
+    fn require_cells_fit(&self, cells: &[TrackedCell], fixtures: bool) -> Result<(), String> {
+        for tracked in cells {
+            let (seconds, composition) = self.path(&tracked.id, fixtures)?;
+            if !self.fits(seconds) {
+                return Err(format!(
+                    "selected cell {} cannot fit the {}s whole-run WALL bound: its declared critical path after the shared builds is {seconds}s ({composition}); choose another sample or deliberately raise --run-timeout",
+                    display_id(&tracked.id),
+                    self.run_timeout_seconds
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Split a sample's parity references into those it runs and those it skips,
+/// so a reference never costs the sample its evidence. A reference is skipped
+/// when its own declared path cannot fit the run bound, or when it alone
+/// would add the fixture node and that would push a path already kept past
+/// the bound. The sampled cells' own fit is checked separately and refuses
+/// the plan.
+fn partition_references(
+    sampled: &[TrackedCell],
+    references: Vec<TrackedCell>,
+    declared: &DeclaredChain<'_>,
+) -> Result<(Vec<TrackedCell>, Vec<SkippedReference>), String> {
+    let mut fixtures = false;
+    for tracked in sampled {
+        fixtures |= declared.reads_fixtures(&tracked.id)?;
+    }
+    let mut kept: Vec<TrackedCell> = Vec::new();
+    let mut skipped = Vec::new();
+    for reference in references {
+        let reads = declared.reads_fixtures(&reference.id)?;
+        let with_fixtures = fixtures || reads;
+        let (seconds, composition) = declared.path(&reference.id, with_fixtures)?;
+        let reason = if !declared.fits(seconds) {
+            Some(format!(
+                "reference not run: its declared budget does not fit the run bound: {seconds}s on its declared critical path after the shared builds ({composition}) is not below the {}s run bound",
+                declared.run_timeout_seconds
+            ))
+        } else if with_fixtures && !fixtures {
+            // It alone would add the fixture node to every path.
+            let mut pushed = None;
+            for tracked in sampled.iter().chain(&kept) {
+                let (seconds, _) = declared.path(&tracked.id, true)?;
+                if !declared.fits(seconds) {
+                    pushed = Some(display_id(&tracked.id));
+                    break;
+                }
+            }
+            pushed.map(|cell| {
+                format!(
+                    "reference not run: its declared budget does not fit the run bound: the fixture preparation it needs ({}s) would push {cell} past the {}s run bound",
+                    declared.fixture_seconds, declared.run_timeout_seconds
+                )
+            })
+        } else {
+            None
+        };
+        match reason {
+            Some(reason) => skipped.push(SkippedReference {
+                cell: reference.id.clone(),
+                reason,
+            }),
+            None => {
+                fixtures |= reads;
+                kept.push(reference);
+            }
+        }
+    }
+    Ok((kept, skipped))
+}
+
 /// Validation's [`VALIDATE_FIXTURE_STEP`], copied for the pressure graph. Its
 /// command, limits and resource hint are validation's, byte for byte. Three
 /// substitutions are documented here and checked by the self-test: the command
@@ -5370,6 +5534,39 @@ fn write_plan_after_scorecard_check(
         references,
         parity_pairs,
     } = pressure_cells(root, selection)?;
+    let preparation_by_test = if selection.uses_shared_preparation() {
+        all_preparations
+    } else {
+        BTreeMap::new()
+    };
+    let timeout_policy = PressureTimeoutPolicy::from_env()?;
+    let selected_budgets = sampled
+        .iter()
+        .chain(&references)
+        .map(|tracked| &tracked.id)
+        .chain(preparation_by_test.values())
+        .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+        .collect();
+    let budgets = resolve_budgets(load_budgets(root)?, timeout_policy, &selected_budgets)?;
+    let run_timeout_seconds = selection
+        .run_timeout_seconds
+        .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
+    let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
+        .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
+    let canonical =
+        dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
+    let declared = DeclaredChain {
+        budgets: &budgets,
+        manifest_facts: &manifest_facts,
+        preparation_by_test: &preparation_by_test,
+        cell_timeout_seconds: selection.cell_timeout_seconds,
+        run_timeout_seconds,
+        fixture_seconds: compat_fixture_seconds(&canonical)?,
+    };
+    // A reference must never cost the sample its evidence: one whose declared
+    // chain cannot fit the run bound is not run, and its pair is reported
+    // reference-missing with the reason.
+    let (references, skipped_references) = partition_references(&sampled, references, &declared)?;
     // Every cell the graph runs: the selected population and, for a sample,
     // its parity references. Only `sampled` is the run's selected population.
     let mut cells: Vec<TrackedCell> = sampled.iter().chain(&references).cloned().collect();
@@ -5391,11 +5588,6 @@ fn write_plan_after_scorecard_check(
     if checked_scorecard.enforce_host_capabilities {
         require_selected_kvm_capability(&cells, &strict_kvm_capability())?;
     }
-    let preparation_by_test = if selection.uses_shared_preparation() {
-        all_preparations
-    } else {
-        BTreeMap::new()
-    };
     let exact_cell = selection.is_exact().then(|| {
         (
             selection.mode.as_deref().expect("exact selection has mode"),
@@ -5412,17 +5604,6 @@ fn write_plan_after_scorecard_check(
         preparation_by_test.len(),
         required_builds.len() + usize::from(reads_compat_fixtures),
     )?;
-    let timeout_policy = PressureTimeoutPolicy::from_env()?;
-    let selected_budgets = cells
-        .iter()
-        .map(|tracked| &tracked.id)
-        .chain(preparation_by_test.values())
-        .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
-        .collect();
-    let budgets = resolve_budgets(load_budgets(root)?, timeout_policy, &selected_budgets)?;
-    let run_timeout_seconds = selection
-        .run_timeout_seconds
-        .unwrap_or(PRESSURE_RUN_TIMEOUT_SECONDS);
     require_cell_occupancy_fits(
         &cells,
         &budgets,
@@ -5433,6 +5614,7 @@ fn write_plan_after_scorecard_check(
         selection.manifest_guest_cap(),
         selection.kvm_guest_cap(),
     )?;
+    declared.require_cells_fit(&sampled, reads_compat_fixtures)?;
     fs::create_dir_all(results).map_err(|e| format!("cannot create {}: {e}", results.display()))?;
     // Validation creates its VALIDATE_RUN_STATE before any node runs.
     let run_state = results.join(VALIDATE_RUN_STATE_DIR);
@@ -5443,10 +5625,6 @@ fn write_plan_after_scorecard_check(
             .map_err(|e| format!("cannot create {}: {e}", parent.display()))?;
     }
 
-    let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
-        .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
-    let canonical =
-        dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
     let mut steps = Vec::new();
     for mut step in host_build_steps(&canonical)? {
         let tag = step.tag();
@@ -5850,8 +6028,8 @@ fn write_plan_after_scorecard_check(
         networkonly: false,
         engine_only: false,
         delegated_children: false,
-        timeout: 120,
-        cpu_timeout: 120,
+        timeout: PRESSURE_SUMMARY_TIMEOUT_SECONDS,
+        cpu_timeout: PRESSURE_SUMMARY_TIMEOUT_SECONDS,
         jobs_flag: None,
         jobs_env: None,
         skip_reason: None,
@@ -5964,6 +6142,7 @@ fn write_plan_after_scorecard_check(
         hermit_epoch: Some(hermit_epoch),
         parity_select: selection.parity_select.clone(),
         reference_cells,
+        skipped_references,
         parity_pairs,
         cells: selected_cells,
     };
@@ -6269,8 +6448,41 @@ fn validate_run_contract(
         ));
     }
     let expected_cells = pressure_cells.selected;
-    let expected_references = pressure_cells.references;
     let expected_pairs = pressure_cells.parity_pairs;
+    // Which references a retained sample ran and which it skipped follows
+    // from its recorded run bound, cell cap and timeout policy, exactly as at
+    // plan time. A run without a timeout policy predates references.
+    let (expected_references, expected_skipped) = match metadata.timeout_policy {
+        Some(policy) if !pressure_cells.references.is_empty() => {
+            let preparation = if selection.uses_shared_preparation() {
+                pressure_cells.preparation_by_test.clone()
+            } else {
+                BTreeMap::new()
+            };
+            let keys = expected_cells
+                .iter()
+                .chain(&pressure_cells.references)
+                .map(|tracked| &tracked.id)
+                .chain(preparation.values())
+                .map(|cell| (cell.test.clone(), cell.mode.clone(), cell.backend.clone()))
+                .collect();
+            let budgets = resolve_budgets(load_budgets(root)?, policy, &keys)?;
+            let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
+                .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
+            let canonical = dag_from_json(&canonical_text)
+                .map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
+            let declared = DeclaredChain {
+                budgets: &budgets,
+                manifest_facts: &pressure_cells.manifest_facts,
+                preparation_by_test: &preparation,
+                cell_timeout_seconds: metadata.cell_timeout_seconds,
+                run_timeout_seconds: metadata.run_timeout_seconds,
+                fixture_seconds: compat_fixture_seconds(&canonical)?,
+            };
+            partition_references(&expected_cells, pressure_cells.references, &declared)?
+        }
+        _ => (pressure_cells.references, Vec::new()),
+    };
     let mut expected = BTreeMap::new();
     for tracked in expected_cells {
         let applicable = tracked.is_applicable();
@@ -6312,10 +6524,18 @@ fn validate_run_contract(
         .iter()
         .map(|tracked| tracked.id.clone())
         .collect();
-    if metadata.reference_cells != reference_ids || metadata.parity_pairs != expected_pairs {
+    if metadata.reference_cells != reference_ids
+        || metadata.skipped_references != expected_skipped
+        || metadata.parity_pairs != expected_pairs
+    {
         return Err(format!(
-            "run metadata records parity references {:?} and pairs {:?}, but its selected population derives {:?} and {:?}",
-            metadata.reference_cells, metadata.parity_pairs, reference_ids, expected_pairs
+            "run metadata records parity references {:?}, skipped references {:?} and pairs {:?}, but its selected population derives {:?}, {:?} and {:?}",
+            metadata.reference_cells,
+            metadata.skipped_references,
+            metadata.parity_pairs,
+            reference_ids,
+            expected_skipped,
+            expected_pairs
         ));
     }
     for tracked in expected_references {
@@ -9367,6 +9587,15 @@ fn summarize(
             ));
         }
     }
+    // A reference the plan did not run, because its declared chain cannot fit
+    // the run bound, is handed to the post-pass as a reference that left no
+    // result row, with that reason: its pair is reported reference-missing,
+    // through the post-pass's own classification, and stays counted.
+    for skipped in &metadata.skipped_references {
+        parity_rejected
+            .entry((skipped.cell.test.clone(), skipped.cell.backend.clone()))
+            .or_insert_with(|| parity::ParityRejection::MissingRow(skipped.reason.clone()));
+    }
     println!("{}", summary_heading(&metadata));
     println!();
     println!(
@@ -9551,6 +9780,13 @@ fn summarize(
         None
     };
 
+    for skipped in &metadata.skipped_references {
+        println!(
+            "Parity reference not run: {}: {}",
+            display_id(&skipped.cell),
+            skipped.reason
+        );
+    }
     if !metadata.reference_cells.is_empty() {
         println!(
             "Parity references: {} ptrace verify cell(s) run beside the {} sampled cell(s) so the post-pass can score {} sampled pair(s); they are reported apart in summary.json and do not count above.",
@@ -9558,7 +9794,7 @@ fn summarize(
             metadata.cells.len(),
             metadata.parity_pairs.len()
         );
-        for row in &reference_rows {
+        for row in reference_rows.iter() {
             if let (Some(cell), Some(result)) = (
                 row.get("cell")
                     .and_then(|cell| serde_json::from_value::<CellId>(cell.clone()).ok()),
@@ -9597,6 +9833,15 @@ fn summarize(
         "rows": rows,
         "parity_pairs": metadata.parity_pairs,
         "reference_cells": reference_rows,
+        "skipped_reference_cells": metadata
+            .skipped_references
+            .iter()
+            .map(|skipped| json!({
+                "cell": skipped.cell,
+                "reason": skipped.reason,
+                "role": "reference",
+            }))
+            .collect::<Vec<_>>(),
     });
     verify_repetition_summary_json(&summary, attempted, retried_repetitions)?;
     let mut text = serde_json::to_string_pretty(&summary)
@@ -16574,6 +16819,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         hermit_epoch: None,
         parity_select: Vec::new(),
         reference_cells: Vec::new(),
+        skipped_references: Vec::new(),
         parity_pairs: Vec::new(),
         cells: vec![sample_a.clone()],
     };
@@ -24467,6 +24713,201 @@ mod pressure_sample_tests {
             candidate.test
         );
         cleanup.remove().unwrap();
+    }
+
+    /// The declared post-build critical path through each node of `dag`, in
+    /// seconds: its wall timeout plus the longest such path among its
+    /// dependencies, where the shared initial nodes (pre, gate, setup and
+    /// build) count zero. Computed here independently of the planner.
+    fn post_build_finish(dag: &DagConfig) -> BTreeMap<String, i64> {
+        let steps: BTreeMap<String, &Step> =
+            dag.steps.iter().map(|step| (step.tag(), step)).collect();
+        fn finish(
+            tag: &str,
+            steps: &BTreeMap<String, &Step>,
+            memo: &mut BTreeMap<String, i64>,
+        ) -> i64 {
+            if let Some(value) = memo.get(tag) {
+                return *value;
+            }
+            let step = steps[tag];
+            let value = if matches!(step.group.as_str(), "pre" | "gate" | "setup" | "build") {
+                0
+            } else {
+                step.timeout
+                    + step
+                        .deps
+                        .iter()
+                        .map(|dep| finish(dep, steps, memo))
+                        .max()
+                        .unwrap_or(0)
+            };
+            memo.insert(tag.to_string(), value);
+            value
+        }
+        let mut memo = BTreeMap::new();
+        for tag in steps.keys() {
+            finish(tag, &steps, &mut memo);
+        }
+        memo
+    }
+
+    /// A reference must never cost the sample its evidence. Where the
+    /// reference's declared chain (fixture preparation, its test's
+    /// preparation, its cell, and the summary node) does not fit the run
+    /// bound, the reference is not run and its pair is recorded
+    /// `reference-missing` with that reason; where it fits, it runs; and a
+    /// sample whose own cells cannot fit is refused when it is planned.
+    #[test]
+    fn a_reference_that_cannot_fit_the_run_bound_is_skipped_and_counted() {
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let pairs = snapshot_parity_pairs(&root).unwrap();
+        let budgets = load_budgets(&root).unwrap();
+        let wall = |test: &str, backend: &str| {
+            budgets
+                .get(&(test.to_string(), "verify".to_string(), backend.to_string()))
+                .map(|budget| budget.timeout_seconds)
+        };
+        // A comparable candidate whose reference declares a much longer cell.
+        let (seed, candidate) = one_cell_sample_seed(&root, |cell| {
+            cell.mode == parity::PARITY_MODE
+                && parity::ParityBackend::parse(&cell.backend)
+                    .is_ok_and(|backend| backend.inputs_not_equalizable().is_none())
+                && pairs.contains(&(cell.test.clone(), cell.backend.clone()))
+                && wall(&cell.test, "ptrace").is_some_and(|reference| {
+                    wall(&cell.test, &cell.backend).is_some_and(|own| reference >= own + 300)
+                })
+        });
+        let reference = reference_of(&candidate);
+        let plan = |label: &str, run_timeout: i64| {
+            let (results, cleanup) = parity_self_test_results(label);
+            let planned = write_plan_after_scorecard_check(
+                &checked,
+                &results,
+                &results.join("dag.json"),
+                &CellSelection {
+                    sample: Some(1),
+                    seed: Some(seed),
+                    run_timeout_seconds: Some(run_timeout),
+                    ..CellSelection::default()
+                },
+            );
+            (planned, results, cleanup)
+        };
+        let (wide, wide_results, wide_cleanup) = plan("fit-wide", 1_000_000);
+        let (_, wide_dag) = wide.unwrap();
+        let finish = post_build_finish(&wide_dag);
+        let summary = finish["pressure.summarize"]
+            - finish
+                .iter()
+                .filter(|(tag, _)| tag.starts_with("cell."))
+                .map(|(_, seconds)| *seconds)
+                .max()
+                .unwrap();
+        let chain =
+            |cell: &CellId| finish[&format!("cell.{}", cell_run_slug(cell, None))] + summary;
+        let (sampled_chain, reference_chain) = (chain(&candidate), chain(&reference));
+        assert!(
+            reference_chain > sampled_chain && reference_chain > 1300,
+            "fixture chains {sampled_chain}s and {reference_chain}s"
+        );
+        wide_cleanup.remove().unwrap();
+        drop(wide_results);
+
+        // It fits: the reference runs.
+        let (fits, _, fits_cleanup) = plan("fit-fits", reference_chain + 1);
+        let (fits, fits_dag) = fits.unwrap();
+        assert_eq!(fits.reference_cells, vec![reference.clone()]);
+        assert!(
+            fits_dag
+                .steps
+                .iter()
+                .any(|step| step.job == cell_run_slug(&reference, None))
+        );
+        fits_cleanup.remove().unwrap();
+
+        // It does not fit: no reference node, the pair stays, and the skip is
+        // recorded with its reason.
+        let (skipped, skipped_results, skipped_cleanup) = plan("fit-skipped", reference_chain);
+        let (mut skipped, skipped_dag) = skipped.unwrap();
+        let retained = serde_json::to_value(&skipped).unwrap();
+        assert_eq!(
+            retained
+                .get("reference_cells")
+                .cloned()
+                .unwrap_or(json!([])),
+            json!([])
+        );
+        assert!(
+            !skipped_dag
+                .steps
+                .iter()
+                .any(|step| step.job == cell_run_slug(&reference, None))
+        );
+        assert_eq!(
+            retained["parity_pairs"],
+            json!([format!("{}@{}", candidate.test, candidate.backend)])
+        );
+        assert_eq!(
+            retained["skipped_references"][0]["cell"],
+            json!(reference),
+            "{retained}"
+        );
+        assert!(
+            retained["skipped_references"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("does not fit the run bound")),
+            "{retained}"
+        );
+        skipped.source_tree_dirty = false;
+        fs::write(
+            skipped_results.join("run.json"),
+            serde_json::to_vec(&skipped).unwrap(),
+        )
+        .unwrap();
+        let slug = plant_matched_verify_cell(&skipped_results, &candidate, &skipped, None);
+        let evidence = BTreeMap::from([(
+            format!("cell.{slug}"),
+            RunnerEvidence {
+                seen: true,
+                ok: true,
+                ..RunnerEvidence::default()
+            },
+        )]);
+        summarize(&root, &skipped_results, false, Some(&evidence), true).unwrap();
+        let cell = parity::ParityCellId {
+            test_id: candidate.test.clone(),
+            backend: parity::ParityBackend::parse(&candidate.backend).unwrap(),
+        };
+        let records = read_parity_records(&skipped_results.join(parity::PARITY_JSONL));
+        let record = parity_record(&records, &cell);
+        assert_eq!(
+            (record.verdict, record.operand),
+            (
+                parity::ParityVerdict::ReferenceMissing,
+                Some(parity::ParityOperand::Reference)
+            ),
+            "{record:?}"
+        );
+        assert!(
+            record
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("reference not run")),
+            "{record:?}"
+        );
+        skipped_cleanup.remove().unwrap();
+
+        // The sample's own cell cannot fit: the plan is refused.
+        let (refused, _, refused_cleanup) = plan("fit-refused", sampled_chain);
+        let error = refused.err().expect("a sample that cannot fit was planned");
+        assert!(error.contains("cannot fit"), "{error}");
+        refused_cleanup.remove().unwrap();
     }
 }
 
