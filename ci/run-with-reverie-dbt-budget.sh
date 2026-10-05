@@ -867,7 +867,15 @@ fi
 # CMAKE/CMAKE_GENERATOR, MAX_PARALLEL_JOBS=16 and the 1050 effective-job-seconds limit stay unchanged.
 # Public SDK archives use release facf55df5c77b517eaef4650dfa23e28b74c5438 separately;
 # its build.rs retains the b024 recipe and its DBT manifest adds only publish=false.
-expected_pin=2eee28d3f2a32d3cdc6052cb2de60588026df5d4
+# PRIVATE SDK MAIN CARRY TO c7a1ed25bca339daa0e69241353fc9882da63d7a (2026-10-05).
+# From 2eee28d3f2a32d3cdc6052cb2de60588026df5d4; all seven recorded DynamoRIO build inputs
+# remain byte-identical. The F85 recipe, available-CPU cap, 16-job clamp
+# and 1050 effective-job-seconds budget retain their existing behavior.
+# Adaptive controller/wait changes introduce no new DBT timing sample.
+# Public SDK package source is separately release fdd3a2d94fa978c3c7025be211b87526a67400c8;
+# its seven recipe inputs match the prior facf release, retaining the
+# existing B024 recipe. This is source provenance, not new calibration.
+expected_pin=c7a1ed25bca339daa0e69241353fc9882da63d7a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
