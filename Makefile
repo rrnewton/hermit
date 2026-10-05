@@ -211,6 +211,7 @@ LINT_CHECK_TARGETS := \
     lint-check-compat-git-location \
     lint-check-run-pinned-tool \
     lint-check-git-dep-mirrors \
+    lint-check-fill-git-mirrors \
     lint-check-validate-stop-paths \
     lint-check-merge-gate-policy \
     lint-check-configure-merge-gate-ruleset \
@@ -284,6 +285,9 @@ lint-check-run-pinned-tool:
 
 lint-check-git-dep-mirrors:
 	./bootstrap/test-git-dep-mirrors.sh
+
+lint-check-fill-git-mirrors:
+	./scripts/test-fill-git-mirrors.sh
 
 lint-check-validate-stop-paths:
 	python3 ./scripts/test_validate_stop_paths.py --exclude-canonical-adapter-accept-arm
