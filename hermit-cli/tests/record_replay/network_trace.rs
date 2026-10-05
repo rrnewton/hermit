@@ -405,20 +405,59 @@ const REPLACE_MODE: &str = "backpressure-replace";
 /// process rewrites while it waits.
 const SHARED_MODE: &str = "backpressure-shared";
 
+/// The client's stdout less the observe mode's own lines, which are checked
+/// against the recording. Every other byte, terminators included, is kept.
+fn backpressure_protocol(stdout: &[u8], mode: &str) -> Vec<u8> {
+    if mode != OBSERVE_MODE {
+        return stdout.to_vec();
+    }
+    stdout
+        .split_inclusive(|&byte| byte == b'\n')
+        .filter(|line| !line.starts_with(b"observe "))
+        .flatten()
+        .copied()
+        .collect()
+}
+
 fn assert_backpressure_output(stdout: &[u8], mode: &str, label: &str) {
     let kind = mode.strip_prefix("backpressure-").unwrap();
-    let text = String::from_utf8_lossy(stdout);
-    // The observe mode's own lines are checked against the recording.
-    let protocol = text
-        .lines()
-        .filter(|line| mode != OBSERVE_MODE || !line.starts_with("observe "))
-        .map(|line| format!("{line}\n"))
-        .collect::<String>();
     assert_eq!(
-        protocol,
+        String::from_utf8_lossy(&backpressure_protocol(stdout, mode)),
         format!("backpressure={kind} bytes={BACKPRESSURE_BYTES} reply=ok\n"),
-        "{label} did not complete the backpressure protocol:\n{text}"
+        "{label} did not complete the backpressure protocol:\n{}",
+        String::from_utf8_lossy(stdout)
     );
+}
+
+#[test]
+fn backpressure_output_check_is_exact_except_for_the_observe_lines() {
+    let accepts = |stdout: &str, mode: &str| {
+        std::panic::catch_unwind(|| assert_backpressure_output(stdout.as_bytes(), mode, "probe"))
+            .is_ok()
+    };
+    let blocking = format!("backpressure=blocking bytes={BACKPRESSURE_BYTES} reply=ok");
+    let observe = format!("backpressure=observe bytes={BACKPRESSURE_BYTES} reply=ok");
+    let observed = "observe released=1\nobserve clock_before=1.0 clock_after=2.0\n";
+
+    assert!(accepts(&format!("{blocking}\n"), "backpressure-blocking"));
+    assert!(!accepts(&blocking, "backpressure-blocking"));
+    assert!(!accepts(
+        &format!("{blocking}\r\n"),
+        "backpressure-blocking"
+    ));
+    assert!(!accepts(
+        &format!("{blocking}\n\n"),
+        "backpressure-blocking"
+    ));
+    // Outside the observe mode an "observe " line is ordinary output.
+    assert!(!accepts(
+        &format!("observe released=1\n{blocking}\n"),
+        "backpressure-blocking"
+    ));
+
+    assert!(accepts(&format!("{observed}{observe}\n"), OBSERVE_MODE));
+    assert!(!accepts(&format!("{observed}{observe}"), OBSERVE_MODE));
+    assert!(!accepts(&format!("{observed}{observe}\r\n"), OBSERVE_MODE));
 }
 
 fn assert_backpressure_report(report: &str) {
