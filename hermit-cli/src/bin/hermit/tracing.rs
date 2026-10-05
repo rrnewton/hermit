@@ -453,23 +453,36 @@ impl LogBudget {
         self.cells.address == other.cells.address
     }
 
-    /// Charge `len` bytes. One relaxed load and one relaxed `fetch_add` per
-    /// write: this sits on the hot path of every log line. A write that would
-    /// take the total past the limit claims the one-way `crossed` flag; the
-    /// single claimant is the crossing, every other writer is already over.
-    /// Refunds lower `spent` but never clear `crossed`, so a crossing is final.
+    /// Charge `len` bytes. Two relaxed loads and one relaxed compare-exchange
+    /// per write, retried only when another writer raced it: this sits on the
+    /// hot path of every log line. A write that would take the
+    /// total past the limit claims the one-way `crossed` flag; the single
+    /// claimant is the crossing, every other writer is already over. Refunds
+    /// lower `spent` but never clear `crossed`, so a crossing is final.
+    ///
+    /// A TOTAL THAT WOULD OVERFLOW IS A CROSSING. `fetch_add` wrapped the stored
+    /// total, and with the largest accepted limit (`u64::MAX`) no sum could
+    /// ever compare above it, so that cap could never fire. The stored total
+    /// saturates instead of wrapping, and an addition with no `u64` result is
+    /// treated as past every limit.
     fn charge(&self, len: u64) -> Charge {
         let cells = self.cells();
         if cells.crossed.load(Ordering::Relaxed) {
             return Charge::AlreadyOver;
         }
-        let before = cells.spent.fetch_add(len, Ordering::Relaxed);
-        if before.saturating_add(len) <= self.limit {
-            Charge::Within
-        } else if cells.crossed.swap(true, Ordering::Relaxed) {
-            Charge::AlreadyOver
-        } else {
-            Charge::Crossed
+        let mut before = cells.spent.load(Ordering::Relaxed);
+        while let Err(current) = cells.spent.compare_exchange_weak(
+            before,
+            before.saturating_add(len),
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            before = current;
+        }
+        match before.checked_add(len) {
+            Some(total) if total <= self.limit => Charge::Within,
+            _ if cells.crossed.swap(true, Ordering::Relaxed) => Charge::AlreadyOver,
+            _ => Charge::Crossed,
         }
     }
 
@@ -1606,6 +1619,28 @@ mod tests {
         budget.refund(3);
         assert_eq!(budget.spent(), 5);
         assert_eq!(budget.charge(u64::MAX), Charge::Crossed, "no wraparound");
+        assert_eq!(
+            budget.spent(),
+            u64::MAX,
+            "the stored total saturates instead of wrapping to 4"
+        );
+    }
+
+    /// The largest accepted limit still fires: a total that would overflow
+    /// `u64` is a crossing, and the stored total never wraps back under the
+    /// limit (review of https://github.com/rrnewton/hermit/pull/3686,
+    /// round 2, finding 7).
+    #[test]
+    fn a_total_past_u64_max_crosses_even_the_largest_limit() {
+        let budget = LogBudget::new(u64::MAX).unwrap();
+        assert_eq!(budget.charge(u64::MAX - 1), Charge::Within);
+        assert_eq!(budget.charge(1), Charge::Within, "exactly u64::MAX fits");
+        assert_eq!(budget.spent(), u64::MAX);
+        assert_eq!(budget.charge(1), Charge::Crossed, "one byte past u64::MAX");
+        assert_eq!(budget.spent(), u64::MAX, "saturated, not wrapped to 0");
+        assert_eq!(budget.charge(1), Charge::AlreadyOver);
+        assert_eq!(budget.charge(u64::MAX), Charge::AlreadyOver);
+        assert_eq!(budget.spent(), u64::MAX);
     }
 
     /// A crossing is final. Independent stderr writers refund failed or
