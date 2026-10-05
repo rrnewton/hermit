@@ -10102,7 +10102,7 @@
       "group": "rrcompat",
       "job": "manifest_compat",
       "desc": "The compatibility corpus recorded and replayed under strict Hermit",
-      "description": "The rr-compat-only run type: `test-harness run --label rr-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are the corpus's `variants` cells compat/rr-<row>: one ptrace replay cell for each of the 139 programs the retired rr lane listed as passing (ci/compat/corpus-rr.json and RR_PASSING_LABELS until 2026-10-02), each running `hermit record start --strict --verify` under the stricter --verify-strict comparison, which records the program, replays the recording and compares the two, with the old lane's 60-second wall bound per program. It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, against the fixtures rrcompatprep.fixtures writes. The old lane ran `record start --verify --verify-strict`; the harness adds what every manifest replay cell has: --strict, --log info, --base-env=minimal, and a tmpfs /test working directory. Only 51 of the 139 pass, on the old lane's own command too (measured on 97ae0ccef with its release Hermit), so the old lane could not have been green: the other 88 stop recording with exit status 122 because record mode refuses every clock read (https://github.com/rrnewton/hermit/issues/3519), and the corpus lists them as `unselected` under that issue, so the node gates the 51 and any of them that diverges, crashes or exceeds its budget turns it red. Until 2026-10-02 these rows were 139 separate rrcompat.<program> nodes running a separately built release Hermit. The node's 600-second wall bound is the 200 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of the largest cell, 60 seconds scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (90 + 10)), plus 400 seconds for the rest of the bucket; the 51 cells took 2.6 seconds of wall time and 15 CPU seconds at 16 jobs on 2026-10-02 (21 seconds of summed cell time), against 56.7 seconds for the same 51 programs run one after another through the old command. The two attempts are that conservative model only; the harness never retries a replay cell, so a recording that fails to replay fails its one attempt, as it did on the old lane.",
+      "description": "The rr-compat-only run type: `test-harness run --label rr-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are the replay cells of the rows' own tests compat/<row>, from the corpus's `replay` section: one ptrace replay cell for each of the 139 programs the retired rr lane listed as passing (ci/compat/corpus-rr.json and RR_PASSING_LABELS until 2026-10-02), each running `hermit record start --strict --verify` under the stricter --verify-strict comparison, which records the program, replays the recording and compares the two, with the old lane's 60-second wall bound per program. It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, against the fixtures rrcompatprep.fixtures writes. The old lane ran `record start --verify --verify-strict`; the harness adds what every manifest replay cell has: --strict, --log info, --base-env=minimal, and a tmpfs /test working directory. Only 51 of the 139 pass, on the old lane's own command too (measured on 97ae0ccef with its release Hermit), so the old lane could not have been green: the other 88 stop recording with exit status 122 because record mode refuses every clock read (https://github.com/rrnewton/hermit/issues/3519), and the corpus lists them as `unselected` under that issue, so the node gates the 51 and any of them that diverges, crashes or exceeds its budget turns it red. Until 2026-10-02 these rows were 139 separate rrcompat.<program> nodes running a separately built release Hermit, and until 2026-10-04 139 separate compat/rr-<row> tests duplicating the rows' own tests. Like the old lane's command, each replay cell runs without the corpus's verify settings: no added Hermit flags or comparator, no TMPDIR=/tmp, and one attempt. The node's 600-second wall bound is the 200 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of the largest cell, 60 seconds scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (90 + 10)), plus 400 seconds for the rest of the bucket; the 51 cells took 2.6 seconds of wall time and 15 CPU seconds at 16 jobs on 2026-10-02 (21 seconds of summed cell time), against 56.7 seconds for the same 51 programs run one after another through the old command. The two attempts are that conservative model only; the harness never retries a replay cell, so a recording that fails to replay fails its one attempt, as it did on the old lane.",
       "labels": [
         "rr-compat-only"
       ],
@@ -10115,357 +10115,357 @@
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-arch",
+          "test": "compat/arch",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-b2sum",
+          "test": "compat/b2sum",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-base32",
+          "test": "compat/base32",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-base64",
+          "test": "compat/base64",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-basename",
+          "test": "compat/basename",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-bracket",
+          "test": "compat/bracket",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-cat",
+          "test": "compat/cat",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-cksum",
+          "test": "compat/cksum",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-df-direct",
+          "test": "compat/df-direct",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-dirname",
+          "test": "compat/dirname",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-du",
+          "test": "compat/du",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-echo",
+          "test": "compat/echo",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-expr",
+          "test": "compat/expr",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-free",
+          "test": "compat/free",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-getopt",
+          "test": "compat/getopt",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-groups",
+          "test": "compat/groups",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-head",
+          "test": "compat/head",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-hostname",
+          "test": "compat/hostname",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-id",
+          "test": "compat/id",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-ionice",
+          "test": "compat/ionice",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-ls",
+          "test": "compat/ls",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-md5sum",
+          "test": "compat/md5sum",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-nice",
+          "test": "compat/nice",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-nohup",
+          "test": "compat/nohup",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-nproc",
+          "test": "compat/nproc",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-numfmt",
+          "test": "compat/numfmt",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-openssl",
+          "test": "compat/openssl",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-pinky",
+          "test": "compat/pinky",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-pr",
+          "test": "compat/pr",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-printenv",
+          "test": "compat/printenv",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-printf",
+          "test": "compat/printf",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-pwd",
+          "test": "compat/pwd",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-readlink",
+          "test": "compat/readlink",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-realpath",
+          "test": "compat/realpath",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-sha1sum",
+          "test": "compat/sha1sum",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-sha224sum",
+          "test": "compat/sha224sum",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-sha256sum",
+          "test": "compat/sha256sum",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-sha384sum",
+          "test": "compat/sha384sum",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-sha512sum",
+          "test": "compat/sha512sum",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-sleep",
+          "test": "compat/sleep",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-stat",
+          "test": "compat/stat",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-stdbuf",
+          "test": "compat/stdbuf",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-sum",
+          "test": "compat/sum",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-test",
+          "test": "compat/test",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-true",
+          "test": "compat/true",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-uname",
+          "test": "compat/uname",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-uptime",
+          "test": "compat/uptime",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-users",
+          "test": "compat/users",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-wc-lines",
+          "test": "compat/wc-lines",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-wc",
+          "test": "compat/wc",
           "mode": "replay",
           "backend": "ptrace"
         },
         {
           "lane": "portable",
           "category": "compat",
-          "test": "compat/rr-whoami",
+          "test": "compat/whoami",
           "mode": "replay",
           "backend": "ptrace"
         },
@@ -14317,7 +14317,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "901",
+        "NEXTEST_EXPECTED_EXECUTED": "904",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -36129,7 +36129,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "901",
+        "NEXTEST_EXPECTED_EXECUTED": "904",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,

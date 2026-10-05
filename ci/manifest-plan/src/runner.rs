@@ -439,9 +439,11 @@ pub struct ModeRecipe {
     pub hermit_args_reason: Option<String>,
     /// Guest environment variables a verify cell adds, as `--env NAME=VALUE`,
     /// after the runner's fixed guest environment. A name the runner sets is
-    /// refused rather than silently overridden.
+    /// refused rather than silently overridden. A replay cell inherits its
+    /// verify recipe's unless it declares its own; an empty mapping there
+    /// declares that it adds none. See [`cell_mode_env`].
     #[serde(default)]
-    pub env: BTreeMap<String, String>,
+    pub env: Option<BTreeMap<String, String>>,
     /// The comparison a verify cell's two runs must pass. `strict` (the
     /// default) is the canonical full-observation comparison that can
     /// establish L2. `stripped` is Hermit's default `--verify` comparison:
@@ -717,11 +719,12 @@ pub(crate) fn cell_workdir(cell: &SelectedCell) -> Option<String> {
 }
 
 /// The guest environment variables a selected cell adds after the runner's own.
+///
+/// A declared `env`, even an empty one, is the cell's whole addition: a replay
+/// recipe that declares `env: {}` runs without its verify recipe's, rather
+/// than inheriting variables its recording was never meant to carry.
 fn cell_mode_env(cell: &SelectedCell) -> BTreeMap<String, String> {
-    inherited(cell, |recipe| {
-        (!recipe.env.is_empty()).then(|| recipe.env.clone())
-    })
-    .unwrap_or_default()
+    inherited(cell, |recipe| recipe.env.clone()).unwrap_or_default()
 }
 
 /// The declared guest disposition for a selected verify or replay cell.
@@ -7785,14 +7788,21 @@ fn allowed_hermit_arg(arg: &str) -> bool {
 fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result<(), String> {
     let extends = !recipe.hermit_args.is_empty()
         || recipe.hermit_args_reason.is_some()
-        || !recipe.env.is_empty()
         || recipe.comparator.is_some()
         || recipe.comparator_reason.is_some()
         || !recipe.diagnostic.is_empty()
         || recipe.no_retry_reason.is_some();
     if extends && mode != "verify" {
         return Err(format!(
-            "{id}: {mode} declares hermit_args, env, comparator, diagnostic or no_retry_reason, which only a verify mode accepts"
+            "{id}: {mode} declares hermit_args, comparator, diagnostic or no_retry_reason, which only a verify mode accepts"
+        ));
+    }
+    // A replay cell records and replays the program its verify cell checks,
+    // so it may restate that program's environment (see [`cell_mode_env`]);
+    // no other mode passes a declared environment to its guest.
+    if recipe.env.is_some() && !matches!(mode, "verify" | "replay") {
+        return Err(format!(
+            "{id}: {mode} declares env, which only a verify or replay mode accepts"
         ));
     }
     if recipe
@@ -7844,7 +7854,7 @@ fn validate_mode_extensions(id: &str, mode: &str, recipe: &ModeRecipe) -> Result
             return Err(format!("{id}: hermit_args_reason without hermit_args"));
         }
     }
-    for (name, value) in &recipe.env {
+    for (name, value) in recipe.env.iter().flatten() {
         let well_formed = name
             .chars()
             .next()
@@ -8671,7 +8681,7 @@ mod tests {
                 ],
             )]),
             hermit_args_reason: Some("the corpus records this configuration".into()),
-            env: BTreeMap::from([("TMPDIR".into(), "/tmp".into())]),
+            env: Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())])),
             comparator: Some(Comparator::Stripped),
             comparator_reason: Some("the corpus verdict policy is the stripped comparison".into()),
             ..ModeRecipe::default()
@@ -8808,16 +8818,43 @@ mod tests {
         );
         for owned in RUNNER_GUEST_ENV {
             refused(
-                &|r| r.env = BTreeMap::from([(owned.into(), "x".into())]),
+                &|r| r.env = Some(BTreeMap::from([(owned.into(), "x".into())])),
                 "verify",
                 "a variable the runner sets itself",
             );
         }
         refused(
-            &|r| r.env = BTreeMap::from([("lower".into(), "x".into())]),
+            &|r| r.env = Some(BTreeMap::from([("lower".into(), "x".into())])),
             "verify",
             "not a valid NAME=VALUE",
         );
+        // A replay recipe may restate its environment, an empty mapping
+        // included, under the same name checks; no other mode may declare one.
+        let with_env = |env: BTreeMap<String, String>| ModeRecipe {
+            env: Some(env),
+            ..ModeRecipe::default()
+        };
+        for env in [
+            BTreeMap::new(),
+            BTreeMap::from([("MODE".into(), "x".into())]),
+        ] {
+            validate_mode_extensions("fixture/test", "replay", &with_env(env)).unwrap();
+        }
+        let error = validate_mode_extensions(
+            "fixture/test",
+            "replay",
+            &with_env(BTreeMap::from([("lower".into(), "x".into())])),
+        )
+        .unwrap_err();
+        assert!(error.contains("not a valid NAME=VALUE"), "{error}");
+        for mode in ["naked", "chaos", "custom"] {
+            let error = validate_mode_extensions("fixture/test", mode, &with_env(BTreeMap::new()))
+                .unwrap_err();
+            assert!(
+                error.contains("declares env, which only a verify or replay mode accepts"),
+                "{error}"
+            );
+        }
         // A diagnostic is accepted only on an enabled backend of a stripped
         // cell, with a substantive reason, and only in verify.
         let diagnostic = || BTreeMap::from([("ptrace".into(), "bounded probe".into())]);
@@ -9095,7 +9132,7 @@ mod tests {
         mode.hermit_args =
             BTreeMap::from([("ptrace".into(), vec!["--no-virtualize-cpuid".into()])]);
         mode.hermit_args_reason = Some("fixture configuration".into());
-        mode.env = BTreeMap::from([("TMPDIR".into(), "/tmp".into())]);
+        mode.env = Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())]));
         mode.comparator = comparator;
         mode.comparator_reason = comparator.map(|_| "fixture policy".into());
         let cell = SelectedCell {
@@ -16823,7 +16860,10 @@ exit "$(cat "$PWD/exit-status")"
         assert!(!requested.argv.iter().any(|arg| arg.ends_with(":/tmp/test")));
         accepted_skid("a row whose manifest names its workdir", &requested, 2);
         let mode_env = rendered(&base, &context(&|_| {}), &|recipe| {
-            recipe.env.insert("FIXTURE_MODE".into(), "on".into());
+            recipe
+                .env
+                .get_or_insert_default()
+                .insert("FIXTURE_MODE".into(), "on".into());
         });
         assert!(has_pair(&mode_env, "--env", "FIXTURE_MODE=on"));
         accepted_skid("a row whose manifest adds a guest variable", &mode_env, 2);
@@ -19284,7 +19324,7 @@ cp "{}" "$verdict"
         let mut verify = base.clone();
         verify.guest_args = BTreeMap::from([("ptrace".into(), vec!["workdir".into()])]);
         verify.workdir = Some("/srv".into());
-        verify.env = BTreeMap::from([("MODE".into(), "x".into())]);
+        verify.env = Some(BTreeMap::from([("MODE".into(), "x".into())]));
         verify.expected_guest_exit = Some(expected_exit(Some(3), None));
         verify.expected_stdout = BTreeMap::from([("ptrace".into(), "p\n".into())]);
         verify.expected_stdout_contains = BTreeMap::from([("ptrace".into(), "ok".into())]);
@@ -19292,7 +19332,7 @@ cp "{}" "$verdict"
         assert_eq!(cell_guest_args(&inherited, "ptrace"), ["workdir"]);
         assert_eq!(cell_guest_args(&inherited, "dbt"), Vec::<String>::new());
         assert_eq!(cell_workdir(&inherited).as_deref(), Some("/srv"));
-        assert_eq!(cell_mode_env(&inherited), verify.env);
+        assert_eq!(Some(cell_mode_env(&inherited)), verify.env);
         assert_eq!(
             cell_expected_guest_exit(&inherited),
             Some(expected_exit(Some(3), None))
@@ -19319,6 +19359,59 @@ cp "{}" "$verdict"
         assert_eq!(cell_expected_guest_exit(&chaos), None);
     }
 
+    /// A replay recipe that declares an environment, even an empty one, runs
+    /// with it instead of its verify recipe's, so a replay cell can run
+    /// without a variable its verify cell adds; the verify cell keeps it.
+    #[test]
+    fn a_replay_cell_that_declares_an_empty_env_runs_without_its_verify_env() {
+        let context = run_context(Path::new("/repo"));
+        let base = ptrace_cell("verify").test.modes["verify"].clone();
+        let mut verify = base.clone();
+        verify.env = Some(BTreeMap::from([("TMPDIR".into(), "/tmp".into())]));
+        let mut replay = base;
+        replay.env = Some(BTreeMap::new());
+        let cell = replay_cell_with_verify(verify.clone(), replay);
+        assert_eq!(cell_mode_env(&cell), BTreeMap::new());
+        let spec = build_spec(
+            &context,
+            &cell,
+            PathBuf::from("/repo/results/replay-cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            15,
+        )
+        .unwrap();
+        assert_eq!(&spec.argv[5..7], ["record", "start"]);
+        assert!(
+            !spec.argv.iter().any(|arg| arg.starts_with("TMPDIR=")),
+            "{:?}",
+            spec.argv
+        );
+
+        let mut verify_cell = ptrace_cell("verify");
+        verify_cell.test.modes.insert("verify".into(), verify);
+        assert_eq!(
+            cell_mode_env(&verify_cell),
+            BTreeMap::from([("TMPDIR".into(), "/tmp".into())])
+        );
+        let spec = build_spec(
+            &context,
+            &verify_cell,
+            PathBuf::from("/repo/results/verify-cell"),
+            vec!["/bin/true".into()],
+            "1",
+            None,
+            15,
+        )
+        .unwrap();
+        assert!(
+            spec.argv.iter().any(|arg| arg == "TMPDIR=/tmp"),
+            "{:?}",
+            spec.argv
+        );
+    }
+
     /// Verify, replay and chaos argv come from one builder: replay runs the
     /// same guest environment and mode environment, and differs only in its
     /// subcommand and recording arguments.
@@ -19327,7 +19420,7 @@ cp "{}" "$verdict"
         let context = run_context(Path::new("/repo"));
         let base = ptrace_cell("verify").test.modes["verify"].clone();
         let mut verify = base.clone();
-        verify.env = BTreeMap::from([("MODE".into(), "x".into())]);
+        verify.env = Some(BTreeMap::from([("MODE".into(), "x".into())]));
         verify.workdir = Some("/srv".into());
         let cell = replay_cell_with_verify(verify, base);
         let spec = build_spec(
