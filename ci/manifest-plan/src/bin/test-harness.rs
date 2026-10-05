@@ -3631,7 +3631,8 @@ fn report_parity(
         &context.hermit_bin,
         &context.run_id,
         &context.source_sha,
-    );
+    )
+    .naming_roots(&context.result_root, &context.root);
     config.jobs = capacity.workers_for(scope.len());
     config.outer_deadline = parity::dagrun_step_deadline();
     config.imported_logs = import_root.map(parity::ImportedLogs::load);

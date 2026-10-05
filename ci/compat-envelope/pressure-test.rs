@@ -9151,7 +9151,8 @@ fn report_parity(
         &parity_hermit_bin(root, rows),
         &metadata.run_id,
         &metadata.hermit_sha,
-    );
+    )
+    .naming_roots(results, root);
     config.jobs = usize::try_from(metadata.jobs).unwrap_or(1).max(1);
     config.rejected = rejected.clone();
     config.nondeterministic = nondeterministic.clone();

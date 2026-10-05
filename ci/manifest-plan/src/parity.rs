@@ -1713,7 +1713,17 @@ pub struct PostPassConfig {
     /// that both cells ran on the same route. `None` for a run that executed
     /// its own cells.
     pub imported_logs: Option<ImportedLogs>,
+    /// The roots a record names a log path under, each with the name it takes
+    /// there, longest first ([`PostPassConfig::naming_roots`]). A path under
+    /// none is recorded as found. Empty unless a caller names its roots.
+    pub record_roots: Vec<(PathBuf, String)>,
 }
+
+/// The name [`PostPassConfig::naming_roots`] gives the result root in a
+/// record: the mount a run in the pinned-root container already sees it at.
+pub const RECORD_RESULT_ROOT: &str = "/results";
+/// The name [`PostPassConfig::naming_roots`] gives the checkout in a record.
+pub const RECORD_CHECKOUT_ROOT: &str = "/src";
 
 /// Why a caller refused to hand over a verify cell's result row
 /// ([`PostPassConfig::rejected`]). Each variant is a condition the harness's
@@ -1787,7 +1797,42 @@ impl PostPassConfig {
             rejected: BTreeMap::new(),
             nondeterministic: BTreeMap::new(),
             imported_logs: None,
+            record_roots: Vec::new(),
         }
+    }
+
+    /// Name the log paths in records under the canonical roots: below
+    /// `result_root` as [`RECORD_RESULT_ROOT`] and below `checkout` as
+    /// [`RECORD_CHECKOUT_ROOT`], so a record reads the same whether its run
+    /// executed in the pinned-root container, where those are the real
+    /// mounts, or on the host. The public parity ledger refuses a record that
+    /// names a workspace-local host path. Buck-imported operands are read on
+    /// the host, so without this their records named the host checkout and
+    /// result root, and the ledger refused the whole batch.
+    pub fn naming_roots(mut self, result_root: &Path, checkout: &Path) -> Self {
+        let mut roots = vec![
+            (result_root.to_path_buf(), RECORD_RESULT_ROOT.to_string()),
+            (checkout.to_path_buf(), RECORD_CHECKOUT_ROOT.to_string()),
+        ];
+        roots.sort_by_key(|(root, _)| std::cmp::Reverse(root.components().count()));
+        self.record_roots = roots;
+        self
+    }
+
+    /// `path` as a record names it: below the longest of
+    /// [`PostPassConfig::record_roots`] that contains it, that root replaced
+    /// by its name; otherwise as found.
+    pub fn record_path(&self, path: &Path) -> String {
+        for (root, name) in &self.record_roots {
+            if let Ok(rest) = path.strip_prefix(root) {
+                return if rest.as_os_str().is_empty() {
+                    name.clone()
+                } else {
+                    format!("{}/{}", name.trim_end_matches('/'), path_text(rest))
+                };
+            }
+        }
+        path_text(path)
     }
 
     /// Write every output below `output_dir` instead of `artifacts`, which is
@@ -2465,8 +2510,8 @@ fn measure(
                 operand,
                 false,
                 reason,
-                reference.map(path_text).as_deref(),
-                candidate.map(path_text).as_deref(),
+                reference.map(|path| config.record_path(path)).as_deref(),
+                candidate.map(|path| config.record_path(path)).as_deref(),
                 &config.run_id,
                 &config.hermit_sha,
             )
@@ -2771,8 +2816,8 @@ fn unrecorded_comparison(
         None,
         comparison.inputs_equalized,
         &format!("the comparison could not be recorded: {error}"),
-        Some(&path_text(&comparison.reference.log)),
-        Some(&path_text(&comparison.candidate.log)),
+        Some(&config.record_path(&comparison.reference.log)),
+        Some(&config.record_path(&comparison.candidate.log)),
         &config.run_id,
         &config.hermit_sha,
     )
@@ -3481,8 +3526,8 @@ fn compare(
     runs: &AtomicUsize,
 ) -> Result<ParityRecord, String> {
     let cell = &comparison.cell;
-    let reference_log = path_text(&comparison.reference.log);
-    let candidate_log = path_text(&comparison.candidate.log);
+    let reference_log = config.record_path(&comparison.reference.log);
+    let candidate_log = config.record_path(&comparison.candidate.log);
     // Both operands are deterministic and retained, so every way the
     // comparison fails to run or report is the parity tool's failure: it
     // concerns the comparison, not either side.
@@ -6967,6 +7012,122 @@ mod tests {
                 "{test_id:?}: {error}"
             );
         }
+
+        // Records name the log paths under the canonical roots
+        // (PostPassConfig::naming_roots), so the public parity ledger never
+        // sees a workspace-local host path.
+
+        let config = PostPassConfig::new(
+            Path::new("/host/run/e2e/portable/x"),
+            Path::new("/bin/hermit"),
+            "run",
+            SHA,
+        )
+        .naming_roots(Path::new("/host/run/e2e"), Path::new("/host/checkout"));
+        assert_eq!(
+            config.record_path(Path::new(
+                "/host/run/e2e/privileged/m/parity/golden/t.detlog"
+            )),
+            "/results/privileged/m/parity/golden/t.detlog"
+        );
+        assert_eq!(
+            config.record_path(Path::new("/host/checkout/target/validation/run/log")),
+            "/src/target/validation/run/log"
+        );
+        // Only whole components match, and a path under neither root is recorded as
+        // found, so the public ledger's check still sees it.
+        assert_eq!(
+            config.record_path(Path::new("/host/run/e2e2/log")),
+            "/host/run/e2e2/log"
+        );
+        assert_eq!(
+            config.record_path(Path::new("/elsewhere/log")),
+            "/elsewhere/log"
+        );
+        // A result root inside the checkout is the longer root, so it wins.
+        let nested = PostPassConfig::new(
+            Path::new("/c/target/results"),
+            Path::new("/bin/hermit"),
+            "run",
+            SHA,
+        )
+        .naming_roots(Path::new("/c/target/results"), Path::new("/c"));
+        assert_eq!(
+            nested.record_path(Path::new("/c/target/results/runs/log")),
+            "/results/runs/log"
+        );
+        assert_eq!(
+            nested.record_path(Path::new("/c/target/other/log")),
+            "/src/target/other/log"
+        );
+        assert_eq!(nested.record_path(Path::new("/c")), "/src");
+        // In the pinned-root container the roots already have these names.
+        let container = PostPassConfig::new(
+            Path::new("/results/portable/x"),
+            Path::new("/bin/hermit"),
+            "run",
+            SHA,
+        )
+        .naming_roots(Path::new("/results"), Path::new("/src"));
+        assert_eq!(
+            container.record_path(Path::new("/results/runs/r/log")),
+            "/results/runs/r/log"
+        );
+        // A caller that names no roots records every path as found.
+        let unnamed = PostPassConfig::new(Path::new("/a"), Path::new("/bin/hermit"), "run", SHA);
+        assert_eq!(
+            unnamed.record_path(Path::new("/host/run/e2e/log")),
+            "/host/run/e2e/log"
+        );
+
+        // A post-pass whose operands were read on the host names every log
+        // path in its records that way, for a comparison and for a cell
+        // recorded without one.
+
+        let fixture = Fixture::new("canonical-paths");
+        let rows = vec![
+            fixture.row("fx/same", "ptrace", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/same", "kvm", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/not-retained", "ptrace", 1, "PASS", Some(REFERENCE)),
+            fixture.row("fx/not-retained", "kvm", 1, "PASS", None),
+        ];
+        let scope = BTreeSet::from([
+            parity_cell("fx/same", ParityBackend::Kvm),
+            parity_cell("fx/not-retained", ParityBackend::Kvm),
+        ]);
+        let config = fixture
+            .config()
+            .naming_roots(&fixture.dir, &fixture.dir.join("checkout"));
+        let report = post_pass(&config, &scope, &rows).unwrap();
+        let written = read_records(&report.path);
+        assert_eq!(written.len(), 2);
+        let host = path_text(&fixture.dir);
+        for record in &written {
+            for path in [&record.reference_log, &record.candidate_log]
+                .into_iter()
+                .flatten()
+            {
+                assert!(path.starts_with("/results/"), "{record:?}");
+                assert!(!path.contains(&host), "{record:?}");
+            }
+        }
+        let matched = written
+            .iter()
+            .find(|record| record.test_id == "fx/same")
+            .unwrap();
+        assert_eq!(matched.verdict, ParityVerdict::Matched, "{matched:?}");
+        assert_eq!(
+            matched.reference_log.as_deref(),
+            Some("/results/artifacts/parity/golden/fx/same.detlog")
+        );
+        let missing = written
+            .iter()
+            .find(|record| record.test_id == "fx/not-retained")
+            .unwrap();
+        assert_eq!(
+            missing.reference_log.as_deref(),
+            Some("/results/artifacts/parity/golden/fx/not-retained.detlog")
+        );
     }
 
     const FAKE_LOG_DIFF: &str = include_str!("../tests/fixtures/fake-parity-log-diff.py");
