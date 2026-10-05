@@ -959,12 +959,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }),
         };
         let ctid = child_tid_clear_address(flags, clone_family.child_tid(&guest.memory()));
+        // Only a CLONE_VFORK parent waits for its child. Every backend runs a
+        // forked process child concurrently with its parent and dispatches a
+        // cloned thread's syscalls through this tool.
         let is_vfork = flags.contains(CloneFlags::CLONE_VFORK);
-        let parent_blocks_for_child = is_vfork
-            || (self.cfg.backend_serializes_fork_children
-                && !flags.contains(CloneFlags::CLONE_THREAD));
-        let backend_uninstrumented_thread =
-            flags.contains(CloneFlags::CLONE_THREAD) && !self.cfg.backend_dispatches_thread_tools;
 
         let ts = guest.thread_state_mut();
         assert_eq!(ts.clone_flags, None);
@@ -972,7 +970,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         ts.clone_flags = Some(flags);
 
         let parent_dettid = ts.dettid;
-        let child_priority_entropy = if parent_blocks_for_child
+        let child_priority_entropy = if is_vfork
             && self.cfg.chaos
             && self.cfg.replay_preemptions_from.is_none()
             && self.cfg.replay_schedule_from.is_none()
@@ -982,7 +980,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        if parent_blocks_for_child {
+        if is_vfork {
             ts.pending_vfork = Some(PendingVfork {
                 parent_dettid,
                 parent_detpid: ts.detpid.expect("detpid unset"),
@@ -997,26 +995,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         let blocking_child_op_id =
             ExternalOpId::new(parent_dettid, guest.thread_state().stats.syscall_count);
 
-        // A CLONE_VFORK parent and a backend-serialized fork parent cannot
-        // resume until the child exits. Relinquish the parent's scheduler turn
-        // before entering either blocking operation.
-        if parent_blocks_for_child && self.cfg.sequentialize_threads {
+        // A CLONE_VFORK parent cannot resume until the child execs or exits.
+        // Relinquish the parent's scheduler turn before entering that
+        // blocking operation.
+        if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
             resources.insert(
                 ResourceID::BlockingVfork(blocking_child_op_id),
                 Permission::RW,
             );
-            resources.fyi(if is_vfork {
-                "clone_vfork"
-            } else {
-                "clone_serialized_child"
-            });
+            resources.fyi("clone_vfork");
             resource_request(guest, resources).await;
         }
 
         let maybe_res = guest.inject(Syscall::from(clone_family)).await;
 
-        if parent_blocks_for_child && self.cfg.sequentialize_threads {
+        if is_vfork && self.cfg.sequentialize_threads {
             let mut resources = Resources::new(parent_dettid);
             if maybe_res.is_err() {
                 // TODO-HUMAN-REVIEW(PR-1152): Review failed deferred-vfork cancellation.
@@ -1028,21 +1022,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                     ResourceID::VforkFailed(blocking_child_op_id),
                     Permission::RW,
                 );
-                resources.fyi(if is_vfork {
-                    "clone_vfork_failed"
-                } else {
-                    "clone_serialized_child_failed"
-                });
+                resources.fyi("clone_vfork_failed");
             } else {
                 resources.insert(
                     ResourceID::BlockedExternalContinue(blocking_child_op_id),
                     Permission::RW,
                 );
-                resources.fyi(if is_vfork {
-                    "clone_vfork"
-                } else {
-                    "clone_serialized_child"
-                });
+                resources.fyi("clone_vfork");
             }
             resource_request(guest, resources).await;
         }
@@ -1062,7 +1048,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         // Match ordinary clone: the parent consumes the priority entropy after
         // the child has inherited the parent state.
-        if parent_blocks_for_child
+        if is_vfork
             && self.cfg.chaos
             && self.cfg.replay_preemptions_from.is_none()
             && self.cfg.replay_schedule_from.is_none()
@@ -1079,7 +1065,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             child_dettid
         );
 
-        if !parent_blocks_for_child && !backend_uninstrumented_thread {
+        if !is_vfork {
             create_child_thread(guest, child_dettid, ctid, Some(flags), exit_signal, None).await;
         }
 
@@ -1213,7 +1199,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut effects = GuestRobustEffects::<'_, G, T> {
             guest,
             dettid,
-            defer_owner_death_to_backend: true,
             staged_wakes: None,
             tool: PhantomData,
         };
@@ -1254,7 +1239,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             let mut effects = GuestRobustEffects::<'_, G, T> {
                 guest,
                 dettid: owner,
-                defer_owner_death_to_backend: true,
                 staged_wakes: Some(&mut wakes),
                 tool: PhantomData,
             };
@@ -2612,7 +2596,6 @@ impl<T: RecordOrReplay> Detcore<T> {
 struct GuestRobustEffects<'a, G, T> {
     guest: &'a mut G,
     dettid: DetTid,
-    defer_owner_death_to_backend: bool,
     staged_wakes: Option<&'a mut Vec<RobustListWake>>,
     tool: PhantomData<T>,
 }
@@ -2636,25 +2619,19 @@ where
         &mut self,
         address: usize,
         expected: u32,
-        desired: u32,
+        _desired: u32,
     ) -> robust_list::FutexCasOutcome {
         use robust_list::FutexCasOutcome;
 
-        let (Some(read_at), Some(write_at)) = (
-            Addr::<u32>::from_raw(address),
-            AddrMut::<u32>::from_raw(address),
-        ) else {
+        let Some(read_at) = Addr::<u32>::from_raw(address) else {
             return FutexCasOutcome::Faulted;
         };
         // Reverie's guest-memory interface offers reads and writes, not a
-        // cross-address-space cmpxchg, so this re-reads the word immediately
-        // before storing and refuses to store when the value has moved.
-        //
-        // The dying task keeps the scheduler turn for the whole walk, so no
-        // modeled thread can run between this read and the write. That does not
-        // make the operations atomic against a process outside the model. Only
-        // ptrace can safely take the deferred branch below; DBT and SaBRe run
-        // their tool-exit callbacks before native cleanup, and KVM has none.
+        // cross-address-space cmpxchg, so Detcore never stores the owner word
+        // itself. It re-reads the word to decide whether the kernel's retry
+        // loop would take another pass, then leaves the replacement to the
+        // native task exit. Both callers return early unless
+        // `backend_runs_exit_robust_list` says the backend performs that exit.
         let observed = match self.guest.memory().read_value::<_, u32>(read_at) {
             Ok(value) => value,
             Err(_) => return FutexCasOutcome::Faulted,
@@ -2662,34 +2639,18 @@ where
         if observed != expected {
             return FutexCasOutcome::Changed(observed);
         }
-        if self.defer_owner_death_to_backend {
-            // Ptrace keeps this syscall handler pending through the native
-            // exit and does not release another scheduler turn until Linux has
-            // repeated the owner check and changed the word atomically. Do not
-            // perform a separate write here: a process outside Hermit's
-            // scheduler can share the mapping and acquire the mutex between
-            // this read and that write.
-            debug!(
-                "[detcore, dtid {}] robust-list owner death: leaving futex word {:#x} for backend exit cleanup",
-                self.dettid, address,
-            );
-            return FutexCasOutcome::Deferred;
-        }
-        // `MemoryAccess::write_value` writes through to the guest immediately
-        // (`write_exact`); it is not the scratch-stack path, which buffers
-        // until `commit()`.
-        if self.guest.memory().write_value(write_at, &desired).is_err() {
-            return FutexCasOutcome::Faulted;
-        }
+        // The native exit keeps this syscall handler pending and does not
+        // release another scheduler turn until Linux has repeated the owner
+        // check and changed the word atomically. Do not perform a separate
+        // write here: a process outside Hermit's scheduler can share the
+        // mapping and acquire the mutex between this read and that write.
         // Deliberately DEBUG, not INFO: this line carries a raw guest address,
-        // and INFO is the surface `--verify-strict` compares. The
-        // KVM diagnostics read this from `--log=debug`; keep it below INFO
-        // because the address is not a deterministic observation.
+        // and INFO is the surface `--verify-strict` compares.
         debug!(
-            "[detcore, dtid {}] robust-list owner death: futex word {:#x} {:#x} -> {:#x}",
-            self.dettid, address, expected, desired,
+            "[detcore, dtid {}] robust-list owner death: leaving futex word {:#x} for backend exit cleanup",
+            self.dettid, address,
         );
-        FutexCasOutcome::Stored
+        FutexCasOutcome::Deferred
     }
 
     async fn wake_one(&mut self, address: usize, observed: u32) {
