@@ -5411,7 +5411,7 @@ sys.exit(37)
 
     /// Only the scorecard's regression tier takes the prepared helper: its
     /// tracked-output check would otherwise build `hermit-manifest-plan`
-    /// with Cargo inside selftest.scorecard's 15-CPU-second cap, and the
+    /// with Cargo inside selftest.scorecard's 30-CPU-second cap, and the
     /// commands tier refuses the variable because its brackets check the
     /// helper Cargo builds.
     #[test]
