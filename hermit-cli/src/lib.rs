@@ -1651,6 +1651,59 @@ fn resolve_sabre_binary() -> Result<PathBuf, Error> {
 const SABRE_RPC_SOCKET_ENV: &str = "REVERIE_SABRE_HERMIT_RPC_SOCKET";
 #[cfg(feature = "sabre")]
 const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
+/// `detcore_liteinst::DETLOG_FORWARD_ENV`; that crate is a preload `cdylib`, so
+/// Hermit cannot import the constant.
+#[cfg(feature = "liteinst")]
+const LITEINST_DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
+
+/// Where in-guest LiteInst runs in this process forward Detcore's DETLOG
+/// records; see [`forward_in_guest_detlogs_to`].
+static IN_GUEST_DETLOG_SINK: Mutex<Option<std::os::fd::OwnedFd>> = Mutex::new(None);
+
+/// Makes the in-guest LiteInst runs this process starts forward the DETLOG
+/// records Detcore logs inside the guest to `socket`, the sending end of a Unix
+/// `SOCK_SEQPACKET` pair. `hermit run --verify` gives each run its own pair and
+/// reads the records from the other end into that run's log. Each record is one
+/// message, one line (`detcore::detlog::forwarded_line`).
+/// Records are forwarded only while Detcore's INFO records are logged; without a
+/// socket they are not forwarded.
+#[doc(hidden)]
+pub fn forward_in_guest_detlogs_to(socket: std::os::fd::OwnedFd) {
+    *IN_GUEST_DETLOG_SINK.lock().unwrap() = Some(socket);
+}
+
+/// Hands the in-guest LiteInst runtime the socket chosen with
+/// [`forward_in_guest_detlogs_to`], when Detcore's INFO records are logged: an
+/// inheritable duplicate whose number goes in the private opt-in variable. The
+/// runtime moves it to a descriptor Reverie reserves and protects from the
+/// guest. The caller keeps the returned duplicate open until the guest has
+/// started.
+#[cfg(feature = "liteinst")]
+fn request_liteinst_detlog_forwarding(
+    command: &mut Command,
+) -> Result<Option<std::os::fd::OwnedFd>, Error> {
+    command.env_remove(LITEINST_DETLOG_FORWARD_ENV);
+    if !tracing::enabled!(target: "detcore", tracing::Level::INFO) {
+        return Ok(None);
+    }
+    let sink = IN_GUEST_DETLOG_SINK.lock().unwrap();
+    let Some(socket) = sink.as_ref() else {
+        return Ok(None);
+    };
+    // SAFETY: F_DUPFD on an open descriptor returns a new descriptor or -1.
+    let duplicate = unsafe { libc::fcntl(socket.as_raw_fd(), libc::F_DUPFD, 3) };
+    if duplicate < 0 {
+        return Err(Error::new(std::io::Error::last_os_error())
+            .context("duplicating the in-guest DETLOG forwarding socket"));
+    }
+    // SAFETY: fcntl returned a new descriptor this function now owns.
+    let duplicate = unsafe { std::os::fd::OwnedFd::from_raw_fd(duplicate) };
+    command.env(
+        LITEINST_DETLOG_FORWARD_ENV,
+        duplicate.as_raw_fd().to_string(),
+    );
+    Ok(Some(duplicate))
+}
 #[cfg(feature = "sabre")]
 const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
 #[cfg(feature = "sabre")]
@@ -3277,6 +3330,7 @@ async fn dispatch_backend(
             let stats_request = backend_stats::request(print_summary_to_json_file);
             let mut command = command;
             refuse_in_guest_liteinst_run(&mut command, &config)?;
+            let _detlog_descriptor = request_liteinst_detlog_forwarding(&mut command)?;
             let preload = liteinst_tool_runtime_library_path()?;
             let (exit_status, mut global_state, dispatch_stats) = if stats_request.is_enabled() {
                 let (exit_status, global_state, source) =
@@ -3558,6 +3612,7 @@ async fn dispatch_output_backend(
             command.stdin(output_backend_stdin()?);
             let stats_request = backend_stats::request(print_summary_to_json_file);
             refuse_in_guest_liteinst_run(&mut command, &config)?;
+            let _detlog_descriptor = request_liteinst_detlog_forwarding(&mut command)?;
             let preload = liteinst_tool_runtime_library_path()?;
             let (output, mut global_state, dispatch_stats) = if stats_request.is_enabled() {
                 let (output, global_state, source) =

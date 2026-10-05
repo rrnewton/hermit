@@ -16,7 +16,6 @@ use std::ffi::OsStr;
 use std::ffi::OsString;
 use std::io;
 use std::io::Read;
-use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::path::PathBuf;
@@ -59,49 +58,6 @@ fn coordinator_socket() -> Option<PathBuf> {
     remember_coordinator_socket(&RPC_SOCKET, requested.as_deref())
 }
 
-struct RawStderr;
-
-impl Write for RawStderr {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        loop {
-            let written = unsafe {
-                libc::write(
-                    libc::STDERR_FILENO,
-                    bytes.as_ptr().cast::<libc::c_void>(),
-                    bytes.len(),
-                )
-            };
-            if written >= 0 {
-                return Ok(written as usize);
-            }
-            let error = io::Error::last_os_error();
-            if error.kind() != io::ErrorKind::Interrupted {
-                return Err(error);
-            }
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-// The record names the module that emitted it, as the coordinator's tracing subscriber
-// would: a forwarded `detcore::tool_local` record must not read as `detcore` and differ
-// from the same record logged through tracing.
-fn forwarded_detlog_line(
-    target: &str,
-    record_suffix: &str,
-    message: std::fmt::Arguments<'_>,
-) -> Vec<u8> {
-    format!("INFO {target}: DETLOG {message}{record_suffix}\n").into_bytes()
-}
-
-// One write per record, so records forwarded from several guest threads cannot interleave.
-fn forward_detlog(target: &str, record_suffix: &str, message: std::fmt::Arguments<'_>) {
-    let _ = RawStderr.write_all(&forwarded_detlog_line(target, record_suffix, message));
-}
-
 fn init_detlog_forwarder() {
     // SAFETY: Plugin construction runs before SaBRe starts guest callbacks.
     let requested = unsafe { sabre::take_private_env(DETLOG_FORWARD_ENV) };
@@ -110,9 +66,8 @@ fn init_detlog_forwarder() {
     }
 
     // Stderr is protected by reverie-sabre and is captured separately during
-    // verification. A direct sink avoids tracing's thread-local dispatcher:
-    // libc may issue its final exit_group after Rust TLS destruction begins.
-    let _ = detcore::detlog::set_forwarder(forward_detlog);
+    // verification.
+    let _ = detcore::detlog::set_forwarder(detcore::detlog::forward_to_stderr);
 }
 
 fn remember_coordinator_socket(
@@ -629,16 +584,6 @@ mod tests {
     fn rpc_socket_uses_sabre_private_environment_namespace() {
         assert!(RPC_SOCKET_ENV.starts_with("REVERIE_SABRE_"));
         assert!(DETLOG_FORWARD_ENV.starts_with("REVERIE_SABRE_"));
-        // A forwarded record keeps the module that emitted it, as tracing would name it.
-        assert_eq!(
-            forwarded_detlog_line(
-                "detcore::tool_local",
-                " DETLOG_RECORD={}",
-                format_args!("USER RAND: seeding PRNG for root thread with seed {}", 0)
-            ),
-            b"INFO detcore::tool_local: DETLOG USER RAND: seeding PRNG for root thread with seed 0 DETLOG_RECORD={}\n"
-                .to_vec()
-        );
     }
 
     #[test]

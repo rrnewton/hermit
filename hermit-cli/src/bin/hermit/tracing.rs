@@ -219,6 +219,19 @@ impl<W: Write> BoundedWriter<W> {
             announced: false,
         }
     }
+
+    /// Continues a log that already holds `written` bytes under the same
+    /// `limit` (`0`: unbounded): the bound counts those bytes too, so appending
+    /// to a log cannot take it past the ceiling, and appending to a log that
+    /// has already reached it discards the bytes and announces the truncation.
+    pub fn resume(inner: W, limit: u64, written: u64) -> Self {
+        Self {
+            inner,
+            remaining: limit.saturating_sub(written),
+            bounded: limit != 0,
+            announced: false,
+        }
+    }
 }
 
 impl<W: Write> BoundedWriter<W> {

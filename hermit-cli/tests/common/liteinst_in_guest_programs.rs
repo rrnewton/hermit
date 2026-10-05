@@ -21,10 +21,11 @@
 //! - Every run passes `--max-timeslice=disabled`. The in-guest Tool host
 //!   cannot deliver Detcore's preemption timer yet, so a run with a maximum
 //!   timeslice is refused. None of these guests depends on preemption.
-//! - No run passes `--verify`. The in-guest Tool does not forward its records
-//!   to Hermit yet, so `--verify` is refused. The exact expected output each
-//!   test asserts remains; the determinism verdict does not. Restoring it is
-//!   the guest-record forwarding step of
+//! - No run passes `--verify` yet. The exact expected output each test
+//!   asserts remains; the determinism verdict does not. The in-guest Tool now
+//!   forwards its records (see
+//!   `liteinst_in_guest_verify_compares_the_records_the_guest_forwards` in
+//!   `cli.rs`), so restoring it is the next step of
 //!   https://github.com/rrnewton/hermit/issues/3520.
 //! - The hybrid's activation banner and `--verify` banner are gone, so each
 //!   run instead asserts Hermit's in-guest selection line and the absence of
@@ -1216,8 +1217,7 @@ fn bootstrap_time_host_identity() -> &'static Path {
 
 /// The runtime's own bootstrap is not charged to the guest's virtual time.
 /// The hybrid version also ran `--verify --verify-strict --verify-json` and
-/// required a matched, bitwise-parity report; in-guest LiteInst refuses
-/// `--verify`, so that half waits for guest-record forwarding
+/// required a matched, bitwise-parity report; that half is not restored yet
 /// (https://github.com/rrnewton/hermit/issues/3520).
 #[test]
 fn liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime() {

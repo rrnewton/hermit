@@ -15,12 +15,11 @@ const IN_GUEST_SELECTED: &str =
     "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool";
 
 /// Runs `guest` under in-guest LiteInst (https://github.com/rrnewton/hermit/issues/3520)
-/// twice and returns its stdout. In-guest LiteInst refuses `--verify` until it
-/// forwards guest records to Hermit, and a maximum timeslice until it can
-/// deliver Detcore's preemption timer, so these runs have neither. The guest
-/// checks its own timestamps against logical time and fails if one escapes;
-/// the second run must print the same output, which stands in for the
-/// determinism verdict that waits for guest-record forwarding. Both runs pin
+/// twice and returns its stdout. In-guest LiteInst refuses a maximum timeslice
+/// until it can deliver Detcore's preemption timer, so these runs have none,
+/// and they do not pass `--verify` yet. The guest checks its own timestamps
+/// against logical time and fails if one escapes; the second run must print the
+/// same output. Both runs pin
 /// the same `--epoch`, as `--verify` pins one epoch for its two runs; without
 /// it each run starts its virtual clock at the host's current time.
 #[cfg(feature = "liteinst")]

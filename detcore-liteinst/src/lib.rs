@@ -17,6 +17,17 @@
 // TODO-HUMAN-REVIEW(PR-3635): Review the
 // in-guest Detcore constructor boundary.
 
+/// Private opt-in, set by Hermit, for forwarding the in-guest Tool's
+/// deterministic INFO records: the number of an inherited socket (the sending
+/// end of a Unix `SOCK_SEQPACKET` pair) to send them on. The constructor
+/// removes it from the guest's environment, moves the socket to a number
+/// Reverie reserves and protects from the guest
+/// (`reverie_liteinst::reserve_tool_output_fd`), and sends each record there
+/// as one message, where Hermit's `--verify` reads them into the run's log. The
+/// guest cannot write to, close or shut down that socket, so its own output
+/// never mixes with the records.
+pub const DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
+
 /// Hermit validates that this constructor is registered in `.init_array`
 /// before it preloads the library, so a DSO that would load without
 /// installing Detcore is refused instead of running the guest unmonitored.
@@ -40,11 +51,43 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
     let Some(socket) = std::env::var_os(reverie_liteinst::COORDINATOR_ENV) else {
         fail("the coordinator socket environment variable is missing");
     };
+    let forward_request = std::env::var_os(DETLOG_FORWARD_ENV);
+    // SAFETY: the loader runs constructors while the process is still
+    // single-threaded, so nothing reads the environment concurrently.
+    unsafe { std::env::remove_var(DETLOG_FORWARD_ENV) };
+    if let Some(value) = forward_request {
+        let Some(fd) = value
+            .to_str()
+            .and_then(|value| value.parse::<libc::c_int>().ok())
+        else {
+            fail("the DETLOG forwarding descriptor is not a descriptor number");
+        };
+        // SAFETY: the process is still single-threaded and Detcore is not yet
+        // installed, which is when the reservation must be made.
+        match unsafe {
+            reverie_liteinst::reserve_tool_output_fd(fd, detcore::detlog::FORWARDING_RETIRED_NOTICE)
+        } {
+            Ok(_) => {
+                let _ = detcore::detlog::set_forwarder(forward_detlog);
+            }
+            Err(error) => fail(&format!(
+                "cannot reserve the DETLOG forwarding descriptor {fd}: {error}"
+            )),
+        }
+    }
     // SAFETY: the loader runs constructors before any application thread
     // exists and before the application can install a seccomp filter, which is
     // the window `install_tool` requires.
     if let Err(error) = unsafe { reverie_liteinst::install_tool::<detcore::Detcore>(socket) } {
         fail(&error.to_string());
+    }
+}
+
+/// Sends one Detcore record on the reserved socket. Its number can move when the
+/// guest `dup2`s onto it, so it is read for each record.
+fn forward_detlog(target: &str, record_suffix: &str, message: std::fmt::Arguments<'_>) {
+    if let Some(socket) = reverie_liteinst::tool_output_fd() {
+        detcore::detlog::send_forwarded_record(socket, target, record_suffix, message);
     }
 }
 

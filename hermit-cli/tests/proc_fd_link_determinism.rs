@@ -178,10 +178,9 @@ fn proc_fd_link_aliases_and_truncation_verify() {
     }
 
     // In-guest LiteInst (https://github.com/rrnewton/hermit/issues/3520) runs
-    // the same guest and must print the same aliases. It refuses `--verify`
-    // until it forwards guest records to Hermit, and a maximum timeslice until
-    // it can deliver Detcore's preemption timer, so this run has neither; the
-    // determinism verdict for this backend waits for guest-record forwarding.
+    // the same guest and must print the same aliases. It refuses a maximum
+    // timeslice until it can deliver Detcore's preemption timer, so this run
+    // has none, and it does not pass `--verify` yet.
     #[cfg(feature = "liteinst")]
     {
         let output = Command::new("timeout")

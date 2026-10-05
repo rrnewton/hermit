@@ -12,6 +12,8 @@
 
 use std::fmt;
 use std::sync::OnceLock;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
 
 use serde::Deserialize;
 use serde::Serialize;
@@ -119,6 +121,124 @@ pub fn set_forwarder(forwarder: DetlogForwarder) -> Result<(), DetlogForwarder> 
     FORWARDER.set(forwarder)
 }
 
+/// The line a forwarded record travels as: the record as the coordinator's tracing
+/// subscriber would print it, naming the module that emitted it (a forwarded
+/// `detcore::tool_local` record must not read as `detcore` and differ from the same
+/// record logged through tracing), then a newline.
+#[doc(hidden)]
+pub fn forwarded_line(target: &str, record_suffix: &str, message: fmt::Arguments<'_>) -> Vec<u8> {
+    format!("INFO {target}: DETLOG {message}{record_suffix}\n").into_bytes()
+}
+
+/// Calls `operation` and restores the calling thread's `errno` afterwards. An
+/// in-guest tool runs on the guest's own thread, so a failed forwarding write must
+/// not change what the guest reads there.
+fn preserving_errno(operation: impl FnOnce()) {
+    // SAFETY: `__errno_location` returns the calling thread's live errno slot.
+    let errno = unsafe { libc::__errno_location() };
+    // SAFETY: as above; the slot is valid for the life of the thread.
+    let saved = unsafe { *errno };
+    operation();
+    // SAFETY: as above.
+    unsafe { *errno = saved };
+}
+
+/// A [`DetlogForwarder`] for a tool that runs inside the guest process and shares the
+/// guest's standard error: it writes each record as one [`forwarded_line`] there, where
+/// Hermit's verification separates the records from the guest's own output by their
+/// text.
+///
+/// It uses one raw `write` per record, so records from several guest threads cannot
+/// interleave, and it avoids `tracing`'s thread-local dispatcher, which libc's final
+/// `exit_group` can reach after Rust thread-local destruction has begun. A write error
+/// drops the record. The calling thread's `errno` is preserved.
+pub fn forward_to_stderr(target: &str, record_suffix: &str, message: fmt::Arguments<'_>) {
+    preserving_errno(|| {
+        let line = forwarded_line(target, record_suffix, message);
+        let mut rest = line.as_slice();
+        while !rest.is_empty() {
+            // SAFETY: `rest` is a live, initialized byte slice of the given length.
+            let written = unsafe {
+                libc::write(
+                    libc::STDERR_FILENO,
+                    rest.as_ptr().cast::<libc::c_void>(),
+                    rest.len(),
+                )
+            };
+            if written > 0 {
+                rest = &rest[written as usize..];
+            } else if written == 0
+                || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+            {
+                return;
+            }
+        }
+    });
+}
+
+/// Starts the line [`send_forwarded_record`] sends in place of a record it could not
+/// deliver, followed by the record's length and the error number. Its presence means
+/// the forwarded records are incomplete, so verification must not compare them.
+pub const FORWARDING_LOSS_NOTICE: &str = "HERMIT_DETLOG_RECORD_LOST";
+
+/// The message an in-guest runtime sends on the forwarding socket when it has to
+/// give the socket up (reverie-liteinst's `reserve_tool_output_fd` retirement
+/// message): a [`FORWARDING_LOSS_NOTICE`], since no later record can arrive.
+pub const FORWARDING_RETIRED_NOTICE: &[u8] = b"HERMIT_DETLOG_RECORD_LOST 0 0 socket retired\n";
+
+/// Losses whose notice could not be sent either; the next message that gets through
+/// is preceded by a notice for them, so a later record cannot hide them.
+static UNREPORTED_LOSSES: AtomicU64 = AtomicU64::new(0);
+
+/// Sends one record as one [`forwarded_line`] message on `socket`, a message-oriented
+/// socket (such as one end of a `SOCK_SEQPACKET` pair) that carries nothing but records,
+/// from which Hermit's verification moves them into the run's log.
+///
+/// It uses one raw `send` with `MSG_NOSIGNAL`, so a socket whose reader has gone never
+/// raises SIGPIPE in the guest. A record that cannot be sent (too large for the socket,
+/// or any other error) is replaced by a short [`FORWARDING_LOSS_NOTICE`] message, so the
+/// loss is visible rather than silent; if that notice cannot be sent either, a notice
+/// precedes the next message that can. The calling thread's `errno` is preserved.
+pub fn send_forwarded_record(
+    socket: libc::c_int,
+    target: &str,
+    record_suffix: &str,
+    message: fmt::Arguments<'_>,
+) {
+    let send = |bytes: &[u8]| loop {
+        // SAFETY: `bytes` is a live, initialized byte slice of the given length.
+        let sent = unsafe {
+            libc::send(
+                socket,
+                bytes.as_ptr().cast::<libc::c_void>(),
+                bytes.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent >= 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    };
+    let notice = |length: usize, errno: i32| format!("{FORWARDING_LOSS_NOTICE} {length} {errno}\n");
+    preserving_errno(|| {
+        let unreported = UNREPORTED_LOSSES.swap(0, Ordering::AcqRel);
+        if unreported > 0 && send(notice(0, 0).as_bytes()).is_err() {
+            UNREPORTED_LOSSES.fetch_add(unreported, Ordering::AcqRel);
+        }
+        let line = forwarded_line(target, record_suffix, message);
+        if let Err(error) = send(&line) {
+            let errno = error.raw_os_error().unwrap_or(0);
+            if send(notice(line.len(), errno).as_bytes()).is_err() {
+                UNREPORTED_LOSSES.fetch_add(1, Ordering::AcqRel);
+            }
+        }
+    });
+}
+
 /// Returns whether a process-local deterministic-record sink is installed.
 #[doc(hidden)]
 pub fn forwarding_enabled() -> bool {
@@ -209,6 +329,92 @@ mod tests {
     use super::DetLogRecord;
     use super::RECORD_SEPARATOR;
     use super::record_suffix;
+
+    #[test]
+    fn forwarded_line_names_the_emitting_module() {
+        assert_eq!(
+            super::forwarded_line(
+                "detcore::tool_local",
+                " DETLOG_RECORD={}",
+                format_args!("USER RAND: seeding PRNG for root thread with seed {}", 0)
+            ),
+            b"INFO detcore::tool_local: DETLOG USER RAND: seeding PRNG for root thread with seed 0 DETLOG_RECORD={}\n"
+                .to_vec()
+        );
+    }
+
+    /// Forwarding failures are never silent, and never change the guest's errno.
+    /// One sequential test, because the unreported-loss count is process-wide:
+    /// - a record sent on an invalid descriptor fails, and so does its notice,
+    ///   and errno is left as it was;
+    /// - the next record that gets through is preceded by a loss notice for it;
+    /// - a record too large for the socket arrives as a loss notice, and the next
+    ///   small record intact.
+    #[test]
+    fn forwarding_failures_become_loss_notices() {
+        let mut pair = [-1; 2];
+        // SAFETY: socketpair writes two descriptors on success.
+        let created = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        };
+        assert_eq!(created, 0);
+        let [sender, receiver] = pair;
+        let mut buffer = vec![0u8; 2 << 20];
+        let mut receive = || {
+            // SAFETY: `buffer` is a live, writable byte slice.
+            let received = unsafe {
+                libc::recv(
+                    receiver,
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            assert!(received > 0, "{}", std::io::Error::last_os_error());
+            String::from_utf8_lossy(&buffer[..received as usize]).into_owned()
+        };
+        let is_notice =
+            |text: &str| text.starts_with(&format!("{} ", super::FORWARDING_LOSS_NOTICE));
+
+        // SAFETY: errno is this thread's own.
+        unsafe {
+            *libc::__errno_location() = libc::EAGAIN;
+            super::send_forwarded_record(-1, "detcore", "", format_args!("lost"));
+            assert_eq!(*libc::__errno_location(), libc::EAGAIN);
+        }
+        super::send_forwarded_record(sender, "detcore", "", format_args!("after"));
+        let notice = receive();
+        assert!(is_notice(&notice), "{notice}");
+        assert_eq!(receive(), "INFO detcore: DETLOG after\n");
+
+        let small: libc::c_int = 4096;
+        // SAFETY: a valid socket and an int option value.
+        unsafe {
+            libc::setsockopt(
+                sender,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const small).cast(),
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        let huge = "x".repeat(1 << 20);
+        super::send_forwarded_record(sender, "detcore", "", format_args!("{huge}"));
+        super::send_forwarded_record(sender, "detcore", "", format_args!("small"));
+        let notice = receive();
+        assert!(is_notice(&notice), "{notice}");
+        assert_eq!(receive(), "INFO detcore: DETLOG small\n");
+        // SAFETY: closing the two descriptors this test created.
+        unsafe {
+            libc::close(sender);
+            libc::close(receiver);
+        }
+    }
 
     #[test]
     fn test_detlog() {

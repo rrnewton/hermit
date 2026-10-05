@@ -2890,10 +2890,8 @@ fn backend_stats_are_debug_gated_and_absent_from_the_info_envelope() {
 ///
 /// The hybrid version of this test also ran the guest under `--verify
 /// --keep-logs` and required exactly one record in run 1's golden log and in
-/// run 2's log (https://github.com/rrnewton/hermit/issues/3301). In-guest
-/// LiteInst refuses `--verify` until it forwards guest records
-/// (https://github.com/rrnewton/hermit/issues/3520), so only the plain-run call
-/// site is checked here.
+/// run 2's log (https://github.com/rrnewton/hermit/issues/3301). This in-guest
+/// version checks only the plain-run call site.
 #[test]
 #[cfg(feature = "liteinst")]
 fn liteinst_backend_stats_report_the_guests_own_dispatch_paths() {
@@ -12043,10 +12041,11 @@ fn liteinst_in_guest_refuses_a_maximum_timeslice_before_dispatch() {
     );
 }
 
-/// In-guest LiteInst refuses `--verify`, and must refuse it before `--verify`
+/// An in-guest LiteInst refusal of a `--verify` run must come before `--verify`
 /// snapshots stdin. The snapshot reads stdin to its end, so a refusal checked
 /// after it would wait for input that may never come instead of exiting. Stdin
-/// here is a pipe that the test holds open and never writes to.
+/// here is a pipe that the test holds open and never writes to; the run is
+/// refused for its maximum timeslice.
 #[test]
 fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
     use std::io::Read;
@@ -12059,7 +12058,6 @@ fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
         "--backend",
         "liteinst",
         "run",
-        "--max-timeslice=disabled",
         "--verify",
         "--",
         "/bin/echo",
@@ -12113,10 +12111,266 @@ fn liteinst_in_guest_refuses_verify_without_reading_stdin() {
         "stderr:\n{stderr}"
     );
     assert!(
-        stderr.contains("--verify compares Detcore's internal logs"),
-        "the refusal must name --verify. stderr:\n{stderr}"
+        stderr.contains("pass --max-timeslice=disabled"),
+        "the refusal must name the timeslice. stderr:\n{stderr}"
     );
     assert!(!stdout.contains("unreachable"), "the guest must not run");
+}
+
+/// What one in-guest LiteInst `--verify` run reported about its forwarded
+/// DETLOG records.
+#[cfg(feature = "liteinst")]
+struct ForwardedVerify {
+    stdout: String,
+    stderr: String,
+    /// The syscall records each run forwarded; both runs forwarded this many.
+    syscall_records: usize,
+    /// Run 1's retained log, which a matched run keeps as the golden log.
+    golden_log: String,
+}
+
+/// Runs `guest` under in-guest LiteInst `--verify --keep-logs` and checks what
+/// holds for every such run: it matches, both runs forward the same nonzero
+/// number of syscall records, and run 1's log holds every one of them,
+/// including the in-guest Tool's own `detcore::tool_local` records.
+#[cfg(feature = "liteinst")]
+fn liteinst_verify_with_forwarded_records(guest: &[&str]) -> ForwardedVerify {
+    const FORWARDED: &str = "1970-01-01T00:00:00.000000Z INFO detcore";
+
+    let logs = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = logs.path().join("verify.json");
+    let log_dir = logs.path().to_str().expect("UTF-8 temporary path");
+    let report_arg = report.to_str().expect("UTF-8 temporary path");
+    let mut args = vec![
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--verify",
+        "--keep-logs",
+        "--verify-log-dir",
+        log_dir,
+        "--verify-json",
+        report_arg,
+        "--",
+    ];
+    args.extend_from_slice(guest);
+    let output = hermit_command(&args)
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    assert_success(&output, &args);
+    let stderr = stderr(&output);
+    assert!(stderr.contains("Determinism verified"), "stderr:\n{stderr}");
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("--verify-json report")).unwrap();
+    assert!(
+        report["verified"] == true
+            && report["verdict"] == "matched"
+            && report["comparison"]["compare_logs"] == true,
+        "{report}"
+    );
+
+    // Both runs forwarded the same number of syscall records.
+    let counts = stderr
+        .split_once(":: LiteInst syscall DETLOG records included: ")
+        .and_then(|(_, rest)| rest.lines().next())
+        .unwrap_or_else(|| panic!("no forwarded record counts in:\n{stderr}"));
+    let [run1, run2] = ["run1=", "run2="].map(|key| -> usize {
+        counts
+            .split(", ")
+            .find_map(|field| field.strip_prefix(key))
+            .and_then(|count| count.parse().ok())
+            .unwrap_or_else(|| panic!("no {key} count in {counts:?}"))
+    });
+    assert!(run1 > 0 && run1 == run2, "{counts}");
+
+    // A matched run 2's log is deleted; run 1's is kept as the golden log.
+    let golden: Vec<_> = fs::read_dir(logs.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("run1_log_"))
+        })
+        .collect();
+    let [golden] = &golden[..] else {
+        panic!("expected one retained run 1 log in {log_dir}, found {golden:?}");
+    };
+    let golden_log = fs::read_to_string(golden).unwrap();
+    let forwarded: Vec<&str> = golden_log
+        .lines()
+        .filter(|line| line.starts_with(FORWARDED))
+        .collect();
+    assert_eq!(
+        forwarded
+            .iter()
+            .filter(|line| line.contains("DETLOG [syscall]"))
+            .count(),
+        run1,
+        "run 1's log must hold every forwarded syscall record:\n{golden_log}"
+    );
+    assert!(
+        forwarded
+            .iter()
+            .any(|line| line.contains("INFO detcore::tool_local: DETLOG ")),
+        "run 1's log holds no record from the in-guest Tool's local state:\n{golden_log}"
+    );
+    ForwardedVerify {
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr,
+        syscall_records: run1,
+        golden_log,
+    }
+}
+
+/// In-guest LiteInst forwards the Tool's DETLOG records to a descriptor Reverie
+/// reserves and protects from the guest, and `--verify` reads them into each
+/// run's log, so the two runs' records are compared
+/// (https://github.com/rrnewton/hermit/issues/3520, C5).
+///
+/// The guest's stderr is never parsed. Here the guest writes a prompt with no
+/// newline, a line in a forwarded record's exact shape, and the same line
+/// behind the record marker an earlier revision of this change used: all must
+/// reach the guest's stderr byte for byte, neither copy may enter the log, and
+/// no real record may reach the guest's stderr.
+#[test]
+#[cfg(feature = "liteinst")]
+fn liteinst_in_guest_verify_compares_the_records_the_guest_forwards() {
+    const LOOK_ALIKE: &str = "INFO detcore: DETLOG [syscall] guest look-alike\n\
+        \u{1e}HERMIT_FORWARDED_DETLOG\u{1f}INFO detcore: DETLOG [syscall] guest look-alike\n";
+
+    let _lock = hermit_run_guard();
+    let run = liteinst_verify_with_forwarded_records(&[
+        "/bin/sh",
+        "-c",
+        "printf 'prompt> ' >&2; \
+         printf 'INFO detcore: DETLOG [syscall] guest look-alike\\n' >&2; \
+         printf '\\036HERMIT_FORWARDED_DETLOG\\037INFO detcore: DETLOG [syscall] guest look-alike\\n' >&2; \
+         echo forwarded",
+    ]);
+    assert_eq!(run.stdout, "forwarded\n");
+    assert!(
+        run.stderr.contains(&format!("prompt> {LOOK_ALIKE}")),
+        "the guest's stderr bytes changed:\n{}",
+        run.stderr
+    );
+    assert_eq!(
+        run.stderr.matches("INFO detcore").count(),
+        2,
+        "a forwarded record reached the guest's stderr:\n{}",
+        run.stderr
+    );
+    assert!(
+        !run.golden_log.contains("guest look-alike"),
+        "guest output entered the log:\n{}",
+        run.golden_log
+    );
+}
+
+/// A guest that points its stderr at a pipe nobody reads, with SIGPIPE at its
+/// default action, that dup2s onto every descriptor from 1024 to 1039 (where
+/// Reverie keeps, and keeps moving, the forwarding socket) and then closes
+/// them all, still runs to the end under `--verify`: each dup2 succeeds as it
+/// would without forwarding, and the records are still forwarded. When
+/// records went to the guest's stderr, Detcore's own record of the first
+/// `dup2` killed it with SIGPIPE under `--verify` only; with a socket that did
+/// not move, the dup2 onto its number failed with EBADF.
+#[test]
+#[cfg(feature = "liteinst")]
+fn liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader() {
+    const GUEST: &str = "import os, signal\n\
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)\n\
+        r, w = os.pipe()\n\
+        os.close(r)\n\
+        os.dup2(w, 2)\n\
+        os.close(w)\n\
+        for fd in range(1024, 1040):\n\
+        \x20   assert os.dup2(1, fd) == fd, fd\n\
+        os.closerange(3, 1100)\n\
+        print('alive', flush=True)\n";
+
+    let _lock = hermit_run_guard();
+    let run = liteinst_verify_with_forwarded_records(&["/usr/bin/python3", "-c", GUEST]);
+    assert_eq!(run.stdout, "alive\n");
+    assert!(run.syscall_records > 0);
+}
+
+/// Forwarded records count against the log's size bound
+/// (`HERMIT_LOG_MAX_BYTES`), and a log they push past it still ends in the
+/// truncation marker, so the comparison is refused (`no_result`) instead of
+/// comparing records that were cut. The bound is chosen so Hermit's own records
+/// for `/bin/echo` (about 40 KB) fit and the forwarded ones (about 36 KB more)
+/// do not; the retained log proves the first half of that.
+#[test]
+#[cfg(feature = "liteinst")]
+fn liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result() {
+    let _lock = hermit_run_guard();
+    let logs = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let report = logs.path().join("verify.json");
+    let log_dir = logs.path().to_str().expect("UTF-8 temporary path");
+    let report_arg = report.to_str().expect("UTF-8 temporary path");
+    let args = [
+        "--backend",
+        "liteinst",
+        "run",
+        "--max-timeslice=disabled",
+        "--verify",
+        "--keep-logs",
+        "--verify-log-dir",
+        log_dir,
+        "--verify-json",
+        report_arg,
+        "--",
+        "/bin/echo",
+        "capped",
+    ];
+    let output = hermit_command(&args)
+        .env_remove("RUST_LOG")
+        .env_remove("HERMIT_LOG")
+        .env_remove("HERMIT_LOG_FILE")
+        .env("HERMIT_LOG_MAX_BYTES", "50000")
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run hermit");
+    let stderr = stderr(&output);
+    assert!(!output.status.success(), "stderr:\n{stderr}");
+    assert!(
+        stderr.contains("truncated at the configured size bound"),
+        "stderr:\n{stderr}"
+    );
+    let report: serde_json::Value =
+        serde_json::from_slice(&fs::read(&report).expect("--verify-json report")).unwrap();
+    assert!(
+        report["verdict"] == "no_result" && report["verified"] == false,
+        "{report}"
+    );
+    let run1: Vec<_> = fs::read_dir(logs.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("run1_log_"))
+        })
+        .collect();
+    let [run1] = &run1[..] else {
+        panic!("expected one retained run 1 log in {log_dir}, found {run1:?}");
+    };
+    let text = fs::read_to_string(run1).unwrap();
+    assert!(
+        text.lines()
+            .any(|line| line.starts_with("1970-01-01T00:00:00.000000Z INFO detcore")),
+        "the bound cut Hermit's own records before any forwarded one:\n{text}"
+    );
+    assert!(
+        text.trim_end().ends_with("was NOT affected. ==="),
+        "the log does not end in the truncation marker:\n{text}"
+    );
 }
 
 /// A statically linked guest has no dynamic loader to load the in-guest
@@ -12586,9 +12840,8 @@ fn liteinst_in_guest_runs_detcore_without_a_ptrace_tracer() {
 /// joins the others.
 ///
 /// In-guest runs are compared by output, exit status and scheduler records
-/// only. In-guest LiteInst refuses `--verify` until it forwards guest records
-/// (landing 4b of https://github.com/rrnewton/hermit/issues/3520), so the
-/// schedule itself is not compared here.
+/// only; they do not pass `--verify`, so the schedule itself is not compared
+/// here.
 ///
 /// This test is ignored, and no validate node runs it, so it runs only when
 /// someone runs it by hand, ptrace legs included

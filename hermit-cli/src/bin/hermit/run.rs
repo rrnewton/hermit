@@ -15,8 +15,10 @@ use std::fs::OpenOptions;
 use std::hash::Hash;
 use std::hash::Hasher;
 use std::io::Read;
+use std::io::Seek;
 use std::io::Write;
 use std::num::NonZeroU64;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -114,14 +116,12 @@ fn warn_bind_outside_tmp(bind: &Bind) {
     );
 }
 const FAIL_CLOSED_ENV: &str = "HERMIT_FAIL_CLOSED";
-#[cfg(feature = "sabre")]
-const NORMALIZED_SABRE_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
+const NORMALIZED_FORWARDED_DETLOG_TIMESTAMP: &str = "1970-01-01T00:00:00.000000Z";
 
-#[cfg(feature = "sabre")]
-fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+fn find_bytes(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
-        .any(|window| window == needle)
+        .position(|window| window == needle)
 }
 
 fn read_verify_summary(path: &Path) -> Option<RunSummary> {
@@ -410,31 +410,363 @@ fn take_verify_summary_before_next_run(path: &Path) -> Result<Option<RunSummary>
     Ok(summary)
 }
 
-#[cfg(feature = "sabre")]
-fn extract_sabre_detlogs(path: &Path, stderr: &mut Vec<u8>) -> Result<usize, Error> {
-    let mut log = OpenOptions::new().append(true).open(path)?;
-    let mut guest_stderr = Vec::with_capacity(stderr.len());
+/// Moves the DETLOG records an in-guest Tool forwarded into the run's log at
+/// `path`, under the log's size bound `limit` (`0`: unbounded), and returns how
+/// many are syscall records. `stream` is what carried them: the guest's standard
+/// error for SaBRe's plugin (`records_only` false), or, for in-guest LiteInst,
+/// a socket that carries nothing but records (`records_only` true). On return
+/// `stream` holds every line that was not a record.
+///
+/// A record is a line whose text, after leading whitespace, starts with
+/// `INFO detcore` and contains ` DETLOG ` (`detcore::detlog::forwarded_line`).
+/// From the guest's standard error every other line stays exactly as the guest
+/// wrote it. A records-only stream must hold nothing else: a
+/// `detcore::detlog::FORWARDING_LOSS_NOTICE` (a record the Tool could not send)
+/// or any other line is an error, so verification reports no result instead of
+/// comparing incomplete records.
+///
+/// The records are appended through the same bound as the log itself, counting
+/// the bytes already in it, and never after an existing truncation marker: the
+/// comparators recognize a truncated log only by that marker on the log's last
+/// line, and a log whose observations were cut must compare as no result.
+fn extract_forwarded_detlogs(
+    path: &Path,
+    stream: &mut Vec<u8>,
+    limit: u64,
+    records_only: bool,
+) -> Result<usize, Error> {
+    let mut kept = Vec::with_capacity(stream.len());
+    let mut records = Vec::new();
     let mut syscall_records = 0;
-    for line in stderr.split_inclusive(|byte| *byte == b'\n') {
+    for line in stream.split_inclusive(|byte| *byte == b'\n') {
         let start = line
             .iter()
             .position(|byte| !byte.is_ascii_whitespace())
             .unwrap_or(line.len());
         let payload = line[start..].strip_suffix(b"\n").unwrap_or(&line[start..]);
         let payload = payload.strip_suffix(b"\r").unwrap_or(payload);
-        if payload.starts_with(b"INFO detcore") && contains_bytes(payload, b" DETLOG ") {
-            log.write_all(NORMALIZED_SABRE_DETLOG_TIMESTAMP.as_bytes())?;
-            log.write_all(b" ")?;
-            log.write_all(payload)?;
-            log.write_all(b"\n")?;
-            syscall_records += usize::from(contains_bytes(payload, b"DETLOG [syscall]"));
+        if payload.starts_with(b"INFO detcore") && find_bytes(payload, b" DETLOG ").is_some() {
+            records.extend_from_slice(NORMALIZED_FORWARDED_DETLOG_TIMESTAMP.as_bytes());
+            records.push(b' ');
+            records.extend_from_slice(payload);
+            records.push(b'\n');
+            syscall_records += usize::from(find_bytes(payload, b"DETLOG [syscall]").is_some());
         } else {
-            guest_stderr.extend_from_slice(line);
+            kept.extend_from_slice(line);
         }
     }
-    *stderr = guest_stderr;
+    if records_only && !kept.is_empty() {
+        let lost = kept
+            .split(|byte| *byte == b'\n')
+            .filter(|line| line.starts_with(detcore::detlog::FORWARDING_LOSS_NOTICE.as_bytes()))
+            .count();
+        if lost > 0 {
+            anyhow::bail!(
+                "the in-guest Tool could not forward {lost} DETLOG record(s) (it sent {} instead), \
+                 so the compared records would be incomplete",
+                detcore::detlog::FORWARDING_LOSS_NOTICE
+            );
+        }
+        anyhow::bail!(
+            "the in-guest DETLOG forwarding socket carried {} bytes outside any record",
+            kept.len()
+        );
+    }
+    *stream = kept;
+    append_within_log_bound(path, &records, limit)?;
     Ok(syscall_records)
 }
+
+/// Appends `bytes` to the log at `path` within its size bound; see
+/// [`extract_forwarded_detlogs`].
+fn append_within_log_bound(path: &Path, bytes: &[u8], limit: u64) -> Result<(), Error> {
+    let log = OpenOptions::new().read(true).append(true).open(path)?;
+    if log_ends_truncated(&log)? {
+        return Ok(());
+    }
+    let written = log.metadata()?.len();
+    let mut log = BoundedWriter::resume(log, limit, written);
+    log.write_all(bytes)?;
+    log.flush()?;
+    Ok(())
+}
+
+/// Ends the log at `path` with the bound's truncation marker unless it already
+/// ends with it: records past the bound were discarded before they reached it.
+fn mark_log_truncated(path: &Path, limit: u64) -> Result<(), Error> {
+    let log = OpenOptions::new().read(true).append(true).open(path)?;
+    if log_ends_truncated(&log)? {
+        return Ok(());
+    }
+    // No room left under the bound, so the write is discarded and announced.
+    let mut log = BoundedWriter::resume(log, limit, limit);
+    log.write_all(b"\n")?;
+    log.flush()?;
+    Ok(())
+}
+
+/// Whether `log` already ends with the bound's truncation marker.
+fn log_ends_truncated(mut log: &fs::File) -> Result<bool, Error> {
+    let written = log.metadata()?.len();
+    // The truncation marker is a few hundred bytes; its whole last line fits.
+    let tail_len = written.min(4096);
+    log.seek(std::io::SeekFrom::Start(written - tail_len))?;
+    let mut tail = Vec::new();
+    log.read_to_end(&mut tail)?;
+    Ok(detcore::logdiff::log_was_truncated(
+        &String::from_utf8_lossy(&tail),
+    ))
+}
+
+/// How long [`ForwardedDrain`] waits for its helper to stop before killing it.
+const FORWARDED_DRAIN_STOP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Collects what one in-guest LiteInst run sends on its forwarding socket while
+/// the run executes, so a guest is never blocked on a full socket. The work is
+/// done by a forked helper process, not a thread: the verify process must stay
+/// single-threaded until it has cloned the run's container, because Reverie's
+/// raw clone runs no fork handlers, so a thread holding the allocator's lock at
+/// that moment would leave the container with it held. The helper keeps at
+/// most one byte more than the log bound (enough for the bound to announce the
+/// truncation) and discards the rest, in a temporary file. It stops at end of
+/// input, or once the run is over (the parent writes a byte to its stop pipe)
+/// and nothing is left to read: a descendant that outlives the run must not
+/// hold verification open. The stop is an explicit byte, not the pipe's end of
+/// file, because container clones inherit the pipe's write end; and waiting
+/// for the helper is bounded, so a helper that does not stop is killed and
+/// reported rather than waited for forever.
+struct ForwardedDrain {
+    helper: libc::pid_t,
+    stop: Option<std::os::fd::OwnedFd>,
+    output: fs::File,
+}
+
+impl ForwardedDrain {
+    fn start(
+        receiver: std::os::fd::OwnedFd,
+        sender: &std::os::fd::OwnedFd,
+        limit: u64,
+    ) -> Result<Self, Error> {
+        let output = tempfile::tempfile().context("creating the in-guest DETLOG drain file")?;
+        let mut pipe = [-1; 2];
+        // SAFETY: pipe2 writes two descriptors into `pipe` on success.
+        if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(Error::new(std::io::Error::last_os_error())
+                .context("creating the in-guest DETLOG drain's stop pipe"));
+        }
+        // SAFETY: pipe2 returned two new descriptors this function owns.
+        let [stop_reader, stop_writer] = pipe
+            .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+        // SAFETY: the verify process is single-threaded here (see above), so the
+        // child may allocate; it leaves only through `_exit`.
+        match unsafe { libc::fork() } {
+            -1 => Err(Error::new(std::io::Error::last_os_error())
+                .context("forking the in-guest DETLOG drain")),
+            0 => {
+                // Hold nothing but its own three descriptors and stdio. Best
+                // effort: the helper stops on an explicit byte, so a copy of a
+                // stop pipe's writer or of a sending end that survives here
+                // cannot keep it running.
+                let _ = sender;
+                close_all_descriptors_except(&[
+                    receiver.as_raw_fd(),
+                    stop_reader.as_raw_fd(),
+                    output.as_raw_fd(),
+                ]);
+                let status = match drain_forwarded_records(
+                    receiver.as_raw_fd(),
+                    stop_reader.as_raw_fd(),
+                    output.as_raw_fd(),
+                    limit,
+                ) {
+                    Ok(()) => 0,
+                    Err(_) => 1,
+                };
+                // SAFETY: `_exit` takes no pointers and does not return.
+                unsafe { libc::_exit(status) }
+            }
+            helper => Ok(Self {
+                helper,
+                stop: Some(stop_writer),
+                output,
+            }),
+        }
+    }
+
+    /// Tells the helper the run is over and waits for it, at most
+    /// [`FORWARDED_DRAIN_STOP_TIMEOUT`]; a helper still running then is killed,
+    /// and reaped if it dies within a further second. Returns its wait status,
+    /// or `None` when it had to be killed.
+    fn stop_and_reap(&mut self) -> Option<libc::c_int> {
+        if let Some(stop) = self.stop.take() {
+            // SAFETY: one byte from a live buffer to this process's pipe.
+            unsafe { libc::write(stop.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        }
+        let helper = std::mem::replace(&mut self.helper, -1);
+        if helper <= 0 {
+            return None;
+        }
+        let deadline = std::time::Instant::now() + FORWARDED_DRAIN_STOP_TIMEOUT;
+        let mut status = 0;
+        loop {
+            // SAFETY: polling this process's own child.
+            match unsafe { libc::waitpid(helper, &mut status, libc::WNOHANG) } {
+                pid if pid == helper => return Some(status),
+                0 if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                _ => {
+                    // SAFETY: killing this process's own child.
+                    unsafe { libc::kill(helper, libc::SIGKILL) };
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+                    // SAFETY: polling this process's own child.
+                    while unsafe { libc::waitpid(helper, &mut status, libc::WNOHANG) } == 0
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    return None;
+                }
+            }
+        }
+    }
+
+    fn finish(mut self) -> Result<Vec<u8>, Error> {
+        let Some(status) = self.stop_and_reap() else {
+            anyhow::bail!(
+                "the in-guest DETLOG drain did not stop within {FORWARDED_DRAIN_STOP_TIMEOUT:?} \
+                 and was killed"
+            );
+        };
+        if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != 0 {
+            anyhow::bail!("the in-guest DETLOG drain failed (wait status {status})");
+        }
+        let mut records = Vec::new();
+        self.output.seek(std::io::SeekFrom::Start(0))?;
+        self.output.read_to_end(&mut records)?;
+        Ok(records)
+    }
+}
+
+impl Drop for ForwardedDrain {
+    fn drop(&mut self) {
+        let _ = self.stop_and_reap();
+    }
+}
+
+/// Closes every descriptor above standard error except `keep`, in this
+/// (forked, single-threaded) process.
+fn close_all_descriptors_except(keep: &[libc::c_int]) {
+    let mut keep: Vec<libc::c_uint> = keep.iter().map(|&fd| fd as libc::c_uint).collect();
+    keep.sort_unstable();
+    let mut start: libc::c_uint = 3;
+    for &fd in &keep {
+        if fd > start {
+            // SAFETY: close_range takes plain integers.
+            unsafe { libc::syscall(libc::SYS_close_range, start, fd - 1, 0) };
+        }
+        start = start.max(fd + 1);
+    }
+    // SAFETY: as above.
+    unsafe { libc::syscall(libc::SYS_close_range, start, libc::c_uint::MAX, 0) };
+}
+
+/// The drain helper's loop: see [`ForwardedDrain`].
+fn drain_forwarded_records(
+    receiver: libc::c_int,
+    stop: libc::c_int,
+    output: libc::c_int,
+    limit: u64,
+) -> std::io::Result<()> {
+    let cap = if limit == 0 {
+        u64::MAX
+    } else {
+        limit.saturating_add(1)
+    };
+    let mut kept: u64 = 0;
+    let mut stopping = false;
+    let mut buffer = vec![0u8; 1 << 20];
+    loop {
+        let mut polls = [
+            libc::pollfd {
+                fd: receiver,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: stop,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let count = if stopping { 1 } else { 2 };
+        // SAFETY: `polls` holds `count` valid pollfds.
+        let ready = unsafe { libc::poll(polls.as_mut_ptr(), count, if stopping { 0 } else { -1 }) };
+        if ready < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error);
+        }
+        if !stopping && polls[1].revents != 0 {
+            // The run is over: read what is queued, then stop.
+            stopping = true;
+        }
+        if polls[0].revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            if stopping {
+                return Ok(());
+            }
+            continue;
+        }
+        // SAFETY: `buffer` is a live, writable byte slice of the given length.
+        let received = unsafe {
+            libc::recv(
+                receiver,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                libc::MSG_DONTWAIT | libc::MSG_TRUNC,
+            )
+        };
+        if received == 0 {
+            return Ok(());
+        }
+        if received < 0 {
+            let error = std::io::Error::last_os_error();
+            match error.kind() {
+                std::io::ErrorKind::Interrupted => continue,
+                std::io::ErrorKind::WouldBlock if stopping => return Ok(()),
+                std::io::ErrorKind::WouldBlock => continue,
+                _ => return Err(error),
+            }
+        }
+        let received = received as usize;
+        if received > buffer.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "a forwarded DETLOG record of {received} bytes exceeds the reader's buffer"
+                ),
+            ));
+        }
+        let take = (received as u64).min(cap - kept) as usize;
+        let mut rest = &buffer[..take];
+        while !rest.is_empty() {
+            // SAFETY: `rest` is a live, initialized byte slice of the given length.
+            let written = unsafe { libc::write(output, rest.as_ptr().cast(), rest.len()) };
+            if written < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(error);
+            }
+            rest = &rest[written as usize..];
+        }
+        kept += take as u64;
+    }
+}
+
 struct PreparedMounts {
     mounts: Vec<Mount>,
     identity_sources: IdentityGuard,
@@ -2554,7 +2886,6 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
         "{error:#}"
     );
     for (option, reason) in [
-        ("--verify", "--verify compares Detcore's internal logs"),
         (
             "--run-evidence-dir=/unused/new-path",
             "--run-evidence-dir has not been qualified",
@@ -2571,6 +2902,8 @@ fn liteinst_in_guest_refuses_options_it_cannot_honour() {
         assert!(error.to_string().contains(reason), "{option}: {error:#}");
     }
     liteinst_in_guest_refusal(&["--max-timeslice=disabled"]).unwrap();
+    // The in-guest Tool forwards its DETLOG records, so `--verify` compares them.
+    liteinst_in_guest_refusal(&["--max-timeslice=disabled", "--verify"]).unwrap();
 }
 
 #[test]
@@ -3604,6 +3937,98 @@ impl RunOpts {
         }
     }
 
+    /// Whether this run's Tool writes its DETLOG records to the guest's standard
+    /// error for `--verify` to move into the run's log: SaBRe's plugin and the
+    /// in-guest LiteInst runtime both do.
+    fn forwards_in_guest_detlogs(&self) -> bool {
+        matches!(self.selected_backend(), Backend::Sabre | Backend::Liteinst)
+    }
+
+    /// A Unix `SOCK_SEQPACKET` pair for one verification run's forwarded
+    /// DETLOG records, when the run hosts Detcore inside the guest through
+    /// LiteInst: the guest's runtime sends each record as one message on the
+    /// sending end, a descriptor Reverie protects from the guest, so the
+    /// guest's own output never mixes with them
+    /// (`hermit::forward_in_guest_detlogs_to`). Returns the sending end and a
+    /// drain already collecting from the receiving end.
+    fn forwarded_detlog_channel(
+        &self,
+    ) -> Result<Option<(std::os::fd::OwnedFd, ForwardedDrain)>, Error> {
+        if !self.uses_in_guest_liteinst() {
+            return Ok(None);
+        }
+        let mut pair = [-1; 2];
+        // SAFETY: socketpair writes two descriptors into `pair` on success.
+        let created = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_SEQPACKET | libc::SOCK_CLOEXEC,
+                0,
+                pair.as_mut_ptr(),
+            )
+        };
+        if created != 0 {
+            return Err(Error::new(std::io::Error::last_os_error())
+                .context("creating the in-guest DETLOG forwarding socket pair"));
+        }
+        // SAFETY: socketpair returned two new descriptors this function owns.
+        let [sender, receiver] = pair
+            .map(|fd| unsafe { <std::os::fd::OwnedFd as std::os::fd::FromRawFd>::from_raw_fd(fd) });
+        // Room for the largest record; the kernel caps the request at its limit.
+        let size: libc::c_int = 4 << 20;
+        for (fd, option) in [(&sender, libc::SO_SNDBUF), (&receiver, libc::SO_RCVBUF)] {
+            // SAFETY: a valid socket and an int option value.
+            unsafe {
+                libc::setsockopt(
+                    fd.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    option,
+                    (&raw const size).cast(),
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                )
+            };
+        }
+        let limit = log_max_bytes().map_err(Error::msg)?;
+        let drain = ForwardedDrain::start(receiver, &sender, limit)?;
+        Ok(Some((sender, drain)))
+    }
+
+    /// Moves the DETLOG records this run's in-guest Tool forwarded into the
+    /// run's log and returns how many are syscall records, or `None` when the
+    /// backend forwards none. SaBRe's plugin forwards them on the guest's
+    /// standard error, from which they are cut out; in-guest LiteInst sends
+    /// them on its own socket, collected by `drain`, which carries nothing else.
+    fn take_forwarded_detlogs(
+        &self,
+        log: &Path,
+        stderr: &mut Vec<u8>,
+        drain: Option<ForwardedDrain>,
+    ) -> Result<Option<usize>, Error> {
+        if !self.forwards_in_guest_detlogs() {
+            return Ok(None);
+        }
+        let limit = log_max_bytes().map_err(Error::msg)?;
+        let Some(drain) = drain else {
+            return extract_forwarded_detlogs(log, stderr, limit, false).map(Some);
+        };
+        let mut records = drain.finish()?;
+        let overflowed = limit != 0 && records.len() as u64 > limit;
+        if overflowed {
+            // The drain kept one byte past the bound and discarded the rest, so
+            // its last line may be cut short: drop it.
+            let whole = records
+                .iter()
+                .rposition(|byte| *byte == b'\n')
+                .map_or(0, |end| end + 1);
+            records.truncate(whole);
+        }
+        let syscall_records = extract_forwarded_detlogs(log, &mut records, limit, true)?;
+        if overflowed {
+            mark_log_truncated(log, limit)?;
+        }
+        Ok(Some(syscall_records))
+    }
+
     /// Whether this run hosts Detcore inside the guest through LiteInst.
     /// `--namespace-only` runs no backend, so it never does.
     fn uses_in_guest_liteinst(&self) -> bool {
@@ -3623,9 +4048,6 @@ impl RunOpts {
             "it cannot deliver Detcore's preemption timer yet (the in-guest Tool host refuses \
              set_timer with ENOSYS), so the run would fail at its first timeslice; pass \
              --max-timeslice=disabled"
-        } else if self.verify {
-            "--verify compares Detcore's internal logs, and the in-guest Tool does not forward \
-             its records to Hermit yet"
         } else if self.run_evidence_dir.is_some() {
             "--run-evidence-dir has not been qualified for the in-guest runtime"
         } else if self.timeout.is_some() {
@@ -5215,6 +5637,8 @@ impl RunOpts {
 
         let (log1_file, log1_path) = log1.into_parts();
         let (log2_file, log2_path) = log2.into_parts();
+        let (forwarded1_for_run, mut forwarded1) = self.forwarded_detlog_channel()?.unzip();
+        let (forwarded2_for_run, mut forwarded2) = self.forwarded_detlog_channel()?.unzip();
 
         // Verification historically sent both executions to one --summary-json
         // path, so run 2 overwrote run 1. Keep the public path's run-2 meaning,
@@ -5261,7 +5685,7 @@ impl RunOpts {
         let (out1, skid_overshoots_run1) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run1,
-            || run1_options.run_verify(log1_file, global),
+            || run1_options.run_verify(log1_file, forwarded1_for_run, global),
         ) {
             Ok(result) => result,
             Err(mut error) => {
@@ -5290,21 +5714,17 @@ impl RunOpts {
                 return Err(error);
             }
         };
-        #[cfg(feature = "sabre")]
         let mut out1 = out1;
-        #[cfg(feature = "sabre")]
-        let sabre_syscalls1 = match (self.selected_backend() == Backend::Sabre)
-            .then(|| extract_sabre_detlogs(&log1_path, &mut out1.stderr))
-            .transpose()
-        {
-            Ok(count) => count,
-            Err(error) => {
-                if self.keep_logs {
-                    retain_verification_logs([("run 1", log1_path)])?;
+        let forwarded_syscalls1 =
+            match self.take_forwarded_detlogs(&log1_path, &mut out1.stderr, forwarded1.take()) {
+                Ok(count) => count,
+                Err(error) => {
+                    if self.keep_logs {
+                        retain_verification_logs([("run 1", log1_path)])?;
+                    }
+                    return Err(error);
                 }
-                return Err(error);
-            }
-        };
+            };
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -5429,7 +5849,7 @@ impl RunOpts {
         let (out2, skid_overshoots_run2) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run2,
-            || run2_options.run_verify(log2_file, global),
+            || run2_options.run_verify(log2_file, forwarded2_for_run, global),
         ) {
             Ok(result) => result,
             Err(mut error) => {
@@ -5460,11 +5880,18 @@ impl RunOpts {
                 return Err(error);
             }
         };
-        #[cfg(feature = "sabre")]
         let mut out2 = out2;
-        #[cfg(feature = "sabre")]
-        if let Some(sabre_syscalls1) = sabre_syscalls1 {
-            let sabre_syscalls2 = match extract_sabre_detlogs(&log2_path, &mut out2.stderr) {
+        if let Some(forwarded_syscalls1) = forwarded_syscalls1 {
+            let backend = if self.selected_backend() == Backend::Sabre {
+                "SaBRe"
+            } else {
+                "LiteInst"
+            };
+            let forwarded_syscalls2 = match self
+                .take_forwarded_detlogs(&log2_path, &mut out2.stderr, forwarded2.take())
+                .and_then(|count| {
+                    count.context("run 2 forwarded no DETLOG records where run 1 did")
+                }) {
                 Ok(count) => count,
                 Err(error) => {
                     if self.keep_logs {
@@ -5473,16 +5900,16 @@ impl RunOpts {
                     return Err(error);
                 }
             };
-            if sabre_syscalls1 == 0 || sabre_syscalls2 == 0 {
+            if forwarded_syscalls1 == 0 || forwarded_syscalls2 == 0 {
                 if self.keep_logs {
                     retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
                 }
                 return Err(Error::msg(format!(
-                    "SaBRe verification captured no syscall DETLOG records: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
+                    "{backend} verification captured no syscall DETLOG records: run1={forwarded_syscalls1}, run2={forwarded_syscalls2}"
                 )));
             }
             eprintln!(
-                ":: SaBRe syscall DETLOG records included: run1={sabre_syscalls1}, run2={sabre_syscalls2}"
+                ":: {backend} syscall DETLOG records included: run1={forwarded_syscalls1}, run2={forwarded_syscalls2}"
             );
         }
 
@@ -5640,7 +6067,6 @@ impl RunOpts {
 
         let backend_banner = match self.selected_backend() {
             Backend::Kvm => Some("KVM (reverie-kvm KvmGuest<Detcore>)"),
-            // In-guest LiteInst refuses `--verify` before it starts a guest.
             Backend::Liteinst
             | Backend::Ptrace
             | Backend::Dbt
@@ -5786,6 +6212,7 @@ impl RunOpts {
     pub fn run_verify(
         &self,
         log_file: fs::File,
+        forwarded_detlogs: Option<std::os::fd::OwnedFd>,
         global: &GlobalOpts,
     ) -> Result<(Output, u64), Error> {
         let mut options = self.clone();
@@ -5794,44 +6221,63 @@ impl RunOpts {
         if self.no_namespace {
             let mut process = Container::new();
             apply_affinity(&mut process, self.pin_threads);
-            let resources = if network_trace.is_some() {
-                "verification log and network trace descriptors; no PID namespace"
-            } else {
-                "verification log descriptor; no PID namespace"
-            };
+            let resources = format!(
+                "verification log{}{} descriptors; no PID namespace",
+                if network_trace.is_some() {
+                    ", network trace"
+                } else {
+                    ""
+                },
+                if forwarded_detlogs.is_some() {
+                    ", forwarded DETLOG"
+                } else {
+                    ""
+                },
+            );
             return super::owned_container::run(
                 &mut process,
-                (Some(log_file), network_trace),
-                resources.into(),
+                (Some(log_file), network_trace, forwarded_detlogs),
+                resources,
                 false,
                 "with_container",
                 None,
-                move |(log, _)| options.run_verify_in_container(log, &global, None),
+                move |(log, _, forwarded)| {
+                    options.run_verify_in_container(log, forwarded, &global, None)
+                },
             )
             .map(|(value, _guards)| value);
         }
         let tmpfs = self.tmpfs()?;
         let (mut container, identity) = self.container(tmpfs.path())?;
-        let resources = if network_trace.is_some() {
-            format!(
-                "private tmp {}, identity mounts, verification log and network trace descriptors",
-                tmpfs.path().display()
-            )
-        } else {
-            format!(
-                "private tmp {}, identity mounts and verification log",
-                tmpfs.path().display()
-            )
-        };
+        let resources = format!(
+            "private tmp {}, identity mounts, verification log{}{} descriptors",
+            tmpfs.path().display(),
+            if network_trace.is_some() {
+                ", network trace"
+            } else {
+                ""
+            },
+            if forwarded_detlogs.is_some() {
+                ", forwarded DETLOG"
+            } else {
+                ""
+            },
+        );
         super::owned_container::run(
             &mut container,
-            (tmpfs, identity, Some(log_file), network_trace),
+            (
+                tmpfs,
+                identity,
+                Some(log_file),
+                network_trace,
+                forwarded_detlogs,
+            ),
             resources,
             true,
             "with_container",
             None,
-            move |(_, identity, log, _)| {
-                options.run_verify_in_container(log, &global, Some(identity))
+            move |(_, identity, log, _, forwarded)| {
+                options.run_verify_in_container(log, forwarded, &global, Some(identity))
             },
         )
         .map(|(value, _guards)| value)
@@ -6142,6 +6588,7 @@ impl RunOpts {
     fn run_verify_in_container(
         &self,
         log_file: &mut Option<fs::File>,
+        forwarded_detlogs: &mut Option<std::os::fd::OwnedFd>,
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
     ) -> Result<(Output, u64), Error> {
@@ -6188,6 +6635,9 @@ impl RunOpts {
         config.fdinfo_unlisted_mount_ids.clear();
         self.save_config_to_disk()?;
 
+        if let Some(socket) = forwarded_detlogs.take() {
+            hermit::forward_in_guest_detlogs_to(socket);
+        }
         let result = hermit::run_with_output_backend_timeout_and_skid_overshoots(
             command,
             config,
@@ -6770,20 +7220,17 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "sabre")]
-    fn extracts_sabre_detlogs_and_preserves_guest_stderr() {
+    fn extracts_forwarded_detlogs_and_preserves_guest_stderr() {
+        let coordinator = "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n";
         let log = tempfile::NamedTempFile::new().unwrap();
-        std::fs::write(
-            log.path(),
-            "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n",
-        )
-        .unwrap();
+        std::fs::write(log.path(), coordinator).unwrap();
+        // SaBRe: records share the guest's stderr and are found by their text, as
+        // before; every other line stays.
         let mut stderr = b"guest stderr\n INFO detcore: inbound syscall: getpid() = ?\n\
               INFO detcore: DETLOG scheduler event\n\
               INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n"
             .to_vec();
-        let syscall_records = extract_sabre_detlogs(log.path(), &mut stderr).unwrap();
-
+        let syscall_records = extract_forwarded_detlogs(log.path(), &mut stderr, 0, false).unwrap();
         assert_eq!(syscall_records, 1);
         assert_eq!(
             stderr,
@@ -6791,10 +7238,101 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(log.path()).unwrap(),
-            "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n\
-             1970-01-01T00:00:00.000000Z INFO detcore: DETLOG scheduler event\n\
-             1970-01-01T00:00:00.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n",
+            format!(
+                "{coordinator}\
+                 1970-01-01T00:00:00.000000Z INFO detcore: DETLOG scheduler event\n\
+                 1970-01-01T00:00:00.000000Z INFO detcore: DETLOG [syscall] finish syscall #1: getpid() = Ok(3)\n"
+            ),
         );
+
+        // In-guest LiteInst: the socket carries nothing but records.
+        let log = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(log.path(), coordinator).unwrap();
+        let mut records = b"INFO detcore::tool_local: DETLOG local state\n\
+              INFO detcore: DETLOG [syscall] finish syscall #2: getppid() = Ok(1)\n"
+            .to_vec();
+        assert_eq!(
+            extract_forwarded_detlogs(log.path(), &mut records, 0, true).unwrap(),
+            1
+        );
+        assert!(records.is_empty());
+
+        // A record the Tool could not send, or anything else, refuses the run.
+        for (stream, expected) in [
+            (
+                format!(
+                    "INFO detcore: DETLOG [syscall] kept\n{} 16777300 90\n",
+                    detcore::detlog::FORWARDING_LOSS_NOTICE
+                ),
+                "could not forward 1 DETLOG record",
+            ),
+            (
+                "INFO detcore: DETLOG [syscall] kept\nstray\n".to_owned(),
+                "bytes outside any record",
+            ),
+        ] {
+            let log = tempfile::NamedTempFile::new().unwrap();
+            std::fs::write(log.path(), coordinator).unwrap();
+            let mut stream = stream.into_bytes();
+            let error = extract_forwarded_detlogs(log.path(), &mut stream, 0, true).unwrap_err();
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+    }
+
+    /// Forwarded records are appended within the log's size bound, counting the
+    /// bytes already in it, and the log still ends in the truncation marker the
+    /// comparators look for, so a run whose records were cut compares as no
+    /// result. A log the bound already truncated gets nothing appended.
+    #[test]
+    fn forwarded_detlogs_respect_the_log_bound_and_keep_its_truncation_marker() {
+        let records = |count: usize| {
+            let mut bytes = Vec::new();
+            for index in 0..count {
+                bytes.extend_from_slice(
+                    format!("INFO detcore: DETLOG [syscall] finish syscall #{index}\n").as_bytes(),
+                );
+            }
+            bytes
+        };
+        let coordinator = "2026-08-02T00:00:00.000000Z INFO detcore: coordinator message\n";
+
+        // Records that would cross the bound are cut, and the marker ends the log.
+        let log = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(log.path(), coordinator).unwrap();
+        let mut stream = records(100);
+        let limit = coordinator.len() as u64 + 200;
+        assert_eq!(
+            extract_forwarded_detlogs(log.path(), &mut stream, limit, true).unwrap(),
+            100
+        );
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(detcore::logdiff::log_was_truncated(&text), "{text}");
+        assert!(text.starts_with(coordinator), "{text}");
+
+        // A log the bound already truncated keeps the marker on its last line,
+        // and marking it truncated again changes nothing.
+        let truncated = std::fs::read(log.path()).unwrap();
+        let mut stream = records(3);
+        extract_forwarded_detlogs(log.path(), &mut stream, 0, true).unwrap();
+        mark_log_truncated(log.path(), limit).unwrap();
+        assert_eq!(std::fs::read(log.path()).unwrap(), truncated);
+
+        // Records the drain had to discard: the log is marked truncated even
+        // though what reached it fits.
+        let log = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(log.path(), coordinator).unwrap();
+        mark_log_truncated(log.path(), 1 << 20).unwrap();
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(detcore::logdiff::log_was_truncated(&text), "{text}");
+
+        // Within the bound nothing is cut.
+        let log = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(log.path(), coordinator).unwrap();
+        let mut stream = records(2);
+        extract_forwarded_detlogs(log.path(), &mut stream, 1 << 20, true).unwrap();
+        let text = std::fs::read_to_string(log.path()).unwrap();
+        assert!(!detcore::logdiff::log_was_truncated(&text), "{text}");
+        assert_eq!(text.lines().count(), 3);
     }
 
     /// The four branches of [`summary_dir_under`].
