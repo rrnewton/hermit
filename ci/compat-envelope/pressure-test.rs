@@ -671,7 +671,10 @@ struct PressureCells {
 /// sampled verify cell on a backend parity compares with ptrace whose parity
 /// cell the committed snapshot [`parity::PARITY_CELLS_PATH`] lists as
 /// applicable, the pair is scored by the post-pass, and the test's ptrace
-/// verify cell is run as the reference unless the sample already holds it.
+/// verify cell is run as the reference unless the sample already holds it or
+/// the backend's inputs cannot be equalized with the reference's
+/// ([`parity::ParityBackend::inputs_not_equalizable`], dbt), which no
+/// reference could change.
 /// Returns the references, in identity order and each once, and the pairs as
 /// canonical `<test-id>@<backend>` strings.
 fn parity_references(
@@ -720,6 +723,13 @@ fn parity_references(
             }
             .to_string(),
         );
+        // A backend whose guest cannot be given the reference's inputs (dbt
+        // refuses --bind and --mount) is never compared, so no reference is
+        // run for it. Its pair stays in scope, and the post-pass reports it
+        // `inputs-not-equalized` with parity.rs's own reason.
+        if backend.inputs_not_equalizable().is_some() {
+            continue;
+        }
         let reference = CellId {
             mode: parity::PARITY_MODE.into(),
             backend: parity::PARITY_REFERENCE_BACKEND.into(),
@@ -12467,7 +12477,9 @@ fn reference_of(cell: &CellId) -> CellId {
 /// sample does not already hold it. `--sample N` still selects N cells; the
 /// references are retained apart in run.json, run as their own nodes, and
 /// their pairs enter the parity scope. A sampled cell that is not a verify
-/// candidate with an applicable pair adds nothing.
+/// candidate with an applicable pair adds nothing. A dbt candidate's pair
+/// enters the scope, but no reference is run for it: dbt refuses `--bind`
+/// and `--mount`, so its pair can never be compared.
 fn parity_reference_sample_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
     const SAMPLE: usize = 40;
     let pairs = snapshot_parity_pairs(root)?;
@@ -12480,6 +12492,12 @@ fn parity_reference_sample_self_test(root: &Path, scratch: &Path) -> Result<(), 
         cell.mode == parity::PARITY_MODE
             && parity::ParityBackend::parse(&cell.backend).is_ok()
             && !pairs.contains(&(cell.test.clone(), cell.backend.clone()))
+    };
+    // A candidate whose pair can be compared, which alone earns a reference.
+    let comparable = |cell: &CellId| {
+        candidate(cell)
+            && parity::ParityBackend::parse(&cell.backend)
+                .is_ok_and(|backend| backend.inputs_not_equalizable().is_none())
     };
     let population: Vec<CellId> = pressure_cells(root, &CellSelection::default())?
         .selected
@@ -12501,24 +12519,32 @@ fn parity_reference_sample_self_test(root: &Path, scratch: &Path) -> Result<(), 
     };
     // The first seed whose sample adds a reference, already holds another
     // candidate's reference, holds a candidate without an applicable pair,
+    // holds a dbt candidate with a pair whose reference it does not hold,
     // and holds a cell that is not in verify mode.
     let (seed, sampled) = (0..1_000_000u64)
         .map(|seed| (seed, sample_of(seed)))
         .find(|(_, sampled)| {
             let references: BTreeSet<CellId> = sampled
                 .iter()
-                .filter(|cell| candidate(cell))
+                .filter(|cell| comparable(cell))
                 .map(reference_of)
                 .collect();
             references.iter().any(|cell| !sampled.contains(cell))
                 && references.iter().any(|cell| sampled.contains(cell))
                 && sampled.iter().any(|cell| unpaired_candidate(cell))
+                && sampled.iter().any(|cell| {
+                    candidate(cell)
+                        && !comparable(cell)
+                        && !sampled.contains(&reference_of(cell))
+                        && !references.contains(&reference_of(cell))
+                })
                 && sampled.iter().any(|cell| cell.mode != parity::PARITY_MODE)
         })
         .ok_or("no seed below 1000000 samples every parity-reference case")?;
     let candidates: Vec<&CellId> = sampled.iter().filter(|cell| candidate(cell)).collect();
     let expected_references: BTreeSet<CellId> = candidates
         .iter()
+        .filter(|cell| comparable(cell))
         .map(|cell| reference_of(cell))
         .filter(|cell| !sampled.contains(cell))
         .collect();
@@ -23942,6 +23968,200 @@ mod pressure_sample_tests {
                 parity::ParityVerdict::ReferenceMissing,
                 Some(parity::UnavailableClass::NoResultRow),
                 Some(parity::ParityOperand::Reference)
+            ),
+            "{record:?}"
+        );
+        record.validate().unwrap();
+        cleanup.remove().unwrap();
+    }
+
+    /// Retain a canonically matched verify attempt of `cell`, golden log
+    /// only, as one deterministic operand: harness exit 0 and a passing row.
+    /// Returns the cell's node slug.
+    fn plant_matched_verify_cell(
+        results: &Path,
+        cell: &CellId,
+        metadata: &RunMetadata,
+        repetition: Option<usize>,
+    ) -> String {
+        let epoch = metadata
+            .hermit_epoch
+            .clone()
+            .expect("a planned series records its epoch");
+        let slug = cell_run_slug(cell, repetition);
+        let run_id = cell_evidence_run_id(cell, repetition, metadata.run_id_prefix.as_deref());
+        let cell_dir = results.join("cells").join(&slug);
+        fs::create_dir_all(&cell_dir).unwrap();
+        fs::write(cell_dir.join("harness-status"), "0\n").unwrap();
+        let artifact = results.join("runs").join(&run_id).join("attempt-1");
+        let logs = artifact.join("verify-logs/verify-1");
+        fs::create_dir_all(&logs).unwrap();
+        fs::write(
+            logs.join("run1_log_fixture.log"),
+            "INFO detcore a\nINFO detcore b\n",
+        )
+        .unwrap();
+        let mut inner = comparison_attempt("verify", 0);
+        inner.argv = vec![
+            "hermit".into(),
+            "--verify-log-dir".into(),
+            logs.to_string_lossy().into_owned(),
+        ];
+        inner.env = BTreeMap::from([
+            ("HERMIT_EPOCH".into(), epoch),
+            ("LC_ALL".into(), "C".into()),
+        ]);
+        inner.shell_command = literal_shell_command(&inner.cwd, &inner.env, &inner.argv);
+        fs::write(
+            verification_report_path(&artifact),
+            inner.verification_report.as_ref().unwrap(),
+        )
+        .unwrap();
+        let mut row = history_row("verify", "PASS", 1, vec![inner.clone()]);
+        row.run_id = run_id;
+        row.run_index = Some(repetition.unwrap_or(0) as u64);
+        row.hermit_sha = metadata.hermit_sha.clone();
+        row.test = cell.test.clone();
+        row.category = cell.category.clone();
+        row.lane = cell.lane.clone();
+        row.backend = Some(cell.backend.clone());
+        row.classification = "required".into();
+        row.argv = inner.argv.clone();
+        row.guest_argv = inner.guest_argv.clone();
+        row.env = inner.env.clone();
+        row.cwd = inner.cwd.clone();
+        row.shell_command = inner.shell_command.clone();
+        row.timeout_seconds = 57;
+        row.execution_cpu_timeout_seconds = Some(22);
+        row.execution_wall_timeout_seconds = Some(57);
+        row.artifact_dir = artifact.to_string_lossy().into_owned();
+        fs::write(
+            cell_dir.join("results.jsonl"),
+            format!("{}\n", serde_json::to_string(&row).unwrap()),
+        )
+        .unwrap();
+        slug
+    }
+
+    /// The first seed whose one-cell red sample satisfies `wanted`.
+    fn one_cell_sample_seed(root: &Path, wanted: impl Fn(&CellId) -> bool) -> (u64, CellId) {
+        let population: Vec<CellId> = pressure_cells(root, &CellSelection::default())
+            .unwrap()
+            .selected
+            .into_iter()
+            .map(|cell| cell.id)
+            .filter(|cell| matches!(cell.mode.as_str(), "verify" | "replay" | "chaos"))
+            .collect();
+        (0..1_000_000u64)
+            .find_map(|seed| {
+                let sampled = population
+                    .iter()
+                    .min_by_key(|cell| (sample_score(cell, seed), (*cell).clone()))?;
+                wanted(sampled).then(|| (seed, sampled.clone()))
+            })
+            .expect("a seed samples the wanted cell")
+    }
+
+    /// A sampled dbt verify candidate with a pair runs no ptrace reference,
+    /// because dbt refuses `--bind` and `--mount` and its pair can never be
+    /// compared. Its pair still gets exactly one parity row,
+    /// `inputs-not-equalized`, with parity.rs's own dbt reason, so the gap
+    /// stays counted.
+    #[test]
+    fn a_dbt_candidate_runs_no_reference_and_its_pair_is_inputs_not_equalized() {
+        let root = checkout_root();
+        let checked = CheckedScorecard {
+            root: &root,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
+        let pairs = snapshot_parity_pairs(&root).unwrap();
+        let (seed, candidate) = one_cell_sample_seed(&root, |cell| {
+            cell.mode == parity::PARITY_MODE
+                && cell.backend == "dbt"
+                && pairs.contains(&(cell.test.clone(), cell.backend.clone()))
+        });
+        let (results, cleanup) = parity_self_test_results("dbt-reference");
+        let selection = CellSelection {
+            sample: Some(1),
+            seed: Some(seed),
+            run_timeout_seconds: Some(1_000_000),
+            ..CellSelection::default()
+        };
+        let (mut metadata, dag) = write_plan_after_scorecard_check(
+            &checked,
+            &results,
+            &results.join("dag.json"),
+            &selection,
+        )
+        .unwrap();
+        assert_eq!(metadata.cells, vec![candidate.clone()]);
+        let cell_nodes: Vec<&str> = dag
+            .steps
+            .iter()
+            .filter(|step| step.group == "cell")
+            .map(|step| step.job.as_str())
+            .collect();
+        assert_eq!(
+            cell_nodes,
+            vec![cell_run_slug(&candidate, None).as_str()],
+            "a dbt candidate must run no ptrace reference"
+        );
+        let retained: JsonValue = serde_json::to_value(&metadata).unwrap();
+        assert_eq!(
+            retained
+                .get("reference_cells")
+                .cloned()
+                .unwrap_or(json!([])),
+            json!([])
+        );
+        assert_eq!(
+            retained["parity_pairs"],
+            json!([format!("{}@dbt", candidate.test)])
+        );
+        metadata.source_tree_dirty = false;
+        fs::write(
+            results.join("run.json"),
+            serde_json::to_vec(&metadata).unwrap(),
+        )
+        .unwrap();
+        let slug = plant_matched_verify_cell(&results, &candidate, &metadata, None);
+        let evidence = BTreeMap::from([(
+            format!("cell.{slug}"),
+            RunnerEvidence {
+                seen: true,
+                ok: true,
+                ..RunnerEvidence::default()
+            },
+        )]);
+        summarize(&root, &results, false, Some(&evidence), true).unwrap();
+        let cell = parity::ParityCellId {
+            test_id: candidate.test.clone(),
+            backend: parity::ParityBackend::Dbt,
+        };
+        let records = read_parity_records(&results.join(parity::PARITY_JSONL));
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.test_id == cell.test_id
+                    && record.backend == parity::ParityBackend::Dbt)
+                .count(),
+            1,
+            "{records:?}"
+        );
+        let record = parity_record(&records, &cell);
+        assert_eq!(
+            (
+                record.verdict,
+                record.unavailable_class,
+                record.operand,
+                record.reason.as_deref()
+            ),
+            (
+                parity::ParityVerdict::InputsNotEqualized,
+                Some(parity::UnavailableClass::InputsNotEqualized),
+                Some(parity::ParityOperand::Candidate),
+                parity::ParityBackend::Dbt.inputs_not_equalizable()
             ),
             "{record:?}"
         );
