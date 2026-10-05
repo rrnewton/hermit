@@ -200,6 +200,22 @@ fn assert_whole_directory_sorted(listing: &Listing, expected: &[String]) {
     assert_eq!(listing.offsets, offsets);
 }
 
+/// A new directory holding every name, created in [`scrambled`] order.
+///
+/// Tests pass this to [`run_five_times_on`] so that the entries are created
+/// before each traced run and removed after it, not inside it. Creating them
+/// in the guest cost 3000 traced `openat` and `close` pairs and 3000 traced
+/// `unlinkat` calls in each of the five runs, none of which the tests examine,
+/// and their kernel cost grows with host load: in validation, three such tests
+/// reached 19 to 22 CPU seconds against a 22-second limit, while
+/// `creation_order_does_not_change_enumeration`, which creates twice as many
+/// files the same way outside the guest, peaked at 10.2.
+fn scrambled_directory() -> tempfile::TempDir {
+    let root = tempfile::tempdir().unwrap();
+    populate(root.path(), scrambled());
+    root
+}
+
 /// Two directories holding the same names, created in different orders.
 fn creation_order_directories() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
@@ -254,9 +270,7 @@ fn creation_order_does_not_change_enumeration() {
     );
 }
 
-fn seekdir_and_rewinddir_guest() {
-    let root = tempfile::tempdir().unwrap();
-    populate(root.path(), scrambled());
+fn seekdir_and_rewinddir_guest(root: &tempfile::TempDir) {
     let dir = open_dir(root.path());
 
     // Stop part way through, well past the first 32KiB buffer.
@@ -295,7 +309,7 @@ fn seekdir_and_rewinddir_guest() {
 
 #[test]
 fn seekdir_and_rewinddir() {
-    run_five_times(seekdir_and_rewinddir_guest);
+    run_five_times_on(scrambled_directory, seekdir_and_rewinddir_guest, true);
 }
 
 fn getdents64(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
@@ -344,9 +358,7 @@ fn record_names(buf: &[u8], name_offset: usize) -> Vec<String> {
     names
 }
 
-fn raw_getdents_guest() {
-    let root = tempfile::tempdir().unwrap();
-    populate(root.path(), scrambled());
+fn raw_getdents_guest(root: &tempfile::TempDir) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
@@ -399,7 +411,7 @@ fn raw_getdents_guest() {
 
 #[test]
 fn raw_getdents_share_one_sorted_stream() {
-    run_five_times(raw_getdents_guest);
+    run_five_times_on(scrambled_directory, raw_getdents_guest, true);
 }
 
 /// Every name in the directory, read with `getdents64` on `fd` until the end.
@@ -465,9 +477,7 @@ fn receive_descriptor(fd: i32) -> i32 {
     }
 }
 
-fn received_descriptor_guest() {
-    let root = tempfile::tempdir().unwrap();
-    populate(root.path(), scrambled());
+fn received_descriptor_guest(root: &tempfile::TempDir) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
@@ -499,12 +509,10 @@ fn received_descriptor_guest() {
 /// see the guest.
 #[test]
 fn received_descriptor_lists_whole_directory() {
-    run_five_times(received_descriptor_guest);
+    run_five_times_on(scrambled_directory, received_descriptor_guest, true);
 }
 
-fn unsequentialized_threads_guest() {
-    let root = tempfile::tempdir().unwrap();
-    populate(root.path(), scrambled());
+fn unsequentialized_threads_guest(root: &tempfile::TempDir) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
@@ -543,7 +551,7 @@ fn unsequentialized_threads_guest() {
 
 #[test]
 fn unsequentialized_threads_share_one_stream() {
-    run_five_times_with(unsequentialized_threads_guest, false);
+    run_five_times_on(scrambled_directory, unsequentialized_threads_guest, false);
 }
 
 /// The name and `d_off` of each record in a raw `getdents64` buffer.
@@ -658,9 +666,7 @@ fn seek_before_first_read_is_kept() {
     run_five_times(seek_before_first_read_guest);
 }
 
-fn rewind_after_host_order_guest() {
-    let root = tempfile::tempdir().unwrap();
-    populate(root.path(), scrambled());
+fn rewind_after_host_order_guest(root: &tempfile::TempDir) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
@@ -699,12 +705,10 @@ fn rewind_after_host_order_guest() {
 
 #[test]
 fn rewind_after_host_order_sorts_again() {
-    run_five_times(rewind_after_host_order_guest);
+    run_five_times_on(scrambled_directory, rewind_after_host_order_guest, true);
 }
 
-fn passed_on_descriptor_guest() {
-    let root = tempfile::tempdir().unwrap();
-    populate(root.path(), scrambled());
+fn passed_on_descriptor_guest(root: &tempfile::TempDir) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
@@ -761,12 +765,10 @@ fn passed_on_descriptor_guest() {
 /// tracked in https://github.com/rrnewton/hermit/issues/3722; see the guest.
 #[test]
 fn passed_on_descriptor_misses_no_entry() {
-    run_five_times(passed_on_descriptor_guest);
+    run_five_times_on(scrambled_directory, passed_on_descriptor_guest, true);
 }
 
-fn partly_mapped_buffer_guest() {
-    let root = tempfile::tempdir().unwrap();
-    populate(root.path(), scrambled());
+fn partly_mapped_buffer_guest(root: &tempfile::TempDir) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
@@ -814,7 +816,7 @@ fn partly_mapped_buffer_guest() {
 
 #[test]
 fn partly_mapped_buffer_returns_entries_that_fit() {
-    run_five_times(partly_mapped_buffer_guest);
+    run_five_times_on(scrambled_directory, partly_mapped_buffer_guest, true);
 }
 
 fn long_name_past_writable_end_guest() {
@@ -879,9 +881,7 @@ fn long_name_past_writable_end_returns_entries_before_it() {
     run_five_times(long_name_past_writable_end_guest);
 }
 
-fn seek_during_first_read_guest() {
-    let root = tempfile::tempdir().unwrap();
-    populate(root.path(), scrambled());
+fn seek_during_first_read_guest(root: &tempfile::TempDir) {
     let mut expected = vec![".".to_owned(), "..".to_owned()];
     expected.extend(sorted_names());
 
@@ -936,7 +936,7 @@ fn seek_during_first_read_guest() {
 
 #[test]
 fn seek_during_first_read_leaves_stream_whole() {
-    run_five_times_with(seek_during_first_read_guest, false);
+    run_five_times_on(scrambled_directory, seek_during_first_read_guest, false);
 }
 
 /// A directory holding `count` names from `name`, created in both orders:
@@ -1283,9 +1283,7 @@ fn record_into_inaccessible_page_is_not_returned() {
     run_five_times(record_into_inaccessible_page_guest);
 }
 
-fn large_buffer_tail_guest() {
-    let root = tempfile::tempdir().unwrap();
-    populate(root.path(), scrambled());
+fn large_buffer_tail_guest(root: &tempfile::TempDir) {
     let expected = listing_of(ENTRIES);
     let page = 4096;
 
@@ -1338,7 +1336,7 @@ fn large_buffer_tail_guest() {
 
 #[test]
 fn large_buffer_tail_left_untouched() {
-    run_five_times(large_buffer_tail_guest);
+    run_five_times_on(scrambled_directory, large_buffer_tail_guest, true);
 }
 
 fn count_above_int_max_guest() {
