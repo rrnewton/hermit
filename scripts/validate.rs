@@ -4264,6 +4264,7 @@ fn self_test() -> Result<(), String> {
         retry_timeout_bound_bracket(&root)?,
         scheduler_accounting_bracket()?,
         process_group_scan_marker_bracket()?,
+        scope_reexec_ledger_history_bracket()?,
         budget_reason_bracket()?,
         summary_listing_bracket()?,
         validate_super::self_test(&root)?,
@@ -25766,6 +25767,174 @@ fn verified_run_state_scope_reexec(root: &Path, inherited: Option<&OsStr>) -> bo
     !unit.is_empty() && observe_own_containment(Some(&unit)).proof().is_some()
 }
 
+/// Run-owned file through which the pre-scope pass hands its ledger-derived
+/// runtime estimate to its own verified cgroup scope re-exec.
+const SCOPE_REEXEC_HISTORY_ESTIMATE_FILE: &str = "scope-reexec-history-estimate.txt";
+
+/// What one pass of `run` takes from the run ledger before it is boxed.
+///
+/// # The scope re-exec does not read the ledger a second time
+///
+/// On the default path `run` executes twice in one logical run. The first
+/// pass reads the ledger and performs the tree-keyed cache lookup; then
+/// `resolve_cgroups` re-execs the same process inside a transient systemd
+/// scope, and the second pass starts `run` again from the top. Each read is one
+/// `validate_rows.py rows --preserve-admission` replay of the whole canonical
+/// ledger. Measured on the local validation of Hermit 66378ba1 (2026-10-05
+/// UTC, a 316-core host at load average ~175): 51.3 s and then 41.7 s of wall
+/// time, ~40 CPU seconds each, back to back. Together they were 93 s of the
+/// ~108 s between the end of the validate.rs compile and the first DAG node.
+///
+/// The second read decided nothing. The pre-scope pass reaches the re-exec only
+/// after its own lookup returned without a hit, and the re-exec is the same
+/// logical run with the same key. So a verified scope re-exec skips the lookup
+/// and prints the estimate the first pass computed. Skipping a lookup can only
+/// forgo a reuse, never manufacture one, and the handed-over text is display
+/// only: no verdict reads it. If it is absent or malformed, the re-exec reads
+/// the ledger for the estimate alone and still does not repeat the lookup.
+struct PassLedgerHistory {
+    rows: Vec<serde_json::Value>,
+    /// Whether this pass performs the tree-keyed cache lookup.
+    run_cache_lookup: bool,
+    /// The pre-scope pass's estimate, when this pass is its verified re-exec.
+    inherited_estimate: Option<String>,
+}
+
+fn pass_ledger_history(
+    verified_scope_reexec: bool,
+    run_state: &Path,
+    read_rows: impl FnOnce() -> Vec<serde_json::Value>,
+) -> PassLedgerHistory {
+    if !verified_scope_reexec {
+        return PassLedgerHistory {
+            rows: read_rows(),
+            run_cache_lookup: true,
+            inherited_estimate: None,
+        };
+    }
+    let inherited_estimate = read_scope_reexec_history_estimate(run_state);
+    let rows = if inherited_estimate.is_some() {
+        Vec::new()
+    } else {
+        read_rows()
+    };
+    PassLedgerHistory {
+        rows,
+        run_cache_lookup: false,
+        inherited_estimate,
+    }
+}
+
+fn write_scope_reexec_history_estimate(run_state: &Path, estimate: &str) -> Result<(), String> {
+    if estimate.is_empty() || estimate.contains('\n') {
+        return Err(format!(
+            "refusing to hand over a runtime estimate that is not one non-empty line: {estimate:?}"
+        ));
+    }
+    let path = run_state.join(SCOPE_REEXEC_HISTORY_ESTIMATE_FILE);
+    std::fs::write(&path, format!("{estimate}\n"))
+        .map_err(|error| format!("cannot write {}: {error}", path.display()))
+}
+
+/// The handed-over estimate, or `None` unless the file holds exactly one
+/// complete non-empty line (a torn write lacks the final newline).
+fn read_scope_reexec_history_estimate(run_state: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(run_state.join(SCOPE_REEXEC_HISTORY_ESTIMATE_FILE)).ok()?;
+    let estimate = text.strip_suffix('\n')?;
+    (!estimate.is_empty() && !estimate.contains('\n')).then(|| estimate.to_string())
+}
+
+fn scope_reexec_ledger_history_bracket() -> Result<String, String> {
+    let dir = std::env::temp_dir().join(format!(
+        "validate-scope-reexec-ledger-history-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|duration| duration.as_nanos())
+            .unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&dir)
+        .map_err(|error| format!("scope re-exec ledger history: cannot create fixture: {error}"))?;
+    let result = scope_reexec_ledger_history_cases(&dir);
+    let _ = std::fs::remove_dir_all(&dir);
+    result
+}
+
+fn scope_reexec_ledger_history_cases(dir: &Path) -> Result<String, String> {
+    let row = || vec![serde_json::json!({"result": "pass"})];
+    let reads = std::cell::Cell::new(0);
+    let counted = || {
+        reads.set(reads.get() + 1);
+        row()
+    };
+
+    // A pass that is not a verified re-exec reads once and performs the lookup,
+    // even when a handed-over estimate exists in its run state.
+    write_scope_reexec_history_estimate(dir, "~13m49s (median)")?;
+    let first = pass_ledger_history(false, dir, counted);
+    if reads.get() != 1 || !first.run_cache_lookup || first.inherited_estimate.is_some() {
+        return Err(
+            "scope re-exec ledger history: a pre-scope pass skipped its read or lookup".into(),
+        );
+    }
+
+    // The verified re-exec reads nothing, repeats no lookup, and prints the
+    // pre-scope pass's estimate byte for byte.
+    let reexec = pass_ledger_history(true, dir, counted);
+    if reads.get() != 1
+        || reexec.run_cache_lookup
+        || !reexec.rows.is_empty()
+        || reexec.inherited_estimate.as_deref() != Some("~13m49s (median)")
+    {
+        return Err(
+            "scope re-exec ledger history: the verified re-exec read the ledger again".into(),
+        );
+    }
+
+    // Without a usable handed-over estimate the re-exec reads for the estimate
+    // alone and still repeats no lookup.
+    let torn = dir.join(SCOPE_REEXEC_HISTORY_ESTIMATE_FILE);
+    for (name, content) in [
+        ("missing", None),
+        ("torn", Some("~13m49s")),
+        ("empty", Some("\n")),
+        ("two lines", Some("a\nb\n")),
+    ] {
+        let _ = std::fs::remove_file(&torn);
+        if let Some(content) = content {
+            std::fs::write(&torn, content)
+                .map_err(|error| format!("scope re-exec ledger history: {error}"))?;
+        }
+        let before = reads.get();
+        let fallback = pass_ledger_history(true, dir, counted);
+        if reads.get() != before + 1
+            || fallback.run_cache_lookup
+            || fallback.inherited_estimate.is_some()
+            || fallback.rows.len() != 1
+        {
+            return Err(format!(
+                "scope re-exec ledger history: a {name} handed-over estimate did not fall back to one read"
+            ));
+        }
+    }
+    for refused in ["", "a\nb"] {
+        if write_scope_reexec_history_estimate(dir, refused).is_ok() {
+            return Err(format!(
+                "scope re-exec ledger history: wrote a non-line estimate {refused:?}"
+            ));
+        }
+    }
+    Ok("scope re-exec ledger history: the pre-scope pass reads and looks up once; its verified re-exec reuses the estimate and reads only when the handover is unusable".into())
+}
+
+#[cfg(test)]
+mod scope_reexec_ledger_history_tests {
+    #[test]
+    fn the_verified_scope_reexec_does_not_read_the_ledger_again() {
+        super::scope_reexec_ledger_history_bracket().unwrap();
+    }
+}
+
 fn run(
     durable_slot: &mut Option<DurableLog>,
     service_result_path: Option<&Path>,
@@ -26831,8 +27000,18 @@ fn run(
     // the commit would re-run it. `--ignore-cache` forces a real run; a focused
     // or selective profile is never cached because `selection_mode == "full"` is
     // part of the key.
+    //
+    // A verified cgroup scope re-exec does not read the ledger or repeat the
+    // lookup: its pre-scope pass already did both, and reaching the re-exec
+    // means that lookup found no hit. See `PassLedgerHistory`.
     let ledger = ledger_path(&root);
-    let ledger_rows = validate_history::read_rows(&ledger);
+    let PassLedgerHistory {
+        rows: ledger_rows,
+        run_cache_lookup,
+        inherited_estimate,
+    } = pass_ledger_history(verified_scope_reexec, &tmp, || {
+        validate_history::read_rows(&ledger)
+    });
     let tree = git_tree();
     let host = short_hostname();
     let toolchain = sh("rustc", &["--version"]).unwrap_or_else(|| "unknown".into());
@@ -26846,7 +27025,8 @@ fn run(
     };
     // A nested payload never consults the cache: the outer run already did, and a
     // payload that "hit" would report a green for a lane it never ran.
-    if !nesting.nested
+    if run_cache_lookup
+        && !nesting.nested
         && !args.allow_local_off_the_record_run
         && !args.ignore_cache
         && plan.cacheable
@@ -26935,6 +27115,27 @@ fn run(
         None => eprintln!(
             "validate: WARNING: no whole-run budget (--run-timeout / HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS); per-node caps do not bound cumulative wall time"
         ),
+    }
+
+    // A measured estimate from THIS machine's own history, or an honest "not
+    // enough history" (validate.sh:936). It is computed here, before the scope
+    // re-exec, so the re-exec can print it without reading the ledger again.
+    let history_estimate = inherited_estimate.unwrap_or_else(|| {
+        validate_history::history_estimate(
+            &ledger_rows,
+            &plan.profile,
+            release_builder,
+            cache,
+            &host,
+            ledger.exists(),
+        )
+    });
+    if !verified_scope_reexec && !nesting.nested {
+        if let Err(error) = write_scope_reexec_history_estimate(&tmp, &history_estimate) {
+            eprintln!(
+                "validate: warning: {error}; a cgroup scope re-exec will read the ledger again for its estimate"
+            );
+        }
     }
 
     std::env::set_var(RUN_STATE_SCOPE_REEXEC_ENV, &tmp);
@@ -27247,20 +27448,9 @@ fn run(
         },
         host_inapplicable_plan_summary(&plan.host_inapplicable)
     );
-    // A measured estimate from THIS machine's own history, or an honest "not
-    // enough history" (validate.sh:936). Printed after the durable log is
-    // established so the receipt carries the prediction next to the outcome.
-    println!(
-        "Estimated time: {}",
-        validate_history::history_estimate(
-            &ledger_rows,
-            &plan.profile,
-            release_builder,
-            cache,
-            &host,
-            ledger.exists()
-        )
-    );
+    // Printed after the durable log is established so the receipt carries the
+    // prediction next to the outcome.
+    println!("Estimated time: {history_estimate}");
     if plan.super_mode {
         println!(
             "Super stress: {} repetitions/probe scheduled as individual boxed nodes at -j {jobs} \
