@@ -367,30 +367,11 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     assert_controller_report(&controller.finish());
 }
 
-#[test]
-fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
-    let _guard = super::hermit_record_lock();
-    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
-    let directory = tempfile::tempdir().expect("create network replay evidence directory");
-    let evidence = directory.path();
+/// Records the fixture's `match` client against a live controller, which
+/// checks the exact outbound stream. Returns the trace, its bytes, and the
+/// controller port the recording connected to, which replay must name.
+fn record_match_trace(fixture: &Path, evidence: &Path) -> (PathBuf, Vec<u8>, String) {
     let trace = evidence.join("network.trace");
-
-    // With no networking flag, run behaves as it always has: the guest's
-    // private network namespace cannot reach the host's loopback listener.
-    let unused = evidence.join("no-flag-controller");
-    fs::create_dir(&unused).expect("create no-flag controller directory");
-    let (unused_controller, unused_port) = Controller::start(fixture, &unused);
-    let no_flag = hermit_command(
-        evidence,
-        "no-networking-flag",
-        &run_arguments(0, 1_000_000),
-        fixture,
-        &["client", &unused_port, "match"],
-    );
-    assert_fails_naming(&no_flag, "run without a networking flag", "connect client");
-    unused_controller.stop_without_connection();
-
-    // Record against the live controller, which checks the exact stream.
     let record_directory = evidence.join("record-controller");
     fs::create_dir(&record_directory).expect("create record controller directory");
     let (controller, port) = Controller::start(fixture, &record_directory);
@@ -411,6 +392,93 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
         !original_trace.is_empty(),
         "recording wrote an empty network trace"
     );
+    (trace, original_trace, port)
+}
+
+/// Fixture modes that each try a way into the host's network namespace
+/// outside an outbound TCP channel, with the refusal reason and remedy. The
+/// refusals do not depend on the mode, so record and replay both run them.
+const OUTSIDE_CHANNEL_REFUSALS: &[(&str, &str, &str)] = &[
+    (
+        "udp",
+        "does not model sendto on an IPv4 or IPv6 socket that is not a connected TCP client",
+        "--network=host",
+    ),
+    (
+        "listen",
+        "does not model bind on an IPv4 or IPv6 socket",
+        "--network=host",
+    ),
+    (
+        "netlink",
+        "does not model netlink sockets",
+        "--network=host",
+    ),
+    (
+        "abstract",
+        "does not model connect to an abstract AF_UNIX address",
+        "--network=host",
+    ),
+    (
+        "rcvtimeo",
+        "does not model socket send or receive timeouts",
+        "--network=host",
+    ),
+    (
+        "rcvtimeo-negative",
+        "does not model socket send or receive timeouts",
+        "--network=host",
+    ),
+    (
+        "scm-rights",
+        "does not model a socket of address family 2 received through SCM_RIGHTS",
+        "--network=host",
+    ),
+    (
+        "epoll",
+        "does not model epoll registration of an IPv4 or IPv6 socket",
+        "--network=host",
+    ),
+    (
+        "async",
+        "does not model signal-driven I/O",
+        "--network=host",
+    ),
+    (
+        "ifindex",
+        "does not model the interface and route ioctl 0x8933",
+        "--network=host",
+    ),
+    (
+        "procnet",
+        "does not model reading /proc/net/dev",
+        "--network=host",
+    ),
+];
+
+#[test]
+fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create network replay evidence directory");
+    let evidence = directory.path();
+
+    // With no networking flag, run behaves as it always has: the guest's
+    // private network namespace cannot reach the host's loopback listener.
+    let unused = evidence.join("no-flag-controller");
+    fs::create_dir(&unused).expect("create no-flag controller directory");
+    let (unused_controller, unused_port) = Controller::start(fixture, &unused);
+    let no_flag = hermit_command(
+        evidence,
+        "no-networking-flag",
+        &run_arguments(0, 1_000_000),
+        fixture,
+        &["client", &unused_port, "match"],
+    );
+    assert_fails_naming(&no_flag, "run without a networking flag", "connect client");
+    unused_controller.stop_without_connection();
+
+    let (trace, original_trace, port) = record_match_trace(fixture, evidence);
 
     // Replay with no server. Each cell verifies twice under one fixed seed;
     // across cells the race winner must change while the input does not.
@@ -462,10 +530,20 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
         "outbound stream mismatch",
         "network outbound mismatch",
     );
+}
 
-    // A replay that ends with part of the recording unsent, or that sends
-    // through a call the engine does not model, is refused with a remedy.
-    let replay_refusals = [
+#[test]
+fn tcp_replay_refuses_divergence_and_operations_outside_a_channel() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create network replay evidence directory");
+    let evidence = directory.path();
+    let (trace, _, port) = record_match_trace(fixture, evidence);
+
+    // A replay that ends with part of the recording unsent, sends through a
+    // call the engine does not model, connects where the recording did not,
+    // or reaches the network outside a channel is refused with a remedy.
+    let divergences = [
         (
             "truncated",
             "network replay ended after",
@@ -481,76 +559,21 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
             "does not model sendfile on a recorded socket",
             "--network=host",
         ),
+        (
+            "unspecified",
+            "network trace mismatch",
+            "diverged from the recording",
+        ),
+        (
+            "ipv6-24",
+            "network trace mismatch",
+            "diverged from the recording",
+        ),
     ];
-    for (mode, reason, remedy) in replay_refusals {
+    for (mode, reason, remedy) in divergences.iter().chain(OUTSIDE_CHANNEL_REFUSALS) {
         let label = format!("replay-refuses-{mode}");
         let mut arguments = run_arguments(0, 1_000_000);
         arguments.push(format!("--replay-networking={}", trace.display()));
-        let refused = hermit_command(
-            evidence,
-            &label,
-            &arguments,
-            fixture,
-            &["client", &port, mode],
-        );
-        assert_refused(&refused, &label, reason, remedy);
-    }
-
-    // Record refuses, before touching the host, anything that would reach
-    // the network outside an outbound TCP channel, or the host's network
-    // namespace at all, or wait in wall-clock time. No server is listening.
-    let record_refusals = [
-        (
-            "udp",
-            "does not model sendto on an IPv4 or IPv6 socket that is not a connected TCP client",
-            "--network=host",
-        ),
-        (
-            "listen",
-            "does not model bind on an IPv4 or IPv6 socket",
-            "--network=host",
-        ),
-        ("unspecified", "names no single host", "nonzero port"),
-        // A 24-byte IPv6 address, without sin6_scope_id, is still traced.
-        ("ipv6-24", "names no single host", "nonzero port"),
-        (
-            "netlink",
-            "does not model netlink sockets",
-            "--network=host",
-        ),
-        (
-            "abstract",
-            "does not model connect to an abstract AF_UNIX address",
-            "--network=host",
-        ),
-        (
-            "rcvtimeo",
-            "does not model socket send or receive timeouts",
-            "--network=host",
-        ),
-        (
-            "scm-rights",
-            "does not model a socket of address family 2 received through SCM_RIGHTS",
-            "--network=host",
-        ),
-        (
-            "epoll",
-            "does not model epoll registration of an IPv4 or IPv6 socket",
-            "--network=host",
-        ),
-        (
-            "async",
-            "does not model signal-driven I/O",
-            "--network=host",
-        ),
-    ];
-    for (mode, reason, remedy) in record_refusals {
-        let label = format!("record-refuses-{mode}");
-        let mut arguments = run_arguments(0, 1_000_000);
-        arguments.push(format!(
-            "--record-networking={}",
-            evidence.join(format!("{label}.trace")).display()
-        ));
         let refused = hermit_command(
             evidence,
             &label,
@@ -583,6 +606,42 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
         !String::from_utf8_lossy(&missing.stdout).contains("aggregate="),
         "the guest ran without its network trace"
     );
+}
+
+#[test]
+fn tcp_record_refuses_operations_outside_a_channel() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create network record evidence directory");
+    let evidence = directory.path();
+
+    // Record refuses, before touching the host, anything that would reach
+    // the network outside an outbound TCP channel, or the host's network
+    // namespace at all, or wait in wall-clock time. A controller listens, and
+    // no probe may reach its accept boundary.
+    let (controller, port) = Controller::start(fixture, evidence);
+    let untraceable = [
+        ("unspecified", "names no single host", "nonzero port"),
+        // A 24-byte IPv6 address, without sin6_scope_id, is still traced.
+        ("ipv6-24", "names no single host", "nonzero port"),
+    ];
+    for (mode, reason, remedy) in untraceable.iter().chain(OUTSIDE_CHANNEL_REFUSALS) {
+        let label = format!("record-refuses-{mode}");
+        let mut arguments = run_arguments(0, 1_000_000);
+        arguments.push(format!(
+            "--record-networking={}",
+            evidence.join(format!("{label}.trace")).display()
+        ));
+        let refused = hermit_command(
+            evidence,
+            &label,
+            &arguments,
+            fixture,
+            &["client", &port, mode],
+        );
+        assert_refused(&refused, &label, reason, remedy);
+    }
+    controller.stop_without_connection();
 }
 
 const HTTP_RESPONSE: &[u8] =

@@ -4263,13 +4263,15 @@ impl RunOpts {
         }
 
         // Set after the strict check: a recording shares the host network
-        // namespace, but reaches it only through recorded channels. Every IPv4
-        // or IPv6 operation either becomes an outbound TCP channel, whose
-        // inputs are captured and released deterministically, or ends the run
-        // with a refusal; so do every socket family other than AF_UNIX, such as
-        // netlink, and every abstract AF_UNIX address, which name the host's
-        // namespace (see detcore's `syscalls::network_trace`). Replay applies
-        // the same refusals in its private namespace.
+        // namespace, so the strict refusal of host networking does not apply.
+        // An IPv4 or IPv6 operation either becomes an outbound TCP channel,
+        // whose inputs are captured and released deterministically, or ends
+        // the run with a refusal. So do the other routes into that namespace
+        // that detcore's `syscalls::network_trace` knows: other socket
+        // families, abstract AF_UNIX addresses, interface ioctls, and opens
+        // of /proc/net, /proc/sys/net and /sys network interfaces. Its module
+        // documentation lists the routes that remain open. Replay applies the
+        // same refusals in its private namespace.
         self.det_opts.det_config.network_trace = self.network_trace_config()?;
         if self.record_networking.is_some() {
             self.network = NetworkingMode::Host;

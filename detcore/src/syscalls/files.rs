@@ -1046,6 +1046,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         match res {
             Ok(fd) => {
                 let fd = fd as RawFd;
+                // Under a network trace mode only; the run ends before the
+                // guest sees the descriptor.
+                let pid = guest.pid().as_raw();
+                self.network_check_open(guest, &observed_path, || resolved_open_path(pid, fd))
+                    .await;
                 let fd_type = path.to_str().map_or(FdType::Regular, |fname| {
                     if fname == "/dev/random" || fname == "/dev/urandom" {
                         FdType::Rng

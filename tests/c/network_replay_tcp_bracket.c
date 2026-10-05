@@ -20,13 +20,15 @@
  * sendfile, connect to the unspecified address, send UDP, or listen. The
  * guard modes each try a way around the channel before any connection: a
  * 24-byte IPv6 connect, a netlink socket, an abstract AF_UNIX connect, a
- * socket receive timeout, an IPv4 socket received through SCM_RIGHTS, epoll
- * registration, or signal-driven I/O.
+ * socket receive timeout, a negative (immediate) receive timeout, an IPv4
+ * socket received through SCM_RIGHTS, epoll registration, signal-driven
+ * I/O, an interface ioctl on an AF_UNIX socket, or opening /proc/net/dev.
  */
 
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <poll.h>
 #include <pthread.h>
@@ -38,6 +40,7 @@
 #include <string.h>
 #include <sys/sendfile.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -367,16 +370,38 @@ static int run_guard_probe(uint16_t port, const char *mode) {
             offsetof(struct sockaddr_un, sun_path) + sizeof(name));
     return 0;
   }
+  if (strcmp(mode, "ifindex") == 0) {
+    /* glibc's if_nametoindex asks an AF_UNIX socket. */
+    int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+    struct ifreq request = {0};
+    if (fd < 0)
+      fail("socket unix");
+    strcpy(request.ifr_name, "lo");
+    if (ioctl(fd, SIOCGIFINDEX, &request) != 0)
+      fail("ioctl SIOCGIFINDEX");
+    return 0;
+  }
+  if (strcmp(mode, "procnet") == 0) {
+    if (open("/proc/net/dev", O_RDONLY | O_CLOEXEC) < 0)
+      fail("open /proc/net/dev");
+    return 0;
+  }
   /* Other modes must not open a socket here: replay matches sockets by
      their creation order. */
-  if (strcmp(mode, "rcvtimeo") != 0 && strcmp(mode, "scm-rights") != 0 &&
-      strcmp(mode, "epoll") != 0 && strcmp(mode, "async") != 0)
+  if (strcmp(mode, "rcvtimeo") != 0 && strcmp(mode, "rcvtimeo-negative") != 0 &&
+      strcmp(mode, "scm-rights") != 0 && strcmp(mode, "epoll") != 0 &&
+      strcmp(mode, "async") != 0)
     return 1;
   int fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
   if (fd < 0)
     fail("socket guard");
   if (strcmp(mode, "rcvtimeo") == 0) {
     set_socket_timeouts(fd);
+  } else if (strcmp(mode, "rcvtimeo-negative") == 0) {
+    /* Linux makes a negative timeout an immediate one. */
+    const struct timeval timeout = {.tv_sec = -1, .tv_usec = 0};
+    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) != 0)
+      fail("setsockopt negative timeout");
   } else if (strcmp(mode, "scm-rights") == 0) {
     pass_descriptor(fd);
   } else if (strcmp(mode, "epoll") == 0) {
@@ -540,7 +565,7 @@ int main(int argc, char **argv) {
     const char *refused[] = {"truncated", "sendmsg",    "sendfile", "unspecified",
                              "udp",       "listen",     "ipv6-24",  "netlink",
                              "abstract",  "rcvtimeo",   "scm-rights", "epoll",
-                             "async"};
+                             "async",     "rcvtimeo-negative", "ifindex", "procnet"};
     for (size_t index = 0; index < sizeof(refused) / sizeof(refused[0]); ++index)
       if (strcmp(argv[3], refused[index]) == 0)
         return run_refused_client(argv[2], argv[3]);
@@ -548,7 +573,8 @@ int main(int argc, char **argv) {
   fprintf(stderr,
           "usage: %s controller PORT_FILE REPORT_FILE CONTACT_FILE | client PORT "
           "match|mismatch|truncated|sendmsg|sendfile|unspecified|udp|listen|"
-          "ipv6-24|netlink|abstract|rcvtimeo|scm-rights|epoll|async\n",
+          "ipv6-24|netlink|abstract|rcvtimeo|scm-rights|epoll|async|"
+          "rcvtimeo-negative|ifindex|procnet\n",
           argv[0]);
   return 2;
 }

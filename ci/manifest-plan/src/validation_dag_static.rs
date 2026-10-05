@@ -908,7 +908,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tool_local::timeslice_tests::
     // child_cpu_publication_replacement_rejects_stale_owner_and_snapshot)
     // retain all 904 prior identities: measured 931 = 904 + 27.
-    // The fourteen syscalls::network_trace::tests of
+    // The sixteen syscalls::network_trace::tests of
     // https://github.com/rrnewton/hermit/pull/3778 (sockaddr_round_trips_both_families,
     // sockaddr_matches_the_libc_layout, other_families_and_short_buffers_are_not_traced,
     // lowat_normalisation_follows_linux,
@@ -919,10 +919,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // ipv6_addresses_without_a_scope_id_are_traced_as_linux_accepts_them,
     // sockaddr_copy_in_follows_linux, abstract_unix_addresses_are_recognised,
     // rights_are_found_in_every_control_message,
-    // only_a_positive_timeout_sets_one and
-    // signal_driven_io_requests_are_recognised) retain all 931 prior
-    // identities (931 + 14 = 945, measured with cargo nextest list --profile ci).
-    ("test.detcore_unit", 945),
+    // every_timeout_but_zero_sets_one, signal_driven_io_requests_are_recognised,
+    // interface_and_route_ioctls_are_recognised and
+    // host_network_state_paths_are_recognised) retain all 931 prior
+    // identities (931 + 16 = 947, measured with cargo nextest list --profile ci).
+    ("test.detcore_unit", 947),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1155,9 +1156,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3226): 881 + 23 = 904.
     // The same 27 https://github.com/rrnewton/hermit/pull/3266 tests as
     // test.detcore_unit retain all 904 prior identities: measured 931.
-    // The same fourteen https://github.com/rrnewton/hermit/pull/3778 tests
-    // retain all 931: 931 + 14 = 945.
-    ("test.detcore_unit_on_host", 945),
+    // The same sixteen https://github.com/rrnewton/hermit/pull/3778 tests
+    // retain all 931: 931 + 16 = 947.
+    ("test.detcore_unit_on_host", 947),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

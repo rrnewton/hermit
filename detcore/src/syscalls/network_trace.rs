@@ -46,13 +46,29 @@
 //! - an abstract `AF_UNIX` address, which names the network namespace rather
 //!   than the file system;
 //! - receiving a socket of another family than `AF_UNIX` through
-//!   `SCM_RIGHTS`, which this module could not classify.
+//!   `SCM_RIGHTS`, which this module could not classify;
+//! - the interface and route ioctls (`SIOCGIFINDEX`, `SIOCGIFCONF`, ...) on a
+//!   socket of any family;
+//! - opening `/proc/net`, `/proc/sys/net`, their per-process spellings, or a
+//!   network interface under `/sys`.
 //!
 //! Creating an IPv4 or IPv6 socket and closing it stays allowed, because
 //! resolvers probe for IPv6 support that way. The checks are the same in both
-//! modes, so a run that records is a run that replays.
+//! modes.
+//!
+//! A recording still runs in the host's network namespace, and some routes to
+//! that namespace's state remain open: `stat` and `readlink` on the paths
+//! above, an implicit abstract `AF_UNIX` autobind under `SO_PASSCRED`, and any
+//! host state a program reaches through a file this module does not know.
+//! A program that takes one of them can record a run that replays
+//! differently or refuses.
 
+use std::ffi::OsStr;
+use std::ops::RangeInclusive;
 use std::os::unix::io::RawFd;
+use std::path::Component;
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use detcore_model::HERMIT_POLICY_REFUSAL_EXIT;
@@ -259,6 +275,65 @@ fn requests_signal_driven_io(call: &Syscall) -> bool {
     }
 }
 
+/// The socket ioctls that read or change the host's routes and interfaces,
+/// from `SIOCADDRT` through the device-private range. Linux answers the
+/// interface requests (`SIOCGIFINDEX`, `SIOCGIFCONF`, `SIOCGIFADDR`, ...) on
+/// a socket of any family, `AF_UNIX` included, from the caller's network
+/// namespace, which a recording shares with the host and a replay does not.
+const INTERFACE_IOCTLS: RangeInclusive<usize> = 0x890B..=0x89FF;
+
+/// Whether `call` asks Linux about or changes the host's routes or
+/// interfaces. `SIOCETHTOOL` is left out: Detcore already answers it with
+/// `ENODEV` in every run without asking Linux.
+fn requests_interface_state(call: &syscalls::Ioctl) -> bool {
+    let request = call.request();
+    !matches!(request, Request::SIOCETHTOOL(_)) && INTERFACE_IOCTLS.contains(&request.into_raw().0)
+}
+
+/// Whether `path`, an absolute path the guest opened, names the host's
+/// network namespace state: `/proc/net` and its per-process and per-thread
+/// spellings, `/proc/sys/net`, or a network interface under `/sys`. A
+/// recording reads the host's interfaces, connections and settings there, a
+/// replay its own.
+fn names_host_network_state(path: &Path) -> bool {
+    let mut components: Vec<&OsStr> = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::Normal(part) => components.push(part),
+            Component::ParentDir => {
+                components.pop();
+            }
+            _ => {}
+        }
+    }
+    let is_task = |name: &OsStr| {
+        name == "self"
+            || name == "thread-self"
+            || name.to_str().is_some_and(|name| {
+                !name.is_empty() && name.bytes().all(|byte| byte.is_ascii_digit())
+            })
+    };
+    match components.as_slice() {
+        [proc, net, ..] if *proc == "proc" && *net == "net" => true,
+        // The per-namespace settings, such as `net/core/somaxconn`.
+        [proc, sys, net, ..] if *proc == "proc" && *sys == "sys" && *net == "net" => true,
+        [proc, task, net, ..] if *proc == "proc" && is_task(task) && *net == "net" => true,
+        [proc, process, tasks, thread, net, ..]
+            if *proc == "proc"
+                && is_task(process)
+                && *tasks == "task"
+                && is_task(thread)
+                && *net == "net" =>
+        {
+            true
+        }
+        // `/sys/class/net/<interface>` and the device directories it links
+        // to, `/sys/devices/.../net/<interface>`.
+        [sys, rest @ ..] if *sys == "sys" => rest.iter().any(|part| *part == "net"),
+        _ => false,
+    }
+}
+
 /// The traced address of an IPv4 or IPv6 `sockaddr`, or `None` for any other
 /// family or a buffer shorter than Linux accepts. An IPv6 address without
 /// `sin6_scope_id` has scope zero, as in Linux.
@@ -305,12 +380,12 @@ fn read_sockaddr<M: MemoryAccess>(
     Ok(bytes)
 }
 
-/// Whether a `setsockopt` timeout value sets a timeout. Zero clears it, a
-/// negative one is treated as zero, and a microsecond count out of range
-/// fails with `EDOM`, all without reaching the network.
+/// Whether a `setsockopt` timeout value sets a timeout. Zero clears it and a
+/// microsecond count out of range fails with `EDOM`, both without reaching
+/// the network. A negative second count sets an immediate timeout, so a
+/// blocking call fails at once with `EAGAIN`.
 fn sets_a_timeout(timeout: libc::timeval) -> bool {
-    (0..1_000_000).contains(&timeout.tv_usec)
-        && (timeout.tv_sec > 0 || (timeout.tv_sec == 0 && timeout.tv_usec > 0))
+    (0..1_000_000).contains(&timeout.tv_usec) && (timeout.tv_sec != 0 || timeout.tv_usec != 0)
 }
 
 /// Whether the first `addrlen` bytes of a `sockaddr`, of which `bytes` holds
@@ -494,6 +569,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             {
                 Self::network_socket_state(guest, c.fd()).1 != NetworkSocketKind::NotInet
             }
+            // Linux answers these from the network namespace on any socket.
+            Syscall::Ioctl(c) if requests_interface_state(c) => true,
             Syscall::Fcntl(_) | Syscall::Ioctl(_) if requests_signal_driven_io(call) => {
                 get_fd(*call).is_some_and(|fd| {
                     Self::network_socket_state(guest, fd).1 != NetworkSocketKind::NotInet
@@ -607,6 +684,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Syscall::Recvmmsg(c) if !Self::is_network_channel(guest, c.fd()) => {
                 return self.network_recv_outside_channel(guest, call).await;
+            }
+            Syscall::Ioctl(c) if requests_interface_state(&c) => {
+                self.network_refuse(
+                    guest,
+                    &format!(
+                        "network record/replay does not model the interface and route ioctl \
+                         {:#x}, which Linux answers from the host's network namespace on a \
+                         recording and from a private one on a replay",
+                        c.request().into_raw().0
+                    ),
+                    UNSUPPORTED_REMEDY,
+                )
+                .await
             }
             Syscall::Fcntl(_) | Syscall::Ioctl(_) if requests_signal_driven_io(&call) => {
                 self.network_refuse(
@@ -743,6 +833,35 @@ impl<T: RecordOrReplay> Detcore<T> {
         unrecoverable_shutdown(guest, HERMIT_POLICY_REFUSAL_EXIT).await
     }
 
+    /// After a successful open of `path`, end the run if it names the host's
+    /// network namespace state. `resolved`, the path the kernel reports for
+    /// the new descriptor, catches a spelling through a symbolic link.
+    pub(crate) async fn network_check_open<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &Path,
+        resolved: impl FnOnce() -> Option<PathBuf>,
+    ) {
+        if self.network_mode() == NetworkTraceMode::Off {
+            return;
+        }
+        if names_host_network_state(path)
+            || resolved().is_some_and(|resolved| names_host_network_state(&resolved))
+        {
+            self.network_refuse(
+                guest,
+                &format!(
+                    "network record/replay does not model reading {}, which lists the host's \
+                     network interfaces and connections on a recording and a private network \
+                     namespace's on a replay",
+                    path.display()
+                ),
+                UNSUPPORTED_REMEDY,
+            )
+            .await
+        }
+    }
+
     /// End the run on an engine error, naming its remedy.
     async fn network_refuse_error<G: Guest<Self>>(
         &self,
@@ -848,6 +967,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .collect();
         let (result, received) = match call {
             Syscall::Recvmsg(c) => (self.handle_recvmsg(guest, c).await?, 1),
+            // Ordinary dispatch first gives a sock_diag reply socket its
+            // sanitized answer. That socket is netlink, which `socket` refuses
+            // under a trace mode, so none exists here.
             Syscall::Recvmmsg(c) => {
                 let result = self.handle_recvmmsg(guest, c).await?;
                 (result, result as usize)
@@ -2025,12 +2147,13 @@ mod tests {
     }
 
     #[test]
-    fn only_a_positive_timeout_sets_one() {
+    fn every_timeout_but_zero_sets_one() {
         let timeout = |tv_sec, tv_usec| libc::timeval { tv_sec, tv_usec };
         assert!(sets_a_timeout(timeout(1, 0)));
         assert!(sets_a_timeout(timeout(0, 1)));
         assert!(!sets_a_timeout(timeout(0, 0)));
-        assert!(!sets_a_timeout(timeout(-1, 5)));
+        assert!(sets_a_timeout(timeout(-1, 5)));
+        assert!(sets_a_timeout(timeout(-1, 0)));
         assert!(!sets_a_timeout(timeout(1, 1_000_000)));
         assert!(!sets_a_timeout(timeout(1, -1)));
         for option in [libc::SO_RCVTIMEO, libc::SO_SNDTIMEO] {
@@ -2058,6 +2181,71 @@ mod tests {
             ioctl(Request::FIONREAD(None)),
         ] {
             assert!(!requests_signal_driven_io(&call), "{call:?}");
+        }
+    }
+
+    #[test]
+    fn interface_and_route_ioctls_are_recognised() {
+        let ioctl = |request| syscalls::Ioctl::new().with_request(request);
+        let raw = |request| ioctl(Request::from_raw(request, 0));
+        for call in [
+            ioctl(Request::SIOCGIFINDEX(None)),
+            // SIOCADDRT, SIOCGIFNAME, SIOCGIFCONF, SIOCGIFADDR, SIOCSIFFLAGS,
+            // SIOCGSKNS and the last device-private request.
+            raw(0x890B),
+            raw(0x8910),
+            raw(0x8912),
+            raw(0x8915),
+            raw(0x8914),
+            raw(0x894C),
+            raw(0x89FF),
+        ] {
+            assert!(requests_interface_state(&call), "{call:?}");
+        }
+        for call in [
+            ioctl(Request::SIOCETHTOOL(None)),
+            ioctl(Request::SIOCGSTAMP(None)),
+            ioctl(Request::SIOCSPGRP(None)),
+            ioctl(Request::FIONREAD(None)),
+            ioctl(Request::FIONBIO(None)),
+            raw(0x890A),
+            raw(0x8A00),
+        ] {
+            assert!(!requests_interface_state(&call), "{call:?}");
+        }
+    }
+
+    #[test]
+    fn host_network_state_paths_are_recognised() {
+        for path in [
+            "/proc/net",
+            "/proc/net/dev",
+            "/proc/self/net/route",
+            "/proc/thread-self/net/if_inet6",
+            "/proc/42/net/tcp",
+            "/proc/42/task/43/net/snmp",
+            "/proc/self/task/43/net/dev",
+            "/proc/self/../net/dev",
+            "/proc/sys/net/core/somaxconn",
+            "/sys/class/net",
+            "/sys/class/net/lo/address",
+            "/sys/devices/virtual/net/lo/operstate",
+            "/sys/devices/pci0000:00/0000:00:03.0/net/eth0/address",
+        ] {
+            assert!(names_host_network_state(Path::new(path)), "{path}");
+        }
+        for path in [
+            "/proc/self/status",
+            "/proc/42/task/43/stat",
+            "/proc/sys/kernel/hostname",
+            "/proc/self/netfilter",
+            "/proc/abc/net/dev",
+            "/sys/class/block",
+            "/home/net/dev",
+            "/net/dev",
+            "/proc/net/../cpuinfo",
+        ] {
+            assert!(!names_host_network_state(Path::new(path)), "{path}");
         }
     }
 }
