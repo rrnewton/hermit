@@ -185,9 +185,11 @@ impl RunData {
                 None
             },
             backend: self.analyze_opts.backend,
-            // Analyze's internal runs are not the invocation's public log.
-            max_log_bytes: None,
-            log_budget: None,
+            // Every trial charges the invocation's ONE budget, as verify's
+            // per-run logs do. Without --verbose/--selfcheck a trial traces to
+            // hermit's own stderr -- the public stream the cap exists to bound.
+            max_log_bytes: self.analyze_opts.max_log_bytes,
+            log_budget: self.analyze_opts.log_budget.clone(),
             log_file_handle: None,
             run_evidence_log_handle: None,
             run_evidence_write_error: None,
@@ -576,6 +578,34 @@ mod tests {
     /// scope check and reach the options every trial is launched with: the
     /// `GlobalOpts` that `RunOpts::main` takes its backend from, the validated
     /// trial `RunOpts`, and the printed reproducer.
+    /// `hermit --max-log-bytes=N analyze` caps its trials with the
+    /// invocation's shared budget. A trial without --verbose/--selfcheck traces
+    /// to hermit's stderr, so an exempt trial would put uncapped output on the
+    /// public stream (review of https://github.com/rrnewton/hermit/pull/3686,
+    /// round 1).
+    #[test]
+    fn analyze_trials_charge_the_invocations_log_budget() {
+        let argv = ["hermit", "--max-log-bytes=4K", "analyze", "--", "/bin/true"];
+        let mut args = crate::Args::try_parse_from(argv).unwrap();
+        args.global.prepare_log_budget().unwrap();
+        let crate::Subcommand::Analyze(mut options) = args.command else {
+            panic!("{argv:?} is not analyze")
+        };
+        options.apply_global(&args.global);
+        let workspace = tempfile::tempdir().unwrap();
+        options.tmp_dir = Some(workspace.path().to_path_buf());
+        let run = RunData::new_baseline(&options, "budget".to_owned()).unwrap();
+        let trial = run.trial_global_opts();
+        assert!(trial.log_file.is_none(), "this trial traces to stderr");
+        assert_eq!(trial.max_log_bytes, Some(4096));
+        let invocation = args.global.log_budget().expect("the invocation is capped");
+        let charged = trial.log_budget().expect("the trial must be capped");
+        assert!(
+            charged.shares_counter_with(&invocation),
+            "the trial must charge the invocation's counter, not a fresh one"
+        );
+    }
+
     #[test]
     fn global_backend_reaches_every_trial_run() {
         for flag in ["ptrace", "kvm"] {

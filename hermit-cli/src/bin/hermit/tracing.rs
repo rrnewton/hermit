@@ -6,11 +6,14 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::fs::File;
 use std::io;
 use std::io::IsTerminal;
 use std::io::Write;
 use std::io::stderr;
 use std::mem;
+use std::os::fd::AsRawFd;
+use std::os::fd::RawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -336,21 +339,34 @@ pub fn format_byte_size(bytes: u64) -> String {
     bytes.to_string()
 }
 
-#[derive(Debug)]
-struct SharedByteCount {
-    address: NonNull<AtomicU64>,
+/// The process-shared state of a [`LogBudget`].
+///
+/// `crossed` is separate from `spent` because `spent` goes DOWN: a write the
+/// sink accepted only in part, or refused, is refunded. Deciding the crossing
+/// from the total alone made it reversible -- with a limit of 10, A charges 6,
+/// B charges 5 and crosses, A's failed write refunds 6, and C's 6 crosses a
+/// second time. The flag only ever goes from false to true.
+#[repr(C)]
+struct BudgetCells {
+    spent: AtomicU64,
+    crossed: AtomicBool,
 }
 
-// SAFETY: as for SharedWriteError -- one initialized atomic in a MAP_SHARED
-// mapping that stays live while any clone of the owning LogBudget exists.
-unsafe impl Send for SharedByteCount {}
-unsafe impl Sync for SharedByteCount {}
+#[derive(Debug)]
+struct SharedBudgetCells {
+    address: NonNull<BudgetCells>,
+}
 
-impl Drop for SharedByteCount {
+// SAFETY: as for SharedWriteError -- initialized atomics in a MAP_SHARED
+// mapping that stays live while any clone of the owning LogBudget exists.
+unsafe impl Send for SharedBudgetCells {}
+unsafe impl Sync for SharedBudgetCells {}
+
+impl Drop for SharedBudgetCells {
     fn drop(&mut self) {
         // SAFETY: this process owns the mapping created in LogBudget::new.
         unsafe {
-            libc::munmap(self.address.as_ptr().cast(), mem::size_of::<AtomicU64>());
+            libc::munmap(self.address.as_ptr().cast(), mem::size_of::<BudgetCells>());
         }
     }
 }
@@ -366,7 +382,7 @@ impl Drop for SharedByteCount {
 #[derive(Clone, Debug)]
 pub struct LogBudget {
     limit: u64,
-    spent: Arc<SharedByteCount>,
+    cells: Arc<SharedBudgetCells>,
     /// Rendered up front so the abort path allocates nothing: it can run on
     /// any thread, with arbitrary locks held.
     message: Arc<str>,
@@ -389,7 +405,7 @@ impl LogBudget {
         let address = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
-                mem::size_of::<AtomicU64>(),
+                mem::size_of::<BudgetCells>(),
                 libc::PROT_READ | libc::PROT_WRITE,
                 libc::MAP_SHARED | libc::MAP_ANONYMOUS,
                 -1,
@@ -399,13 +415,18 @@ impl LogBudget {
         if address == libc::MAP_FAILED {
             return Err(io::Error::last_os_error());
         }
-        let address = NonNull::new(address.cast::<AtomicU64>())
+        let address = NonNull::new(address.cast::<BudgetCells>())
             .expect("mmap returned a non-null non-failure address");
         // SAFETY: the fresh mapping is writable and suitably page-aligned.
-        unsafe { address.as_ptr().write(AtomicU64::new(0)) };
+        unsafe {
+            address.as_ptr().write(BudgetCells {
+                spent: AtomicU64::new(0),
+                crossed: AtomicBool::new(false),
+            })
+        };
         Ok(Self {
             limit,
-            spent: Arc::new(SharedByteCount { address }),
+            cells: Arc::new(SharedBudgetCells { address }),
             message: exceeded_message(limit).into(),
         })
     }
@@ -415,35 +436,47 @@ impl LogBudget {
         &self.message
     }
 
-    fn cell(&self) -> &AtomicU64 {
+    fn cells(&self) -> &BudgetCells {
         // SAFETY: the Arc keeps the initialized mapping live in this process.
-        unsafe { self.spent.address.as_ref() }
+        unsafe { self.cells.address.as_ref() }
     }
 
     /// Bytes charged so far, across every process sharing this budget.
     #[cfg(test)]
     fn spent(&self) -> u64 {
-        self.cell().load(Ordering::Relaxed)
+        self.cells().spent.load(Ordering::Relaxed)
     }
 
-    /// Charge `len` bytes. One relaxed `fetch_add` per write: this sits on the
-    /// hot path of every log line, and exactness only matters at the crossing,
-    /// which the returned previous total identifies uniquely.
+    /// Whether `other` charges the same process-shared cells as `self`.
+    #[cfg(test)]
+    pub(crate) fn shares_counter_with(&self, other: &LogBudget) -> bool {
+        self.cells.address == other.cells.address
+    }
+
+    /// Charge `len` bytes. One relaxed load and one relaxed `fetch_add` per
+    /// write: this sits on the hot path of every log line. A write that would
+    /// take the total past the limit claims the one-way `crossed` flag; the
+    /// single claimant is the crossing, every other writer is already over.
+    /// Refunds lower `spent` but never clear `crossed`, so a crossing is final.
     fn charge(&self, len: u64) -> Charge {
-        let before = self.cell().fetch_add(len, Ordering::Relaxed);
-        if before > self.limit {
-            Charge::AlreadyOver
-        } else if before.saturating_add(len) > self.limit {
-            Charge::Crossed
-        } else {
+        let cells = self.cells();
+        if cells.crossed.load(Ordering::Relaxed) {
+            return Charge::AlreadyOver;
+        }
+        let before = cells.spent.fetch_add(len, Ordering::Relaxed);
+        if before.saturating_add(len) <= self.limit {
             Charge::Within
+        } else if cells.crossed.swap(true, Ordering::Relaxed) {
+            Charge::AlreadyOver
+        } else {
+            Charge::Crossed
         }
     }
 
     /// Return bytes charged for a write that the sink accepted only in part, so
     /// the caller's retry of the remainder is not counted twice.
     fn refund(&self, len: u64) {
-        self.cell().fetch_sub(len, Ordering::Relaxed);
+        self.cells().spent.fetch_sub(len, Ordering::Relaxed);
     }
 }
 
@@ -479,36 +512,57 @@ fn exceeded_message(limit: u64) -> String {
 /// while the subscriber's writer lock is held, and there is nothing left worth
 /// flushing: every sink here is unbuffered. The parent maps the status through
 /// `classify_container_result`.
+///
+/// THE FINAL MESSAGE NEVER WAITS. It is written with [`write_without_waiting`],
+/// not through the inner writer or `RetryingStderr`: a blocking `write(2)` to a
+/// full pipe whose reader has stopped reading, or to a FIFO log sink, would
+/// hold the `_exit` -- and with it the guest teardown -- for as long as nobody
+/// drains the sink.
 pub struct CappedWriter<W: Write> {
     inner: W,
     budget: Option<LogBudget>,
-    /// The inner writer is stderr itself, so the final message is written once.
-    inner_is_stderr: bool,
+    /// Where the final message goes besides stderr: the descriptor under the
+    /// inner writer. `None` when the inner writer is stderr itself (so the
+    /// message is written once) or has no descriptor (an in-memory test sink).
+    final_message_fd: Option<RawFd>,
 }
 
 impl<W: Write> CappedWriter<W> {
-    /// Wrap a file sink. `None` disables the cap (no counting at all).
+    /// Wrap a sink with no descriptor of its own; the final message goes to
+    /// stderr only. `None` disables the cap (no counting at all).
     pub fn new(inner: W, budget: Option<LogBudget>) -> Self {
         Self {
             inner,
             budget,
-            inner_is_stderr: false,
+            final_message_fd: None,
         }
     }
 
     fn exceeded(&mut self, budget: &LogBudget) -> ! {
-        let message = budget.exceeded_message();
-        if !self.inner_is_stderr {
-            // Best effort: the log should say why it ends. If the file bound has
-            // already truncated it, BoundedWriter drops this, and stderr below
-            // still carries the message.
-            let _ = self.inner.write_all(message.as_bytes());
-            let _ = self.inner.flush();
+        let message = budget.exceeded_message().as_bytes();
+        if let Some(fd) = self.final_message_fd {
+            // Best effort: the log should say why it ends. Written to the
+            // descriptor directly, so it lands even after BoundedWriter has
+            // reached its bound (a few hundred bytes past it, once).
+            write_without_waiting(fd, message);
         }
-        let _ = detcore::util::RetryingStderr.write_all(message.as_bytes());
+        write_without_waiting(libc::STDERR_FILENO, message);
         // SAFETY: _exit has no preconditions; see the type-level note for why
         // the immediate exit is the teardown.
         unsafe { libc::_exit(hermit::HERMIT_LOG_CAP_EXIT) }
+    }
+}
+
+impl CappedWriter<BoundedWriter<File>> {
+    /// Wrap a log file under its `HERMIT_LOG_MAX_BYTES` bound (`file_limit`,
+    /// `0` for none). `None` disables the cap (no counting at all).
+    pub fn file(file: File, file_limit: u64, budget: Option<LogBudget>) -> Self {
+        let fd = file.as_raw_fd();
+        Self {
+            inner: BoundedWriter::new(file, file_limit),
+            budget,
+            final_message_fd: Some(fd),
+        }
     }
 }
 
@@ -518,9 +572,48 @@ impl CappedWriter<detcore::util::RetryingStderr> {
         Self {
             inner: detcore::util::RetryingStderr,
             budget,
-            inner_is_stderr: true,
+            final_message_fd: None,
         }
     }
+}
+
+/// Put `bytes` on `fd` in one attempt that cannot wait for the other end.
+///
+/// A regular file never waits for a reader, so it gets one plain `write`.
+/// Anything else is written with `RWF_NOWAIT`, which pipes, FIFOs and sockets
+/// honour by failing with `EAGAIN` instead of sleeping. A descriptor that does
+/// not support `RWF_NOWAIT` (a terminal) gets one `write` only when `poll`
+/// with a zero timeout reports it writable. A message that does not fit now is
+/// dropped: the exit status still says why the run ended.
+fn write_without_waiting(fd: RawFd, bytes: &[u8]) {
+    // SAFETY: fstat writes only into the zeroed struct it is given.
+    let mut stat: libc::stat = unsafe { mem::zeroed() };
+    let regular =
+        unsafe { libc::fstat(fd, &mut stat) } == 0 && stat.st_mode & libc::S_IFMT == libc::S_IFREG;
+    if !regular {
+        let iov = libc::iovec {
+            iov_base: bytes.as_ptr() as *mut libc::c_void,
+            iov_len: bytes.len(),
+        };
+        // SAFETY: one valid iovec over `bytes`; offset -1 is "the current
+        // position", the only one a pipe accepts.
+        let written = unsafe { libc::pwritev2(fd, &iov, 1, -1, libc::RWF_NOWAIT) };
+        if written >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP) {
+            return;
+        }
+        let mut ready = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
+        // SAFETY: one valid pollfd; a zero timeout returns at once.
+        let polled = unsafe { libc::poll(&mut ready, 1, 0) };
+        if polled != 1 || ready.revents & libc::POLLOUT == 0 {
+            return;
+        }
+    }
+    // SAFETY: `bytes` is valid for its length.
+    unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
 }
 
 impl<W: Write> Write for CappedWriter<W> {
@@ -1303,6 +1396,25 @@ mod tests {
         assert_eq!(budget.charge(u64::MAX), Charge::Crossed, "no wraparound");
     }
 
+    /// A crossing is final. Independent stderr writers refund failed or
+    /// partial writes without a shared lock, so the total can fall back under
+    /// the limit after a crossing; that must not produce a second crossing
+    /// (review of https://github.com/rrnewton/hermit/pull/3686, round 1).
+    #[test]
+    fn a_refund_after_the_crossing_does_not_reopen_the_budget() {
+        let budget = LogBudget::new(10).unwrap();
+        assert_eq!(budget.charge(6), Charge::Within, "writer A");
+        assert_eq!(budget.charge(5), Charge::Crossed, "writer B crosses at 11");
+        budget.refund(6);
+        assert_eq!(budget.spent(), 5, "writer A's failed write was refunded");
+        assert_eq!(
+            budget.charge(6),
+            Charge::AlreadyOver,
+            "writer C must not cross a second time"
+        );
+        assert_eq!(budget.charge(1), Charge::AlreadyOver);
+    }
+
     #[test]
     fn capped_writer_counts_what_it_passes_through() {
         let mut sink = Vec::new();
@@ -1358,8 +1470,11 @@ mod tests {
                 // Keep the test runner's stderr clean.
                 let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
                 libc::dup2(null, 2);
-                let mut writer =
-                    CappedWriter::new(std::fs::File::from_raw_fd(write_fd), Some(budget.clone()));
+                let mut writer = CappedWriter::file(
+                    std::fs::File::from_raw_fd(write_fd),
+                    0,
+                    Some(budget.clone()),
+                );
                 let _ = writer.write_all(&[b'a'; 60]);
                 let _ = writer.write_all(&[b'b'; 60]);
                 libc::_exit(0);
@@ -1391,5 +1506,92 @@ mod tests {
             120,
             "the child's charges are visible to the parent"
         );
+    }
+
+    /// A pipe whose buffer is full and whose reader never reads, switched back
+    /// to blocking mode: a plain `write(2)` to it waits forever.
+    fn full_blocking_pipe() -> (libc::c_int, libc::c_int) {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+            0
+        );
+        for chunk in [&[b'x'; 4096][..], &[b'x'; 1][..]] {
+            while unsafe { libc::write(fds[1], chunk.as_ptr().cast(), chunk.len()) } > 0 {}
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::EAGAIN)
+            );
+        }
+        assert_eq!(unsafe { libc::fcntl(fds[1], libc::F_SETFL, 0) }, 0);
+        (fds[0], fds[1])
+    }
+
+    /// The crossing must end the process even when no sink can take the
+    /// final message: here both the log sink (a FIFO-like pipe) and stderr
+    /// are full blocking pipes whose readers stay open and never read. A
+    /// blocking diagnostic write would hold `_exit`, and with it the guest
+    /// teardown, indefinitely (review of
+    /// https://github.com/rrnewton/hermit/pull/3686, round 1).
+    #[test]
+    fn crossing_the_cap_exits_even_when_no_sink_can_take_the_message() {
+        use std::os::fd::FromRawFd;
+        use std::time::Duration;
+        use std::time::Instant;
+
+        let budget = LogBudget::new(100).unwrap();
+        let (sink_read, sink_write) = full_blocking_pipe();
+        let (stderr_read, stderr_write) = full_blocking_pipe();
+        // SAFETY: as in the test above -- the child uses preformatted data,
+        // atomics, raw syscalls and _exit.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
+        if child == 0 {
+            unsafe {
+                libc::dup2(stderr_write, 2);
+                let mut writer = CappedWriter::file(
+                    std::fs::File::from_raw_fd(sink_write),
+                    0,
+                    Some(budget.clone()),
+                );
+                // One write that crosses at once: nothing before it needs
+                // room in the full sink.
+                let _ = writer.write(&[b'c'; 120]);
+                libc::_exit(0);
+            }
+        }
+        unsafe {
+            libc::close(sink_write);
+            libc::close(stderr_write);
+        }
+        let deadline = Instant::now() + Duration::from_secs(20);
+        let mut status = 0;
+        let exited = loop {
+            let reaped = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+            assert!(reaped >= 0, "waitpid: {}", io::Error::last_os_error());
+            if reaped == child {
+                break true;
+            }
+            if Instant::now() >= deadline {
+                unsafe {
+                    libc::kill(child, libc::SIGKILL);
+                    libc::waitpid(child, &mut status, 0);
+                }
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        unsafe {
+            libc::close(sink_read);
+            libc::close(stderr_read);
+        }
+        assert!(
+            exited,
+            "the crossing writer was still alive after 20 s: it waited on a full sink \
+             instead of exiting"
+        );
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), hermit::HERMIT_LOG_CAP_EXIT);
+        assert_eq!(budget.spent(), 120);
     }
 }

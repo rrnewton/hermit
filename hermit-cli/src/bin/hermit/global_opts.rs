@@ -275,8 +275,7 @@ impl GlobalOpts {
                 .try_clone()
                 .expect("cannot duplicate the host log file descriptor");
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
-            let file_writer =
-                CappedWriter::new(BoundedWriter::new(file_writer, limit), self.log_budget());
+            let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
             if let Some(evidence) = self.run_evidence_writer(limit) {
                 Some(init_file_tracing_with_evidence(
                     self.log,
@@ -300,8 +299,7 @@ impl GlobalOpts {
             // typo in the value meant to DISABLE the bound cannot quietly
             // re-enable it.
             let limit = log_max_bytes().unwrap_or_else(|e| panic!("{e}"));
-            let file_writer =
-                CappedWriter::new(BoundedWriter::new(file_writer, limit), self.log_budget());
+            let file_writer = CappedWriter::file(file_writer, limit, self.log_budget());
             if let Some(evidence) = self.run_evidence_writer(limit) {
                 Some(init_file_tracing_with_evidence(
                     self.log,

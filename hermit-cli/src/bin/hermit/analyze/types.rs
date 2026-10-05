@@ -200,6 +200,14 @@ pub struct AnalyzeOpts {
     /// `run` has no `--backend` of its own, so this is the only way to choose it.
     #[clap(skip)]
     pub backend: Option<hermit::Backend>,
+
+    /// The invocation's `--max-log-bytes` limit and its ONE shared budget,
+    /// which every trial charges; taken from the global options by
+    /// [`AnalyzeOpts::main`].
+    #[clap(skip)]
+    pub max_log_bytes: Option<u64>,
+    #[clap(skip)]
+    pub log_budget: Option<crate::tracing::LogBudget>,
 }
 
 // TODO: introduce a new type to encapsulate the state of the search, and make it immutable.

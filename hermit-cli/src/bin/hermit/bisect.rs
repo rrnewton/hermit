@@ -112,8 +112,11 @@ impl BisectOpts {
             run_arg: Vec::new(),
             run_args: self.run_args.clone(),
             // Replays run on the globally selected backend
-            // (`hermit --backend <BACKEND> bisect ...`).
+            // (`hermit --backend <BACKEND> bisect ...`) and charge the
+            // invocation's shared `--max-log-bytes` budget.
             backend: global.backend,
+            max_log_bytes: global.max_log_bytes,
+            log_budget: global.log_budget(),
         };
 
         analyzer.bisect_schedule_pair(good, bad)
