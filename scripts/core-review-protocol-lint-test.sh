@@ -12,7 +12,8 @@
 set -euo pipefail
 
 # SHARDS. The cases below are independent linter invocations, and running all
-# of them one after another took 42 s on devbig030, the second-longest path in
+# of them one after another took 42 s (host: docs/TESTING_ENVIRONMENTS.md,
+# "Named measurement hosts"), the second-longest path in
 # check.lint_checks. So this script runs itself CORE_REVIEW_LINT_TEST_JOBS times
 # in parallel; each copy walks every case in the same order, evaluates only the
 # cases whose index falls in its shard, and reports how many cases it saw. The
@@ -70,8 +71,8 @@ if [ -z "${CORE_REVIEW_LINT_TEST_SHARD-}" ]; then
         echo "core-review-protocol-lint-test.sh: CORE_REVIEW_LINT_TEST_JOBS='${shard_jobs}' is not a positive integer" >&2
         exit 2
     fi
-    # The default is capped at 8 by memory, not by speed. Measured on devbig030
-    # (316 cores), 670 cases, peak anonymous memory sampled from the cgroup:
+    # The default is capped at 8 by memory, not by speed. Measured on the host
+    # in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts" (316 cores), 670 cases, peak anonymous memory sampled from the cgroup:
     #   shards   wall     anon
     #     1      39.1 s   104 MB
     #     4      10.2 s   290 MB

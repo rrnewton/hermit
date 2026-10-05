@@ -332,8 +332,8 @@ esac
 # to the node's CPU width.
 #
 # A run without it uses one job per checker, bounded by the cores and by memory
-# (default_lint_jobs). Measured 2026-10-05 on devbig030 at 32e2d4bb3e, 44
-# checkers: the node's anonymous memory peaked at 1.46 GB with -j8 and 4.18 GB
+# (default_lint_jobs). Measured 2026-10-05 at 32e2d4bb3e on the lint-checks
+# host in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", 44 checkers: the node's anonymous memory peaked at 1.46 GB with -j8 and 4.18 GB
 # with -j44, and the largest single checker process, in the lint-check-shellcheck
 # recipe, reached 230 MiB. So each job is budgeted 256 MiB, against MemAvailable or,
 # inside a cgroup with a memory.max, the room left under it.

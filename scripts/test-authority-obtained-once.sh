@@ -78,7 +78,8 @@ fi
 
 failures=0
 # The checks below are independent processes, each with its own files, so they
-# run concurrently: run serially they took 66 s on devbig030 (41 s of it the
+# run concurrently: run serially they took 66 s (host: docs/TESTING_ENVIRONMENTS.md,
+# "Named measurement hosts"; 41 s of it the
 # core-review self-test), the longest single path in check.lint_checks. A job
 # is a shell function that prints its FAIL lines and returns nonzero; its output
 # is shown only when it fails, in the order the jobs were started.
