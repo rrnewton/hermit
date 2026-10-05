@@ -233,13 +233,18 @@ pub const GUEST_PROGRAM_NOT_EXECUTABLE_EXIT: i32 = 126;
 //              `bin/safehermit` WALL DEADLINE kill. `tests/cli.rs` asserts
 //              `assert_ne!(code, Some(124))` on the awk-mincore probe.
 //   125        HERMIT_INTERNAL_FAILURE_EXIT -- hermit itself failed, no guest
-//              ran. Sole meaning as of 2026-08-25: `bin/safehermit` previously
-//              also emitted 125 for its byte-cap kill, so a run through that
-//              wrapper produced one number for two faults with opposite
-//              remedies. SAFEHERMIT MOVED, NOT HERMIT, because that wrapper is
-//              the only layer that knows which happened -- it relays hermit's
-//              status otherwise -- and because 125/126/127 is one GNU scheme
-//              that cannot be broken up. Tracked as `hermit_s_125_collides`.
+//              ran. NOT YET THE SOLE MEANING through dev-hermit's
+//              `bin/safehermit`: that wrapper has exited 125 for its
+//              log-byte-cap kill since it was created on 2026-08-20 and still
+//              did on 2026-10-05, so a run through it produces one number for
+//              two faults with opposite remedies (see "125 ⚠️ NOT FREE" below).
+//              An earlier version of this table said safehermit had already
+//              moved off 125; it never did. The intended fix is that SAFEHERMIT
+//              MOVES -- to the 123 reserved for it above -- NOT HERMIT, because
+//              that wrapper is the only layer that knows which happened (it
+//              relays hermit's status otherwise) and because 125/126/127 is one
+//              GNU scheme that cannot be broken up. Tracked as
+//              `hermit_s_125_collides`.
 //   126        GUEST_PROGRAM_NOT_EXECUTABLE_EXIT.
 //   127        GUEST_PROGRAM_NOT_FOUND_EXIT -- the ABSOLUTE-PATH form. The
 //              bare-name-on-guest-PATH form currently exits 125 instead, which
@@ -3250,16 +3255,18 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
 // COMMENT SAID THEY WERE. agent(hermit-007)'s codex lane caught the overclaim.
 // They deliberately differ:
 //
-//   this predicate            122..=127  +  signal band  +  real Signaled
-//   classify_container_result 122        +  signal band
+//   this predicate            122..=127        +  signal band  +  real Signaled
+//   classify_container_result 122 + 123 + 124  +  signal band
 //
 // 123..=127 force a LiteInst shutdown and are classified as NEITHER a refusal
-// nor a signal death -- 123 is safehermit's log cap, 124 a deadline, 125 hermit
-// itself, 126/127 exec-level, and each has a different producer. Only the signal
-// half is shared, and only the signal half is protected from drift. Do not
-// "simplify" this by assuming the two agree; the `122..=127` bound here is still
-// hard-coded and still needs a human to widen it if the reserved set grows
-// again.
+// nor a signal death. The classifier gives 123 and 124 arms of their own -- 123
+// is the log byte cap (hermit's `--max-log-bytes`, and the value reserved for
+// safehermit's log-cap kill, which still exits 125), 124 a deadline hermit
+// enforced -- while 125 (hermit itself) and 126/127 (exec-level) have none, and
+// each has a different producer. Only the signal half is shared, and only the
+// signal half is protected from drift. Do not "simplify" this by assuming the
+// two agree; the `122..=127` bound here is still hard-coded and still needs a
+// human to widen it if the reserved set grows again.
 #[cfg(feature = "liteinst")]
 fn liteinst_requires_forced_shutdown(status: ExitStatus) -> bool {
     match status {

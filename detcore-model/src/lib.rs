@@ -31,11 +31,12 @@ pub mod host_capability;
 /// status, so it cannot distinguish "hermit refused" from "your program
 /// returned 1".
 ///
-/// ⚠️ WHY 122. It sits immediately below the reserved band (123 safehermit log
-/// cap, 124 deadline, 125 hermit broke, 126/127 GNU exec-level), keeping the
-/// reserved codes contiguous, and it is the cheapest possible narrowing of the
-/// guest range. See the full allocation above the constants in
-/// `hermit-cli/src/lib.rs`.
+/// ⚠️ WHY 122. It sits immediately below the reserved band (123 log byte cap --
+/// hermit's `--max-log-bytes`, and the value reserved for `bin/safehermit`'s
+/// log-cap kill, which still exits 125 -- then 124 deadline, 125 hermit broke,
+/// 126/127 GNU exec-level), keeping the reserved codes contiguous, and it is
+/// the cheapest possible narrowing of the guest range. See the full allocation
+/// above the constants in `hermit-cli/src/lib.rs`.
 ///
 /// ⚠️ IT LIVES IN `detcore-model` BECAUSE BOTH SIDES NEED IT. `detcore` emits it
 /// and `hermit-cli` recognises it; `detcore-model` is the only crate both
