@@ -949,8 +949,17 @@ fi
 # recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
 # second budget are unchanged. Source identity carries the calibration;
 # no new timing sample or >=5-sample replacement claim is made.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != c7a1ed25bca339daa0e69241353fc9882da63d7a ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie c7a1ed25bca339daa0e69241353fc9882da63d7a (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO aa1cffcd7893307ce06da3d6d74434b8ea567119 (2026-10-05): from
+# c7a1ed25bca339daa0e69241353fc9882da63d7a; all seven recorded DynamoRIO build inputs
+# are byte-identical. The one-commit range changes only the in-guest LiteInst
+# runtime (reverie-liteinst: CPUID/RDTSC at sites whose patch would cross a
+# cache line), not the DynamoRIO build recipe.
+# The available-CPU cap and f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
+# second budget are unchanged. Source identity carries the calibration;
+# no new timing sample or >=5-sample replacement claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != aa1cffcd7893307ce06da3d6d74434b8ea567119 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie aa1cffcd7893307ce06da3d6d74434b8ea567119 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
