@@ -380,6 +380,15 @@ class CellTest(unittest.TestCase):
         self.assert_error(done, "needs a local route", "'re'")
         self.assertEqual(self.calls_by("check-image"), [])
 
+    def test_local_cell_uses_the_bound_workdir_like_an_re_cell(self) -> None:
+        # Backend parity compares a local candidate (kvm) with a ptrace reference that may
+        # have run on RE, where /test cannot be mounted: both must use the bound /tmp/test.
+        done, result = self.run_cell(HERMIT_E2E_ROUTE="local")
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "local cells use the bound /tmp/test")
+        self.assertEqual(result["empty_workdir"], "")
+
     def test_unknown_container_is_an_error(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_CONTAINER="docker")
         self.assert_error(done, "unknown HERMIT_E2E_CONTAINER 'docker'")
