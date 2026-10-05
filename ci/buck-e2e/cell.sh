@@ -34,7 +34,12 @@ mkdir -p "$TEST_RESULT_ARTIFACTS_DIR" "$TEST_RESULT_ARTIFACT_ANNOTATIONS_DIR"
 # On RE these are relative to /re_cwd; absolutize before anything changes directory.
 A=$(realpath "$TEST_RESULT_ARTIFACTS_DIR")
 N=$(realpath "$TEST_RESULT_ARTIFACT_ANNOTATIONS_DIR")
-run_id="buck-$(hostname -s)-$$-$(date +%s%N)"
+# The pid and the clock do not make the id unique: every RE action runs in a PID
+# namespace of its own, so $$ is 2 on every worker, and a validate of c977ef11 saw
+# two cells on one worker draw the same nanosecond as well. ingest.py refuses a run
+# whose id names two executions, so 64 random bits keep two executions apart.
+run_id="buck-$(hostname -s)-$$-$(date +%s%N)-$(od -An -N8 -tx8 /dev/urandom | tr -d ' \n')"
+[[ $run_id =~ -[0-9a-f]{16}$ ]] || emit_fatal "cannot read 8 random bytes for the run id"
 # Named by the run id, so the testx listing shows which run an execution was
 # without fetching anything (ingest.py ties local artifact copies to it).
 printf '%s\n' "$run_id" >"$A/run_id.$run_id"
