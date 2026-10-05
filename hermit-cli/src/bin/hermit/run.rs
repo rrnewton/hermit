@@ -123,7 +123,7 @@ fn read_verify_summary(path: &Path) -> Option<RunSummary> {
     }
 }
 
-fn first_run_rejected_report(
+pub(super) fn first_run_rejected_report(
     output: &Output,
     runtime: Option<VerificationRuntime>,
 ) -> VerificationReport {
