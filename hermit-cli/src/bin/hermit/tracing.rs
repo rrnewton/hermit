@@ -832,24 +832,54 @@ pub(crate) fn enable_log_cap_exit_bound() {
 /// stderr nobody reads. This starts a thread that, after
 /// [`LOG_CAP_OUTER_GRACE`], attempts the class line once without waiting
 /// (unless the final report already did) and calls `_exit(123)`. A normal exit
-/// before then ends the thread with the process. If the thread cannot be
-/// created, the bound is not armed; the final report still never waits.
+/// before then ends the thread with the process.
+///
+/// Two ways around that timer are closed here. If the thread cannot be
+/// created, nothing would bound the diagnostics that follow, so the process
+/// exits 123 at once. And from here on a panic exits 123 instead of
+/// unwinding to the panic status 101: `eprintln!` panics when stderr's reader
+/// has gone, and `analyze` still `expect`s its trials' results.
 pub(crate) fn bound_log_cap_exit() {
+    bound_log_cap_exit_with(|timer| {
+        std::thread::Builder::new()
+            .name("log-cap-exit".to_string())
+            .spawn(timer)
+            .map(drop)
+    });
+}
+
+/// [`bound_log_cap_exit`] with the timer thread's creation supplied, so a test
+/// can make it fail.
+fn bound_log_cap_exit_with(start_timer: impl FnOnce(Box<dyn FnOnce() + Send>) -> io::Result<()>) {
     if !LOG_CAP_EXIT_BOUND_ENABLED.load(Ordering::Relaxed)
         || LOG_CAP_EXIT_SCHEDULED.swap(true, Ordering::Relaxed)
     {
         return;
     }
-    let _ = std::thread::Builder::new()
-        .name("log-cap-exit".to_string())
-        .spawn(|| {
-            std::thread::sleep(LOG_CAP_OUTER_GRACE);
-            if !LOG_CAP_REPORTED.swap(true, Ordering::Relaxed) {
-                write_without_waiting(libc::STDERR_FILENO, LOG_CAP_CLASS_LINE.as_bytes());
-            }
-            // SAFETY: _exit has no preconditions.
-            unsafe { libc::_exit(hermit::HERMIT_LOG_CAP_EXIT) }
-        });
+    std::panic::set_hook(Box::new(|info| {
+        write_without_waiting(
+            libc::STDERR_FILENO,
+            format!("hermit: panic after the log cap ended the run: {info}\n").as_bytes(),
+        );
+        exit_with_log_cap_status()
+    }));
+    let timer: Box<dyn FnOnce() + Send> = Box::new(|| {
+        std::thread::sleep(LOG_CAP_OUTER_GRACE);
+        exit_with_log_cap_status()
+    });
+    if start_timer(timer).is_err() {
+        exit_with_log_cap_status()
+    }
+}
+
+/// Attempt the class line once without waiting, unless a report already did,
+/// and exit 123.
+fn exit_with_log_cap_status() -> ! {
+    if !LOG_CAP_REPORTED.swap(true, Ordering::Relaxed) {
+        write_without_waiting(libc::STDERR_FILENO, LOG_CAP_CLASS_LINE.as_bytes());
+    }
+    // SAFETY: _exit has no preconditions.
+    unsafe { libc::_exit(hermit::HERMIT_LOG_CAP_EXIT) }
 }
 
 /// The stderr class line for a run the log cap ended.
@@ -1988,6 +2018,38 @@ mod tests {
                 0
             }
         );
+    }
+
+    /// Round-3 review of https://github.com/rrnewton/hermit/pull/3686, finding
+    /// 1: when the exit timer's thread cannot be created, nothing would bound
+    /// the diagnostics that follow the classification, so the process must
+    /// exit 123 at once rather than carry on unbounded.
+    #[test]
+    fn a_failed_exit_timer_start_exits_with_the_log_cap_status_at_once() {
+        let status = in_child_with_default_sigpipe(|| {
+            LOG_CAP_EXIT_SCHEDULED.store(false, Ordering::Relaxed);
+            enable_log_cap_exit_bound();
+            bound_log_cap_exit_with(|_timer| Err(io::Error::from_raw_os_error(libc::EAGAIN)));
+        });
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), hermit::HERMIT_LOG_CAP_EXIT);
+    }
+
+    /// Round-3 review of https://github.com/rrnewton/hermit/pull/3686,
+    /// findings 3 and 4: a panic after the cap ended the run -- `eprintln!` to
+    /// a stderr whose reader has gone, or an `analyze` trial's `expect` --
+    /// must still exit 123, not the panic status 101.
+    #[test]
+    fn a_panic_after_the_cap_ended_the_run_still_exits_with_the_log_cap_status() {
+        let status = in_child_with_default_sigpipe(|| {
+            LOG_CAP_EXIT_SCHEDULED.store(false, Ordering::Relaxed);
+            enable_log_cap_exit_bound();
+            // A timer that never runs, so only the panic can end the child.
+            bound_log_cap_exit_with(|_timer| Ok(()));
+            let _ = std::panic::catch_unwind(|| panic!("a diagnostic after the cap"));
+        });
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), hermit::HERMIT_LOG_CAP_EXIT);
     }
 
     /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
