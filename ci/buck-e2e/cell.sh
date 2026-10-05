@@ -68,13 +68,25 @@ container=${HERMIT_E2E_CONTAINER:-}
 workdir_env=()
 [[ ${HERMIT_E2E_ROUTE:-} == local && (-d /test || $container == pinned-root) ]] &&
     workdir_env=(HERMIT_E2E_EMPTY_WORKDIR=/test)
+# The harness measures each budgeted invocation's live CPU from a cgroup of its own and
+# refuses the invocation when it cannot create one. An RE worker runs the test inside a
+# root-owned cgroup that cell.sh cannot write (cgroup.procs: EACCES), so an RE cell is a
+# run without cgroups on purpose and sets HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1. The
+# harness still tries a cgroup first and only then uses the agent-utils process-group
+# scan, whose rows name that source. A local cell runs in a cgroup it can use, so it
+# never inherits a caller's marker; neither does the pinned-root container.
+if [[ ${HERMIT_E2E_ROUTE:-} == re ]]; then
+    cpu_scan_env=(HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN=1)
+else
+    cpu_scan_env=(-u HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN)
+fi
 extra=()
 # The compat bucket node runs with --diagnostic-results; so does its Buck cell.
 [[ $TEST == compat/* ]] && extra+=(--diagnostic-results)
 out=$W/out
 case $container in
 "")
-    env "${workdir_env[@]}" VALIDATE_RUN_STATE="$W/run-state" \
+    env "${cpu_scan_env[@]}" "${workdir_env[@]}" VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_BUILD_ROOT="$B/build" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         HERMIT_BIN="$B/hermit/hermit" HERMIT_INSTALL_DIR="$B/hermit/install" \
@@ -142,7 +154,7 @@ exec "$@"'
     outer=$((deadline - ($(date +%s%N) - t0) / 1000000000))
     ((outer > 25)) || outer=25
     deadline=$((outer - 15))
-    env HERMIT_E2E_EMPTY_WORKDIR=/test VALIDATE_RUN_STATE="$W/run-state" \
+    env "${cpu_scan_env[@]}" HERMIT_E2E_EMPTY_WORKDIR=/test VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         timeout --kill-after=10 "$outer" \

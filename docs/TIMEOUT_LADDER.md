@@ -136,8 +136,10 @@ scan then measures the execution, and its rows name
 as their CPU source. `scripts/validate.rs` sets the marker only for a run that
 `--allow-cgroup-failure` left unboxed, and refuses to start a boxed run whose
 caller set it. `ci/run-dag.sh` sets it only for `--unsafe-no-cgroups`, the
-privileged workflow only for its unboxed occasional KVM probe step, and
-`ci/compat-envelope/pressure-test.rs` never.
+privileged workflow only for its unboxed occasional KVM probe step,
+`ci/buck-e2e/cell.sh` only for cells on the RE route (an RE worker's cgroup is
+not writable by the test; local and pinned-root cells drop a caller's marker),
+and `ci/compat-envelope/pressure-test.rs` never.
 
 ## Regular Nextest calibration and enclosing budgets
 

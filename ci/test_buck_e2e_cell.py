@@ -56,7 +56,8 @@ def host(path):
             return target + path[len(prefix):]
     return path
 keys = ("HERMIT_E2E_EMPTY_WORKDIR", "E2E_RESULT_ROOT", "E2E_BUILD_ROOT", "VALIDATE_RUN_STATE",
-        "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS")
+        "E2E_RUN_ID", "HERMIT_BIN", "HERMIT_INSTALL_DIR", "E2E_KEEP_VERIFY_LOGS", "E2E_PARITY_POST_PASS",
+        "HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN")
 # The client directory the DBT backend would load from: name -> link target, or None.
 rsrcs = os.path.join(host(os.environ.get("HERMIT_INSTALL_DIR", "/nonexistent")), "rsrcs")
 links = {n: os.readlink(os.path.join(rsrcs, n)) if os.path.islink(os.path.join(rsrcs, n)) else None
@@ -374,6 +375,29 @@ class CellTest(unittest.TestCase):
         self.assertEqual(harness["env"]["HERMIT_BIN"], str(self.bundle / "hermit" / "hermit"))
         self.assertEqual(result["container"], "")
         self.assertEqual(result["empty_workdir"], "")
+
+    # An RE worker's cgroup is not writable by the test, so the harness cannot give a
+    # budgeted invocation a cgroup of its own there (https://github.com/rrnewton/hermit/issues/3766).
+    def test_re_cell_declares_a_run_without_cgroups(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_ROUTE="re")
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertEqual(harness["env"]["HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN"], "1")
+
+    def test_local_cell_drops_a_callers_cpu_scan_marker(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN="1")
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN"])
+
+    def test_pinned_root_cell_drops_a_callers_cpu_scan_marker(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root",
+                                HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN="1")
+        self.assertEqual(done["status"], "passed", done)
+        [wrapper] = self.calls_by("wrapper")
+        self.assertNotIn("HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN", wrapper["forwarded"])
+        [harness] = self.calls_by("harness")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN"])
 
 
     def assert_evidence(self, complete: bool, missing: str = "detlogs", **env: str) -> None:
