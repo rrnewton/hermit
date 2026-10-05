@@ -395,13 +395,29 @@ const BACKPRESSURE_BYTES: usize = 256 * 1024;
 /// A blocking send waits before any byte of it is accepted while another
 /// thread's nonblocking send on the same connection is refused.
 const INTERLEAVED_MODE: &str = "backpressure-interleaved";
+/// A blocking send that also prints whether the go thread had run when it
+/// completed, and the monotonic clock around it.
+const OBSERVE_MODE: &str = "backpressure-observe";
+/// A blocking send whose descriptor number another thread replaces while it
+/// waits.
+const REPLACE_MODE: &str = "backpressure-replace";
+/// A blocking send from a shared file mapping whose unsent half a child
+/// process rewrites while it waits.
+const SHARED_MODE: &str = "backpressure-shared";
 
 fn assert_backpressure_output(stdout: &[u8], mode: &str, label: &str) {
     let kind = mode.strip_prefix("backpressure-").unwrap();
+    let text = String::from_utf8_lossy(stdout);
+    // The observe mode's own lines are checked against the recording.
+    let protocol = text
+        .lines()
+        .filter(|line| mode != OBSERVE_MODE || !line.starts_with("observe "))
+        .map(|line| format!("{line}\n"))
+        .collect::<String>();
     assert_eq!(
-        String::from_utf8_lossy(stdout),
+        protocol,
         format!("backpressure={kind} bytes={BACKPRESSURE_BYTES} reply=ok\n"),
-        "{label} did not complete the backpressure protocol"
+        "{label} did not complete the backpressure protocol:\n{text}"
     );
 }
 
@@ -427,8 +443,8 @@ fn trace_version(trace: &[u8]) -> u32 {
 /// exact outbound stream, and checks the client's output and the trace
 /// version. Returns the trace and the controller port.
 fn record_backpressure(fixture: &Path, evidence: &Path, mode: &str) -> (PathBuf, String) {
-    use detcore_model::network_trace::NETWORK_TRACE_VERSION_V2;
     use detcore_model::network_trace::NETWORK_TRACE_VERSION_V3;
+    use detcore_model::network_trace::NETWORK_TRACE_VERSION_V4;
 
     let trace = evidence.join(format!("{mode}.trace"));
     let controller_directory = evidence.join(format!("{mode}-controller"));
@@ -449,11 +465,12 @@ fn record_backpressure(fixture: &Path, evidence: &Path, mode: &str) -> (PathBuf,
     assert_backpressure_output(&recorded.stdout, mode, &label);
     assert_backpressure_report(&controller.finish());
     let bytes = fs::read(&trace).expect("recording omitted its network trace");
-    // Only a nonblocking send can be refused; a blocking one waits.
+    // Only a nonblocking send can be refused; a blocking one waits, and the
+    // chunks it sends after waiting carry the waits.
     let expected_version = if mode == "backpressure-nonblocking" {
         NETWORK_TRACE_VERSION_V3
     } else {
-        NETWORK_TRACE_VERSION_V2
+        NETWORK_TRACE_VERSION_V4
     };
     assert_eq!(
         trace_version(&bytes),
@@ -463,15 +480,16 @@ fn record_backpressure(fixture: &Path, evidence: &Path, mode: &str) -> (PathBuf,
     (trace, port)
 }
 
-/// Replays a `mode` recording offline under two schedules at L2.
+/// Replays a `mode` recording offline under each of `cells` at L2.
 fn replay_backpressure_at_l2(
     fixture: &Path,
     evidence: &Path,
     mode: &str,
     trace: &Path,
     port: &str,
+    cells: &[(u64, u64)],
 ) {
-    for (seed, max_timeslice) in &REPLAY_CELLS[1..3] {
+    for (seed, max_timeslice) in cells {
         let label = format!("replay-{mode}-seed-{seed}-timeslice-{max_timeslice}");
         let report = evidence.join(format!("{label}.verify.json"));
         let mut arguments = run_arguments(*seed, *max_timeslice);
@@ -505,7 +523,7 @@ fn tcp_backpressure_nonblocking_records_and_replays_without_stalling_other_threa
     let evidence = directory.path();
     let mode = "backpressure-nonblocking";
     let (trace, port) = record_backpressure(fixture, evidence, mode);
-    replay_backpressure_at_l2(fixture, evidence, mode, &trace, &port);
+    replay_backpressure_at_l2(fixture, evidence, mode, &trace, &port, &REPLAY_CELLS[1..3]);
 }
 
 /// A thread stuck on a full send buffer must not hold back the thread that
@@ -518,7 +536,7 @@ fn tcp_backpressure_blocking_records_and_replays_without_stalling_other_threads(
     let evidence = directory.path();
     let mode = "backpressure-blocking";
     let (trace, port) = record_backpressure(fixture, evidence, mode);
-    replay_backpressure_at_l2(fixture, evidence, mode, &trace, &port);
+    replay_backpressure_at_l2(fixture, evidence, mode, &trace, &port, &REPLAY_CELLS[1..3]);
 }
 
 /// Replay refuses a blocking send where the recording holds a refused
@@ -575,6 +593,230 @@ fn tcp_backpressure_refuses_a_diverged_replay_and_an_interleaved_recording() {
         "accepted or refused, reached stream offset",
         "one thread at a time",
     );
+}
+
+/// The scheduler's report of each network-send retry in `stderr`, in order,
+/// from the waiting thread onwards; the turn number is left out.
+fn network_send_retries(stderr: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stderr)
+        .lines()
+        .filter(|line| line.contains("polling resource") && line.contains("\"network send\""))
+        .filter_map(|line| {
+            line.find("SKIP dettid")
+                .map(|start| line[start..].to_owned())
+        })
+        .collect()
+}
+
+/// Replay completes a blocking send that waited for buffer space when the
+/// recording did: after as many waits, at the same virtual time, and so
+/// after the other thread whose message let the peer drain it. Each
+/// difference would change what the program observes; see
+/// https://github.com/rrnewton/hermit/issues/3792.
+#[test]
+fn tcp_backpressure_replay_completes_a_waited_send_when_the_recording_did() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create backpressure evidence directory");
+    let evidence = directory.path();
+    let mode = OBSERVE_MODE;
+    let (trace, port) = record_backpressure(fixture, evidence, mode);
+    let recorded_stdout = fs::read(evidence.join(format!("record-{mode}.stdout")))
+        .expect("read the recording's stdout");
+    let recorded_stderr = fs::read(evidence.join(format!("record-{mode}.stderr")))
+        .expect("read the recording's stderr");
+    let recorded = String::from_utf8_lossy(&recorded_stdout);
+    // The peer drains nothing before the go thread's message.
+    assert!(
+        recorded.contains("observe released=1\n"),
+        "the recording completed the send before the go thread ran:\n{recorded}"
+    );
+    let recorded_retries = network_send_retries(&recorded_stderr);
+    assert!(
+        !recorded_retries.is_empty(),
+        "the recording's send never waited for buffer space"
+    );
+
+    // The same configuration as the recording, offline.
+    let label = format!("replay-{mode}");
+    let mut arguments = run_arguments(0, 1_000_000);
+    arguments.push(format!("--replay-networking={}", trace.display()));
+    let replayed = hermit_command(
+        evidence,
+        &label,
+        &arguments,
+        fixture,
+        &["client", &port, mode],
+    );
+    assert_success(&replayed, &label);
+    assert_backpressure_output(&replayed.stdout, mode, &label);
+    let replayed_text = String::from_utf8_lossy(&replayed.stdout);
+    let mut mismatches = Vec::new();
+    for prefix in ["observe released=", "observe clock_before="] {
+        let line = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with(prefix))
+                .map(str::to_owned)
+        };
+        let (recorded_line, replayed_line) = (line(&recorded), line(&replayed_text));
+        if recorded_line != replayed_line {
+            mismatches.push(format!(
+                "record printed {recorded_line:?}, replay printed {replayed_line:?}"
+            ));
+        }
+    }
+    if replayed.stdout != recorded_stdout {
+        mismatches.push(format!(
+            "stdout differs:\nrecord:\n{recorded}replay:\n{replayed_text}"
+        ));
+    }
+    let replayed_retries = network_send_retries(&replayed.stderr);
+    if replayed_retries != recorded_retries {
+        mismatches.push(format!(
+            "record retried the send {} times, replay {} times; the first difference is at retry {}",
+            recorded_retries.len(),
+            replayed_retries.len(),
+            recorded_retries
+                .iter()
+                .zip(&replayed_retries)
+                .take_while(|(left, right)| left == right)
+                .count()
+        ));
+    }
+    assert!(
+        mismatches.is_empty(),
+        "replay did not complete the waited send when the recording did:\n{}",
+        mismatches.join("\n")
+    );
+}
+
+/// Record refuses to resume a waiting send once another thread replaced its
+/// descriptor number, before any byte reaches the replacement connection.
+/// Linux would finish the send on the original connection, which a dup
+/// keeps open; Hermit's injected sends name the number, not the connection.
+#[test]
+fn tcp_backpressure_record_refuses_a_waiting_send_whose_descriptor_was_replaced() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create backpressure evidence directory");
+    let evidence = directory.path();
+    let controller_directory = evidence.join("replace-controller");
+    fs::create_dir(&controller_directory).expect("create replace controller directory");
+    let (controller, port) =
+        Controller::start_mode(fixture, &controller_directory, "replace-controller");
+    let mut arguments = run_arguments(0, 1_000_000);
+    arguments.push(format!(
+        "--record-networking={}",
+        evidence.join("replace.trace").display()
+    ));
+    let label = "record-replace";
+    let recorded = hermit_command(
+        evidence,
+        label,
+        &arguments,
+        fixture,
+        &["client", &port, REPLACE_MODE],
+    );
+    assert_refused(
+        &recorded,
+        label,
+        "network trace does not model closing or replacing a descriptor while a send on it waits for buffer space",
+        "supports only outbound TCP clients",
+    );
+    let report = controller.finish();
+    assert!(
+        report.starts_with("controller=replace\n") && report.ends_with("\nreplacement_bytes=0\n"),
+        "the replacement connection received part of the waiting send:\n{report}"
+    );
+}
+
+/// The digest of the shared mode's stream after its child rewrote the
+/// second half.
+fn shared_stream_digest() -> u64 {
+    fnv1a64(
+        &(0..BACKPRESSURE_BYTES)
+            .map(|index| {
+                let byte = (index * 131 + (index >> 9)) as u8;
+                if index < BACKPRESSURE_BYTES / 2 {
+                    byte
+                } else {
+                    !byte
+                }
+            })
+            .collect::<Vec<_>>(),
+    )
+}
+
+/// The trace holds the bytes each resumed send injected, read from the
+/// guest's buffer just before it: here the half that a child process
+/// rewrote while the send waited, as Linux sent it. Replay reads the buffer
+/// at the same points and matches.
+#[test]
+fn tcp_backpressure_records_the_bytes_each_resumed_send_injected() {
+    use detcore_model::network_trace::NETWORK_TRACE_VERSION_V4;
+    use detcore_model::network_trace::NetworkTraceV2;
+
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create backpressure evidence directory");
+    let evidence = directory.path();
+    let mode = SHARED_MODE;
+    let trace = evidence.join(format!("{mode}.trace"));
+    let controller_directory = evidence.join("shared-controller");
+    fs::create_dir(&controller_directory).expect("create shared controller directory");
+    let (controller, port) =
+        Controller::start_mode(fixture, &controller_directory, "shared-controller");
+    let mut arguments = run_arguments(0, 1_000_000);
+    arguments.push(format!("--record-networking={}", trace.display()));
+    let label = format!("record-{mode}");
+    let recorded = hermit_command(
+        evidence,
+        &label,
+        &arguments,
+        fixture,
+        &["client", &port, mode],
+    );
+    assert_success(&recorded, &label);
+    assert_backpressure_output(&recorded.stdout, mode, &label);
+    let digest = shared_stream_digest();
+    assert_eq!(
+        controller.finish(),
+        format!("controller=shared\nbytes={BACKPRESSURE_BYTES}\nfnv1a64={digest:016x}\n"),
+        "the peer did not receive the rewritten stream"
+    );
+
+    let bytes = fs::read(&trace).expect("recording omitted its network trace");
+    assert_eq!(
+        trace_version(&bytes),
+        NETWORK_TRACE_VERSION_V4,
+        "{label} recorded the wrong trace version"
+    );
+    let decoded = NetworkTraceV2::read_framed(&bytes[..]).expect("decode the recorded trace");
+    let streams = decoded
+        .channels
+        .iter()
+        .map(|channel| {
+            decoded
+                .outputs
+                .iter()
+                .filter(|output| output.channel == channel.id)
+                .flat_map(|output| output.bytes.iter().copied())
+                .collect::<Vec<_>>()
+        })
+        .filter(|stream| stream.len() == BACKPRESSURE_BYTES)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        streams.len(),
+        1,
+        "the trace must hold exactly one data stream"
+    );
+    assert_eq!(
+        format!("{:016x}", fnv1a64(&streams[0])),
+        format!("{digest:016x}"),
+        "the trace holds bytes the peer did not receive"
+    );
+
+    replay_backpressure_at_l2(fixture, evidence, mode, &trace, &port, &REPLAY_CELLS[..1]);
 }
 
 /// Records the fixture's `match` client against a live controller, which

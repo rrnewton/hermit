@@ -37,6 +37,19 @@
  * connection is refused before it sends "go". Linux completes that too;
  * record refuses it, because replay would hand the refusal to the waiting
  * blocking send.
+ *
+ * Three more blocking modes check what replay and record do around the
+ * wait. The observe mode prints whether the "go" thread had run, and the
+ * monotonic clock before and after the send, so that a replay that
+ * completed the send earlier or later than the recording prints something
+ * else. In the replace mode the "go" thread installs a third connection
+ * over the waiting send's descriptor number, keeping the original open
+ * through a dup; Linux finishes the send on the original connection. In
+ * the shared mode the send buffer is a shared file mapping; the data thread
+ * first fills the connection, so its blocking send waits before its first
+ * byte, and a child process rewrites the unsent second half during that
+ * wait. Linux sends the rewritten bytes. The shared and replace
+ * controllers report what each connection received instead of checking it.
  */
 
 #include <arpa/inet.h>
@@ -48,6 +61,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -55,6 +69,7 @@
 #include <sys/sendfile.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -64,6 +79,8 @@
 #include <sys/uio.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 #define PAYLOAD_SIZE 3
@@ -673,9 +690,12 @@ static void expect_eof(int fd, const char *what) {
   }
 }
 
-static int run_backpressure_controller(const char *port_path,
-                                       const char *report_path,
-                                       const char *contact_path) {
+/* Listens with the small receive buffer, publishes the port, and accepts
+ * the data connection, which it returns, and then the control connection.
+ * Leaves the listener open for a third connection. */
+static int accept_backpressure_connections(const char *port_path,
+                                           const char *contact_path, int *listener_out,
+                                           int *control) {
   signal(SIGPIPE, SIG_IGN);
   alarm(CONTROLLER_ACCEPT_DEADLINE_SECONDS);
   int listener = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
@@ -691,7 +711,7 @@ static int run_backpressure_controller(const char *port_path,
   socklen_t address_length = sizeof(address);
   if (getsockname(listener, (struct sockaddr *)&address, &address_length) != 0)
     fail("getsockname backpressure controller");
-  if (listen(listener, 2) != 0)
+  if (listen(listener, 3) != 0)
     fail("listen backpressure controller");
   char port[32];
   int port_length = snprintf(port, sizeof(port), "%u\n", ntohs(address.sin_port));
@@ -705,17 +725,34 @@ static int run_backpressure_controller(const char *port_path,
     fail("accept data connection");
   alarm(FIXTURE_DEADLINE_SECONDS);
   publish_text(contact_path, "accepted\n");
-  int control = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
-  if (control < 0)
+  *control = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+  if (*control < 0)
     fail("accept control connection");
   set_socket_timeouts(data);
-  set_socket_timeouts(control);
-  close(listener);
+  set_socket_timeouts(*control);
+  *listener_out = listener;
+  return data;
+}
 
+static void receive_go(int control) {
   char go[sizeof(GO) - 1];
   receive_exact(control, go, sizeof(go));
   if (memcmp(go, GO, sizeof(go)) != 0)
     fail_message("control connection mismatch");
+}
+
+/* Drains the data connection only after "go". With `report_digest` it
+ * reports the digest of what it received; otherwise it requires the fixed
+ * stream. */
+static int run_backpressure_controller(const char *port_path,
+                                       const char *report_path,
+                                       const char *contact_path, int report_digest) {
+  int listener;
+  int control;
+  int data = accept_backpressure_connections(port_path, contact_path, &listener, &control);
+  close(listener);
+
+  receive_go(control);
   uint64_t digest = UINT64_C(14695981039346656037);
   for (size_t received = 0; received < BACKPRESSURE_BYTES;) {
     unsigned char bytes[BACKPRESSURE_SOCKET_BUFFER];
@@ -726,7 +763,7 @@ static int run_backpressure_controller(const char *port_path,
     digest = fnv1a64_update(digest, bytes, wanted);
     received += wanted;
   }
-  if (digest != backpressure_digest())
+  if (!report_digest && digest != backpressure_digest())
     fail_message("backpressure data mismatch");
   send_all(data, DRAINED, sizeof(DRAINED) - 1);
   expect_eof(data, "recv data tail");
@@ -736,8 +773,73 @@ static int run_backpressure_controller(const char *port_path,
 
   char report[256];
   int report_length = snprintf(
-      report, sizeof(report), "controller=backpressure\nbytes=%d\nfnv1a64=%016llx\n",
-      BACKPRESSURE_BYTES, (unsigned long long)backpressure_digest());
+      report, sizeof(report), "controller=%s\nbytes=%d\nfnv1a64=%016llx\n",
+      report_digest ? "shared" : "backpressure", BACKPRESSURE_BYTES,
+      (unsigned long long)digest);
+  if (report_length <= 0 || (size_t)report_length >= sizeof(report))
+    fail_message("controller report did not fit its fixed buffer");
+  publish_text(report_path, report);
+  return 0;
+}
+
+/* Accepts a third, replacement connection, and after "go" counts what the
+ * data and replacement connections each receive until both end. Replies
+ * on the data connection once the whole stream arrived. */
+static int run_replace_controller(const char *port_path, const char *report_path,
+                                  const char *contact_path) {
+  int listener;
+  int control;
+  int data = accept_backpressure_connections(port_path, contact_path, &listener, &control);
+  int replacement = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+  if (replacement < 0)
+    fail("accept replacement connection");
+  set_socket_timeouts(replacement);
+  close(listener);
+
+  receive_go(control);
+  int fds[2] = {data, replacement};
+  size_t counts[2] = {0, 0};
+  int open_count = 2;
+  int replied = 0;
+  while (open_count != 0) {
+    struct pollfd ready[2];
+    for (int index = 0; index < 2; ++index)
+      ready[index] = (struct pollfd){.fd = fds[index], .events = POLLIN};
+    int count = poll(ready, 2, 5000);
+    if (count < 0 && errno == EINTR)
+      continue;
+    if (count <= 0)
+      fail_message("replace controller saw no progress within five seconds");
+    for (int index = 0; index < 2; ++index) {
+      if (ready[index].revents == 0)
+        continue;
+      unsigned char bytes[BACKPRESSURE_SOCKET_BUFFER];
+      ssize_t received = recv(fds[index], bytes, sizeof(bytes), 0);
+      if (received < 0 && errno == EINTR)
+        continue;
+      if (received < 0)
+        fail("recv replace controller");
+      if (received == 0) {
+        fds[index] = -1;
+        --open_count;
+        continue;
+      }
+      counts[index] += (size_t)received;
+    }
+    if (!replied && counts[0] == BACKPRESSURE_BYTES) {
+      send_all(data, DRAINED, sizeof(DRAINED) - 1);
+      replied = 1;
+    }
+  }
+  expect_eof(control, "recv control tail");
+  close(data);
+  close(replacement);
+  close(control);
+
+  char report[256];
+  int report_length =
+      snprintf(report, sizeof(report), "controller=replace\ndata_bytes=%zu\nreplacement_bytes=%zu\n",
+               counts[0], counts[1]);
   if (report_length <= 0 || (size_t)report_length >= sizeof(report))
     fail_message("controller report did not fit its fixed buffer");
   publish_text(report_path, report);
@@ -750,6 +852,17 @@ struct backpressure {
   /* The data connection, on which this thread first makes a refused
    * nonblocking send; -1 if it makes none. */
   int interleave;
+  /* The data connection and a connection this thread installs over its
+   * descriptor number, or -1 and -1. */
+  int replaced;
+  int replacement;
+  /* A pipe on which this thread releases the child that rewrites the
+   * unsent half of the send buffer, and one on which the child reports the
+   * rewrite done; or -1 and -1. */
+  int rewrite;
+  int rewrite_done;
+  /* Set just before "go". */
+  atomic_int released;
   pthread_mutex_t lock;
   pthread_cond_t stuck_cond;
   int stuck;
@@ -784,6 +897,25 @@ static void *run_go_sender(void *raw) {
     if (!(accepted < 0 && errno == EAGAIN))
       fail_message("a nonblocking send on the full data connection was not refused");
   }
+  if (state->replacement >= 0 && dup2(state->replacement, state->replaced) < 0)
+    fail("dup2 replacement");
+  if (state->rewrite >= 0) {
+    const char release = 1;
+    ssize_t written;
+    do
+      written = write(state->rewrite, &release, 1);
+    while (written < 0 && errno == EINTR);
+    if (written != 1)
+      fail("write rewriter release");
+    char done;
+    ssize_t received;
+    do
+      received = read(state->rewrite_done, &done, 1);
+    while (received < 0 && errno == EINTR);
+    if (received != 1)
+      fail_message("the child failed to rewrite the send buffer");
+  }
+  atomic_store(&state->released, 1);
   send_all(state->control, GO, sizeof(GO) - 1);
   return NULL;
 }
@@ -801,7 +933,90 @@ static int connect_loopback(uint16_t port, int send_buffer) {
   return fd;
 }
 
-enum backpressure_kind { NONBLOCKING, BLOCKING, INTERLEAVED };
+enum backpressure_kind { NONBLOCKING, BLOCKING, INTERLEAVED, OBSERVE, REPLACE, SHARED };
+
+/* The byte the shared mode's child writes at `index` of the second half. */
+static unsigned char rewritten_byte(size_t index) {
+  return (unsigned char)~backpressure_byte(index);
+}
+
+static void pwrite_all(int fd, const unsigned char *bytes, size_t length, off_t offset) {
+  while (length != 0) {
+    ssize_t written = pwrite(fd, bytes, length, offset);
+    if (written < 0 && errno == EINTR)
+      continue;
+    if (written <= 0)
+      fail("pwrite shared stream");
+    bytes += written;
+    length -= (size_t)written;
+    offset += written;
+  }
+}
+
+/* Maps a temporary file holding the stream with MAP_SHARED, and forks a
+ * child that rewrites the file's second half once released through
+ * `*rewrite`, reports that through `*rewrite_done`, and exits when `*rewrite`
+ * is closed. It must not exit while the send waits: network record refuses a
+ * signal during that wait, and its exit sends SIGCHLD. */
+static const unsigned char *map_shared_stream(int *rewrite, int *rewrite_done,
+                                              pid_t *rewriter) {
+  char path[] = "/tmp/network-replay-shared-XXXXXX";
+  int fd = mkstemp(path);
+  if (fd < 0)
+    fail("mkstemp shared stream");
+  if (unlink(path) != 0)
+    fail("unlink shared stream");
+  static unsigned char half[BACKPRESSURE_BYTES / 2];
+  for (size_t offset = 0; offset < BACKPRESSURE_BYTES; offset += sizeof(half)) {
+    for (size_t index = 0; index < sizeof(half); ++index)
+      half[index] = backpressure_byte(offset + index);
+    pwrite_all(fd, half, sizeof(half), (off_t)offset);
+  }
+  // The child only writes, so the rewrite fits the controller's timeout.
+  static unsigned char rewritten[BACKPRESSURE_BYTES / 2];
+  for (size_t index = 0; index < sizeof(rewritten); ++index)
+    rewritten[index] = rewritten_byte(sizeof(rewritten) + index);
+  const unsigned char *bytes =
+      mmap(NULL, BACKPRESSURE_BYTES, PROT_READ, MAP_SHARED, fd, 0);
+  if (bytes == MAP_FAILED)
+    fail("mmap shared stream");
+  int release[2];
+  int done[2];
+  if (pipe2(release, O_CLOEXEC) != 0 || pipe2(done, O_CLOEXEC) != 0)
+    fail("pipe2 rewriter");
+  pid_t child = fork();
+  if (child < 0)
+    fail("fork rewriter");
+  if (child == 0) {
+    close(release[1]);
+    close(done[0]);
+    char byte;
+    ssize_t received;
+    do
+      received = read(release[0], &byte, 1);
+    while (received < 0 && errno == EINTR);
+    if (received != 1)
+      _exit(1);
+    pwrite_all(fd, rewritten, sizeof(rewritten), (off_t)sizeof(rewritten));
+    ssize_t written;
+    do
+      written = write(done[1], &byte, 1);
+    while (written < 0 && errno == EINTR);
+    if (written != 1)
+      _exit(1);
+    do
+      received = read(release[0], &byte, 1);
+    while (received < 0 && errno == EINTR);
+    _exit(received == 0 ? 0 : 1);
+  }
+  close(release[0]);
+  close(done[1]);
+  close(fd);
+  *rewrite = release[1];
+  *rewrite_done = done[0];
+  *rewriter = child;
+  return bytes;
+}
 
 /* Sends nonblocking from `sent` until the connection refuses; returns the
  * new total. */
@@ -838,15 +1053,39 @@ static size_t fill_until_full(int fd, const unsigned char *bytes) {
 static int run_backpressure_client(const char *port_text, enum backpressure_kind kind) {
   set_deadline();
   uint16_t port = parse_port(port_text);
+  // Build the stream before connecting: the controller's receive timeouts
+  // start at accept, and filling the buffer is slow under Hermit.
+  static unsigned char filled[BACKPRESSURE_BYTES];
+  const unsigned char *bytes = filled;
+  int rewrite = -1;
+  int rewrite_done = -1;
+  pid_t rewriter = 0;
+  if (kind == SHARED) {
+    bytes = map_shared_stream(&rewrite, &rewrite_done, &rewriter);
+  } else {
+    for (size_t index = 0; index < BACKPRESSURE_BYTES; ++index)
+      filled[index] = backpressure_byte(index);
+  }
   int data = connect_loopback(port, BACKPRESSURE_SOCKET_BUFFER);
   int control = connect_loopback(port, 0);
-  static unsigned char bytes[BACKPRESSURE_BYTES];
-  for (size_t index = 0; index < BACKPRESSURE_BYTES; ++index)
-    bytes[index] = backpressure_byte(index);
+  int replacement = -1;
+  // Linux finishes a send on the connection it started on, which this
+  // descriptor keeps open after another descriptor replaces `data`.
+  int original = data;
+  if (kind == REPLACE) {
+    replacement = connect_loopback(port, 0);
+    original = dup(data);
+    if (original < 0)
+      fail("dup data connection");
+  }
 
   struct backpressure state = {.control = control,
                                .blocking = kind != NONBLOCKING,
-                               .interleave = kind == INTERLEAVED ? data : -1};
+                               .interleave = kind == INTERLEAVED ? data : -1,
+                               .replaced = kind == REPLACE ? data : -1,
+                               .replacement = replacement,
+                               .rewrite = rewrite,
+                               .rewrite_done = rewrite_done};
   if (pthread_mutex_init(&state.lock, NULL) != 0 ||
       pthread_cond_init(&state.stuck_cond, NULL) != 0)
     fail_message("backpressure synchronization setup failed");
@@ -854,14 +1093,15 @@ static int run_backpressure_client(const char *port_text, enum backpressure_kind
   if (pthread_create(&go_sender, NULL, run_go_sender, &state) != 0)
     fail_message("pthread_create go sender failed");
 
-  if (kind == INTERLEAVED) {
+  int released = 0;
+  struct timespec before = {0, 0};
+  struct timespec after = {0, 0};
+  if (kind == INTERLEAVED || kind == SHARED) {
+    // The blocking send waits before it sends its first byte.
     size_t sent = fill_until_full(data, bytes);
     announce_stuck(&state);
     send_all(data, bytes + sent, BACKPRESSURE_BYTES - sent);
-  } else if (kind == BLOCKING) {
-    announce_stuck(&state);
-    send_all(data, bytes, BACKPRESSURE_BYTES);
-  } else {
+  } else if (kind == NONBLOCKING) {
     int refused = 0;
     for (size_t sent = 0; sent < BACKPRESSURE_BYTES;) {
       ssize_t accepted = send(data, bytes + sent, BACKPRESSURE_BYTES - sent,
@@ -880,16 +1120,47 @@ static int run_backpressure_client(const char *port_text, enum backpressure_kind
     }
     if (!refused)
       fail_message("a nonblocking send on a full buffer never reported EAGAIN");
+  } else {
+    if (kind == OBSERVE && clock_gettime(CLOCK_MONOTONIC, &before) != 0)
+      fail("clock_gettime before send");
+    announce_stuck(&state);
+    send_all(data, bytes, BACKPRESSURE_BYTES);
+    // The peer drains nothing before "go", so the send cannot complete
+    // before the go thread set this.
+    released = atomic_load(&state.released);
+    if (kind == OBSERVE && clock_gettime(CLOCK_MONOTONIC, &after) != 0)
+      fail("clock_gettime after send");
   }
   char reply[sizeof(DRAINED) - 1];
-  receive_exact(data, reply, sizeof(reply));
+  receive_exact(original, reply, sizeof(reply));
   if (memcmp(reply, DRAINED, sizeof(reply)) != 0)
     fail_message("backpressure reply mismatch");
   if (pthread_join(go_sender, NULL) != 0)
     fail_message("pthread_join go sender failed");
+  if (kind == REPLACE) {
+    close(original);
+    close(replacement);
+  }
+  if (kind == SHARED) {
+    // The send is done, so the child may exit now.
+    close(rewrite);
+    close(rewrite_done);
+    int status;
+    if (waitpid(rewriter, &status, 0) != rewriter)
+      fail("waitpid rewriter");
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0)
+      fail_message("the rewriting child failed");
+  }
   close(data);
   close(control);
-  const char *names[] = {"nonblocking", "blocking", "interleaved"};
+  if (kind == OBSERVE) {
+    printf("observe released=%d\n", released);
+    printf("observe clock_before=%lld.%09ld clock_after=%lld.%09ld\n",
+           (long long)before.tv_sec, before.tv_nsec, (long long)after.tv_sec,
+           after.tv_nsec);
+  }
+  const char *names[] = {"nonblocking", "blocking", "interleaved",
+                         "observe",     "replace",  "shared"};
   printf("backpressure=%s bytes=%d reply=ok\n", names[kind], BACKPRESSURE_BYTES);
   return 0;
 }
@@ -898,7 +1169,11 @@ int main(int argc, char **argv) {
   if (argc == 5 && strcmp(argv[1], "controller") == 0)
     return run_controller(argv[2], argv[3], argv[4]);
   if (argc == 5 && strcmp(argv[1], "backpressure-controller") == 0)
-    return run_backpressure_controller(argv[2], argv[3], argv[4]);
+    return run_backpressure_controller(argv[2], argv[3], argv[4], 0);
+  if (argc == 5 && strcmp(argv[1], "shared-controller") == 0)
+    return run_backpressure_controller(argv[2], argv[3], argv[4], 1);
+  if (argc == 5 && strcmp(argv[1], "replace-controller") == 0)
+    return run_replace_controller(argv[2], argv[3], argv[4]);
   if (argc == 4 && strcmp(argv[1], "client") == 0) {
     if (strcmp(argv[3], "match") == 0)
       return run_client(argv[2], 0);
@@ -910,6 +1185,12 @@ int main(int argc, char **argv) {
       return run_backpressure_client(argv[2], BLOCKING);
     if (strcmp(argv[3], "backpressure-interleaved") == 0)
       return run_backpressure_client(argv[2], INTERLEAVED);
+    if (strcmp(argv[3], "backpressure-observe") == 0)
+      return run_backpressure_client(argv[2], OBSERVE);
+    if (strcmp(argv[3], "backpressure-replace") == 0)
+      return run_backpressure_client(argv[2], REPLACE);
+    if (strcmp(argv[3], "backpressure-shared") == 0)
+      return run_backpressure_client(argv[2], SHARED);
     const char *refused[] = {"truncated", "sendmsg",    "sendfile", "unspecified",
                              "udp",       "listen",     "ipv6-24",  "netlink",
                              "abstract",  "rcvtimeo",   "scm-rights", "epoll",
@@ -920,10 +1201,11 @@ int main(int argc, char **argv) {
         return run_refused_client(argv[2], argv[3]);
   }
   fprintf(stderr,
-          "usage: %s controller|backpressure-controller PORT_FILE REPORT_FILE "
-          "CONTACT_FILE | client PORT "
+          "usage: %s controller|backpressure-controller|shared-controller|"
+          "replace-controller PORT_FILE REPORT_FILE CONTACT_FILE | client PORT "
           "match|mismatch|backpressure-nonblocking|backpressure-blocking|"
-          "backpressure-interleaved|truncated|sendmsg|sendfile|unspecified|udp|listen|"
+          "backpressure-interleaved|backpressure-observe|backpressure-replace|"
+          "backpressure-shared|truncated|sendmsg|sendfile|unspecified|udp|listen|"
           "ipv6-24|netlink|abstract|rcvtimeo|scm-rights|epoll|async|"
           "rcvtimeo-negative|ifindex|procnet|select-high|pselect-high\n",
           argv[0]);

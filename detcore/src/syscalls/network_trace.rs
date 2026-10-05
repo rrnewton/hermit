@@ -1548,20 +1548,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         let nonblocking = logically_nonblocking || flags & libc::MSG_DONTWAIT != 0;
         let buffer = buffer.ok_or(Errno::EFAULT)?;
         let mut sent = 0;
+        // A blocking send that cannot go on yet yields to the scheduler, so
+        // that other guest threads, which may be what the peer waits for,
+        // keep running. Record waits until the host accepts more; replay
+        // waits until the next fragment is due, which is after as many waits
+        // as the recording took and no earlier in global time than the
+        // recording accepted it. Both wait the same way, so a replayed send
+        // returns at the same point of the guest's execution as the recorded
+        // one. `waits` counts the waits since the send started or since its
+        // last accepted chunk; after the first wait, every attempt goes on
+        // from what the guest holds then.
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("network send");
+        let mut waits = 0;
+        let mut waited = false;
         if self.network_mode() == NetworkTraceMode::Record {
             // A nonblocking send the host refuses reports EAGAIN, and the
             // recording holds the refusal so that replay reports it at the
-            // same stream offset. A blocking send yields to the scheduler
-            // until the host accepts all of it, so that other guest threads,
-            // which may be what the peer waits for, keep running. It carries
-            // its mark across each wait, and the engine refuses it if any
-            // other output event on the channel happened in between: replay
-            // never waits here, so it would order the two the other way.
-            let mut rsrc = Resources::new(guest.thread_state().dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi("network send");
+            // same stream offset. A blocking send carries its mark across
+            // each wait, and the engine refuses it if any other output event
+            // on the channel happened in between, which network replay does
+            // not model.
             let mut at = None;
             while sent < len && !(nonblocking && sent > 0) {
+                if waited {
+                    self.network_send_resume(guest, fd, id, buffer, sent, &mut bytes)
+                        .await;
+                }
                 let call = syscalls::Sendto::new()
                     .with_fd(fd)
                     // SAFETY: `sent < len` stays within the guest's buffer.
@@ -1577,6 +1591,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             id,
                             bytes: bytes[sent..sent + written].to_vec(),
                             at,
+                            waits,
                         };
                         let NetworkReply::Recorded(end) =
                             self.network_request(guest, request).await
@@ -1585,6 +1600,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         };
                         at = Some(end);
                         sent += written;
+                        waits = 0;
                     }
                     Err(Errno::EINTR) => {}
                     Err(Errno::EAGAIN) if nonblocking => {
@@ -1600,6 +1616,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 id,
                                 bytes: Vec::new(),
                                 at: None,
+                                waits: 0,
                             };
                             let NetworkReply::Recorded(mark) =
                                 self.network_request(guest, request).await
@@ -1608,22 +1625,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                             };
                             at = Some(mark);
                         }
-                        rsrc.poll_attempt += 1;
-                        record_retry_event(guest, syscalls::Sendto::new().with_fd(fd)).await;
-                        if matches!(
-                            resource_request(guest, rsrc.clone()).await,
-                            ResumeStatus::Signaled(_)
-                        ) {
-                            // Replay never waits here, so it could not
-                            // reproduce the interruption.
-                            self.network_refuse(
-                                guest,
-                                "network record does not model a signal interrupting a send \
-                                 that waits for buffer space",
-                                UNSUPPORTED_REMEDY,
-                            )
-                            .await
-                        }
+                        waits += 1;
+                        waited = true;
+                        self.network_send_wait(guest, fd, &mut rsrc).await;
                     }
                     Err(errno) => {
                         self.network_refuse(
@@ -1637,19 +1641,100 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         } else {
             while sent < len && !(nonblocking && sent > 0) {
+                if waited {
+                    self.network_send_resume(guest, fd, id, buffer, sent, &mut bytes)
+                        .await;
+                }
                 let request = NetworkRequest::ReplaySend {
                     id,
                     bytes: bytes[sent..].to_vec(),
                     nonblocking,
+                    waits,
                 };
                 match self.network_request(guest, request).await {
-                    NetworkReply::Sent(accepted) => sent += accepted,
+                    NetworkReply::Sent(accepted) => {
+                        sent += accepted;
+                        waits = 0;
+                    }
                     NetworkReply::WouldBlock => return Err(Errno::EAGAIN.into()),
+                    NetworkReply::NotYet => {
+                        waits += 1;
+                        waited = true;
+                        self.network_send_wait(guest, fd, &mut rsrc).await;
+                    }
                     _ => unreachable!(),
                 }
             }
         }
         Ok(sent as i64)
+    }
+
+    /// Wait once for a blocking send: publish a retry event and yield one
+    /// polling turn to the scheduler. Record and replay wait identically.
+    async fn network_send_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        rsrc: &mut Resources,
+    ) {
+        rsrc.poll_attempt += 1;
+        record_retry_event(guest, syscalls::Sendto::new().with_fd(fd)).await;
+        if matches!(
+            resource_request(guest, rsrc.clone()).await,
+            ResumeStatus::Signaled(_)
+        ) {
+            self.network_refuse(
+                guest,
+                "network record does not model a signal interrupting a send that waits for \
+                 buffer space",
+                UNSUPPORTED_REMEDY,
+            )
+            .await
+        }
+    }
+
+    /// Prepare a blocking send to go on after it waited, while other guest
+    /// threads ran. Linux's in-flight send keeps the open file description it
+    /// started on and reads the buffer when it copies each part. So `fd` must
+    /// still name the channel `id`, and the unsent bytes are read again; the
+    /// caller sends, and records, exactly what the guest's memory holds now.
+    async fn network_send_resume<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+        id: OpenFileId,
+        buffer: Addr<'_, u8>,
+        sent: usize,
+        bytes: &mut [u8],
+    ) {
+        let same_channel = guest
+            .thread_state()
+            .with_detfd(fd, |detfd| detfd.open_file_id() == id)
+            .unwrap_or(false);
+        if !same_channel {
+            self.network_refuse(
+                guest,
+                "network trace does not model closing or replacing a descriptor while a send \
+                 on it waits for buffer space",
+                UNSUPPORTED_REMEDY,
+            )
+            .await
+        }
+        // SAFETY: `sent < bytes.len()` stays within the guest's buffer.
+        let unsent = unsafe { buffer.add(sent) };
+        if guest
+            .memory()
+            .read_exact(unsent, &mut bytes[sent..])
+            .is_err()
+        {
+            self.network_refuse(
+                guest,
+                "network trace cannot send from a guest buffer that became unreadable while \
+                 the send waited for buffer space",
+                "The program unmapped a buffer while sending from it; fix the program.",
+            )
+            .await
+        }
     }
 
     /// The pollfd array at `address` and, for each entry, its channel and

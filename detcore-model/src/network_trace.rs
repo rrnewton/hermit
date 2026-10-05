@@ -13,7 +13,8 @@
 //! integration cannot accidentally reuse the schedule-coupled syscall event
 //! stream. [`NetworkTraceV1`] is the original single-channel envelope;
 //! [`NetworkTraceV2`] is the multi-channel form the recorder writes, and its
-//! reader upgrades v1 traces. Merely constructing a [`NetworkTraceConfig`]
+//! reader upgrades v1 traces. The v3 and v4 framings extend the v2 payload
+//! with refused sends and with send waits respectively. Merely constructing a [`NetworkTraceConfig`]
 //! does not enable any behavior.
 
 use std::collections::BTreeMap;
@@ -305,6 +306,46 @@ pub struct NetworkOutputV1 {
     pub bytes: Vec<u8>,
 }
 
+/// How long a blocking send waited for buffer space before Linux accepted
+/// one fragment of it.
+///
+/// Replay hands the fragment to the guest only after the same send has
+/// waited `waits` times and global time has reached `not_before_global_time`,
+/// so the send returns at the same point of the guest's execution as it did
+/// in the recording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkSendWaitV4 {
+    /// Waits for buffer space since the send started or since its previous
+    /// accepted fragment, whichever came later; never zero.
+    pub waits: u64,
+    /// The global time at which the recording accepted the fragment.
+    pub not_before_global_time: LogicalTime,
+}
+
+/// One recorded outbound fragment, as a v4 trace holds it: a v1 fragment
+/// and, when a blocking send waited before Linux accepted it, that wait.
+/// Fragments of earlier versions have no wait.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NetworkOutputV4 {
+    pub channel: OpenFileId,
+    pub stream_offset: u64,
+    pub bytes: Vec<u8>,
+    pub wait: Option<NetworkSendWaitV4>,
+}
+
+impl From<NetworkOutputV1> for NetworkOutputV4 {
+    fn from(output: NetworkOutputV1) -> Self {
+        Self {
+            channel: output.channel,
+            stream_offset: output.stream_offset,
+            bytes: output.bytes,
+            wait: None,
+        }
+    }
+}
+
 /// Version-one schedule-independent network input trace.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -456,6 +497,7 @@ fn read_frame<R: Read>(mut reader: R) -> Result<(u32, Vec<u8>), NetworkTraceCode
         NETWORK_TRACE_VERSION_V1,
         NETWORK_TRACE_VERSION_V2,
         NETWORK_TRACE_VERSION_V3,
+        NETWORK_TRACE_VERSION_V4,
     ]
     .contains(&version)
     {
@@ -517,6 +559,10 @@ pub const NETWORK_TRACE_VERSION_V2: u32 = 2;
 /// nonblocking send refused with `EAGAIN`. The recorder writes it only for a
 /// trace that holds one, so a reader that predates it rejects only those.
 pub const NETWORK_TRACE_VERSION_V3: u32 = 3;
+/// The v3 format, extended with the wait of each outbound fragment that a
+/// blocking send waited for. The recorder writes it only for a trace that
+/// holds one.
+pub const NETWORK_TRACE_VERSION_V4: u32 = 4;
 
 /// One outbound TCP client connection in a v2 trace.
 ///
@@ -549,7 +595,29 @@ pub struct NetworkTraceV2 {
     /// Inputs of every channel, in the global order they were observed.
     pub inputs: Vec<NetworkInputEventV1>,
     /// Outbound fragments of every channel, in the order they were sent.
-    pub outputs: Vec<NetworkOutputV1>,
+    pub outputs: Vec<NetworkOutputV4>,
+}
+
+/// The v2 and v3 payload: [`NetworkTraceV2`] before fragments could carry a
+/// wait. Decoding through it is what keeps a wait out of a v2 or v3 trace.
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NetworkTraceV2Wire {
+    epoch: DateTime<Utc>,
+    channels: Vec<NetworkChannelV2>,
+    inputs: Vec<NetworkInputEventV1>,
+    outputs: Vec<NetworkOutputV1>,
+}
+
+impl From<NetworkTraceV2Wire> for NetworkTraceV2 {
+    fn from(trace: NetworkTraceV2Wire) -> Self {
+        Self {
+            epoch: trace.epoch,
+            channels: trace.channels,
+            inputs: trace.inputs,
+            outputs: trace.outputs.into_iter().map(Into::into).collect(),
+        }
+    }
 }
 
 impl From<NetworkTraceV1> for NetworkTraceV2 {
@@ -569,7 +637,7 @@ impl From<NetworkTraceV1> for NetworkTraceV2 {
                 })
                 .collect(),
             inputs: trace.inputs,
-            outputs: trace.outputs,
+            outputs: trace.outputs.into_iter().map(Into::into).collect(),
         }
     }
 }
@@ -602,6 +670,7 @@ impl NetworkTraceV2 {
         }
 
         let mut total_output: BTreeMap<OpenFileId, u64> = BTreeMap::new();
+        let mut last_wait: BTreeMap<OpenFileId, LogicalTime> = BTreeMap::new();
         for output in &self.outputs {
             let channel = channels
                 .get(&output.channel)
@@ -616,6 +685,23 @@ impl NetworkTraceV2 {
             *offset = offset
                 .checked_add(output.bytes.len() as u64)
                 .ok_or(NetworkTraceValidationError::StreamOffsetOverflow)?;
+            if let Some(wait) = &output.wait {
+                // A refused send returned without waiting, so it has no wait.
+                if output.bytes.is_empty() {
+                    return Err(NetworkTraceValidationError::WaitOnRefusedSend);
+                }
+                if wait.waits == 0 {
+                    return Err(NetworkTraceValidationError::ZeroSendWaits);
+                }
+                if wait.not_before_global_time < epoch_start {
+                    return Err(NetworkTraceValidationError::SendWaitBeforeEpoch);
+                }
+                let previous = last_wait.entry(output.channel).or_insert(epoch_start);
+                if wait.not_before_global_time < *previous {
+                    return Err(NetworkTraceValidationError::NonMonotonicSendWait);
+                }
+                *previous = wait.not_before_global_time;
+            }
         }
 
         #[derive(Default)]
@@ -662,36 +748,61 @@ impl NetworkTraceV2 {
     }
 
     /// Whether the trace records a nonblocking send refused with `EAGAIN`,
-    /// which only v3 can hold.
+    /// which only v3 and v4 can hold.
     pub fn records_refused_sends(&self) -> bool {
         self.outputs.iter().any(|output| output.bytes.is_empty())
     }
 
-    /// Write one complete, length-delimited trace: v3 when it records a
-    /// refused send, otherwise v2.
+    /// Whether any outbound fragment records a wait, which only v4 can hold.
+    pub fn records_send_waits(&self) -> bool {
+        self.outputs.iter().any(|output| output.wait.is_some())
+    }
+
+    /// Write one complete, length-delimited trace: v4 when it records a send
+    /// wait, otherwise v3 when it records a refused send, otherwise v2.
     pub fn write_framed<W: Write>(&self, writer: W) -> Result<(), NetworkTraceCodecError> {
         self.validate()?;
+        if self.records_send_waits() {
+            return write_frame(writer, NETWORK_TRACE_VERSION_V4, self);
+        }
         let version = if self.records_refused_sends() {
             NETWORK_TRACE_VERSION_V3
         } else {
             NETWORK_TRACE_VERSION_V2
         };
-        write_frame(writer, version, self)
+        let wire = NetworkTraceV2Wire {
+            epoch: self.epoch,
+            channels: self.channels.clone(),
+            inputs: self.inputs.clone(),
+            outputs: self
+                .outputs
+                .iter()
+                .map(|output| NetworkOutputV1 {
+                    channel: output.channel,
+                    stream_offset: output.stream_offset,
+                    bytes: output.bytes.clone(),
+                })
+                .collect(),
+        };
+        write_frame(writer, version, &wire)
     }
 
-    /// Read exactly one complete v1, v2 or v3 trace. A v1 trace is upgraded
-    /// to the equivalent v2 trace after passing v1 validation; a v2 trace may
-    /// not hold the refused sends that v3 added.
+    /// Read exactly one complete v1, v2, v3 or v4 trace. A v1 trace is
+    /// upgraded to the equivalent v2 trace after passing v1 validation; a v2
+    /// trace may not hold the refused sends that v3 added, and only a v4
+    /// trace can hold a send wait.
     pub fn read_framed<R: Read>(reader: R) -> Result<Self, NetworkTraceCodecError> {
         let (version, payload) = read_frame(reader)?;
-        let trace = if version == NETWORK_TRACE_VERSION_V1 {
-            let trace: NetworkTraceV1 = decode_payload(&payload)?;
-            trace.validate()?;
-            Self::from(trace)
-        } else {
-            decode_payload(&payload)?
+        let trace = match version {
+            NETWORK_TRACE_VERSION_V1 => {
+                let trace: NetworkTraceV1 = decode_payload(&payload)?;
+                trace.validate()?;
+                Self::from(trace)
+            }
+            NETWORK_TRACE_VERSION_V4 => decode_payload(&payload)?,
+            _ => Self::from(decode_payload::<NetworkTraceV2Wire>(&payload)?),
         };
-        if version != NETWORK_TRACE_VERSION_V3 && trace.records_refused_sends() {
+        if version < NETWORK_TRACE_VERSION_V3 && trace.records_refused_sends() {
             return Err(NetworkTraceValidationError::EmptyByteChunk.into());
         }
         trace.validate()?;
@@ -820,6 +931,10 @@ pub enum NetworkTraceValidationError {
     EventAfterTerminal,
     DuplicateChannel,
     TrafficOnFailedChannel,
+    WaitOnRefusedSend,
+    ZeroSendWaits,
+    SendWaitBeforeEpoch,
+    NonMonotonicSendWait,
 }
 
 impl fmt::Display for NetworkTraceValidationError {
@@ -1434,15 +1549,17 @@ mod tests {
                 ),
             ],
             outputs: vec![
-                NetworkOutputV1 {
+                NetworkOutputV4 {
                     channel: first,
                     stream_offset: 0,
                     bytes: b"req".to_vec(),
+                    wait: None,
                 },
-                NetworkOutputV1 {
+                NetworkOutputV4 {
                     channel: second,
                     stream_offset: 0,
                     bytes: b"hi".to_vec(),
+                    wait: None,
                 },
             ],
         }
@@ -1476,7 +1593,8 @@ mod tests {
             Some(v1.channels[0].local_address.clone())
         );
         assert_eq!(upgraded.inputs, v1.inputs);
-        assert_eq!(upgraded.outputs, v1.outputs);
+        let v1_outputs: Vec<NetworkOutputV4> = v1.outputs.into_iter().map(Into::into).collect();
+        assert_eq!(upgraded.outputs, v1_outputs);
     }
 
     #[test]
@@ -1494,11 +1612,120 @@ mod tests {
         let mut bytes = Vec::new();
         valid_trace_v2().write_framed(&mut bytes).unwrap();
         let start = NETWORK_TRACE_MAGIC.len();
-        bytes[start..start + 4].copy_from_slice(&4u32.to_le_bytes());
+        bytes[start..start + 4].copy_from_slice(&5u32.to_le_bytes());
         assert!(matches!(
             NetworkTraceV2::read_framed(Cursor::new(bytes)),
-            Err(NetworkTraceCodecError::UnsupportedVersion(4))
+            Err(NetworkTraceCodecError::UnsupportedVersion(5))
         ));
+    }
+
+    /// `valid_trace_v2` with one more fragment on the first channel, accepted
+    /// after its send waited twice.
+    fn waited_trace_v4() -> NetworkTraceV2 {
+        let mut trace = valid_trace_v2();
+        trace.outputs.push(NetworkOutputV4 {
+            channel: trace.channels[0].id,
+            stream_offset: 3,
+            bytes: b"more".to_vec(),
+            wait: Some(NetworkSendWaitV4 {
+                waits: 2,
+                not_before_global_time: global_time_after_epoch(20),
+            }),
+        });
+        trace
+    }
+
+    #[test]
+    fn network_trace_v4_holds_send_waits_that_v2_and_v3_cannot() {
+        let trace = waited_trace_v4();
+        let mut bytes = Vec::new();
+        trace.write_framed(&mut bytes).unwrap();
+        let start = NETWORK_TRACE_MAGIC.len();
+        assert_eq!(
+            bytes[start..start + 4],
+            NETWORK_TRACE_VERSION_V4.to_le_bytes()
+        );
+        assert_eq!(
+            NetworkTraceV2::read_framed(Cursor::new(bytes.clone())).unwrap(),
+            trace
+        );
+        // The older payloads have no field for a wait, so the same payload
+        // labelled v2 or v3 does not decode.
+        for older in [NETWORK_TRACE_VERSION_V2, NETWORK_TRACE_VERSION_V3] {
+            let mut relabelled = bytes.clone();
+            relabelled[start..start + 4].copy_from_slice(&older.to_le_bytes());
+            assert!(
+                NetworkTraceV2::read_framed(Cursor::new(relabelled)).is_err(),
+                "a v4 payload labelled v{older} decoded"
+            );
+        }
+        // A trace without a wait keeps its older version byte for byte.
+        let mut unwaited = Vec::new();
+        valid_trace_v2().write_framed(&mut unwaited).unwrap();
+        assert_eq!(
+            unwaited[start..start + 4],
+            NETWORK_TRACE_VERSION_V2.to_le_bytes()
+        );
+    }
+
+    #[test]
+    fn network_trace_v4_validation_rejects_each_malformed_wait() {
+        let check = |mutate: &dyn Fn(&mut NetworkTraceV2), expected| {
+            let mut trace = waited_trace_v4();
+            mutate(&mut trace);
+            assert_eq!(trace.validate(), Err(expected));
+        };
+        use NetworkTraceValidationError as E;
+        let wait_at = |nanos| {
+            Some(NetworkSendWaitV4 {
+                waits: 1,
+                not_before_global_time: global_time_after_epoch(nanos),
+            })
+        };
+        check(
+            &|t| {
+                t.outputs.push(NetworkOutputV4 {
+                    channel: t.channels[0].id,
+                    stream_offset: 7,
+                    bytes: Vec::new(),
+                    wait: wait_at(30),
+                })
+            },
+            E::WaitOnRefusedSend,
+        );
+        check(
+            &|t| t.outputs[2].wait.as_mut().unwrap().waits = 0,
+            E::ZeroSendWaits,
+        );
+        check(
+            &|t| {
+                let epoch = epoch_global_time(&t.epoch).unwrap().as_nanos();
+                t.outputs[2].wait.as_mut().unwrap().not_before_global_time =
+                    LogicalTime::from_nanos(epoch - 1);
+            },
+            E::SendWaitBeforeEpoch,
+        );
+        check(
+            &|t| {
+                t.outputs.push(NetworkOutputV4 {
+                    channel: t.channels[0].id,
+                    stream_offset: 7,
+                    bytes: b"x".to_vec(),
+                    wait: wait_at(19),
+                })
+            },
+            E::NonMonotonicSendWait,
+        );
+        // Monotonicity is per channel: an earlier wait on another channel
+        // after a later one on the first is valid.
+        let mut trace = waited_trace_v4();
+        trace.outputs.push(NetworkOutputV4 {
+            channel: trace.channels[1].id,
+            stream_offset: 2,
+            bytes: b"x".to_vec(),
+            wait: wait_at(5),
+        });
+        assert_eq!(trace.validate(), Ok(()));
     }
 
     #[test]
@@ -1507,10 +1734,11 @@ mod tests {
         let first = trace.channels[0].id;
         trace.outputs.insert(
             0,
-            NetworkOutputV1 {
+            NetworkOutputV4 {
                 channel: first,
                 stream_offset: 0,
                 bytes: Vec::new(),
+                wait: None,
             },
         );
         let mut bytes = Vec::new();
