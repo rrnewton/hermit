@@ -3377,11 +3377,11 @@ fn run_dbt_uses_the_normalized_backend_config() {
         "DBT did not consume the CLI-provided config:\n{stderr}",
     );
     assert!(
-        stderr.contains("backend_requires_thread_directed_process_signals: true"),
+        stderr.contains("requires_thread_directed_process_signals: true"),
         "DBT did not receive its required process-signal translation capability:\n{stderr}",
     );
     assert!(
-        !stderr.contains("backend_requires_thread_directed_process_signals: false"),
+        !stderr.contains("requires_thread_directed_process_signals: false"),
         "DBT received an unnormalized process-signal capability:\n{stderr}",
     );
 }

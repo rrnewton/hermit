@@ -1415,7 +1415,7 @@ impl GlobalTool for GlobalState {
                 // the identity-transfer RPC. This successful-exec edge still
                 // commits the frozen sibling cohort in scheduler order.
                 let prepared = self.pending_exec_states.lock().unwrap().get(&dtid).cloned();
-                if self.cfg.kvm_shared_dequeue_timers {
+                if self.cfg.shared_dequeue_timers {
                     let result = (|| {
                         let identity = signal_identity.ok_or(ProtocolFailure::Identity)?;
                         let pid = sched
@@ -2282,7 +2282,7 @@ impl GlobalState {
             {
                 return SchedulerRpcResult::ThreadExited;
             }
-            if self.cfg.backend_requires_thread_directed_process_signals && physical_ids.is_none() {
+            if self.cfg.backend.requires_thread_directed_process_signals && physical_ids.is_none() {
                 error!(
                     "[detcore, dtid {}] backend requires a host thread ID at StartNewThread",
                     dettid,
@@ -2338,7 +2338,7 @@ impl GlobalState {
                 sched.logically_kill_thread(&dettid, &detpid, request_mm);
                 return SchedulerRpcResult::ThreadExited;
             }
-            if self.cfg.kvm_shared_dequeue_timers {
+            if self.cfg.shared_dequeue_timers {
                 let binding = signal_identity
                     .ok_or(TimerFailure::Identity)
                     .and_then(|identity| {
@@ -3295,7 +3295,7 @@ where
 {
     let signal_identity = guest
         .config()
-        .kvm_shared_dequeue_timers
+        .shared_dequeue_timers
         .then(|| guest.signal_task_identity())
         .flatten();
     let detpid = guest.thread_state().detpid.expect("detpid unset");
@@ -3308,7 +3308,7 @@ where
         GlobalResponse::MarkPastFirstExecve(overrides) => overrides,
         _ => unreachable!(),
     };
-    if guest.config().kvm_shared_dequeue_timers {
+    if guest.config().shared_dequeue_timers {
         guest.thread_state_mut().signal_task_identity = signal_identity;
     }
     if !overrides.is_empty() {
@@ -4770,9 +4770,11 @@ mod tests {
     fn cancellation_test_state() -> (Config, GlobalState, DetTid, DetPid) {
         let config = Config {
             sequentialize_threads: true,
-            cancel_killed_thread_rpcs: true,
             ..Config::default()
-        };
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let state = GlobalState::initialize(&config, false);
         let dettid = DetTid::from_raw(17);
         let detpid = DetPid::from_raw(17);
@@ -5135,12 +5137,14 @@ mod tests {
 
         let config = Config {
             sequentialize_threads: true,
-            cancel_killed_thread_rpcs: true,
             // This control observes registration before the child starts; use
             // the supported parent-first order for the one turn it drives.
             runs_post_fork: crate::RunsPostFork::Parent,
             ..Config::default()
-        };
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let state = GlobalState::initialize(&config, false);
         let parent = DetTid::from_raw(17);
         let parent_pid = DetPid::from_raw(17);
@@ -6200,12 +6204,14 @@ mod tests {
 
         let config = Config {
             sequentialize_threads: true,
-            cancel_killed_thread_rpcs: true,
             // This test enters one callback while the caller owns its turn;
             // no guest instructions or PMU timer are needed to drive it.
             max_timeslice: None,
             ..Config::default()
-        };
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let state = GlobalState::initialize(&config, false);
         let leader = DetTid::from_raw(17);
         let detpid = DetPid::from_raw(17);
@@ -6891,10 +6897,12 @@ mod tests {
         .unwrap();
         let config = Config {
             sequentialize_threads: true,
-            cancel_killed_thread_rpcs: true,
             replay_schedule_from: Some(trace_file.path().to_path_buf()),
             ..Config::default()
-        };
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
         let state = GlobalState::initialize(&config, false);
         state
             .sched
@@ -6965,10 +6973,12 @@ mod tests {
     async fn required_physical_thread_id_missing_is_terminal() {
         let config = Config {
             sequentialize_threads: true,
-            cancel_killed_thread_rpcs: true,
-            backend_requires_thread_directed_process_signals: true,
             ..Config::default()
-        };
+        }
+        .with_backend(|backend| {
+            backend.needs_killed_thread_rpc_cancellation = true;
+            backend.requires_thread_directed_process_signals = true;
+        });
         let state = GlobalState::initialize(&config, false);
         let dettid = DetTid::from_raw(17);
         let detpid = DetPid::from_raw(17);
@@ -7410,12 +7420,13 @@ mod robust_exit_clock_tests {
             reason: RobustListExit,
             equal_clocks: bool,
             empty_owner: Option<usize>,
-            cancel_killed_thread_rpcs: bool,
+            needs_rpc_cancellation: bool,
         ) -> Self {
             let config = Config {
                 sequentialize_threads: true,
-                cancel_killed_thread_rpcs,
-                ..Config::default()
+                ..Config::default().with_backend(|backend| {
+                    backend.needs_killed_thread_rpc_cancellation = needs_rpc_cancellation
+                })
             };
             let state = GlobalState::initialize(&config, false);
             let parent = DetTid::from_raw(1);

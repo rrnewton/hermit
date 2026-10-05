@@ -85,6 +85,8 @@ pub use config::Config;
 pub use config::RunsPostFork;
 pub use config::SchedHeuristic;
 pub use config::config_wire_fingerprint;
+pub use config::from_legacy_backend_json;
+pub use config::to_legacy_backend_json;
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-1120): Review the public canonical Detcore root identity.
 pub use consts::ROOT_DETPID;
@@ -1139,7 +1141,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     type ThreadState = ThreadState<T::ThreadState>;
 
     fn observe_signal_dequeues(config: &Config) -> bool {
-        config.kvm_shared_dequeue_timers && config.sequentialize_threads
+        config.shared_dequeue_timers && config.sequentialize_threads
     }
 
     async fn handle_signal_dequeue<G: Guest<Self>>(
@@ -1179,7 +1181,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // own CPUID table (KVM) still needs the trap for the guest to see host values.
             let mut subscription = Subscription::all_syscalls();
             subscription.rdtsc();
-            if config.virtualize_cpuid || config.cpuid_virtualized_by_backend {
+            if config.virtualize_cpuid || config.backend.virtualizes_cpuid {
                 subscription.cpuid();
             }
             subscription
@@ -1635,7 +1637,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                             ))
                         }
                     },
-                    discover_live_file_metadata: pts.1.discover_live_file_metadata,
+                    tool_shares_guest_descriptor_table: pts.1.tool_shares_guest_descriptor_table,
                     // Linux copies the creating thread's current timer slack
                     // into both fields of every new task (thread or process).
                     timer_slack_ns: pts.1.timer_slack_ns,
@@ -1678,7 +1680,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     },
                     parent_cpu_publication: if clone_flags.contains(CloneFlags::CLONE_THREAD) {
                         pts.1.parent_cpu_publication.clone()
-                    } else if self.cfg.backend_is_kvm && self.cfg.sequentialize_threads {
+                    } else if self.cfg.backend.emulates_child_waits
+                        && self.cfg.sequentialize_threads
+                    {
                         Some(pts.1.prepare_child_cpu_publication(dettid))
                     } else {
                         None
@@ -1783,7 +1787,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             );
             let physical_ids = if guest
                 .config()
-                .backend_requires_thread_directed_process_signals
+                .backend
+                .requires_thread_directed_process_signals
             {
                 Some((
                     guest.pid().as_raw(),
@@ -3047,7 +3052,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // Defense-in-depth: unless the backend already owns this guarantee,
         // force the syscall-clobbered registers (%rcx/%r11 on x86-64) to
         // deterministic values before returning to the guest.
-        if !self.cfg.syscall_clobbers_virtualized_by_backend {
+        if !self.cfg.backend.virtualizes_syscall_clobbers {
             self.canonicalize_syscall_clobbers(guest).await;
         }
 
@@ -3440,8 +3445,7 @@ mod subscription_tests {
         // sees host values only through the trap: keep subscribing there.
         let kvm_host_cpuid = Config {
             virtualize_cpuid: false,
-            cpuid_virtualized_by_backend: true,
-            ..strict_config(false)
+            ..strict_config(false).with_backend(|backend| backend.virtualizes_cpuid = true)
         };
         assert_eq!(
             <Detcore as Tool>::subscriptions(&kvm_host_cpuid),

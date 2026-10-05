@@ -373,8 +373,11 @@ fn require_live_time_store_probe(replay_data_is_some: bool) -> Result<(), Error>
     }
 }
 
-fn should_repair_failed_gettimeofday_tv(backend_is_kvm: bool) -> bool {
-    !backend_is_kvm
+/// A failed `gettimeofday` needs its `tv` repaired only on a backend where the
+/// failing host call may already have stored host wall-clock words
+/// (`BackendCapabilities::failed_gettimeofday_may_store_host_time`).
+fn should_repair_failed_gettimeofday_tv(failed_call_may_store_host_time: bool) -> bool {
+    failed_call_may_store_host_time
 }
 
 /// Replaces the host wall-clock time that a `gettimeofday` failing with EFAULT
@@ -545,7 +548,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let time_ns = guest_clock_time(guest).await;
 
-        let repair_on_efault = should_repair_failed_gettimeofday_tv(guest.config().backend_is_kvm);
+        let repair_on_efault = should_repair_failed_gettimeofday_tv(
+            guest
+                .config()
+                .backend
+                .failed_gettimeofday_may_store_host_time,
+        );
         // What Detcore could read in `tv` before the call; the repair uses it
         // to confirm which words a failing call left alone.
         let before = match call.tv() {
@@ -1191,8 +1199,12 @@ mod tests {
 
         #[test]
         fn failed_gettimeofday_repair_is_skipped_only_for_kvm() {
-            assert!(should_repair_failed_gettimeofday_tv(false));
-            assert!(!should_repair_failed_gettimeofday_tv(true));
+            assert!(should_repair_failed_gettimeofday_tv(
+                reverie::BackendCapabilities::PTRACE.failed_gettimeofday_may_store_host_time
+            ));
+            assert!(!should_repair_failed_gettimeofday_tv(
+                reverie::BackendCapabilities::KVM.failed_gettimeofday_may_store_host_time
+            ));
         }
 
         #[test]

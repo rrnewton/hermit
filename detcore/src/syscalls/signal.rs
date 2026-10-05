@@ -575,7 +575,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         target_process: Option<DetPid>,
         target_thread: Option<DetTid>,
     ) -> bool {
-        if !self.cfg.kvm_shared_dequeue_timers {
+        if !self.cfg.shared_dequeue_timers {
             return false;
         }
         let (current_thread, mm) = {
@@ -633,7 +633,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             call.sig(),
             guest
                 .config()
-                .backend_requires_thread_directed_process_signals,
+                .backend
+                .requires_thread_directed_process_signals,
         ) {
             return Ok(self.record_or_replay(guest, call).await?);
         }
@@ -653,7 +654,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let tid = deterministic_kill_target(&targets, call.sig())?;
         let value = if !guest
             .config()
-            .backend_requires_thread_directed_process_signals
+            .backend
+            .requires_thread_directed_process_signals
         {
             self.record_or_replay(guest, call).await?
         } else {
@@ -799,7 +801,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         let tid = deterministic_kill_target(&targets, call.sig())?;
         let value = if !guest
             .config()
-            .backend_requires_thread_directed_process_signals
+            .backend
+            .requires_thread_directed_process_signals
         {
             self.record_or_replay(guest, call).await?
         } else {

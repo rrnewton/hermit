@@ -12,7 +12,8 @@ use reverie::syscalls::Errno;
 use reverie::syscalls::MemoryAccess;
 
 pub(crate) const MAX_RW_COUNT: usize = 0x7fff_f000;
-const KVM_USER_LIMIT: usize = (1_usize << 47) - 4096;
+#[cfg(test)]
+const FOUR_LEVEL_USER_LIMIT: usize = reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT as usize;
 
 /// A copied descriptor with its length capped by Linux's aggregate read limit.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -24,14 +25,26 @@ pub(crate) struct ImportedIovec {
 /// Structural address policy, independent of whether pages are mapped.
 #[derive(Clone, Copy)]
 pub(crate) enum UserAddressPolicy {
+    /// Ask the running kernel, which knows its own TASK_SIZE.
     Native,
-    Kvm,
+    /// The backend enforces this exclusive user address limit itself
+    /// (`BackendCapabilities::user_address_limit`).
+    Limit(usize),
 }
 
 impl UserAddressPolicy {
+    /// The policy for a backend's reported user address limit: `None` means
+    /// guest addresses are the host kernel's own.
+    pub(crate) fn for_backend(user_address_limit: Option<u64>) -> Self {
+        match user_address_limit {
+            Some(limit) => Self::Limit(usize::try_from(limit).unwrap_or(usize::MAX)),
+            None => Self::Native,
+        }
+    }
+
     pub(crate) fn validate(self, iovecs: &[ImportedIovec]) -> Result<(), Error> {
         match self {
-            Self::Kvm => validate_ranges(iovecs, KVM_USER_LIMIT).map_err(Error::from),
+            Self::Limit(limit) => validate_ranges(iovecs, limit).map_err(Error::from),
             Self::Native => {
                 let local: Vec<_> = iovecs
                     .iter()
@@ -44,7 +57,8 @@ impl UserAddressPolicy {
                 // vectors. That zero returns before PID lookup, page pinning,
                 // mapping checks or copying (mm/process_vm_access.c). Asking
                 // the running kernel preserves native LA57 without guessing
-                // its TASK_SIZE from CPU capabilities. KVM uses its own limit.
+                // its TASK_SIZE from CPU capabilities. A backend that enforces its own
+                // limit uses `Limit` instead.
                 let result = unsafe {
                     libc::process_vm_readv(
                         libc::getpid(),
@@ -207,15 +221,34 @@ mod tests {
     }
 
     #[test]
+    fn backend_user_address_limit_selects_the_policy() {
+        // The limit the KVM executor enforces, written out as before.
+        assert_eq!(FOUR_LEVEL_USER_LIMIT, (1_usize << 47) - 4096);
+        assert!(matches!(
+            UserAddressPolicy::for_backend(reverie::BackendCapabilities::KVM.user_address_limit),
+            UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
+        ));
+        assert!(matches!(
+            UserAddressPolicy::for_backend(reverie::BackendCapabilities::PTRACE.user_address_limit),
+            UserAddressPolicy::Native
+        ));
+    }
+
+    #[test]
     fn rng_iovecs_normalize_count_before_limits_or_memory() {
         let memory = ArrayMemory::new(vec![ImportedIovec {
             base: 0x2000,
             len: 3,
         }]);
         assert!(
-            import_read_iovecs(&memory, usize::MAX, 1 << 32, UserAddressPolicy::Kvm)
-                .unwrap()
-                .is_empty()
+            import_read_iovecs(
+                &memory,
+                usize::MAX,
+                1 << 32,
+                UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
+            )
+            .unwrap()
+            .is_empty()
         );
         assert_eq!(memory.reads.get(), 0);
         assert_eq!(
@@ -223,13 +256,19 @@ mod tests {
                 &memory,
                 0,
                 (1 << 32) | 1025,
-                UserAddressPolicy::Kvm
+                UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
             )),
             Errno::EINVAL
         );
         assert_eq!(memory.reads.get(), 0);
         assert_eq!(
-            import_read_iovecs(&memory, 0x1000, (1 << 32) | 1, UserAddressPolicy::Kvm).unwrap(),
+            import_read_iovecs(
+                &memory,
+                0x1000,
+                (1 << 32) | 1,
+                UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
+            )
+            .unwrap(),
             memory.vectors
         );
         assert_eq!(memory.reads.get(), 1);
@@ -244,9 +283,9 @@ mod tests {
         assert_eq!(
             errno(import_read_iovecs(
                 &memory,
-                KVM_USER_LIMIT - 8,
+                FOUR_LEVEL_USER_LIMIT - 8,
                 2,
-                UserAddressPolicy::Kvm
+                UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
             )),
             Errno::EFAULT
         );
@@ -256,7 +295,7 @@ mod tests {
                 &memory,
                 0x1000,
                 2,
-                UserAddressPolicy::Kvm
+                UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
             )),
             Errno::EINVAL
         );
@@ -280,7 +319,7 @@ mod tests {
                 &memory,
                 0x1000,
                 2,
-                UserAddressPolicy::Kvm
+                UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
             )),
             Errno::EINVAL
         );
@@ -295,7 +334,14 @@ mod tests {
         };
         let memory = ArrayMemory::new(vec![large]);
         assert_eq!(
-            import_read_iovecs(&memory, 0x1000, 1, UserAddressPolicy::Kvm).unwrap()[0].len,
+            import_read_iovecs(
+                &memory,
+                0x1000,
+                1,
+                UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
+            )
+            .unwrap()[0]
+                .len,
             MAX_RW_COUNT
         );
         let memory = ArrayMemory::new(vec![large, ImportedIovec { base: 0, len: 0 }]);
@@ -304,7 +350,7 @@ mod tests {
                 &memory,
                 0x1000,
                 2,
-                UserAddressPolicy::Kvm
+                UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
             )),
             Errno::EFAULT
         );
@@ -323,7 +369,7 @@ mod tests {
                 &memory,
                 0x1000,
                 2,
-                UserAddressPolicy::Kvm
+                UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT)
             )),
             Errno::EFAULT
         );
@@ -332,13 +378,13 @@ mod tests {
     #[test]
     fn rng_iovecs_preserve_zero_length_ceiling_inclusivity() {
         for (base, len, expected) in [
-            (KVM_USER_LIMIT, 0, Ok(())),
-            (KVM_USER_LIMIT, 1, Err(Errno::EFAULT)),
-            (KVM_USER_LIMIT + 1, 0, Err(Errno::EFAULT)),
+            (FOUR_LEVEL_USER_LIMIT, 0, Ok(())),
+            (FOUR_LEVEL_USER_LIMIT, 1, Err(Errno::EFAULT)),
+            (FOUR_LEVEL_USER_LIMIT + 1, 0, Err(Errno::EFAULT)),
             (0, 0, Ok(())),
         ] {
             assert_eq!(
-                validate_ranges(&[ImportedIovec { base, len }], KVM_USER_LIMIT),
+                validate_ranges(&[ImportedIovec { base, len }], FOUR_LEVEL_USER_LIMIT),
                 expected
             );
         }
@@ -380,7 +426,12 @@ mod tests {
                     },
                 ]);
                 memory.read_error = Some((attempt, error));
-                let result = import_read_iovecs(&memory, 0x1000, 2, UserAddressPolicy::Kvm);
+                let result = import_read_iovecs(
+                    &memory,
+                    0x1000,
+                    2,
+                    UserAddressPolicy::Limit(FOUR_LEVEL_USER_LIMIT),
+                );
                 assert_eq!(
                     memory.reads.get(),
                     attempt,

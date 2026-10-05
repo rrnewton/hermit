@@ -1854,9 +1854,11 @@ pub struct ThreadState<T> {
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-gated live descriptor discovery state.
-    /// Whether missing guest descriptors may be inspected in the current process.
+    /// Whether the tool runs in the guest's process and shares its descriptor
+    /// table, so a descriptor detcore has not seen yet may be inspected live
+    /// (copied from `BackendCapabilities::tool_shares_guest_descriptor_table`).
     #[serde(default)]
-    pub(crate) discover_live_file_metadata: bool,
+    pub(crate) tool_shares_guest_descriptor_table: bool,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-2150): Review the per-thread timer-slack state
@@ -2390,7 +2392,7 @@ impl<T> ThreadState<T> {
         let thread_logical_time = DetTime::new(cfg);
         let last_accounted_user_time = thread_logical_time.user_cpu_time();
         let last_accounted_system_time = thread_logical_time.system_cpu_time();
-        let file_metadata = if cfg.discover_live_file_metadata {
+        let file_metadata = if cfg.backend.tool_shares_guest_descriptor_table {
             let mut metadata = FileMetadata::new(pid);
             for fd in 0..=2 {
                 metadata
@@ -2413,7 +2415,7 @@ impl<T> ThreadState<T> {
             pedigree: Pedigree::new(), // Root thread.
             stats: ThreadStats::new(),
             file_metadata: Arc::new(Mutex::new(file_metadata)),
-            discover_live_file_metadata: cfg.discover_live_file_metadata,
+            tool_shares_guest_descriptor_table: cfg.backend.tool_shares_guest_descriptor_table,
             timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             default_timer_slack_ns: DEFAULT_TIMER_SLACK_NS,
             posix_timers: Arc::new(Mutex::new(PosixTimers::default())),
@@ -2736,7 +2738,7 @@ impl<T> ThreadState<T> {
         F: FnMut(&mut DetFd) -> U,
     {
         let mut metadata = self.metadata();
-        if self.discover_live_file_metadata {
+        if self.tool_shares_guest_descriptor_table {
             metadata.discover_fd_from_current_process(self.dettid, fd)?;
         }
         metadata.with_detfd(fd, f)
@@ -2806,7 +2808,7 @@ impl<T> ThreadState<T> {
         flags: OFlag,
     ) -> Result<Option<OpenFileId>, Errno> {
         let mut metadata = self.metadata();
-        if self.discover_live_file_metadata {
+        if self.tool_shares_guest_descriptor_table {
             metadata.discover_fd_from_current_process(self.dettid, oldfd)?;
         }
         metadata.dup_fd(oldfd, newfd, flags)
@@ -2825,7 +2827,7 @@ impl<T> ThreadState<T> {
         current_tid: DetTid,
     ) -> Result<CapturedDetFd, Errno> {
         let mut metadata = self.metadata();
-        if self.discover_live_file_metadata {
+        if self.tool_shares_guest_descriptor_table {
             metadata.discover_fd_from_current_process(self.dettid, pidfd)?;
         }
         let (is_pidfd, target) = metadata.with_detfd(pidfd, |detfd| {
@@ -2837,7 +2839,7 @@ impl<T> ThreadState<T> {
         if !pidfd_getfd_targets_calling_task(target, current_tgid, current_tid) {
             return Err(Errno::EOPNOTSUPP);
         }
-        if self.discover_live_file_metadata {
+        if self.tool_shares_guest_descriptor_table {
             metadata.discover_fd_from_current_process(self.dettid, targetfd)?;
         }
         metadata.capture_fd(targetfd)

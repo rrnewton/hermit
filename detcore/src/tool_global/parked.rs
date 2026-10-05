@@ -138,7 +138,7 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if !guest.config().kvm_shared_dequeue_timers {
+    if !guest.config().shared_dequeue_timers {
         return Ok(());
     }
     let current_identity = guest.signal_task_identity();
@@ -221,7 +221,7 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    if !guest.config().backend_is_kvm || !guest.config().kvm_shared_dequeue_timers {
+    if !guest.config().backend.emulates_child_waits || !guest.config().shared_dequeue_timers {
         terminate_protocol(guest, ProtocolFailure::Unsupported).await;
     }
     let Some(site) = guest.parked_signal_site() else {

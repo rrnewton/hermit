@@ -931,7 +931,12 @@ pub(super) fn run_dbt(
              remove --no-sequentialize-threads (or --strace-only) to run under --backend dbt",
         ));
     }
-    let config_json = serde_json::to_string(config).map_err(|error| {
+    // The guest sees this string in its environment, so it keeps the encoding
+    // it had before the backend facts moved into `Config::backend`. The DBT
+    // runtime decodes the backend facts back out of it (here DBT's own); when
+    // the string is absent or does not parse, it uses the strict default's
+    // facts, which are ptrace's.
+    let config_json = detcore::to_legacy_backend_json(config).map_err(|error| {
         Error::msg(format!(
             "failed to serialize the Detcore config for the DBT backend: {error}"
         ))

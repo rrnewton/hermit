@@ -2600,8 +2600,8 @@ async fn run_kvm(
     let envp = envp.iter().map(String::as_str).collect::<Vec<_>>();
 
     let setup_started = Instant::now();
-    config.cpuid_virtualized_by_backend = true;
-    config.backend_supports_madvise = false;
+    // `prepare_backend_config` already copied `KvmBackend::capabilities()`,
+    // which reports the backend's own CPUID table and its lack of madvise.
     // KVM does not enter Hermit's UTS namespace, so Detcore must provide the
     // same synthetic identity that the namespace-backed ptrace path exposes.
     // TODO-HUMAN-REVIEW(PR-998): Review KVM UTS namespace parity.
@@ -2748,7 +2748,12 @@ async fn run_dbt(
         ));
     }
 
-    let config_json = serde_json::to_string(&config)
+    // The guest sees this string in its environment, so it keeps the encoding
+    // it had before the backend facts moved into `Config::backend`. The DBT
+    // runtime decodes the backend facts back out of it (here DBT's own); when
+    // the string is absent or does not parse, it uses the strict default's
+    // facts, which are ptrace's.
+    let config_json = detcore::to_legacy_backend_json(&config)
         .map_err(|error| anyhow!("failed to serialize the Detcore config for DBT: {error}"))?;
     let panic_on_unsupported_syscalls = config.panic_on_unsupported_syscalls;
     let (drrun, client) = detcore_dbt::prepare_native_client()
@@ -2960,11 +2965,10 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     backend: Backend,
     liteinst_runtime: LiteinstRuntime,
 ) -> DetConfig {
-    let in_guest_liteinst =
-        backend == Backend::Liteinst && liteinst_runtime == LiteinstRuntime::InGuest;
-    config.discover_live_file_metadata = backend == Backend::Sabre;
-    // Three properties hold on every backend, so Config carries no switch for
-    // them:
+    // Detcore reads what the selected backend can do, never which backend it is.
+    // Each backend states its own facts in `Backend::capabilities()`.
+    //
+    // Three properties hold on every backend, so they are not capabilities:
     // - Guest-visible wall and monotonic clocks stay in the same global
     //   virtual-time domain as timers, sleeps, and timeout deadlines. SaBRe's
     //   per-thread execution clock does not advance when the scheduler skips
@@ -2977,38 +2981,51 @@ pub fn prepare_backend_config_for_liteinst_runtime(
     // TODO-HUMAN-REVIEW(PR-1013): Review backend child process execution ordering.
     // TODO-HUMAN-REVIEW(PR-1013): Review backend thread callback coverage.
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
-    config.detect_host_clock_futex_timeouts = backend == Backend::Sabre;
-    config.syscall_clobbers_virtualized_by_backend = backend == Backend::Sabre;
-    // Wake pending RPCs on logical removal, reject stale requests, and account
-    // the eventual deregistration exactly once. KVM has no native task exit
-    // that can resolve a removed thread's pending Tool future, and in-guest
-    // LiteInst, like DBT, has no ptrace exit-group teardown to resolve it.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3635): Review in-guest LiteInst killed-thread RPC cancellation.
-    config.cancel_killed_thread_rpcs =
-        in_guest_liteinst || matches!(backend, Backend::Sabre | Backend::Dbt | Backend::Kvm);
-    config.backend_reports_physical_process_exits = backend == Backend::Sabre;
-    config.backend_tracks_process_children = backend != Backend::Dbt;
-    // Ptrace reports the task exit after Linux has atomically updated every
-    // robust owner word. DBT and SaBRe report tool exit before executing the
-    // native exit syscall, while KVM does not execute a native task exit, so
-    // none of those backends can safely defer Detcore's modeled transition.
-    config.backend_runs_exit_robust_list = backend == Backend::Ptrace;
-    config.backend_requires_thread_directed_process_signals = backend == Backend::Dbt;
-    config.backend_is_kvm = backend == Backend::Kvm;
-    config.kvm_shared_dequeue_timers = config.backend_is_kvm && config.sequentialize_threads;
-    // E9patch preprocesses the guest and then uses the ptrace builder. LiteInst,
-    // DBT, KVM, and SaBRe re-invoke the Tool callback on ERESTARTSYS instead of
-    // resuming through the kernel's ptrace syscall-restart frame.
-    config.backend_supports_parked_write_signal_interruption =
-        matches!(backend, Backend::Ptrace | Backend::E9patch);
-    config.backend_virtualizes_capability_prctls = backend == Backend::Kvm;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
     // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
-    // the parent kernel-blocked until the child registers, so this stays false there.
-    config.backend_defers_vfork_child_registration = backend == Backend::Kvm;
+    // the parent kernel-blocked until the child registers.
+    config.backend = backend_capabilities(backend, liteinst_runtime);
+    // Combined policy, not a backend fact: tool-controlled shared dequeue
+    // timers need the backend's process signal control and a serial schedule.
+    config.shared_dequeue_timers =
+        config.backend.provides_process_signal_control && config.sequentialize_threads;
     config
+}
+
+/// What the selected backend can do, as Detcore consumes it.
+///
+/// Backends whose crate is always linked are asked directly. The LiteInst and
+/// DBT constants are checked against their crates by tests built with those
+/// features; the SaBRe and E9patch values have no such check.
+#[doc(hidden)]
+pub fn backend_capabilities(
+    backend: Backend,
+    liteinst_runtime: LiteinstRuntime,
+) -> reverie::BackendCapabilities {
+    match backend {
+        Backend::Ptrace => <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
+        Backend::Kvm => reverie_kvm::KvmBackend::capabilities(),
+        Backend::E9patch => {
+            let mut capabilities = reverie::BackendCapabilities::E9PATCH;
+            // This arm is reached only when a caller passes `Backend::E9patch`
+            // to this helper directly. `hermit run --backend=e9patch` maps the
+            // selection to `Backend::Ptrace` before it configures the run, so
+            // that run takes ptrace's value. A direct caller has always seen
+            // the robust-list transition left undeferred, and this keeps that.
+            // TODO: decide whether this direct path should inherit ptrace's value.
+            capabilities.runs_exit_robust_list = false;
+            capabilities
+        }
+        Backend::Liteinst => match liteinst_runtime {
+            LiteinstRuntime::HostHybrid => reverie::BackendCapabilities::LITEINST_HOST_HYBRID,
+            LiteinstRuntime::InGuest => reverie::BackendCapabilities::LITEINST_IN_GUEST,
+        },
+        Backend::Sabre => reverie::BackendCapabilities::SABRE,
+        Backend::Dbt => reverie::BackendCapabilities::DBT,
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
@@ -5310,7 +5327,8 @@ mod tests {
                 Backend::Liteinst,
                 LiteinstRuntime::InGuest,
             )
-            .cancel_killed_thread_rpcs
+            .backend
+            .needs_killed_thread_rpc_cancellation
         );
         assert!(
             !prepare_backend_config_for_liteinst_runtime(
@@ -5318,7 +5336,8 @@ mod tests {
                 Backend::Liteinst,
                 LiteinstRuntime::HostHybrid,
             )
-            .cancel_killed_thread_rpcs
+            .backend
+            .needs_killed_thread_rpc_cancellation
         );
         // The LiteInst runtime selection changes no other backend.
         assert!(
@@ -5327,35 +5346,44 @@ mod tests {
                 Backend::Ptrace,
                 LiteinstRuntime::InGuest,
             )
-            .cancel_killed_thread_rpcs
+            .backend
+            .needs_killed_thread_rpc_cancellation
         );
     }
 
     #[test]
     fn sabre_backend_configures_process_local_capabilities() {
         let config = super::DetConfig::default();
-        let sabre = prepare_backend_config(config.clone(), Backend::Sabre);
-        assert!(sabre.discover_live_file_metadata);
-        assert!(sabre.detect_host_clock_futex_timeouts);
-        assert!(sabre.syscall_clobbers_virtualized_by_backend);
-        assert!(sabre.cancel_killed_thread_rpcs);
-        assert!(sabre.backend_reports_physical_process_exits);
-        assert!(sabre.backend_tracks_process_children);
-        assert!(!sabre.backend_runs_exit_robust_list);
-        assert!(!sabre.backend_requires_thread_directed_process_signals);
-        assert!(!sabre.backend_virtualizes_capability_prctls);
-        assert!(!sabre.backend_defers_vfork_child_registration);
-        let ptrace = prepare_backend_config(config, Backend::Ptrace);
-        assert!(!ptrace.discover_live_file_metadata);
-        assert!(!ptrace.detect_host_clock_futex_timeouts);
-        assert!(!ptrace.syscall_clobbers_virtualized_by_backend);
-        assert!(!ptrace.cancel_killed_thread_rpcs);
-        assert!(!ptrace.backend_reports_physical_process_exits);
-        assert!(ptrace.backend_tracks_process_children);
-        assert!(ptrace.backend_runs_exit_robust_list);
-        assert!(!ptrace.backend_requires_thread_directed_process_signals);
-        assert!(!ptrace.backend_virtualizes_capability_prctls);
-        assert!(!ptrace.backend_defers_vfork_child_registration);
+        let sabre = prepare_backend_config(config.clone(), Backend::Sabre).backend;
+        assert!(sabre.tool_shares_guest_descriptor_table);
+        assert!(sabre.rediscovers_descriptors_after_exec);
+        assert!(sabre.internal_pipe_turns_are_host_timed);
+        assert!(sabre.loopback_pollers_yield_to_peers);
+        assert!(sabre.guest_clock_reads_bypass_backend);
+        assert!(sabre.virtualizes_syscall_clobbers);
+        assert!(sabre.needs_killed_thread_rpc_cancellation);
+        assert!(sabre.reports_physical_process_exits);
+        assert!(sabre.signal_interrupts_external_syscalls);
+        assert!(sabre.tracks_process_children);
+        assert!(!sabre.runs_exit_robust_list);
+        assert!(!sabre.requires_thread_directed_process_signals);
+        assert!(!sabre.virtualizes_capability_prctls);
+        assert!(!sabre.defers_vfork_child_registration);
+        let ptrace = prepare_backend_config(config, Backend::Ptrace).backend;
+        assert!(!ptrace.tool_shares_guest_descriptor_table);
+        assert!(!ptrace.rediscovers_descriptors_after_exec);
+        assert!(!ptrace.internal_pipe_turns_are_host_timed);
+        assert!(!ptrace.loopback_pollers_yield_to_peers);
+        assert!(!ptrace.guest_clock_reads_bypass_backend);
+        assert!(!ptrace.virtualizes_syscall_clobbers);
+        assert!(!ptrace.needs_killed_thread_rpc_cancellation);
+        assert!(!ptrace.reports_physical_process_exits);
+        assert!(!ptrace.signal_interrupts_external_syscalls);
+        assert!(ptrace.tracks_process_children);
+        assert!(ptrace.runs_exit_robust_list);
+        assert!(!ptrace.requires_thread_directed_process_signals);
+        assert!(!ptrace.virtualizes_capability_prctls);
+        assert!(!ptrace.defers_vfork_child_registration);
     }
 
     #[test]
@@ -5393,31 +5421,343 @@ mod tests {
         let defaults = super::DetConfig::default();
         assert!(!defaults.sequentialize_threads);
         let nonsequential = prepare_backend_config(defaults, Backend::Kvm);
-        assert!(nonsequential.backend_is_kvm);
-        assert!(!nonsequential.kvm_shared_dequeue_timers);
+        assert!(nonsequential.backend.provides_process_signal_control);
+        assert!(nonsequential.backend.emulates_child_waits);
+        assert!(!nonsequential.shared_dequeue_timers);
 
         let config = super::DetConfig {
             sequentialize_threads: true,
             ..super::DetConfig::default()
         };
         let kvm = prepare_backend_config(config, Backend::Kvm);
-        assert!(kvm.cancel_killed_thread_rpcs);
-        assert!(kvm.kvm_shared_dequeue_timers);
-        assert!(kvm.backend_tracks_process_children);
-        assert!(!kvm.backend_runs_exit_robust_list);
-        assert!(!kvm.backend_requires_thread_directed_process_signals);
-        assert!(kvm.backend_virtualizes_capability_prctls);
-        assert!(kvm.backend_defers_vfork_child_registration);
+        assert!(kvm.shared_dequeue_timers);
+        assert!(kvm.backend.needs_killed_thread_rpc_cancellation);
+        assert!(kvm.backend.tracks_process_children);
+        assert!(!kvm.backend.runs_exit_robust_list);
+        assert!(!kvm.backend.requires_thread_directed_process_signals);
+        assert!(kvm.backend.virtualizes_capability_prctls);
+        assert!(kvm.backend.defers_vfork_child_registration);
+
+        // Shared dequeue timers need both the backend's process-signal control
+        // and sequentialized threads; neither alone enables them.
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::E9patch,
+        ] {
+            let config = super::DetConfig {
+                sequentialize_threads: true,
+                ..super::DetConfig::default()
+            };
+            assert!(
+                !prepare_backend_config(config, backend).shared_dequeue_timers,
+                "{backend:?}"
+            );
+        }
+    }
+
+    /// The values the hand-written assignments in `prepare_backend_config` and
+    /// `run_kvm` gave each backend before Detcore read
+    /// [`reverie::BackendCapabilities`], transcribed field by field. A backend
+    /// identity check became the capability it selected:
+    /// `discover_live_file_metadata` split into the first four fields, the old
+    /// `backend_reports_physical_process_exits` became two, and
+    /// `backend_is_kvm` became the last five.
+    fn golden_backend_capabilities(
+        backend: Backend,
+        liteinst_runtime: LiteinstRuntime,
+    ) -> serde_json::Value {
+        let sabre = backend == Backend::Sabre;
+        let kvm = backend == Backend::Kvm;
+        let dbt = backend == Backend::Dbt;
+        let in_guest_liteinst =
+            backend == Backend::Liteinst && liteinst_runtime == LiteinstRuntime::InGuest;
+        serde_json::json!({
+            "tool_shares_guest_descriptor_table": sabre,
+            "rediscovers_descriptors_after_exec": sabre,
+            "internal_pipe_turns_are_host_timed": sabre,
+            "loopback_pollers_yield_to_peers": sabre,
+            "guest_clock_reads_bypass_backend": sabre,
+            "virtualizes_syscall_clobbers": sabre,
+            "needs_killed_thread_rpc_cancellation": in_guest_liteinst || sabre || dbt || kvm,
+            "reports_physical_process_exits": sabre,
+            "signal_interrupts_external_syscalls": sabre,
+            "tracks_process_children": !dbt,
+            "runs_exit_robust_list": backend == Backend::Ptrace,
+            "requires_thread_directed_process_signals": dbt,
+            "supports_parked_write_signal_interruption":
+                matches!(backend, Backend::Ptrace | Backend::E9patch),
+            "defers_vfork_child_registration": kvm,
+            "virtualizes_capability_prctls": kvm,
+            // `run_kvm` set these two after `prepare_backend_config`.
+            "virtualizes_cpuid": kvm,
+            "supports_madvise": !kvm,
+            "provides_process_signal_control": kvm,
+            "emulates_child_waits": kvm,
+            "failed_gettimeofday_may_store_host_time": !kvm,
+            "refuses_nonleader_exec_with_enosys": kvm,
+            "user_address_limit":
+                kvm.then_some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT),
+        })
+    }
+
+    #[test]
+    fn backend_capabilities_match_the_golden_table() {
+        for (backend, liteinst_runtime) in [
+            (Backend::Ptrace, LiteinstRuntime::HostHybrid),
+            (Backend::Kvm, LiteinstRuntime::HostHybrid),
+            (Backend::E9patch, LiteinstRuntime::HostHybrid),
+            (Backend::Liteinst, LiteinstRuntime::HostHybrid),
+            (Backend::Liteinst, LiteinstRuntime::InGuest),
+            (Backend::Sabre, LiteinstRuntime::HostHybrid),
+            (Backend::Dbt, LiteinstRuntime::HostHybrid),
+            // The LiteInst runtime selection changes no other backend.
+            (Backend::Ptrace, LiteinstRuntime::InGuest),
+            (Backend::Kvm, LiteinstRuntime::InGuest),
+            (Backend::Sabre, LiteinstRuntime::InGuest),
+            (Backend::Dbt, LiteinstRuntime::InGuest),
+        ] {
+            let config = prepare_backend_config_for_liteinst_runtime(
+                super::DetConfig::default(),
+                backend,
+                liteinst_runtime,
+            );
+            assert_eq!(
+                serde_json::to_value(config.backend).unwrap(),
+                golden_backend_capabilities(backend, liteinst_runtime),
+                "{backend:?} with LiteInst runtime {liteinst_runtime:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_capabilities_are_the_ones_each_backend_reports() {
+        assert_eq!(
+            super::backend_capabilities(Backend::Ptrace, LiteinstRuntime::HostHybrid),
+            <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities()
+        );
+        assert_eq!(
+            super::backend_capabilities(Backend::Kvm, LiteinstRuntime::HostHybrid),
+            reverie_kvm::KvmBackend::capabilities()
+        );
+        #[cfg(feature = "liteinst")]
+        {
+            assert_eq!(
+                super::backend_capabilities(Backend::Liteinst, LiteinstRuntime::InGuest),
+                <reverie_liteinst::LiteinstBackend as reverie::Backend>::capabilities()
+            );
+            assert_eq!(
+                super::backend_capabilities(Backend::Liteinst, LiteinstRuntime::HostHybrid),
+                reverie_liteinst::LiteinstBackend::host_capabilities()
+            );
+        }
+        #[cfg(feature = "dbt")]
+        {
+            assert_eq!(
+                super::backend_capabilities(Backend::Dbt, LiteinstRuntime::HostHybrid),
+                reverie_dbt::DbtRunner::capabilities()
+            );
+            // The DBT runtime re-asserts the same value when it loads the
+            // configuration this crate serializes for it.
+            assert_eq!(
+                super::backend_capabilities(Backend::Dbt, LiteinstRuntime::HostHybrid),
+                detcore_dbt::backend_capabilities()
+            );
+        }
+    }
+
+    /// `Config` with its three environment-backed fields (`HERMIT_EPOCH`,
+    /// `HERMIT_PRNG`, `HERMIT_SCHED_SEED`) pinned, so the encoding does not
+    /// depend on the test process's environment.
+    fn env_free_detconfig(epoch: &str, seed: &str) -> DetConfig {
+        use clap::Parser;
+        let mut config = DetConfig::parse_from(["hermit", epoch, seed, "--sched-seed=0"]);
+        config.sched_seed = None;
+        config
+    }
+
+    /// Non-default values in fields that serialize as strings, floats,
+    /// options and nested arrays. The path contains legacy key names, so an
+    /// encoder that edited text would put a key inside a string value.
+    fn rich_detconfig() -> DetConfig {
+        let mut config = env_free_detconfig("--epoch=2000-12-31T23:59:59Z", "--seed=7");
+        config.rng_seed = Some(13);
+        config.sched_seed = Some(11);
+        config.clock_multiplier = Some(1.5);
+        config.chaos = true;
+        config.record_preemptions_to = Some(std::path::PathBuf::from(
+            "/tmp/a,\"detect_host_clock_futex_timeouts\":true,\"backend_tracks_process_children\":{",
+        ));
+        config.mountinfo_root_rewrites = vec![detcore_model::config::MountInfoRootRewrite {
+            raw_mount_id: 41,
+            deterministic_root: b"/".to_vec(),
+            raw_root_prefix: Some(b"/tmp/x".to_vec()),
+            deterministic_root_prefix: Some(b"/tmp".to_vec()),
+            raw_mountpoint_prefix: None,
+            deterministic_mountpoint_prefix: None,
+        }];
+        config.stacktrace_event = vec![(3, Some(std::path::PathBuf::from("/s")))];
+        config
+    }
+
+    /// `HERMIT_DBT_DETCONFIG` is in the guest's environment, so a guest can
+    /// read it with `getenv` or `/proc/self/environ`. These are its bytes
+    /// before Detcore read [`reverie::BackendCapabilities`]: the output of
+    /// `serde_json::to_string` on the same configs, captured from a build of
+    /// the commit before that change, when `Config` still had one boolean
+    /// field per backend switch. Every DBT run sequentializes threads, so the
+    /// DBT cases do too.
+    #[test]
+    fn dbt_detconfig_bytes_are_unchanged_by_backend_capabilities() {
+        let sequential = |mut config: DetConfig| {
+            config.sequentialize_threads = true;
+            config
+        };
+        let default_config = || env_free_detconfig("--epoch=2026-01-01T00:00:00Z", "--seed=0");
+        for (name, config, before) in [
+            (
+                "default",
+                default_config(),
+                include_str!("../tests/fixtures/dbt/detconfig-before-capabilities-default.json"),
+            ),
+            (
+                "dbt",
+                prepare_backend_config(sequential(default_config()), Backend::Dbt),
+                include_str!("../tests/fixtures/dbt/detconfig-before-capabilities-dbt.json"),
+            ),
+            (
+                "rich_dbt",
+                prepare_backend_config(sequential(rich_detconfig()), Backend::Dbt),
+                include_str!("../tests/fixtures/dbt/detconfig-before-capabilities-rich_dbt.json"),
+            ),
+        ] {
+            assert_eq!(
+                detcore::to_legacy_backend_json(&config).unwrap(),
+                before,
+                "HERMIT_DBT_DETCONFIG for the {name} config changed"
+            );
+            // A reader of the earlier bytes recovers the capabilities.
+            let decoded = detcore::from_legacy_backend_json(before).unwrap();
+            assert_eq!(decoded.backend, config.backend, "{name}");
+            assert_eq!(
+                decoded.shared_dequeue_timers, config.shared_dequeue_timers,
+                "{name}"
+            );
+        }
+    }
+
+    /// The fifteen per-backend keys, in the order the encoding has always
+    /// carried them.
+    const LEGACY_BACKEND_KEYS: [&str; 15] = [
+        "cpuid_virtualized_by_backend",
+        "backend_supports_madvise",
+        "discover_live_file_metadata",
+        "detect_host_clock_futex_timeouts",
+        "syscall_clobbers_virtualized_by_backend",
+        "cancel_killed_thread_rpcs",
+        "backend_reports_physical_process_exits",
+        "backend_tracks_process_children",
+        "backend_runs_exit_robust_list",
+        "backend_requires_thread_directed_process_signals",
+        "backend_is_kvm",
+        "kvm_shared_dequeue_timers",
+        "backend_supports_parked_write_signal_interruption",
+        "backend_virtualizes_capability_prctls",
+        "backend_defers_vfork_child_registration",
+    ];
+
+    /// Only DBT puts the encoding in a guest's environment, but every backend
+    /// must encode the facts it had before. Each string is one digit per key
+    /// in [`LEGACY_BACKEND_KEYS`], captured with `serde_json::to_string` from
+    /// `prepare_backend_config_for_liteinst_runtime` at the commit before
+    /// Detcore read [`reverie::BackendCapabilities`], once without and once
+    /// with sequentialized threads. KVM's first two digits are the values
+    /// `run_kvm` then set before it started Detcore; they are capabilities now,
+    /// so the prepared config already has them.
+    #[test]
+    fn every_backend_encodes_its_previous_backend_keys() {
+        for (backend, liteinst_runtime, unsequenced, sequential) in [
+            (
+                Backend::Ptrace,
+                LiteinstRuntime::HostHybrid,
+                "010000011000100",
+                "010000011000100",
+            ),
+            (
+                Backend::E9patch,
+                LiteinstRuntime::HostHybrid,
+                "010000010000100",
+                "010000010000100",
+            ),
+            (
+                Backend::Liteinst,
+                LiteinstRuntime::HostHybrid,
+                "010000010000000",
+                "010000010000000",
+            ),
+            (
+                Backend::Liteinst,
+                LiteinstRuntime::InGuest,
+                "010001010000000",
+                "010001010000000",
+            ),
+            (
+                Backend::Sabre,
+                LiteinstRuntime::HostHybrid,
+                "011111110000000",
+                "011111110000000",
+            ),
+            (
+                Backend::Dbt,
+                LiteinstRuntime::HostHybrid,
+                "010001000100000",
+                "010001000100000",
+            ),
+            (
+                Backend::Kvm,
+                LiteinstRuntime::HostHybrid,
+                "100001010010011",
+                "100001010011011",
+            ),
+        ] {
+            for (sequentialize_threads, expected) in [(false, unsequenced), (true, sequential)] {
+                let config = prepare_backend_config_for_liteinst_runtime(
+                    DetConfig {
+                        sequentialize_threads,
+                        ..DetConfig::default()
+                    },
+                    backend,
+                    liteinst_runtime,
+                );
+                let encoded: serde_json::Map<String, serde_json::Value> =
+                    serde_json::from_str(&detcore::to_legacy_backend_json(&config).unwrap())
+                        .unwrap();
+                let digits: String = LEGACY_BACKEND_KEYS
+                    .iter()
+                    .map(|key| match encoded.get(*key) {
+                        Some(serde_json::Value::Bool(true)) => '1',
+                        Some(serde_json::Value::Bool(false)) => '0',
+                        other => panic!("{key} encoded as {other:?}"),
+                    })
+                    .collect();
+                assert_eq!(
+                    digits, expected,
+                    "{backend:?} ({liteinst_runtime:?}), sequentialize_threads={sequentialize_threads}"
+                );
+            }
+        }
     }
 
     #[test]
     fn dbt_backend_config_translates_process_signals_to_host_threads() {
         let config = prepare_backend_config(super::DetConfig::default(), Backend::Dbt);
-        assert!(config.cancel_killed_thread_rpcs);
-        assert!(!config.backend_tracks_process_children);
-        assert!(!config.backend_runs_exit_robust_list);
-        assert!(config.backend_requires_thread_directed_process_signals);
-        assert!(!config.backend_defers_vfork_child_registration);
+        assert!(config.backend.needs_killed_thread_rpc_cancellation);
+        assert!(!config.backend.tracks_process_children);
+        assert!(!config.backend.runs_exit_robust_list);
+        assert!(config.backend.requires_thread_directed_process_signals);
+        assert!(!config.backend.defers_vfork_child_registration);
     }
 
     #[test]
@@ -5432,7 +5772,7 @@ mod tests {
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
             assert_eq!(
-                config.backend_supports_parked_write_signal_interruption, supports_interruption,
+                config.backend.supports_parked_write_signal_interruption, supports_interruption,
                 "unexpected parked-write signal support for {backend:?}"
             );
         }

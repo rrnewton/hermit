@@ -553,14 +553,17 @@ fn validate_wait4_arguments(pid: libc::pid_t, options: WaitPidFlag) -> Result<()
     Ok(())
 }
 
-// Serial KVM represents terminal events only, including the terminal subset
+// A serial emulated child wait (today KVM) represents terminal events only, including the terminal subset
 // of WUNTRACED. `__WNOTHREAD` is enforced by the logical owner filter in
 // `terminal_child_wait_spec`, and exact-child completion strips it before
 // the backend call. Keep unsupported and unknown low-int bits on the
 // backend's prevalidation path; they must not select or consume a logical
 // child.
-pub(super) fn wait4_uses_terminal_selector(options: WaitPidFlag, serial_kvm: bool) -> bool {
-    if serial_kvm {
+pub(super) fn wait4_uses_terminal_selector(
+    options: WaitPidFlag,
+    serial_emulated_wait: bool,
+) -> bool {
+    if serial_emulated_wait {
         options.bits() & !(libc::WNOHANG | libc::WUNTRACED | libc::__WNOTHREAD) == 0
     } else {
         !options.intersects(
@@ -572,7 +575,7 @@ pub(super) fn wait4_uses_terminal_selector(options: WaitPidFlag, serial_kvm: boo
     }
 }
 
-pub(super) async fn complete_selected_kvm_wait4<G, T>(
+pub(super) async fn complete_selected_emulated_wait4<G, T>(
     guest: &mut G,
     call: syscalls::Wait4,
     child: DetPid,
@@ -745,7 +748,8 @@ where
         .with_set(
             (!guest
                 .config()
-                .backend_requires_thread_directed_process_signals)
+                .backend
+                .requires_thread_directed_process_signals)
                 .then_some(blocked_mask_addr.cast()),
         )
         .with_oldset(Some(old_mask_addr.cast()))
@@ -764,7 +768,8 @@ where
 {
     if !guest
         .config()
-        .backend_requires_thread_directed_process_signals
+        .backend
+        .requires_thread_directed_process_signals
     {
         let old_mask: Addr<'_, KernelSigset> = old_mask_addr.into();
         let restore_signals = syscalls::RtSigprocmask::new()
@@ -789,7 +794,8 @@ where
 {
     if !guest
         .config()
-        .backend_requires_thread_directed_process_signals
+        .backend
+        .requires_thread_directed_process_signals
     {
         return Err(Errno::ERESTARTSYS.into());
     }
@@ -889,7 +895,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(Some(now + Duration::from_nanos(nanos)))
             }
             FutexTimeout::Absolute(deadline)
-                if self.cfg.virtualize_time && !self.cfg.detect_host_clock_futex_timeouts =>
+                if self.cfg.virtualize_time
+                    && !self.cfg.backend.guest_clock_reads_bypass_backend =>
             {
                 Ok(Some(deadline))
             }
@@ -906,7 +913,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let clock_call = syscalls::ClockGettime::new()
                     .with_clockid(clockid)
                     .with_tp(Some(clock_output));
-                if self.cfg.virtualize_time && self.cfg.detect_host_clock_futex_timeouts {
+                if self.cfg.virtualize_time && self.cfg.backend.guest_clock_reads_bypass_backend {
                     // Read the same live host clock as a direct guest vDSO call. Replaying a
                     // recorded value here would compare this run's host-domain deadline with the
                     // previous run's clock and turn a short timeout into an arbitrary long one.
@@ -1172,7 +1179,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     // TODO-HUMAN-REVIEW(PR-2223): Review owner-death wakeup
     // emulation, which changes how a dying thread's peers are scheduled.
     async fn run_robust_list_owner_death<G: Guest<Self>>(&self, guest: &mut G) {
-        if !self.cfg.backend_runs_exit_robust_list
+        if !self.cfg.backend.runs_exit_robust_list
             || !self.cfg.sequentialize_threads
             || self.cfg.debug_futex_mode != BlockingMode::Precise
         {
@@ -1225,7 +1232,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         reason: RobustListExit,
     ) {
-        if !self.cfg.backend_runs_exit_robust_list
+        if !self.cfg.backend.runs_exit_robust_list
             || !self.cfg.sequentialize_threads
             || self.cfg.debug_futex_mode != BlockingMode::Precise
         {
@@ -1543,7 +1550,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 new_metadata.exec_blocking_overrides(),
             )
         };
-        let preserve_exec_fd_status = guest.thread_state().discover_live_file_metadata;
+        let preserve_exec_fd_status = guest.config().backend.rediscovers_descriptors_after_exec;
 
         prepare_exec(
             guest,
@@ -1592,10 +1599,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        // KVM validates the replacement image before refusing a worker's
-        // promotion to group leader. Diagnose that refusal only after normal
-        // failed-exec rollback, preserving errors such as ENOENT and ENOEXEC.
-        if self.cfg.backend_is_kvm && dettid != detpid && errno == Errno::ENOSYS {
+        // A backend that refuses nonleader exec with ENOSYS (today KVM)
+        // validates the replacement image before refusing a worker's promotion
+        // to group leader. Diagnose that refusal only after normal failed-exec
+        // rollback, preserving errors such as ENOENT and ENOEXEC.
+        if self.cfg.backend.refuses_nonleader_exec_with_enosys
+            && dettid != detpid
+            && errno == Errno::ENOSYS
+        {
             tracing::error!(
                 "[detcore, dtid {dettid}] KVM nonleader exec is unsupported; \
                  the replacement image did not run"
@@ -1666,8 +1677,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Wait4,
     ) -> Result<i64, Error> {
-        let serial_kvm = guest.config().backend_is_kvm && guest.config().sequentialize_threads;
-        let mut kvm_consumed = false;
+        let serial_emulated_wait =
+            guest.config().backend.emulates_child_waits && guest.config().sequentialize_threads;
+        let mut emulated_wait_consumed = false;
         let dettid = guest.thread_state().dettid;
         let mut rsrc = Resources::new(dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
@@ -1680,7 +1692,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // process clones also remain legacy until backends distinguish
         // PTRACE_EVENT_CLONE from CLONE_THREAD. The common matcher already
         // carries those filters so activation does not require another model.
-        let selector = if !wait4_uses_terminal_selector(call.options(), serial_kvm) {
+        let selector = if !wait4_uses_terminal_selector(call.options(), serial_emulated_wait) {
             None
         } else {
             match call.pid() {
@@ -1695,7 +1707,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let spec = selector
             .map(|selector| terminal_child_wait_spec(selector, dettid, call.options().bits()));
-        let complete_lineage = guest.config().backend_tracks_process_children;
+        let complete_lineage = guest.config().backend.tracks_process_children;
         let managed_spec = if let Some(spec) = spec {
             let (_, has_child) = ready_child_wait(guest, spec).await;
             (has_child || complete_lineage).then_some(spec)
@@ -1724,15 +1736,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let _ = await_exact_child_physical_exit(guest, child).await;
                     let exact_call = call.with_pid(child.as_raw());
                     loop {
-                        let result = if serial_kvm {
-                            complete_selected_kvm_wait4(guest, exact_call, child).await
+                        let result = if serial_emulated_wait {
+                            complete_selected_emulated_wait4(guest, exact_call, child).await
                         } else {
                             guest
                                 .inject_with_retry(exact_call)
                                 .await
                                 .map_err(Error::from)
                         };
-                        kvm_consumed = serial_kvm && matches!(result, Ok(value) if value > 0);
+                        emulated_wait_consumed =
+                            serial_emulated_wait && matches!(result, Ok(value) if value > 0);
                         match result {
                             Ok(value) if value != 0 => break 'select_child value,
                             Ok(_) => yield_once().await,
@@ -1767,7 +1780,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                     block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
                 let inspect_signal_action = guest
                     .config()
-                    .backend_requires_thread_directed_process_signals;
+                    .backend
+                    .requires_thread_directed_process_signals;
 
                 let poll_call = call.with_options(call.options() | WaitPidFlag::WNOHANG);
                 let mut pending_signal = None;
@@ -1786,15 +1800,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     let (ready, has_child) = ready_child_wait(guest, spec).await;
                     if let Some(child) = ready {
                         let _ = await_exact_child_physical_exit(guest, child).await;
-                        let result = if serial_kvm {
-                            complete_selected_kvm_wait4(guest, call, child).await
+                        let result = if serial_emulated_wait {
+                            complete_selected_emulated_wait4(guest, call, child).await
                         } else {
                             guest
                                 .inject_with_retry(call.with_pid(child.as_raw()))
                                 .await
                                 .map_err(Error::from)
                         };
-                        kvm_consumed = serial_kvm && matches!(result, Ok(value) if value > 0);
+                        emulated_wait_consumed =
+                            serial_emulated_wait && matches!(result, Ok(value) if value > 0);
                         match result {
                             Ok(value) => break Ok(value),
                             Err(Error::Errno(Errno::ECHILD)) => {
@@ -1822,7 +1837,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     if !has_child {
                         break Err(Errno::ECHILD.into());
                     }
-                    if serial_kvm {
+                    if serial_emulated_wait {
                         // A broad backend poll can become consuming while the
                         // owner callback is still publishing logical/CPU state.
                         // Only a selected exact identity may cross that boundary.
@@ -1853,7 +1868,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             // so it is not routed through the record/replay subtool.
             retry_nonblocking_syscall(guest, call, rsrc, None).await?
         };
-        let consumed_termination = if kvm_consumed || value <= 0 {
+        let consumed_termination = if emulated_wait_consumed || value <= 0 {
             false
         } else if let Some(status) = call.wstatus() {
             wait_status_is_termination(guest.memory().read_value(status)?)
@@ -1888,10 +1903,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         mut call: syscalls::Waitid,
     ) -> Result<i64, Error> {
-        // The serial KVM path can delegate ordered user copyout to its backend.
-        // Enter before the legacy NULL rejection and whole-siginfo writes;
-        // ptrace, DBT and nonsequential execution retain their existing path.
-        if guest.config().backend_is_kvm && guest.config().sequentialize_threads {
+        // A backend that emulates child waits (today KVM) can delegate ordered
+        // user copyout to itself on the serial path. Enter before the legacy
+        // NULL rejection and whole-siginfo writes; ptrace, DBT and
+        // nonsequential execution retain their existing path.
+        if guest.config().backend.emulates_child_waits && guest.config().sequentialize_threads {
             return kvm_waitid::handle(guest, call).await;
         }
         let dettid = guest.thread_state().dettid;
@@ -1985,7 +2001,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
-        let complete_lineage = guest.config().backend_tracks_process_children;
+        let complete_lineage = guest.config().backend.tracks_process_children;
         let managed_terminal_spec = if let Some(spec) = terminal_spec {
             let (_, has_child) = ready_child_wait(guest, spec).await;
             (has_child || complete_lineage).then_some(spec)
@@ -2071,7 +2087,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 block_signals_for_disposition(guest, blocked_mask_addr, old_mask_addr).await?;
             let inspect_signal_action = guest
                 .config()
-                .backend_requires_thread_directed_process_signals;
+                .backend
+                .requires_thread_directed_process_signals;
 
             let poll_call = call.with_options(call.options() | libc::WNOHANG);
             let mut pending_signal = None;
@@ -2631,7 +2648,8 @@ where
         // itself. It re-reads the word to decide whether the kernel's retry
         // loop would take another pass, then leaves the replacement to the
         // native task exit. Both callers return early unless
-        // `backend_runs_exit_robust_list` says the backend performs that exit.
+        // `BackendCapabilities::runs_exit_robust_list` says the backend performs
+        // that exit.
         let observed = match self.guest.memory().read_value::<_, u32>(read_at) {
             Ok(value) => value,
             Err(_) => return FutexCasOutcome::Faulted,
@@ -2829,7 +2847,7 @@ mod tests {
     async fn kvm_nonleader_exec_refusal_preserves_failed_exec_rollback_and_policy() {
         let process = DetPid::from_raw(17);
         let worker = DetTid::from_raw(18);
-        for (backend_is_kvm, caller, errno, fail_closed, refused, reported) in [
+        for (kvm_behaviours, caller, errno, fail_closed, refused, reported) in [
             (true, worker, Errno::ENOSYS, true, true, false),
             (true, worker, Errno::ENOSYS, false, false, true),
             (true, worker, Errno::ENOENT, true, false, false),
@@ -2842,13 +2860,22 @@ mod tests {
         ] {
             let mut report = tempfile::tempfile().unwrap();
             let config = Config {
-                backend_is_kvm,
                 sequentialize_threads: false,
                 panic_on_unsupported_syscalls: fail_closed,
                 exit_on_unsupported_syscall: true,
                 shutdown_on_unsupported_syscall: false,
                 unsupported_syscall_report_fd: Some(report.as_raw_fd()),
-                ..Config::default()
+                ..Config::default().with_backend(|backend| {
+                    if kvm_behaviours {
+                        // The five behaviours the old `backend_is_kvm` identity flag selected.
+                        backend.provides_process_signal_control = true;
+                        backend.emulates_child_waits = true;
+                        backend.refuses_nonleader_exec_with_enosys = true;
+                        backend.failed_gettimeofday_may_store_host_time = false;
+                        backend.user_address_limit =
+                            Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
+                    }
+                })
             };
             let global = GlobalState::init_global_state(&config).await;
             let tool = Detcore::new(Tid::from_raw(process.as_raw()), &config);
