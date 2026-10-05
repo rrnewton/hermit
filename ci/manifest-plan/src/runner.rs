@@ -460,9 +460,10 @@ pub struct ModeRecipe {
     #[serde(default)]
     pub diagnostic: BTreeMap<String, String>,
     /// Why a product failure of this verify cell is final. Every other cell
-    /// is retried once after a product failure; this one gets one attempt,
-    /// for a corpus whose recorded verdict was a single run (the strict
-    /// compatibility corpus), so a first-attempt failure stays a failure.
+    /// except a replay cell is retried once after a product failure (see
+    /// [`retries_product_failures`]); this one gets one attempt, for a corpus
+    /// whose recorded verdict was a single run (the strict compatibility
+    /// corpus), so a first-attempt failure stays a failure.
     pub no_retry_reason: Option<String>,
     /// Run-type labels of this mode's cell on an enabled backend, added to the
     /// test's own `labels` for that cell only. See [`cell_labels`].
@@ -533,12 +534,21 @@ pub fn resolve_hermit_bin(root: &Path, hermit_bin: Option<std::ffi::OsString>) -
 }
 
 /// Whether a product failure of `cell` earns the runner's one retry: false
-/// for a verify cell that declares `no_retry_reason`.
+/// for a replay cell and for a verify cell that declares `no_retry_reason`.
+///
+/// A replay cell records the program and replays that recording, and its
+/// product failure is a replay that diverged from the recording or a
+/// recording that did not complete. A second, fresh recording that happens to
+/// replay cleanly does not answer whether the first one did, so a replay
+/// failure is final, as it was on the retired rr lane, which ran each program
+/// once.
 pub fn retries_product_failures(cell: &SelectedCell) -> bool {
-    cell.test
-        .modes
-        .get(&cell.id.mode)
-        .is_none_or(|mode| mode.no_retry_reason.is_none())
+    cell.id.mode != "replay"
+        && cell
+            .test
+            .modes
+            .get(&cell.id.mode)
+            .is_none_or(|mode| mode.no_retry_reason.is_none())
 }
 
 /// A stripped cell's report must hold the comparison it declared: Hermit's
@@ -9306,6 +9316,37 @@ mod tests {
             })
             .unwrap();
         assert!(retries_product_failures(&ordinary[0]));
+    }
+
+    /// A replay cell's product failure is a divergence between a recording
+    /// and its replay, or a recording that did not complete; a fresh
+    /// recording on a retry does not answer for the first, so the cell gets
+    /// one attempt, as the retired rr lane gave each program. The same test's
+    /// verify cell keeps its retry.
+    #[test]
+    fn a_replay_cell_is_not_retried_after_a_product_failure() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let manifests = ManifestSet::load(&root).unwrap();
+        let cell = |mode: &str| {
+            let mut cells = manifests
+                .select(&Selection {
+                    test: Some("c-programs/random-readv-stream".into()),
+                    mode: Some(mode.into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(Population::Required),
+                    ..Selection::default()
+                })
+                .unwrap();
+            assert_eq!(cells.len(), 1, "{mode}: {cells:?}");
+            cells.remove(0)
+        };
+        let replay = cell("replay");
+        assert_eq!(replay.id.mode, "replay");
+        // The replay cell declares no no_retry_reason (a replay mode may not),
+        // so only its mode makes it final.
+        assert!(replay.test.modes["replay"].no_retry_reason.is_none());
+        assert!(!retries_product_failures(&replay));
+        assert!(retries_product_failures(&cell("verify")));
     }
 
     use super::PRODUCER_STRIPPED_REPORT;

@@ -9040,6 +9040,47 @@ sys.exit(1 if failed else 0)
         ));
     }
 
+    /// The production retry decision for a replay cell: its product FAIL (a
+    /// replay that diverged from its recording) is final, as the retired rr
+    /// lane ran each program once, while the same FAIL of the same test's
+    /// verify cell earns its retry.
+    #[test]
+    fn a_replay_cell_is_not_retried_after_a_product_failure() {
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let cell = |mode: &str| {
+            manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some("c-programs/random-readv-stream".into()),
+                    mode: Some(mode.into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+        let failed = attempt_row(
+            "fixture/t",
+            1,
+            "FAIL",
+            Some("product_failure"),
+            "required",
+            &[],
+            None,
+        );
+        let replay = cell("replay");
+        assert_eq!(replay.id.mode, "replay");
+        assert_eq!(
+            super::attempt_retry_cause(super::Retries::Framework, &replay, &failed),
+            None
+        );
+        assert!(super::attempt_earns_retry(
+            super::Retries::Framework,
+            &cell("verify"),
+            &failed
+        ));
+    }
+
     #[test]
     fn no_retry_flag_turns_framework_retries_off() {
         assert_eq!(
