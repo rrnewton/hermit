@@ -525,6 +525,18 @@ pub fn cell_hermit_args<'a>(recipe: &'a ModeRecipe, backend: &str) -> &'a [Strin
         .unwrap_or_default()
 }
 
+/// The Hermit an import run (`E2E_IMPORT_RESULTS`) compares logs with: `HERMIT_BIN`, else
+/// the Hermit ci/buck-e2e/stage staged for the imported Buck cells
+/// (`ci/buck-e2e/staged/hermit`, which `-c hermit_e2e.hermit=staged` cells run). An import
+/// runs no cell, but its parity post-pass runs `hermit log-diff`, and a Buck run builds no
+/// target/debug/hermit for it to fall back on.
+pub fn resolve_import_hermit_bin(root: &Path, hermit_bin: Option<std::ffi::OsString>) -> PathBuf {
+    resolve_hermit_bin(
+        root,
+        Some(hermit_bin.unwrap_or_else(|| "ci/buck-e2e/staged/hermit".into())),
+    )
+}
+
 /// The Hermit the harness runs: `HERMIT_BIN`, else target/debug/hermit. A
 /// relative path names a checkout path, like the default, because cells start
 /// Hermit from their own working directories; an absolute path is kept.
@@ -2898,9 +2910,11 @@ impl RunContext {
     }
 
     /// The context of a run that executes no cell: `E2E_IMPORT_RESULTS`
-    /// re-publishes rows another harness process wrote. Nothing launches the
-    /// Hermit binary, so it is neither required nor probed; the binary-derived
-    /// fields stay empty and every other field is read as `from_env` reads it.
+    /// re-publishes rows another harness process wrote. No cell launches the
+    /// Hermit binary, so it is not probed and the binary-derived fields stay
+    /// empty; only the parity post-pass runs it, for `hermit log-diff`, so it is
+    /// [`resolve_import_hermit_bin`]'s choice. Every other field is read as
+    /// `from_env` reads it.
     pub fn for_import(root: PathBuf, source_sha: Option<&str>) -> Result<Self, String> {
         Self::from_env_probing(root, true, source_sha, false)
     }
@@ -2958,7 +2972,11 @@ impl RunContext {
         let build_root = std::env::var_os("E2E_BUILD_ROOT")
             .map(PathBuf::from)
             .unwrap_or_else(|| result_root.join("build").join(&source_sha));
-        let hermit_bin = resolve_hermit_bin(&root, std::env::var_os("HERMIT_BIN"));
+        let hermit_bin = if probe_hermit {
+            resolve_hermit_bin(&root, std::env::var_os("HERMIT_BIN"))
+        } else {
+            resolve_import_hermit_bin(&root, std::env::var_os("HERMIT_BIN"))
+        };
         // Ask the binary where it came from, the same way this function already
         // asks it what flags it supports. `source_sha` above describes the
         // checkout; only the binary can describe the binary.
@@ -9234,6 +9252,16 @@ mod tests {
         );
         assert_eq!(
             resolve_hermit_bin(root, Some("/opt/hermit".into())),
+            Path::new("/opt/hermit")
+        );
+        // An import compares the imported Buck cells' logs with the Hermit they ran, unless
+        // HERMIT_BIN names another; it never falls back to target/debug/hermit.
+        assert_eq!(
+            resolve_import_hermit_bin(root, None),
+            Path::new("/repo/ci/buck-e2e/staged/hermit")
+        );
+        assert_eq!(
+            resolve_import_hermit_bin(root, Some("/opt/hermit".into())),
             Path::new("/opt/hermit")
         );
     }

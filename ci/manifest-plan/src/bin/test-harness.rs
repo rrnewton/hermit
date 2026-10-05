@@ -3857,8 +3857,17 @@ fn parity_compare_config(
     run_id: &str,
     hermit_sha: &str,
 ) -> Result<parity::PostPassConfig, String> {
-    let hermit_bin =
-        hermit_manifest_plan::runner::resolve_hermit_bin(root, std::env::var_os("HERMIT_BIN"));
+    let import_root = recorded_import_root(&request.artifacts)?;
+    // An imported run's logs are compared with the Hermit its Buck cells ran, as its own
+    // post-pass compares them (`RunContext::for_import`).
+    let hermit_bin = if import_root.is_some() {
+        hermit_manifest_plan::runner::resolve_import_hermit_bin(
+            root,
+            std::env::var_os("HERMIT_BIN"),
+        )
+    } else {
+        hermit_manifest_plan::runner::resolve_hermit_bin(root, std::env::var_os("HERMIT_BIN"))
+    };
     let mut config =
         parity::PostPassConfig::new(&request.artifacts, &hermit_bin, run_id, hermit_sha)
             .writing_below(&request.artifacts.join(PARITY_COMPARE_DIR));
@@ -3867,8 +3876,7 @@ fn parity_compare_config(
     }
     config.jobs = request.jobs;
     config.outer_deadline = parity::dagrun_step_deadline();
-    config.imported_logs =
-        recorded_import_root(&request.artifacts)?.map(|root| parity::ImportedLogs::load(&root));
+    config.imported_logs = import_root.map(|root| parity::ImportedLogs::load(&root));
     Ok(config)
 }
 
@@ -5707,6 +5715,14 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         );
         let cells = run_cells(&manifests, &selection).unwrap();
         let context = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
+        // The import's parity post-pass runs `hermit log-diff` with the Hermit the Buck cells
+        // ran, never the target/debug/hermit a Buck run does not build.
+        if std::env::var_os("HERMIT_BIN").is_none() {
+            assert_eq!(
+                context.hermit_bin,
+                fixture.join("ci/buck-e2e/staged/hermit")
+            );
+        }
         let import = fixture.join("import");
         let bucket = bucket_dir(&import, "portable", "imported");
         fs::create_dir_all(&bucket).unwrap();
