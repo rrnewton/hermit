@@ -6192,15 +6192,15 @@ fn max_log_bytes_aborts_a_run_whose_log_file_runs_away() {
     // omitted otherwise (btrfs answers EAGAIN, tmpfs EOPNOTSUPP). stderr, a
     // pipe this test drains, carries it either way (asserted above). What must
     // hold on every file system: the file ends on a complete line, and if the
-    // reason is there at all it is the last line.
+    // reason is there at all, it and its class line are the last lines.
     let tail = &written[written.len().saturating_sub(600)..];
     assert!(written.ends_with('\n'), "the log ends mid-line:\n{tail}");
     if let Some(at) = written.find("hermit: log output exceeded --max-log-bytes") {
         assert!(
-            written[at..]
-                .trim_end()
-                .ends_with("raise --max-log-bytes, to let the run finish."),
-            "the reason the log ends must be its last line:\n{tail}"
+            written[at..].ends_with(
+                "raise --max-log-bytes, to let the run finish.\nHERMIT_LOG_CAP class=log-cap\n"
+            ),
+            "the reason the log ends, then its class line, must be the last lines:\n{tail}"
         );
     }
 }

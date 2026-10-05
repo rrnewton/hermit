@@ -480,15 +480,25 @@ impl LogBudget {
     }
 }
 
-/// The final message. Names the bound, what happens next, and what to change.
+/// The final message. Names the bound, what happens next, and what to change,
+/// then ends with [`LOG_CAP_CLASS_LINE`].
+///
+/// THE CLASS LINE IS PART OF THE MESSAGE because a crossing can end hermit with
+/// no outer process left to print a report: under `run --namespace-only`
+/// tracing runs in the outer hermit itself, so its crossing `_exit`s without
+/// reaching `display_error`. Where an outer hermit does survive (the container
+/// paths), it prints the class line again in its own report, so stderr may
+/// carry it twice; both are best effort. The whole message stays far below
+/// `PIPE_BUF`, so [`write_without_waiting`]'s truncation never cuts the marker.
 fn exceeded_message(limit: u64) -> String {
     format!(
         "hermit: log output exceeded --max-log-bytes={} ({} bytes); aborting the run and killing \
          the guest process tree (exit {}). Lower --log / RUST_LOG verbosity, or raise \
-         --max-log-bytes, to let the run finish.\n",
+         --max-log-bytes, to let the run finish.\n{}",
         format_byte_size(limit),
         limit,
         hermit::HERMIT_LOG_CAP_EXIT,
+        LOG_CAP_CLASS_LINE,
     )
 }
 
@@ -1703,11 +1713,35 @@ mod tests {
             message.starts_with("hermit: log output exceeded --max-log-bytes=100 (100 bytes)"),
             "{message}"
         );
+        // The crossing process's own last words carry the class marker: under
+        // `run --namespace-only` no outer hermit survives to print it.
+        assert!(
+            message.ends_with("to let the run finish.\nHERMIT_LOG_CAP class=log-cap\n"),
+            "{message}"
+        );
         assert_eq!(
             budget.spent(),
             120,
             "the child's charges are visible to the parent"
         );
+    }
+
+    /// Every prepared crossing message names its bound, ends with exactly one
+    /// class line, and fits in one `PIPE_BUF` write, so the truncation in
+    /// [`write_without_waiting`] can never cut the marker off.
+    #[test]
+    fn the_crossing_message_ends_with_the_class_line_at_every_limit() {
+        for limit in [1, 100, 64 << 10, 8 << 30, u64::MAX] {
+            let message = exceeded_message(limit);
+            let named = format!(
+                "hermit: log output exceeded --max-log-bytes={} ({limit} bytes);",
+                format_byte_size(limit)
+            );
+            assert!(message.starts_with(&named), "{message}");
+            assert!(message.ends_with(LOG_CAP_CLASS_LINE), "{message}");
+            assert_eq!(message.matches("HERMIT_LOG_CAP").count(), 1, "{message}");
+            assert!(message.len() < libc::PIPE_BUF, "{} bytes", message.len());
+        }
     }
 
     /// A pipe whose buffer is full and whose reader never reads, switched back
