@@ -675,7 +675,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and the front door's tests::accepts_an_env_in_a_replay_mode and
     // rejects_an_env_outside_verify_and_replay, so 899 of the 902 prior
     // identities are retained: 902 - 3 + 6 = 905 (the same listing gives 708).
-    ("test.regular_crates", 905),
+    // 69f25331 adds the detcore-dbt test
+    // self_identity_targets_reach_detcore_as_the_abis_runtime_identity and
+    // retains all 905 prior identities (+1).
+    ("test.regular_crates", 906),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1013,7 +1016,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // selected CLI identities (`cargo nextest list --profile ci` measured +3).
     // Its two other CLI tests are #[ignore]d: they need the in-guest runtime
     // library, which this selection does not build.
-    ("test.cli", 123),
+    ("test.cli", 125),
     // liteinst_runtime_bootstrap_is_not_charged_to_host_identity_uptime and
     // liteinst_clock_trajectory_excludes_runtime_bootstrap_in_each_image
     // (https://github.com/rrnewton/hermit/pull/3430) retain all 25 prior
@@ -1071,7 +1074,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // prior identities retained.
     // The three https://github.com/rrnewton/hermit/pull/3635 in-guest LiteInst
     // refusal tests, as in test.cli; all 120 prior identities retained.
-    ("test.cli_on_host", 123),
+    ("test.cli_on_host", 125),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
@@ -1193,7 +1196,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // two replay-retry tests listed there retain all 900. The rr fold listed
     // there removes three tests, rewrites them under new names and adds three,
     // so 899 of the 902 prior identities are retained (+3).
-    ("test.regular_crates_on_host", 905),
+    // 69f25331 adds the detcore-dbt test
+    // self_identity_targets_reach_detcore_as_the_abis_runtime_identity and
+    // retains all 905 prior identities (+1).
+    ("test.regular_crates_on_host", 906),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
