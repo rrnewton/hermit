@@ -864,7 +864,15 @@ fi
 # clamp. These two local samples do not replace the original n=3 hosted
 # calibration or satisfy the >=5-sample replacement rule, and they are not a
 # Hermit guest or replay result; fresh validation is required.
-expected_pin=c8181d43a59a6d1ac602f2fad7615189f4996b41
+# CARRY TO c7a1ed25bca339daa0e69241353fc9882da63d7a (2026-10-05): from
+# c8181d43a59a6d1ac602f2fad7615189f4996b41; all seven recorded DynamoRIO build inputs
+# are byte-identical. Adaptive wait-mode selection and retained controller
+# delivery change SDK and ptrace sources, not the DynamoRIO build recipe.
+# The available-CPU cap and f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
+# second budget are unchanged. Source identity carries the calibration;
+# no new timing sample or >=5-sample replacement claim is made.
+expected_pin=c7a1ed25bca339daa0e69241353fc9882da63d7a
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
