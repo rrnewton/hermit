@@ -5,7 +5,7 @@
 //! [dependencies]
 //! chrono = "0.4"
 //! csv = "1"
-//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "79b27f46ae3d14e5d6f517ab4908f22a706fb8c1" }
+//! dagrun = { version = "0.15.0", git = "https://github.com/rrnewton/agent-utils.git", rev = "2e31e52689fc443273dd745991ce4d0a86174f8e" }
 //! hermit-manifest-plan = { path = "../manifest-plan" }
 //! serde = { version = "1", features = ["derive"] }
 //! serde_json = "1"
