@@ -31,7 +31,8 @@ Seven buckets currently contain calibrated blocking workloads:
 - `c-programs.yaml` (eight calibrated Buck-derived C probes)
 - `compat.yaml` (the 189-program strict compatibility corpus, written as a
   `corpus` section; five of its rows are diagnostics; it also holds the
-  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, and the
+  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, the
+  `rr-compat-only` run type's 139 replay cells, and the
   `strict-compat-only` run type's 193 strict variant tests)
 
 Eight additional `*-c.yaml`/`c-programs.yaml` buckets make 180 more C guests
@@ -356,7 +357,9 @@ specific configuration:
   `relaxations`.
 - `env` adds guest variables as `--env NAME=VALUE` after the runner's fixed
   guest environment; a name the runner sets (`HOME`, `TZ`, `LC_ALL`, ...) is
-  refused.
+  refused. Only a verify or a replay mode accepts it. A replay cell that does
+  not declare `env` inherits its verify cell's; one that does, an empty
+  mapping included, records with exactly the variables it declares.
 - `comparator: stripped` runs Hermit's default `--verify` comparison instead of
   `--verify-strict`. It is below L2. The cell passes only on a verified,
   matched report that compared a non-empty stripped event stream on both
@@ -401,20 +404,23 @@ why that row's cell is a diagnostic, with its own shortened budget, and
 on one more backend to every row except those its `except` names (each with
 the reason that backend is disabled there), labelled with a run type (below),
 so the default run type does not run it; it shares the section's verify
-settings except `hermit_args`, which stay on the section's backend. Each
-`variants` entry adds one more test per row except those its `except` groups
+settings except `hermit_args`, which stay on the section's backend.
+`replay` gives every row except those its `except` groups name (each group
+with its reason) a replay cell on ptrace in the row's own test (`hermit record
+start` then replay, compared by the harness), labelled with the section's run
+type so the default run type does not run it, with the section's budget and
+`slow_reason`, an empty `env`, so it does not inherit the verify cell's
+`TMPDIR`, and none of the verify settings: no `hermit_args`, comparator,
+`no_retry_reason` or diagnostic. Its `unselected` lists the replay cells
+measured red. Each `variants` entry adds one more test per row except those its `except` groups
 name (each group with its reason): id `<bucket>/<id_prefix><id or label>`,
 labelled with the entry's run type, with one verify cell on the section's
 backend that keeps the section's environment and comparator but takes its
 `hermit_args` (none unless stated), budget, `slow_reason` and
 `no_retry_reason` from the entry and is never a diagnostic; the entry's own
-`unselected` lists its cells measured red. An entry with `mode: replay`
-instead gives each test one replay cell on ptrace (`hermit record start`
-then replay, compared by the harness), with the entry's budget and
-`slow_reason` but no `hermit_args`, environment, comparator or
-`no_retry_reason`, which a replay cell does not take; the default is
-`mode: verify`. A row's own
-`labels` put all of its cells in those run types. `unselected` lists cells
+`unselected` lists its cells measured red. A row's own `labels` put its
+verify cells in those run types, and not its replay cell, which carries only
+the `replay` section's run type. `unselected` lists cells
 measured red: each stays enabled with `ci: false` and a `ci_disabled_reason`
 carrying the class's `result`, `evidence` (an issue) and `reason`. A row's
 `argv` is a `direct` argv list, run without a shell; in it `{{ROOT_DIR}}` is
