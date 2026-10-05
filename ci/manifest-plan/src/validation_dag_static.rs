@@ -678,7 +678,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // stress_series::tests::timed_out_match_evidence_is_the_timeout_and_nothing_else
     // and stress_series::tests::declared_guest_exit_holds_a_timed_out_sibling_to_the_timeout_rule
     // retain all 905: 905 + 2 = 907 (the same listing gives 710 with them).
-    ("test.regular_crates", 907),
+    // The network trace and record/replay data model
+    // (https://github.com/rrnewton/hermit/pull/3777) adds 16 detcore-model
+    // tests and retains all 907 prior identities: six
+    // network_trace::tests::network_trace_v2_* tests and ten
+    // network_engine::tests (907 + 16 = 923).
+    ("test.regular_crates", 923),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1203,7 +1208,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // there removes three tests, rewrites them under new names and adds three,
     // so 899 of the 902 prior identities are retained (+3).
     // The two timed-out-match stress_series tests listed there: 905 + 2 = 907.
-    ("test.regular_crates_on_host", 907),
+    // The 16 https://github.com/rrnewton/hermit/pull/3777 tests listed there
+    // retain all 907.
+    ("test.regular_crates_on_host", 923),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects
     // sabre_dispatch_record_reports_its_routes_and_tracer_stops.
