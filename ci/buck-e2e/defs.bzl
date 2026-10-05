@@ -7,7 +7,7 @@ pass --no-retry to the harness, so `buck2 test ... -- --retry 1` retries a faile
 and the ingester keeps "passed only on rerun" red.
 
 Routing (per cell, first match wins; see _route):
-  local: kvm backend, privileged lane, a host-capability requirement, a `requires` tool
+  local: kvm or dbt backend, privileged lane, a host-capability requirement, a `requires` tool
          RE workers lack, the LOCAL_TESTS deny-list, a test measured to fail only on RE
          (re_exclusions.json), or a PMU-armed cell under -c hermit_e2e.pmu_on_re=false.
   re:    everything else.
@@ -70,6 +70,10 @@ def _route(cell, pmu_on_re, re_exclusions):
     """Returns (where, reason): where is "local" or "re"."""
     if cell["backend"] == "kvm":
         return ("local", "kvm backend: RE workers have no /dev/kvm")
+    if cell["backend"] == "dbt":
+        # The DBT adapter applies --bind (the bound workdir and the equalized inputs) in its
+        # own mount namespace, which needs CAP_SYS_ADMIN; RE workers cannot mount.
+        return ("local", "dbt backend: its mount namespace needs CAP_SYS_ADMIN, which RE workers lack")
     if cell["lane"] == "privileged":
         return ("local", "privileged lane")
     if cell.get("requires_host_capabilities"):
@@ -98,10 +102,10 @@ def _container(cell, where):
     if pinned:
         return ("pinned-root", "pinned-root-only: " + pinned)
     if cell["backend"] == "dbt":
-        # The DBT adapter enters the /test mount namespace itself (hermit_test_workdir),
-        # which needs CAP_SYS_ADMIN; the other backends mount /test in hermit's own
-        # user namespace.
-        return ("pinned-root", "dbt backend: entering the /test mount namespace needs CAP_SYS_ADMIN")
+        # The DBT adapter makes its own mount namespace (hermit_test_workdir) for --bind and
+        # /test, which needs CAP_SYS_ADMIN; the other backends mount in hermit's own user
+        # namespace.
+        return ("pinned-root", "dbt backend: its own mount namespace needs CAP_SYS_ADMIN")
     return ("", "")
 
 def _cell_test_impl(ctx):

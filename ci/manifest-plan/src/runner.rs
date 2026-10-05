@@ -1222,9 +1222,10 @@ pub struct EqualizedInput {
 /// alone make ptrace diverge from ptrace: 16 of 18 pairs in the S0 control
 /// (<https://github.com/rrnewton/hermit/issues/3301#issuecomment-5874842696>).
 /// Binding each directory to the same guest path, and naming only guest paths
-/// in the guest's environment and argv, gives every backend that honours
-/// `--bind` the same guest-visible inputs. The dbt backend refuses `--bind`,
-/// so its cells keep the host paths (see [`equalizes_guest_inputs`]).
+/// in the guest's environment and argv, gives every backend the same
+/// guest-visible inputs. The dbt backend applies `--bind` in its own per-run
+/// mount namespace (`common/test-workdir`), which needs CAP_SYS_ADMIN, so a
+/// dbt cell runs in the pinned root.
 ///
 /// It is below guest `/tmp` because `--bind` accepts only targets there;
 /// every such guest gets a private tmpfs `/tmp`, in which the bind targets
@@ -1252,13 +1253,11 @@ pub const EQUALIZED_INPUTS: [EqualizedInput; 3] = [
 
 /// Whether a cell's guest is given the equalized inputs.
 ///
-/// Only `verify` cells are, because only they are compared across backends
-/// (the parity post-pass). Other modes keep the host paths they always had.
-/// The dbt backend refuses `--bind` (`hermit-cli/src/bin/hermit/run.rs`: "the
-/// dbt backend cannot apply --mount or --bind"), so a dbt cell cannot be given
-/// them and its parity rows say `inputs-not-equalized`.
-pub fn equalizes_guest_inputs(mode: &str, backend: &str) -> bool {
-    mode == "verify" && backend != "dbt"
+/// Only `verify` cells are, on every backend, because only they are compared
+/// across backends (the parity post-pass). Other modes keep the host paths
+/// they always had.
+pub fn equalizes_guest_inputs(mode: &str) -> bool {
+    mode == "verify"
 }
 
 /// The guest path of a host path at or below one of `cell_dir`'s equalized
@@ -4236,9 +4235,7 @@ fn prepare_test_until(
         _ => return Err(format!("{} has unsupported program kind", cell.test.id)),
     };
     guest.extend(guest_args);
-    if context.isolated_workdir.is_some()
-        || (backend != "dbt" && supports_test_workdir(&cell.id.mode, backend))
-    {
+    if context.isolated_workdir.is_some() || supports_test_workdir(&cell.id.mode, backend) {
         resolve_repo_guest_args(&context.root, &mut guest);
     }
     Ok((guest, cpu_usage_usec))
@@ -4436,7 +4433,7 @@ pub fn build_spec(
     // hermetic tmpfs path does not remove this path-safety property.
     let fixed_workdir_source = fixed_workdir_source_for_attempt(&dir, attempt)?;
     let backend = cell.id.backend.as_deref().unwrap_or("native");
-    let equalized_inputs = equalizes_guest_inputs(&cell.id.mode, backend);
+    let equalized_inputs = equalizes_guest_inputs(&cell.id.mode);
     // The recorded guest argv is the argv after `--`, so both carry the guest
     // paths of an equalized cell.
     let guest_argv = if equalized_inputs {
@@ -4476,8 +4473,7 @@ pub fn build_spec(
     }
     // `record start` has no `--bind`, so outside the hermetic path a replay cell
     // runs in its manifest workdir or the runner's working directory.
-    let bound_workdir_source = (matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
-        && backend != "dbt")
+    let bound_workdir_source = matches!(cell.id.mode.as_str(), "verify" | "chaos" | "custom")
         .then_some(fixed_workdir_source.as_path());
     let isolated = context.isolated_workdir.is_some();
     let verdict = dir.join(format!("verify-{attempt}.json"));
@@ -14645,8 +14641,10 @@ backends_disabled:
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// A dbt verify cell's guest starts in the bound /tmp/test like every other
+    /// backend's, so its repo-relative arguments are resolved in both shapes.
     #[test]
-    fn ordinary_dbt_arguments_remain_literal_until_isolation_is_requested() {
+    fn dbt_repo_arguments_resolve_before_the_guest_changes_directory() {
         let root = std::env::temp_dir().join(format!(
             "hermit-runner-dbt-literal-args-{}",
             std::process::id()
@@ -14666,27 +14664,24 @@ backends_disabled:
         cell.test.direct = Some(DirectCommand::Argv(original.clone()));
         let mut context = run_context(root.as_path());
         let dir = root.as_path().join("results/cell");
-        assert_eq!(prepare_test(&context, &cell, &dir).unwrap(), original);
+        let resolved = vec![
+            original[0].clone(),
+            root.as_path()
+                .join("literal.txt")
+                .to_string_lossy()
+                .into_owned(),
+            // `./literal.txt` resolves without its `.` component.
+            root.as_path()
+                .join("literal.txt")
+                .to_string_lossy()
+                .into_owned(),
+            original[3].clone(),
+            original[4].clone(),
+        ];
+        assert_eq!(prepare_test(&context, &cell, &dir).unwrap(), resolved);
 
         context.isolated_workdir = Some(PathBuf::from("/test"));
-        let isolated = prepare_test(&context, &cell, &dir).unwrap();
-        assert_eq!(
-            isolated,
-            vec![
-                original[0].clone(),
-                root.as_path()
-                    .join("literal.txt")
-                    .to_string_lossy()
-                    .into_owned(),
-                // `./literal.txt` resolves without its `.` component.
-                root.as_path()
-                    .join("literal.txt")
-                    .to_string_lossy()
-                    .into_owned(),
-                original[3].clone(),
-                original[4].clone(),
-            ]
-        );
+        assert_eq!(prepare_test(&context, &cell, &dir).unwrap(), resolved);
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -14887,9 +14882,9 @@ backends_disabled:
     /// A verify cell's guest sees its home, xdg-config and fixture directories
     /// only at the fixed guest paths below `/tmp/e2e`, so the ptrace and
     /// candidate cells of one test, which run from different cell directories,
-    /// give their guests the same argv and environment in both runner shapes.
-    /// dbt refuses `--bind` and keeps the host paths, as does every mode the
-    /// parity post-pass does not compare. The row's own environment keeps the
+    /// give their guests the same argv and environment in both runner shapes,
+    /// dbt included. Every mode the parity post-pass does not compare keeps the
+    /// host paths. The row's own environment keeps the
     /// host paths, which name where the directories are.
     #[test]
     fn verify_cells_give_every_bindable_backend_the_same_guest_inputs() {
@@ -14973,7 +14968,7 @@ backends_disabled:
                 );
             }
 
-            for backend in ["kvm", "liteinst", "sabre"] {
+            for backend in ["dbt", "kvm", "liteinst", "sabre"] {
                 let (dir, candidate) = spec_for(backend, "verify");
                 assert_ne!(dir, reference_dir);
                 assert_equalized_guest_env(&candidate.argv, &dir, tmp, jobs);
@@ -14985,10 +14980,16 @@ backends_disabled:
                 assert_eq!(argv[5], reference_argv[5], "{backend}");
             }
 
+            // dbt refuses --mount: its adapter mounts the hermetic /test itself,
+            // and outside the hermetic shape it binds the workdir like the rest.
             let (dir, dbt) = spec_for("dbt", "verify");
-            assert_minimal_guest_env(&dbt.argv, &dir, tmp, jobs);
-            assert_eq!(dbt.guest_argv[0], format!("{dir}/fixtures/program"));
-            assert!(!dbt.argv.iter().any(|arg| arg.starts_with("--bind=")));
+            assert!(!dbt.argv.iter().any(|arg| arg.starts_with("--mount=")));
+            assert_eq!(
+                dbt.argv
+                    .iter()
+                    .any(|arg| *arg == format!("--bind={dir}/workdir/1:/tmp/test")),
+                isolated.is_none()
+            );
 
             for mode in ["chaos", "replay", "custom"] {
                 let (dir, spec) = spec_for("ptrace", mode);
@@ -15003,9 +15004,8 @@ backends_disabled:
                 assert_eq!(spec.guest_argv[0], format!("{dir}/fixtures/program"));
             }
         }
-        assert!(!equalizes_guest_inputs("verify", "dbt"));
-        assert!(!equalizes_guest_inputs("naked", "ptrace"));
-        assert!(equalizes_guest_inputs("verify", "ptrace"));
+        assert!(equalizes_guest_inputs("verify"));
+        assert!(!equalizes_guest_inputs("naked"));
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -17065,7 +17065,12 @@ exit "$(cat "$PWD/exit-status")"
         let mut dbt = base.clone();
         dbt.backend = Some("dbt".into());
         let dbt_fixed = with_executor_invocation(dbt.clone());
-        assert!(!dbt_fixed.argv.iter().any(|arg| arg.starts_with("--bind=")));
+        assert!(
+            dbt_fixed
+                .argv
+                .iter()
+                .any(|arg| arg.starts_with("--bind=") && arg.ends_with(":/tmp/test"))
+        );
         accepted("a DBT row", &dbt_fixed);
         let dbt_isolated = rendered(
             &dbt,

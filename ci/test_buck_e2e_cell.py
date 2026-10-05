@@ -279,7 +279,9 @@ class CellTest(unittest.TestCase):
         self.assertEqual(wrapper["mountpoints"], ["agent-utils/rs/.agent-utils-locks",
                                                   "agent-utils/rs/.agent-utils-snapshots",
                                                   "agent-utils/rs/target", "target"])
-        self.assertEqual(wrapper["forwarded"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
+        # A DBT verify cell is here only for CAP_SYS_ADMIN: it gets the bound /tmp/test that
+        # its ptrace reference outside the container gets, not the /test marker.
+        self.assertNotIn("HERMIT_E2E_EMPTY_WORKDIR", wrapper["forwarded"])
         for name in ("E2E_RESULT_ROOT", "VALIDATE_RUN_STATE", "E2E_RUN_ID"):
             self.assertTrue(wrapper["forwarded"].get(name), name)
         self.assertEqual(wrapper["forwarded"]["E2E_KEEP_VERIFY_LOGS"], "1")
@@ -301,7 +303,7 @@ class CellTest(unittest.TestCase):
         self.assertTrue(all(not c.startswith(str(self.tmp)) for c in command),
                         "the in-container command must not name host paths")
         [harness] = self.calls_by("harness")
-        self.assertEqual(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"])
         self.assertEqual(harness["env"]["E2E_RESULT_ROOT"], "/results")
         self.assertEqual(harness["env"]["E2E_BUILD_ROOT"], "/src/bundle/build")
         # The image's libc, libm, libgcc_s and its ld.so, from the same glibc, beside the
@@ -311,7 +313,7 @@ class CellTest(unittest.TestCase):
         self.assertEqual(harness["rsrcs"], expected)
         self.assertEqual(result["container"], "pinned-root")
         self.assertEqual(result["container_reason"], "dbt backend: needs CAP_SYS_ADMIN")
-        self.assertEqual(result["empty_workdir"], "HERMIT_E2E_EMPTY_WORKDIR=/test")
+        self.assertEqual(result["empty_workdir"], "")
         self.assertTrue(result["evidence_complete"], result)
         self.assertEqual(result["outcome"], "PASS")
         after = sorted(str(p.relative_to(self.bundle)) for p in self.bundle.rglob("*"))
@@ -411,6 +413,27 @@ class CellTest(unittest.TestCase):
         [harness] = self.calls_by("harness")
         self.assertIsNone(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "local cells use the bound /tmp/test")
         self.assertEqual(result["empty_workdir"], "")
+
+    def test_other_pinned_root_cells_keep_the_test_workdir(self) -> None:
+        # Only a DBT verify cell drops /test: a non-verify DBT cell and a cell of another
+        # backend in the pinned root keep the container's fresh tmpfs at /test.
+        for backend, mode in (("dbt", "custom"), ("ptrace", "verify"), ("kvm", "verify")):
+            with self.subTest(backend=backend, mode=mode):
+                self.calls.write_text("")
+                done, result = self.run_cell(backend, TEST, mode, HERMIT_E2E_CONTAINER="pinned-root",
+                                             HERMIT_E2E_CONTAINER_REASON="privileged lane")
+                self.assertEqual(done["status"], "passed", done)
+                [wrapper] = self.calls_by("wrapper")
+                self.assertEqual(wrapper["forwarded"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
+                [harness] = self.calls_by("harness")
+                self.assertEqual(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
+                self.assertEqual(result["empty_workdir"], "HERMIT_E2E_EMPTY_WORKDIR=/test")
+
+    def test_a_callers_workdir_marker_never_reaches_a_bound_cell(self) -> None:
+        done, _ = self.run_cell(HERMIT_E2E_CONTAINER="pinned-root", HERMIT_E2E_EMPTY_WORKDIR="/test")
+        self.assertEqual(done["status"], "passed", done)
+        [harness] = self.calls_by("harness")
+        self.assertIsNone(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"])
 
     def test_every_cell_whose_guest_asserts_the_test_workdir_gets_it(self) -> None:
         # The guest of c-programs/environment-and-workdir asserts that it starts in a fresh
@@ -648,13 +671,14 @@ class ContainerChoiceTest(unittest.TestCase):
         self.assertIn("c-programs-cpuid-probe-verify-dbt", chosen)
         self.assertIn("c-programs-environment-and-workdir-custom-ptrace", chosen)
         self.assertIn("c-programs-environment-and-workdir-verify-ptrace", chosen)
-        # A portable DBT cell stays on RE, where the workdir is not requested.
-        portable_dbt = {self.slug(c) for c in self.plan if c["lane"] == "portable" and c["backend"] == "dbt"}
-        self.assertTrue(portable_dbt)
-        for name in portable_dbt:
-            self.assertEqual(targets[name]["route"], "re", name)
-        self.assertEqual(chosen, privileged | {"c-programs-environment-and-workdir-custom-ptrace",
-                                               "c-programs-environment-and-workdir-verify-ptrace"})
+        # Every DBT cell runs locally, in the pinned root: its mount namespace, which applies
+        # --bind, needs CAP_SYS_ADMIN, and RE workers cannot mount.
+        dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt"}
+        self.assertTrue(dbt)
+        for name in dbt:
+            self.assertEqual(targets[name]["route"], "local", name)
+        self.assertEqual(chosen, privileged | dbt | {"c-programs-environment-and-workdir-custom-ptrace",
+                                                     "c-programs-environment-and-workdir-verify-ptrace"})
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))

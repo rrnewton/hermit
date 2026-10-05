@@ -74,12 +74,16 @@ deadline=${CELL_DEADLINE_S:-$((tpx_timeout - 30))}
 # backend parity compares a candidate's log with a ptrace reference that may have run on
 # RE, so a local cell must see the same workdir or the two guests' inputs differ (a local
 # /test tmpfs made every kvm comparison inputs-not-equalized). The pinned-root container
-# keeps its fresh tmpfs at /test: the DBT adapter refuses --bind and enters that mount
-# namespace itself, and a guest that asserts /test (c-programs/environment-and-workdir)
-# runs there for it (defs.bzl PINNED_ROOT_ONLY).
+# keeps its fresh tmpfs at /test, and a guest that asserts /test
+# (c-programs/environment-and-workdir) runs there for it (defs.bzl PINNED_ROOT_ONLY). A
+# DBT verify cell is in the pinned root only for CAP_SYS_ADMIN, which the DBT adapter's
+# own mount namespace needs to apply --bind; it is compared with a ptrace reference that
+# ran outside, so it uses the bound /tmp/test as well.
 container=${HERMIT_E2E_CONTAINER:-}
-workdir_env=()
-[[ $container == pinned-root ]] && workdir_env=(HERMIT_E2E_EMPTY_WORKDIR=/test)
+workdir=
+[[ $container == pinned-root && ! ($BACKEND == dbt && $MODE == verify) ]] &&
+    workdir=HERMIT_E2E_EMPTY_WORKDIR=/test
+# env's -u options must precede its assignments (cpu_scan_env may be either).
 # The harness measures each budgeted invocation's live CPU from a cgroup of its own and
 # refuses the invocation when it cannot create one. An RE worker runs the test inside a
 # root-owned cgroup that cell.sh cannot write (cgroup.procs: EACCES), so an RE cell is a
@@ -158,7 +162,7 @@ case $container in
     # What is left of the deadline after the setup above and any wait for a KVM slot.
     deadline=$((deadline - ($(date +%s%N) - t0) / 1000000000))
     ((deadline > 10)) || deadline=10
-    env "${cpu_scan_env[@]}" "${workdir_env[@]}" VALIDATE_RUN_STATE="$W/run-state" \
+    env -u HERMIT_E2E_EMPTY_WORKDIR "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_BUILD_ROOT="$B/build" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         HERMIT_BIN="$B/hermit/hermit" HERMIT_INSTALL_DIR="$B/hermit/install" \
@@ -170,7 +174,7 @@ case $container in
     harness_rc=$?
     ;;
 pinned-root)
-    # Cells that need CAP_SYS_ADMIN (DBT's /test mount namespace), the privileged lane or
+    # Cells that need CAP_SYS_ADMIN (DBT's mount namespace), the privileged lane or
     # the container's identity (hostname, /results). The wrapper and the image digest it
     # pins come from the bundle's own source snapshot, as in the cargo flow.
     [[ ${HERMIT_E2E_ROUTE:-} == local ]] ||
@@ -228,7 +232,7 @@ exec "$@"'
     outer=$((deadline - ($(date +%s%N) - t0) / 1000000000))
     ((outer > 25)) || outer=25
     deadline=$((outer - 15))
-    env "${cpu_scan_env[@]}" HERMIT_E2E_EMPTY_WORKDIR=/test VALIDATE_RUN_STATE="$W/run-state" \
+    env -u HERMIT_E2E_EMPTY_WORKDIR "${cpu_scan_env[@]}" ${workdir:+"$workdir"} VALIDATE_RUN_STATE="$W/run-state" \
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         timeout --kill-after=10 "$outer" \
@@ -304,7 +308,7 @@ json.dump({
     "route": "${HERMIT_E2E_ROUTE:-}", "route_reason": "${HERMIT_E2E_ROUTE_REASON:-}",
     "container": os.environ.get("HERMIT_E2E_CONTAINER", ""),
     "container_reason": os.environ.get("HERMIT_E2E_CONTAINER_REASON", ""),
-    "empty_workdir": "${workdir_env[*]}",
+    "empty_workdir": "$workdir",
     "kvm_slot": "$kvm_slot", "kvm_slot_wait_ms": $kvm_slot_wait_ms,
     "harness_rc": $harness_rc, "outcome": "$outcome", "deadline_s": $deadline,
     "tpx_timeout_s": $tpx_timeout, "wall_ms": $(((t1 - t0) / 1000000)),
