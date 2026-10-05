@@ -770,6 +770,11 @@ struct ManifestCellFacts {
     /// `{{VALIDATE_RUN_STATE}}`, which validation's [`VALIDATE_FIXTURE_STEP`]
     /// fills before any such cell runs.
     reads_compat_fixtures: bool,
+    /// The test's argv names a path below `{{VALIDATE_RUN_STATE}}` outside
+    /// the shared fixture root: a fixed scratch directory every run of the
+    /// test shares, so two runs of it must not overlap
+    /// ([`run_state_resource`]).
+    writes_run_state: bool,
 }
 
 /// The fixture root [`VALIDATE_FIXTURE_STEP`] fills, relative to
@@ -814,6 +819,15 @@ fn manifest_cell_facts(
             .into_iter()
             .map(str::to_string)
             .collect();
+            let writes_run_state = match &cell.test.direct {
+                Some(hermit_manifest_plan::runner::DirectCommand::Argv(argv)) => {
+                    argv.iter().any(|arg| names_run_state_outside_fixtures(arg))
+                }
+                Some(hermit_manifest_plan::runner::DirectCommand::Shell(command)) => {
+                    names_run_state_outside_fixtures(command)
+                }
+                None => false,
+            };
             let reads_compat_fixtures = match &cell.test.direct {
                 Some(hermit_manifest_plan::runner::DirectCommand::Argv(argv)) => {
                     argv.iter().any(|arg| arg.contains(&fixture_root))
@@ -835,6 +849,7 @@ fn manifest_cell_facts(
                         run_types,
                         enabled: cell.enabled,
                         reads_compat_fixtures,
+                        writes_run_state,
                     },
                 )
                 .is_some()
@@ -1080,6 +1095,54 @@ const DBT_HOST_TMP_RESOURCE_PREFIX: &str = "dbt_host_tmp:";
 /// start; its command and environment do not change.
 fn dbt_host_tmp_resource(cell: &CellId) -> Option<String> {
     (cell.backend == "dbt").then(|| format!("{DBT_HOST_TMP_RESOURCE_PREFIX}{}", cell.test))
+}
+
+/// Prefix of the named resource that [`run_state_resource`] gives each test
+/// whose argv writes below VALIDATE_RUN_STATE outside the fixture root.
+const RUN_STATE_RESOURCE_PREFIX: &str = "run_state:";
+
+/// Whether `text` names `{{VALIDATE_RUN_STATE}}` anywhere other than inside
+/// the shared fixture root that validation's fixture node fills.
+fn names_run_state_outside_fixtures(text: &str) -> bool {
+    let placeholder = hermit_manifest_plan::manifest_corpus::VALIDATE_RUN_STATE_PLACEHOLDER;
+    let root = format!("/{COMPAT_FIXTURE_ROOT}");
+    text.match_indices(placeholder).any(|(index, _)| {
+        let rest = &text[index + placeholder.len()..];
+        !rest.strip_prefix(root.as_str()).is_some_and(|after| {
+            after
+                .chars()
+                .next()
+                .is_none_or(|next| !(next.is_alphanumeric() || matches!(next, '-' | '_' | '.')))
+        })
+    })
+}
+
+/// The named resource that keeps two runs of one test from overlapping when
+/// its argv writes a fixed path below VALIDATE_RUN_STATE outside the fixture
+/// root, or `None`. A run's VALIDATE_RUN_STATE is one directory per pressure
+/// run, as in validation, so repetitions or other modes and backends of the
+/// same test would share that path; compat.yaml's shell-build row removes and
+/// rebuilds its directory. Like [`dbt_host_tmp_resource`], the name belongs
+/// to the test and the plan grants it one unit; it decides only when a cell
+/// may start.
+fn run_state_resource(cell: &CellId, facts: &ManifestCellFacts) -> Option<String> {
+    facts
+        .writes_run_state
+        .then(|| format!("{RUN_STATE_RESOURCE_PREFIX}{}", cell.test))
+}
+
+/// Every per-test resource of which a run of `cell` holds the one unit.
+fn exclusive_test_resources(cell: &CellId, facts: Option<&ManifestCellFacts>) -> Vec<String> {
+    dbt_host_tmp_resource(cell)
+        .into_iter()
+        .chain(facts.and_then(|facts| run_state_resource(cell, facts)))
+        .collect()
+}
+
+/// A resource name that admits exactly one cell at a time.
+fn is_exclusive_test_resource(resource: &str) -> bool {
+    resource.starts_with(DBT_HOST_TMP_RESOURCE_PREFIX)
+        || resource.starts_with(RUN_STATE_RESOURCE_PREFIX)
 }
 
 /// The prefix a cell's harness command starts with: [`DBT_NAMESPACE_WRAPPER`]
@@ -4994,6 +5057,7 @@ fn validate_guest_caps_against_selected_demand(
 
 fn require_cell_occupancy_fits(
     cells: &[TrackedCell],
+    exclusive: &dyn Fn(&CellId) -> Vec<String>,
     budgets: &BTreeMap<(String, String, String), CellBudget>,
     selected_cap: Option<i64>,
     run_timeout_seconds: i64,
@@ -5038,11 +5102,11 @@ fn require_cell_occupancy_fits(
                 "the selected KVM cells exceed the supported occupancy range".to_string()
             })?;
         }
-        if let Some(resource) = dbt_host_tmp_resource(&tracked.id) {
+        for resource in exclusive(&tracked.id) {
             let serial = serial_seconds.entry(resource).or_default();
             *serial = serial.checked_add(seconds).ok_or_else(|| {
                 format!(
-                    "the selected cells of DBT test {} exceed the supported occupancy range",
+                    "the selected cells of test {} exceed the supported occupancy range",
                     tracked.id.test
                 )
             })?;
@@ -5604,8 +5668,15 @@ fn write_plan_after_scorecard_check(
         preparation_by_test.len(),
         required_builds.len() + usize::from(reads_compat_fixtures),
     )?;
+    let exclusive = |cell: &CellId| {
+        exclusive_test_resources(
+            cell,
+            manifest_facts.get(&(cell.test.clone(), cell.mode.clone(), cell.backend.clone())),
+        )
+    };
     require_cell_occupancy_fits(
         &cells,
+        &exclusive,
         &budgets,
         selection.cell_timeout_seconds,
         run_timeout_seconds,
@@ -5914,7 +5985,7 @@ fn write_plan_after_scorecard_check(
             if cell.backend == "kvm" {
                 resources.insert("kvm_guest".into(), 1);
             }
-            if let Some(resource) = dbt_host_tmp_resource(cell) {
+            for resource in exclusive(cell) {
                 resources.insert(resource, 1);
             }
             let mut deps = selected_cell_dependencies(
@@ -6048,7 +6119,7 @@ fn write_plan_after_scorecard_check(
     dag.resource_caps.extend(
         cells
             .iter()
-            .filter_map(|tracked| dbt_host_tmp_resource(&tracked.id))
+            .flat_map(|tracked| exclusive(&tracked.id))
             .map(|resource| (resource, 1)),
     );
     dag.default_step_timeout = max_timeout;
@@ -6186,10 +6257,9 @@ fn audit_dag(
                     "{tag} requests {demand} unit(s) of {resource}, but the DAG grants {capacity}"
                 ));
             }
-            if resource.starts_with(DBT_HOST_TMP_RESOURCE_PREFIX) && (*demand != 1 || capacity != 1)
-            {
+            if is_exclusive_test_resource(resource) && (*demand != 1 || capacity != 1) {
                 return Err(format!(
-                    "{tag} requests {demand} of {capacity} unit(s) of {resource}; one DBT test's host /tmp admits exactly one cell"
+                    "{tag} requests {demand} of {capacity} unit(s) of {resource}; one DBT test's host /tmp, or one test's shared run state, admits exactly one cell"
                 ));
             }
         }
@@ -6246,9 +6316,9 @@ fn audit_dag(
     // demands is still part of the plan, so every DBT host /tmp grant must be
     // exactly the one unit `dbt_host_tmp_resource` promises.
     for (resource, capacity) in &dag.resource_caps {
-        if resource.starts_with(DBT_HOST_TMP_RESOURCE_PREFIX) && *capacity != 1 {
+        if is_exclusive_test_resource(resource) && *capacity != 1 {
             return Err(format!(
-                "the DAG grants {capacity} unit(s) of {resource}; one DBT test's host /tmp admits exactly one cell"
+                "the DAG grants {capacity} unit(s) of {resource}; one DBT test's host /tmp, or one test's shared run state, admits exactly one cell"
             ));
         }
     }
@@ -12737,6 +12807,91 @@ fn compat_fixture_step_refusal_self_test(root: &Path) -> Result<(), String> {
     }
 }
 
+/// Two runs of one test whose argv writes below VALIDATE_RUN_STATE outside
+/// the shared fixture root (compat.yaml's shell-build and top rows name
+/// fixed scratch directories there) must never overlap: the shell-build
+/// workload removes and rebuilds its directory. Each such cell run holds the
+/// one unit of its test's `run_state:` resource, the same per-test exclusive
+/// scheduling that keeps two DBT cells of one test apart; a cell that only
+/// reads the fixtures holds none.
+fn run_state_exclusive_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
+    const PREFIX: &str = "run_state:";
+    let writer = ("compat/strict-shell-build", "verify", "ptrace");
+    let reader = ("compat/shuf", "verify", "sabre");
+    let other = ("c-programs/prctl-identity", "verify", "dbt");
+    let ids: Vec<CellId> = [writer, reader, other]
+        .iter()
+        .map(|(test, mode, backend)| CellId {
+            lane: "portable".into(),
+            category: test
+                .split_once('/')
+                .map_or("", |(category, _)| category)
+                .into(),
+            test: (*test).into(),
+            mode: (*mode).into(),
+            backend: (*backend).into(),
+        })
+        .collect();
+    let checked = CheckedScorecard {
+        root,
+        enforce_host_capabilities: false,
+        memory_budget_override: Some(i64::MAX),
+    };
+    let cells_file = scratch.join("run-state-exclusive.jsonl");
+    fs::write(&cells_file, canonical_cells_jsonl(&ids)?)
+        .map_err(|error| format!("cannot write {}: {error}", cells_file.display()))?;
+    let plan = scratch.join("run-state-exclusive-plan");
+    let (_, dag) = write_plan_after_scorecard_check(
+        &checked,
+        &plan,
+        &plan.join("dag.json"),
+        &CellSelection {
+            cells_file: Some(cells_file),
+            repetitions: Some(2),
+            run_timeout_seconds: Some(1_000_000),
+            ..CellSelection::default()
+        },
+    )?;
+    let expected = format!("{PREFIX}{}", writer.0);
+    if dag.resource_caps.get(&expected) != Some(&1) {
+        return Err(format!(
+            "the plan does not grant exactly one unit of {expected}: {:?}",
+            dag.resource_caps
+        ));
+    }
+    let mut writer_runs = 0;
+    for step in dag.steps.iter().filter(|step| step.group == "cell") {
+        let held: Vec<(&String, &i64)> = step
+            .hint
+            .resources
+            .iter()
+            .filter(|(name, _)| name.starts_with(PREFIX))
+            .collect();
+        let is_writer = step
+            .cmd
+            .contains(&format!(" --test {} ", shell_quote(writer.0)));
+        let ok = if is_writer {
+            writer_runs += 1;
+            held == [(&expected, &1)]
+        } else {
+            held.is_empty()
+        };
+        if !ok {
+            return Err(format!(
+                "{} holds {held:?} of the run-state resources",
+                step.tag()
+            ));
+        }
+    }
+    if writer_runs != 2 {
+        return Err(format!(
+            "the plan runs {writer_runs} repetitions of {}, expected 2",
+            writer.0
+        ));
+    }
+    Ok(())
+}
+
 /// The parity candidates of a sampled population: its verify cells on a
 /// backend parity compares with ptrace, whose parity cell the committed
 /// snapshot ([`parity::PARITY_CELLS_PATH`]) lists as applicable. Read from the
@@ -14934,6 +15089,7 @@ fn self_test(root: &Path) -> Result<(), String> {
     focused_run_type_selection_self_test(root, &scratch)?;
     validate_run_state_self_test(root, &scratch)?;
     parity_reference_sample_self_test(root, &scratch)?;
+    run_state_exclusive_self_test(root, &scratch)?;
 
     let cells_file_results = scratch.join("cells-file-plan");
     let cells_file_budget_keys = cells_file_ids
@@ -25250,7 +25406,17 @@ mod pressure_planning_tests {
             })
             .collect::<BTreeMap<_, _>>();
         let fits = |cells: &[TrackedCell], run_timeout_seconds: i64| {
-            require_cell_occupancy_fits(cells, &budgets, None, run_timeout_seconds, 100, 4, 4, 4)
+            require_cell_occupancy_fits(
+                cells,
+                &|cell| dbt_host_tmp_resource(cell).into_iter().collect(),
+                &budgets,
+                None,
+                run_timeout_seconds,
+                100,
+                4,
+                4,
+                4,
+            )
         };
         // Two DBT modes of one test, 100 repetitions each at 58s apiece, hold
         // that test's grant for 11,600s, although four guest slots alone
@@ -26430,5 +26596,33 @@ mod runner_outcome_tests {
                 "{repetitions:?}: a foreign outcome was accepted in place of a reference"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod run_state_exclusive_tests {
+    use super::*;
+
+    #[test]
+    fn runs_of_a_test_that_writes_its_run_state_never_overlap() {
+        let root = Path::new(file!())
+            .canonicalize()
+            .unwrap()
+            .ancestors()
+            .nth(3)
+            .unwrap()
+            .to_path_buf();
+        let path = env::temp_dir().join(format!(
+            "hermit-pressure-self-test-run-state-exclusive-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let cleanup = SelfTestDirectory::new(path.clone());
+        run_state_exclusive_self_test(&root, &path).unwrap();
+        cleanup.remove().unwrap();
     }
 }
