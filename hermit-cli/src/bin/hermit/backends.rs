@@ -1136,6 +1136,22 @@ pub(super) fn run_dbt(
             String::from_utf8_lossy(&first.stdout),
             String::from_utf8_lossy(&first.stderr),
         );
+        // Record the rejected first run where its disposition is known, as the
+        // ptrace path does. Left alone, the pre-stamped `not_run` record keeps
+        // `guest_exit_code: null`, so the runner cannot tell this completed
+        // failure from a run that never started and counts it as an
+        // infrastructure error. Best effort: an unwritable artifact must not
+        // turn a rejected first run into a different error.
+        if let Some(path) = verify_json {
+            let report = super::run::first_run_rejected_report(&first, None);
+            if let Err(error) = super::verify::write_report_json(path, &report) {
+                eprintln!(
+                    "WARNING: could not record the rejected first run in {}: {}",
+                    path.display(),
+                    error
+                );
+            }
+        }
         if keep_logs {
             retain_verification_logs([("run 1", log1_path)])?;
         }
@@ -2104,6 +2120,33 @@ mod tests {
                 "unreadable typed stats must return while the pre-stamped no_result is still current"
             );
         }
+
+        // A first run the verify policy rejects is a completed failure, not
+        // an unknown state: like the ptrace path, the DBT path records
+        // FirstRunRejected with the guest's disposition before it returns, so
+        // the runner can count it as a failure instead of an infrastructure
+        // error.
+        let rejected_arm = canonical
+            .split_once("if !verify_allow.satisfies(process_status(first_raw.status))")
+            .expect("first-run rejection arm")
+            .1
+            .split_once("return Err(Error::msg(\"First run during --verify exited in error\"));")
+            .expect("end of first-run rejection arm")
+            .0;
+        let record = rejected_arm
+            .find("super::run::first_run_rejected_report(&first, None)")
+            .expect("the rejected first run is recorded as FirstRunRejected");
+        let publish = rejected_arm
+            .find("super::verify::write_report_json(path, &report)")
+            .expect("the FirstRunRejected report is written to --verify-json");
+        assert!(
+            rejected_arm.contains("if let Some(path) = verify_json"),
+            "the record is written only where a verify report was requested"
+        );
+        assert!(
+            record < publish,
+            "the rejected first run must be recorded before the report is written"
+        );
     }
 
     #[test]
