@@ -563,6 +563,9 @@ fn main() {
     // against the guest's fresh /tmp and silently discards the log.
     // The --max-log-bytes counter is mapped here for the same reason: it must
     // exist before the first container fork to be shared by every run.
+    if global.max_log_bytes.is_some() {
+        self::tracing::enable_log_cap_exit_bound();
+    }
     let result = global
         .prepare_log_budget()
         .and_then(|()| global.open_log_file())
@@ -747,6 +750,22 @@ fn display_error(error: Error) {
     // The ordering below (class first) was already written for a truncated
     // capture. Ordering limits the damage; it does not prevent it.
     use std::io::Write;
+    if error.downcast_ref::<LogCapExceeded>().is_some() {
+        // A run the log cap ended must exit 123 promptly even when stderr is
+        // a full pipe nobody reads, so this one report is attempted once and
+        // never waits (RetryingStderr below retries until it is delivered).
+        let mut report = classify_failure(&error);
+        report.push('\n');
+        for (index, cause) in error.chain().enumerate() {
+            report.push_str(&if index == 0 {
+                format!("{}: {}\n", "Error".red().bold(), cause)
+            } else {
+                format!("     {} {}\n", ">".dimmed().bold(), cause)
+            });
+        }
+        self::tracing::report_log_cap_without_waiting(&report);
+        return;
+    }
     let mut out = detcore::util::RetryingStderr;
     let _ = writeln!(out, "{}", classify_failure(&error));
 

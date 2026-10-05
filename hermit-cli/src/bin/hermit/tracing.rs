@@ -577,43 +577,245 @@ impl CappedWriter<detcore::util::RetryingStderr> {
     }
 }
 
-/// Put `bytes` on `fd` in one attempt that cannot wait for the other end.
+/// Put `bytes` on `fd` once, without waiting for the other end and without
+/// letting the attempt raise a signal. A diagnostic that cannot be delivered
+/// that way is omitted: the exit status still says why the run ended.
 ///
-/// A regular file never waits for a reader, so it gets one plain `write`.
-/// Anything else is written with `RWF_NOWAIT`, which pipes, FIFOs and sockets
-/// honour by failing with `EAGAIN` instead of sleeping. A descriptor that does
-/// not support `RWF_NOWAIT` (a terminal) gets one `write` only when `poll`
-/// with a zero timeout reports it writable. A message that does not fit now is
-/// dropped: the exit status still says why the run ended.
-fn write_without_waiting(fd: RawFd, bytes: &[u8]) {
-    // SAFETY: fstat writes only into the zeroed struct it is given.
-    let mut stat: libc::stat = unsafe { mem::zeroed() };
-    let regular =
-        unsafe { libc::fstat(fd, &mut stat) } == 0 && stat.st_mode & libc::S_IFMT == libc::S_IFREG;
-    if !regular {
-        let iov = libc::iovec {
-            iov_base: bytes.as_ptr() as *mut libc::c_void,
-            iov_len: bytes.len(),
-        };
-        // SAFETY: one valid iovec over `bytes`; offset -1 is "the current
-        // position", the only one a pipe accepts.
-        let written = unsafe { libc::pwritev2(fd, &iov, 1, -1, libc::RWF_NOWAIT) };
-        if written >= 0 || io::Error::last_os_error().raw_os_error() != Some(libc::EOPNOTSUPP) {
-            return;
+/// THE DESCRIPTOR ITSELF IS NEVER MADE NON-BLOCKING. An inherited descriptor's
+/// open file description is shared with the parent, the guest or a terminal,
+/// and `fcntl(O_NONBLOCK)` on it would leak into all of them. Each kind of file
+/// instead gets a primitive that is non-blocking on its own:
+///
+/// - a regular file: `pwritev2(RWF_NOWAIT)` at offset -1, so the file position
+///   and `O_APPEND` are honoured. `EAGAIN` or `EOPNOTSUPP` omit the line.
+///   Buffered `RWF_NOWAIT` writes fail with `EAGAIN` on btrfs and with
+///   `EOPNOTSUPP` on tmpfs, so a log file there does not get the line.
+/// - a socket: `send(MSG_DONTWAIT | MSG_NOSIGNAL)`.
+/// - a pipe, FIFO or terminal: a NEW open file description for the same
+///   object, opened through `/proc/self/fd/<fd>` with `O_NONBLOCK`, and one
+///   write of at most `PIPE_BUF` bytes, which a pipe either takes whole or
+///   refuses with `EAGAIN`. Opening a pipe that has no reader fails with
+///   `ENXIO` rather than raising `SIGPIPE`.
+/// - anything else, including a descriptor `statx` cannot inspect: omitted.
+///
+/// The file type comes from `statx(AT_STATX_DONT_SYNC)`, which answers from
+/// cached attributes instead of asking a network or FUSE file system.
+///
+/// No signal escapes; see [`suppressing_diagnostic_signals`].
+///
+/// What this cannot avoid are short kernel locks that sleep uninterruptibly,
+/// which no handled signal or timer could break either: the file-position lock
+/// of an open file description another process is writing through at that
+/// moment, a terminal's termios and output locks, a socket's lock. None of
+/// them waits for a reader to drain anything.
+pub(crate) fn write_without_waiting(fd: RawFd, bytes: &[u8]) {
+    let bytes = &bytes[..bytes.len().min(libc::PIPE_BUF)];
+    suppressing_diagnostic_signals(|| {
+        // SAFETY: statx writes only into the zeroed struct it is given; an
+        // empty path with AT_EMPTY_PATH names `fd` itself.
+        let mut stat: libc::statx = unsafe { mem::zeroed() };
+        let inspected = unsafe {
+            libc::statx(
+                fd,
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+                libc::STATX_TYPE,
+                &mut stat,
+            )
+        } == 0;
+        if !inspected {
+            return 0;
         }
-        let mut ready = libc::pollfd {
-            fd,
-            events: libc::POLLOUT,
-            revents: 0,
+        let written = match libc::mode_t::from(stat.stx_mode) & libc::S_IFMT {
+            libc::S_IFREG => {
+                let iov = libc::iovec {
+                    iov_base: bytes.as_ptr() as *mut libc::c_void,
+                    iov_len: bytes.len(),
+                };
+                // SAFETY: one valid iovec over `bytes`; offset -1 is the
+                // current position.
+                unsafe { libc::pwritev2(fd, &iov, 1, -1, libc::RWF_NOWAIT) }
+            }
+            // SAFETY: `bytes` is valid for its length.
+            libc::S_IFSOCK => unsafe {
+                libc::send(
+                    fd,
+                    bytes.as_ptr().cast(),
+                    bytes.len(),
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            },
+            libc::S_IFIFO => return write_through_new_description(fd, bytes),
+            // SAFETY: isatty only inspects `fd`.
+            libc::S_IFCHR if unsafe { libc::isatty(fd) } == 1 => {
+                return write_through_new_description(fd, bytes);
+            }
+            _ => return 0,
         };
-        // SAFETY: one valid pollfd; a zero timeout returns at once.
-        let polled = unsafe { libc::poll(&mut ready, 1, 0) };
-        if polled != 1 || ready.revents & libc::POLLOUT == 0 {
-            return;
+        if written < 0 { last_errno() } else { 0 }
+    });
+}
+
+fn last_errno() -> i32 {
+    io::Error::last_os_error().raw_os_error().unwrap_or(0)
+}
+
+/// Write `bytes` through a new, non-blocking open file description for the
+/// pipe, FIFO or terminal behind `fd`. Returns the write's errno, 0 for none.
+/// `O_NOCTTY`: a session leader (the container init) must not acquire the
+/// terminal as its controlling terminal by writing a diagnostic to it.
+fn write_through_new_description(fd: RawFd, bytes: &[u8]) -> i32 {
+    let path = proc_self_fd_path(fd);
+    // SAFETY: `path` is NUL-terminated.
+    let reopened = unsafe {
+        libc::open(
+            path.as_ptr().cast(),
+            libc::O_WRONLY | libc::O_NONBLOCK | libc::O_CLOEXEC | libc::O_NOCTTY,
+        )
+    };
+    if reopened < 0 {
+        // ENXIO is a pipe with no reader: nothing written, nothing raised.
+        return 0;
+    }
+    // SAFETY: `bytes` is valid for its length; `reopened` is ours.
+    let written = unsafe { libc::write(reopened, bytes.as_ptr().cast(), bytes.len()) };
+    let errno = if written < 0 { last_errno() } else { 0 };
+    // SAFETY: closes only the descriptor opened above.
+    unsafe { libc::close(reopened) };
+    errno
+}
+
+/// `/proc/self/fd/<fd>` as a NUL-terminated path, built without allocating:
+/// the crossing writer may run with arbitrary locks held.
+fn proc_self_fd_path(fd: RawFd) -> [u8; 32] {
+    const PREFIX: &[u8] = b"/proc/self/fd/";
+    let mut path = [0u8; 32];
+    path[..PREFIX.len()].copy_from_slice(PREFIX);
+    let mut digits = [0u8; 10];
+    let mut count = 0;
+    let mut rest = fd.unsigned_abs();
+    loop {
+        digits[count] = b'0' + (rest % 10) as u8;
+        count += 1;
+        rest /= 10;
+        if rest == 0 {
+            break;
         }
     }
-    // SAFETY: `bytes` is valid for its length.
-    unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+    for (slot, digit) in path[PREFIX.len()..]
+        .iter_mut()
+        .zip(digits[..count].iter().rev())
+    {
+        *slot = *digit;
+    }
+    path
+}
+
+/// Run one diagnostic write (`write` returns its errno, 0 for none) so that no
+/// signal it generates escapes.
+///
+/// The crossing process can be a Reverie tracer, which restores `SIGPIPE`'s
+/// default disposition and clears the signal mask. A `SIGPIPE` from a reader
+/// that left between the open and the write would kill it before `_exit(123)`,
+/// and the parent would classify the death by signal as an internal failure
+/// (125) -- review of https://github.com/rrnewton/hermit/pull/3686, round 2.
+/// As in `proc_mount`'s warning writer, `SIGPIPE` and `SIGXFSZ` (a file-size
+/// limit) are blocked for the attempt, and a signal is consumed only when this
+/// write failed with the matching error and the signal was not already pending
+/// before it. `SIGTTOU` is blocked too: a terminal with `TOSTOP` treats a
+/// blocked `SIGTTOU` as ignored and accepts the write, instead of stopping a
+/// background process. The original mask is restored afterwards.
+fn suppressing_diagnostic_signals(write: impl FnOnce() -> i32) {
+    // SAFETY: sigset operations on local, initialized sets; pthread_sigmask and
+    // sigtimedwait affect only the calling thread.
+    unsafe {
+        let mut blocked: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut blocked);
+        for signal in [libc::SIGPIPE, libc::SIGXFSZ, libc::SIGTTOU] {
+            libc::sigaddset(&mut blocked, signal);
+        }
+        let mut original: libc::sigset_t = mem::zeroed();
+        if libc::pthread_sigmask(libc::SIG_BLOCK, &blocked, &mut original) != 0 {
+            return;
+        }
+        let mut pending_before: libc::sigset_t = mem::zeroed();
+        libc::sigemptyset(&mut pending_before);
+        libc::sigpending(&mut pending_before);
+        let errno = write();
+        let generated = match errno {
+            libc::EPIPE => Some(libc::SIGPIPE),
+            libc::EFBIG => Some(libc::SIGXFSZ),
+            _ => None,
+        };
+        if let Some(signal) = generated
+            && libc::sigismember(&pending_before, signal) == 0
+        {
+            let mut consume: libc::sigset_t = mem::zeroed();
+            libc::sigemptyset(&mut consume);
+            libc::sigaddset(&mut consume, signal);
+            let now = libc::timespec {
+                tv_sec: 0,
+                tv_nsec: 0,
+            };
+            while libc::sigtimedwait(&consume, std::ptr::null_mut(), &now) < 0
+                && last_errno() == libc::EINTR
+            {}
+        }
+        libc::pthread_sigmask(libc::SIG_SETMASK, &original, std::ptr::null_mut());
+    }
+}
+
+/// Set by `main` when `--max-log-bytes` is in force; see [`bound_log_cap_exit`].
+static LOG_CAP_EXIT_BOUND_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Whether the outer report's class line has been attempted.
+static LOG_CAP_REPORTED: AtomicBool = AtomicBool::new(false);
+static LOG_CAP_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
+
+/// How long the outer process may keep reporting after it learns that a run
+/// crossed the cap, before it exits 123 regardless.
+const LOG_CAP_OUTER_GRACE: std::time::Duration = std::time::Duration::from_millis(750);
+
+/// Let [`bound_log_cap_exit`] act in this process. Only `main` calls this, so
+/// unit tests that classify a 123 status never start the exit timer.
+pub(crate) fn enable_log_cap_exit_bound() {
+    LOG_CAP_EXIT_BOUND_ENABLED.store(true, Ordering::Relaxed);
+}
+
+/// The process that classifies a container's 123 status must itself exit 123
+/// within a fixed bound, whatever its remaining diagnostics do: between the
+/// classification and `main`'s final report it can still print through
+/// blocking `eprintln!` calls (cleanup notices, verification notes) to a
+/// stderr nobody reads. This starts a thread that, after
+/// [`LOG_CAP_OUTER_GRACE`], attempts the class line once without waiting
+/// (unless the final report already did) and calls `_exit(123)`. A normal exit
+/// before then ends the thread with the process. If the thread cannot be
+/// created, the bound is not armed; the final report still never waits.
+pub(crate) fn bound_log_cap_exit() {
+    if !LOG_CAP_EXIT_BOUND_ENABLED.load(Ordering::Relaxed)
+        || LOG_CAP_EXIT_SCHEDULED.swap(true, Ordering::Relaxed)
+    {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("log-cap-exit".to_string())
+        .spawn(|| {
+            std::thread::sleep(LOG_CAP_OUTER_GRACE);
+            if !LOG_CAP_REPORTED.swap(true, Ordering::Relaxed) {
+                write_without_waiting(libc::STDERR_FILENO, LOG_CAP_CLASS_LINE.as_bytes());
+            }
+            // SAFETY: _exit has no preconditions.
+            unsafe { libc::_exit(hermit::HERMIT_LOG_CAP_EXIT) }
+        });
+}
+
+/// The stderr class line for a run the log cap ended.
+pub(crate) const LOG_CAP_CLASS_LINE: &str = "HERMIT_LOG_CAP class=log-cap\n";
+
+/// Write the outer report for a run the log cap ended: once, without waiting,
+/// omitted when it cannot be delivered at once (see [`write_without_waiting`]).
+pub(crate) fn report_log_cap_without_waiting(report: &str) {
+    LOG_CAP_REPORTED.store(true, Ordering::Relaxed);
+    write_without_waiting(libc::STDERR_FILENO, report.as_bytes());
 }
 
 impl<W: Write> Write for CappedWriter<W> {
@@ -1593,5 +1795,126 @@ mod tests {
         assert!(libc::WIFEXITED(status), "status {status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), hermit::HERMIT_LOG_CAP_EXIT);
         assert_eq!(budget.spent(), 120);
+    }
+
+    /// Run `body` in a forked child whose SIGPIPE has its default disposition
+    /// and whose signal mask is empty -- the state Reverie leaves the tracer
+    /// in -- and return the child's raw wait status.
+    fn in_child_with_default_sigpipe(body: impl FnOnce()) -> libc::c_int {
+        // SAFETY: the child runs raw syscalls and a closure that does the
+        // same, then _exits.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
+        if child == 0 {
+            unsafe {
+                libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+                let mut empty: libc::sigset_t = mem::zeroed();
+                libc::sigemptyset(&mut empty);
+                libc::pthread_sigmask(libc::SIG_SETMASK, &empty, std::ptr::null_mut());
+                body();
+                libc::_exit(0);
+            }
+        }
+        let mut status = 0;
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        status
+    }
+
+    fn assert_exited_cleanly(status: libc::c_int, what: &str) {
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "{what}: status {status:#x} (signal {})",
+            if libc::WIFSIGNALED(status) {
+                libc::WTERMSIG(status)
+            } else {
+                0
+            }
+        );
+    }
+
+    /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
+    /// 4: a cap diagnostic to a pipe whose reader is gone, or to a socket whose
+    /// peer is gone, must not raise SIGPIPE in a process that has SIGPIPE at
+    /// its default disposition. Such a death turned exit 123 into 125.
+    #[test]
+    fn a_cap_diagnostic_to_a_departed_reader_raises_no_signal() {
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        unsafe { libc::close(pipe[0]) };
+        let status = in_child_with_default_sigpipe(|| {
+            write_without_waiting(pipe[1], b"hermit: diagnostic\n");
+        });
+        unsafe { libc::close(pipe[1]) };
+        assert_exited_cleanly(status, "pipe without a reader");
+
+        let mut pair = [0; 2];
+        assert_eq!(
+            unsafe {
+                libc::socketpair(
+                    libc::AF_UNIX,
+                    libc::SOCK_STREAM | libc::SOCK_CLOEXEC,
+                    0,
+                    pair.as_mut_ptr(),
+                )
+            },
+            0
+        );
+        unsafe { libc::close(pair[1]) };
+        let status = in_child_with_default_sigpipe(|| {
+            write_without_waiting(pair[0], b"hermit: diagnostic\n");
+        });
+        unsafe { libc::close(pair[0]) };
+        assert_exited_cleanly(status, "socket without a peer");
+    }
+
+    /// The guard itself: a raw write that does raise SIGPIPE is survived, the
+    /// signal it generated is consumed rather than left pending, and the
+    /// signal mask is restored.
+    #[test]
+    fn the_diagnostic_signal_guard_consumes_only_the_signal_its_write_raised() {
+        let mut pipe = [0; 2];
+        assert_eq!(
+            unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        unsafe { libc::close(pipe[0]) };
+        let status = in_child_with_default_sigpipe(|| unsafe {
+            suppressing_diagnostic_signals(|| {
+                if libc::write(pipe[1], b"x".as_ptr().cast(), 1) < 0 {
+                    last_errno()
+                } else {
+                    0
+                }
+            });
+            let mut pending: libc::sigset_t = mem::zeroed();
+            libc::sigpending(&mut pending);
+            let mut mask: libc::sigset_t = mem::zeroed();
+            libc::pthread_sigmask(libc::SIG_SETMASK, std::ptr::null(), &mut mask);
+            if libc::sigismember(&pending, libc::SIGPIPE) == 1
+                || libc::sigismember(&mask, libc::SIGPIPE) == 1
+                || libc::sigismember(&mask, libc::SIGTTOU) == 1
+            {
+                libc::_exit(3);
+            }
+        });
+        unsafe { libc::close(pipe[1]) };
+        assert_exited_cleanly(status, "raw write to a pipe without a reader");
+    }
+
+    #[test]
+    fn the_proc_fd_path_names_the_descriptor() {
+        for (fd, expected) in [
+            (0, "/proc/self/fd/0"),
+            (2, "/proc/self/fd/2"),
+            (1234, "/proc/self/fd/1234"),
+            (i32::MAX, "/proc/self/fd/2147483647"),
+        ] {
+            let path = proc_self_fd_path(fd);
+            let end = path.iter().position(|&byte| byte == 0).unwrap();
+            assert_eq!(std::str::from_utf8(&path[..end]).unwrap(), expected);
+        }
     }
 }

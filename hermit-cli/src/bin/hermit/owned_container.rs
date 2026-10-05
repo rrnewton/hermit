@@ -127,7 +127,10 @@ impl ParentCleanupUnconfirmed {
         // The copied headline is display-only. Keep the original typed error
         // underneath this typed retention context for classification/downcasts.
         self.primary_display = Some(primary.to_string());
-        eprintln!("HERMIT_CLEANUP_UNCONFIRMED: {self}");
+        // Not `eprintln!`, which panics when stderr's reader has gone (EPIPE)
+        // and would replace the primary failure's status with 101.
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stderr(), "HERMIT_CLEANUP_UNCONFIRMED: {self}");
         primary.context(self)
     }
 }

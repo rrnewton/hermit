@@ -1359,7 +1359,10 @@ pub fn classify_container_result<T>(
         }
         // The --max-log-bytes cap, chosen by `CappedWriter` in the init. Same
         // reason as the deadline arm: without it a working bound reports 125.
+        // From here this process must exit 123 within a fixed bound even if a
+        // later diagnostic blocks on a stderr nobody reads.
         Err(RunError::ExitStatus(status)) if status.code() == Some(HERMIT_LOG_CAP_EXIT) => {
+            super::tracing::bound_log_cap_exit();
             Err(Error::new(LogCapExceeded))
         }
         // A signal death, before the catch-all for the same reason the refusal arm

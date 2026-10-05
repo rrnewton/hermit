@@ -4390,7 +4390,11 @@ impl RunOpts {
         }
 
         if self.no_namespace {
-            eprintln!(
+            // Not `eprintln!`, which panics when stderr's reader has gone
+            // (EPIPE): a warning must not end the run with 101.
+            use std::io::Write as _;
+            let _ = writeln!(
+                std::io::stderr(),
                 "WARNING: --no-namespace is not a sandbox; run trusted guests only. The guest \
                  inherits the caller UID/GID/capabilities and shares host /proc, filesystem, /tmp, \
                  localhost/network, ports, Unix sockets, and mutable state between runs. Unsupported \

@@ -6187,12 +6187,177 @@ fn max_log_bytes_aborts_a_run_whose_log_file_runs_away() {
         "log was {} bytes",
         written.len()
     );
+    // The file's copy of the reason is best effort: it is written only when
+    // the file system takes a write that cannot wait (`RWF_NOWAIT`), and
+    // omitted otherwise (btrfs answers EAGAIN, tmpfs EOPNOTSUPP). stderr, a
+    // pipe this test drains, carries it either way (asserted above). What must
+    // hold on every file system: the file ends on a complete line, and if the
+    // reason is there at all it is the last line.
+    let tail = &written[written.len().saturating_sub(600)..];
+    assert!(written.ends_with('\n'), "the log ends mid-line:\n{tail}");
+    if let Some(at) = written.find("hermit: log output exceeded --max-log-bytes") {
+        assert!(
+            written[at..]
+                .trim_end()
+                .ends_with("raise --max-log-bytes, to let the run finish."),
+            "the reason the log ends must be its last line:\n{tail}"
+        );
+    }
+}
+
+/// A pipe for a child's stderr whose buffer is already full and whose reader
+/// (the first descriptor, held by the caller) stays open and never reads. The
+/// write end is back in blocking mode, so a plain `write(2)` to it waits
+/// forever.
+fn full_unread_stderr_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0; 2];
+    assert_eq!(
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) },
+        0
+    );
+    for chunk in [&[b'x'; 4096][..], &[b'x'; 1][..]] {
+        while unsafe { libc::write(fds[1], chunk.as_ptr().cast(), chunk.len()) } > 0 {}
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::EAGAIN)
+        );
+    }
+    assert_eq!(unsafe { libc::fcntl(fds[1], libc::F_SETFL, 0) }, 0);
+    // SAFETY: both descriptors were just created and are owned only here.
+    unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    }
+}
+
+/// Wait for `child` for at most `bound`, killing it on expiry. Returns the
+/// exit status (`None` when it had to be killed) and the time waited.
+fn wait_at_most(
+    child: &mut std::process::Child,
+    bound: Duration,
+) -> (Option<std::process::ExitStatus>, Duration) {
+    let start = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            return (Some(status), start.elapsed());
+        }
+        if start.elapsed() >= bound {
+            let _ = child.kill();
+            let _ = child.wait();
+            return (None, start.elapsed());
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Termination of a capped run must not depend on any diagnostic write
+/// (round-2 review of https://github.com/rrnewton/hermit/pull/3686). Here
+/// hermit's stderr is a pipe that is already full and whose reader never
+/// reads, so every stderr diagnostic would block forever if it waited: the
+/// crossing line from the container init (the crossing process) and the
+/// outer process's `HERMIT_LOG_CAP` report after it classifies the init's
+/// 123. The log goes to `--log-file` so no ordinary log line touches stderr.
+///
+/// The bound is 60 s of wall time from spawn. A capped run like this one
+/// finishes in a few seconds; the failure it catches is an indefinite wait,
+/// so the bound only has to exceed startup plus 64 KiB of debug logging on a
+/// loaded host by a wide margin. The measured time is printed.
+#[test]
+fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
+    let _lock = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log = directory.path().join("hermit.log");
+    let (_reader, writer) = full_unread_stderr_pipe();
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "--log-file",
+        log.to_str().unwrap(),
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let mut child = hermit_command(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(writer))
+        .spawn()
+        .unwrap();
+    let (status, elapsed) = wait_at_most(&mut child, Duration::from_secs(60));
+    eprintln!("capped run, stderr a full unread pipe: {status:?} after {elapsed:?}");
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "hermit was still running after {elapsed:?}: a cap diagnostic waited on the \
+             full stderr pipe"
+        )
+    });
+    assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
     assert!(
-        written
-            .trim_end()
-            .ends_with("raise --max-log-bytes, to let the run finish."),
-        "the log file must end with the reason it ends:\n{}",
-        &written[written.len().saturating_sub(600)..]
+        fs::metadata(&log).unwrap().len() > 0,
+        "the run logged to the file"
+    );
+}
+
+/// A cap diagnostic must not raise SIGPIPE in the crossing process (round-2
+/// review of https://github.com/rrnewton/hermit/pull/3686, finding 4). Under
+/// `--no-namespace` the crossing process is the Reverie tracer, which restores
+/// SIGPIPE's default disposition; its crossing line to a stderr pipe whose
+/// reader is gone used to kill it by signal, and the outer process reported
+/// that as an internal failure (125) instead of the cap (123).
+#[test]
+fn max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader() {
+    let _lock = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log = directory.path().join("hermit.log");
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both descriptors were just created and are owned only here.
+    let (reader, writer) = unsafe {
+        use std::os::fd::FromRawFd;
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    };
+    drop(reader);
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "--log-file",
+        log.to_str().unwrap(),
+        "run",
+        "--no-namespace",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let mut child = hermit_command(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(writer))
+        .spawn()
+        .unwrap();
+    let (status, elapsed) = wait_at_most(&mut child, Duration::from_secs(60));
+    eprintln!("capped --no-namespace run, stderr without a reader: {status:?} after {elapsed:?}");
+    let status = status.unwrap_or_else(|| panic!("hermit was still running after {elapsed:?}"));
+    assert_eq!(
+        status.code(),
+        Some(HERMIT_LOG_CAP_EXIT),
+        "{status:?}; 125 is the crossing tracer killed by SIGPIPE from its own diagnostic. \
+         Log tail:\n{}",
+        fs::read_to_string(&log)
+            .map(|text| {
+                text.get(text.len().saturating_sub(1500)..)
+                    .unwrap_or(&text)
+                    .to_string()
+            })
+            .unwrap_or_default()
     );
 }
 
