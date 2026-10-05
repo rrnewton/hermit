@@ -77,6 +77,33 @@ elif [ "$authority_rc" -ne 0 ]; then
 fi
 
 failures=0
+# The checks below are independent processes, each with its own files, so they
+# run concurrently: run serially they took 66 s on devbig030 (41 s of it the
+# core-review self-test), the longest single path in check.lint_checks. A job
+# is a shell function that prints its FAIL lines and returns nonzero; its output
+# is shown only when it fails, in the order the jobs were started.
+jobs_dir="$work/jobs"
+mkdir -p "$jobs_dir"
+job_count=0
+job_pids=()
+start_job() { # FUNCTION [ARGS...]
+    "$@" >"$jobs_dir/$job_count.log" 2>&1 &
+    job_pids[job_count]=$!
+    job_count=$((job_count + 1))
+}
+finish_jobs() {
+    local i rc
+    for i in "${!job_pids[@]}"; do
+        rc=0
+        wait "${job_pids[$i]}" || rc=$?
+        # A FAIL line counts even if the job forgot to return nonzero.
+        if [ "$rc" -ne 0 ] || grep -q '^FAIL' "$jobs_dir/$i.log"; then
+            cat "$jobs_dir/$i.log" >&2
+            failures=$((failures + 1))
+        fi
+    done
+    job_pids=()
+}
 # ⚠️ THE LIST IS CHECKED AGAINST THE TARGET, NOT JUST WRITTEN DOWN. A hard-coded
 # list is exactly where a newly added authority consumer goes untested: the new
 # checker fetches, nobody notices, and the race is reachable again through it.
@@ -138,16 +165,19 @@ if [ "$missing" -ne 0 ]; then
     exit 1
 fi
 
-for checker in $GUARDED; do
-    calls="$work/calls"
-    checker_runner=()
+check_obtained_once() {
+    local checker=$1
+    local calls="$work/obtained-once/${checker}.calls"
+    local empty="$work/obtained-once/${checker}.empty"
+    local out="$work/obtained-once/${checker}.out"
+    local payload n
+    local -a checker_runner=()
     case "$checker" in *.py) checker_runner=(python3) ;; esac
     : > "$calls"
     # DEV_HERMIT_PARENT is deliberately pointed at an EMPTY directory: the
     # checker must obtain the authority itself, which is the behaviour under
     # test. Pointing it at the materialised copy would test the adapter instead.
-    empty="$work/empty"
-    rm -rf "$empty"; mkdir -p "$empty"
+    mkdir -p "$empty"
     payload="$authority/ci-hub/check_outcome.py"
     case "$checker" in core-review-protocol-lint-test.sh)
         payload="$authority/ci-hub/review_contract.py" ;;
@@ -156,11 +186,10 @@ for checker in $GUARDED; do
             OBTAINED_ONCE_PAYLOAD="$payload" \
             OBTAINED_ONCE_GH_CALLS="$calls" \
             "${checker_runner[@]}" \
-            "$ROOT_DIR/scripts/$checker" >"$work/out" 2>&1; then
-        echo "FAIL: ${checker} did not complete with the authority already obtained" >&2
-        tail -5 "$work/out" >&2
-        failures=$((failures + 1))
-        continue
+            "$ROOT_DIR/scripts/$checker" >"$out" 2>&1; then
+        echo "FAIL: ${checker} did not complete with the authority already obtained"
+        tail -5 "$out"
+        return 1
     fi
     # ⚠️ THE ORACLE MUST SEE A CHECKER THAT EVALUATED NOTHING. rc=0 and a low
     # fetch count are also what a checker that skipped every case looks like,
@@ -168,16 +197,20 @@ for checker in $GUARDED; do
     # fetches. Without this arm the test passes hardest exactly when the checker
     # did least. The authority is obtainable here, so a marker means the checker
     # declined to evaluate and the property was never exercised.
-    if grep -q '^NO-RESULT-CASE:' "$work/out"; then
-        echo "FAIL: ${checker} skipped its cases while the authority WAS obtainable; this test proved nothing about it" >&2
-        failures=$((failures + 1))
-        continue
+    if grep -q '^NO-RESULT-CASE:' "$out"; then
+        echo "FAIL: ${checker} skipped its cases while the authority WAS obtainable; this test proved nothing about it"
+        return 1
     fi
     n=$(wc -c < "$calls")
     if [ "$n" -ne 1 ]; then
-        echo "FAIL: ${checker} made ${n} authority fetches, expected exactly 1; zero bypasses the planted first-success/later-504 ordering, and more than one reopens the race" >&2
-        failures=$((failures + 1))
+        echo "FAIL: ${checker} made ${n} authority fetches, expected exactly 1; zero bypasses the planted first-success/later-504 ordering, and more than one reopens the race"
+        return 1
     fi
+}
+
+mkdir -p "$work/obtained-once"
+for checker in $GUARDED; do
+    start_job check_obtained_once "$checker"
 done
 
 # ⚠️ EXIT ZERO ALONE CANNOT DISTINGUISH AN OUTAGE FROM A CHECKER THAT DID
@@ -214,7 +247,7 @@ check_response() {
     local checker="$1" name="$2" response="$3" want_rc="$4" want_markers="$5"
     local empty="$work/response/empty-${checker}-${name}"
     local out="$work/response/${checker}-${name}.out"
-    local rc marker_count
+    local rc marker_count failures=0
     local -a runner=()
     case "$checker" in *.py) runner=(python3) ;; esac
     mkdir -p "$empty"
@@ -233,22 +266,23 @@ check_response() {
         tail -5 "$out" >&2
         failures=$((failures + 1))
     fi
+    [ "$failures" -eq 0 ]
 }
 
 for checker in $GUARDED; do
-    check_response "$checker" 'HTTP-504' \
+    start_job check_response "$checker" 'HTTP-504' \
         'gh: HTTP 504 Gateway Timeout' 0 1
-    check_response "$checker" 'dial-tcp-socket' \
+    start_job check_response "$checker" 'dial-tcp-socket' \
         'Get "https://127.0.0.1/api/v3/": dial tcp 127.0.0.1:443: socket: operation not permitted' 0 1
-    check_response "$checker" 'gh-connect-hint' \
+    start_job check_response "$checker" 'gh-connect-hint' \
         'error connecting to api.github.com; check your internet connection or https://www.githubstatus.com' 0 1
-    check_response "$checker" 'dial-tcp-dns' \
+    start_job check_response "$checker" 'dial-tcp-dns' \
         'Get "https://api.github.com/": dial tcp: lookup api.github.com: no such host' 0 1
-    check_response "$checker" 'HTTP-404' \
+    start_job check_response "$checker" 'HTTP-404' \
         'gh: Not Found (HTTP 404)' 1 0
-    check_response "$checker" 'HTTP-403' \
+    start_job check_response "$checker" 'HTTP-403' \
         'gh: HTTP 403: Resource not accessible by integration' 1 0
-    check_response "$checker" 'unknown-error' \
+    start_job check_response "$checker" 'unknown-error' \
         'gh: unexpected command failure' 1 0
 done
 
@@ -260,7 +294,7 @@ check_node_response() {
     local name="$1" response="$2" want_rc="$3" want_markers="$4"
     local empty="$work/response/node-empty-${name}"
     local out="$work/response/node-${name}.out"
-    local rc marker_count
+    local rc marker_count failures=0
     mkdir -p "$empty"
     env PATH="$response_bin" DEV_HERMIT_PARENT="$empty" \
         AUTHORITY_RESPONSE="$response" \
@@ -277,38 +311,79 @@ check_node_response() {
         tail -5 "$out" >&2
         failures=$((failures + 1))
     fi
+    [ "$failures" -eq 0 ]
 }
 
-check_node_response 'HTTP-504' 'gh: HTTP 504 Gateway Timeout' 75 2
-check_node_response 'dial-tcp-socket' \
+start_job check_node_response 'HTTP-504' 'gh: HTTP 504 Gateway Timeout' 75 2
+start_job check_node_response 'dial-tcp-socket' \
     'Get "https://127.0.0.1/api/v3/": dial tcp 127.0.0.1:443: socket: operation not permitted' 75 2
-check_node_response 'gh-connect-hint' \
+start_job check_node_response 'gh-connect-hint' \
     'error connecting to api.github.com; check your internet connection or https://www.githubstatus.com' 75 2
-check_node_response 'dial-tcp-dns' \
+start_job check_node_response 'dial-tcp-dns' \
     'Get "https://api.github.com/": dial tcp: lookup api.github.com: no such host' 75 2
-check_node_response 'HTTP-404' 'gh: Not Found (HTTP 404)' 1 0
-check_node_response 'HTTP-403' \
+start_job check_node_response 'HTTP-404' 'gh: Not Found (HTTP 404)' 1 0
+start_job check_node_response 'HTTP-403' \
     'gh: HTTP 403: Resource not accessible by integration' 1 0
-check_node_response 'unknown-error' 'gh: unexpected command failure' 1 0
+start_job check_node_response 'unknown-error' 'gh: unexpected command failure' 1 0
 
 # Negative arms are insufficient if the wrapper can pass them by failing every
 # invocation. With both verified authorities local and no fetch needed, both
 # real checkers must complete and the wrapper must return pass with no marker.
-correct_node_out="$work/response/node-correct-authority.out"
-env PATH="$response_bin" DEV_HERMIT_PARENT="$authority" \
-    "$ROOT_DIR/ci/check-outcome-consumers-node.sh" >"$correct_node_out" 2>&1
-correct_node_rc=$?
-correct_node_markers=$(grep -c '^NO-RESULT-CASE:' "$correct_node_out" || true)
-if [ "$correct_node_rc" -ne 0 ]; then
-    echo "FAIL: check-outcome-consumers-node with correct authorities exited ${correct_node_rc}, expected 0" >&2
-    tail -5 "$correct_node_out" >&2
-    failures=$((failures + 1))
-fi
-if [ "$correct_node_markers" -ne 0 ]; then
-    echo "FAIL: check-outcome-consumers-node with correct authorities emitted ${correct_node_markers} no-result markers, expected 0" >&2
-    tail -5 "$correct_node_out" >&2
-    failures=$((failures + 1))
-fi
+check_correct_node() {
+    local failures=0
+    correct_node_out="$work/response/node-correct-authority.out"
+    env PATH="$response_bin" DEV_HERMIT_PARENT="$authority" \
+        "$ROOT_DIR/ci/check-outcome-consumers-node.sh" >"$correct_node_out" 2>&1
+    correct_node_rc=$?
+    correct_node_markers=$(grep -c '^NO-RESULT-CASE:' "$correct_node_out" || true)
+    if [ "$correct_node_rc" -ne 0 ]; then
+        echo "FAIL: check-outcome-consumers-node with correct authorities exited ${correct_node_rc}, expected 0" >&2
+        tail -5 "$correct_node_out" >&2
+        failures=$((failures + 1))
+    fi
+    if [ "$correct_node_markers" -ne 0 ]; then
+        echo "FAIL: check-outcome-consumers-node with correct authorities emitted ${correct_node_markers} no-result markers, expected 0" >&2
+        tail -5 "$correct_node_out" >&2
+        failures=$((failures + 1))
+    fi
+    [ "$failures" -eq 0 ]
+}
+start_job check_correct_node
+
+# ⚠️ AN INTEGRITY FAILURE MUST NOT BECOME A SKIP. Serving a CORRECTLY REACHABLE
+# but WRONG authority is the one failure the content pin exists to catch. An
+# earlier version of the guard treated any nonzero from the helper as
+# "unavailable", so a tampered authority exited the checker 0 with a no-result
+# marker -- measured 2026-09-04. If this ever passes with a marker again, the
+# pin has been turned into a suggestion.
+check_tamper() {
+    local failures=0
+    tamper="$work/tamper"
+    mkdir -p "$tamper/bin"
+    cat "$authority/ci-hub/check_outcome.py" > "$tamper/payload"
+    printf '# tampered\n' >> "$tamper/payload"
+    cat > "$tamper/bin/gh" <<STUB
+#!/usr/bin/env bash
+exec cat "$tamper/payload"
+STUB
+    chmod +x "$tamper/bin/gh"
+    mkdir -p "$tamper/empty"
+    tamper_out="$work/tamper.out"
+    if env PATH="$tamper/bin:$PATH" DEV_HERMIT_PARENT="$tamper/empty" \
+            "$ROOT_DIR/scripts/test-required-check-outcomes.sh" >"$tamper_out" 2>&1; then
+        echo "FAIL: a tampered authority did not fail the checker" >&2
+        failures=$((failures + 1))
+    elif grep -q '^NO-RESULT-CASE:' "$tamper_out"; then
+        echo "FAIL: a tampered authority was reported as could-not-determine; an integrity refusal is not an outage" >&2
+        failures=$((failures + 1))
+    fi
+    [ "$failures" -eq 0 ]
+}
+start_job check_tamper
+
+# Every job above reads $response_bin as built so far; the arms below replace
+# its tee, git and make, so they must wait for those jobs to finish.
+finish_jobs
 
 # A marker is useful only if the node can inspect the file tee is supposed to
 # write. Plant a tee that forwards output but fails without writing that file:
@@ -321,7 +396,6 @@ cat
 exit 1
 STUB
 chmod +x "$response_bin/tee"
-check_node_response 'tee-write-error' 'gh: HTTP 504 Gateway Timeout' 1 2
 
 # ci/lint-checks-node.sh is the other consumer of the same classification
 # helper. Exercise the actual wrapper with clean submodule inventory, a make
@@ -352,46 +426,29 @@ echo "unexpected make invocation: $*" >&2
 exit 2
 STUB
 chmod +x "$response_bin/git" "$response_bin/make"
-lint_node_out="$work/response/lint-node-tee-write-error.out"
-env PATH="$response_bin" HERMIT_LINT_CHECK_JOBS=2 "$ROOT_DIR/ci/lint-checks-node.sh" >"$lint_node_out" 2>&1
-lint_node_rc=$?
-lint_node_markers=$(grep -c '^NO-RESULT-CASE:' "$lint_node_out" || true)
-if [ "$lint_node_rc" -ne 1 ]; then
-    echo "FAIL: lint-checks-node with failed output capture exited ${lint_node_rc}, expected 1" >&2
-    tail -5 "$lint_node_out" >&2
-    failures=$((failures + 1))
-fi
-if [ "$lint_node_markers" -ne 1 ]; then
-    echo "FAIL: lint-checks-node with failed output capture emitted ${lint_node_markers} visible no-result markers, expected 1" >&2
-    tail -5 "$lint_node_out" >&2
-    failures=$((failures + 1))
-fi
-
-# ⚠️ AN INTEGRITY FAILURE MUST NOT BECOME A SKIP. Serving a CORRECTLY REACHABLE
-# but WRONG authority is the one failure the content pin exists to catch. An
-# earlier version of the guard treated any nonzero from the helper as
-# "unavailable", so a tampered authority exited the checker 0 with a no-result
-# marker -- measured 2026-09-04. If this ever passes with a marker again, the
-# pin has been turned into a suggestion.
-tamper="$work/tamper"
-mkdir -p "$tamper/bin"
-cat "$authority/ci-hub/check_outcome.py" > "$tamper/payload"
-printf '# tampered\n' >> "$tamper/payload"
-cat > "$tamper/bin/gh" <<STUB
-#!/usr/bin/env bash
-exec cat "$tamper/payload"
-STUB
-chmod +x "$tamper/bin/gh"
-mkdir -p "$tamper/empty"
-tamper_out="$work/tamper.out"
-if env PATH="$tamper/bin:$PATH" DEV_HERMIT_PARENT="$tamper/empty" \
-        "$ROOT_DIR/scripts/test-required-check-outcomes.sh" >"$tamper_out" 2>&1; then
-    echo "FAIL: a tampered authority did not fail the checker" >&2
-    failures=$((failures + 1))
-elif grep -q '^NO-RESULT-CASE:' "$tamper_out"; then
-    echo "FAIL: a tampered authority was reported as could-not-determine; an integrity refusal is not an outage" >&2
-    failures=$((failures + 1))
-fi
+check_lint_node_tee() {
+    local failures=0
+    lint_node_out="$work/response/lint-node-tee-write-error.out"
+    env PATH="$response_bin" HERMIT_LINT_CHECK_JOBS=2 "$ROOT_DIR/ci/lint-checks-node.sh" >"$lint_node_out" 2>&1
+    lint_node_rc=$?
+    lint_node_markers=$(grep -c '^NO-RESULT-CASE:' "$lint_node_out" || true)
+    if [ "$lint_node_rc" -ne 1 ]; then
+        echo "FAIL: lint-checks-node with failed output capture exited ${lint_node_rc}, expected 1" >&2
+        tail -5 "$lint_node_out" >&2
+        failures=$((failures + 1))
+    fi
+    if [ "$lint_node_markers" -ne 1 ]; then
+        echo "FAIL: lint-checks-node with failed output capture emitted ${lint_node_markers} visible no-result markers, expected 1" >&2
+        tail -5 "$lint_node_out" >&2
+        failures=$((failures + 1))
+    fi
+    [ "$failures" -eq 0 ]
+}
+# Start both arms only after tee, git and make are all replaced, so neither
+# can see a stub directory that is half rewritten.
+start_job check_node_response 'tee-write-error' 'gh: HTTP 504 Gateway Timeout' 1 2
+start_job check_lint_node_tee
+finish_jobs
 
 if [ "$failures" -ne 0 ]; then
     exit 1
