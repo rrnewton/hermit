@@ -15,10 +15,17 @@
  * three-byte inputs. Which thread wins depends on the schedule; the bytes
  * the client sends and receives do not.
  *
+ * The select client runs the same protocol on one thread, waiting with
+ * select, pselect6 and glibc's select and pselect, alongside a pipe that
+ * the host answers for. Before the request it checks that a closed
+ * descriptor fails the call with EBADF, that a wait in which nothing
+ * arrives times out with no time left, and that only the pipe is writable.
+ *
  * The other client modes each do one thing network record/replay must
  * refuse: end before sending the whole request, send with sendmsg or
  * sendfile, select or pselect6 on an alias of the socket above FD_SETSIZE,
- * connect to the unspecified address, send UDP, or listen. The
+ * pselect6 with a signal mask, connect to the unspecified address, send
+ * UDP, or listen. The
  * guard modes each try a way around the channel before any connection: a
  * 24-byte IPv6 connect, a netlink socket, an abstract AF_UNIX connect, a
  * socket receive timeout, a negative (immediate) receive timeout, an IPv4
@@ -546,6 +553,15 @@ static int run_refused_client(const char *port_text, const char *mode) {
       fail("sendfile client");
   } else if (strcmp(mode, "select-high") == 0 || strcmp(mode, "pselect-high") == 0) {
     select_high_alias(socket_fd, strcmp(mode, "pselect-high") == 0);
+  } else if (strcmp(mode, "pselect-mask") == 0) {
+    fd_set readable;
+    FD_ZERO(&readable);
+    FD_SET(socket_fd, &readable);
+    struct timespec zero = {0};
+    sigset_t mask;
+    sigemptyset(&mask);
+    if (pselect(socket_fd + 1, &readable, NULL, NULL, &zero, &mask) < 0)
+      fail("pselect with a signal mask");
   }
   close(socket_fd);
   return 0;
@@ -659,6 +675,159 @@ static int run_client(const char *port_text, int mismatch) {
   printf("reader-marker=%d:abc,%d:def\n", readers[first].index,
          readers[second].index);
   close(alias);
+  close(socket_fd);
+  return 0;
+}
+
+/* The descriptors in `set`, below `nfds`, as "3+5" or "-". */
+static const char *describe_set(int nfds, const fd_set *set, char *text, size_t size) {
+  size_t used = 0;
+  text[0] = '\0';
+  for (int fd = 0; fd < nfds; ++fd) {
+    if (!FD_ISSET(fd, set))
+      continue;
+    int written = snprintf(text + used, size - used, "%s%d", used ? "+" : "", fd);
+    if (written <= 0 || (size_t)written >= size - used)
+      fail_message("select description did not fit its buffer");
+    used += (size_t)written;
+  }
+  if (used == 0)
+    snprintf(text, size, "-");
+  return text;
+}
+
+/* Fails unless `actual` holds exactly the descriptors in `expected`. */
+static void expect_set(int nfds, const fd_set *actual, const fd_set *expected,
+                       const char *what) {
+  for (int fd = 0; fd < nfds; ++fd) {
+    if (FD_ISSET(fd, actual) != FD_ISSET(fd, expected)) {
+      char got[64];
+      char want[64];
+      fprintf(stderr, "%s: select reported %s, expected %s\n", what,
+              describe_set(nfds, actual, got, sizeof(got)),
+              describe_set(nfds, expected, want, sizeof(want)));
+      exit(1);
+    }
+  }
+}
+
+/* The match protocol on one thread, waiting with the select family on the
+ * socket and a pipe. Every result is checked against what Linux returns. */
+static int run_select_client(const char *port_text) {
+  set_deadline();
+  struct sockaddr_in address = loopback_address(parse_port(port_text));
+  int socket_fd = socket(AF_INET, SOCK_STREAM | SOCK_CLOEXEC, 0);
+  if (socket_fd < 0)
+    fail("socket client");
+  if (connect(socket_fd, (struct sockaddr *)&address, sizeof(address)) != 0)
+    fail("connect client");
+  int pipe_fds[2];
+  if (pipe2(pipe_fds, O_CLOEXEC) != 0)
+    fail("pipe2");
+  int closed = dup(pipe_fds[0]);
+  if (closed < 0 || close(closed) != 0)
+    fail("dup and close");
+  int nfds = socket_fd;
+  for (int index = 0; index < 2; ++index)
+    if (pipe_fds[index] > nfds)
+      nfds = pipe_fds[index];
+  if (closed > nfds)
+    nfds = closed;
+  nfds += 1;
+  fd_set readable, writable, exceptional, expected, none;
+  FD_ZERO(&none);
+
+  /* A closed descriptor fails the call before any wait and leaves the sets
+   * alone, even beside a channel. */
+  FD_ZERO(&readable);
+  FD_SET(socket_fd, &readable);
+  FD_SET(closed, &readable);
+  expected = readable;
+  struct timespec zero = {0};
+  long ready = syscall(SYS_pselect6, nfds, &readable, NULL, NULL, &zero, NULL);
+  if (ready != -1 || errno != EBADF)
+    fail_message("pselect6 naming a closed descriptor did not fail with EBADF");
+  expect_set(nfds, &readable, &expected, "EBADF pselect6");
+
+  /* Nothing arrives before the request, so a timed wait expires, clears
+   * every set, and reports no time left. */
+  FD_ZERO(&readable);
+  FD_SET(socket_fd, &readable);
+  FD_SET(pipe_fds[0], &readable);
+  FD_ZERO(&exceptional);
+  FD_SET(socket_fd, &exceptional);
+  struct timeval short_wait = {.tv_sec = 0, .tv_usec = 20000};
+  ready = syscall(SYS_select, nfds, &readable, NULL, &exceptional, &short_wait);
+  if (ready != 0)
+    fail_message("select before the request did not time out");
+  expect_set(nfds, &readable, &none, "timed-out select readable");
+  expect_set(nfds, &exceptional, &none, "timed-out select exceptional");
+  if (short_wait.tv_sec != 0 || short_wait.tv_usec != 0)
+    fail_message("timed-out select left time in its timeout");
+
+  /* Only the pipe is writable among the descriptors asked about. */
+  FD_ZERO(&readable);
+  FD_SET(socket_fd, &readable);
+  FD_ZERO(&writable);
+  FD_SET(pipe_fds[1], &writable);
+  ready = syscall(SYS_pselect6, nfds, &readable, &writable, NULL, &zero, NULL);
+  FD_ZERO(&expected);
+  FD_SET(pipe_fds[1], &expected);
+  if (ready != 1)
+    fail_message("zero-timeout pselect6 did not report exactly the pipe");
+  expect_set(nfds, &readable, &none, "zero-timeout pselect6 readable");
+  expect_set(nfds, &writable, &expected, "zero-timeout pselect6 writable");
+
+  send_all(socket_fd, REQUEST, sizeof(REQUEST) - 1);
+  FD_ZERO(&readable);
+  FD_SET(socket_fd, &readable);
+  FD_SET(pipe_fds[0], &readable);
+  struct timeval wait = {.tv_sec = 5, .tv_usec = 0};
+  ready = select(nfds, &readable, NULL, NULL, &wait);
+  FD_ZERO(&expected);
+  FD_SET(socket_fd, &expected);
+  if (ready != 1)
+    fail_message("select did not report the first input");
+  expect_set(nfds, &readable, &expected, "first-input select");
+  if (wait.tv_sec < 0 || wait.tv_sec > 5 || wait.tv_usec < 0 || wait.tv_usec >= 1000000 ||
+      (wait.tv_sec == 5 && wait.tv_usec != 0))
+    fail_message("select reported an impossible remaining time");
+  char first[PAYLOAD_SIZE];
+  receive_exact(socket_fd, first, sizeof(first));
+  if (memcmp(first, FIRST_INPUT, sizeof(first)) != 0)
+    fail_message("select client received the wrong first input");
+  send_all(socket_fd, PROGRESS, sizeof(PROGRESS) - 1);
+
+  /* glibc's pselect passes the mask wrapper even with no mask. */
+  FD_ZERO(&readable);
+  FD_SET(socket_fd, &readable);
+  struct timespec long_wait = {.tv_sec = 5, .tv_nsec = 0};
+  ready = pselect(nfds, &readable, NULL, NULL, &long_wait, NULL);
+  if (ready != 1)
+    fail_message("pselect did not report the second input");
+  expect_set(nfds, &readable, &expected, "second-input pselect");
+  char second[PAYLOAD_SIZE];
+  receive_exact(socket_fd, second, sizeof(second));
+  if (memcmp(second, SECOND_INPUT, sizeof(second)) != 0)
+    fail_message("select client received the wrong second input");
+  send_all(socket_fd, COMPLETION, sizeof(COMPLETION) - 1);
+
+  /* The peer's half-close is readable to a wait with no timeout. */
+  FD_ZERO(&readable);
+  FD_SET(socket_fd, &readable);
+  ready = select(nfds, &readable, NULL, NULL, NULL);
+  if (ready != 1)
+    fail_message("select did not report the peer's half-close");
+  expect_set(nfds, &readable, &expected, "half-close select");
+  char eof_byte;
+  if (recv(socket_fd, &eof_byte, 1, 0) != 0)
+    fail_message("peer half-close did not produce EOF after abcdef");
+
+  printf("select=ebadf,timeout,pipe-writable,first,second,eof aggregate=abcdef "
+         "outbound_hex=%s outbound_fnv1a64=%016llx\n",
+         OUTBOUND_HEX, (unsigned long long)expected_outbound_digest());
+  close(pipe_fds[0]);
+  close(pipe_fds[1]);
   close(socket_fd);
   return 0;
 }
@@ -1179,6 +1348,8 @@ int main(int argc, char **argv) {
       return run_client(argv[2], 0);
     if (strcmp(argv[3], "mismatch") == 0)
       return run_client(argv[2], 1);
+    if (strcmp(argv[3], "select") == 0)
+      return run_select_client(argv[2]);
     if (strcmp(argv[3], "backpressure-nonblocking") == 0)
       return run_backpressure_client(argv[2], NONBLOCKING);
     if (strcmp(argv[3], "backpressure-blocking") == 0)
@@ -1195,7 +1366,7 @@ int main(int argc, char **argv) {
                              "udp",       "listen",     "ipv6-24",  "netlink",
                              "abstract",  "rcvtimeo",   "scm-rights", "epoll",
                              "async",     "rcvtimeo-negative", "ifindex", "procnet",
-                             "select-high", "pselect-high"};
+                             "select-high", "pselect-high", "pselect-mask"};
     for (size_t index = 0; index < sizeof(refused) / sizeof(refused[0]); ++index)
       if (strcmp(argv[3], refused[index]) == 0)
         return run_refused_client(argv[2], argv[3]);
@@ -1203,11 +1374,11 @@ int main(int argc, char **argv) {
   fprintf(stderr,
           "usage: %s controller|backpressure-controller|shared-controller|"
           "replace-controller PORT_FILE REPORT_FILE CONTACT_FILE | client PORT "
-          "match|mismatch|backpressure-nonblocking|backpressure-blocking|"
+          "match|mismatch|select|backpressure-nonblocking|backpressure-blocking|"
           "backpressure-interleaved|backpressure-observe|backpressure-replace|"
           "backpressure-shared|truncated|sendmsg|sendfile|unspecified|udp|listen|"
           "ipv6-24|netlink|abstract|rcvtimeo|scm-rights|epoll|async|"
-          "rcvtimeo-negative|ifindex|procnet|select-high|pselect-high\n",
+          "rcvtimeo-negative|ifindex|procnet|select-high|pselect-high|pselect-mask\n",
           argv[0]);
   return 2;
 }

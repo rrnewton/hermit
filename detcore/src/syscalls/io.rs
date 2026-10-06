@@ -93,16 +93,17 @@ fn connect_result_allows_peer_classification(result: &Result<i64, Error>) -> boo
 }
 
 const KERNEL_SIGSET_SIZE: usize = std::mem::size_of::<u64>();
-const PSELECT6_INTERNAL_MAX_NFDS: i32 = (std::mem::size_of::<libc::c_ulong>() * 8) as i32;
+pub(super) const PSELECT6_INTERNAL_MAX_NFDS: i32 =
+    (std::mem::size_of::<libc::c_ulong>() * 8) as i32;
 
 #[derive(Clone, Copy)]
 #[repr(C)]
-struct Pselect6SigmaskArg {
-    sigmask: usize,
-    sigsetsize: usize,
+pub(super) struct Pselect6SigmaskArg {
+    pub(super) sigmask: usize,
+    pub(super) sigsetsize: usize,
 }
 
-fn pselect6_fd_set_len(nfds: i32) -> Result<usize, Errno> {
+pub(super) fn pselect6_fd_set_len(nfds: i32) -> Result<usize, Errno> {
     let nfds = usize::try_from(nfds).map_err(|_| Errno::EINVAL)?;
     let bits_per_word = std::mem::size_of::<libc::c_ulong>() * 8;
     Ok(nfds.div_ceil(bits_per_word) * std::mem::size_of::<libc::c_ulong>())
@@ -118,7 +119,7 @@ fn pselect6_probe_result(result: Result<i64, Errno>) -> Result<i64, Errno> {
     }
 }
 
-fn read_pselect6_fd_set<T, G>(
+pub(super) fn read_pselect6_fd_set<T, G>(
     guest: &mut G,
     address: Option<AddrMut<'_, libc::fd_set>>,
     len: usize,
@@ -140,7 +141,7 @@ where
     Ok(Some(bytes))
 }
 
-fn write_pselect6_fd_set<T, G>(
+pub(super) fn write_pselect6_fd_set<T, G>(
     guest: &mut G,
     address: Option<AddrMut<'_, libc::fd_set>>,
     bytes: &Option<Vec<u8>>,
@@ -195,7 +196,7 @@ pub(super) fn ppoll_timeout_duration(timeout: Timespec) -> Result<Duration, Errn
     Ok(Duration::new(seconds, nanoseconds))
 }
 
-fn select_timeout_duration(timeout: libc::timeval) -> Result<Duration, Errno> {
+pub(super) fn select_timeout_duration(timeout: libc::timeval) -> Result<Duration, Errno> {
     let seconds = u64::try_from(timeout.tv_sec).map_err(|_| Errno::EINVAL)?;
     let microseconds = u64::try_from(timeout.tv_usec).map_err(|_| Errno::EINVAL)?;
     // Linux rejects select timeouts whose microsecond field is out of range.
@@ -702,7 +703,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         copy_pselect6_fd_set(guest, probe.exceptfds(), call.exceptfds(), len)
     }
 
-    async fn write_pselect6_remaining<G: Guest<Self>>(
+    pub(super) async fn write_pselect6_remaining<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Pselect6,
@@ -900,7 +901,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         copy_pselect6_fd_set(guest, probe.exceptfds(), call.exceptfds(), len)
     }
 
-    async fn write_select_remaining<G: Guest<Self>>(
+    pub(super) async fn write_select_remaining<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Select,

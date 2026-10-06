@@ -60,6 +60,15 @@ fn expected_invariant() -> String {
 
 /// Checks the schedule-independent output and returns the reader marker,
 /// which names the thread that won the race for the first input.
+/// The select client's whole stdout: every check it makes passed.
+fn expected_select_output() -> String {
+    format!(
+        "select=ebadf,timeout,pipe-writable,first,second,eof aggregate=abcdef \
+         outbound_hex={OUTBOUND_HEX} outbound_fnv1a64={:016x}\n",
+        fnv1a64(b"request\nnext\ndone\n")
+    )
+}
+
 fn assert_guest_invariants(output: &[u8], label: &str) -> String {
     let text = std::str::from_utf8(output)
         .unwrap_or_else(|error| panic!("{label} stdout was not UTF-8: {error}"));
@@ -369,6 +378,26 @@ fn network_replay_tcp_fixture_has_the_exact_native_contract() {
     );
     assert_success(&output, "native TCP bracket client");
     assert_guest_invariants(&output.stdout, "native TCP bracket client");
+    assert_controller_report(&controller.finish());
+
+    let directory = evidence.path().join("select");
+    fs::create_dir(&directory).expect("create native select directory");
+    let (controller, port) = Controller::start(fixture, &directory);
+    let output = bounded_command(
+        fixture,
+        &[
+            OsStr::new("client"),
+            OsStr::new(&port),
+            OsStr::new("select"),
+        ],
+        NATIVE_CLIENT_WALL_SECONDS,
+    );
+    assert_success(&output, "native select client");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout),
+        expected_select_output(),
+        "native select client"
+    );
     assert_controller_report(&controller.finish());
 
     for mode in BACKPRESSURE_MODES.into_iter().chain([INTERLEAVED_MODE]) {
@@ -1023,6 +1052,70 @@ fn tcp_recording_replays_offline_across_schedules_and_refuses_mismatch() {
     );
 }
 
+/// The select client waits on a channel and a pipe with select, pselect6 and
+/// glibc's select and pselect, and checks each result against Linux's. Record
+/// must complete it against a live controller, and replay offline must print
+/// the same output and verify at L2.
+#[test]
+fn tcp_select_family_records_and_replays_offline() {
+    let _guard = super::hermit_record_lock();
+    let fixture = &super::workload("c_network_replay_tcp_bracket").path;
+    let directory = tempfile::tempdir().expect("create select evidence directory");
+    let evidence = directory.path();
+    let trace = evidence.join("select.trace");
+    let record_directory = evidence.join("record-controller");
+    fs::create_dir(&record_directory).expect("create select record controller directory");
+    let (controller, port) = Controller::start(fixture, &record_directory);
+    let mut record_arguments = run_arguments(0, 1_000_000);
+    record_arguments.push(format!("--record-networking={}", trace.display()));
+    let recorded = hermit_command(
+        evidence,
+        "select-record",
+        &record_arguments,
+        fixture,
+        &["client", &port, "select"],
+    );
+    assert_success(&recorded, "select recording");
+    assert_eq!(
+        String::from_utf8_lossy(&recorded.stdout),
+        expected_select_output(),
+        "select recording"
+    );
+    assert_controller_report(&controller.finish());
+    let original_trace = fs::read(&trace).expect("select recording omitted its network trace");
+
+    for (seed, max_timeslice) in &REPLAY_CELLS[..2] {
+        let label = format!("select-replay-seed-{seed}-timeslice-{max_timeslice}");
+        let report = evidence.join(format!("{label}.verify.json"));
+        let mut arguments = run_arguments(*seed, *max_timeslice);
+        arguments.extend([
+            "--verify".into(),
+            "--verify-strict".into(),
+            format!("--verify-json={}", report.display()),
+            format!("--replay-networking={}", trace.display()),
+        ]);
+        let replayed = hermit_command(
+            evidence,
+            &label,
+            &arguments,
+            fixture,
+            &["client", &port, "select"],
+        );
+        assert_success(&replayed, &label);
+        assert_eq!(
+            String::from_utf8_lossy(&replayed.stdout),
+            expected_select_output(),
+            "{label}"
+        );
+        assert_l2_report(&report, &label);
+        assert_eq!(
+            fs::read(&trace).expect("select replay removed its network trace"),
+            original_trace,
+            "{label} changed the network trace"
+        );
+    }
+}
+
 #[test]
 fn tcp_replay_refuses_divergence_and_operations_outside_a_channel() {
     let _guard = super::hermit_record_lock();
@@ -1054,12 +1147,17 @@ fn tcp_replay_refuses_divergence_and_operations_outside_a_channel() {
         // the channel too.
         (
             "select-high",
-            "does not model select on a recorded socket",
+            "does not model select with nfds above 64 on a recorded socket",
             "--network=host",
         ),
         (
             "pselect-high",
-            "does not model pselect6 on a recorded socket",
+            "does not model pselect6 with nfds above 64 on a recorded socket",
+            "--network=host",
+        ),
+        (
+            "pselect-mask",
+            "does not model pselect6 with a signal mask on a recorded socket",
             "--network=host",
         ),
         (

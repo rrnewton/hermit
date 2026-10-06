@@ -93,7 +93,13 @@ use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::ioctl::Request;
 
+use super::io::PSELECT6_INTERNAL_MAX_NFDS;
+use super::io::Pselect6SigmaskArg;
 use super::io::ppoll_timeout_duration;
+use super::io::pselect6_fd_set_len;
+use super::io::read_pselect6_fd_set;
+use super::io::select_timeout_duration;
+use super::io::write_pselect6_fd_set;
 use crate::fd::FdType;
 use crate::fd::NetworkSocketKind;
 use crate::record_or_replay::RecordOrReplay;
@@ -122,6 +128,92 @@ const POLL_PULL_BYTES: usize = 512;
 
 /// A polled channel and its receive low-water mark.
 type PolledChannel = (OpenFileId, usize);
+
+// A `select` naming a channel probes its other descriptors through a pollfd
+// array in the pull scratch, one entry per descriptor below `nfds`.
+const _: () = assert!(
+    PSELECT6_INTERNAL_MAX_NFDS as usize * std::mem::size_of::<libc::pollfd>() <= POLL_PULL_BYTES
+);
+
+/// The poll events Linux's `select` reports as readable, writable and
+/// exceptional (`POLLIN_SET`, `POLLOUT_SET` and `POLLEX_SET` in
+/// `fs/select.c`).
+const SELECT_REPORTED: [i16; 3] = [
+    libc::POLLRDNORM | libc::POLLRDBAND | libc::POLLIN | libc::POLLHUP | libc::POLLERR,
+    libc::POLLWRBAND | libc::POLLWRNORM | libc::POLLOUT | libc::POLLERR,
+    libc::POLLPRI,
+];
+
+/// The poll events a descriptor in each `select` set asks for. `POLLERR` and
+/// `POLLHUP` need no request.
+const SELECT_REQUESTED: [i16; 3] = [
+    libc::POLLRDNORM | libc::POLLRDBAND | libc::POLLIN,
+    libc::POLLWRBAND | libc::POLLWRNORM | libc::POLLOUT,
+    libc::POLLPRI,
+];
+
+/// Whether a `poll` has an entry to report.
+fn poll_ready(pollfds: &[libc::pollfd]) -> bool {
+    pollfds.iter().any(|pollfd| pollfd.revents != 0)
+}
+
+/// For each of `select`'s three sets, whether `pollfd`, built from those sets,
+/// reports ready in it.
+fn select_bits(pollfd: &libc::pollfd) -> [bool; 3] {
+    std::array::from_fn(|set| {
+        pollfd.events & SELECT_REQUESTED[set] != 0 && pollfd.revents & SELECT_REPORTED[set] != 0
+    })
+}
+
+/// Whether a `select` has a bit to report, or must fail with `EBADF`.
+fn select_ready(pollfds: &[libc::pollfd]) -> bool {
+    pollfds
+        .iter()
+        .any(|pollfd| pollfd.revents & libc::POLLNVAL != 0 || select_bits(pollfd).contains(&true))
+}
+
+/// The pollfd entries for `select`'s descriptor sets: one per descriptor below
+/// `nfds` named in any set, asking for that set's events.
+fn select_pollfds(nfds: usize, sets: &[Option<Vec<u8>>; 3]) -> Vec<libc::pollfd> {
+    (0..nfds)
+        .filter_map(|fd| {
+            let events = sets
+                .iter()
+                .zip(SELECT_REQUESTED)
+                .filter(|(set, _)| {
+                    set.as_ref()
+                        .is_some_and(|set| set[fd / 8] & (1 << (fd % 8)) != 0)
+                })
+                .fold(0, |events, (_, requested)| events | requested);
+            (events != 0).then_some(libc::pollfd {
+                fd: fd as RawFd,
+                events,
+                revents: 0,
+            })
+        })
+        .collect()
+}
+
+/// `select`'s result sets for `pollfds`, with `len` bytes for each set the
+/// call passed, and the number of bits set across them.
+fn select_result(
+    pollfds: &[libc::pollfd],
+    sets: &[Option<Vec<u8>>; 3],
+    len: usize,
+) -> ([Option<Vec<u8>>; 3], i64) {
+    let mut result = sets.clone().map(|set| set.map(|_| vec![0u8; len]));
+    let mut count = 0;
+    for pollfd in pollfds {
+        let fd = pollfd.fd as usize;
+        for (set, ready) in result.iter_mut().zip(select_bits(pollfd)) {
+            if let (Some(set), true) = (set, ready) {
+                set[fd / 8] |= 1 << (fd % 8);
+                count += 1;
+            }
+        }
+    }
+    (result, count)
+}
 
 /// `recv` flags with a modelled meaning.
 const RECV_FLAGS: i32 =
@@ -724,9 +816,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await
             }
-            Syscall::Select(_)
-            | Syscall::Pselect6(_)
-            | Syscall::Sendfile(_)
+            Syscall::Select(c) => return self.network_select(guest, c).await,
+            Syscall::Pselect6(c) => return self.network_pselect6(guest, c).await,
+            Syscall::Sendfile(_)
             | Syscall::Splice(_)
             | Syscall::Tee(_)
             | Syscall::CopyFileRange(_) => self.network_refuse_on_channel(guest, &call).await,
@@ -1760,22 +1852,39 @@ impl<T: RecordOrReplay> Detcore<T> {
             .ok()?;
         let channels: Vec<_> = pollfds
             .iter()
-            .map(|pollfd| {
-                guest
-                    .thread_state()
-                    .with_detfd(pollfd.fd, |detfd| {
-                        detfd
-                            .is_network_channel()
-                            .then(|| (detfd.open_file_id(), detfd.network_lowat()))
-                    })
-                    .ok()
-                    .flatten()
-            })
+            .map(|pollfd| Self::polled_channel(guest, pollfd.fd))
             .collect();
         channels
             .iter()
             .any(Option::is_some)
             .then_some((pollfds, channels))
+    }
+
+    /// The channel `fd` names and its receive low-water mark, if any.
+    fn polled_channel<G: Guest<Self>>(guest: &mut G, fd: RawFd) -> Option<PolledChannel> {
+        guest
+            .thread_state()
+            .with_detfd(fd, |detfd| {
+                detfd
+                    .is_network_channel()
+                    .then(|| (detfd.open_file_id(), detfd.network_lowat()))
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Write the entries a channel wait reported back to the guest's pollfd
+    /// array and count the ready ones, as `poll` and `ppoll` return.
+    fn network_poll_result<G: Guest<Self>>(
+        guest: &mut G,
+        address: AddrMut<'_, libc::pollfd>,
+        pollfds: &[libc::pollfd],
+    ) -> Result<i64, Error> {
+        guest
+            .memory()
+            .write_values(address, pollfds)
+            .map_err(|_| Errno::EFAULT)?;
+        Ok(pollfds.iter().filter(|pollfd| pollfd.revents != 0).count() as i64)
     }
 
     /// `poll` naming at least one channel.
@@ -1789,18 +1898,22 @@ impl<T: RecordOrReplay> Detcore<T> {
         else {
             return self.handle_poll(guest, call).await;
         };
+        let address = address.expect("a pollfd array naming a channel");
         let deadline = millis_duration_to_absolute_timeout(guest, call.timeout()).await;
-        self.network_wait(
-            guest,
-            address.expect("a pollfd array naming a channel"),
-            pollfds,
-            &channels,
-            call.timeout() == 0,
-            deadline,
-            call.signal_interrupt_errno(),
-            Syscall::Poll(call),
-        )
-        .await
+        let pollfds = self
+            .network_wait(
+                guest,
+                Some(address),
+                pollfds,
+                &channels,
+                call.timeout() == 0,
+                deadline,
+                call.signal_interrupt_errno(),
+                Syscall::Poll(call),
+                poll_ready,
+            )
+            .await?;
+        Self::network_poll_result(guest, address, &pollfds)
     }
 
     /// `ppoll` naming at least one channel.
@@ -1826,19 +1939,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(address) => Some(ppoll_timeout_duration(guest.memory().read_value(address)?)?),
             None => None,
         };
+        let address = call.fds().expect("a pollfd array naming a channel");
         let started_at = thread_observe_time(guest).await;
         let result = self
             .network_wait(
                 guest,
-                call.fds().expect("a pollfd array naming a channel"),
+                Some(address),
                 pollfds,
                 &channels,
                 timeout == Some(Duration::ZERO),
                 timeout.map(|timeout| started_at + timeout),
                 call.signal_interrupt_errno(),
                 Syscall::Ppoll(call),
+                poll_ready,
             )
-            .await;
+            .await
+            .and_then(|pollfds| Self::network_poll_result(guest, address, &pollfds));
         // Linux reports the time not slept, and leaves a zero timeout alone.
         if let (Some(address), Some(timeout)) = (call.timeout(), timeout)
             && !timeout.is_zero()
@@ -1849,23 +1965,170 @@ impl<T: RecordOrReplay> Detcore<T> {
         result
     }
 
-    /// Wait for readiness on a pollfd array naming channels. Each scheduler
-    /// turn asks the engine about the channels and probes every other
-    /// descriptor with a zero-timeout host poll, as a strict guest-internal
-    /// poll does; channel entries are masked to -1 for that probe, which
-    /// Linux skips.
+    /// `select` naming at least one channel.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#3804): Review select on a recorded socket.
+    // https://github.com/rrnewton/hermit/issues/3804
+    async fn network_select<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Select,
+    ) -> Result<i64, Error> {
+        let timeout = match call.timeout() {
+            Some(address) => Some(select_timeout_duration(
+                guest.memory().read_value(address)?,
+            )?),
+            None => None,
+        };
+        let started_at = thread_observe_time(guest).await;
+        let deadline = timeout.map(|timeout| started_at + timeout);
+        let result = self
+            .network_select_wait(
+                guest,
+                call.nfds(),
+                [call.readfds(), call.writefds(), call.exceptfds()],
+                timeout,
+                deadline,
+                Syscall::Select(call),
+            )
+            .await;
+        // Linux reports the time not slept, and leaves a zero timeout alone.
+        if timeout.is_some_and(|timeout| !timeout.is_zero()) {
+            self.write_select_remaining(guest, call, deadline).await?;
+        }
+        result
+    }
+
+    /// `pselect6` naming at least one channel.
+    // AUTONOMOUS-BOT-IMPLEMENTED
+    // TODO-HUMAN-REVIEW(#3804): Review pselect6 on a recorded socket.
+    // https://github.com/rrnewton/hermit/issues/3804
+    async fn network_pselect6<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Pselect6,
+    ) -> Result<i64, Error> {
+        // Linux copies the { sigmask, sigsetsize } wrapper first. Glibc's
+        // `select` passes none and its `pselect` passes one even with no mask.
+        let sigmask = match call.sigmask() {
+            Some(argument) => {
+                let argument: Pselect6SigmaskArg = guest.memory().read_value(argument.cast())?;
+                argument.sigmask
+            }
+            None => 0,
+        };
+        let timeout = match call.timeout() {
+            Some(address) => Some(ppoll_timeout_duration(guest.memory().read_value(address)?)?),
+            None => None,
+        };
+        if sigmask != 0 {
+            self.network_refuse(
+                guest,
+                "network trace does not model pselect6 with a signal mask on a recorded socket",
+                UNSUPPORTED_REMEDY,
+            )
+            .await
+        }
+        let started_at = thread_observe_time(guest).await;
+        let deadline = timeout.map(|timeout| started_at + timeout);
+        let result = self
+            .network_select_wait(
+                guest,
+                call.nfds(),
+                [call.readfds(), call.writefds(), call.exceptfds()],
+                timeout,
+                deadline,
+                Syscall::Pselect6(call),
+            )
+            .await;
+        if timeout.is_some_and(|timeout| !timeout.is_zero()) {
+            self.write_pselect6_remaining(guest, call, deadline).await?;
+        }
+        result
+    }
+
+    /// Wait on `select`'s descriptor sets as on the pollfd entries they name,
+    /// then write the sets of ready descriptors back and return how many bits
+    /// they hold, as Linux's `select` does. A descriptor that is not open
+    /// fails the call with `EBADF` and leaves the sets alone.
+    async fn network_select_wait<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        nfds: i32,
+        addresses: [Option<AddrMut<'_, libc::fd_set>>; 3],
+        timeout: Option<Duration>,
+        deadline: Option<LogicalTime>,
+        retry: Syscall,
+    ) -> Result<i64, Error> {
+        if nfds > PSELECT6_INTERNAL_MAX_NFDS {
+            self.network_refuse(
+                guest,
+                &format!(
+                    "network trace does not model {} with nfds above \
+                     {PSELECT6_INTERNAL_MAX_NFDS} on a recorded socket",
+                    retry.name()
+                ),
+                UNSUPPORTED_REMEDY,
+            )
+            .await
+        }
+        let len = pselect6_fd_set_len(nfds)?;
+        let mut sets = [None, None, None];
+        for (set, address) in sets.iter_mut().zip(addresses) {
+            *set = read_pselect6_fd_set(guest, address, len)?;
+        }
+        let pollfds = select_pollfds(nfds as usize, &sets);
+        let channels: Vec<_> = pollfds
+            .iter()
+            .map(|pollfd| Self::polled_channel(guest, pollfd.fd))
+            .collect();
+        let pollfds = self
+            .network_wait(
+                guest,
+                None,
+                pollfds,
+                &channels,
+                timeout == Some(Duration::ZERO),
+                deadline,
+                Errno::EINTR,
+                retry,
+                select_ready,
+            )
+            .await?;
+        if pollfds
+            .iter()
+            .any(|pollfd| pollfd.revents & libc::POLLNVAL != 0)
+        {
+            return Err(Errno::EBADF.into());
+        }
+        let (result, count) = select_result(&pollfds, &sets, len);
+        for (set, address) in result.iter().zip(addresses) {
+            write_pselect6_fd_set(guest, address, set)?;
+        }
+        Ok(count)
+    }
+
+    /// Wait for readiness on pollfd entries naming channels, until `ready`
+    /// accepts the reported entries or the timeout expires, and return them.
+    /// Each scheduler turn asks the engine about the channels and probes every
+    /// other descriptor with a zero-timeout host poll, as a strict
+    /// guest-internal poll does; channel entries are masked to -1 for that
+    /// probe, which Linux skips. The probe uses the guest's own pollfd array
+    /// at `address` and restores it, or, with no array, the pull scratch,
+    /// which then bounds the entries to `PSELECT6_INTERNAL_MAX_NFDS`.
     #[allow(clippy::too_many_arguments)]
     async fn network_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
-        address: AddrMut<'_, libc::pollfd>,
+        address: Option<AddrMut<'_, libc::pollfd>>,
         mut pollfds: Vec<libc::pollfd>,
         channels: &[Option<PolledChannel>],
         zero_timeout: bool,
         deadline: Option<LogicalTime>,
         interrupted: Errno,
         retry: Syscall,
-    ) -> Result<i64, Error> {
+        ready: fn(&[libc::pollfd]) -> bool,
+    ) -> Result<Vec<libc::pollfd>, Error> {
         let record = self.network_mode() == NetworkTraceMode::Record;
         let probe: Vec<libc::pollfd> = pollfds
             .iter()
@@ -1880,6 +2143,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut stack = guest.stack().await;
         let scratch: AddrMut<[u8; POLL_PULL_BYTES]> = stack.reserve();
         let _guard = stack.commit()?;
+        let probe_address = match address {
+            Some(address) => address,
+            None => {
+                assert!(probe.len() <= PSELECT6_INTERNAL_MAX_NFDS as usize);
+                scratch.cast()
+            }
+        };
         let mut rsrc = Resources::new(guest.thread_state().dettid);
         rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
         rsrc.fyi("network poll");
@@ -1914,20 +2184,22 @@ impl<T: RecordOrReplay> Detcore<T> {
             if probe_host {
                 guest
                     .memory()
-                    .write_values(address, &probe)
+                    .write_values(probe_address, &probe)
                     .map_err(|_| Errno::EFAULT)?;
                 let call = syscalls::Poll::new()
-                    .with_fds(Some(address.cast()))
+                    .with_fds(Some(probe_address.cast()))
                     .with_nfds(probe.len() as libc::nfds_t)
                     .with_timeout(0);
                 let probed = guest.inject(call).await;
                 let mut after = probe.clone();
-                let read = guest.memory().read_values(address.into(), &mut after);
+                let read = guest.memory().read_values(probe_address.into(), &mut after);
                 // Restore the guest's descriptors before reporting anything.
-                guest
-                    .memory()
-                    .write_values(address, &pollfds)
-                    .map_err(|_| Errno::EFAULT)?;
+                if let Some(address) = address {
+                    guest
+                        .memory()
+                        .write_values(address, &pollfds)
+                        .map_err(|_| Errno::EFAULT)?;
+                }
                 probed?;
                 read?;
                 for (revents, pollfd) in host_revents.iter_mut().zip(&after) {
@@ -1935,27 +2207,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             let mut events = events.into_iter();
-            let mut ready = 0;
             for ((pollfd, channel), host) in pollfds.iter_mut().zip(channels).zip(host_revents) {
                 pollfd.revents = match channel {
                     Some(_) => masked_revents(events.next().unwrap(), pollfd.events),
                     None => host,
                 };
-                if pollfd.revents != 0 {
-                    ready += 1;
-                }
             }
             let expired = zero_timeout
                 || match deadline {
                     Some(deadline) => thread_observe_time(guest).await >= deadline,
                     None => false,
                 };
-            if ready > 0 || expired {
-                guest
-                    .memory()
-                    .write_values(address, &pollfds)
-                    .map_err(|_| Errno::EFAULT)?;
-                return Ok(ready);
+            if ready(&pollfds) || expired {
+                return Ok(pollfds);
             }
             rsrc.poll_attempt += 1;
             record_retry_event(guest, retry).await;
