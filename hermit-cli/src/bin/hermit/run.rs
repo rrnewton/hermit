@@ -4252,12 +4252,26 @@ impl RunOpts {
     ///   hermit's PID namespace the question does not arise.
     ///
     /// The match has no wildcard arm, so a new backend must be classified here
-    /// before it compiles. Every subcommand that accepts the global flag reaches
-    /// a guest through `RunOpts::main`, which calls this, except `analyze` and
-    /// `bisect`, whose trials go straight to `RunOpts::run`; they call it
-    /// through `AnalyzeOpts::refuse_unsupervised_log_cap` before any trial.
-    /// `Subcommand::validate_backend_scope` admits DBT and LiteInst only through
-    /// `run`, so KVM under `--no-namespace` is the case that check catches.
+    /// before it compiles. Not every subcommand that accepts the global flag
+    /// passes through this check, and each one stands as follows (round-3
+    /// review of https://github.com/rrnewton/hermit/pull/3686, finding 6):
+    ///
+    /// - `run` and `oci run` call it through `RunOpts::main`.
+    /// - `analyze` and `bisect` send their trials straight to `RunOpts::run`
+    ///   and call it through `AnalyzeOpts::refuse_unsupervised_log_cap` before
+    ///   any trial. `Subcommand::validate_backend_scope` admits only KVM there
+    ///   besides ptrace, so KVM with `--no-namespace` is the case it catches.
+    /// - `record` and `replay` start their containers through
+    ///   `owned_container::run` and never call it. `validate_backend_scope`
+    ///   admits only ptrace there, plus e9patch preprocessing on the ptrace
+    ///   runtime for `record start`, and a ptrace guest is bound in both
+    ///   namespace modes.
+    /// - `hermit --backend=sabre strace` starts no container: `StraceOpts::main`
+    ///   refuses the flag itself, and `strace` with any other backend fails
+    ///   before it starts anything.
+    /// - `instruction-map` and `record list`, `remove` and `clean` charge their
+    ///   tracing but run no guest. `version`, `host-capabilities`, `log-diff`
+    ///   and `oci ls`, `inspect` and `pull` initialize no tracing at all.
     fn log_cap_refusal(backend: Backend, no_namespace: bool) -> Option<&'static str> {
         match backend {
             Backend::Dbt => Some(

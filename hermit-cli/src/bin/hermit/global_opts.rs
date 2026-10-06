@@ -79,15 +79,35 @@ pub struct GlobalOpts {
     #[clap(long, value_name = "FILE", env = "HERMIT_LOG_FILE")]
     pub log_file: Option<PathBuf>,
 
-    /// Abort the run once hermit's own log output exceeds SIZE bytes in total.
+    /// Stop the run (exit 123) once hermit's tracing output exceeds SIZE bytes.
     ///
-    /// Counts every byte hermit's tracing writes to stderr or to --log-file
-    /// (including `run --verify`'s per-run logs, summed over the runs), measured
-    /// before the HERMIT_LOG_MAX_BYTES file truncation. The guest's own stdout
-    /// and stderr are not counted. When the cap is exceeded hermit prints
-    /// "log output exceeded --max-log-bytes=SIZE", kills the guest process tree
-    /// and exits 123 (class=log-cap). SIZE is a byte count with an optional
-    /// K/M/G/T suffix in powers of 1024, e.g. 8G. Omit the flag for no cap.
+    /// Counted: every byte hermit's tracing writes to stderr, to --log-file, or
+    /// to the per-run logs of `run --verify` and `record --verify`, as one total
+    /// for the whole invocation, measured before the HERMIT_LOG_MAX_BYTES file
+    /// truncation.
+    ///
+    /// Not counted: stdout; the guest's own output, including the DETLOG
+    /// records the SaBRe backend writes from inside the guest; hermit messages
+    /// that do not go through tracing, such as error reports, the `--verify`
+    /// comparison and retention report, and everything `log-diff` prints; and
+    /// the private --run-evidence-dir log.
+    ///
+    /// At the crossing hermit drops the write that crossed, tries once, without
+    /// waiting, to write "log output exceeded --max-log-bytes=SIZE" followed by
+    /// "HERMIT_LOG_CAP class=log-cap" to stderr and to --log-file, and exits
+    /// 123. That message is best effort: it is missing when, for example,
+    /// stderr is a full pipe or has no reader, and the exit status is then the
+    /// only signal. Where the flag is accepted the guest dies with hermit,
+    /// because it runs inside hermit's PID namespace or as a ptrace tracee that
+    /// the kernel kills when hermit's tracer exits.
+    ///
+    /// Refused with exit 122, before any guest starts, where the guest could
+    /// outlive hermit: --backend=dbt; --backend=liteinst, sabre or kvm with
+    /// --no-namespace, including the KVM trials of `analyze` and `bisect`; and
+    /// `hermit --backend=sabre strace`.
+    ///
+    /// SIZE is a byte count with an optional K/M/G/T suffix in powers of 1024,
+    /// e.g. 8G. Omit the flag for no cap.
     #[clap(long, value_name = "SIZE", value_parser = parse_max_log_bytes)]
     pub max_log_bytes: Option<u64>,
 
