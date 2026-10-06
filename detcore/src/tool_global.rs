@@ -258,7 +258,12 @@ impl Default for InodePool {
 /// differ between runs (a new pipe or socket gets a fresh one each time).
 ///
 /// Called after the pool's lock is released, so formatting and writing the
-/// record never makes another thread's inode lookup wait on the subscriber.
+/// record never holds the pool mutex. It does not stop other inode requests
+/// from waiting on the subscriber: both callers (`recv_determinize_inode`,
+/// and `set_inode_mtime` from `recv_touch_file` and `recv_set_file_mtime`)
+/// still hold the RPC scheduler lock (`_sched`, from `lock_rpc_scheduler`)
+/// across this call, and every inode request takes that lock before the
+/// pool's.
 fn log_minted_inode(det: DetInode, raw: RawInode) {
     debug!(
         "minted deterministic inode {} for host device {:#x} inode {}",
