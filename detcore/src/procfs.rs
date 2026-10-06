@@ -3312,14 +3312,12 @@ pub(crate) fn mapping_header_key(line: &str) -> Option<MappingKey> {
 /// already reads.
 ///
 /// Whether those bytes are the same from run to run depends on the backend.
-/// Every Linux-process backend Hermit launches sets `ADDR_NO_RANDOMIZE` before
-/// the guest execs:
+/// Every Linux-process backend Hermit launches except LiteInst sets
+/// `ADDR_NO_RANDOMIZE` before the guest execs:
 ///
 /// - ptrace: `init_tracee` in `reverie/reverie-ptrace/src/tracer.rs` calls
 ///   `personality(PER_LINUX | ADDR_NO_RANDOMIZE)` in the child's `pre_exec`
 ///   closure installed by `TracerBuilder::spawn`;
-/// - LiteInst launches through that same `TracerBuilder`
-///   (`reverie-liteinst/src/backend.rs`);
 /// - DBT ORs `ADDR_NO_RANDOMIZE` into the current personality in its own
 ///   `pre_exec` (`reverie/reverie-dbt/src/launcher.rs`, the
 ///   `libc::personality` calls in the launch command);
@@ -3334,6 +3332,14 @@ pub(crate) fn mapping_header_key(line: &str) -> Option<MappingKey> {
 /// runs. That is nondeterministic guest-visible output that already exists
 /// without this ordering, and the mint order still follows the bytes the
 /// guest sees.
+///
+/// LiteInst runs Detcore only in the guest. Its `launch` in
+/// `reverie-liteinst/src/backend.rs` spawns the guest with a plain
+/// `std::process::Command` that preloads the runtime, and neither it nor
+/// Hermit changes the personality, so the guest gets whatever address-space
+/// randomization the host's `kernel.randomize_va_space` setting gives it. Its
+/// address columns can then differ between runs in the same way, and the mint
+/// order still follows the bytes the guest sees.
 ///
 /// `personality(2)` is classified `PassThrough`
 /// (`crate::syscall_classification`), so a guest can also turn ASLR back on
