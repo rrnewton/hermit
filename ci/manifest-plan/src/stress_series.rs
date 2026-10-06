@@ -1428,12 +1428,26 @@ impl SeriesRow {
                     let backend = self.series.cell.rsplit('/').next().unwrap_or_default();
                     let passed_exit = match &self.series.declared_guest_exit {
                         None => disposition.status == Some(0) && disposition.signal.is_none(),
-                        Some(declared) => ExpectedGuestExit {
-                            code: declared.code,
-                            signal: declared.signal,
-                            reason: declared.reason.clone(),
+                        Some(declared) => {
+                            // This runs before validate_declared_guest_exit,
+                            // so check the declaration before matching: a
+                            // declaration the runner itself would refuse
+                            // accepts nothing, and an out-of-range signal
+                            // would overflow the match's `128 + signal`.
+                            let expected = ExpectedGuestExit {
+                                code: declared.code,
+                                signal: declared.signal,
+                                reason: declared.reason.clone(),
+                            };
+                            validate_expected_guest_exit(
+                                "declared_guest_exit",
+                                mode,
+                                Some(&expected),
+                            )
+                            .is_ok()
+                                && expected
+                                    .hermit_status_matches(disposition.status, disposition.signal)
                         }
-                        .hermit_status_matches(disposition.status, disposition.signal),
                     };
                     if disposition.attempt_outcome != "PASS"
                         || disposition.disposition != SeriesOutcome::Errored
@@ -2926,11 +2940,23 @@ mod tests {
                 "declared signal 11, signal 6",
                 declared_cell(None, Some(11), None, Some(6)),
             ),
+            // A declaration the runner would refuse admits nothing. This
+            // check runs before the declaration's own, so it must refuse
+            // rather than panic: matching exit 0 against this signal would
+            // overflow `128 + signal`.
+            (
+                "declared signal i32::MAX, exit 0",
+                declared_cell(None, Some(i32::MAX), Some(0), None),
+            ),
         ] {
-            let error = row
-                .validate_for_write()
-                .expect_err(&format!("{label}: admitted"));
-            assert!(error.contains(SHAPE), "{label}: {error}");
+            for (path, error) in [
+                ("write", row.validate_for_write()),
+                ("read", row.validate_for_read()),
+                ("projection", row.validate_for_projection()),
+            ] {
+                let error = error.expect_err(&format!("{label}: admitted on {path}"));
+                assert!(error.contains(SHAPE), "{label}: {path}: {error}");
+            }
         }
         type Edit = fn(&mut SeriesRow);
         let refused: [(&str, Edit, &str); 16] = [
