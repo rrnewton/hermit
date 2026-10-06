@@ -1971,6 +1971,116 @@ fn untracked_directory_descriptor_lists_entries_with_stat_inodes() {
     assert_eq!(stdout, inode_identity_views::scm_getdents_expected_stdout());
 }
 
+// Detcore gives the guest's descriptors 0, 1 and 2 one cached stat when it
+// starts, an fstat of descriptor 0 (Hermit's own on the ptrace backend), and
+// getdents keys each entry's deterministic inode on the device of the
+// descriptor it lists (https://github.com/rrnewton/hermit/issues/3307). So a
+// stdout on another device than stdin, or a dup of it, must be identified by
+// what it refers to, not by stdin's metadata
+// (https://github.com/rrnewton/hermit/pull/3255). Here stdout is a directory
+// and stdin is /dev/null; the guest lists the directory through descriptor 1
+// and through a dup of it and checks each entry's d_ino against fstatat.
+// ptrace backend.
+//
+// Not under --verify, which captures the guest's stdout: that must be the
+// directory here. Hermit's stdout is the directory too, opened for reading
+// only, so the kernel lets nothing be written to it (write fails with EBADF);
+// a write by Hermit's own `println!` would have panicked, which the test
+// would see in Hermit's exit status and stderr, and the directory must still
+// hold exactly the three files afterwards.
+#[test]
+fn stdout_directory_on_another_device_lists_entries_with_stat_inodes() {
+    use std::os::unix::fs::MetadataExt;
+
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("stdio-getdents");
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).expect("directory to list");
+    // Created before the directory is opened, which btrfs requires for them
+    // to be listed through it (see scm_getdents in the fixture).
+    let files = ["alpha", "beta", "gamma"];
+    for name in files {
+        fs::File::create(directory.path().join(name)).expect("create a file to list");
+    }
+    let stdin_device = fs::metadata("/dev/null").expect("stat /dev/null").dev();
+    let stdout_device = fs::metadata(directory.path())
+        .expect("stat the directory")
+        .dev();
+    assert_ne!(
+        stdin_device,
+        stdout_device,
+        "stdin (/dev/null) and stdout ({}) must report different st_dev for this test to \
+         exercise anything; both report {stdin_device:#x}",
+        directory.path().display()
+    );
+    let open_directory =
+        || fs::File::open(directory.path()).expect("open the directory for reading");
+    let summary = |stderr: &[u8]| -> Vec<String> {
+        String::from_utf8_lossy(stderr)
+            .lines()
+            .filter(|line| line.starts_with("stdio-getdents "))
+            .map(str::to_owned)
+            .collect()
+    };
+    // Five entries -- ".", "..", and the three files -- one per call, taking
+    // turns, whatever order the filesystem lists them in.
+    let expected = ["stdio-getdents stdout entries=3 dup entries=2 matched=3"];
+
+    // What the guest asserts holds on native Linux, on this host's
+    // filesystems.
+    let native = Command::new(&guest)
+        .arg("stdio-getdents")
+        .stdin(Stdio::null())
+        .stdout(open_directory())
+        .output()
+        .expect("run the guest natively");
+    assert!(
+        native.status.success() && summary(&native.stderr) == expected,
+        "native run: {}\nstderr:\n{}",
+        native.status,
+        String::from_utf8_lossy(&native.stderr)
+    );
+
+    let mut command = Command::new(hermit_test::hermit_binary());
+    command.args([
+        "--log=error",
+        "run",
+        "--base-env=minimal",
+        "--no-virtualize-cpuid",
+        "--max-timeslice=disabled",
+        "--",
+    ]);
+    command.arg(&guest).arg("stdio-getdents");
+    hermit_test::configure_guest_execution(&mut command);
+    // After configure_guest_execution, which rebuilds the command.
+    command.stdin(Stdio::null()).stdout(open_directory());
+    let rendered = format!("{command:?}");
+    let output = command
+        .output()
+        .unwrap_or_else(|error| panic!("failed to run {rendered}: {error}"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success() && summary(&output.stderr) == expected,
+        "{rendered}\nstatus: {}\nstderr:\n{stderr}",
+        output.status
+    );
+    assert!(
+        !stderr.contains("failed printing to stdout"),
+        "Hermit tried to write to its stdout:\n{stderr}"
+    );
+    let mut listed: Vec<String> = fs::read_dir(directory.path())
+        .expect("list the directory after the run")
+        .map(|entry| {
+            entry
+                .expect("directory entry")
+                .file_name()
+                .into_string()
+                .expect("UTF-8 name")
+        })
+        .collect();
+    listed.sort();
+    assert_eq!(listed, files, "the run must leave the directory as it was");
+}
+
 // Every file-backed /proc/self/maps line must report the inode `stat` reports
 // for that file. Deterministic inodes are keyed on device and inode
 // (https://github.com/rrnewton/hermit/issues/3307), and on btrfs maps and stat

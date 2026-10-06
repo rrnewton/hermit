@@ -10,6 +10,7 @@
 //        inode_identity_views maps-stat [DIR]
 //        inode_identity_views proc-fd-links
 //        inode_identity_views stdio-mmap-sentinel < REGULAR-FILE
+//        inode_identity_views stdio-getdents > DIR
 //
 // Detcore keys its deterministic inodes on a raw device and inode together
 // (https://github.com/rrnewton/hermit/issues/3307). Every interface that
@@ -64,6 +65,21 @@
 //   inherited, which Detcore identifies after the mmap by injecting an fstat;
 //   on ptrace that fstat borrows guest stack below the red zone and must put
 //   the bytes there back.
+//
+// stdio-getdents > DIR
+//   Stdout is a directory opened for reading, on another device than stdin;
+//   the owning test creates three files in it first and makes stdin
+//   /dev/null. Lists the directory with getdents64 through descriptor 1 and
+//   through a dup of it, taking turns. The two share one file offset, and the
+//   buffer holds one record but never two, so each lists part of the
+//   directory. (An lseek back to the start cannot give each a whole listing
+//   instead: Hermit reports ESPIPE for its inherited stdout and stderr.)
+//   Every entry's d_ino must equal the st_ino fstatat reports for its name
+//   relative to the descriptor that listed it. getdents keys each entry's
+//   inode on the device of the descriptor it lists, so a stdout keyed on
+//   stdin's device would list inodes stat does not report. Stdout is the
+//   directory, so the result goes to stderr, on a line beginning
+//   "stdio-getdents ".
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -730,6 +746,80 @@ static int stdio_mmap_sentinel(void) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// stdio-getdents
+
+// Check one entry listed through `directory`, whatever its name: its d_ino
+// must be the st_ino fstatat reports for that name relative to the same
+// descriptor. Returns 1 if it is one of the files the owning test created.
+static int check_listed_entry(
+    int directory,
+    const char* name,
+    uint64_t d_ino,
+    const char* through) {
+  struct stat st;
+  CHECK(fstatat(directory, name, &st, AT_SYMLINK_NOFOLLOW) == 0);
+  if ((uint64_t)st.st_ino != d_ino) {
+    fprintf(
+        stderr,
+        "stdio-getdents: through %s, d_ino of %s is %llu but fstatat reports "
+        "%llu\n",
+        through,
+        name,
+        (unsigned long long)d_ino,
+        (unsigned long long)st.st_ino);
+    exit(1);
+  }
+  for (int i = 0; i < ENTRY_COUNT; i++) {
+    if (strcmp(name, kEntries[i]) == 0) {
+      return 1;
+    }
+  }
+  return 0;
+}
+
+static int stdio_getdents(void) {
+  struct stat st;
+  CHECK(fstat(STDOUT_FILENO, &st) == 0);
+  CHECK(S_ISDIR(st.st_mode));
+  int alias = dup(STDOUT_FILENO);
+  CHECK(alias > STDERR_FILENO);
+  const int descriptors[2] = {STDOUT_FILENO, alias};
+  const char* const names[2] = {"stdout", "a dup of stdout"};
+  int entries[2] = {0, 0};
+  int matched = 0;
+  // Room for one record of a name up to 20 bytes long (19 header bytes, the
+  // name and its NUL, rounded up to 8), never for two: the smallest, "." and
+  // "..", take 24 bytes each.
+  char buffer[40] __attribute__((aligned(8)));
+  for (int turn = 0;; turn ^= 1) {
+    long count =
+        syscall(SYS_getdents64, descriptors[turn], buffer, sizeof(buffer));
+    CHECK(count >= 0);
+    if (count == 0) {
+      break;
+    }
+    for (long offset = 0; offset < count;) {
+      struct linux_dirent64_header* entry =
+          (struct linux_dirent64_header*)(buffer + offset);
+      entries[turn]++;
+      matched += check_listed_entry(
+          descriptors[turn], entry->d_name, entry->d_ino, names[turn]);
+      offset += entry->d_reclen;
+    }
+  }
+  CHECK(entries[0] > 0 && entries[1] > 0);
+  CHECK(matched == ENTRY_COUNT);
+  CHECK(close(alias) == 0);
+  fprintf(
+      stderr,
+      "stdio-getdents stdout entries=%d dup entries=%d matched=%d\n",
+      entries[0],
+      entries[1],
+      matched);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc == 3 && strcmp(argv[1], "scm-getdents") == 0) {
     return scm_getdents(argv[2]);
@@ -743,10 +833,13 @@ int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "stdio-mmap-sentinel") == 0) {
     return stdio_mmap_sentinel();
   }
+  if (argc == 2 && strcmp(argv[1], "stdio-getdents") == 0) {
+    return stdio_getdents();
+  }
   fprintf(
       stderr,
       "usage: %s scm-getdents DIR | maps-stat [DIR] | proc-fd-links | "
-      "stdio-mmap-sentinel\n",
+      "stdio-mmap-sentinel | stdio-getdents\n",
       argv[0]);
   return 2;
 }
