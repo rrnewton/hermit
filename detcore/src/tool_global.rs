@@ -2295,7 +2295,7 @@ impl GlobalState {
 
                 let endtime_update = match schedval {
                     // Only syscalls timeout, and they don't need to update guest timeslice end.
-                    SchedValue::TimeOut => None,
+                    SchedValue::TimeOut | SchedValue::Signaled => None,
                     SchedValue::Value(timeslice) => Some(LogicalTime::from_nanos(timeslice)),
                 };
                 (
@@ -2847,7 +2847,7 @@ impl GlobalState {
                 return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
             };
             match action {
-                FutexAction::WaitRequest(maybe_timeout) => {
+                FutexAction::WaitRequest(maybe_timeout, interrupting_signals) => {
                     if sched.child_tid_was_cleared(futexid, init_read) {
                         trace!(
                             "[detcore, dtid {}] late wait on cleared child-TID futex {:?}",
@@ -2866,7 +2866,13 @@ impl GlobalState {
                         sched.fail_parked(dettid, error);
                         return Some(SchedValue::Value(nix::errno::Errno::EINTR as u64));
                     }
-                    sched.sleep_futex_waiter(&dettid, futexid, maybe_timeout, mask);
+                    sched.sleep_futex_waiter(
+                        &dettid,
+                        futexid,
+                        maybe_timeout,
+                        mask,
+                        interrupting_signals,
+                    );
                     // block on ivar, below
                 }
                 FutexAction::WaitFinished => {
@@ -2891,15 +2897,9 @@ impl GlobalState {
                     "[detcore, dtid {}] Unblocked from futex_wait! ({})",
                     &dettid, &response_iv
                 );
-                // A wakeup's `Go` carries the next timeslice in nanoseconds, which is
-                // meaningless to a futex waiter and could collide with the EINTR value
-                // that reports a signal below. Only a timeout is information here.
-                match answer {
-                    Some(SchedValue::TimeOut) => Some(SchedValue::TimeOut),
-                    Some(SchedValue::Value(_)) | None => Some(SchedValue::Value(0)),
-                }
+                answer
             }
-            SchedResponse::Signaled(_) => Some(SchedValue::Value(nix::errno::Errno::EINTR as u64)),
+            SchedResponse::Signaled(_) => Some(SchedValue::Signaled),
             SchedResponse::ObserveSignal(_) => {
                 self.sched
                     .lock()
@@ -4150,8 +4150,11 @@ where
 /// Which actions we can take before/after a futex system call.
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum FutexAction {
-    /// Check in before a FUTEX_WAIT, including an optional timeout.
-    WaitRequest(Option<LogicalTime>),
+    /// Check in before a FUTEX_WAIT, including an optional timeout and, on a backend
+    /// that reports the kernel's signal state, the set of signals that interrupt the
+    /// wait. With `None`, as before, a scheduler-sent signal wakes the waiter and a
+    /// cross-task signal does not.
+    WaitRequest(Option<LogicalTime>, Option<u64>),
     /// Check in after a FUTEX_WAIT
     WaitFinished,
     /// Check in before a FUTEX_WAKE, parameterized by the number of threads woken.
@@ -7208,7 +7211,7 @@ mod tests {
                     dettid,
                     mm: MmId::initial(detpid),
                 },
-                FutexAction::WaitRequest(None),
+                FutexAction::WaitRequest(None, None),
                 FutexID::private(MmId::initial(detpid), 0x1000),
                 0,
                 u32::MAX,
@@ -7267,7 +7270,7 @@ mod tests {
                     dettid: detpid,
                     mm: MmId::initial(detpid),
                 },
-                FutexAction::WaitRequest(None),
+                FutexAction::WaitRequest(None, None),
                 futex,
                 child.as_raw(),
                 u32::MAX,
@@ -7688,7 +7691,7 @@ mod tests {
                 MmId::initial(dettid),
                 GlobalRequest::FutexAction(
                     dettid,
-                    FutexAction::WaitRequest(None),
+                    FutexAction::WaitRequest(None, None),
                     FutexID::private(MmId::initial(detpid), 0x1000),
                     0,
                     u32::MAX,
@@ -8400,7 +8403,7 @@ mod robust_exit_clock_tests {
                 sched.runqueue_push_back(peer);
                 sched.next_turns[&peer].req.put(Ok(Resources::new(peer)));
                 for (waiter, futex) in waiters.into_iter().zip(futexes) {
-                    sched.sleep_futex_waiter(&waiter, futex, None, u32::MAX);
+                    sched.sleep_futex_waiter(&waiter, futex, None, u32::MAX, None);
                 }
             }
             {

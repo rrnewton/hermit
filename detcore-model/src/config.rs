@@ -106,6 +106,21 @@ pub struct Config {
     #[clap(skip = BackendCapabilities::PTRACE)]
     pub backend: BackendCapabilities,
 
+    /// The backend runs the guest as real host threads whose signal state the kernel
+    /// owns and reports in `/proc`, and resumes a Tool's restart errno through the
+    /// kernel's own signal-delivery and syscall-restart path. Blocking waits then
+    /// decide signal interruption from the guest's real mask and dispositions
+    /// (https://github.com/rrnewton/hermit/issues/3146). Off by default: only the
+    /// backends measured to honor that contract opt in.
+    ///
+    /// The host sets it from the backend's name, because
+    /// `reverie::BackendCapabilities` has no field for this fact yet. It has no
+    /// legacy key: [`to_legacy_backend_json`] leaves it out and
+    /// [`from_legacy_backend_json`] reads it back as false.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_supports_blocked_wait_signal_interruption: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
@@ -1416,8 +1431,10 @@ impl Default for Config {
 /// under the names and in the order it carried them, each with a value
 /// computed from `config`. [`Config::record_host_inputs`], which the legacy
 /// form never had, is left out too, and reads back as false: this form serves
-/// only DBT, whose launcher collects no host inputs. Every other field is
-/// serialized exactly as `serde_json::to_string(config)` serializes it.
+/// only DBT, whose launcher collects no host inputs. So is
+/// [`Config::backend_supports_blocked_wait_signal_interruption`], which
+/// is false for DBT. Every other field is serialized exactly as
+/// `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
 /// --backend=dbt` passes the configuration to the in-guest DBT runtime in the
@@ -1733,7 +1750,13 @@ mod legacy_backend_json {
     /// `record_host_inputs` has no legacy key and no legacy value: the legacy
     /// form serves only DBT, whose launcher collects no host inputs, so it is
     /// never written and always reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 2] = ["backend", "record_host_inputs"];
+    /// `backend_supports_blocked_wait_signal_interruption` is the same: it is
+    /// false for DBT, so it is never written and always reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 3] = [
+        "backend",
+        "record_host_inputs",
+        "backend_supports_blocked_wait_signal_interruption",
+    ];
 
     /// Reads the top-level object or array of a legacy configuration. The
     /// derived `Config` deserializer reads every field; this takes the legacy
@@ -1821,8 +1844,10 @@ mod legacy_backend_json {
     /// derived `Config` deserializer asks for one element per field in
     /// declaration order; at [`Config::backend`] this reads up to fifteen
     /// elements as the legacy backend keys, and neither the field it asks for
-    /// there nor [`Config::record_host_inputs`] takes an element. Both get a
-    /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
+    /// there nor [`Config::record_host_inputs`] or
+    /// [`Config::backend_supports_blocked_wait_signal_interruption`] takes an
+    /// element. Each gets a placeholder; [`super::from_legacy_backend_json`]
+    /// replaces the first.
     struct LegacyPositions<'f, 'l, A> {
         inner: A,
         fields: std::slice::Iter<'f, String>,
@@ -1851,9 +1876,9 @@ mod legacy_backend_json {
                         .map(Some)
                         .map_err(<A::Error as de::Error>::custom)
                 }
-                Some("record_host_inputs") => {
-                    seed.deserialize(BoolDeserializer::new(false)).map(Some)
-                }
+                Some(
+                    "record_host_inputs" | "backend_supports_blocked_wait_signal_interruption",
+                ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 _ => self.inner.next_element_seed(seed),
             }
         }
@@ -2093,7 +2118,9 @@ mod legacy_backend_json {
                     Ok(())
                 }
                 // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
-                "record_host_inputs" => Ok(()),
+                "record_host_inputs" | "backend_supports_blocked_wait_signal_interruption" => {
+                    Ok(())
+                }
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -2158,6 +2185,7 @@ mod tests {
             legacy_backend_keys(&config).contains(&("kvm_shared_dequeue_timers", false)),
             "the default configuration must not write a controlled-run legacy key"
         );
+        assert!(!config.backend_supports_blocked_wait_signal_interruption);
     }
 
     #[test]
@@ -2550,7 +2578,8 @@ mod tests {
 
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
-    /// `record_host_inputs`, which is the key order the encoder writes.
+    /// `record_host_inputs` or `backend_supports_blocked_wait_signal_interruption`,
+    /// which is the key order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2565,7 +2594,7 @@ mod tests {
         for field in &fields {
             match field.as_str() {
                 "backend" => expected.extend(names.map(str::to_owned)),
-                "record_host_inputs" => {}
+                "record_host_inputs" | "backend_supports_blocked_wait_signal_interruption" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -2575,9 +2604,10 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         assert_eq!(keys, expected);
-        // `backend` becomes fifteen keys; `record_host_inputs` none.
+        // `backend` becomes fifteen keys; `record_host_inputs` and
+        // `backend_supports_blocked_wait_signal_interruption` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 13, keys.len());
+        assert_eq!(fields.len() + 12, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2634,6 +2664,43 @@ mod tests {
                 .unwrap()
                 .backend
                 .process_exits_complete_asynchronously
+        );
+    }
+
+    /// `backend_supports_blocked_wait_signal_interruption` never enters the
+    /// legacy form, whatever its value: the guest-visible string stays the
+    /// legacy bytes, and it reads back as false from both the object and the
+    /// array form.
+    #[test]
+    fn blocked_wait_signal_interruption_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            backend_supports_blocked_wait_signal_interruption: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(
+            !json.contains("backend_supports_blocked_wait_signal_interruption"),
+            "{json}"
+        );
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .backend_supports_blocked_wait_signal_interruption
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .backend_supports_blocked_wait_signal_interruption
         );
     }
 
