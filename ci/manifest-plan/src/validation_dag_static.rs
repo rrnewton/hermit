@@ -962,7 +962,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // canonical_verdict::tests::the_exact_branch_counter_verdict_is_optional_and_strictly_typed
     // and verify::tests::a_recorded_branch_counter_verdict_is_stamped_on_every_report_once
     // retain all 859 (861, measured with cargo nextest list).
-    ("test.hermit_unit", 861),
+    // run.rs the_ptrace_runtime_guards_reverie_private_page retains all 861 (862).
+    ("test.hermit_unit", 862),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1088,7 +1089,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 964 (965).
     // detlog::tests::forwarded_records_are_written_at_points_the_schedule_fixes
     // and detlog::tests::split_forwarded_message_reads_the_sender_tag (967).
-    ("test.detcore_unit", 967),
+    // syscalls::files::untraced_code_tests' three tests retain all 967 (970).
+    ("test.detcore_unit", 970),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1162,7 +1164,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // under_passthru_opt_a_host_replacement_is_reported_but_not_named and
     // a_rebinding_through_reverie_private_page_names_no_host_input_change
     // retain all 200 (203, measured with cargo nextest list).
-    ("test.hermit_integration", 203),
+    // verify_claim_names_its_limit's three private-page rewriting tests and
+    // reverie_private_page_is_the_range_hermit_guards retain all 203 (207).
+    ("test.hermit_integration", 207),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1431,7 +1435,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same three DETLOG forwarding-policy tests retain all 954: 957.
     // And the rebound-path test (958), the six mount-ID tests (964), and the
     // select-set test (965), and the two forwarded-record ordering tests (967).
-    ("test.detcore_unit_on_host", 967),
+    // And the three untraced-code tests (970).
+    ("test.detcore_unit_on_host", 970),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1447,7 +1452,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin also selects the five host-input-change verify tests (200).
     // And the two --passthru-opt host-input verify tests and the
     // private-page rebinding test (203).
-    ("test.hermit_integration_on_host", 203),
+    // And the four private-page guard tests (207).
+    ("test.hermit_integration_on_host", 207),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -1484,7 +1490,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same six exact-branch-counter tests: 843 + 6 = 849.
     // And the same --passthru-opt coverage test (850).
     // And the same two exact-branch-counter report tests (861).
-    ("test.hermit_unit_on_host", 861),
+    // And the same private-page range test (862).
+    ("test.hermit_unit_on_host", 862),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

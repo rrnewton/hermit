@@ -171,15 +171,29 @@ The instruction after the stub is `ud2`, so such a guest faults with SIGILL as
 soon as its syscall returns. Detcore records any SIGILL a guest takes during a
 verify run as a namespace change at `/`, which it could not establish, so no
 host input change is named in that run. A false alarm only withholds a name.
-Two ways around the fault remain, and both need a guest that deliberately
-attacks the tool. One rewrites Reverie's private page first: it makes the page
-writable with `mprotect` and replaces the `ud2`, maps a page over it with
-`MAP_FIXED`, or writes it through `/proc/self/mem`, and then uses the stub
-without faulting. That is not covered yet; a follow-up guards every operation
-that can change the page. The other has a signal delivered at the syscall's
-return, by racing a signal into those two instructions, and never returns to
-the stub (its handler jumps elsewhere, or SIGKILL ends the process). Both
-defeat ptrace's determinism guarantee itself, not only this attribution.
+A guest can avoid the fault only by changing the page first: making it
+writable with `mprotect` and replacing the `ud2`, mapping a page over it with
+`MAP_FIXED`, or writing it through `/proc/self/mem`. Detcore records each call
+that may change the page as a change at `/` too: `mmap` with `MAP_FIXED`
+(widened to the huge page size for `MAP_HUGETLB`), `mremap` with
+`MREMAP_FIXED`, or `shmat` with `SHM_REMAP` onto it; `mprotect`,
+`pkey_mprotect`, `madvise`, `munmap` or `mremap` of a range covering it; and
+an open for writing whose descriptor is a procfs file named `mem`
+(`/proc/<pid>/mem`, `/proc/<pid>/task/<tid>/mem`), however it was reached.
+hermit-cli gives Detcore the page's range on the ptrace runtime
+(`DetConfig::untraced_code_range`). Each rule is narrow enough that an
+ordinary program never trips it, since a false alarm would withhold a real
+host input change. Not covered, and each needing a guest that deliberately
+rewrites the tool's own page, which no ordinary program does: a result Detcore
+emulates and writes into guest memory from the tracer, which does not honor
+page protections, through an output pointer into the page; a fixed `mremap` of
+a huge-page mapping, whose extent the old mapping decides; `userfaultfd` and
+other forwarded ioctls; and a process-memory descriptor received from outside
+the container. One more way around both remains: a signal delivered at the syscall's
+return, by racing a signal into those two instructions, after which the guest
+never returns to the stub (its handler jumps elsewhere, or SIGKILL ends the
+process). That defeats ptrace's determinism guarantee itself, not only this
+attribution.
 
 The one remaining case is a coincidence: a host file replaced during an attempt
 before the divergence, and an unrelated flaky product divergence in that same

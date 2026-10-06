@@ -98,6 +98,76 @@ os.link(d + "/F", d + "/A")' "$1"
     )
 }
 
+/// How [`private_page_rewriting_guest`] changes Reverie's private page so
+/// that its untraced `syscall` is followed by a `ret` instead of the `ud2`.
+#[derive(Clone, Copy, Debug)]
+pub enum PrivatePageRewrite {
+    /// `mprotect` the page writable and replace the `ud2` with `ret`.
+    Mprotect,
+    /// `mmap` a page of `syscall; ret` over it with MAP_FIXED.
+    MapFixed,
+    /// Replace the `ud2` with `ret` through `/proc/self/mem`, which writes
+    /// through the page's protection.
+    ProcSelfMem,
+}
+
+/// [`private_page_rebinding_guest`]'s sequence, with the page first changed
+/// as `rewrite` says, so that the forked child calls into it, renames `A`
+/// onto `F` untraced and returns without faulting, then exits 9; the parent
+/// writes the child's wait status to its standard error, an open
+/// descriptor, so no host input is recorded for it, and stops before its
+/// second open of `F` unless the child exited 9. No SIGILL
+/// occurs, so only the rewrite can tell Detcore the rename may have
+/// happened.
+pub fn private_page_rewriting_guest(python: &Path, rewrite: PrivatePageRewrite) -> String {
+    let rewrite = match rewrite {
+        PrivatePageRewrite::Mprotect => {
+            "libc.mprotect.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+    assert libc.mprotect(0x71000000, 4096, 7) == 0, ctypes.get_errno()
+    ctypes.memmove(0x71000002, b\"\\xc3\", 1)"
+        }
+        PrivatePageRewrite::MapFixed => {
+            "libc.mmap.restype = ctypes.c_void_p
+    libc.mmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_long]
+    # PROT_READ | PROT_WRITE | PROT_EXEC; MAP_PRIVATE | MAP_FIXED | MAP_ANONYMOUS
+    assert libc.mmap(0x71000000, 4096, 7, 0x32, -1, 0) == 0x71000000, ctypes.get_errno()
+    ctypes.memmove(0x71000000, b\"\\x0f\\x05\\xc3\", 3)"
+        }
+        PrivatePageRewrite::ProcSelfMem => {
+            "with open(\"/proc/self/mem\", \"r+b\", buffering=0) as mem:
+        mem.seek(0x71000002)
+        mem.write(b\"\\xc3\")"
+        }
+    };
+    format!(
+        r#"
+    read line < "$1/fifo" || exit 3
+    '{}' -c 'import ctypes, mmap, os, sys
+d = sys.argv[1]
+open(d + "/F").read()
+pid = os.fork()
+if pid == 0:
+    libc = ctypes.CDLL(None, use_errno=True)
+    {rewrite}
+    # mov eax, 82 (rename); movabs r11, 0x71000000; call r11; ret
+    code = bytes([0xb8, 0x52, 0, 0, 0, 0x49, 0xbb, 0, 0, 0, 0x71, 0, 0, 0, 0, 0x41, 0xff, 0xd3, 0xc3])
+    page = mmap.mmap(-1, mmap.PAGESIZE, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
+    page.write(code)
+    stub = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_char_p, ctypes.c_char_p)(
+        ctypes.addressof(ctypes.c_char.from_buffer(page)))
+    assert stub((d + "/A").encode(), (d + "/F").encode()) == 0
+    os._exit(9)
+_, status = os.waitpid(pid, 0)
+print(status)
+print("child wait status %d" % status, file=sys.stderr, flush=True)
+assert status == 9 << 8, status
+open(d + "/F").read()
+os.link(d + "/F", d + "/A")' "$1"
+"#,
+        python.display()
+    )
+}
+
 /// A guest that tries to rename onto `F` and fails: it opens `F`, waits for
 /// the host's line, tries `rename(missing, F)` (ENOENT), opens `F` again and
 /// prints the inode number of `G`. A failed rename changes nothing, but

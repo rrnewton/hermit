@@ -1527,7 +1527,9 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // issued from the untraced stub of Reverie's private page is let
             // through, and the instruction after it is `ud2`. So the run
             // reports `/`, the ancestor of every path, and names no host input
-            // change. A false alarm only withholds a name.
+            // change. A false alarm only withholds a name. A guest that first
+            // rewrites or replaces that code is reported when it does so
+            // (`record_untraced_code_change`).
             if signal == Signal::SIGILL && self.cfg.record_host_inputs {
                 tool_global::record_host_mutation(guest, String::from("/")).await;
             }
@@ -2175,6 +2177,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // before this handler returns.
         if self.cfg.record_host_inputs {
             self.record_host_namespace_change(guest, &call).await;
+            self.record_untraced_code_change(guest, &call).await;
         }
 
         // Only an emulated RNG readv supplies authoritative imported geometry.

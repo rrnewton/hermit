@@ -437,6 +437,44 @@ fn resolved_open_path(pid: i32, fd: RawFd) -> Option<PathBuf> {
     link.is_absolute().then_some(link)
 }
 
+/// The host's default huge page size (`Hugepagesize` in /proc/meminfo), the
+/// size of a MAP_HUGETLB mapping that names none, or 2 MiB, the x86_64
+/// default, when it cannot be read (see [`may_change_untraced_code`]).
+fn default_huge_page_size() -> u64 {
+    static SIZE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *SIZE.get_or_init(|| {
+        std::fs::read_to_string("/proc/meminfo")
+            .ok()
+            .and_then(|meminfo| {
+                let line = meminfo
+                    .lines()
+                    .find(|line| line.starts_with("Hugepagesize:"))?;
+                let kib: u64 = line.split_whitespace().nth(1)?.parse().ok()?;
+                kib.checked_mul(1024)
+            })
+            .unwrap_or(2 << 20)
+    })
+}
+
+/// What a guest descriptor is, read through the opening thread's
+/// `/proc/<tid>/fd/<fd>`: its link as the kernel spells it, and whether the
+/// file is on procfs (see [`may_write_process_memory`]). Read through the
+/// thread because its descriptor table may not be its leader's (a thread
+/// cloned without CLONE_FILES). `None` when either cannot be read.
+fn descriptor_identity(tid: i32, fd: RawFd) -> Option<(PathBuf, bool)> {
+    let path = format!("/proc/{tid}/fd/{fd}");
+    let link = std::fs::read_link(&path).ok()?;
+    let path = std::ffi::CString::new(path).ok()?;
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    // SAFETY: `path` is NUL-terminated and `buf` is large enough for statfs.
+    if unsafe { libc::statfs(path.as_ptr(), buf.as_mut_ptr()) } != 0 {
+        return None;
+    }
+    // SAFETY: statfs succeeded, so it filled `buf`.
+    let on_procfs = unsafe { buf.assume_init() }.f_type == libc::PROC_SUPER_MAGIC;
+    Some((link, on_procfs))
+}
+
 /// Resolve an `AT_FDCWD`-relative spelling in the guest's filesystem view.
 ///
 /// Replayer chroots the guest, so the tracer-visible cwd includes the replay
@@ -462,6 +500,82 @@ fn rebound_path(observed: Option<PathBuf>) -> String {
         Some(path) if path.is_absolute() => path.to_string_lossy().into_owned(),
         _ => String::from("/"),
     }
+}
+
+/// Whether the raw call `number(args)` may change the guest memory in
+/// `range`, `[start, end)` (see `Config::untraced_code_range`):
+/// - a fixed mapping over any part of it: `mmap` with MAP_FIXED, `mremap`
+///   with MREMAP_FIXED, `shmat` with SHM_REMAP;
+/// - a protection, advice or unmapping over any part of it: `mprotect`,
+///   `pkey_mprotect`, `madvise`, `munmap`, the old range of `mremap`.
+///
+/// Linux takes page-aligned addresses for these calls and rounds a length up
+/// to whole pages, and `range` is whole pages, so the unrounded interval
+/// overlaps it exactly when the rounded one does. A MAP_HUGETLB `mmap` rounds
+/// to its own page size on both ends, so it is widened to the size its
+/// MAP_HUGE_* bits name, or else to `default_huge_page` (the host's
+/// `Hugepagesize`). A zero length counts as its first byte, and a `shmat` as
+/// reaching the end of the address space, since its size is the segment's.
+/// A mapping without a fixed address never lands on an existing one, and the
+/// guest's `process_vm_writev`, `ptrace` and `remap_file_pages` are refused.
+/// Scalar arguments are never read as addresses, so an ordinary call is
+/// never counted.
+pub(crate) fn may_change_untraced_code(
+    number: Sysno,
+    args: &syscalls::SyscallArgs,
+    (start, end): (u64, u64),
+    default_huge_page: u64,
+) -> bool {
+    let [arg0, arg1, arg2, arg3, arg4] =
+        [args.arg0, args.arg1, args.arg2, args.arg3, args.arg4].map(|arg| arg as u64);
+    let overlaps = |addr: u64, len: u64| addr < end && addr.saturating_add(len.max(1)) > start;
+    let overlaps_huge = |addr: u64, len: u64, page: u64| {
+        let page = page.max(1);
+        let first = addr - addr % page;
+        let last = addr
+            .saturating_add(len.max(1))
+            .div_ceil(page)
+            .saturating_mul(page);
+        overlaps(first, last.saturating_sub(first).max(1))
+    };
+    let huge_page = |flags: u64| match (flags >> libc::MAP_HUGE_SHIFT) & libc::MAP_HUGE_MASK as u64
+    {
+        0 => default_huge_page,
+        shift => 1u64.checked_shl(shift as u32).unwrap_or(u64::MAX),
+    };
+    match number {
+        Sysno::mmap if arg3 & libc::MAP_FIXED as u64 == 0 => false,
+        Sysno::mmap if arg3 & libc::MAP_HUGETLB as u64 != 0 => {
+            overlaps_huge(arg0, arg1, huge_page(arg3))
+        }
+        Sysno::mmap => overlaps(arg0, arg1),
+        Sysno::mprotect | Sysno::pkey_mprotect | Sysno::madvise | Sysno::munmap => {
+            overlaps(arg0, arg1)
+        }
+        Sysno::mremap => {
+            overlaps(arg0, arg1) || (arg3 & libc::MREMAP_FIXED as u64 != 0 && overlaps(arg4, arg2))
+        }
+        Sysno::shmat => arg1 != 0 && arg2 & libc::SHM_REMAP as u64 != 0 && overlaps(arg1, u64::MAX),
+        _ => false,
+    }
+}
+
+/// Whether an open with `flags` that returned a descriptor may write a
+/// process's memory: `/proc/<pid>/mem` and `/proc/<pid>/task/<tid>/mem`
+/// write through page protections. `descriptor` is what the descriptor is,
+/// read through the opening thread's `/proc/<tid>/fd/<fd>` (see
+/// [`descriptor_identity`]): its link, which names the file however the guest
+/// reached it (a symlink, a `/proc/self/fd` reopen), and whether it is on
+/// procfs. It counts only when it is a procfs file named `mem`, so an
+/// ordinary file of that name, or a name that leads to a pipe, does not. A
+/// descriptor that cannot be read at all counts, since Detcore cannot
+/// establish what it is.
+pub(crate) fn may_write_process_memory(flags: OFlag, descriptor: Option<(&Path, bool)>) -> bool {
+    let writes = !flags.contains(OFlag::O_PATH) && flags & OFlag::O_ACCMODE != OFlag::O_RDONLY;
+    writes
+        && descriptor.is_none_or(|(link, on_procfs)| {
+            on_procfs && link.file_name() == Some(std::ffi::OsStr::new("mem"))
+        })
 }
 
 /// Writes back the guest bytes that the utimensat lookup buffer covered.
@@ -1110,6 +1224,29 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// For `hermit run --verify` on a backend whose guest holds code that
+    /// makes untraced syscalls (`Config::untraced_code_range`): report `/`
+    /// when `call` may change the memory holding it (see
+    /// [`may_change_untraced_code`]). Intact, that code faults right after
+    /// its syscall, and the fault is reported (`handle_signal_event`); a
+    /// guest that rewrote or replaced it could use it without faulting, so
+    /// Detcore could not establish what the guest changed, and `/`, the
+    /// ancestor of every path, keeps a host input change from being named
+    /// in that run. Called before the call runs, whatever its outcome.
+    pub(crate) async fn record_untraced_code_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+    ) {
+        let Some(range) = guest.config().untraced_code_range else {
+            return;
+        };
+        let (number, args) = call.into_parts();
+        if may_change_untraced_code(number, &args, range, default_huge_page_size()) {
+            crate::tool_global::record_host_mutation(guest, String::from("/")).await;
+        }
+    }
+
     /// Openat system call.
     pub async fn handle_openat<G: Guest<Self>>(
         &self,
@@ -1197,6 +1334,22 @@ impl<T: RecordOrReplay> Detcore<T> {
                         detcore_model::host_input::HostFileIdentity::from_stat(stat),
                     )
                     .await;
+                }
+                // A descriptor that writes process memory can rewrite the
+                // untraced code (see `record_untraced_code_change`). Reported
+                // once the open returns, before the guest has the descriptor;
+                // the record has no position in the run, so it covers every
+                // write through it.
+                if guest.config().record_host_inputs
+                    && guest.config().untraced_code_range.is_some()
+                    && may_write_process_memory(
+                        call.flags(),
+                        descriptor_identity(guest.tid().as_raw(), fd)
+                            .as_ref()
+                            .map(|(link, on_procfs)| (link.as_path(), *on_procfs)),
+                    )
+                {
+                    crate::tool_global::record_host_mutation(guest, String::from("/")).await;
                 }
                 if fd_type == FdType::Pipe {
                     self.maybe_set_nonblocking_fd(guest, fd);
@@ -7135,5 +7288,327 @@ mod rebound_path_tests {
         assert_eq!(rebound_path(Some(PathBuf::from("/data/F"))), "/data/F");
         assert_eq!(rebound_path(None), "/");
         assert_eq!(rebound_path(Some(PathBuf::from("F"))), "/");
+    }
+}
+
+#[cfg(test)]
+mod untraced_code_tests {
+    use std::path::Path;
+
+    use nix::fcntl::OFlag;
+    use reverie::syscalls::SyscallArgs;
+    use reverie::syscalls::Sysno;
+
+    use super::descriptor_identity;
+    use super::may_change_untraced_code;
+    use super::may_write_process_memory;
+
+    const PAGE: (u64, u64) = (0x7100_0000, 0x7100_1000);
+
+    fn args(arg0: u64, arg1: u64, arg2: u64, arg3: u64, arg4: u64) -> SyscallArgs {
+        SyscallArgs::new(
+            arg0 as usize,
+            arg1 as usize,
+            arg2 as usize,
+            arg3 as usize,
+            arg4 as usize,
+            0,
+        )
+    }
+
+    /// A thread cloned without CLONE_FILES has its own descriptor table, so
+    /// a descriptor is read through the thread that opened it. Through its
+    /// leader the same number names nothing here, which would make an
+    /// ordinary write-mode open count as unreadable (a false `/` that
+    /// withholds a real host input change) and would miss the thread's own
+    /// process-memory file.
+    #[test]
+    fn a_descriptor_is_read_through_the_thread_that_opened_it() {
+        use std::os::fd::AsRawFd;
+
+        let directory = tempfile::tempdir().unwrap();
+        let ordinary = directory.path().join("out");
+        let named_mem = directory.path().join("mem");
+        std::thread::spawn(move || {
+            // SAFETY: gives only this thread a private copy of the table.
+            assert_eq!(unsafe { libc::unshare(libc::CLONE_FILES) }, 0);
+            // SAFETY: plain syscalls on this thread's own descriptors.
+            let tid = unsafe { libc::gettid() };
+            let leader = std::process::id() as i32;
+            let files = [
+                (std::fs::File::create(&ordinary).unwrap(), false),
+                (std::fs::File::create(&named_mem).unwrap(), false),
+                (
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open("/proc/thread-self/mem")
+                        .unwrap(),
+                    true,
+                ),
+            ];
+            for (number, (file, is_process_memory)) in (900..).zip(files) {
+                assert_eq!(unsafe { libc::dup2(file.as_raw_fd(), number) }, number);
+                drop(file);
+                let identity = descriptor_identity(tid, number);
+                assert!(identity.is_some(), "{number}");
+                assert_eq!(descriptor_identity(leader, number), None, "{number}");
+                assert_eq!(
+                    may_write_process_memory(
+                        OFlag::O_WRONLY,
+                        identity
+                            .as_ref()
+                            .map(|(link, procfs)| (link.as_path(), *procfs)),
+                    ),
+                    is_process_memory,
+                    "{identity:?}"
+                );
+                assert_eq!(unsafe { libc::close(number) }, 0);
+            }
+        })
+        .join()
+        .unwrap();
+    }
+
+    /// Every call that can replace, unprotect, discard or unmap the range
+    /// counts when its interval reaches any byte of it, and not when it stops
+    /// short of it or starts after it.
+    #[test]
+    fn a_call_counts_exactly_when_it_may_change_the_range() {
+        let fixed = libc::MAP_FIXED as u64 | libc::MAP_PRIVATE as u64;
+        let huge = fixed | libc::MAP_HUGETLB as u64;
+        let huge_1gb = (30 << libc::MAP_HUGE_SHIFT) as u64;
+        let remap_fixed = (libc::MREMAP_MAYMOVE | libc::MREMAP_FIXED) as u64;
+        let remap = libc::SHM_REMAP as u64;
+        let cases = [
+            (
+                "mmap fixed over it",
+                Sysno::mmap,
+                args(0x7100_0000, 0x1000, 7, fixed, 0),
+                true,
+            ),
+            (
+                "mmap fixed reaching it",
+                Sysno::mmap,
+                args(0x70ff_f000, 0x1001, 7, fixed, 0),
+                true,
+            ),
+            (
+                "mmap fixed below it",
+                Sysno::mmap,
+                args(0x70ff_f000, 0x1000, 7, fixed, 0),
+                false,
+            ),
+            (
+                "mmap fixed above it",
+                Sysno::mmap,
+                args(0x7100_1000, 0x1000, 7, fixed, 0),
+                false,
+            ),
+            (
+                "mmap hinted at it",
+                Sysno::mmap,
+                args(0x7100_0000, 0x1000, 7, 0x22, 0),
+                false,
+            ),
+            // The host default here is 2 MiB; 0x7100_0000 is 2 MiB aligned.
+            (
+                "mmap fixed default huge page holding it",
+                Sysno::mmap,
+                args(0x7110_0000, 1, 7, huge, 0),
+                true,
+            ),
+            (
+                "mmap fixed small page there",
+                Sysno::mmap,
+                args(0x7110_0000, 1, 7, fixed, 0),
+                false,
+            ),
+            (
+                "mmap fixed default huge page below it",
+                Sysno::mmap,
+                args(0x70ff_f000, 1, 7, huge, 0),
+                false,
+            ),
+            (
+                "mmap fixed 1 GiB page holding it",
+                Sysno::mmap,
+                args(0x4000_0000, 1, 7, huge | huge_1gb, 0),
+                true,
+            ),
+            (
+                "mmap fixed 1 GiB page elsewhere",
+                Sysno::mmap,
+                args(0x8000_0000, 1, 7, huge | huge_1gb, 0),
+                false,
+            ),
+            (
+                "mprotect of it",
+                Sysno::mprotect,
+                args(0x7100_0000, 0x1000, 7, 0, 0),
+                true,
+            ),
+            (
+                "mprotect covering it",
+                Sysno::mprotect,
+                args(0x7000_0000, 0x200_0000, 7, 0, 0),
+                true,
+            ),
+            (
+                "mprotect of a zero length",
+                Sysno::mprotect,
+                args(0x7100_0000, 0, 7, 0, 0),
+                true,
+            ),
+            (
+                "pkey_mprotect of it",
+                Sysno::pkey_mprotect,
+                args(0x7100_0000, 1, 7, 0, 0),
+                true,
+            ),
+            (
+                "madvise of it",
+                Sysno::madvise,
+                args(0x7100_0000, 0x1000, 4, 0, 0),
+                true,
+            ),
+            (
+                "munmap of it",
+                Sysno::munmap,
+                args(0x7100_0000, 0x1000, 0, 0, 0),
+                true,
+            ),
+            (
+                "munmap past it",
+                Sysno::munmap,
+                args(0x7100_1000, 0x1000, 0, 0, 0),
+                false,
+            ),
+            (
+                "mremap from it",
+                Sysno::mremap,
+                args(0x7100_0000, 0x1000, 0x2000, 1, 0),
+                true,
+            ),
+            (
+                "mremap fixed onto it",
+                Sysno::mremap,
+                args(0x6000_0000, 0x1000, 0x1000, remap_fixed, 0x7100_0000),
+                true,
+            ),
+            (
+                "mremap fixed of a small page into its gigabyte",
+                Sysno::mremap,
+                args(0x6000_0000, 0x1000, 0x1000, remap_fixed, 0x4000_0000),
+                false,
+            ),
+            (
+                "mremap moving elsewhere",
+                Sysno::mremap,
+                args(0x6000_0000, 0x1000, 0x2000, 1, 0x7100_0000),
+                false,
+            ),
+            (
+                "shmat remapping at it",
+                Sysno::shmat,
+                args(3, 0x7100_0000, remap, 0, 0),
+                true,
+            ),
+            (
+                "shmat remapping below it",
+                Sysno::shmat,
+                args(3, 0x6000_0000, remap, 0, 0),
+                true,
+            ),
+            (
+                "shmat without remap",
+                Sysno::shmat,
+                args(3, 0x7100_0000, 0, 0, 0),
+                false,
+            ),
+            (
+                "shmat anywhere",
+                Sysno::shmat,
+                args(3, 0, remap, 0, 0),
+                false,
+            ),
+            ("brk", Sysno::brk, args(0x7100_0000, 0, 0, 0, 0), false),
+            // A scalar argument that equals an address in the range is not one.
+            (
+                "lseek to that offset",
+                Sysno::lseek,
+                args(3, 0x7100_0000, 0, 0, 0),
+                false,
+            ),
+            (
+                "an address near the end",
+                Sysno::munmap,
+                args(u64::MAX - 0xfff, 0x1000, 0, 0, 0),
+                false,
+            ),
+        ];
+        for (label, number, args, expected) in cases {
+            assert_eq!(
+                may_change_untraced_code(number, &args, PAGE, 2 << 20),
+                expected,
+                "{label}"
+            );
+        }
+    }
+
+    /// A write-mode open counts when its descriptor is a procfs file named
+    /// `mem`, or cannot be read at all; a read-only or `O_PATH` open, an
+    /// ordinary file named `mem`, a pipe, and another procfs file do not.
+    #[test]
+    fn an_open_counts_when_it_may_write_process_memory() {
+        let proc_mem = Some((Path::new("/proc/12/mem"), true));
+        let cases = [
+            ("process mem read-write", OFlag::O_RDWR, proc_mem, true),
+            (
+                "task mem write-only",
+                OFlag::O_WRONLY,
+                Some((Path::new("/proc/12/task/13/mem"), true)),
+                true,
+            ),
+            ("an unreadable descriptor", OFlag::O_WRONLY, None, true),
+            ("process mem read-only", OFlag::O_RDONLY, proc_mem, false),
+            (
+                "process mem as a path",
+                OFlag::O_PATH | OFlag::O_RDWR,
+                proc_mem,
+                false,
+            ),
+            (
+                "an ordinary file named mem",
+                OFlag::O_WRONLY | OFlag::O_CREAT,
+                Some((Path::new("/tmp/mem"), false)),
+                false,
+            ),
+            (
+                "a name that leads to a pipe",
+                OFlag::O_WRONLY,
+                Some((Path::new("pipe:[4026]"), false)),
+                false,
+            ),
+            (
+                "another procfs file",
+                OFlag::O_WRONLY,
+                Some((Path::new("/proc/12/attr/current"), true)),
+                false,
+            ),
+            (
+                "an unreadable read-only descriptor",
+                OFlag::O_RDONLY,
+                None,
+                false,
+            ),
+        ];
+        for (label, flags, descriptor, expected) in cases {
+            assert_eq!(
+                may_write_process_memory(flags, descriptor),
+                expected,
+                "{label}"
+            );
+        }
     }
 }

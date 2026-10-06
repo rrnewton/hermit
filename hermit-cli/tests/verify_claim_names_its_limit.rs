@@ -352,6 +352,78 @@ fn a_rebinding_through_reverie_private_page_names_no_host_input_change() {
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
 }
 
+/// [`a_rebinding_through_reverie_private_page_names_no_host_input_change`]
+/// with the page changed first, as `rewrite` says, so that the stub returns
+/// and no SIGILL occurs. Detcore reports the change to the page, so no host
+/// input change is named and the run stays a divergence.
+fn assert_a_rewritten_private_page_names_no_host_input_change(
+    name: &str,
+    rewrite: host_input::PrivatePageRewrite,
+) {
+    let guest =
+        host_input::private_page_rewriting_guest(&host_input::python_interpreter(), rewrite);
+    let (_root, stderr, report) = verify_across_host_action(name, &guest, false, ["go", "go"]);
+    // In both runs the child returned from the stub and exited 9 (wait
+    // status 2304), so the untraced rename ran and nothing faulted: neither
+    // run's SIGILL rule can be what keeps the change from being named.
+    assert_eq!(
+        stderr.matches("child wait status 2304").count(),
+        2,
+        "{rewrite:?}: {stderr}"
+    );
+    assert_eq!(
+        report.verdict,
+        hermit::canonical_verdict::Verdict::Diverged,
+        "{rewrite:?}: {stderr}"
+    );
+    assert_eq!(report.infrastructure_error, None, "{rewrite:?}: {stderr}");
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+}
+
+#[test]
+fn a_private_page_made_writable_names_no_host_input_change() {
+    assert_a_rewritten_private_page_names_no_host_input_change(
+        "host-input-private-page-mprotect",
+        host_input::PrivatePageRewrite::Mprotect,
+    );
+}
+
+#[test]
+fn a_page_mapped_over_the_private_page_names_no_host_input_change() {
+    assert_a_rewritten_private_page_names_no_host_input_change(
+        "host-input-private-page-map-fixed",
+        host_input::PrivatePageRewrite::MapFixed,
+    );
+}
+
+#[test]
+fn a_private_page_written_through_proc_self_mem_names_no_host_input_change() {
+    assert_a_rewritten_private_page_names_no_host_input_change(
+        "host-input-private-page-proc-mem",
+        host_input::PrivatePageRewrite::ProcSelfMem,
+    );
+}
+
+/// hermit-cli hard-codes Reverie's private page as the range Detcore guards
+/// (`REVERIE_PTRACE_PRIVATE_PAGE` in run.rs), because reverie-ptrace keeps
+/// its constants private. A guest's own memory map under the ptrace backend
+/// shows it there, one executable page, so a move in Reverie fails here.
+#[test]
+fn reverie_private_page_is_the_range_hermit_guards() {
+    let output = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["run", "--strict", "--", "/bin/cat", "/proc/self/maps"])
+        .output()
+        .expect("failed to start hermit");
+    let maps = String::from_utf8_lossy(&output.stdout);
+    assert!(output.status.success(), "{output:?}");
+    let page: Vec<&str> = maps
+        .lines()
+        .filter(|line| line.starts_with("71000000-"))
+        .collect();
+    assert_eq!(page.len(), 1, "{maps}");
+    assert!(page[0].starts_with("71000000-71001000 r-xp "), "{maps}");
+}
+
 /// Under `--passthru-opt` every syscall outside Detcore's short allow-list
 /// bypasses it, `rename` and `link` among them, so the guest's own rebinding
 /// is never reported. The opens still are, and they show the guest's

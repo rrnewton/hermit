@@ -660,6 +660,20 @@ pub struct Config {
     #[serde(skip)]
     #[clap(skip)]
     pub host_input_log: Option<PathBuf>,
+
+    /// A guest address range, `[start, end)`, holding code whose syscalls
+    /// the backend lets through without Detcore seeing them, which the guest
+    /// cannot otherwise use without faulting. With
+    /// [`Self::record_host_inputs`] set, a guest call that may change the
+    /// memory there (a fixed mapping over it, a protection or advice change
+    /// or unmapping that covers it, an open of a process-memory file for
+    /// writing) is reported as a change at `/`, so no host input change is
+    /// named in that run (see [`crate::host_input`]). The backend that hosts
+    /// Detcore in-process sets it, so set programmatically, like
+    /// `happens_before`, and never serialized.
+    #[serde(skip)]
+    #[clap(skip)]
+    pub untraced_code_range: Option<(u64, u64)>,
 }
 
 fn try_parse_numbers_with_colon(from_str: &str) -> anyhow::Result<(DetTid, u64)> {

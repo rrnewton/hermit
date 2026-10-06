@@ -381,9 +381,11 @@ fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'
         // Reverie needs to inject syscalls. The instruction after that stub is
         // `ud2`, so a guest that uses it faults with SIGILL, and Detcore then
         // records a change it could not establish, so that no host input
-        // change is named in that run (detcore `handle_signal_event`). See
-        // docs/DIVERGENCE_CLASSES.md for the two ways around the fault that
-        // remain, both by a guest that deliberately attacks the tool.
+        // change is named in that run (detcore `handle_signal_event`). A
+        // guest that rewrites or replaces the page to avoid the fault is
+        // recorded the same way when it does so (`untraced_code_range`). See
+        // docs/DIVERGENCE_CLASSES.md for the one way around both that
+        // remains, by a guest that deliberately races a signal into the stub.
         Backend::Ptrace | Backend::E9patch | Backend::Kvm => None,
         Backend::Sabre => Some(
             "SaBRe's loader runs an exec'd program's .preinit_array before Detcore starts \
@@ -393,6 +395,26 @@ fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'
             Some("in-guest LiteInst's preload starts after an exec'd program's .preinit_array runs")
         }
         Backend::Dbt => Some("DBT's launcher does not collect host inputs"),
+    }
+}
+
+/// Reverie ptrace's private page, `[start, end)`, which Reverie maps in every
+/// guest process (reverie-ptrace `cp::PRIVATE_PAGE_OFFSET` and
+/// `cp::PRIVATE_PAGE_SIZE`, which that crate keeps private). It holds the
+/// untraced stub described in [`unobserved_guest_execution`]. The cli test
+/// `reverie_private_page_is_the_range_hermit_guards` pins it against a
+/// guest's own memory map.
+const REVERIE_PTRACE_PRIVATE_PAGE: (u64, u64) = (0x7100_0000, 0x7100_1000);
+
+/// The guest code that makes syscalls `backend` lets through untraced
+/// (`DetConfig::untraced_code_range`), which Detcore guards in a run that
+/// records host inputs: Reverie's private page on the ptrace runtime, and
+/// none elsewhere. KVM traps every syscall, and the other backends never
+/// name a host input change ([`unobserved_guest_execution`]).
+fn untraced_code_range(backend: Backend) -> Option<(u64, u64)> {
+    match backend {
+        Backend::Ptrace | Backend::E9patch => Some(REVERIE_PTRACE_PRIVATE_PAGE),
+        Backend::Kvm | Backend::Sabre | Backend::Liteinst | Backend::Dbt => None,
     }
 }
 
@@ -2427,6 +2449,35 @@ fn passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend() {
             "{backend:?}"
         );
     }
+}
+
+/// Detcore guards Reverie's private page on the ptrace runtime, the one
+/// backend that names host input changes and lets the guest's syscalls past
+/// its tracer from code it maps; nowhere else is any range guarded.
+#[test]
+fn the_ptrace_runtime_guards_reverie_private_page() {
+    for backend in [Backend::Ptrace, Backend::E9patch] {
+        assert_eq!(
+            untraced_code_range(backend),
+            Some(REVERIE_PTRACE_PRIVATE_PAGE),
+            "{backend:?}"
+        );
+    }
+    for backend in [
+        Backend::Kvm,
+        Backend::Sabre,
+        Backend::Liteinst,
+        Backend::Dbt,
+    ] {
+        assert_eq!(untraced_code_range(backend), None, "{backend:?}");
+    }
+    let mut ro = RunOpts::parse_from(["fakehermit", "fakeprog"]);
+    assert_eq!(
+        ro.effective_det_config().untraced_code_range,
+        Some((0x7100_0000, 0x7100_1000))
+    );
+    ro.set_backend(Some(Backend::Kvm));
+    assert_eq!(ro.effective_det_config().untraced_code_range, None);
 }
 
 #[test]
@@ -6369,6 +6420,7 @@ impl RunOpts {
         config.happens_before = self.resolved_happens_before.clone();
         config.record_host_inputs = self.host_input_log.is_some();
         config.host_input_log = self.host_input_log.clone();
+        config.untraced_code_range = untraced_code_range(self.selected_backend());
         config
     }
 
