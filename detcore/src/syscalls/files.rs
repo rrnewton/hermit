@@ -4088,14 +4088,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         let in_type = guest
             .thread_state()
             .with_detfd(call.in_fd(), |detfd| detfd.ty())?;
-        let (out_type, out_resource, out_inode) =
-            guest.thread_state().with_detfd(call.out_fd(), |detfd| {
-                (
-                    detfd.ty(),
-                    detfd.resource(),
-                    detfd.stat().map(|stat| stat.raw_inode()),
-                )
-            })?;
+        let (out_type, out_resource) = guest
+            .thread_state()
+            .with_detfd(call.out_fd(), |detfd| (detfd.ty(), detfd.resource()))?;
 
         // AUTONOMOUS-BOT-IMPLEMENTED
         // TODO-HUMAN-REVIEW(PR-973): Refuse sendfile from a procfs input so it
@@ -4118,11 +4113,12 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Err(Errno::ENOSYS.into());
         }
 
+        let out_inode = self.written_identity(guest, call.out_fd()).await?;
         let dettid = guest.thread_state().dettid;
         let mut resources = Resources::new(dettid);
-        // `out_inode` is the fd's cached HOST identity, so it must be
-        // determinized before naming a resource. It is deliberately left raw
-        // for the `touch_file` call below, which takes a `RawInode`.
+        // `out_inode` is the fd's HOST identity, so it must be determinized
+        // before naming a resource. It is deliberately left raw for the
+        // `touch_file` call below, which takes a `RawInode`.
         let out_resource = match out_resource {
             Some(resource) => Some(resource),
             None => match out_inode {
@@ -4162,27 +4158,21 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (
-            fd_type,
-            physically_nonblocking,
-            logically_nonblocking,
-            open_file_id,
-            resource,
-            raw_ino,
-        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.ty(),
-                detfd.physically_nonblocking(),
-                detfd.is_nonblocking(),
-                detfd.open_file_id(),
-                detfd.resource(),
-                detfd.stat().map(|x| x.raw_inode()),
-            )
-        })?;
+        let (fd_type, physically_nonblocking, logically_nonblocking, open_file_id, resource) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
+                    detfd.open_file_id(),
+                    detfd.resource(),
+                )
+            })?;
+        let written = self.written_identity(guest, call.fd()).await?;
         // It doesn't matter much where the linearization point for this mtime bump falls:
         if guest.config().virtualize_metadata {
             let r =
-                raw_ino.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
+                written.expect("Expect that when virtualize_metadata, DetFd's stat is populated!");
             touch_file(guest, r).await;
         }
 
@@ -4275,9 +4265,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             });
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.raw_inode()))
-        })?;
+        let resource = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+        let raw_ino = self.written_identity(guest, call.fd()).await?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
         // can name a guest-visible resource. Passing it through directly used
@@ -4380,23 +4371,17 @@ impl<T: RecordOrReplay> Detcore<T> {
             return self.writev_timer_slack(guest, call.fd(), iovecs, 0).await;
         }
 
-        let (
-            fd_type,
-            physically_nonblocking,
-            logically_nonblocking,
-            open_file_id,
-            resource,
-            raw_ino,
-        ) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (
-                detfd.ty(),
-                detfd.physically_nonblocking(),
-                detfd.is_nonblocking(),
-                detfd.open_file_id(),
-                detfd.resource(),
-                detfd.stat().map(|x| x.raw_inode()),
-            )
-        })?;
+        let (fd_type, physically_nonblocking, logically_nonblocking, open_file_id, resource) =
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                (
+                    detfd.ty(),
+                    detfd.physically_nonblocking(),
+                    detfd.is_nonblocking(),
+                    detfd.open_file_id(),
+                    detfd.resource(),
+                )
+            })?;
+        let written = self.written_identity(guest, call.fd()).await?;
 
         if let Some(resource) = resource {
             let mut request = guest.thread_state().mk_request(resource, Permission::W);
@@ -4424,9 +4409,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await
         };
 
-        if guest.config().virtualize_metadata && matches!(&result, Ok(written) if *written > 0) {
+        if guest.config().virtualize_metadata && matches!(&result, Ok(bytes) if *bytes > 0) {
             let inode =
-                raw_ino.expect("virtualized metadata requires stat data for every tracked fd");
+                written.expect("virtualized metadata requires stat data for every tracked fd");
             touch_file(guest, inode).await;
         }
 
@@ -4716,9 +4701,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             };
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.raw_inode()))
-        })?;
+        let resource = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+        let raw_ino = self.written_identity(guest, call.fd()).await?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
         // can name a guest-visible resource. Passing it through directly used
@@ -4776,9 +4762,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await;
         }
 
-        let (resource, raw_ino) = guest.thread_state().with_detfd(call.fd(), |detfd| {
-            (detfd.resource(), detfd.stat().map(|stat| stat.raw_inode()))
-        })?;
+        let resource = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.resource())?;
+        let raw_ino = self.written_identity(guest, call.fd()).await?;
         // The fd's cached `DetStat` carries the HOST inode (`DetStat` is built
         // straight from `fstat`/`statx`), so it must be determinized before it
         // can name a guest-visible resource. Passing it through directly used
@@ -6850,6 +6837,25 @@ impl<T: RecordOrReplay> Detcore<T> {
                 errno,
             )),
         }
+    }
+
+    /// The raw identity of the file a write through `fd` changes, for the
+    /// virtual mtime bump of the write family: the descriptor's own object,
+    /// [`Self::descriptor_identity_stat`]. The cached stat of an inherited
+    /// stdio descriptor, or of a dup of one, is the `fstat(0)` stand-in all
+    /// three share, so bumping it bumped stdin's file for a write to stdout
+    /// while a `stat` of stdout's file looked under that file's own identity.
+    /// `Ok(None)` when Detcore has no stat for `fd`. Asked before the kernel
+    /// writes, so a refusal leaves the guest's file unchanged.
+    async fn written_identity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<RawInode>, Error> {
+        Ok(self
+            .descriptor_identity_stat(guest, fd)
+            .await?
+            .map(|stat| stat.raw_inode()))
     }
 
     /// [`Self::descriptor_identity_stat`] of each inherited stdio descriptor,
@@ -9069,6 +9075,14 @@ pub(crate) mod inject_fstat_scratch {
         /// What `detlog_memory_regions` reports: `None`, as ptrace does, or
         /// the guest ranges a test wants the memory-map DETLOG to hash.
         detlog_regions: Option<Vec<reverie::DetlogMemoryRegion>>,
+        /// (descriptor, stat): an injected fstat of the descriptor reads the
+        /// stat instead of running, for a file the test process cannot make.
+        fstat_answers: Vec<(RawFd, libc::stat)>,
+        /// Whether `send_rpc` answers `TouchFile`. Off by default, so a test
+        /// that expects no RPC still fails on one.
+        answers_touch_file: bool,
+        /// Raw identity of each `TouchFile` request, in order.
+        touched: std::sync::Mutex<Vec<RawInode>>,
     }
 
     /// The deterministic inode `send_rpc` gives the first `DeterminizeInode`
@@ -9118,6 +9132,9 @@ pub(crate) mod inject_fstat_scratch {
                 answers_determinize_inode: false,
                 determinized: std::sync::Mutex::new(Vec::new()),
                 detlog_regions: None,
+                fstat_answers: Vec::new(),
+                answers_touch_file: false,
+                touched: std::sync::Mutex::new(Vec::new()),
             };
             (tool, guest)
         }
@@ -9170,6 +9187,10 @@ pub(crate) mod inject_fstat_scratch {
                             LogicalTime::ZERO,
                         )),
                     )
+                }
+                GlobalRequest::TouchFile(raw) if self.answers_touch_file => {
+                    self.touched.lock().unwrap().push(raw);
+                    (None, GlobalResponse::TouchFile(()))
                 }
                 request => panic!("fd registration must not send an RPC: {request:?}"),
             }
@@ -9291,7 +9312,15 @@ pub(crate) mod inject_fstat_scratch {
                     self.fstat_buffers.push(buffer);
                     self.fstat_guard_live
                         .push(self.guard_live.load(Ordering::SeqCst));
-                    i64::from(unsafe { libc::fstat(call.fd(), buffer as *mut libc::stat) })
+                    match self.fstat_answers.iter().find(|(fd, _)| *fd == call.fd()) {
+                        Some(&(_, answer)) => {
+                            unsafe { std::ptr::write_unaligned(buffer as *mut libc::stat, answer) };
+                            0
+                        }
+                        None => {
+                            i64::from(unsafe { libc::fstat(call.fd(), buffer as *mut libc::stat) })
+                        }
+                    }
                 }
                 Syscall::Newfstatat(call) => {
                     assert_eq!(call.dirfd(), libc::AT_FDCWD);
@@ -9454,6 +9483,24 @@ pub(crate) mod inject_fstat_scratch {
                     self.closed.push(call.fd());
                     i64::from(unsafe { libc::close(call.fd()) })
                 }
+                // A write a handler forwards, run as it is: the test process
+                // stands in for the guest and owns its buffers.
+                Syscall::Write(_)
+                | Syscall::Pwrite64(_)
+                | Syscall::Writev(_)
+                | Syscall::Pwritev(_)
+                | Syscall::Pwritev2(_)
+                | Syscall::Sendfile(_) => unsafe {
+                    libc::syscall(
+                        number as libc::c_long,
+                        args.arg0,
+                        args.arg1,
+                        args.arg2,
+                        args.arg3,
+                        args.arg4,
+                        args.arg5,
+                    )
+                },
                 // The test process stands in for the guest's thread.
                 Syscall::Getpid(_) => i64::from(unsafe { libc::getpid() }),
                 Syscall::Gettid(_) => unsafe { libc::syscall(libc::SYS_gettid) },
@@ -10667,6 +10714,213 @@ pub(crate) mod inject_fstat_scratch {
             [Sysno::mmap],
             "only the failed transient page for the fstat"
         );
+    }
+
+    /// One byte written through `fd` by the write-family call `name`, through
+    /// that call's own handler; `sendfile` copies it from `source`.
+    async fn write_one_byte(
+        tool: &Detcore,
+        guest: &mut ScriptedGuest,
+        name: &str,
+        fd: RawFd,
+        source: RawFd,
+    ) -> Result<i64, Error> {
+        static BYTE: [u8; 1] = *b"x";
+        let buf = Addr::from_ptr(BYTE.as_ptr());
+        let iovec = [libc::iovec {
+            iov_base: BYTE.as_ptr() as *mut libc::c_void,
+            iov_len: BYTE.len(),
+        }];
+        let iov = Addr::from_ptr(iovec.as_ptr());
+        match name {
+            "write" => {
+                let call = syscalls::Write::new().with_fd(fd).with_buf(buf).with_len(1);
+                tool.handle_write(guest, call).await
+            }
+            "pwrite64" => {
+                let call = syscalls::Pwrite64::new()
+                    .with_fd(fd)
+                    .with_buf(buf)
+                    .with_len(1)
+                    .with_offset(0);
+                tool.handle_pwrite64(guest, call).await
+            }
+            "writev" => {
+                let call = syscalls::Writev::new().with_fd(fd).with_iov(iov).with_len(1);
+                tool.handle_writev(guest, call).await
+            }
+            "pwritev" => {
+                let call = syscalls::Pwritev::new()
+                    .with_fd(fd)
+                    .with_iov(iov)
+                    .with_iov_len(1)
+                    .with_pos_l(0)
+                    .with_pos_h(0);
+                tool.handle_pwritev(guest, call).await
+            }
+            "pwritev2" => {
+                let call = syscalls::Pwritev2::new()
+                    .with_fd(fd)
+                    .with_iov(iov)
+                    .with_iov_len(1)
+                    .with_pos_l(0)
+                    .with_pos_h(0)
+                    .with_flags(0);
+                tool.handle_pwritev2(guest, call).await
+            }
+            "sendfile" => {
+                let call = syscalls::Sendfile::new()
+                    .with_out_fd(fd)
+                    .with_in_fd(source)
+                    .with_offset(None)
+                    .with_count(1);
+                tool.handle_sendfile(guest, call).await
+            }
+            other => panic!("not a write-family call: {other}"),
+        }
+    }
+
+    // A write bumps the virtual mtime of the file it changes, which a later
+    // `stat` of that file looks up under the file's own (device, inode). The
+    // cached stat of an inherited stdio descriptor, and of every dup of one,
+    // is the `fstat(0)` stand-in all three share, so with stdin and stdout on
+    // different devices that share a raw inode number,
+    // `stat(B); write(1, ...); stat(B)` touched stdin's identity and the
+    // guest saw no change. The scripted fstat gives the stdout dup the
+    // stand-in's inode number on another device, a pair the test process
+    // cannot make. Each write-family call writes twice: the second must use
+    // the identity the first cached on the open file description.
+    #[tokio::test]
+    async fn a_stdio_write_touches_the_descriptors_own_file_not_the_stand_in() {
+        let mut observed = Vec::new();
+        let mut expected = Vec::new();
+        for name in [
+            "write", "pwrite64", "writev", "pwritev", "pwritev2", "sendfile",
+        ] {
+            let (tool, mut guest) = ScriptedGuest::new(true, false);
+            guest.config.sequentialize_threads = false;
+            guest.answers_touch_file = true;
+            let (source, _) = open_file();
+            assert_eq!(
+                unsafe { libc::pwrite(source, b"xx".as_ptr().cast(), 2, 0) },
+                2
+            );
+            tool.add_fd(&mut guest, source, OFlag::O_RDONLY, FdType::Regular)
+                .await
+                .expect("precondition: Detcore tracks the sendfile source");
+            let (fd, _) = stdio_backed_by_a_file(&mut guest);
+            let stand_in = guest
+                .thread
+                .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+                .unwrap()
+                .expect("precondition: the dup carries the stand-in");
+            let mut answer: libc::stat = unsafe { std::mem::zeroed() };
+            assert_eq!(unsafe { libc::fstat(fd, &mut answer) }, 0);
+            answer.st_dev = stand_in.dev ^ 1;
+            answer.st_ino = stand_in.ino;
+            guest.fstat_answers.push((fd, answer));
+            let own = RawInode::new(answer.st_dev, answer.st_ino);
+            guest.injected.clear();
+
+            let first = write_one_byte(&tool, &mut guest, name, fd, source).await;
+            let second = write_one_byte(&tool, &mut guest, name, fd, source).await;
+            close_unless_detcore_did(&guest, fd);
+            close_unless_detcore_did(&guest, source);
+
+            let fstats = guest
+                .injected
+                .iter()
+                .filter(|&&sysno| sysno == Sysno::fstat)
+                .count();
+            let touched = guest.touched.lock().unwrap().clone();
+            observed.push((name, first.ok(), second.ok(), touched, fstats));
+            // Both writes succeed and bump the file the descriptor names; one
+            // fstat for the description, whose identity the second write
+            // finds cached.
+            expected.push((name, Some(1), Some(1), vec![own, own], 1));
+        }
+        assert_eq!(
+            observed, expected,
+            "(call, first write, second write, identities touched, fstats injected): a \
+             write through a stdio dup must bump the mtime of the file the descriptor \
+             names, not of the stand-in"
+        );
+    }
+
+    // With no writable stack scratch and no transient page, Detcore cannot
+    // ask a stdio descriptor's own identity. A write must then refuse before
+    // the kernel writes anything: touching the stand-in instead would bump
+    // stdin's file again. Without virtualized metadata (`hermit record` and
+    // `hermit replay`) no mtime is bumped and nothing is asked.
+    #[tokio::test]
+    async fn a_stdio_write_refuses_before_writing_when_it_cannot_ask_the_identity() {
+        let writes = [
+            Sysno::write,
+            Sysno::pwrite64,
+            Sysno::writev,
+            Sysno::pwritev,
+            Sysno::pwritev2,
+            Sysno::sendfile,
+        ];
+        for virtualize_metadata in [true, false] {
+            for name in [
+                "write", "pwrite64", "writev", "pwritev", "pwritev2", "sendfile",
+            ] {
+                let (tool, mut guest) = ScriptedGuest::new(false, true);
+                guest.config.sequentialize_threads = false;
+                guest.config.virtualize_metadata = virtualize_metadata;
+                guest.answers_touch_file = true;
+                let (source, _) = open_file();
+                assert_eq!(unsafe { libc::pwrite(source, b"x".as_ptr().cast(), 1, 0) }, 1);
+                // Tracked directly: with no stack scratch, the fstat
+                // `add_fd` injects could not be asked either.
+                let mut source_stat: libc::stat = unsafe { std::mem::zeroed() };
+                assert_eq!(unsafe { libc::fstat(source, &mut source_stat) }, 0);
+                guest
+                    .thread
+                    .add_fd(
+                        source,
+                        OFlag::O_RDONLY,
+                        FdType::Regular,
+                        Some(DetStat::from(source_stat)),
+                    )
+                    .unwrap();
+                let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+                let result = write_one_byte(&tool, &mut guest, name, fd, source).await;
+                let length = unsafe {
+                    let mut stat: libc::stat = std::mem::zeroed();
+                    assert_eq!(libc::fstat(fd, &mut stat), 0);
+                    stat.st_size
+                };
+                close_unless_detcore_did(&guest, fd);
+                close_unless_detcore_did(&guest, source);
+
+                if virtualize_metadata {
+                    assert_typed_refusal(name, result.map(|_| ()), Errno::ENOMEM);
+                    assert_eq!(
+                        guest.injected,
+                        [Sysno::mmap],
+                        "{name}: only the failed transient page for the fstat; the write \
+                         must not reach the kernel"
+                    );
+                    assert_eq!(length, 0, "{name}: the refused write wrote nothing");
+                } else {
+                    assert_eq!(result.ok(), Some(1), "{name}: the write succeeds");
+                    assert!(
+                        guest.injected.iter().all(|sysno| writes.contains(sysno)),
+                        "{name}: nothing but the write is injected: {:?}",
+                        guest.injected
+                    );
+                    assert_eq!(length, 1, "{name}: the write reached the file");
+                }
+                assert!(
+                    guest.touched.lock().unwrap().is_empty(),
+                    "{name}: no mtime is bumped for a refused write or without \
+                     virtualized metadata"
+                );
+            }
+        }
     }
 
     // The table the maps and `/proc/<pid>/fd` views match stdio objects
