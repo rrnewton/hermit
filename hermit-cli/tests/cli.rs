@@ -6453,6 +6453,183 @@ fn max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader() {
     );
 }
 
+/// What a test below does to hermit's stderr once `run --verify` has announced
+/// run 1, before that run crosses the cap.
+#[derive(Clone, Copy, Debug)]
+enum StderrAfterRun1 {
+    /// Close the pipe's only read end. A blocking write then fails with EPIPE,
+    /// which `eprintln!` turns into a panic and exit 101.
+    LosesItsReader,
+    /// Fill the pipe and never read it again. A blocking write then waits
+    /// forever.
+    FillsUp,
+}
+
+/// Round-3 review of https://github.com/rrnewton/hermit/pull/3686, finding 4.
+/// After the cap ends run 1, `run --verify --keep-logs` keeps run 1's log and
+/// reports that on stderr. The report must neither turn the cap's 123 into 101
+/// nor wait on a stderr that nobody reads.
+///
+/// The run logs at debug level into run 1's per-run log, so stderr carries
+/// nothing between the `Run1...` notice and the crossing. A 16M cap puts the
+/// crossing seconds after that notice (a 4M cap crossed 2.0 s after spawn at a
+/// load average of about 220), and the test changes stderr in between. It then
+/// waits at most [`LOG_CAP_RUN_WAIT_BOUND`] from spawn, as the tests above do.
+///
+/// hermit's exit bound for a capped run (`bound_log_cap_exit` in
+/// `tracing.rs`: a panic hook and a 750 ms timer, both exiting 123) also
+/// covers this report, so this test passes whenever that bound works. The unit
+/// tests `log_cap_retention_report_*` in `verify.rs` test the report without
+/// it.
+fn capped_verify_keeps_the_cap_status(after_run1: StderrAfterRun1) {
+    use std::io::Read;
+    use std::os::fd::AsRawFd;
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _lock = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    // SAFETY: both descriptors were just created and are owned only here.
+    let (reader, writer) = unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    };
+    // Only this test reads the pipe, so this flag on the read end's open file
+    // description changes nothing that hermit uses.
+    assert_eq!(
+        unsafe { libc::fcntl(reader.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK) },
+        0
+    );
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=16M",
+        "run",
+        "--verify",
+        "--keep-logs",
+        "--verify-log-dir",
+        directory.path().to_str().unwrap(),
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let start = Instant::now();
+    let mut child = hermit_command(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(writer))
+        .spawn()
+        .unwrap();
+    let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    let mut reader = fs::File::from(reader);
+    let run1_announced = |seen: &[u8]| {
+        String::from_utf8_lossy(seen)
+            .split_once("Run1...")
+            .is_some_and(|(_, after)| after.contains('\n'))
+    };
+    let mut seen = Vec::new();
+    while !run1_announced(&seen) {
+        let mut chunk = [0; 4096];
+        match reader.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(read) => seen.extend_from_slice(&chunk[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                if child.try_wait().unwrap().is_some() || start.elapsed() >= bound {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            Err(error) => panic!("reading hermit's stderr: {error}"),
+        }
+    }
+    let seen = String::from_utf8_lossy(&seen).into_owned();
+    // The test shows something only if stderr changes before the crossing.
+    assert!(
+        run1_announced(seen.as_bytes())
+            && !seen.contains("HERMIT_LOG_CAP")
+            && child.try_wait().unwrap().is_none(),
+        "{:?} after spawn hermit had not announced run 1, or had already crossed the cap \
+         or exited; its stderr so far:\n{seen}",
+        start.elapsed()
+    );
+    let reader = match after_run1 {
+        StderrAfterRun1::LosesItsReader => {
+            drop(reader);
+            None
+        }
+        StderrAfterRun1::FillsUp => {
+            // A second, non-blocking open file description for the same pipe,
+            // so that hermit's own stays blocking.
+            let mut filler = fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(format!("/proc/self/fd/{}", reader.as_raw_fd()))
+                .unwrap();
+            for chunk in [&[b'x'; 4096][..], &[b'x'; 1][..]] {
+                loop {
+                    match filler.write(chunk) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("filling hermit's stderr: {error}"),
+                    }
+                }
+            }
+            Some(reader)
+        }
+    };
+    let (status, _) = wait_at_most(&mut child, bound.saturating_sub(start.elapsed()));
+    let elapsed = start.elapsed();
+    eprintln!(
+        "capped run --verify, stderr {after_run1:?} after the Run1 notice: {status:?} \
+         {elapsed:?} after spawn"
+    );
+    if let Some(mut reader) = reader {
+        // What hermit wrote before the pipe filled is still at its head.
+        let mut rest = Vec::new();
+        let mut chunk = [0; 4096];
+        while let Ok(read @ 1..) = reader.read(&mut chunk) {
+            rest.extend_from_slice(&chunk[..read]);
+        }
+        let rest = String::from_utf8_lossy(&rest);
+        assert!(
+            !rest.contains("HERMIT_LOG_CAP") && !rest.contains("Verification logs retained"),
+            "hermit reported the cap before the pipe was full, so this run shows nothing \
+             about a full pipe:\n{}",
+            rest.trim_end_matches('x')
+        );
+    }
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "hermit was still running {elapsed:?} after spawn (bound {bound:?}) and was \
+             killed: a report after the crossing waited on the stderr that {after_run1:?}"
+        )
+    });
+    assert_eq!(
+        status.code(),
+        Some(HERMIT_LOG_CAP_EXIT),
+        "{status:?}; 101 is a panic in a report after the crossing"
+    );
+    let kept: Vec<String> = fs::read_dir(directory.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("run1_log_"))
+        .collect();
+    assert_eq!(kept.len(), 1, "run 1's log was not kept: {kept:?}");
+}
+
+#[test]
+fn max_log_bytes_verify_keeps_the_cap_status_when_stderr_loses_its_reader() {
+    capped_verify_keeps_the_cap_status(StderrAfterRun1::LosesItsReader);
+}
+
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_stderr_fills_after_run1() {
+    capped_verify_keeps_the_cap_status(StderrAfterRun1::FillsUp);
+}
+
 /// Where the cap could end hermit and leave the guest running, hermit refuses
 /// the flag instead, with 122 (round-2 review of
 /// https://github.com/rrnewton/hermit/pull/3686, finding 2). LiteInst, which

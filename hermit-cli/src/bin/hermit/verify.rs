@@ -50,9 +50,11 @@ use tempfile::NamedTempFile;
 use tempfile::TempPath;
 use tracing::metadata::LevelFilter;
 
+use super::container::LogCapExceeded;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
+use super::tracing::write_without_waiting;
 
 const FAILED_VERIFY_LOG_DIR_PREFIX: &str = "comparison-";
 const FAILED_VERIFY_LOG_PENDING_PREFIX: &str = ".pending-comparison-";
@@ -961,12 +963,58 @@ pub(crate) fn retain_logs_after_verification_error<const N: usize>(
     mut primary: Error,
     logs: [(&str, TempPath); N],
 ) -> Error {
+    if primary.downcast_ref::<LogCapExceeded>().is_some() {
+        return retain_logs_after_log_cap(primary, logs);
+    }
     // Attempt every requested retention, even if an earlier one fails.
     eprintln!(":: Verification logs retained:");
     for (label, log) in logs {
         if let Err(secondary) = retain_verification_log(label, log) {
             primary = retain_verification_error(primary, "retaining verification log", secondary);
         }
+    }
+    primary
+}
+
+/// [`retain_logs_after_verification_error`] for a run that the log cap ended.
+/// The logs are kept as for any other failure, but the report that names them
+/// is attempted without waiting and is left out when stderr cannot take it at
+/// once (see [`write_without_waiting`]). Through `eprintln!` it would wait on a
+/// full stderr pipe, and panic, exiting 101 instead of 123, on one whose reader
+/// has gone (round-3 review of https://github.com/rrnewton/hermit/pull/3686,
+/// finding 4).
+///
+/// Lines are packed into writes of at most `PIPE_BUF` bytes, so that a pipe
+/// takes each write whole or not at all; a line longer than that is left out
+/// rather than cut.
+fn retain_logs_after_log_cap<const N: usize>(
+    mut primary: Error,
+    logs: [(&str, TempPath); N],
+) -> Error {
+    let mut lines = vec![":: Verification logs retained:\n".to_owned()];
+    // Attempt every requested retention, even if an earlier one fails.
+    for (label, log) in logs {
+        match log.keep() {
+            Ok(path) => lines.push(format!("::   {label}: {}\n", path.display())),
+            Err(secondary) => {
+                primary = retain_verification_error(
+                    primary,
+                    "retaining verification log",
+                    secondary.into(),
+                );
+            }
+        }
+    }
+    let mut chunk = String::new();
+    for line in lines.iter().filter(|line| line.len() <= libc::PIPE_BUF) {
+        if chunk.len() + line.len() > libc::PIPE_BUF {
+            write_without_waiting(libc::STDERR_FILENO, chunk.as_bytes());
+            chunk.clear();
+        }
+        chunk.push_str(line);
+    }
+    if !chunk.is_empty() {
+        write_without_waiting(libc::STDERR_FILENO, chunk.as_bytes());
     }
     primary
 }
@@ -2250,6 +2298,255 @@ mod tests {
                     .unwrap()
                     .raw_os_error(),
                 Some(libc::EACCES)
+            );
+        }
+    }
+
+    /// How a forked child that reported its kept verification log ended; see
+    /// [`retention_report_in_child`].
+    #[derive(Debug, PartialEq, Eq)]
+    enum RetentionChild {
+        /// The report returned, the error kept its exit class and the log
+        /// was kept.
+        Returned,
+        /// The report panicked. In hermit that is exit 101, not the
+        /// primary error's status.
+        Panicked,
+        /// The report was still running after [`RETENTION_CHILD_BOUND`], and
+        /// the child was killed.
+        StillRunning,
+        /// Any other end, as the raw wait status.
+        Other(libc::c_int),
+    }
+
+    /// Far longer than a report that does not wait takes on a loaded host. A
+    /// report blocked on a full pipe never ends by itself, so waiting longer
+    /// would show nothing more.
+    const RETENTION_CHILD_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
+
+    /// The child's exit code when an `eprint!` did not reach its descriptor
+    /// 2. That happens when libtest captures output (`cargo test` without
+    /// `--nocapture`; nextest always passes `--nocapture`). A blocking or
+    /// panicking `eprintln!` could not be seen then, so the test fails
+    /// rather than pass without testing anything.
+    const RETENTION_CHILD_OUTPUT_CAPTURED: libc::c_int = 5;
+
+    /// Fork a child whose descriptor 2 is `stderr`, the write end of a pipe,
+    /// and have it call `retain_logs_after_verification_error(primary(), ..)`
+    /// for one log it creates in `dir`. Wait for it for at most
+    /// [`RETENTION_CHILD_BOUND`].
+    ///
+    /// The child keeps SIGPIPE ignored, as hermit's outer process does: the
+    /// Rust runtime ignores it at startup and hermit never restores it. A
+    /// write to a pipe without a reader therefore fails with EPIPE, which
+    /// `eprintln!` turns into a panic. Unit tests never enable the exit
+    /// bound that `main` arms for a capped run
+    /// (`tracing::bound_log_cap_exit`), so what this observes is the report
+    /// itself, not that bound covering for it.
+    fn retention_report_in_child(
+        primary: fn() -> Error,
+        stderr: &std::os::fd::OwnedFd,
+        dir: &Path,
+    ) -> RetentionChild {
+        let stderr = stderr.as_raw_fd();
+        // SAFETY: the child calls only `retention_report_child_body`, then
+        // _exits without returning into the test harness.
+        let child = unsafe { libc::fork() };
+        assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
+        if child == 0 {
+            let code = retention_report_child_body(primary, stderr, dir);
+            // SAFETY: _exit has no preconditions.
+            unsafe { libc::_exit(code) }
+        }
+        let start = std::time::Instant::now();
+        loop {
+            let mut status = 0;
+            // SAFETY: waitpid writes only `status`.
+            let reaped = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
+            assert!(
+                reaped >= 0,
+                "waitpid failed: {}",
+                io::Error::last_os_error()
+            );
+            if reaped == child {
+                assert!(
+                    !(libc::WIFEXITED(status)
+                        && libc::WEXITSTATUS(status) == RETENTION_CHILD_OUTPUT_CAPTURED),
+                    "eprint! in the child did not reach its descriptor 2, so libtest is \
+                     capturing output; run this test under nextest or with --nocapture"
+                );
+                return match status {
+                    status if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 => {
+                        RetentionChild::Returned
+                    }
+                    status if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 101 => {
+                        RetentionChild::Panicked
+                    }
+                    status => RetentionChild::Other(status),
+                };
+            }
+            if start.elapsed() >= RETENTION_CHILD_BOUND {
+                // SAFETY: `child` is this test's unreaped child.
+                unsafe { libc::kill(child, libc::SIGKILL) };
+                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+                return RetentionChild::StillRunning;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// The forked child of [`retention_report_in_child`]; returns its exit
+    /// code.
+    fn retention_report_child_body(
+        primary: fn() -> Error,
+        stderr: std::os::fd::RawFd,
+        dir: &Path,
+    ) -> i32 {
+        // SAFETY: the calls below only change this single-threaded child's
+        // signal disposition and descriptors, and read into a local buffer.
+        unsafe {
+            libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            let mut probe = [0; 2];
+            if libc::pipe2(probe.as_mut_ptr(), libc::O_NONBLOCK) != 0
+                || libc::dup2(probe[1], libc::STDERR_FILENO) < 0
+            {
+                return 6;
+            }
+            eprint!("probe");
+            let mut seen = [0u8; 8];
+            if libc::read(probe[0], seen.as_mut_ptr().cast(), seen.len()) != 5
+                || &seen[..5] != b"probe"
+            {
+                return RETENTION_CHILD_OUTPUT_CAPTURED;
+            }
+            if libc::dup2(stderr, libc::STDERR_FILENO) < 0 {
+                return 6;
+            }
+        }
+        let Ok(log) = tempfile::NamedTempFile::new_in(dir) else {
+            return 6;
+        };
+        let log = log.into_temp_path();
+        let path = log.to_path_buf();
+        let class = super::super::failure_exit_code(&primary());
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            retain_logs_after_verification_error(primary(), [("run 1", log)])
+        })) {
+            Err(_) => 101,
+            Ok(error) if super::super::failure_exit_code(&error) != class => 3,
+            // A TempPath that was not kept deletes its file when dropped.
+            Ok(_) if !path.exists() => 4,
+            Ok(_) => 0,
+        }
+    }
+
+    fn retention_stderr_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+        use std::os::fd::FromRawFd;
+        let mut fds = [0; 2];
+        // SAFETY: pipe2 writes two new descriptors into `fds`.
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        // SAFETY: both descriptors were just created and are owned only here.
+        unsafe {
+            (
+                std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+                std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+            )
+        }
+    }
+
+    fn files_in(dir: &Path) -> Vec<PathBuf> {
+        fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect()
+    }
+
+    fn log_cap_error() -> Error {
+        Error::new(super::super::container::LogCapExceeded)
+    }
+
+    /// Round-3 review of https://github.com/rrnewton/hermit/pull/3686, finding
+    /// 4: after the log cap ends run 1 or run 2, `--verify --keep-logs`
+    /// reports the logs it kept. Through `eprintln!`, that report panicked
+    /// when stderr was a pipe whose reader had gone, so hermit exited 101
+    /// instead of 123. The report is now tried once without waiting and is
+    /// omitted when it cannot be delivered; the log is still kept.
+    #[test]
+    fn log_cap_retention_report_survives_a_stderr_without_a_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, writer) = retention_stderr_pipe();
+        drop(reader);
+        assert_eq!(
+            retention_report_in_child(log_cap_error, &writer, dir.path()),
+            RetentionChild::Returned
+        );
+        assert_eq!(files_in(dir.path()).len(), 1, "the log was not kept");
+    }
+
+    /// The same finding with stderr a full pipe that its reader never
+    /// drains: the `eprintln!` report waited for it forever.
+    #[test]
+    fn log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let (reader, writer) = retention_stderr_pipe();
+        // Fill the pipe in non-blocking mode, then make the write end
+        // blocking again, as an inherited stderr is.
+        // SAFETY: fcntl and write act only on this test's own descriptor,
+        // and write reads only the chunk it is given.
+        unsafe {
+            assert_eq!(
+                libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, libc::O_NONBLOCK),
+                0
+            );
+            for chunk in [&[b'x'; 4096][..], &[b'x'; 1][..]] {
+                while libc::write(writer.as_raw_fd(), chunk.as_ptr().cast(), chunk.len()) > 0 {}
+                assert_eq!(
+                    io::Error::last_os_error().raw_os_error(),
+                    Some(libc::EAGAIN)
+                );
+            }
+            assert_eq!(libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, 0), 0);
+        }
+        assert_eq!(
+            retention_report_in_child(log_cap_error, &writer, dir.path()),
+            RetentionChild::Returned
+        );
+        drop(reader);
+        assert_eq!(files_in(dir.path()).len(), 1, "the log was not kept");
+    }
+
+    /// Where stderr can take the report at once, the report reads exactly
+    /// as it did before the fix above, for the cap and for every other
+    /// failure class (a timeout stands for those here).
+    #[test]
+    fn retention_report_reads_as_before_when_stderr_has_room() {
+        use std::io::Read as _;
+        fn timeout_error() -> Error {
+            Error::new(super::super::container::RunTimeoutMarker)
+        }
+        for (primary, class) in [
+            (log_cap_error as fn() -> Error, "log cap"),
+            (timeout_error, "timeout"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let (reader, writer) = retention_stderr_pipe();
+            assert_eq!(
+                retention_report_in_child(primary, &writer, dir.path()),
+                RetentionChild::Returned,
+                "{class}"
+            );
+            drop(writer);
+            let mut report = String::new();
+            File::from(reader).read_to_string(&mut report).unwrap();
+            let kept = files_in(dir.path());
+            assert_eq!(kept.len(), 1, "{class}: the log was not kept");
+            assert_eq!(
+                report,
+                format!(
+                    ":: Verification logs retained:\n::   run 1: {}\n",
+                    kept[0].display()
+                ),
+                "{class}"
             );
         }
     }
