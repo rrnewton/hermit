@@ -2681,6 +2681,12 @@ impl SubmoduleFixtureChild {
             .env_remove(TOOL_AGENT_UTILS_SHA_ENV)
             .env_remove(TOOL_BOOTSTRAP_SHA256_ENV)
             .env_remove(validate_runtime::ACTIVE_ENV)
+            // ci/run-dag.sh exports the process-group CPU scan marker for its
+            // own cells on a host without cgroups (the hosted runner). This
+            // child forces a boxed scope attempt, and a boxed run refuses the
+            // marker before its DAG starts, so the fixture's real first node
+            // would never run.
+            .env_remove(ALLOW_PROCESS_GROUP_CPU_SCAN_ENV)
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_PID")
             .env_remove("CI_HUB_VALIDATE_LOCK_OWNER_FILE");
         if prepared_source_root.is_none() {
