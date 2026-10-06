@@ -1217,10 +1217,10 @@ impl GlobalTool for GlobalState {
     }
 
     async fn receive_rpc(&self, from: Tid, gr: Self::Request) -> Self::Response {
-        // Records an in-guest Tool forwarded before sending this request go to the
-        // log ahead of anything handling it writes (the order rule at
+        // Records an in-guest Tool forwarded before sending this request are queued,
+        // and the sender's are written now if it runs alone (the order rule at
         // `detlog::set_forwarded_source`).
-        crate::detlog::drain_forwarded();
+        crate::detlog::drain_forwarded_at_request(from.as_raw());
         type R = GlobalResponse;
         let dtid = DetTid::from_raw(from.into()); // TODO(T78538674): FIXME
         let (guest_time, request_mm, request) = gr;

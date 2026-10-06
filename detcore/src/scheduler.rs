@@ -4403,6 +4403,7 @@ impl Scheduler {
                         self.vfork_registration_origins.insert(dettid, origin.mm);
                     }
                 }
+                crate::detlog::write_forwarded_for(dettid.as_raw(), false);
                 if enabled!(Level::INFO) {
                     let record_suffix = scheduler_commit_record_suffix(
                         self.turn,
@@ -4905,6 +4906,10 @@ impl Scheduler {
                 }
                 // N.B.: these prints themselves should be deterministic between
                 // runs.  They are part of the "detlog".
+                // The records this thread's in-guest Tool forwarded before the request
+                // this turn serves go to the log here, at a point the schedule fixes
+                // (the order rule at `detlog::set_forwarded_source`).
+                crate::detlog::write_forwarded_for(next_dtid.as_raw(), true);
                 let normalization_marker = if self.is_host_timed_internal_pipe_io_turn(rsrcs) {
                     " [sabre-internal-pipe-io]"
                 } else if self.is_loopback_poll_yield_turn(rsrcs) {

@@ -439,7 +439,10 @@ pub fn send_forwarded_record(
         if unreported > 0 && send(notice(0, 0).as_bytes()).is_err() {
             UNREPORTED_LOSSES.fetch_add(unreported, Ordering::AcqRel);
         }
-        let line = forwarded_line(target, record_suffix, message);
+        let line = tagged_forwarded_message(
+            current_tid(),
+            &forwarded_line(target, record_suffix, message),
+        );
         if let Err(error) = send(&line) {
             let errno = error.raw_os_error().unwrap_or(0);
             if send(notice(line.len(), errno).as_bytes()).is_err() {
@@ -449,45 +452,269 @@ pub fn send_forwarded_record(
     });
 }
 
-/// Receives each message the coordinator drains from a forwarding socket, in arrival
-/// order: a [`forwarded_line`], or a [`FORWARDING_LOSS_NOTICE`].
+/// The calling thread's kernel id, for [`tagged_forwarded_message`].
+fn current_tid() -> i32 {
+    // SAFETY: gettid has no arguments and cannot fail.
+    unsafe { libc::syscall(libc::SYS_gettid) as i32 }
+}
+
+/// Prefixes a forwarded record with the id of the guest thread that sent it,
+/// `T<tid> `, so the coordinator can write each thread's records at that thread's
+/// own scheduler turn ([`write_forwarded_for`]). The coordinator strips the tag
+/// before the record reaches the log.
+pub fn tagged_forwarded_message(tid: i32, line: &[u8]) -> Vec<u8> {
+    let mut message = format!("T{tid} ").into_bytes();
+    message.extend_from_slice(line);
+    message
+}
+
+/// The sender's thread id and the record, for a message tagged by
+/// [`tagged_forwarded_message`]; `None` for an untagged message (a
+/// [`FORWARDING_LOSS_NOTICE`] or [`FORWARDING_RETIRED_NOTICE`] sent raw).
+pub fn split_forwarded_message(message: &[u8]) -> Option<(i32, &[u8])> {
+    let rest = message.strip_prefix(b"T")?;
+    let space = rest.iter().position(|&byte| byte == b' ')?;
+    let digits = std::str::from_utf8(&rest[..space]).ok()?;
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    Some((digits.parse().ok()?, &rest[space + 1..]))
+}
+
+/// Receives each record the coordinator writes from a forwarding socket: a
+/// [`forwarded_line`] (its sender tag removed), or a [`FORWARDING_LOSS_NOTICE`].
 pub type ForwardedRecordSink = Box<dyn FnMut(&[u8]) + Send>;
 
-/// The receiving end of the socket an in-guest Tool sends its records on, and where
-/// the coordinator writes them ([`set_forwarded_source`]).
-static FORWARDED_SOURCE: Mutex<Option<(OwnedFd, ForwardedRecordSink)>> = Mutex::new(None);
+/// Where a thread's forwarded records may be written at its request
+/// ([`ForwardedOrder::at_request`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Runner {
+    /// No turn has been committed yet and no request has arrived.
+    NoTurnYet,
+    /// No turn has been committed yet; this thread sent the first request, so it
+    /// is the root.
+    Root(i32),
+    /// The thread of the last ordinary COMMIT, whose request ends that turn.
+    Exclusive(i32),
+    /// The last COMMIT was a BACKGROUND one: no request is a fixed point.
+    None,
+}
+
+/// The order rule's state ([`set_forwarded_source`]): the forwarded records taken
+/// from the socket but not yet written, by sending thread, and which thread's
+/// request is a point the schedule fixes. It decides what to write; the caller
+/// writes it.
+#[derive(Debug)]
+pub(crate) struct ForwardedOrder {
+    pending: std::collections::BTreeMap<i32, Vec<Vec<u8>>>,
+    runner: Runner,
+    /// A second root asked before any turn ([`ForwardedOrder::at_request`]).
+    ambiguous: bool,
+    /// An untagged ordinary record arrived ([`ForwardedOrder::untagged`]).
+    legacy: bool,
+}
+
+/// The [`FORWARDING_LOSS_NOTICE`] the coordinator writes when a forwarded record
+/// arrives without a sender tag (a guest runtime older than the tag), so its place
+/// in the log would be the host's choice.
+pub const FORWARDING_UNTAGGED_RECORD_NOTICE: &[u8] =
+    b"HERMIT_DETLOG_RECORD_LOST 0 0 untagged forwarded record from an older runtime\n";
+
+/// The [`FORWARDING_LOSS_NOTICE`] the coordinator writes when more than one guest
+/// thread sends a request before the first turn, so the forwarded records' order
+/// would depend on the host.
+pub const FORWARDING_AMBIGUOUS_ORDER_NOTICE: &[u8] =
+    b"HERMIT_DETLOG_RECORD_LOST 0 0 forwarded order ambiguous: more than one root\n";
+
+impl ForwardedOrder {
+    pub(crate) fn new() -> Self {
+        Self {
+            pending: Default::default(),
+            runner: Runner::NoTurnYet,
+            ambiguous: false,
+            legacy: false,
+        }
+    }
+
+    /// Queues a record thread `tid` sent.
+    pub(crate) fn queue(&mut self, tid: i32, record: Vec<u8>) {
+        self.pending.entry(tid).or_default().push(record);
+    }
+
+    /// The records to write when a request from `tid` arrives: `tid`'s queue if its
+    /// request is a point the schedule fixes, otherwise none.
+    pub(crate) fn at_request(&mut self, tid: i32) -> Vec<Vec<u8>> {
+        match self.runner {
+            Runner::NoTurnYet => {
+                self.runner = Runner::Root(tid);
+                self.pending.remove(&tid).unwrap_or_default()
+            }
+            Runner::Root(root) | Runner::Exclusive(root) if root == tid => {
+                self.pending.remove(&tid).unwrap_or_default()
+            }
+            Runner::Root(_) if !self.ambiguous => {
+                // A second thread asks before any turn: there is more than one root
+                // (for example a preload constructor that forked before the runtime
+                // was installed), so which root's records come first is decided by
+                // the host. Say so instead of writing a host-timed order: the loss
+                // notice makes verification refuse to compare the records.
+                self.ambiguous = true;
+                vec![FORWARDING_AMBIGUOUS_ORDER_NOTICE.to_vec()]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The records to write immediately before the scheduler commits a turn of
+    /// `tid` (all of `tid`'s queue); `exclusive` is false for a BACKGROUND turn.
+    pub(crate) fn at_commit(&mut self, tid: i32, exclusive: bool) -> Vec<Vec<u8>> {
+        self.runner = if exclusive {
+            Runner::Exclusive(tid)
+        } else {
+            Runner::None
+        };
+        self.pending.remove(&tid).unwrap_or_default()
+    }
+
+    /// What to write for a message without a sender tag, at once: a loss notice the
+    /// runtime sent as is; for an ordinary record (from a runtime older than the
+    /// tag), the record preceded, the first time, by
+    /// [`FORWARDING_UNTAGGED_RECORD_NOTICE`], so verification refuses to compare
+    /// records whose place the host chose.
+    pub(crate) fn untagged(&mut self, message: &[u8]) -> Vec<Vec<u8>> {
+        if message.starts_with(FORWARDING_LOSS_NOTICE.as_bytes()) {
+            return vec![message.to_vec()];
+        }
+        let mut out = Vec::new();
+        if !self.legacy {
+            self.legacy = true;
+            out.push(FORWARDING_UNTAGGED_RECORD_NOTICE.to_vec());
+        }
+        out.push(message.to_vec());
+        out
+    }
+
+    /// Everything still queued, thread by thread in thread-id order.
+    pub(crate) fn finish(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.pending)
+            .into_values()
+            .flatten()
+            .collect()
+    }
+}
+
+/// The receiving end of the socket an in-guest Tool sends its records on, where
+/// the coordinator writes them, and the order rule's state ([`set_forwarded_source`]).
+struct ForwardedSource {
+    socket: OwnedFd,
+    sink: ForwardedRecordSink,
+    order: ForwardedOrder,
+}
+
+static FORWARDED_SOURCE: Mutex<Option<ForwardedSource>> = Mutex::new(None);
 
 /// Registers the receiving end of the socket an in-guest Tool sends its records on
 /// ([`send_forwarded_record`]) and the sink that writes them to the run's log.
 ///
-/// THE ORDER RULE, one for every backend whose Tool runs in the guest: the coordinator
-/// writes the records already waiting on the socket immediately before it handles any
-/// guest request ([`drain_forwarded`] at the top of the request handler), and once more
-/// when the run ends. A `send` on a message socket queues the record on the receiver
-/// before it returns, so a guest thread's records for an event are waiting when its
-/// next request arrives, and every coordinator record for that event comes from
-/// handling that request. The log then holds the guest's and the coordinator's
-/// records in the order a single-process (ptrace) run writes them, and both
-/// verification runs of a deterministic guest write the same log.
+/// THE ORDER RULE, one for every backend whose Tool runs in the guest. Each record
+/// carries its sending thread ([`tagged_forwarded_message`]). Before it handles any
+/// guest request the coordinator takes the records waiting on the socket into a
+/// queue per sending thread ([`drain_forwarded_at_request`] at the top of the
+/// request handler). A thread's queued records are written into the log:
+/// - when that thread's own request arrives, if it is the thread the scheduler last
+///   committed an ordinary turn to, or, before any turn, the thread whose request
+///   arrives first (the root; every other thread is created during some turn). That
+///   thread's request is the event that ends the turn the schedule gave it, so the
+///   request arrives at a point the schedule fixes, and its records land where a
+///   single-process (ptrace) run writes them, ahead of everything handling that
+///   request writes. (A thread still in background IO from an earlier BACKGROUND
+///   turn may run at the same time; its records wait for its own COMMIT, by the next
+///   rule. Coordinator lines its continuation writes below INFO verbosity, such as
+///   TRACE, are not ordered by this rule; the INFO DETLOG and COMMIT lines that
+///   verification compares are.)
+/// - otherwise immediately before the scheduler commits that thread's next turn
+///   ([`write_forwarded_for`], at both kinds of COMMIT): a thread that runs without
+///   holding the turn (a forked child doing its setup, a thread in background IO)
+///   sends its records while other threads' turns are being handled, so only its
+///   own next COMMIT is a point the schedule fixes;
+/// - and, for any still queued when the run ends, then, thread by thread in
+///   thread-id order.
+///
+/// If a second thread sends a request before the first turn, there is more than one
+/// root (a preload constructor that forked before the runtime was installed, say),
+/// and which root's records come first would be the host's choice. The coordinator
+/// then writes [`FORWARDING_AMBIGUOUS_ORDER_NOTICE`], so verification refuses to
+/// compare the records rather than compare a host-timed order.
+///
+/// A `send` on a message socket queues the record on the receiver before it returns,
+/// so a guest thread's records sent before a request are queued by the time that
+/// request is handled, and so before the turn it leads to is committed. Writing every
+/// thread's records at any request's arrival instead put a record wherever the host
+/// happened to deliver it: a forked child's records, sent while its parent's next
+/// request was being handled, landed before or after the scheduler's records for that
+/// request depending on timing.
 pub fn set_forwarded_source(socket: OwnedFd, sink: ForwardedRecordSink) {
-    *FORWARDED_SOURCE.lock().unwrap() = Some((socket, sink));
+    *FORWARDED_SOURCE.lock().unwrap() = Some(ForwardedSource {
+        socket,
+        sink,
+        order: ForwardedOrder::new(),
+    });
 }
 
-/// Unregisters the source set with [`set_forwarded_source`], after a last
-/// [`drain_forwarded`], and closes its socket.
+/// Unregisters the source set with [`set_forwarded_source`], after taking the last
+/// waiting records and writing every queued record, thread by thread in thread-id
+/// order, and closes its socket.
 pub fn clear_forwarded_source() {
-    drain_forwarded();
-    FORWARDED_SOURCE.lock().unwrap().take();
+    let mut source = FORWARDED_SOURCE.lock().unwrap();
+    if let Some(source) = source.as_mut() {
+        collect_forwarded(source);
+        let records = source.order.finish();
+        write_records(source, records);
+    }
+    source.take();
 }
 
-/// Passes every message waiting on the registered forwarding socket to its sink, in
-/// arrival order, without blocking. Without a registered source it does nothing.
+/// Takes every message waiting on the registered forwarding socket into the queue of
+/// its sending thread, without blocking and without writing it. An untagged message is
+/// written at once as [`ForwardedOrder::untagged`] says. Without a registered source it
+/// does nothing.
 pub fn drain_forwarded() {
-    let mut source = FORWARDED_SOURCE.lock().unwrap();
-    let Some((socket, sink)) = source.as_mut() else {
-        return;
-    };
-    let fd = socket.as_raw_fd();
+    if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
+        collect_forwarded(source);
+    }
+}
+
+/// Takes waiting messages as [`drain_forwarded`] does, then writes every queued record
+/// thread `tid` sent, in the order it sent them. The scheduler calls this immediately
+/// before it commits a turn of `tid`; `exclusive` is false for a BACKGROUND turn,
+/// which runs alongside later turns, and true for an ordinary one.
+pub fn write_forwarded_for(tid: i32, exclusive: bool) {
+    if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
+        collect_forwarded(source);
+        let records = source.order.at_commit(tid, exclusive);
+        write_records(source, records);
+    }
+}
+
+/// Takes waiting messages as [`drain_forwarded`] does at the top of the handler of
+/// a request from thread `tid`, and writes `tid`'s queued records now when its
+/// request is a point the schedule fixes (the order rule at [`set_forwarded_source`]).
+pub fn drain_forwarded_at_request(tid: i32) {
+    if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
+        collect_forwarded(source);
+        let records = source.order.at_request(tid);
+        write_records(source, records);
+    }
+}
+
+fn write_records(source: &mut ForwardedSource, records: Vec<Vec<u8>>) {
+    for record in records {
+        (source.sink)(&record);
+    }
+}
+
+fn collect_forwarded(source: &mut ForwardedSource) {
+    let fd = source.socket.as_raw_fd();
     let mut buffer = Vec::new();
     loop {
         // The size of the next message, without taking it (a message socket reports
@@ -522,7 +749,15 @@ pub fn drain_forwarded() {
         if received <= 0 {
             return;
         }
-        sink(&buffer[..received as usize]);
+        let message = &buffer[..received as usize];
+        match split_forwarded_message(message) {
+            Some((tid, record)) => source.order.queue(tid, record.to_vec()),
+            None => {
+                for record in source.order.untagged(message) {
+                    (source.sink)(&record);
+                }
+            }
+        }
     }
 }
 
@@ -681,10 +916,11 @@ mod tests {
             super::send_forwarded_record(-1, "detcore", "", format_args!("lost"));
             assert_eq!(*libc::__errno_location(), libc::EAGAIN);
         }
+        let tag = format!("T{} ", super::current_tid());
         super::send_forwarded_record(sender, "detcore", "", format_args!("after"));
         let notice = receive();
         assert!(is_notice(&notice), "{notice}");
-        assert_eq!(receive(), "INFO detcore: DETLOG after\n");
+        assert_eq!(receive(), format!("{tag}INFO detcore: DETLOG after\n"));
 
         let small: libc::c_int = 4096;
         // SAFETY: a valid socket and an int option value.
@@ -702,12 +938,103 @@ mod tests {
         super::send_forwarded_record(sender, "detcore", "", format_args!("small"));
         let notice = receive();
         assert!(is_notice(&notice), "{notice}");
-        assert_eq!(receive(), "INFO detcore: DETLOG small\n");
+        assert_eq!(receive(), format!("{tag}INFO detcore: DETLOG small\n"));
         // SAFETY: closing the two descriptors this test created.
         unsafe {
             libc::close(sender);
             libc::close(receiver);
         }
+    }
+
+    /// The order rule at `set_forwarded_source`, on its own state (no process-wide
+    /// source, so no other test's scheduler commits can interfere): records are
+    /// written at the sender's own request only before any turn or when it is the
+    /// thread of the last ordinary COMMIT, otherwise at its own next COMMIT, and the
+    /// rest at the end in thread-id order.
+    #[test]
+    fn forwarded_records_are_written_at_points_the_schedule_fixes() {
+        let mut order = super::ForwardedOrder::new();
+        let text = |records: Vec<Vec<u8>>| -> Vec<String> {
+            records
+                .into_iter()
+                .map(|record| String::from_utf8(record).unwrap())
+                .collect()
+        };
+        let none: Vec<String> = Vec::new();
+
+        // Before any turn only the root thread exists: its records go out at its
+        // request. Its turn 0 makes it the exclusive runner.
+        order.queue(3, b"root-1".to_vec());
+        assert_eq!(text(order.at_request(3)), ["root-1"]);
+        assert_eq!(text(order.at_commit(3, true)), none);
+        // A forked child that does not hold the turn: queued until its own COMMIT,
+        // even when its request arrives first.
+        order.queue(9, b"child-1".to_vec());
+        assert_eq!(text(order.at_request(9)), none);
+        assert_eq!(text(order.at_commit(9, true)), ["child-1"]);
+        // Thread 9 now holds the turn: its records go out at its request; thread 3's
+        // records sent meanwhile wait for 3's COMMIT.
+        order.queue(3, b"root-2".to_vec());
+        order.queue(9, b"child-2".to_vec());
+        assert_eq!(text(order.at_request(9)), ["child-2"]);
+        assert_eq!(text(order.at_request(3)), none);
+        // A BACKGROUND commit writes its thread's records but leaves no exclusive
+        // runner, so a later request writes nothing.
+        assert_eq!(text(order.at_commit(3, false)), ["root-2"]);
+        order.queue(3, b"root-3".to_vec());
+        assert_eq!(text(order.at_request(3)), none);
+        // At the end, every queued record, thread by thread in thread-id order.
+        order.queue(12, b"late-12".to_vec());
+        order.queue(5, b"late-5".to_vec());
+        assert_eq!(text(order.finish()), ["root-3", "late-5", "late-12"]);
+        assert_eq!(text(order.finish()), none);
+
+        // Two roots before any turn: the second request yields one ambiguity notice
+        // (and only one), and the second root's records wait for its COMMIT.
+        let mut order = super::ForwardedOrder::new();
+        order.queue(3, b"first-root".to_vec());
+        order.queue(4, b"second-root".to_vec());
+        assert_eq!(text(order.at_request(3)), ["first-root"]);
+        let notice = String::from_utf8(super::FORWARDING_AMBIGUOUS_ORDER_NOTICE.to_vec()).unwrap();
+        assert!(notice.starts_with(&format!("{} ", super::FORWARDING_LOSS_NOTICE)));
+        assert_eq!(text(order.at_request(4)), [notice]);
+        assert_eq!(text(order.at_request(4)), none);
+        assert_eq!(text(order.at_commit(4, true)), ["second-root"]);
+
+        // Untagged messages: a loss notice passes as is; an ordinary record from an
+        // older runtime is written with one untagged-record notice before it.
+        let mut order = super::ForwardedOrder::new();
+        let retired = String::from_utf8(super::FORWARDING_RETIRED_NOTICE.to_vec()).unwrap();
+        assert_eq!(
+            text(order.untagged(super::FORWARDING_RETIRED_NOTICE)),
+            [retired]
+        );
+        let untagged =
+            String::from_utf8(super::FORWARDING_UNTAGGED_RECORD_NOTICE.to_vec()).unwrap();
+        assert!(untagged.starts_with(&format!("{} ", super::FORWARDING_LOSS_NOTICE)));
+        assert_eq!(
+            text(order.untagged(b"INFO detcore: DETLOG legacy-1\n")),
+            [untagged, "INFO detcore: DETLOG legacy-1\n".to_string()]
+        );
+        assert_eq!(
+            text(order.untagged(b"INFO detcore: DETLOG legacy-2\n")),
+            ["INFO detcore: DETLOG legacy-2\n"]
+        );
+    }
+
+    #[test]
+    fn split_forwarded_message_reads_the_sender_tag() {
+        assert_eq!(
+            super::split_forwarded_message(b"T42 INFO detcore: x\n"),
+            Some((42, &b"INFO detcore: x\n"[..]))
+        );
+        assert_eq!(
+            super::split_forwarded_message(super::FORWARDING_RETIRED_NOTICE),
+            None
+        );
+        assert_eq!(super::split_forwarded_message(b"T INFO"), None);
+        assert_eq!(super::split_forwarded_message(b"Tx1 INFO"), None);
+        assert_eq!(super::split_forwarded_message(b"INFO detcore"), None);
     }
 
     #[test]

@@ -1069,7 +1069,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // at a25b3fcd3805 ("Starting 964 tests across 2 binaries").
     // syscalls::network_trace::tests::select_sets_report_each_set_s_events_as_fs_select_c_does
     // retains all 964 (965).
-    ("test.detcore_unit", 965),
+    // detlog::tests::forwarded_records_are_written_at_points_the_schedule_fixes
+    // and detlog::tests::split_forwarded_message_reads_the_sender_tag (967).
+    ("test.detcore_unit", 967),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1407,8 +1409,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two forwarded-record tests retain all 952: 952 + 2 = 954.
     // The same three DETLOG forwarding-policy tests retain all 954: 957.
     // And the rebound-path test (958), the six mount-ID tests (964), and the
-    // select-set test (965).
-    ("test.detcore_unit_on_host", 965),
+    // select-set test (965), and the two forwarded-record ordering tests (967).
+    ("test.detcore_unit_on_host", 967),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
