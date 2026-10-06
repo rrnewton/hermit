@@ -6366,9 +6366,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// for example) has no cached stat, which is not an error: the kernel owns
     /// the descriptor table, and the injected `fstat` asks it directly. The
     /// getdents handlers call this BEFORE the real system call, so an `fstat`
-    /// failure (only possible for a descriptor the kernel would also reject)
-    /// is reported without consuming directory entries, and a successful
-    /// getdents is never turned into an error afterwards.
+    /// failure is reported without consuming directory entries, and a
+    /// successful getdents is never turned into an error afterwards. The
+    /// failure is usually one the kernel would also report for the
+    /// descriptor, but not always: when the guest's stack cannot hold the
+    /// `fstat` buffer, `inject_fstat` maps a transient page instead, and that
+    /// `mmap` can fail for a valid descriptor (`ENOMEM` at the guest's
+    /// address-space or mapping-count limit), failing a getdents Linux would
+    /// have completed.
     async fn directory_device<G: Guest<Self>>(
         &self,
         guest: &mut G,

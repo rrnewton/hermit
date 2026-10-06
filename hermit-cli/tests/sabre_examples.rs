@@ -1225,6 +1225,10 @@ fn sabre_names_no_host_input_change_for_a_guest_that_replaced_a_file_after_diver
 // reports.
 #[test]
 fn sabre_other_process_links_resolve_with_a_full_descriptor_table() {
+    // As in every test here: with HERMIT_SABRE_BINARY unset and no built
+    // artifacts, this prints "skipping SaBRe example parity: artifacts are
+    // unavailable: ..." to stderr and passes. The validation gate sets
+    // HERMIT_SABRE_BINARY, and there a missing artifact panics.
     let Some(loader) = sabre_loader() else {
         return;
     };
