@@ -1169,7 +1169,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Eleven C3.5 exit-hold tests (scheduler and tool_global) retain all 976: 987.
     // Six exit_dependencies tests (rulings A and D.1) retain all 987: 993.
     // The completion-before-registration test (C3.5 fix-forward) retains all 993: 994.
-    ("test.detcore_unit", 994),
+    // io_buffers::event_tests::rng_readv_event_digest_reads_exactly_when_the_wide_read_fails
+    // (https://github.com/rrnewton/hermit/issues/3823) retains all 994 (995,
+    // measured with cargo nextest list --profile ci).
+    ("test.detcore_unit", 995),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1190,7 +1193,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (measured 75).
     // One more (a 1-, 4- and 8-byte self-maps read on a tight stack before an
     // unmapped page) retains all 75 (measured 76).
-    ("test.detcore_misc", 76),
+    // random_read_before_an_unmapped_page (1-, 4- and 8-byte random reads
+    // before an unmapped page; https://github.com/rrnewton/hermit/issues/3823)
+    // retains all 76 (measured 77).
+    ("test.detcore_misc", 77),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1524,8 +1530,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 76-test tests_misc selection.
-    ("test.detcore_misc_on_host", 76),
+    // The host node carries the identical 77-test tests_misc selection.
+    ("test.detcore_misc_on_host", 77),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -1566,7 +1572,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same eleven exit-hold tests: 987.
     // The host twin selects the same six exit_dependencies tests: 993.
     // The host twin selects the same test: 994.
-    ("test.detcore_unit_on_host", 994),
+    // And the RNG digest exact-read test (995).
+    ("test.detcore_unit_on_host", 995),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

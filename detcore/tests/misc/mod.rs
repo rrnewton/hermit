@@ -2036,6 +2036,54 @@ fn getrandom_intercepted() {
     })
 }
 
+/// A random read of 1 or 4 bytes into a destination that ends right before an
+/// unmapped page gets those bytes, as natively, whether through `readv`,
+/// `preadv`, `read` or `getrandom`. The digest of the moved bytes in the log
+/// must not fail on the unmapped page, as an eight-byte `PTRACE_PEEKDATA`
+/// there does (https://github.com/rrnewton/hermit/issues/3823). Eight bytes is
+/// the control.
+#[test]
+fn random_read_before_an_unmapped_page() {
+    det_test_fn_sequential_without_pmu(|| {
+        let fd = unsafe { libc::open(c"/dev/urandom".as_ptr(), libc::O_RDONLY) };
+        assert!(fd >= 0);
+        for count in [1_usize, 4, 8] {
+            for call in ["readv", "preadv", "read", "getrandom"] {
+                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+                let mapping = unsafe {
+                    libc::mmap(
+                        std::ptr::null_mut(),
+                        2 * page,
+                        libc::PROT_READ | libc::PROT_WRITE,
+                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                        -1,
+                        0,
+                    )
+                };
+                assert_ne!(mapping, libc::MAP_FAILED);
+                let second_page = unsafe { mapping.cast::<u8>().add(page) };
+                assert_eq!(unsafe { libc::munmap(second_page.cast(), page) }, 0);
+                let destination = unsafe { second_page.sub(count) };
+                let iov = libc::iovec {
+                    iov_base: destination.cast(),
+                    iov_len: count,
+                };
+                let n = unsafe {
+                    match call {
+                        "readv" => libc::readv(fd, &iov, 1),
+                        "preadv" => libc::preadv(fd, &iov, 1, 0),
+                        "read" => libc::read(fd, destination.cast(), count),
+                        _ => libc::syscall(libc::SYS_getrandom, destination, count, 0) as isize,
+                    }
+                };
+                assert_eq!(n, count as isize, "{call} of {count} bytes");
+                assert_eq!(unsafe { libc::munmap(mapping, page) }, 0);
+            }
+        }
+        assert!(unistd::close(fd).is_ok());
+    })
+}
+
 #[test]
 fn has_rdrand_without_detcore() {
     let features = hardware_random_features();

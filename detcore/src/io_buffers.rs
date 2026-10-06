@@ -497,13 +497,20 @@ where
     let (buf, unread) = if rng_output {
         // RNG output was written by Detcore itself after the output commit:
         // reserving the payload and reading it back are both fatal, with no
-        // fallback (see `rng_observation_vec`).
+        // fallback (see `rng_observation_vec`). The read back is the same
+        // wide-then-exact pair as `read_extent`, so an extent that ends less
+        // than eight bytes before an unmapped page is still read; only when
+        // neither read can is the failure fatal.
         let size = len as usize;
         let mut buf = rng_observation_vec(size, "digest payload")?;
         buf.resize(size, 0u8);
         if size > 0 {
-            let start = Addr::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
-            guest.memory().read_values(start, buf.as_mut_slice())?;
+            let start = AddrMut::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
+            let memory = guest.memory();
+            if let Err(error) = memory.read_values(Addr::from(start), buf.as_mut_slice()) {
+                crate::syscalls::read_guest_exact(&memory, start, buf.as_mut_slice())
+                    .map_err(|_| error)?;
+            }
         }
         (buf, 0)
     } else {
@@ -744,6 +751,10 @@ mod event_tests {
         after_import_error: Vec<&'static str>,
         observer_reads: Vec<(usize, usize)>,
         digest_error: Option<Errno>,
+        /// Exact (`read_vectored`) reads, which the digest makes only after a
+        /// scalar read fails, and the error they return at `FIRST_DEST`.
+        exact_reads: Vec<(usize, usize)>,
+        exact_error: Option<Errno>,
         user_copy_audit: bool,
         copy_done: bool,
         copy_actions: std::collections::VecDeque<(usize, Result<usize, Errno>)>,
@@ -816,12 +827,28 @@ mod event_tests {
             outcome
         }
 
+        /// Only the digest's exact read of one extent, after its scalar read
+        /// failed; any other vectored read is still a fixture violation.
         fn read_vectored(
             &self,
-            _remote: &[IoSlice],
-            _local: &mut [IoSliceMut],
+            remote: &[IoSlice],
+            local: &mut [IoSliceMut],
         ) -> Result<usize, Errno> {
-            panic!("event fixture must use its scalar memory override")
+            let ([remote], [local]) = (remote, local) else {
+                panic!("event fixture must use its scalar memory override")
+            };
+            let start = remote.as_ptr() as usize;
+            assert_eq!(remote.len(), local.len());
+            let mut reads = self.1.lock().unwrap();
+            reads.exact_reads.push((start, remote.len()));
+            if start == FIRST_DEST
+                && let Some(error) = reads.exact_error
+            {
+                return Err(error);
+            }
+            drop(reads);
+            self.copy_read(start, local)?;
+            Ok(local.len())
         }
 
         fn write_vectored(
@@ -1754,7 +1781,11 @@ mod event_tests {
                 let memory = guest.memory.clone();
                 memory.put_iovec(0, RETRY_DEST, 3);
                 memory.put_iovec(1, FIRST_DEST, 5);
-                memory.1.lock().unwrap().digest_error = Some(fault);
+                {
+                    let mut reads = memory.1.lock().unwrap();
+                    reads.digest_error = Some(fault);
+                    reads.exact_error = Some(fault);
+                }
 
                 let result = tool.handle_syscall_event(&mut guest, call).await;
                 let Err(Error::Tool(error)) = result else {
@@ -1789,10 +1820,47 @@ mod event_tests {
                 let reads = memory.1.lock().unwrap();
                 assert_eq!(reads.imported_entries, 2);
                 assert_eq!(reads.observer_reads, [(RETRY_DEST, 3), (FIRST_DEST, 5)]);
+                assert_eq!(reads.exact_reads, [(FIRST_DEST, 5)]);
                 let messages = logs.0.lock().unwrap();
                 assert_eq!(messages.len(), 1);
                 assert_named_extent(&messages[0], name, RETRY_DEST, &expected[..3]);
             }
+        }
+    }
+
+    /// On ptrace a read of up to eight bytes is one eight-byte
+    /// `PTRACE_PEEKDATA`, which fails for an extent that ends less than eight
+    /// bytes before an unmapped page although every byte of it is readable.
+    /// The digest then reads the extent exactly, logs it, and the guest keeps
+    /// its result (https://github.com/rrnewton/hermit/issues/3823).
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_readv_event_digest_reads_exactly_when_the_wide_read_fails() {
+        for (name, call, advances) in rng_vector_calls(2) {
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (tool, mut guest) = event_guest(FdType::Rng, None);
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, RETRY_DEST, 3);
+            memory.put_iovec(1, FIRST_DEST, 5);
+            memory.1.lock().unwrap().digest_error = Some(Errno::EIO);
+
+            let result = tool.handle_syscall_event(&mut guest, call).await;
+            assert_eq!(result.unwrap(), 8, "{name}");
+            let expected = if advances {
+                [41, 114, 187, 4, 77, 150, 223, 40]
+            } else {
+                [148, 221, 38, 111, 184, 1, 74, 147]
+            };
+            assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
+            assert_eq!(memory.bytes(FIRST_DEST, 5), expected[3..]);
+            assert_eq!(memory.bytes(FIRST_DEST + 5, 1), [CANARY]);
+            let reads = memory.1.lock().unwrap();
+            assert_eq!(reads.observer_reads, [(RETRY_DEST, 3), (FIRST_DEST, 5)]);
+            assert_eq!(reads.exact_reads, [(FIRST_DEST, 5)]);
+            let messages = logs.0.lock().unwrap();
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert_named_extent(&messages[0], name, RETRY_DEST, &expected[..3]);
+            assert_named_extent(&messages[1], name, FIRST_DEST, &expected[3..]);
         }
     }
 
