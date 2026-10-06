@@ -1456,9 +1456,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Detcore does not consult), and an unlinked executable in maps whose
     /// process is not known by number (`MappingSubject::Unknown`: a
     /// `/proc/self/maps` descriptor read in another address space when the
-    /// opener's ids were not asked for). A path that exists also goes unresolved when
-    /// `stat_guest_path` cannot map the transient page it falls back to,
-    /// which is not always a function of guest state (see there).
+    /// opener's ids were not asked for). A lookup that cannot be asked --
+    /// `stat_guest_path` finds no scratch, faults in its own buffers, or the
+    /// injected stat fails with anything but the guest filesystem's answer
+    /// that the path names nothing -- is an error, never a step to the next
+    /// source or to this fallback, so host resources cannot choose the
+    /// identity (see there).
     ///
     /// ⚠️ WITHOUT `virtualize_metadata` THE SPLIT REACHES FDINFO TOO. There
     /// the header's pair keys every line, while the `ino:` line of
@@ -1523,8 +1526,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `stat(path)` performed BY THE GUEST, through an injected
-    /// `fstatat(AT_FDCWD, path, _, 0)`. `None` when the guest's stat fails,
-    /// when `path` contains a NUL, or when no scratch can be found for it.
+    /// `fstatat(AT_FDCWD, path, _, 0)`. `None` when the guest's filesystem
+    /// answers that `path` names nothing this stat can reach -- `ENOENT`,
+    /// `ENOTDIR`, `ELOOP`, `ENAMETOOLONG` or `EACCES` under the guest's own
+    /// credentials -- or when `path` contains a NUL. Any other failure is an
+    /// error, not a missing answer: no scratch to stage the call in, a fault
+    /// in Detcore's own buffers, or any other errno from the injected stat
+    /// (`ENOMEM`, retries exhausted) says nothing about the path, and a caller
+    /// that moved on to another identity source would let host resources
+    /// choose the identity.
     ///
     /// Injected rather than performed here for the reason `handle_stat_family`
     /// gives: an access from the tracer can hang on some FUSE filesystems
@@ -1559,7 +1569,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    they are writable: every write into the scratch, the commit's and
     ///    the kernel's included, runs forward from a buffer's start and stops
     ///    at its first fault, so whatever it changed is a prefix that writing
-    ///    back from the same start reaches. Every other error propagates.
+    ///    back from the same start reaches. Every other error is an error of
+    ///    the whole stat (see below).
     /// 2. A private anonymous mapping made for this call alone, of whole
     ///    pages sized for the NUL-terminated path and an 8-aligned
     ///    `struct stat`. It serves a stack scratch that is too small, a fault
@@ -1568,19 +1579,28 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    the guest resumes. If that `munmap` fails, which is not expected for
     ///    a page this call mapped and whose address the guest never saw,
     ///    Detcore only warns and keeps the answer, and the page stays mapped.
-    ///    An `EFAULT` there means no answer.
+    ///    An `EFAULT` there is an error.
     ///
-    /// ⚠️ WHEN THAT MAPPING CANNOT BE MADE, THE STAT HAS NO ANSWER. This
-    /// returns `Ok(None)`, as a failed stat does, rather than an error:
-    /// every caller has an answer without the stat, and the call it serves
-    /// (a `read` of `maps` or `smaps`, a `readlink` of `/proc/<pid>/fd/<n>`)
-    /// must not fail because Detcore could not map a page of its own. Why
-    /// the `mmap` fails is partly guest state and partly host state: the
-    /// guest's `RLIMIT_AS` and its mapping count are the guest's, but the
-    /// limit on that count (`vm.max_map_count`) is a host setting, and a
-    /// strict overcommit policy (`vm.overcommit_memory=2`) refuses the page
-    /// on the host's commit charge. So on such a host the answer -- and the
-    /// identity a caller keys on without it -- can differ between runs.
+    /// ⚠️ WHEN THAT MAPPING CANNOT BE MADE, THE STAT FAILS WITH AN ERROR, and
+    /// so does the call it serves (a `read` of `maps` or `smaps`, a
+    /// `readlink` of `/proc/<pid>/fd/<n>`). Every failure that is not the
+    /// guest filesystem's answer is returned as a tool error rather than an
+    /// errno, which fails the run on ptrace and is `EIO` to the guest on DBT
+    /// and SaBRe, except `ESRCH`: that thread is gone, and nothing it would
+    /// print an identity to is left. Why the `mmap` fails is partly
+    /// guest state and partly host state: the guest's `RLIMIT_AS` and its
+    /// mapping count are the guest's, but the limit on that count
+    /// (`vm.max_map_count`) is a host setting, and a strict overcommit policy
+    /// (`vm.overcommit_memory=2`) refuses the page on the host's commit
+    /// charge. A caller that treated the failure as "no such file" and keyed
+    /// on its fallback identity would key differently on such a host than
+    /// elsewhere, and every deterministic inode minted after it would shift.
+    /// A host-resource failure may stop a run; it must not change a minted
+    /// identity. Detcore logs why at `warn`. No page is reserved up front
+    /// instead, because a page kept mapped in the guest would itself be a
+    /// line of the guest's `maps`; the pinned KVM backend's reserved
+    /// `ToolScratch` memory is outside the guest's view and has no such
+    /// cost.
     pub(crate) async fn stat_guest_path<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1589,13 +1609,30 @@ impl<T: RecordOrReplay> Detcore<T> {
         if path.contains(&0) {
             return Ok(None);
         }
-        if path.len() < GUEST_STAT_PATH_CAPACITY {
-            match Self::stat_guest_path_on_stack(guest, path).await? {
-                StackStat::Answered(identity) => return Ok(identity),
-                StackStat::Unusable => {}
+        let asked = if path.len() < GUEST_STAT_PATH_CAPACITY {
+            match Self::stat_guest_path_on_stack(guest, path).await {
+                Ok(StackStat::Answered(identity)) => Ok(identity),
+                Ok(StackStat::Unusable) => {
+                    Self::stat_guest_path_in_transient_page(guest, path).await
+                }
+                Err(errno) => Err(errno),
             }
-        }
-        Ok(Self::stat_guest_path_in_transient_page(guest, path).await?)
+        } else {
+            Self::stat_guest_path_in_transient_page(guest, path).await
+        };
+        asked.map_err(|errno| match errno {
+            // The thread is gone, so nothing it would print an identity to
+            // is left; the errno is returned as before.
+            Errno::ESRCH => Error::Errno(errno),
+            // Not an `Error::Errno`: the guest's call must not see a host
+            // resource's errno as its own result. A tool error fails the run
+            // on ptrace and is `EIO` to the guest on DBT and SaBRe.
+            errno => Error::Tool(anyhow::anyhow!(
+                "could not ask the guest to stat {:?}: {errno}; refusing rather than \
+                 keying the file's identity on another source",
+                String::from_utf8_lossy(path)
+            )),
+        })
     }
 
     /// The fast path of [`Self::stat_guest_path`]: the path and the
@@ -1701,12 +1738,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         {
             Ok(mapped) => mapped,
             Err(errno) => {
-                debug!(
-                    "could not map a transient page for a stat of {:?} ({}); it has no answer",
+                warn!(
+                    "[detcore] could not map a transient page for a stat of {:?} ({}); \
+                     refusing rather than keying on another identity",
                     String::from_utf8_lossy(path),
                     errno
                 );
-                return Ok(None);
+                return Err(errno);
             }
         };
         let page = usize::try_from(mapped)
@@ -1733,23 +1771,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                 errno
             );
         }
-        match identity {
-            Err(Errno::EFAULT) => {
-                trace!(
-                    "transient page faulted during a stat of {:?}",
-                    String::from_utf8_lossy(path)
-                );
-                Ok(None)
-            }
-            identity => identity,
+        if let Err(errno) = identity {
+            warn!(
+                "[detcore] the stat of {:?} in a transient page could not be asked ({}); \
+                 refusing rather than keying on another identity",
+                String::from_utf8_lossy(path),
+                errno
+            );
         }
+        identity
     }
 
     /// The body of [`Self::stat_guest_path`] once a scratch is in place: stage
     /// `path` NUL-terminated at `path_address` and inject
-    /// `fstatat(AT_FDCWD, path, statptr, 0)`. `Ok(None)` when the guest's stat
-    /// fails; `Err(EFAULT)` when the scratch faults, from the kernel as from a
-    /// staging write, since the path and the buffer are both Detcore's.
+    /// `fstatat(AT_FDCWD, path, statptr, 0)`. `Ok(None)` when the guest's
+    /// filesystem answers that the path names nothing the stat reaches
+    /// (`ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`, `EACCES`);
+    /// `Err(EFAULT)` when the scratch faults, from the kernel as from a
+    /// staging write, since the path and the buffer are both Detcore's; and
+    /// the errno itself for every other failure, which is not an answer
+    /// about the path.
     async fn fstatat_in_scratch<G: Guest<Self>>(
         guest: &mut G,
         path: &[u8],
@@ -1773,12 +1814,25 @@ impl<T: RecordOrReplay> Detcore<T> {
         match guest.inject_with_retry(call).await {
             Ok(_) => statptr.read(&guest.memory()).map(Some),
             Err(Errno::EFAULT) => Err(Errno::EFAULT),
-            Err(error) => {
+            Err(
+                error @ (Errno::ENOENT
+                | Errno::ENOTDIR
+                | Errno::ELOOP
+                | Errno::ENAMETOOLONG
+                | Errno::EACCES),
+            ) => {
                 trace!(
                     "guest stat of {:?} failed: {error}",
                     String::from_utf8_lossy(path)
                 );
                 Ok(None)
+            }
+            Err(error) => {
+                warn!(
+                    "[detcore] guest stat of {:?} could not be asked: {error}",
+                    String::from_utf8_lossy(path)
+                );
+                Err(error)
             }
         }
     }
@@ -8219,6 +8273,9 @@ pub(crate) mod inject_fstat_scratch {
         scratch: Option<(usize, usize)>,
         write_error: Option<Errno>,
         mmap_fails: bool,
+        /// The errno every injected `fstatat` fails with instead of running,
+        /// when set: a failure the test process cannot provoke on demand.
+        fstatat_error: Option<Errno>,
         arena: Box<[u64; ARENA_WORDS]>,
         guard_live: Arc<AtomicBool>,
         /// How many times a stack scratch was committed, successfully or not.
@@ -8277,6 +8334,7 @@ pub(crate) mod inject_fstat_scratch {
                 scratch: None,
                 write_error: None,
                 mmap_fails,
+                fstatat_error: None,
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 guard_live: Arc::new(AtomicBool::new(false)),
                 commits: Arc::new(AtomicUsize::new(0)),
@@ -8482,6 +8540,9 @@ pub(crate) mod inject_fstat_scratch {
                     self.fstatat_buffers.push(buffer);
                     self.fstatat_guard_live
                         .push(self.guard_live.load(Ordering::SeqCst));
+                    if let Some(errno) = self.fstatat_error {
+                        return Err(errno);
+                    }
                     unsafe {
                         libc::syscall(
                             libc::SYS_newfstatat,
@@ -9374,7 +9435,7 @@ pub(crate) mod inject_fstat_scratch {
     }
 
     #[tokio::test]
-    async fn stat_guest_path_has_no_answer_when_its_transient_page_cannot_be_mapped() {
+    async fn stat_guest_path_refuses_when_its_transient_page_cannot_be_mapped() {
         let scratch = Pages::map(1, 1);
         let (tool, mut guest) =
             ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
@@ -9383,12 +9444,76 @@ pub(crate) mod inject_fstat_scratch {
         let result = tool.stat_guest_path(&mut guest, b"/").await;
 
         assert!(
-            matches!(result, Ok(None)),
-            "a page Detcore cannot map must mean no answer, not an error: {}",
+            refused_with(&result, Errno::ENOMEM),
+            "a page Detcore cannot map says nothing about the path, so it must be a tool \
+             error naming the errno, not `Ok(None)`: {}",
             outcome(&result)
         );
         assert_eq!(guest.injected, [Sysno::mmap]);
         assert!(guest.unmapped.is_empty(), "unmapped {:?}", guest.unmapped);
+    }
+
+    /// Whether `result` is the tool error `stat_guest_path` refuses with
+    /// when it could not ask, naming `errno`.
+    fn refused_with(result: &Result<Option<libc::stat>, Error>, errno: Errno) -> bool {
+        matches!(result, Err(Error::Tool(error)) if error.to_string().contains(&errno.to_string()))
+    }
+
+    // A stat the guest's filesystem answers with "no such file" (or one of
+    // the other answers about the path) is `None`; any other errno from the
+    // injected stat, such as `ENOMEM`, says nothing about the path and is an
+    // error, in the stack scratch and in the transient page alike.
+    #[tokio::test]
+    async fn stat_guest_path_refuses_when_the_guests_stat_cannot_be_asked() {
+        let long = [b"/".as_slice(), &[b'x'; 600]].concat();
+        for (path, scratch_works) in [(b"/".to_vec(), true), (long, false)] {
+            for (errno, answered) in [
+                (Errno::ENOENT, true),
+                (Errno::ENOTDIR, true),
+                (Errno::ELOOP, true),
+                (Errno::ENAMETOOLONG, true),
+                (Errno::EACCES, true),
+                (Errno::ENOMEM, false),
+                (Errno::EIO, false),
+                (Errno::EOVERFLOW, false),
+            ] {
+                let scratch = Pages::sentinel(1, 1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.fstatat_error = Some(errno);
+
+                let result = tool.stat_guest_path(&mut guest, &path).await;
+
+                if answered {
+                    assert!(
+                        matches!(result, Ok(None)),
+                        "{errno} from the guest's stat is its answer about the path: {}",
+                        outcome(&result)
+                    );
+                } else {
+                    assert!(
+                        refused_with(&result, errno),
+                        "{errno} from the guest's stat is not an answer about the path, so \
+                         it must be a tool error naming it, never `Ok(None)`: {}",
+                        outcome(&result)
+                    );
+                }
+                assert_eq!(
+                    guest.fstatat_paths.len(),
+                    1,
+                    "one stat, in the {} (errno {errno})",
+                    if scratch_works {
+                        "stack scratch"
+                    } else {
+                        "transient page"
+                    }
+                );
+                assert!(scratch.holds_sentinel(0, scratch.len));
+                if !scratch_works {
+                    sole_transient_page(&guest, path.len());
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -9400,8 +9525,9 @@ pub(crate) mod inject_fstat_scratch {
         let result = tool.stat_guest_path(&mut guest, b"/").await;
 
         assert!(
-            matches!(result, Err(Error::Errno(Errno::EIO))),
-            "only EFAULT sends the stat to a transient page: {}",
+            refused_with(&result, Errno::EIO),
+            "only EFAULT sends the stat to a transient page; any other failure is a tool \
+             error naming the errno: {}",
             outcome(&result)
         );
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
@@ -9615,6 +9741,55 @@ pub(crate) mod inject_fstat_scratch {
 
         assert_eq!(result.expect("mapping_stat_identity failed"), recorded);
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    // A lookup that could not be asked must refuse rather than step to the
+    // next source or to the header: here neither the stack scratch nor a
+    // transient page is available, as when the guest has used up its address
+    // space or its mapping count. On a host where the page can be mapped the
+    // path's stat keys the line, so a fallback would let host resources
+    // choose the identity. A path the guest's filesystem reports missing is an
+    // answer, and still falls back to the header.
+    #[tokio::test]
+    async fn mapping_stat_identity_refuses_when_a_lookup_cannot_be_asked() {
+        let (_file, _identity, key) = mapped_path();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
+        guest.mmap_fails = true;
+
+        let refused = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Reader)
+            .await;
+
+        assert!(
+            matches!(&refused, Err(Error::Tool(error))
+                if error.to_string().contains(&Errno::ENOMEM.to_string())),
+            "a lookup that could not be asked must refuse, never key the line on the \
+             header or another source: {refused:?}"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "nothing may be asked after the refusal"
+        );
+
+        // Control: a missing path is the filesystem's answer.
+        let directory = tempfile::tempdir().unwrap();
+        let missing = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: key.inode,
+            pathname: directory.path().join("absent").to_str().unwrap().to_owned(),
+        };
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let fallback = tool
+            .mapping_stat_identity(&mut guest, &missing, &[], MappingSubject::Unknown)
+            .await;
+        assert_eq!(
+            fallback.expect("a missing path must not be an error"),
+            RawInode::new(HEADER_DEVICE, key.inode)
+        );
+        assert_eq!(guest.injected, [Sysno::newfstatat]);
     }
 
     // Step 3 of `mapping_stat_identity`: the reader's own executable after it
