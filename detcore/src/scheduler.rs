@@ -747,6 +747,11 @@ pub struct Scheduler {
     #[cfg(test)]
     test_kernel_signal_states: BTreeMap<DetTid, KernelSignalState>,
 
+    /// How many times `read_thread_blocked_mask` was asked for a thread's mask,
+    /// so a test can show that a path which must not read `/proc` does not.
+    #[cfg(test)]
+    test_kernel_mask_reads: std::sync::atomic::AtomicUsize,
+
     /// Child-TID futexes whose kernel clear may still be racing a guest join.
     cleared_child_tids: HashMap<FutexID, DetTid>,
 
@@ -1931,6 +1936,8 @@ impl Scheduler {
             sigchld_child_exit_timers: Default::default(),
             #[cfg(test)]
             test_kernel_signal_states: Default::default(),
+            #[cfg(test)]
+            test_kernel_mask_reads: Default::default(),
             cleared_child_tids: Default::default(),
             terminal_deadlock: None,
             empty_queue_kick_turn: None,
@@ -4383,6 +4390,9 @@ impl Scheduler {
     /// stopped at a request (`kernel_sigchld_target`).
     fn read_thread_blocked_mask(&self, thread: DetTid) -> Option<u64> {
         #[cfg(test)]
+        self.test_kernel_mask_reads
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(test)]
         if let Some(state) = self.test_kernel_signal_states.get(&thread) {
             return Some(state.blocked);
         }
@@ -5496,8 +5506,20 @@ impl Scheduler {
                 // current mask, which only it can change and cannot change while
                 // it is still stopped at this request. Once released, its live
                 // mask is host-timed (`kernel_sigchld_target`).
-                let sleeping_mask =
-                    blocked_signal_mask.or_else(|| self.read_thread_blocked_mask(dettid));
+                //
+                // Only a scheduler with `sigchld_eligibility` reads or records
+                // that mask. Its two readers, `kernel_sigchld_target` (through
+                // `thread_signal_mask`) and `arm_signaled_background`, run only
+                // under that flag, and the flag needs
+                // `backend_supports_blocked_wait_signal_interruption`, which is
+                // set only for ptrace and LiteInst (`hermit-cli/src/lib.rs`).
+                // Those are the backends whose `DetTid`s are the host thread IDs
+                // that `/proc` names. On any other backend, KVM among them, whose
+                // IDs are guest-virtual, a `/proc` read of `dettid` would name an
+                // unrelated host thread or none at all.
+                let sleeping_mask = self
+                    .sigchld_eligibility
+                    .then(|| blocked_signal_mask.or_else(|| self.read_thread_blocked_mask(dettid)));
                 self.run_queue.consume_yield_exclusion();
                 self.unblock_guest(dettid, resp)?;
 
@@ -5509,9 +5531,9 @@ impl Scheduler {
                     self.blocked.external_io_blockers.insert(dettid, *op_id)
                 };
                 assert!(old.is_none(), "thread started a second external operation");
-                self.blocked
-                    .out_of_scheduler_masks
-                    .insert(dettid, sleeping_mask);
+                if let Some(mask) = sleeping_mask {
+                    self.blocked.out_of_scheduler_masks.insert(dettid, mask);
+                }
                 Err(SkipTurn)
             }
 
@@ -9910,6 +9932,62 @@ mod test {
             scheduler.kernel_sigchld_target(parent, creator),
             Some(creator)
         );
+    }
+
+    /// A scheduler without `sigchld_eligibility` neither reads a committed
+    /// thread's sleeping mask from `/proc` nor records one. Nothing on such a
+    /// scheduler consumes the record, and on a backend other than ptrace and
+    /// LiteInst, KVM among them, a `DetTid` is not a host thread ID, so the read
+    /// would name an unrelated host thread or none. The gated scheduler, for
+    /// contrast, records the call's own mask, or else reads the thread's
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn a_scheduler_without_sigchld_eligibility_reads_and_records_no_sleeping_mask() {
+        use std::sync::atomic::Ordering;
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        for eligible in [false, true] {
+            for (seq, rt_sigsuspend, call_mask) in [(1, false, None), (2, true, Some(0))] {
+                let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+                scheduler.sigchld_eligibility = eligible;
+                scheduler.test_kernel_signal_states.insert(
+                    creator,
+                    KernelSignalState {
+                        blocked: chld,
+                        ..signal_state(chld, 0)
+                    },
+                );
+                let op = ExternalOpId::new(creator, seq);
+                let rid = if rt_sigsuspend {
+                    ResourceID::BlockingRtSigsuspend(op)
+                } else {
+                    ResourceID::BlockingExternalIO(op)
+                };
+                let before = scheduler.test_kernel_mask_reads.load(Ordering::Relaxed);
+                commit_out_of_scheduler_call(&mut scheduler, creator, rid, call_mask);
+                let reads = scheduler.test_kernel_mask_reads.load(Ordering::Relaxed) - before;
+                let case = format!("eligible={eligible} rt_sigsuspend={rt_sigsuspend}");
+
+                // Either way the thread sleeps in its pool.
+                let pool = if rt_sigsuspend {
+                    &scheduler.blocked.rt_sigsuspend_blockers
+                } else {
+                    &scheduler.blocked.external_io_blockers
+                };
+                assert_eq!(pool.get(&creator), Some(&op), "{case}");
+                let recorded = scheduler.blocked.out_of_scheduler_masks.get(&creator);
+                if eligible {
+                    assert_eq!(recorded, Some(&Some(call_mask.unwrap_or(chld))), "{case}");
+                    assert_eq!(reads, usize::from(call_mask.is_none()), "{case}");
+                } else {
+                    assert_eq!(recorded, None, "{case}");
+                    assert!(
+                        scheduler.blocked.out_of_scheduler_masks.is_empty(),
+                        "{case}"
+                    );
+                    assert_eq!(reads, 0, "{case}");
+                }
+            }
+        }
     }
 
     /// Post `signal`'s delivery stop for `thread`, as its backend does when the
