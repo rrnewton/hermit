@@ -127,6 +127,19 @@ where
     })
 }
 
+/// Whether the calling process holds CAP_SYS_ADMIN (in its effective set), which
+/// [`with_isolation`]'s mount namespace needs.
+pub fn has_cap_sys_admin() -> io::Result<bool> {
+    const CAP_SYS_ADMIN: u32 = 21;
+    let status = std::fs::read_to_string("/proc/self/status")?;
+    let effective = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))
+        .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+        .ok_or_else(|| io::Error::other("/proc/self/status has no readable CapEff line"))?;
+    Ok(effective & (1 << CAP_SYS_ADMIN) != 0)
+}
+
 /// Make the calling process root in a new user namespace that maps root to the
 /// caller's own user and group, exactly as `reverie::process::Container::map_root`
 /// maps the guest of every other backend. The process then holds CAP_SYS_ADMIN

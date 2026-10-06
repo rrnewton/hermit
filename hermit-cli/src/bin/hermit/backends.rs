@@ -1382,16 +1382,21 @@ impl DbtExecution {
                 isolation: None,
             }
         } else {
-            // The run's mount namespace needs CAP_SYS_ADMIN. Take it the way
-            // every other backend's container does (root mapped to the caller),
-            // so a bound DBT run needs no privileged host and its guest sees the
-            // same identity as theirs. Nothing has started a thread yet.
-            hermit_test_workdir::enter_root_user_namespace().map_err(|error| {
-                Error::msg(format!(
-                    "failed to give the DBT run the user namespace its --bind and \
-                     HERMIT_E2E_EMPTY_WORKDIR mounts need: {error}"
-                ))
-            })?;
+            // The run's mount namespace needs CAP_SYS_ADMIN. A caller without it
+            // takes it the way every other backend's container does (root mapped
+            // to the caller), so a bound DBT run needs no privileged host; such a
+            // caller has no capability to lose, and its file access is unchanged.
+            // A caller that holds it keeps its own credentials, so nothing it
+            // writes after the run (verify reports, retained logs) loses one.
+            // Nothing has started a thread yet.
+            if !hermit_test_workdir::has_cap_sys_admin()? {
+                hermit_test_workdir::enter_root_user_namespace().map_err(|error| {
+                    Error::msg(format!(
+                        "failed to give the DBT run the user namespace its --bind and \
+                         HERMIT_E2E_EMPTY_WORKDIR mounts need: {error}"
+                    ))
+                })?;
+            }
             Self {
                 runtime: None,
                 isolation: Some(std::sync::Mutex::new(isolation)),

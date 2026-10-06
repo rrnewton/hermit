@@ -1919,7 +1919,7 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     fs::write(directory.path().join("input"), "bound input\n").unwrap();
     let bind = format!("{}:/tmp/e2e/bound", directory.path().display());
-    let output = hermit_command(&[
+    let mut command = hermit_command(&[
         "--backend",
         "dbt",
         "run",
@@ -1929,9 +1929,20 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
         "/bin/sh",
         "-c",
         "cat /tmp/e2e/bound/input; cat /proc/self/uid_map",
-    ])
-    .output()
-    .unwrap();
+    ]);
+    // Hermit must work without CAP_SYS_ADMIN, the case its user namespace is
+    // for: drop it from the bounding set, so even a root caller (the pinned
+    // root) execs Hermit without it. An unprivileged caller cannot drop it and
+    // never had it.
+    // SAFETY: prctl is async-signal-safe and touches only this child.
+    unsafe {
+        command.pre_exec(|| {
+            const CAP_SYS_ADMIN: libc::c_ulong = 21;
+            libc::prctl(libc::PR_CAPBSET_DROP, CAP_SYS_ADMIN, 0, 0, 0);
+            Ok(())
+        });
+    }
+    let output = command.output().unwrap();
     assert!(output.status.success(), "{}", stderr(&output));
     let text = stdout(&output);
     let mut lines = text.lines();
