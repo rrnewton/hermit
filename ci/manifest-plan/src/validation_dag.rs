@@ -199,6 +199,53 @@ const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
 /// them in agreement with this list.
 pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm"];
 
+/// `test.cli` cases the GitHub-hosted portable profile excludes by exact name.
+///
+/// Each starts the in-guest LiteInst runtime, which needs CPUID faulting, a
+/// host capability like the PMU. GitHub-hosted runners have none: in portable
+/// run 37383177918 the first 25 refused with `detcore-liteinst:
+/// initialization failed: CPUID faulting is unavailable: No such device`, and
+/// the runtime-staging case failed earlier only because the prebuilt tree did
+/// not yet ship the runtime it launches. The five `liteinst_in_guest_verify_`
+/// cases came later and run guests under the same runtime. Only
+/// `test.cli_on_host` excludes
+/// them, with one exact-name filterset (`-E 'not (test(=NAME) | ...)'`) rather
+/// than substring `--skip`s; the local `test.cli` keeps running every one in
+/// the pinned root, and a test below holds both sides to this list.
+pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
+    "liteinst_backend_stats_report_the_guests_own_dispatch_paths",
+    "liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang",
+    "liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs",
+    "liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite",
+    "liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites",
+    "liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging",
+    "liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings",
+    "liteinst_in_guest_programs::liteinst_in_guest_identity_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_python_entropy",
+    "liteinst_in_guest_programs::liteinst_in_guest_python_random_example",
+    "liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime",
+    "liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer",
+    "liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time",
+    "liteinst_in_guest_verify_compares_the_records_the_guest_forwards",
+    "liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer",
+    "liteinst_in_guest_verify_log_keeps_records_in_ptraces_order",
+    "liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader",
+    "liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result",
+    "run_liteinst_finds_the_runtime_staged_as_an_installed_resource",
+];
+
 fn hosted_portable_excludes(cell: &DagManifest) -> bool {
     cell.backend
         .as_deref()
@@ -5117,6 +5164,36 @@ sys.exit(37)
                 assert_eq!(hosted.cmd.matches("--calibration-host").count(), 1);
                 assert!(local.deps.iter().any(|dep| dep == "build.rust_scripts"));
                 local_payload.replace(PINNED, "--calibration-host")
+            } else if local_tag == "test.cli" {
+                // The hosted twin excludes exactly the CPUID-faulting cases,
+                // by exact name, which the local selection must keep running:
+                // no local filter names one, and no local substring --skip
+                // matches one.
+                let local_argv = shell_words::split(&local_payload).unwrap();
+                assert!(!local_argv.iter().any(|arg| arg == "-E"));
+                for name in HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS {
+                    assert!(
+                        !local_payload.contains(name),
+                        "test.cli must keep running {name}"
+                    );
+                    for pattern in local_argv
+                        .windows(2)
+                        .filter(|pair| pair[0] == "--skip")
+                        .map(|pair| &pair[1])
+                    {
+                        assert!(
+                            !name.contains(pattern.as_str()),
+                            "test.cli's --skip {pattern} skips {name}"
+                        );
+                    }
+                }
+                let exclusions = HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS
+                    .iter()
+                    .map(|name| format!("test(={name})"))
+                    .collect::<Vec<_>>()
+                    .join(" | ");
+                assert_eq!(local_payload.matches(" -- ").count(), 1);
+                local_payload.replacen(" -- ", &format!(" -E 'not ({exclusions})' -- "), 1)
             } else {
                 local_payload
             };
@@ -5138,17 +5215,30 @@ sys.exit(37)
                 "{} changed its CPU timeout",
                 hosted.tag()
             );
-            for key in [
-                "NEXTEST_EXPECTED_EXECUTED",
-                crate::nextest_binaries::SELECTION_ENV,
-            ] {
-                assert_eq!(
-                    hosted.env.get(key),
-                    local.env.get(key),
-                    "{} changed {key}",
-                    hosted.tag()
-                );
-            }
+            assert_eq!(
+                hosted.env.get(crate::nextest_binaries::SELECTION_ENV),
+                local.env.get(crate::nextest_binaries::SELECTION_ENV),
+                "{} changed {}",
+                hosted.tag(),
+                crate::nextest_binaries::SELECTION_ENV
+            );
+            // Both counts are measured by listing. Each exact test(=NAME) term
+            // excludes at most one test, so the hosted twin executes exactly
+            // that many fewer only if every listed name exists and nothing
+            // else is excluded.
+            let hosted_only_skips = if local_tag == "test.cli" {
+                HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len()
+            } else {
+                0
+            };
+            let count =
+                |step: &Step| -> usize { step.env["NEXTEST_EXPECTED_EXECUTED"].parse().unwrap() };
+            assert_eq!(
+                count(hosted) + hosted_only_skips,
+                count(local),
+                "{} changed NEXTEST_EXPECTED_EXECUTED",
+                hosted.tag()
+            );
         }
         assert_eq!(
             checked,
