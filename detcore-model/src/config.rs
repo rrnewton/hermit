@@ -121,6 +121,21 @@ pub struct Config {
     #[clap(skip)]
     pub backend_supports_blocked_wait_signal_interruption: bool,
 
+    /// The backend can complete an intercepted syscall without the kernel's
+    /// syscall-return path, so a restart errno (`ERESTARTSYS`, `ERESTARTNOINTR`,
+    /// `ERESTARTNOHAND`, `ERESTART_RESTARTBLOCK`) that a Tool returns can reach the
+    /// guest unconverted. LiteInst does this at a call site it has already patched:
+    /// reverie's `handle_injected_syscall` writes the Tool's result straight into
+    /// the guest's register frame. Detcore then applies Linux's restart rules
+    /// itself for a call that arrived that way
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    ///
+    /// Like `backend_supports_blocked_wait_signal_interruption`, the host sets it
+    /// from the backend's name, and it has no legacy key.
+    #[serde(default)]
+    #[clap(skip)]
+    pub backend_may_skip_kernel_syscall_restart: bool,
+
     /// Epoch of the logical time.
     ///
     /// This is the datetime from which all time and date modtimes begin and
@@ -1431,9 +1446,10 @@ impl Default for Config {
 /// under the names and in the order it carried them, each with a value
 /// computed from `config`. [`Config::record_host_inputs`], which the legacy
 /// form never had, is left out too, and reads back as false: this form serves
-/// only DBT, whose launcher collects no host inputs. So is
-/// [`Config::backend_supports_blocked_wait_signal_interruption`], which
-/// is false for DBT. Every other field is serialized exactly as
+/// only DBT, whose launcher collects no host inputs. So are
+/// [`Config::backend_supports_blocked_wait_signal_interruption`] and
+/// [`Config::backend_may_skip_kernel_syscall_restart`], which are false
+/// for DBT. Every other field is serialized exactly as
 /// `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
@@ -1750,12 +1766,14 @@ mod legacy_backend_json {
     /// `record_host_inputs` has no legacy key and no legacy value: the legacy
     /// form serves only DBT, whose launcher collects no host inputs, so it is
     /// never written and always reads as false.
-    /// `backend_supports_blocked_wait_signal_interruption` is the same: it is
-    /// false for DBT, so it is never written and always reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 3] = [
+    /// `backend_supports_blocked_wait_signal_interruption` and
+    /// `backend_may_skip_kernel_syscall_restart` are the same: each is false
+    /// for DBT, so each is never written and always reads as false.
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 4] = [
         "backend",
         "record_host_inputs",
         "backend_supports_blocked_wait_signal_interruption",
+        "backend_may_skip_kernel_syscall_restart",
     ];
 
     /// Reads the top-level object or array of a legacy configuration. The
@@ -1844,10 +1862,11 @@ mod legacy_backend_json {
     /// derived `Config` deserializer asks for one element per field in
     /// declaration order; at [`Config::backend`] this reads up to fifteen
     /// elements as the legacy backend keys, and neither the field it asks for
-    /// there nor [`Config::record_host_inputs`] or
-    /// [`Config::backend_supports_blocked_wait_signal_interruption`] takes an
-    /// element. Each gets a placeholder; [`super::from_legacy_backend_json`]
-    /// replaces the first.
+    /// there nor [`Config::record_host_inputs`],
+    /// [`Config::backend_supports_blocked_wait_signal_interruption`] or
+    /// [`Config::backend_may_skip_kernel_syscall_restart`] takes an element.
+    /// Each gets a placeholder; [`super::from_legacy_backend_json`] replaces the
+    /// first.
     struct LegacyPositions<'f, 'l, A> {
         inner: A,
         fields: std::slice::Iter<'f, String>,
@@ -1877,7 +1896,9 @@ mod legacy_backend_json {
                         .map_err(<A::Error as de::Error>::custom)
                 }
                 Some(
-                    "record_host_inputs" | "backend_supports_blocked_wait_signal_interruption",
+                    "record_host_inputs"
+                    | "backend_supports_blocked_wait_signal_interruption"
+                    | "backend_may_skip_kernel_syscall_restart",
                 ) => seed.deserialize(BoolDeserializer::new(false)).map(Some),
                 _ => self.inner.next_element_seed(seed),
             }
@@ -2118,9 +2139,9 @@ mod legacy_backend_json {
                     Ok(())
                 }
                 // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
-                "record_host_inputs" | "backend_supports_blocked_wait_signal_interruption" => {
-                    Ok(())
-                }
+                "record_host_inputs"
+                | "backend_supports_blocked_wait_signal_interruption"
+                | "backend_may_skip_kernel_syscall_restart" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -2186,6 +2207,7 @@ mod tests {
             "the default configuration must not write a controlled-run legacy key"
         );
         assert!(!config.backend_supports_blocked_wait_signal_interruption);
+        assert!(!config.backend_may_skip_kernel_syscall_restart);
     }
 
     #[test]
@@ -2578,8 +2600,9 @@ mod tests {
 
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
-    /// `record_host_inputs` or `backend_supports_blocked_wait_signal_interruption`,
-    /// which is the key order the encoder writes.
+    /// `record_host_inputs`, `backend_supports_blocked_wait_signal_interruption`
+    /// or `backend_may_skip_kernel_syscall_restart`, which is the key order the
+    /// encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2594,7 +2617,9 @@ mod tests {
         for field in &fields {
             match field.as_str() {
                 "backend" => expected.extend(names.map(str::to_owned)),
-                "record_host_inputs" | "backend_supports_blocked_wait_signal_interruption" => {}
+                "record_host_inputs"
+                | "backend_supports_blocked_wait_signal_interruption"
+                | "backend_may_skip_kernel_syscall_restart" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -2604,10 +2629,11 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         assert_eq!(keys, expected);
-        // `backend` becomes fifteen keys; `record_host_inputs` and
-        // `backend_supports_blocked_wait_signal_interruption` none.
+        // `backend` becomes fifteen keys; `record_host_inputs`,
+        // `backend_supports_blocked_wait_signal_interruption` and
+        // `backend_may_skip_kernel_syscall_restart` none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 12, keys.len());
+        assert_eq!(fields.len() + 11, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2701,6 +2727,41 @@ mod tests {
             !from_legacy_backend_json(&array)
                 .unwrap()
                 .backend_supports_blocked_wait_signal_interruption
+        );
+    }
+
+    /// `backend_may_skip_kernel_syscall_restart` never enters the legacy form,
+    /// whatever its value, and reads back as false from both forms.
+    #[test]
+    fn skipped_syscall_restart_never_enters_the_legacy_form() {
+        let off = Config {
+            backend: BackendCapabilities::DBT,
+            ..Config::default()
+        };
+        let on = Config {
+            backend_may_skip_kernel_syscall_restart: true,
+            ..off.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(
+            !json.contains("backend_may_skip_kernel_syscall_restart"),
+            "{json}"
+        );
+        assert!(
+            !from_legacy_backend_json(&json)
+                .unwrap()
+                .backend_may_skip_kernel_syscall_restart
+        );
+        let values: Vec<serde_json::Value> = ordered_entries(&json)
+            .into_iter()
+            .map(|(_, value)| value)
+            .collect();
+        let array = serde_json::to_string(&values).unwrap();
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .backend_may_skip_kernel_syscall_restart
         );
     }
 
