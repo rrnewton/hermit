@@ -66,10 +66,12 @@
 //! - The `spin` role in polling mode. Between probes a polling waiter blocks
 //!   every signal, so the running sibling takes the SIGCHLD that Linux gives the
 //!   waiting thread that forked the child.
-//! - LiteInst `sem thread warm`: the guest dies of SIGSEGV after its handler
-//!   runs, on every head of https://github.com/rrnewton/hermit/pull/3361
-//!   measured; on its base the wait was never interrupted. Only
-//!   `sem exit warm` is asserted.
+//! - LiteInst `sem thread warm`: the guest dies of SIGSEGV whether or not a
+//!   signal arrives, on Hermit `356dfd3e` as with this change. A
+//!   `sem_timedwait` that LiteInst patched while the guest was single-threaded
+//!   crashes on a call made after a thread starts, because glibc jumps into the
+//!   middle of the patched bytes (https://github.com/rrnewton/reverie/issues/812).
+//!   Only `sem exit warm` is asserted.
 //! - `warm` on ptrace, which patches no call site.
 
 #[path = "common/hermit_binary.rs"]
@@ -980,7 +982,9 @@ fn liteinst_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
 /// woke the main thread for the sibling's SIGCHLD in precise mode. The kernel
 /// then restarted a timed wait with a fresh timeout, ending it near 400 ms, and
 /// at LiteInst's patched site the kernel-internal errno 512 or 514 reached the
-/// guest. Polling mode already left the wait alone; its cells guard that.
+/// guest. Polling mode already left the wait alone; its cells guard that. The
+/// ptrace precise untimed cell also passes without the fix, because there the
+/// kernel restarts an untimed `FUTEX_WAIT` transparently.
 fn assert_runnable_sibling_takes_the_sigchld(backend: &str, mode: FutexMode, timed: bool) {
     let (expected, elapsed) = match (timed, mode) {
         (true, _) => (
@@ -1188,6 +1192,11 @@ const PATCHED_SITE_FUTEX_CELLS: [(&[&str], &str); 6] = [
         &["futex", "thread", "restart", "timed", "warm"],
         EINTR_FUTEX,
     ),
+    // A known deviation, pinned so that a change is seen. Linux restarts this
+    // wait under `SA_RESTART` and the sibling's FUTEX_WAKE ends it near 200 ms.
+    // A patched site cannot re-run the call, so the wait returns 0 as soon as
+    // the handler has run, near 100 ms
+    // (https://github.com/rrnewton/hermit/issues/3403).
     (
         &["futex", "thread", "restart", "warm"],
         "RESULT call=futex ret=0 errno=none handler=1",
