@@ -4887,7 +4887,7 @@ Rss:                   4 kB\n" as &[u8];
     #[test]
     fn maps_keeps_two_files_that_share_a_maps_device_and_inode_apart() {
         let raw = b"7f0000000000-7f0000001000 r-xp 00000000 00:20 257 /usr/lib/a.so\n\
-7f0000002000-7f0000003000 r-xp 00000000 00:20 257 /home/u/b.so\n" as &[u8];
+7f0000002000-7f0000003000 r-xp 00000000 00:20 257 /home/user/b.so\n" as &[u8];
         let keys = mapping_keys_in_text_order(raw);
         assert_eq!(keys.len(), 2, "both headers keyed separately: {keys:?}");
         let table = BTreeMap::from([
@@ -4896,7 +4896,7 @@ Rss:                   4 kB\n" as &[u8];
                 (libc::makedev(0x00, 0x2a), 11u64),
             ),
             (
-                mapping_key(libc::makedev(0x00, 0x20), 257, "/home/u/b.so"),
+                mapping_key(libc::makedev(0x00, 0x20), 257, "/home/user/b.so"),
                 (libc::makedev(0x00, 0x2a), 12u64),
             ),
         ]);
