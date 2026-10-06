@@ -111,8 +111,10 @@ fn available_tools(allowed: &[&str]) -> Vec<Tool> {
         tool(
             "curl",
             &["/usr/bin/curl", "/usr/local/bin/curl"],
-            &["--silent", "--show-error", "file:///etc/os-release"],
-            "NAME=",
+            // The pinned root has no /etc/os-release; its flake writes this
+            // passwd line, which hosts share.
+            &["--silent", "--show-error", "file:///etc/passwd"],
+            "root:x:0:0:",
         ),
         tool(
             "git",
