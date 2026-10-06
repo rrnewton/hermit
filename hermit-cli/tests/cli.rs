@@ -6292,8 +6292,30 @@ fn full_unread_stderr_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
     }
 }
 
-/// Wait for `child` for at most `bound`, killing it on expiry. Returns the
-/// exit status (`None` when it had to be killed) and the time waited.
+/// How long a log-cap test below waits for a capped hermit, from spawn, before
+/// scaling by [`dap_wall_timeout_multiplier`].
+///
+/// Nextest ends a test at 57 s of wall time: `.config/nextest.toml` sets
+/// `slow-timeout = { period = "57s", terminate-after = 1, grace-period = "2s" }`
+/// in `[profile.default]`, and `[profile.ci]` inherits it. Before it runs
+/// nextest, `ci/run-nextest-counted.sh` writes a temporary copy of that file
+/// with every `slow-timeout` period multiplied by
+/// `HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER` (unset is 1) and rounded up to whole
+/// seconds. A wait as long as that kill can never fail on its own: round 2's
+/// 60 s wait ended in nextest's `TIMEOUT` at 57 s instead, which names no cause
+/// (round-3 review of https://github.com/rrnewton/hermit/pull/3686, finding
+/// 8). So these tests wait at most 45 s times the same multiplier, then kill
+/// hermit with SIGKILL and reap it ([`wait_at_most`]), close their own pipe
+/// descriptors, and fail with the time they waited. Killing hermit also ends
+/// the guest: the container init, or under `--no-namespace` the tracer, dies
+/// with hermit through its parent-death signal, and the guest dies with it
+/// (with its PID namespace, or as a `PTRACE_O_EXITKILL` tracee). The 12 s left
+/// before nextest's kill cover the setup before spawn and that cleanup.
+const LOG_CAP_RUN_WAIT_BOUND: Duration = Duration::from_secs(45);
+
+/// Wait for `child` for at most `bound`, killing it with SIGKILL and reaping it
+/// on expiry. Returns the exit status (`None` when it had to be killed) and the
+/// time waited, the kill and the reap included.
 fn wait_at_most(
     child: &mut std::process::Child,
     bound: Duration,
@@ -6320,16 +6342,18 @@ fn wait_at_most(
 /// outer process's `HERMIT_LOG_CAP` report after it classifies the init's
 /// 123. The log goes to `--log-file` so no ordinary log line touches stderr.
 ///
-/// The bound is 60 s of wall time from spawn. A capped run like this one
-/// finishes in a few seconds; the failure it catches is an indefinite wait,
-/// so the bound only has to exceed startup plus 64 KiB of debug logging on a
-/// loaded host by a wide margin. The measured time is printed.
+/// The failure this catches is an indefinite wait, so the test waits at most
+/// [`LOG_CAP_RUN_WAIT_BOUND`] from spawn, which ends before nextest's own kill
+/// and leaves the test to report a hang itself, with the time waited. A capped
+/// run like this one exited 123 after 0.06 s in round 3's runs, so the bound
+/// only has to exceed startup plus 64 KiB of debug logging on a loaded host by
+/// a wide margin. The measured time is printed.
 #[test]
 fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
     let _lock = hermit_run_guard();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let log = directory.path().join("hermit.log");
-    let (_reader, writer) = full_unread_stderr_pipe();
+    let (reader, writer) = full_unread_stderr_pipe();
     let mut args = vec![
         "--log=debug",
         "--max-log-bytes=64K",
@@ -6347,12 +6371,16 @@ fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
         .stderr(Stdio::from(writer))
         .spawn()
         .unwrap();
-    let (status, elapsed) = wait_at_most(&mut child, Duration::from_secs(60));
+    let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    let (status, elapsed) = wait_at_most(&mut child, bound);
+    // hermit is reaped (killed first if it outlived the bound), and the guest
+    // died with it; this closes the read end, the last descriptor of the pipe.
+    drop(reader);
     eprintln!("capped run, stderr a full unread pipe: {status:?} after {elapsed:?}");
     let status = status.unwrap_or_else(|| {
         panic!(
-            "hermit was still running after {elapsed:?}: a cap diagnostic waited on the \
-             full stderr pipe"
+            "hermit was still running after {elapsed:?} (bound {bound:?}) and was killed: \
+             a cap diagnostic waited on the full stderr pipe"
         )
     });
     assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
@@ -6367,7 +6395,9 @@ fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
 /// `--no-namespace` the crossing process is the Reverie tracer, which restores
 /// SIGPIPE's default disposition; its crossing line to a stderr pipe whose
 /// reader is gone used to kill it by signal, and the outer process reported
-/// that as an internal failure (125) instead of the cap (123).
+/// that as an internal failure (125) instead of the cap (123). Like the test
+/// above, it waits at most [`LOG_CAP_RUN_WAIT_BOUND`], so that a hang fails
+/// here, with the time waited, before nextest's own kill.
 #[test]
 fn max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader() {
     let _lock = hermit_run_guard();
@@ -6402,9 +6432,12 @@ fn max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader() {
         .stderr(Stdio::from(writer))
         .spawn()
         .unwrap();
-    let (status, elapsed) = wait_at_most(&mut child, Duration::from_secs(60));
+    let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    let (status, elapsed) = wait_at_most(&mut child, bound);
     eprintln!("capped --no-namespace run, stderr without a reader: {status:?} after {elapsed:?}");
-    let status = status.unwrap_or_else(|| panic!("hermit was still running after {elapsed:?}"));
+    let status = status.unwrap_or_else(|| {
+        panic!("hermit was still running after {elapsed:?} (bound {bound:?}) and was killed")
+    });
     assert_eq!(
         status.code(),
         Some(HERMIT_LOG_CAP_EXIT),
