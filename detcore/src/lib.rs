@@ -53,6 +53,7 @@ mod ivar;
 pub mod logdiff;
 mod memory;
 pub mod netlink_route;
+pub mod nonwaiting_write;
 mod procfs;
 mod procmaps;
 pub mod random;
@@ -1959,6 +1960,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     Some(path) => Box::new(
                         File::create(path).expect("Failed to open preemption stacktrace log file"),
                     ),
+                    // Under --max-log-bytes a full stderr must not stop the
+                    // run before the cap; see `util::DroppingStderr`.
+                    None if crate::nonwaiting_write::diagnostics_must_not_wait() => {
+                        Box::new(crate::util::DroppingStderr)
+                    }
                     None => Box::new(std::io::stderr()),
                 };
             let ts = guest.thread_state();
