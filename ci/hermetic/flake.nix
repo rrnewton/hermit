@@ -140,12 +140,16 @@
       # selected manifest entry's requirements/program, and commands invoked by
       # shell fixtures. The second line supplies the previously missing lua, m4,
       # node, ssh-keygen, ruby, tclsh, uuidgen, mcookie, hexdump and ps.
+      # curl is the guest of test.record_replay's
+      # curl_recording_replays_offline_with_identical_logs, which finds it on
+      # PATH (https://github.com/rrnewton/hermit/issues/3786). The root already
+      # held libcurl as a dependency, but not the curl executable.
       guestTools = with pkgs; [
         bash coreutils diffutils findutils gnugrep gnused gawk
         openssl zstd gnutar gzip xz jq sqlite git perl python3 redis
         lua5_4 gnum4 nodejs openssh ruby tcl util-linux procps
         # These outputs are not implied by their runtime libraries.
-        bzip2.bin glibc.bin hostname
+        bzip2.bin curl.bin glibc.bin hostname
       ];
 
       # The CLI replay tests run GDB outside Hermit and execute Python commands.
