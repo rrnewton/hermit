@@ -716,17 +716,23 @@ fn utimensat_input_overlaps<M: MemoryAccess>(
 
 /// The run-global identity pools, reached through this guest's RPCs to the
 /// global tool: the same `InodePool`/`DevicePool` that `stat` determinizes
-/// through, so a mapping line and a `stat` of the same file agree.
-struct GuestMappingMinter<'a, G, T> {
+/// through, so a mapping line and a `stat` of the same file agree. A header is
+/// resolved to the file identity `stat` reports by `mapping_stat_identity`.
+struct GuestMappingMinter<'a, G, T: RecordOrReplay> {
+    detcore: &'a Detcore<T>,
     guest: &'a mut G,
-    tool: std::marker::PhantomData<fn() -> T>,
+    /// Whether the snapshot shows the reader's own address space, the only
+    /// case in which the reader's mapping records describe its lines
+    /// (`ProcfsFile::mapping_address_space`).
+    readers_address_space: bool,
 }
 
-impl<'a, G, T> GuestMappingMinter<'a, G, T> {
-    fn new(guest: &'a mut G) -> Self {
+impl<'a, G, T: RecordOrReplay> GuestMappingMinter<'a, G, T> {
+    fn new(detcore: &'a Detcore<T>, guest: &'a mut G, readers_address_space: bool) -> Self {
         Self {
+            detcore,
             guest,
-            tool: std::marker::PhantomData,
+            readers_address_space,
         }
     }
 }
@@ -736,8 +742,25 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    async fn inode(&mut self, raw_inode: RawInode) -> DetInode {
-        determinize_inode(self.guest, raw_inode).await.0
+    type Error = Error;
+
+    async fn stat_identity(
+        &mut self,
+        key: &crate::procfs::MappingKey,
+        starts: &[usize],
+    ) -> Result<RawInode, Error> {
+        let recorded_starts: &[usize] = if self.readers_address_space {
+            starts
+        } else {
+            &[]
+        };
+        self.detcore
+            .mapping_stat_identity(self.guest, key, recorded_starts)
+            .await
+    }
+
+    async fn inode(&mut self, raw_file: RawInode) -> DetInode {
+        determinize_inode(self.guest, raw_file).await.0
     }
 
     async fn device(&mut self, raw_device: u64) -> u64 {
@@ -1209,6 +1232,144 @@ impl<T: RecordOrReplay> Detcore<T> {
         statptr.read(&guest.memory())
     }
 
+    /// The raw identity `stat` reports for the file a `maps`/`smaps` header
+    /// names, which keys that mapping's deterministic inode. `starts` are the
+    /// start addresses of the snapshot's lines with this header, and must be
+    /// empty unless the snapshot shows the reader's own address space
+    /// (`ProcfsFile::mapping_address_space`).
+    ///
+    /// The header's own `(device, inode)` pair is NOT always that identity: on
+    /// btrfs maps prints the superblock's device and `stat` the subvolume's,
+    /// and on overlayfs maps prints the lower file's device. Keying the inode
+    /// pool on the maps pair then gives the maps inode column a different
+    /// value from `st_ino` for the same file
+    /// (<https://github.com/rrnewton/hermit/issues/3307>). In order:
+    ///
+    /// 1. A file the reader mapped through a descriptor Detcore tracks is
+    ///    keyed on the `fstat` identity `handle_mmap` recorded for that
+    ///    address range (`MemoryMetadata::mapped_file_at`). That record needs
+    ///    no path, so it still holds after the file is unlinked or replaced
+    ///    and its descriptor closed, when the line reads ` (deleted)`, and for
+    ///    a path too long to resolve below. It is consulted only for a
+    ///    snapshot of the reader's own address space, which Detcore knows
+    ///    only for a file opened through `/proc/self` or `/proc/thread-self`
+    ///    in that same address space.
+    /// 2. Otherwise the pathname is resolved in the guest. This covers the
+    ///    executable and the ELF interpreter, which `execve` maps without a
+    ///    system call Detcore sees, and files mapped through a descriptor
+    ///    Detcore does not track, such as one received over `SCM_RIGHTS`.
+    ///
+    /// Either answer is accepted only if its inode is the one the header
+    /// reports.
+    ///
+    /// Falls back to the header's pair -- which IS `stat`'s identity on every
+    /// filesystem whose `st_dev` is its superblock device, such as ext4, xfs
+    /// and tmpfs -- when metadata is not virtualized (record/replay, where
+    /// `stat` is not determinized either and a resolution at replay time would
+    /// depend on the replay host), and when neither step names the file.
+    ///
+    /// ⚠️ ON BTRFS AND OVERLAYFS THAT FALLBACK DISAGREES WITH `stat`. The maps
+    /// inode column then differs from `st_ino` for a file that is BOTH absent
+    /// from the record and unresolvable by path: the executable or the
+    /// interpreter after it is unlinked or replaced, a file mapped through an
+    /// untracked descriptor and then unlinked, any unlinked file in another
+    /// process's maps (or in `/proc/<own pid>/maps`, which is not recognized
+    /// as the reader's own), or one of those under a path of 512 bytes or
+    /// more (see `stat_guest_path`).
+    async fn mapping_stat_identity<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        key: &crate::procfs::MappingKey,
+        starts: &[usize],
+    ) -> Result<RawInode, Error> {
+        let header = RawInode::new(key.device, key.inode);
+        if !guest.config().virtualize_metadata {
+            return Ok(header);
+        }
+        let recorded = {
+            let thread = guest.thread_state();
+            starts.iter().find_map(|&start| {
+                thread
+                    .mapped_file_at(start)
+                    .filter(|file| file.ino == key.inode)
+            })
+        };
+        if let Some(file) = recorded {
+            return Ok(file);
+        }
+        for candidate in crate::procfs::mapping_path_candidates(&key.pathname) {
+            if let Some(stat) = self.stat_guest_path(guest, candidate.as_bytes()).await?
+                && stat.st_ino == key.inode
+            {
+                return Ok(RawInode::new(stat.st_dev, stat.st_ino));
+            }
+        }
+        Ok(header)
+    }
+
+    /// `stat(path)` performed BY THE GUEST, through an injected
+    /// `fstatat(AT_FDCWD, path, _, 0)`; `None` when it fails or when the path
+    /// does not fit in the scratch buffer.
+    ///
+    /// Injected rather than performed here for the reason `handle_stat_family`
+    /// gives: an access from the tracer can hang on some FUSE filesystems
+    /// (squashfs_ll), and on in-guest backends "here" is the guest process
+    /// anyway. The guest resolves the path in its own mount namespace and
+    /// root, which is also the root `maps` printed the path relative to. The
+    /// injection is not a guest-visible system call, and both scratch buffers
+    /// are zeroed afterwards so no host inode number or timestamp is left
+    /// behind in guest memory below the stack pointer.
+    ///
+    /// ⚠️ THE PATH IS BOUNDED BY THE SMALLEST INJECTION STACK. The ptrace
+    /// backend allows 896 bytes per injection, which must hold the path and a
+    /// 144-byte `struct stat`; a path of `GUEST_STAT_PATH_CAPACITY` bytes or
+    /// more is not resolved (see `mapping_stat_identity` for what a mapping
+    /// then keys on).
+    pub(crate) async fn stat_guest_path<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        path: &[u8],
+    ) -> Result<Option<libc::stat>, Error> {
+        const GUEST_STAT_PATH_CAPACITY: usize = 512;
+        if path.len() >= GUEST_STAT_PATH_CAPACITY || path.contains(&0) {
+            return Ok(None);
+        }
+        let mut stack = guest.stack().await;
+        let needed = GUEST_STAT_PATH_CAPACITY + std::mem::size_of::<libc::stat>();
+        if stack.capacity().saturating_sub(stack.size()) < needed {
+            return Ok(None);
+        }
+        let path_address: AddrMut<[u8; GUEST_STAT_PATH_CAPACITY]> = stack.reserve();
+        let statptr = StatPtr(stack.reserve());
+        let stack_guard = stack.commit()?;
+        // `reserve` zero-fills, so the path stays NUL-terminated.
+        guest
+            .memory()
+            .write_exact(path_address.cast::<u8>(), path)?;
+        let call = syscalls::Fstatat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ))
+            .with_stat(Some(statptr))
+            .with_flags(AtFlags::empty());
+        let identity = match guest.inject_with_retry(call).await {
+            Ok(_) => Some(statptr.read(&guest.memory())?),
+            Err(error) => {
+                trace!(
+                    "guest stat of {:?} failed: {error}",
+                    String::from_utf8_lossy(path)
+                );
+                None
+            }
+        };
+        let mut memory = guest.memory();
+        memory.write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])?;
+        memory.write_exact(path_address.cast::<u8>(), &[0; GUEST_STAT_PATH_CAPACITY])?;
+        drop(stack_guard);
+        Ok(identity)
+    }
+
     // helper function to track a new file descriptor.
     pub(crate) async fn add_fd<G: Guest<Self>>(
         &self,
@@ -1507,6 +1668,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         .filter(|resolved| resolved != &observed_path)
                         .and_then(|resolved| ProcfsFile::from_path(&resolved))
                 });
+                if let Some(procfs) = procfs.as_mut() {
+                    // A `/proc/self/maps` descriptor shows the opener's address
+                    // space even when a forked child reads it, or the opener
+                    // after an `execve`.
+                    procfs.bind_mapping_address_space(guest.thread_state().mm_id);
+                }
                 if procfs
                     .as_ref()
                     .is_some_and(ProcfsFile::needs_bound_thread_identity)
@@ -2188,14 +2355,28 @@ impl<T: RecordOrReplay> Detcore<T> {
         let needs_mapping_identities = guest
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mapping_identities())?;
-        let mapping_identities: BTreeMap<(u64, u64), (u64, u64)> = if needs_mapping_identities {
+        let mapping_identities = if needs_mapping_identities {
             // A mapping backed by stdio must report the SAME inode fdinfo
             // reports for that fd, which is the fixed `deterministic_stdio_inode`
-            // value rather than a pooled one. Matching is by raw inode, read
-            // from the cached stat only: injecting an fstat here would add
-            // syscalls to every maps read and perturb the very traces this
-            // change is meant to keep consistent.
-            let mut stdio_by_raw_inode: BTreeMap<RawInode, DetInode> = BTreeMap::new();
+            // value rather than a pooled one. Matching is by the raw device and
+            // inode `stat` reported for the stdio descriptor, read from its
+            // cached stat.
+            //
+            // The inode alone is not enough: an unrelated file on another
+            // filesystem can share the stdio inode number (a fresh tmpfs
+            // numbers its files 2, 3, ...; `/dev/null` is inode 3 on
+            // devtmpfs), and it would then be rendered with the stdio inode
+            // in the runs where the host numbers happened to coincide
+            // (https://github.com/rrnewton/hermit/issues/3307).
+            //
+            // When several stdio descriptors share one raw identity the LOWEST
+            // descriptor's inode wins. The tracer-side backends cache the
+            // tracer's own `fstat(0)` for all three descriptors (see
+            // `setup_stdio`), so every mapping of the stdin file matches all
+            // three; letting the last insert win reported it as stderr's inode
+            // (1002) while `fstat(0)` reports 1000. `namespace.rs`'s
+            // `deterministic_stdio_inode_for_raw` applies the same precedence.
+            let mut stdio_by_raw_file: BTreeMap<RawInode, DetInode> = BTreeMap::new();
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
                 let cached = guest
                     .thread_state()
@@ -2206,21 +2387,33 @@ impl<T: RecordOrReplay> Detcore<T> {
                     .ok()
                     .flatten();
                 if let Some((raw, det)) = cached {
-                    stdio_by_raw_inode.insert(raw, det);
+                    stdio_by_raw_file.entry(raw).or_insert(det);
                 }
             }
+            // The reader's mapping records describe this snapshot only when it
+            // shows the reader's own address space; `GuestMappingMinter` passes
+            // the line start addresses on to its record lookup only then.
+            let readers_address_space = guest
+                .thread_state()
+                .with_detfd(call.fd(), |detfd| detfd.procfs_mapping_address_space())?
+                == Some(guest.thread_state().mm_id);
             // The minting loop lives in `crate::procfs::mint_mapping_identities`
             // so the unit tests drive the same code: it mints in maps-TEXT
             // order, never in host raw-number order, because a file first
-            // seen here gets the next deterministic inode.
+            // seen here gets the next deterministic inode. For each header it
+            // keys the INODE on what `stat` reports for the file
+            // (`GuestMappingMinter::stat_identity`) and the DEVICE column on
+            // what maps printed: on btrfs and overlayfs the two devices differ
+            // on native Linux as well, while the inode numbers agree. See
+            // `ProcfsSnapshotContext::mapping_identities`.
             crate::procfs::mint_mapping_identities(
                 &contents,
-                &stdio_by_raw_inode,
-                &mut GuestMappingMinter::<G, T>::new(guest),
+                &stdio_by_raw_file,
+                &mut GuestMappingMinter::new(self, guest, readers_address_space),
             )
-            .await
+            .await?
         } else {
-            BTreeMap::new()
+            crate::procfs::MappingIdentities::new()
         };
         let mountinfo = if guest
             .thread_state()
@@ -2864,7 +3057,7 @@ impl<T: RecordOrReplay> Detcore<T> {
 
         let dettid = guest.thread_state().dettid;
         let mut resources = Resources::new(dettid);
-        // `out_inode` is the fd's cached HOST inode, so it must be
+        // `out_inode` is the fd's cached HOST identity, so it must be
         // determinized before naming a resource. It is deliberately left raw
         // for the `touch_file` call below, which takes a `RawInode`.
         let out_resource = match out_resource {
@@ -3593,11 +3786,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         } else {
             None
         };
+        // The raw identity `fstat` reported for a mapped file, from the
+        // descriptor's cached stat (present only under `virtualize_metadata`).
+        // A maps line for this range keys its inode on it; see
+        // `mapping_stat_identity`.
+        let mapped_file = if call.flags().contains(MapFlags::MAP_ANONYMOUS) || call.fd() < 0 {
+            None
+        } else {
+            guest
+                .thread_state()
+                .with_detfd(call.fd(), |fd| fd.stat().map(|stat| stat.raw_inode()))
+                .ok()
+                .flatten()
+        };
         let len = call.len();
         let result = self.record_or_replay(guest, call).await?;
         let start = usize::try_from(result).expect("a successful mmap must return an address");
 
         guest.thread_state().unmap_memory(start, len);
+        if let Some(file) = mapped_file {
+            guest.thread_state().map_file(start, len, file);
+        }
         match backing {
             Some(SharedBacking::Anonymous) => {
                 guest.thread_state().map_shared_anonymous(start, len);
@@ -3685,6 +3894,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                 } else {
                     ObservedMtime::Unobserved
                 };
+                // Key on the raw device as well as the raw inode, read before
+                // `stat.dev` is overwritten below: inode numbers repeat across
+                // filesystems (https://github.com/rrnewton/hermit/issues/3307).
                 determinize_inode_observing_mtime(guest, stat.raw_inode(), observed).await
             }
         };
@@ -4590,8 +4802,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         if (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino) {
             return Ok(res);
         }
+        let file = RawInode::new(after.st_dev, after.st_ino);
         if mtime.tv_nsec == libc::UTIME_NOW {
-            touch_file(guest, RawInode::new(after.st_dev, after.st_ino)).await;
+            touch_file(guest, file).await;
             return Ok(res);
         }
         const NANOS_PER_SEC: i128 = 1_000_000_000;
@@ -4601,12 +4814,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         // granularity, at most a second on the filesystems builds use.
         if (0..NANOS_PER_SEC).contains(&(requested - stored)) {
             let nanos = u64::try_from(stored.max(0)).unwrap_or(u64::MAX);
-            set_file_mtime(
-                guest,
-                RawInode::new(after.st_dev, after.st_ino),
-                LogicalTime::from_nanos(nanos),
-            )
-            .await;
+            set_file_mtime(guest, file, LogicalTime::from_nanos(nanos)).await;
         }
         Ok(res)
     }
@@ -5467,6 +5675,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
+    /// The raw device of the filesystem an open descriptor refers to.
+    ///
     /// getdents system call.
     pub async fn handle_getdents<G: Guest<Self>>(
         &self,
@@ -5477,12 +5687,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         }
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
+        // Resolved before the real call: see `directory_device`.
+        let device = self.directory_device(guest, call.fd() as RawFd).await?;
         self.serve_directory_stream(
             guest,
             GetdentsCall {
                 call: Syscall::from(call),
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
+                device,
                 buf,
                 capacity: call.count() as usize,
                 format: DirentFormat::Legacy,
@@ -5501,12 +5714,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(self.record_or_replay(guest, call).await?);
         }
         let buf = call.dirent().ok_or(Errno::EFAULT)?.cast::<u8>();
+        // Resolved before the real call: see `directory_device`.
+        let device = self.directory_device(guest, call.fd() as RawFd).await?;
         self.serve_directory_stream(
             guest,
             GetdentsCall {
                 call: Syscall::from(call),
                 empty: Syscall::from(call.with_count(0)),
                 fd: call.fd() as i32,
+                device,
                 buf,
                 capacity: call.count() as usize,
                 format: DirentFormat::Dirent64,
@@ -5673,12 +5889,11 @@ impl<T: RecordOrReplay> Detcore<T> {
         })??;
         let (passed, copied) = match batch {
             Ok(batch) => {
-                let device = self.directory_device(guest, call.fd).await?;
                 let mut records = Vec::new();
                 let mut names = Vec::with_capacity(batch.len());
                 for (index, entry) in batch.iter().enumerate() {
                     let (d_ino, _) =
-                        determinize_inode(guest, RawInode::new(device, entry.ino)).await;
+                        determinize_inode(guest, RawInode::new(call.device, entry.ino)).await;
                     let d_off = i64::try_from(start + index as u64 + 1).unwrap_or(i64::MAX);
                     call.format
                         .encode(entry, d_ino.as_raw(), d_off, &mut records);
@@ -5714,6 +5929,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// every inode number its entries carry (a mount point's entry names the
     /// directory beneath the mount, on the same device). It is the cached
     /// stat's when Detcore tracks `fd`, and an injected `fstat` otherwise.
+    ///
+    /// A descriptor Detcore does not track (one received over `SCM_RIGHTS`,
+    /// for example) has no cached stat, which is not an error: the kernel owns
+    /// the descriptor table, and the injected `fstat` asks it directly. The
+    /// getdents handlers call this BEFORE the real system call, so an `fstat`
+    /// failure (only possible for a descriptor the kernel would also reject)
+    /// is reported without consuming directory entries, and a successful
+    /// getdents is never turned into an error afterwards.
     async fn directory_device<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -5767,10 +5990,9 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
         let mut entries = read_records(&guest.memory(), call.buf, len, call.format)?;
         sort_dir_entries(&mut entries);
-        let device = self.directory_device(guest, call.fd).await?;
         let mut records = Vec::with_capacity(len);
         for entry in &entries {
-            let (d_ino, _) = determinize_inode(guest, RawInode::new(device, entry.ino)).await;
+            let (d_ino, _) = determinize_inode(guest, RawInode::new(call.device, entry.ino)).await;
             call.format
                 .encode(entry, d_ino.as_raw(), entry.off, &mut records);
         }
@@ -6267,6 +6489,10 @@ struct GetdentsCall<'a> {
     /// The same call asking for no bytes.
     empty: Syscall,
     fd: RawFd,
+    /// The raw device of the directory's filesystem, which keys each entry's
+    /// deterministic inode; resolved before the real call (see
+    /// `Detcore::directory_device`).
+    device: u64,
     buf: AddrMut<'a, u8>,
     /// The guest's buffer size.
     capacity: usize,
@@ -6289,6 +6515,7 @@ impl<'a> GetdentsCall<'a> {
             call,
             empty: self.empty,
             fd: self.fd,
+            device: self.device,
             buf,
             capacity: count as usize,
             format: self.format,
@@ -6470,9 +6697,10 @@ mod procfs_wiring_guard {
                 // The call's argument list, up to its balancing `)`. The
                 // snapshot bytes must be the ones passed, unmodified: a
                 // re-sorted copy would feed the tested loop host-ordered input.
-                // And the stdio map built above must be the one passed: an
-                // empty map here would drop the fdinfo-consistent stdio inode
-                // override and no unit test of the loop itself could notice.
+                // And the stdio map built above, keyed on the raw device and
+                // inode `stat` reports, must be the one passed: an empty map
+                // here would drop the fdinfo-consistent stdio inode override
+                // and no unit test of the loop itself could notice.
                 let args = &body[start + CALL.len()..];
                 let mut depth = 0usize;
                 let end = args
@@ -6495,17 +6723,21 @@ mod procfs_wiring_guard {
                 }
                 if !args[..end]
                     .split(',')
-                    .any(|arg| arg.trim() == "&stdio_by_raw_inode")
+                    .any(|arg| arg.trim() == "&stdio_by_raw_file")
                 {
-                    violations.push("does not pass `&stdio_by_raw_inode` to the minting loop");
+                    violations.push("does not pass `&stdio_by_raw_file` to the minting loop");
                 }
             }
         }
-        // Parsing mapping identities here would mean the order in which this
-        // body mints is no longer the order the unit tests drive.
+        // Parsing mapping headers, collecting their keys, or resolving their
+        // `stat` identities here would mean the order in which this body
+        // resolves and mints is no longer the order the unit tests drive.
+        // `mapping_keys` also matches `mapping_keys_in_text_order`.
         if [
             "mapping_header_identity",
-            "mapping_identities_in_text_order",
+            "mapping_header_key",
+            "mapping_keys",
+            "mapping_stat_identity",
         ]
         .iter()
         .any(|local_parse| body.contains(local_parse))
@@ -6519,11 +6751,12 @@ mod procfs_wiring_guard {
     fn maps_identities_are_minted_through_the_tested_loop() {
         // The mint ORDER is tested behaviourally, against the production loop
         // itself, by `tool_global::tests::maps_*_are_minted_in_text_order_not_raw_order`,
-        // which drive `crate::procfs::mint_mapping_identities`. What those tests
+        // and `maps_keys_are_minted_in_text_order_under_device_keying`, which
+        // drive `crate::procfs::mint_mapping_identities`. What those tests
         // cannot see is whether the snapshot initialiser still calls that loop.
         // This checks only that: the body calls it with `&contents` and
-        // `&stdio_by_raw_inode`, and does not parse mapping identities on its
-        // own. It does not check the order.
+        // `&stdio_by_raw_file`, and does not parse mapping headers or resolve
+        // their identities on its own. It does not check the order.
         let body = handler_body("initialize_procfs_snapshot");
         assert!(
             body.len() > 200 && body.contains("needs_mapping_identities"),
@@ -6549,7 +6782,7 @@ mod procfs_wiring_guard {
         // only, so disabling any single check makes its own control fail.
         const NO_CALL: &str = "does not call `crate::procfs::mint_mapping_identities`";
         const NOT_CONTENTS: &str = "does not pass `&contents` as the snapshot to mint from";
-        const NO_STDIO: &str = "does not pass `&stdio_by_raw_inode` to the minting loop";
+        const NO_STDIO: &str = "does not pass `&stdio_by_raw_file` to the minting loop";
         const LOCAL_PARSE: &str = "parses mapping identities itself instead of delegating";
 
         let no_call = "let mapping_identities = BTreeMap::new();";
@@ -6560,31 +6793,57 @@ mod procfs_wiring_guard {
             maps_minting_wiring_violations(local_loop),
             [NO_CALL, LOCAL_PARSE]
         );
-        let local_order = "let raw_pairs = crate::procfs::mapping_identities_in_text_order(&text);\n\
-                           crate::procfs::mint_mapping_identities(&contents, &stdio_by_raw_inode, &mut minter)";
-        assert_eq!(maps_minting_wiring_violations(local_order), [LOCAL_PARSE]);
+        // The keying commit's first draft: a local loop over the keys in
+        // sorted order, resolving each one itself.
+        let local_order = "for (key, starts) in crate::procfs::mapping_keys(&contents) {\n\
+                           let raw_file = self.mapping_stat_identity(guest, &key, &starts).await?;";
+        assert_eq!(
+            maps_minting_wiring_violations(local_order),
+            [NO_CALL, LOCAL_PARSE]
+        );
+        // Each forbidden name alone, next to an otherwise valid call, so
+        // dropping any one of them from the check fails its own control.
+        let valid_call = "crate::procfs::mint_mapping_identities(\n\
+                          &contents,\n\
+                          &stdio_by_raw_file,\n\
+                          &mut GuestMappingMinter::new(self, guest, readers_address_space),\n\
+                          )";
+        for local_parse in [
+            "let keys = crate::procfs::mapping_keys_in_text_order(&contents);",
+            "let key = crate::procfs::mapping_header_key(line);",
+            "let pair = crate::procfs::mapping_header_identity(line);",
+            "let raw_file = self.mapping_stat_identity(guest, &key, &starts).await?;",
+        ] {
+            assert_eq!(
+                maps_minting_wiring_violations(&format!("{local_parse}\n{valid_call}")),
+                [LOCAL_PARSE],
+                "{local_parse}"
+            );
+        }
         let other_buffer = "crate::procfs::mint_mapping_identities(\n\
                             &resorted,\n\
-                            &stdio_by_raw_inode,\n\
-                            &mut GuestMappingMinter::<G, T>::new(guest),\n\
+                            &stdio_by_raw_file,\n\
+                            &mut GuestMappingMinter::new(self, guest, readers_address_space),\n\
                             )";
         assert_eq!(maps_minting_wiring_violations(other_buffer), [NOT_CONTENTS]);
         let no_stdio = "crate::procfs::mint_mapping_identities(\n\
                         &contents,\n\
                         &BTreeMap::new(),\n\
-                        &mut GuestMappingMinter::<G, T>::new(guest),\n\
+                        &mut GuestMappingMinter::new(self, guest, readers_address_space),\n\
                         )";
         assert_eq!(maps_minting_wiring_violations(no_stdio), [NO_STDIO]);
-        assert!(
-            maps_minting_wiring_violations(
-                "crate::procfs::mint_mapping_identities(\n\
-                 &contents,\n\
-                 &stdio_by_raw_inode,\n\
-                 &mut GuestMappingMinter::<G, T>::new(guest),\n\
-                 )"
-            )
-            .is_empty()
+        // A stdio map keyed on the raw inode alone, as before
+        // https://github.com/rrnewton/hermit/issues/3307 was fixed.
+        let inode_keyed_stdio = "crate::procfs::mint_mapping_identities(\n\
+                                 &contents,\n\
+                                 &stdio_by_raw_inode,\n\
+                                 &mut GuestMappingMinter::new(self, guest, readers_address_space),\n\
+                                 )";
+        assert_eq!(
+            maps_minting_wiring_violations(inode_keyed_stdio),
+            [NO_STDIO]
         );
+        assert!(maps_minting_wiring_violations(valid_call).is_empty());
     }
 
     #[test]
