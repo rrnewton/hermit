@@ -1174,8 +1174,12 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         let detpid = DetPid::from_raw(pid.into()); // TODO(T78538674): virtualize pid.
         cfg.validate_invariants();
         // Read before any guest syscall, so a readlink of another process's
-        // pipe or socket never depends on the tracer's descriptors then. The
-        // outcome is kept; a failure is reported only if a guest needs it.
+        // pipe or socket never depends on the descriptors Detcore's host
+        // process has then. The outcome is kept; a failure is reported only
+        // if a guest needs it. Every backend constructs the tool before the
+        // process can run a second guest thread, so on the in-guest backends
+        // this is the last point at which the probe's descriptors cannot
+        // interleave with the guest's own; see `anonymous_object_devices`.
         let _ = syscalls::anonymous_object_devices();
         Self {
             detpid,
