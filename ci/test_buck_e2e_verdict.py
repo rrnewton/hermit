@@ -95,15 +95,20 @@ sys.exit(report.get("rc", 0))
 """
 # buck2, for the one thing ci/buck-e2e/run asks of it: `test ... --write-test-id FILE
 # //ci/buck-e2e:NAME -- ...`. It writes NAME as the test run id and exits FAKE_BUCK2_RC.
-# With FAKE_BUCK2_TOUCH it appends a line to that file; with FAKE_BUCK2_COMMIT it commits
-# nothing in its working directory, moving HEAD.
+# With FAKE_BUCK2_TOUCH it appends a line to that file (with FAKE_BUCK2_TOUCH_ONLY, only
+# when it runs that target); with FAKE_BUCK2_COMMIT it commits
+# nothing in its working directory, moving HEAD; with FAKE_BUCK2_CALLS it appends its
+# arguments to that file as a JSON line.
 FAKE_BUCK2 = r"""#!/usr/bin/env python3
-import os, subprocess, sys
+import json, os, subprocess, sys
 args = sys.argv[1:]
+if os.environ.get("FAKE_BUCK2_CALLS"):
+    with open(os.environ["FAKE_BUCK2_CALLS"], "a") as calls:
+        calls.write(json.dumps(args) + "\n")
 target = next(arg for arg in args if arg.startswith("//ci/buck-e2e:"))
 with open(args[args.index("--write-test-id") + 1], "w") as f:
     f.write(target.split(":", 1)[1] + "\n")
-if os.environ.get("FAKE_BUCK2_TOUCH"):
+if os.environ.get("FAKE_BUCK2_TOUCH") and os.environ.get("FAKE_BUCK2_TOUCH_ONLY", target) == target:
     with open(os.environ["FAKE_BUCK2_TOUCH"], "a") as touched:
         touched.write("changed during the run\n")
 if os.environ.get("FAKE_BUCK2_COMMIT"):
@@ -478,6 +483,53 @@ class RunTest(unittest.TestCase):
         self.assertEqual(len(calls), 1)
         self.assertEqual(calls[0]["env"]["E2E_IMPORT_RESULTS"], str(self.root / "import"))
         self.assertEqual(calls[0]["argv"][:3], ["run", "--repo-root", str(self.root / "checkout")])
+
+    def test_a_cell_withheld_on_every_re_worker_is_run_again_locally_and_judged(self):
+        x_on_re = [ingest_test.withheld_on("re", ingest_test.X, 100, "rx1"),
+                   ingest_test.withheld_on("re", ingest_test.X, 110, "rx2")]
+        buck2_calls = self.root / "buck2-calls.jsonl"
+        for name, rerun, status in (
+            ("the local rerun passes", ingest_test.execution(ingest_test.X, 200, "PASS", "rx3"), 0),
+            ("the local rerun fails", ingest_test.execution(ingest_test.X, 200, "FAIL", "rx3"), 1),
+        ):
+            with self.subTest(name):
+                for directory in ("import", "work"):
+                    shutil.rmtree(self.root / directory, ignore_errors=True)
+                buck2_calls.unlink(missing_ok=True)
+                self.calls.unlink(missing_ok=True)
+                runs = {"re": x_on_re, "local": [ingest_test.Y_PASSES], ingest_test.X_SLUG: [rerun]}
+                process = self.run_buck_e2e("hybrid", runs, buck2_status=0, FAKE_BUCK2_CALLS=str(buck2_calls))
+                self.assertEqual(process.returncode, status, process.stdout + process.stderr)
+                self.assertIn("1 cell(s) were withheld on every RE worker that ran them; running them locally: "
+                              f"{ingest_test.X_SLUG}\n", process.stderr)
+                reruns = [args for args in calls_in(buck2_calls) if f"//ci/buck-e2e:{ingest_test.X_SLUG}" in args]
+                self.assertEqual(len(reruns), 1, calls_in(buck2_calls))
+                self.assertIn("hermit_e2e.routing=local", reruns[0])
+                self.assertEqual(len(calls_in(buck2_calls)), 3)
+                rows = [json.loads(line) for path in (self.root / "import").rglob("results.jsonl")
+                        for line in path.read_text().splitlines()]
+                x_rows = [(row["outcome"], row["attempt"]) for row in rows if row["test"] == "t/x"]
+                self.assertEqual(x_rows, [(rerun["rows"][0]["outcome"], 1)])
+                self.assertEqual(len(calls_in(self.calls)), 1, "the run was not judged once, after the rerun")
+
+    def test_a_checkout_that_changes_during_the_local_rerun_has_no_verdict(self):
+        runs = {"re": [ingest_test.withheld_on("re", ingest_test.X, 100, "rx1")], "local": [ingest_test.Y_PASSES],
+                ingest_test.X_SLUG: [ingest_test.execution(ingest_test.X, 200, "PASS", "rx2")]}
+        process = self.run_buck_e2e("hybrid", runs, buck2_status=0, FAKE_BUCK2_TOUCH=str(self.tracked),
+                                    FAKE_BUCK2_TOUCH_ONLY=f"//ci/buck-e2e:{ingest_test.X_SLUG}")
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        self.assertIn("running them locally: " + ingest_test.X_SLUG, process.stderr)
+        self.assertIn("has uncommitted changes after the local rerun", process.stderr)
+        self.assertEqual(calls_in(self.calls), [])
+
+    def test_a_cell_still_withheld_only_on_re_after_the_local_rerun_has_no_verdict(self):
+        x_on_re = ingest_test.withheld_on("re", ingest_test.X, 100, "rx1")
+        runs = {"re": [x_on_re], "local": [ingest_test.Y_PASSES],
+                ingest_test.X_SLUG: [ingest_test.withheld_on("re", ingest_test.X, 200, "rx2")]}
+        process = self.run_buck_e2e("hybrid", runs, buck2_status=0)
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        self.assertIn("after the local rerun, cells still have only RE claims", process.stderr)
+        self.assertEqual(calls_in(self.calls), [])
 
     def test_a_run_that_fails_before_judging_leaves_no_older_verdict(self):
         passing_runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}

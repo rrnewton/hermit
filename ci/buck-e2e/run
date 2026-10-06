@@ -32,6 +32,13 @@
 # Tpx retries a failed cell once (--retry 1); cells pass --no-retry to the harness, and
 # ingest.py turns a retried cell's executions into attempts 1 and 2. EXTRA args go to
 # every `buck2 test` before the `--` (e.g. @shim/modes/hybrid).
+# An RE worker can lack a capability a cell needs that the plan cannot route on, because
+# workers differ: `hermit run --strict` on ptrace refuses where the branch counter is
+# inexact. There the harness withholds the cell (HOST-INAPPLICABLE), and its run, having
+# executed no cell, fails, so Tpx retries it on another worker. ingest.py numbers no
+# withheld execution as an attempt. A cell withheld on every RE execution is run once
+# more, locally (-c hermit_e2e.routing=local, only those targets), and the run is
+# ingested again, so import mode never judges a claim this machine did not make.
 # The release hermit is built unstamped (-c hermit_release.unstamped=true: no commit
 # hash or build date in the binary), so a commit that changes no compiled source
 # rebuilds nothing and its cells stay cached. Only scripts/build-buck-release.rs stamps.
@@ -111,44 +118,65 @@ rm -rf -- "${work:?}/verdict"
 extra=("$@")
 tpx=(-- --retry 1 --no-retry-on-skip)
 
-invoke() { # invoke NAME TARGET [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
-    local name=$1 target=$2
-    shift 2
+invoke() { # invoke NAME TARGET... [buck2 args...]: one `buck2 test`, its exit status in NAME.rc
+    local name=$1
+    shift
     set +e
     env -C "$root" "$buck2" test -c hermit_release.unstamped=true "${extra[@]}" "$@" \
         --event-log "$work/$name.event-log.pb.zst" --write-test-id "$work/$name.test_id" \
-        "$target" "${tpx[@]}" >"$work/$name.log" 2>&1
+        "${tpx[@]}" >"$work/$name.log" 2>&1
     echo $? >"$work/$name.rc"
     set -e
+}
+
+ids=()
+collect() { # collect NAME...: append each invocation's test-run id to ids, or exit 1
+    local r rc
+    for r in "$@"; do
+        # buck2 test exits 32 when tests fail: the verdicts are the rows', not the exit code.
+        rc=$(cat "$work/$r.rc")
+        if [[ ! -s $work/$r.test_id ]] || { [[ $rc != 0 && $rc != 32 ]]; }; then
+            echo "ci/buck-e2e/run: buck2 test ($r) failed with exit $rc; see $work/$r.log" >&2
+            tail -20 "$work/$r.log" >&2
+            exit 1
+        fi
+        ids+=("$(cat "$work/$r.test_id")")
+    done
+}
+
+ingest() { # ingest: rows for every invocation in ids, and the cells withheld on every RE execution
+    python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
+        --local-artifacts "$root/buck-out/v2/test/execution" --withheld-on-re "$work/withheld-on-re" "${failed_logs[@]}" "${ids[@]}" || {
+        echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
+        exit 1
+    }
 }
 
 if [[ $mode == hybrid ]]; then
     invoke re //ci/buck-e2e:re &
     invoke local //ci/buck-e2e:local &
     wait
-    runs=(re local)
+    collect re local
 else
     invoke all //ci/buck-e2e:all -c hermit_e2e.routing=local
-    runs=(all)
+    collect all
 fi
-
-ids=()
-for r in "${runs[@]}"; do
-    # buck2 test exits 32 when tests fail: the verdicts are the rows', not the exit code.
-    rc=$(cat "$work/$r.rc")
-    if [[ ! -s $work/$r.test_id ]] || { [[ $rc != 0 && $rc != 32 ]]; }; then
-        echo "ci/buck-e2e/run: buck2 test ($r) failed with exit $rc; see $work/$r.log" >&2
-        tail -20 "$work/$r.log" >&2
+require_staged_source "after the run" 1
+ingest
+if [[ -s $work/withheld-on-re ]]; then
+    mapfile -t withheld <"$work/withheld-on-re"
+    echo "ci/buck-e2e/run: ${#withheld[@]} cell(s) were withheld on every RE worker that ran them; running them locally:" \
+        "${withheld[*]}" >&2
+    invoke rerun-local "${withheld[@]/#/"//ci/buck-e2e:"}" -c hermit_e2e.routing=local
+    collect rerun-local
+    require_staged_source "after the local rerun" 1
+    ingest
+    if [[ -s $work/withheld-on-re ]]; then
+        echo "ci/buck-e2e/run: after the local rerun, cells still have only RE claims: $(paste -sd' ' "$work/withheld-on-re");" \
+            "the run has no verdict" >&2
         exit 1
     fi
-    ids+=("$(cat "$work/$r.test_id")")
-done
-require_staged_source "after the run" 1
-python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
-    --local-artifacts "$root/buck-out/v2/test/execution" "${failed_logs[@]}" "${ids[@]}" || {
-    echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
-    exit 1
-}
+fi
 ((verdict)) || {
     echo "ci/buck-e2e/run: --no-verdict: the rows in $out are unjudged; this run has no verdict" >&2
     exit 0

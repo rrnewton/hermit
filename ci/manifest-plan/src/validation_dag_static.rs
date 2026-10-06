@@ -753,7 +753,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest-plan's validation_dag::tests::
     // pinned_workspace_compile_does_not_wait_for_the_rust_script_tools retains
     // all 968: 969 (a full validation executed 969 against the 968 pin).
-    ("test.regular_crates", 969),
+    // Three exact-branch-counter tests
+    // (https://github.com/rrnewton/hermit/issues/3794: detcore-model's
+    // host_capability::tests::exact_branch_counter_needs_evidence,
+    // manifest-plan's runner::tests::exact_branch_counter_is_read_from_the_typed_host_report
+    // and test-harness's
+    // tests::strict_run_pmu_clock_cells_are_withheld_where_the_binary_reports_an_inexact_counter)
+    // retain all 969: 969 + 3 = 972.
+    ("test.regular_crates", 972),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -922,7 +929,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // tests::liteinst_detlog_forwarding_hands_the_guest_its_per_target_policy
     // and tests::detlog_forward_policy_matches_real_detlog_emission_under_field_filters
     // retain all 841 (843, measured with cargo nextest list).
-    ("test.hermit_unit", 843),
+    // Six exact-branch-counter tests
+    // (https://github.com/rrnewton/hermit/issues/3794: host_capabilities::tests::
+    // only_a_failed_validation_of_an_armed_counter_is_inexact,
+    // a_validation_failure_kind_carries_no_measured_count and
+    // cpu_identity_reads_the_first_processor; run::
+    // strict_refuses_an_inexact_branch_counter_on_the_pmu_backends,
+    // strict_refusal_needs_strict_a_pmu_backend_and_an_inexact_counter and
+    // strict_run_refuses_an_inexact_branch_counter_before_it_looks_at_the_program)
+    // retain all 843: 843 + 6 = 849.
+    ("test.hermit_unit", 849),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1414,7 +1430,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same SaBRe DETLOG forwarding-policy test retains all 838: 839.
     // And the two guest-rebinding host_input_change tests (841).
     // And the same two LiteInst DETLOG forwarding-policy tests (843).
-    ("test.hermit_unit_on_host", 843),
+    // The host twin selects the same six exact-branch-counter tests: 843 + 6 = 849.
+    ("test.hermit_unit_on_host", 849),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -1479,7 +1496,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The legacy-form host-input test listed there retains all 966: 967.
     // The same detcore-sabre forwarding-policy test retains all 967: 968.
     // The same pinned-workspace-compile ordering test retains all 968: 969.
-    ("test.regular_crates_on_host", 969),
+    // The three exact-branch-counter tests listed there retain all 969: 972.
+    ("test.regular_crates_on_host", 972),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

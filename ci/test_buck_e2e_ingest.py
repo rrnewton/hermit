@@ -159,8 +159,17 @@ def write_test_runs(fake, runs):
         (fake / f"list-{run_id}.json").write_text(json.dumps(listing))
 
 
+def withheld_on(route, cell, end, run_id):
+    """An execution of CELL that withheld it (no row, a host-inapplicable claim)
+    on ROUTE, as cell.sh records it in result.json."""
+    summary = {"schema": 1, "host_inapplicable_cells": [claim(cell)]}
+    result = {"cell": cell, "run_id": run_id, "evidence_complete": True, "route": route}
+    return execution(cell, end, None, run_id, summary=summary, result=result)
+
+
 Y_PASSES = execution(Y, 150, "PASS", "ry1")
 HOST_INAPPLICABLE_X = {"schema": 1, "host_inapplicable_cells": [claim(X)]}
+X_SLUG = "t-x-custom-ptrace"
 
 
 class IngestTest(unittest.TestCase):
@@ -176,7 +185,8 @@ class IngestTest(unittest.TestCase):
     def ingest(self, runs, local=(), extra=(), **environment):
         """Run ingest.py on RUNS ({test run id: [execution, ...]}), with each
         execution in LOCAL copied into its own buck-out artifacts directory and
-        EXTRA added to its arguments."""
+        EXTRA added to its arguments. Its --withheld-on-re list goes to
+        WORK/withheld-on-re."""
         work = Path(tempfile.mkdtemp(dir=self.root))
         fake = work / "fake"
         write_test_runs(fake, runs)
@@ -189,6 +199,8 @@ class IngestTest(unittest.TestCase):
             str(work / "out"),
             "--work",
             str(work / "fetched"),
+            "--withheld-on-re",
+            str(work / "withheld-on-re"),
         ]
         if local:
             buck_out = work / "buck-out-test-execution"
@@ -207,11 +219,13 @@ class IngestTest(unittest.TestCase):
         self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
         self.assertIn(reason, process.stderr)
 
-    def accepted(self, runs, local=()):
+    def accepted(self, runs, local=(), withheld_on_re=()):
         """Return ingest.py's printed summary, the bucket's rows as (cell,
-        attempt, outcome, run id), and the bucket's summary.json."""
+        attempt, outcome, run id), and the bucket's summary.json. The cells it
+        lists as withheld on RE by every execution must be WITHHELD_ON_RE."""
         work, process = self.ingest(runs, local)
         self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual((work / "withheld-on-re").read_text(), "".join(f"{slug}\n" for slug in withheld_on_re))
         bucket = work / "out" / "portable" / "manifest_cat"
         written = [json.loads(line) for line in (bucket / "results.jsonl").read_text().splitlines()]
         rows = [
@@ -319,6 +333,88 @@ class IngestTest(unittest.TestCase):
                     },
                     f"neither a row nor a host-inapplicable claim from every execution: ['{X}'] (1)",
                 )
+
+    def test_an_execution_that_withheld_its_cell_on_re_takes_no_attempt_number(self):
+        """The worker could not run the cell; Tpx retried it on another, whose
+        first try is the cell's attempt 1."""
+        cases = [
+            ("then passed", [execution(X, 200, "PASS", "rx2")], [(X, 1, "PASS", "rx2")]),
+            (
+                "then failed and passed",
+                [execution(X, 200, "FAIL", "rx2"), execution(X, 300, "PASS", "rx3")],
+                [(X, 1, "FAIL", "rx2"), (X, 2, "PASS", "rx3")],
+            ),
+        ]
+        for name, later, rows_wanted in cases:
+            with self.subTest(name):
+                printed, rows, summary = self.accepted({"RUN": [withheld_on("re", X, 100, "rx1"), *later, Y_PASSES]})
+                self.assertEqual(rows, rows_wanted + [(Y, 1, "PASS", "ry1")])
+                self.assertEqual(summary.get("host_inapplicable_cells"), None)
+                self.assertEqual(printed["withheld_on_re_executions"], 1)
+                self.assertEqual(printed["withheld_on_re_every_execution"], 0)
+                self.assertEqual(printed["no_row_examples"], [])
+        # A hybrid run's local rerun is another test run, listed after the RE one.
+        printed, rows, _ = self.accepted(
+            {
+                "RE": [withheld_on("re", X, 100, "rx1"), withheld_on("re", X, 200, "rx2"), Y_PASSES],
+                "RERUN": [execution(X, 300, "PASS", "rx3")],
+            }
+        )
+        self.assertEqual(rows, [(X, 1, "PASS", "rx3"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["withheld_on_re_executions"], 2)
+
+    def test_only_a_claim_made_on_re_is_skipped(self):
+        """A claim this machine made, or one whose route is not recorded, still
+        takes its number, so the PASS after it is attempt 2."""
+        for route in ("local", None, ""):
+            with self.subTest(route=route):
+                first = withheld_on(route, X, 100, "rx1")
+                if route is None:
+                    del first["result"]["route"]
+                printed, rows, _ = self.accepted({"RUN": [first, execution(X, 200, "PASS", "rx2"), Y_PASSES]})
+                self.assertEqual(rows, [(X, 2, "PASS", "rx2"), (Y, 1, "PASS", "ry1")])
+                self.assertEqual(printed["withheld_on_re_executions"], 0)
+        # An RE execution that wrote a row, or wrote none without a claim, is an attempt.
+        killed_on_re = execution(X, 100, None, "rx1", complete=False)
+        killed_on_re["result"]["route"] = "re"
+        printed, rows, _ = self.accepted({"RUN": [killed_on_re, execution(X, 200, "PASS", "rx2"), Y_PASSES]})
+        self.assertEqual(rows, [(X, 2, "PASS", "rx2"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["no_row_examples"], [f"{X} attempt 1"])
+        failed_on_re = execution(X, 100, "FAIL", "rx1")
+        failed_on_re["result"]["route"] = "re"
+        _, rows, _ = self.accepted({"RUN": [failed_on_re, execution(X, 200, "PASS", "rx2"), Y_PASSES]})
+        self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (X, 2, "PASS", "rx2"), (Y, 1, "PASS", "ry1")])
+        # So is one that wrote a row and also claimed the cell: the row is kept and numbered.
+        failed_and_claimed_on_re = withheld_on("re", X, 100, "rx1")
+        failed_and_claimed_on_re["rows"] = [row(X, "FAIL", "rx1")]
+        printed, rows, _ = self.accepted({"RUN": [failed_and_claimed_on_re, execution(X, 200, "PASS", "rx2"), Y_PASSES]})
+        self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (X, 2, "PASS", "rx2"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(printed["withheld_on_re_executions"], 0)
+
+    def test_a_claim_on_re_after_a_row_leaves_the_row_and_the_claim_for_import_mode(self):
+        """Import mode refuses a cell with both a row and a claim; skipping the
+        claim's number must not hide either."""
+        printed, rows, summary = self.accepted(
+            {"RUN": [execution(X, 100, "FAIL", "rx1"), withheld_on("re", X, 200, "rx2"), Y_PASSES]}
+        )
+        self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (Y, 1, "PASS", "ry1")])
+        self.assertEqual(summary["host_inapplicable_cells"], [claim(X)])
+        self.assertEqual(printed["final_outcomes"], {"HOST-INAPPLICABLE": 1, "PASS": 1})
+        self.assertEqual(printed["withheld_on_re_every_execution"], 0)
+
+    def test_a_cell_withheld_on_re_by_every_execution_is_listed_for_a_local_rerun(self):
+        printed, rows, summary = self.accepted(
+            {"RUN": [withheld_on("re", X, 100, "rx1"), withheld_on("re", X, 200, "rx2"), Y_PASSES]},
+            withheld_on_re=[X_SLUG],
+        )
+        self.assertEqual(rows, [(Y, 1, "PASS", "ry1")])
+        self.assertEqual(summary["host_inapplicable_cells"], [claim(X)])
+        self.assertEqual(printed["withheld_on_re_every_execution"], 1)
+        # Not when one of the claims is this machine's own: import mode can confirm that one.
+        printed, _, _ = self.accepted(
+            {"RUN": [withheld_on("re", X, 100, "rx1"), withheld_on("local", X, 200, "rx2"), Y_PASSES]}
+        )
+        self.assertEqual(printed["withheld_on_re_every_execution"], 0)
 
     def test_every_plan_cell_and_no_other_cell(self):
         self.refused(

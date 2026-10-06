@@ -3,7 +3,7 @@
 
 usage: ingest.py --plan ci/expected-e2e-plan.json --out IMPORT_DIR [--work DIR]
                  [--local-artifacts BUCK_OUT_TEST_DIR] [--failed-verify-logs DIR]
-                 TEST_RUN_ID...
+                 [--withheld-on-re FILE] TEST_RUN_ID...
 
 TEST_RUN_ID is what `buck2 test --write-test-id FILE` wrote (one per invocation; the
 hybrid run makes two, one for RE cells and one for local cells). Every cell execution
@@ -30,6 +30,17 @@ order is attempt N, and its row (at most one, for its own cell) carries that num
 execution that wrote no row still takes its number, so the next row shows the gap and
 import mode refuses the history. "Passed only on rerun" therefore stays visible, as
 attempt 1 failing before attempt 2 passes, even when attempt 1 died before writing a row.
+The one exception is an execution that withheld its cell on an RE worker: it wrote no row,
+its summary.json claims the cell host-inapplicable, and its result.json records route "re".
+That harness started no hermit, because the worker it landed on cannot run the cell (a
+worker without an exact branch counter, which the plan cannot route around: RE workers
+differ in CPU model). It is not an attempt and takes no number; the cell's next execution,
+on another worker, is attempt 1. Any other claim followed by a later execution still takes
+its number.
+--withheld-on-re FILE: write the Buck target name (the harness's slug) of each cell that
+has no row and was withheld on RE by every one of its executions, one per line. Import
+mode would judge such a cell's claim against the machine that imports it, which did not
+make it, so ci/buck-e2e/run runs these cells again locally and ingests once more.
 A cell with no rows is host-inapplicable only if it ran and every one of its executions
 says so in its own summary.json. Any other plan cell with no rows is an error, and so is
 a cell outside the plan. Executions of one cell that end in the same second are refused:
@@ -131,6 +142,10 @@ def markers(names):
 
 def cell_of(entry):
     return "{}/{}@{}".format(entry.get("test"), entry.get("mode"), entry.get("backend") or "native")
+
+def cell_slug(cell):
+    """A plan cell's Buck target name (defs.bzl cell_slug)."""
+    return "{}-{}-{}".format(cell["test"].replace("/", "-"), cell["mode"], cell["backend"])
 
 def claims_host_inapplicable(cell, summary):
     return any(cell_of(h) == cell for h in (summary or {}).get("host_inapplicable_cells", []))
@@ -325,6 +340,7 @@ def main():
     ap.add_argument("--local-artifacts", help="buck-out/v2/test/execution: read an execution from here when one directory holds its marker")
     ap.add_argument("--failed-verify-logs", metavar="DIR", help="keep the verify logs of every execution that did not pass here")
     ap.add_argument("--failed-log-max-bytes", type=int, default=FAILED_LOG_MAX_BYTES, help=argparse.SUPPRESS)  # tests only
+    ap.add_argument("--withheld-on-re", help="write the target name of each cell withheld on RE by every execution here")
     ap.add_argument("run_ids", nargs="+")
     a = ap.parse_args()
     failed_root, failed_logs_error = a.failed_verify_logs, None
@@ -461,7 +477,7 @@ def main():
             run_cells[run_id] = where
         if result is not None and result.get("evidence_complete") is True:
             complete_runs[cell].append(run_id)
-        per_cell[cell].append((rows, summary))
+        per_cell[cell].append((rows, summary, result.get("route") if result is not None else None))
         log_sources.append((run_id, result, logs))
         # An execution with neither a row nor a log (one that claimed host inapplicability) has nothing to keep.
         if failed is not None and (rows or failed[0]):
@@ -493,7 +509,10 @@ def main():
 
     def covered(cell):
         runs = per_cell.get(cell, [])
-        return any(rows for rows, _ in runs) or (runs and all(claims_host_inapplicable(cell, s) for _, s in runs))
+        return any(rows for rows, _, _ in runs) or (runs and all(claims_host_inapplicable(cell, s) for _, s, _ in runs))
+
+    def withheld_on_re(cell, rows, summary, route):
+        return not rows and route == "re" and claims_host_inapplicable(cell, summary)
     missing = sorted(c for c in want if not covered(c))
     extra = sorted(set(per_cell) - set(want))
     if missing or extra:
@@ -505,9 +524,11 @@ def main():
     attempts = collections.Counter()
     final = collections.Counter()
     no_row = []  # "cell attempt N" for each execution that wrote no row and claimed no host inapplicability
+    withheld = 0  # executions that withheld their cell on an RE worker, which take no attempt number
+    rerun_locally = []  # cells withheld on RE by every execution
     for cell, runs in per_cell.items():
         lane, category = want[cell]["lane"], want[cell]["category"]
-        final_rows, final_summary = runs[-1]
+        final_rows, final_summary, _ = runs[-1]
         if final_summary:
             summaries[(lane, category)].append(final_summary)
         c = want[cell]
@@ -515,7 +536,14 @@ def main():
             evidence_complete[(lane, category)].append(
                 {"test": c["test"], "mode": c["mode"], "backend": None if c["backend"] == "native" else c["backend"],
                  "run_id": run_id})
-        for attempt, (rows, summary) in enumerate(runs, 1):
+        if all(withheld_on_re(cell, *run) for run in runs):
+            rerun_locally.append(cell_slug(want[cell]))
+        attempt = 0
+        for rows, summary, route in runs:
+            if withheld_on_re(cell, rows, summary, route):
+                withheld += 1
+                continue
+            attempt += 1
             for row in rows:
                 buckets[(lane, category)].append(dict(row, attempt=attempt))
                 attempts[attempt] += 1
@@ -544,6 +572,9 @@ def main():
         with open(os.path.join(d, "summary.json"), "w") as f:
             json.dump(total, f, indent=2, sort_keys=True)
             f.write("\n")
+    if a.withheld_on_re:
+        with open(a.withheld_on_re, "w") as f:
+            f.writelines(slug + "\n" for slug in sorted(rerun_locally))
     logs_root = os.path.join(a.out, LOGS_DIR)
     shutil.rmtree(logs_root, ignore_errors=True)
     os.makedirs(logs_root)  # fails if a previous ingest's logs could not all be removed
@@ -563,6 +594,7 @@ def main():
     print(json.dumps({"sources": dict(sources), "cells": len(per_cell), "buckets": len(set(buckets) | set(summaries)), "rows": sum(attempts.values()),
                       "attempts": dict(attempts), "final_outcomes": dict(final),
                       "no_row_executions": len(no_row), "no_row_examples": sorted(no_row)[:20],
+                      "withheld_on_re_executions": withheld, "withheld_on_re_every_execution": len(rerun_locally),
                       "evidence_complete_executions": sum(len(v) for v in evidence_complete.values()),
                       "verify_logs_restored": len(index) - len(unrestored), "verify_logs_unrestored": len(unrestored),
                       "verify_logs_unrestored_examples": unrestored[:5],
