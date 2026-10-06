@@ -421,6 +421,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// waits, so it resumes them from the record the wait kept
     /// (`syscalls::helpers::RestartBlock`). Any other `restart_syscall` keeps the
     /// unsupported-syscall policy.
+    // TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/pull/3361): Review the
+    // emulated `restart_syscall` resumption and the record it consumes.
     async fn handle_restart_syscall<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -3087,6 +3089,7 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
             // The kernel's restart of a wait Detcore emulates resumes it; any other
             // `restart_syscall` keeps the unsupported-syscall policy below.
+            // AUTONOMOUS-BOT-IMPLEMENTED
             SyscallClassification::Unsupported if call.number() == Sysno::restart_syscall => {
                 self.handle_restart_syscall(
                     guest,
