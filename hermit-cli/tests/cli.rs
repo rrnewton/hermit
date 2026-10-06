@@ -6650,7 +6650,7 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
     let _lock = hermit_run_guard();
     /// Arguments and the configuration the refusal must name.
     type Case<'a> = (&'a [&'a str], &'a str);
-    let cases: [Case; 6] = [
+    let cases: [Case; 7] = [
         (
             &[
                 "--max-log-bytes=64K",
@@ -6718,6 +6718,21 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
                 "/bin/true",
             ],
             "--backend=kvm and --no-namespace",
+        ),
+        // Round-4c review, finding 1: the ptrace tracer starts the GDB server
+        // after it spawns the guest and before PTRACE_O_EXITKILL binds it. The
+        // refusal comes before any GDB server is started, so nothing waits for
+        // a client here.
+        (
+            &[
+                "--max-log-bytes=64K",
+                "run",
+                "--no-namespace",
+                "--gdbserver",
+                "--",
+                "/bin/true",
+            ],
+            "--gdbserver and --no-namespace",
         ),
     ];
     for (args, named) in cases {

@@ -2891,7 +2891,7 @@ fn log_cap_refusal_for(global: &[&str], options: &[&str]) -> Result<(), Error> {
 /// ends nothing where the guest is not bound to that process.
 #[test]
 fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
-    let refused: [(&[&str], &[&str], &str); 5] = [
+    let refused: [(&[&str], &[&str], &str); 7] = [
         (
             &["--max-log-bytes=4K", "--backend=liteinst"],
             &["--no-namespace", "--max-timeslice=disabled"],
@@ -2918,6 +2918,18 @@ fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
             &["--max-log-bytes=4K", "--backend=sabre"],
             &["--no-namespace"],
             "--backend=sabre and --no-namespace",
+        ),
+        // Round-4c review, finding 1: the ptrace tracer starts the GDB server
+        // after it spawns the guest and before PTRACE_O_EXITKILL binds it.
+        (
+            &["--max-log-bytes=4K", "--backend=ptrace"],
+            &["--no-namespace", "--gdbserver"],
+            "--gdbserver and --no-namespace",
+        ),
+        (
+            &["--max-log-bytes=4K"],
+            &["--gdbserver", "--no-namespace"],
+            "--gdbserver and --no-namespace",
         ),
     ];
     for (global, options, named) in refused {
@@ -2970,6 +2982,13 @@ fn log_cap_is_accepted_where_hermit_takes_the_guest_down_with_it() {
     .unwrap();
     // The default backend, without --backend.
     log_cap_refusal_for(&["--max-log-bytes=4K"], &["--no-namespace"]).unwrap();
+    // --gdbserver inside hermit's PID namespace, whose death takes the guest
+    // with it even before PTRACE_O_EXITKILL is set.
+    log_cap_refusal_for(
+        &["--max-log-bytes=4K", "--backend=ptrace"],
+        &["--gdbserver"],
+    )
+    .unwrap();
 }
 
 /// Every backend and namespace mode, so a change to the decision is a change
@@ -4266,6 +4285,13 @@ impl RunOpts {
     ///   signal. Unproven is refused until each site is audited; inside
     ///   hermit's PID namespace the question does not arise.
     ///
+    /// One refusal does not depend on the backend, so
+    /// [`Self::refuse_unsupervised_log_cap`] adds it to this table: `--gdbserver`
+    /// with `--no-namespace`. Reverie's ptrace tracer spawns the guest, then
+    /// starts the GDB server, whose accepted-client event is charged, and sets
+    /// `PTRACE_O_EXITKILL` only after that (round-4c review of
+    /// https://github.com/rrnewton/hermit/pull/3686, finding 1).
+    ///
     /// The match has no wildcard arm, so a new backend must be classified here
     /// before it compiles. Not every subcommand that accepts the global flag
     /// passes through this check, and each one stands as follows (round-3
@@ -4280,7 +4306,8 @@ impl RunOpts {
     ///   `owned_container::run` and never call it. `validate_backend_scope`
     ///   admits only ptrace there, plus e9patch preprocessing on the ptrace
     ///   runtime for `record start`, and a ptrace guest is bound in both
-    ///   namespace modes.
+    ///   namespace modes. Their GDB servers (`replay` and `record start
+    ///   --verify-with-gdbex`) always run inside hermit's PID namespace.
     /// - `hermit --backend=sabre strace` starts no container: `StraceOpts::main`
     ///   refuses the flag itself, and `strace` with any other backend fails
     ///   before it starts anything.
@@ -4319,7 +4346,8 @@ impl RunOpts {
     }
 
     /// Refuses `--max-log-bytes` (exit 122) where [`Self::log_cap_refusal`]
-    /// says the cap could end hermit and leave the guest running. Hermit does
+    /// says the cap could end hermit and leave the guest running, and for
+    /// `--gdbserver` with `--no-namespace`, whatever the backend. Hermit does
     /// not supervise the guest tree itself, so the honest answer is to refuse
     /// the combination rather than report a run as stopped when it is not.
     pub(crate) fn refuse_unsupervised_log_cap(
@@ -4329,7 +4357,14 @@ impl RunOpts {
         if max_log_bytes.is_none() {
             return Ok(());
         }
-        match Self::log_cap_refusal(self.selected_backend(), self.no_namespace) {
+        const GDBSERVER: &str = "--gdbserver and --no-namespace: the ptrace tracer starts the \
+             GDB server after it spawns the guest and before PTRACE_O_EXITKILL binds the guest \
+             to it, and the server's log can cross the cap in that window; no PID namespace \
+             contains the guest, so exiting 123 there would leave it behind; drop --no-namespace";
+        let gdbserver_window = self.no_namespace && self.det_opts.det_config.gdbserver;
+        let refusal = Self::log_cap_refusal(self.selected_backend(), self.no_namespace)
+            .or(gdbserver_window.then_some(GDBSERVER));
+        match refusal {
             None => Ok(()),
             Some(reason) => Err(Error::new(PolicyRefusal)
                 .context(format!("--max-log-bytes cannot be enforced with {reason}"))),
