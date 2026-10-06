@@ -188,6 +188,8 @@ const HANDLED_BEFORE_EXIT_MS: u64 = SIGNAL_DELAY_MS + SIGNAL_DELAY_MS / 2;
 /// Trials in the guest's `sigsuspend creator` mode (`CREATOR_TRIALS` in the
 /// guest).
 const CREATOR_TRIALS: usize = 6;
+/// Trials in the guest's `racing` mode (`RACING_TRIALS` in the guest).
+const RACING_TRIALS: usize = 6;
 /// Part of the INFO line Hermit's scheduler logs when a signal is delivered to a
 /// thread that sleeps outside its run queue, here the creator in
 /// `rt_sigsuspend` (`[dtid N] signal S armed signaled background thread`, in
@@ -979,6 +981,100 @@ fn liteinst_readiness_waits_are_not_ended_by_non_interrupting_thread_signals() {
 #[test]
 fn liteinst_readiness_waits_are_not_ended_by_non_interrupting_process_signals() {
     assert_readiness_waits_are_not_ended("liteinst", "process");
+}
+
+/// A call that does not wait reports its result although a caught signal races
+/// it: a ready descriptor for `poll` and `ppoll`, a queued event for
+/// `epoll_wait` and `epoll_pwait`, or an argument error, EINVAL for
+/// `epoll_wait` with maxevents 0, EBADF for `epoll_wait` on a descriptor that is
+/// not open, and EFAULT for `rt_sigtimedwait` with a set it cannot read. Linux
+/// looks at pending signals only after those checks: do_poll returns a ready
+/// count before it checks signal_pending, ep_poll hands over queued events
+/// first, and do_epoll_wait and rt_sigtimedwait check their arguments first.
+/// So in each of the guest's six trials, wherever the sibling's SIGUSR1 lands,
+/// the call returns its result and the handler runs once; the cell is
+/// strict-verified. Before round 7 of
+/// https://github.com/rrnewton/hermit/pull/3361, Hermit's first probe of these
+/// calls saw the pending signal first and returned EINTR in the trial where
+/// the signal was already pending when the call began (`matched=5`).
+fn assert_racing_call(backend: &str, call: &str) {
+    assert_cell(
+        backend,
+        FutexMode::Precise,
+        &[call, "racing"],
+        false,
+        &format!("RESULT call={call} role=racing trials={RACING_TRIALS} matched={RACING_TRIALS}"),
+    );
+}
+
+#[test]
+fn ptrace_poll_reports_a_ready_descriptor_before_a_racing_signal() {
+    assert_racing_call("ptrace", "poll");
+}
+
+#[test]
+fn ptrace_ppoll_reports_a_ready_descriptor_before_a_racing_signal() {
+    assert_racing_call("ptrace", "ppoll");
+}
+
+#[test]
+fn ptrace_epoll_wait_reports_a_queued_event_before_a_racing_signal() {
+    assert_racing_call("ptrace", "epoll");
+}
+
+#[test]
+fn ptrace_epoll_pwait_reports_a_queued_event_before_a_racing_signal() {
+    assert_racing_call("ptrace", "epollpwait");
+}
+
+#[test]
+fn ptrace_epoll_wait_reports_einval_for_zero_maxevents_before_a_racing_signal() {
+    assert_racing_call("ptrace", "epollinval");
+}
+
+#[test]
+fn ptrace_epoll_wait_reports_ebadf_for_a_closed_descriptor_before_a_racing_signal() {
+    assert_racing_call("ptrace", "epollbadf");
+}
+
+#[test]
+fn ptrace_rt_sigtimedwait_reports_efault_for_an_unreadable_set_before_a_racing_signal() {
+    assert_racing_call("ptrace", "sigtimedwaitfault");
+}
+
+#[test]
+fn liteinst_poll_reports_a_ready_descriptor_before_a_racing_signal() {
+    assert_racing_call("liteinst", "poll");
+}
+
+#[test]
+fn liteinst_ppoll_reports_a_ready_descriptor_before_a_racing_signal() {
+    assert_racing_call("liteinst", "ppoll");
+}
+
+#[test]
+fn liteinst_epoll_wait_reports_a_queued_event_before_a_racing_signal() {
+    assert_racing_call("liteinst", "epoll");
+}
+
+#[test]
+fn liteinst_epoll_pwait_reports_a_queued_event_before_a_racing_signal() {
+    assert_racing_call("liteinst", "epollpwait");
+}
+
+#[test]
+fn liteinst_epoll_wait_reports_einval_for_zero_maxevents_before_a_racing_signal() {
+    assert_racing_call("liteinst", "epollinval");
+}
+
+#[test]
+fn liteinst_epoll_wait_reports_ebadf_for_a_closed_descriptor_before_a_racing_signal() {
+    assert_racing_call("liteinst", "epollbadf");
+}
+
+#[test]
+fn liteinst_rt_sigtimedwait_reports_efault_for_an_unreadable_set_before_a_racing_signal() {
+    assert_racing_call("liteinst", "sigtimedwaitfault");
 }
 
 /// An ignored, blocked, or default-ignored signal does not end a timed futex wait

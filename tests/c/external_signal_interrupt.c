@@ -15,6 +15,7 @@
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
  *             extchld|extchldreaped|extchldlive]
  *        external_signal_interrupt sigsuspend creator
+ *        external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
  * select system call itself. `sem` is glibc's sem_timedwait, a FUTEX_WAIT_BITSET
@@ -164,6 +165,22 @@
  * ended after the child's exit, the call's result, how often the handler ran,
  * whether it ran on the creator, and the reaped status), then one RESULT line
  * counts the trials that matched Linux.
+ *
+ * The `racing` sender is a mode of its own, for a call that does not wait: a
+ * readable pipe for poll, ppoll (no mask), epoll and epollpwait (epoll_wait and
+ * epoll_pwait with no mask, on an epoll set holding that pipe), epoll_wait with
+ * maxevents 0 for epollinval, epoll_wait on a descriptor that is not open
+ * for epollbadf, and rt_sigtimedwait with a set pointer that cannot be read for
+ * sigtimedwaitfault; every call has a 5 s timeout. Six times, the main thread
+ * starts a thread that waits for a flag, yields the trial number of times, and
+ * sends SIGUSR1 (caught, flags 0) to the main thread with tgkill; the main
+ * thread sets the flag and makes the call. Linux reports a ready descriptor or
+ * an argument error before it looks at pending signals (do_poll, ep_poll,
+ * do_epoll_wait, and rt_sigtimedwait copies its set first), so whenever the
+ * signal arrives the call returns 1 with the pipe's event, or -1 with EINVAL,
+ * EBADF or EFAULT, and the handler runs once by the time the thread is joined.
+ * Each trial prints a TRIAL line, then one RESULT line counts the trials that
+ * matched Linux.
  *
  * Output is one deterministic RESULT line after the call returns, followed
  * by DONE once every helper has been reaped. A kernel-internal errno, which has
@@ -570,6 +587,142 @@ static int creator_main(const char *role_name) {
   return 0;
 }
 
+/* The `racing` sender (see the usage comment). */
+#define RACING_TRIALS 6
+#define RACING_TIMEOUT_MS 5000
+enum racing_call {
+  RACE_POLL,
+  RACE_PPOLL,
+  RACE_EPOLL,
+  RACE_EPOLLP,
+  RACE_EPOLLINVAL,
+  RACE_EPOLLBADF,
+  RACE_SIGTIMEDWAITFAULT
+};
+static int race_go = 0;
+
+struct racer {
+  pid_t target;
+  int yields;
+};
+
+static void *racer_thread(void *arg) {
+  const struct racer *racer = arg;
+  while (!__atomic_load_n(&race_go, __ATOMIC_SEQ_CST)) sched_yield();
+  for (int i = 0; i < racer->yields; i++) sched_yield();
+  if (syscall(SYS_tgkill, getpid(), racer->target, SIGUSR1) != 0) _exit(95);
+  return NULL;
+}
+
+static int racing_main(const char *call) {
+  static const struct {
+    const char *name;
+    enum racing_call call;
+  } calls[] = {
+      {"poll", RACE_POLL},           {"ppoll", RACE_PPOLL},
+      {"epoll", RACE_EPOLL},         {"epollpwait", RACE_EPOLLP},
+      {"epollinval", RACE_EPOLLINVAL}, {"epollbadf", RACE_EPOLLBADF},
+      {"sigtimedwaitfault", RACE_SIGTIMEDWAITFAULT},
+  };
+  int which = -1;
+  for (size_t i = 0; i < sizeof calls / sizeof calls[0]; i++)
+    if (!strcmp(call, calls[i].name)) which = (int)calls[i].call;
+  if (which < 0) return 2;
+  set_handler(SIGUSR1, on_usr1);
+  int fds[2];
+  if (pipe(fds) != 0) return 97;
+  /* The read end stays readable for every trial: nothing reads the byte. */
+  if (write(fds[1], "x", 1) != 1) return 97;
+  int ep = epoll_create1(0);
+  if (ep < 0) return 97;
+  struct epoll_event event;
+  memset(&event, 0, sizeof event);
+  event.events = EPOLLIN;
+  event.data.u32 = 7;
+  if (epoll_ctl(ep, EPOLL_CTL_ADD, fds[0], &event) != 0) return 97;
+  /* A descriptor number that is not open. */
+  int closed = dup(fds[0]);
+  if (closed < 0 || close(closed) != 0) return 97;
+  pid_t self = (pid_t)syscall(SYS_gettid);
+  say("READY\n");
+  int matched = 0;
+  for (int i = 0; i < RACING_TRIALS; i++) {
+    handled = 0;
+    __atomic_store_n(&race_go, 0, __ATOMIC_SEQ_CST);
+    struct racer racer = {self, i};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, racer_thread, &racer) != 0) return 98;
+    __atomic_store_n(&race_go, 1, __ATOMIC_SEQ_CST);
+    struct pollfd pfd = {fds[0], POLLIN, 0};
+    struct timespec timeout = {RACING_TIMEOUT_MS / 1000, 0};
+    struct epoll_event events[4];
+    memset(events, 0, sizeof events);
+    long ret = -1;
+    errno = 0;
+    switch (which) {
+    case RACE_POLL:
+      ret = poll(&pfd, 1, RACING_TIMEOUT_MS);
+      break;
+    case RACE_PPOLL:
+      ret = ppoll(&pfd, 1, &timeout, NULL);
+      break;
+    case RACE_EPOLL:
+      ret = epoll_wait(ep, events, 4, RACING_TIMEOUT_MS);
+      break;
+    case RACE_EPOLLP:
+      ret = syscall(SYS_epoll_pwait, ep, events, 4, RACING_TIMEOUT_MS, NULL, (size_t)8);
+      break;
+    case RACE_EPOLLINVAL:
+      ret = epoll_wait(ep, events, 0, RACING_TIMEOUT_MS);
+      break;
+    case RACE_EPOLLBADF:
+      ret = epoll_wait(closed, events, 4, RACING_TIMEOUT_MS);
+      break;
+    case RACE_SIGTIMEDWAITFAULT:
+      /* Address 1 is never mapped, so the kernel cannot copy the set. */
+      ret = syscall(SYS_rt_sigtimedwait, (const void *)1, NULL, &timeout, (size_t)8);
+      break;
+    }
+    int err = errno;
+    int got = which == RACE_POLL || which == RACE_PPOLL ? pfd.revents
+              : ret > 0                                ? (int)events[0].data.u32
+                                                       : 0;
+    if (pthread_join(thread, NULL) != 0) return 98;
+    /* The racer sent the signal before it exited, so it is pending at the latest
+     * now; the first system call below delivers it. */
+    wait_for_handler();
+    int handled_count = handled;
+    printf("TRIAL %d ret=%ld errno=%s got=%d handled=%d\n", i, ret,
+           ret < 0 ? errno_name(err) : "none", got, handled_count);
+    fflush(stdout);
+    int ok;
+    switch (which) {
+    case RACE_POLL:
+    case RACE_PPOLL:
+      ok = ret == 1 && got == POLLIN;
+      break;
+    case RACE_EPOLL:
+    case RACE_EPOLLP:
+      ok = ret == 1 && got == 7;
+      break;
+    case RACE_EPOLLINVAL:
+      ok = ret == -1 && err == EINVAL;
+      break;
+    case RACE_EPOLLBADF:
+      ok = ret == -1 && err == EBADF;
+      break;
+    default:
+      ok = ret == -1 && err == EFAULT;
+      break;
+    }
+    if (ok && handled_count == 1) matched += 1;
+  }
+  printf("RESULT call=%s role=racing trials=%d matched=%d\n", call, RACING_TRIALS, matched);
+  printf("DONE\n");
+  fflush(stdout);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) {
     say("usage: external_signal_interrupt <futex|sem|select|rawselect|poll|epoll|wait4|waitid> "
@@ -577,7 +730,8 @@ int main(int argc, char **argv) {
         "[ignored|blocked|winch|tstp|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit|"
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
         "spinthrexit|usr2|extchld|extchldreaped|extchldlive]\n"
-        "       external_signal_interrupt sigsuspend creator\n");
+        "       external_signal_interrupt sigsuspend creator\n"
+        "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing\n");
     return 2;
   }
   /* Before any handler is installed: the handler compares against it. */
@@ -585,6 +739,7 @@ int main(int argc, char **argv) {
   const char *call = argv[1];
   const char *sender = argv[2];
   if (!strcmp(call, "sigsuspend")) return creator_main(sender);
+  if (!strcmp(sender, "racing")) return racing_main(call);
   int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
   enum extchld extchld = EXTCHLD_NONE;
   static const struct {
