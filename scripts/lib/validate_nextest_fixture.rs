@@ -253,8 +253,15 @@ fn ensure_prepared_helpers(source: &Path, root: &Path, deadline: u64) {
 
 /// Wall-clock cap of [`prepare_cpu_wrapper`]'s one Cargo build, in seconds.
 const CPU_WRAPPER_WALL_SECONDS: i64 = 600;
-/// CPU cap of the same build. It runs at one Cargo job, like the cases.
+/// CPU cap of the same build.
 const CPU_WRAPPER_CPU_SECONDS: i64 = 900;
+/// Cargo width of the same build. The cases still run at one job; this build
+/// only prepares the wrapper they check for freshness. Cold, under an 8-core
+/// quota, at a25b3fcd3805 on 2026-10-06: 136 s wall at one job, 48 s at four
+/// and 33 s at eight, for 134 to 146 CPU-seconds and a 2.37 to 2.62 GB cgroup
+/// memory peak (page cache included) in all three. At one job it was about
+/// 128 of the 185 seconds this fixture took inside the full script-test run.
+const CPU_WRAPPER_CARGO_JOBS: u32 = 8;
 
 /// Build the standalone Nextest CPU wrapper once, before the timed cases, with
 /// the cases' own environment and private Cargo target directory.
@@ -277,7 +284,7 @@ fn prepare_cpu_wrapper(source: &Path, root: &Path, target: &Path, deadline: u64)
     fs::create_dir_all(prepare.join("tmp")).unwrap();
     let command = format!(
         "cd {} || exit $?; export PATH={}:\"$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT={}; \
-         export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS=1; \
+         export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1 CARGO_NET_OFFLINE=true CARGO_BUILD_JOBS={CPU_WRAPPER_CARGO_JOBS}; \
          export CARGO_TARGET_DIR={} TMPDIR={}; unset HERMIT_PREPARED_NEXTEST_REQUIRED; set +e; \
          {} --force {} build-cpu-wrapper >{} 2>{}; \
          prepare_status=$?; cat {}; cat {} >&2; exit \"$prepare_status\"",
@@ -484,6 +491,7 @@ fn actual_nextest_results_and_publication_failures() {
         "per_case_wall_seconds":180,"per_case_cpu_seconds":300,
         "cpu_wrapper_wall_seconds":CPU_WRAPPER_WALL_SECONDS,
         "cpu_wrapper_cpu_seconds":CPU_WRAPPER_CPU_SECONDS,
+        "cpu_wrapper_cargo_jobs":CPU_WRAPPER_CARGO_JOBS,
         "declared_memory_bytes":2_u64*1024*1024*1024,"dag_width":1,"cargo_jobs":1,"nextest_retries":0,
         "per_case_cgroup_binding":null,"cargo_home_env":cargo_home,
         "cargo_home_policy":"conventional explicit/default Cargo home; ownership not inferred",
