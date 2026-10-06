@@ -1013,7 +1013,11 @@ pub(crate) fn restart_outcome(
 /// `EINTR`, and the kernel still delivers the signal as the thread resumes. A
 /// restart cannot re-execute the call, because the backend resumes after the
 /// syscall instruction: a futex wait returns 0, a wakeup futex(2) allows and
-/// every caller re-checks, and any other call returns `EINTR`.
+/// every caller re-checks, and any other call returns `EINTR`, where Linux
+/// would re-run the call in both cases.
+/// https://github.com/rrnewton/hermit/issues/3403 tracks handing the restart to
+/// a backend that can re-run the call, which also retires the register test
+/// above.
 pub(crate) async fn complete_skipped_syscall_restart<G, T>(
     guest: &mut G,
     call: &Syscall,
