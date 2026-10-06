@@ -555,10 +555,13 @@ fn assert_verified(backend: &str, mode: FutexMode, args: &[&str], run: &GuestRun
     }
 }
 
+/// A change that `verification_report_with` makes to a matching report.
+type ReportEdit = fn(&mut serde_json::Value);
+
 /// A strict verification report with the fields `strict_verification_gap` reads,
 /// as Hermit's verifier writes them for two runs that matched on 412 INFO
 /// messages each, after `edit`.
-fn verification_report_with(edit: fn(&mut serde_json::Value)) -> serde_json::Value {
+fn verification_report_with(edit: ReportEdit) -> serde_json::Value {
     let mut report = serde_json::json!({
         "verified": true,
         "bitwise_parity": true,
@@ -579,7 +582,7 @@ fn strict_verification_requires_bitwise_parity_over_compared_info_messages() {
         strict_verification_gap(&verification_report_with(|_| {})),
         None
     );
-    let refused: [(&str, fn(&mut serde_json::Value)); 10] = [
+    let refused: [(&str, ReportEdit); 10] = [
         ("an empty comparison", |report| {
             report["compared_log_messages"] = serde_json::json!({"left": 0, "right": 0});
         }),
