@@ -169,6 +169,86 @@ impl std::fmt::Display for UnsupportedSyscallError {
 }
 
 impl std::error::Error for UnsupportedSyscallError {}
+
+/// A file identity Detcore could not establish, so it refused rather than key
+/// the file on another source: the lookup the guest makes for it (`stat`,
+/// `statx`, `readlink`, `fstat`) failed for a reason that is not the file's
+/// own answer, or what that answer is checked against (the guest's
+/// mountinfo, the pipefs and sockfs devices) could not be read.
+///
+/// It travels inside [`Error::Tool`], never as an errno, and the process
+/// that made the call must not run on past it: the call may have changed the
+/// guest in a way it could not undo, as an `mmap` over an existing range
+/// does. Each backend stops that process. Ptrace, which e9patch
+/// preprocessing also runs under, and KVM end execution on any tool error
+/// that is not an errno, and in-guest LiteInst ends the process on one.
+/// `detcore-dbt` recognizes this type and ends the runtime tree, as for
+/// [`UnsupportedSyscallError`]. A backend that would hand the error to the
+/// guest as an errno sets the Config's
+/// `exit_process_on_identity_lookup_refusal`, and Detcore ends the process
+/// itself.
+#[derive(Debug)]
+pub struct IdentityLookupRefused(pub String);
+
+impl std::fmt::Display for IdentityLookupRefused {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for IdentityLookupRefused {}
+
+impl IdentityLookupRefused {
+    /// The tool error that carries this refusal.
+    pub fn into_error(self) -> Error {
+        Error::Tool(anyhow::Error::new(self))
+    }
+
+    /// The refusal `error` carries, if it carries one.
+    pub fn carried_by(error: &Error) -> Option<&Self> {
+        match error {
+            Error::Tool(inner) => inner.downcast_ref::<Self>(),
+            _ => None,
+        }
+    }
+}
+
+/// The status of a process Detcore ends for a refused identity lookup: the
+/// status the in-guest tool hosts end a process with on a tool error.
+const IDENTITY_LOOKUP_REFUSED_EXIT_STATUS: libc::c_long = 125;
+
+/// The refusal a syscall's result carries, when the Config asks Detcore to
+/// end the refusing process itself; see [`IdentityLookupRefused`].
+fn refusal_to_exit_on<'a>(
+    cfg: &Config,
+    res: &'a Result<i64, Error>,
+) -> Option<&'a IdentityLookupRefused> {
+    if !cfg.exit_process_on_identity_lookup_refusal {
+        return None;
+    }
+    res.as_ref()
+        .err()
+        .and_then(IdentityLookupRefused::carried_by)
+}
+
+/// Ends the calling process with a raw `exit_group` after one write of the
+/// refusal to stderr. Nothing unwinds and no exit handler runs, so nothing of
+/// the guest's runs after the refused call.
+fn exit_refusing_process(refused: &IdentityLookupRefused) -> ! {
+    let message = format!("detcore: {refused}\n");
+    // SAFETY: two system calls on a buffer that outlives them; `exit_group`
+    // does not return.
+    unsafe {
+        libc::write(
+            libc::STDERR_FILENO,
+            message.as_ptr().cast::<libc::c_void>(),
+            message.len(),
+        );
+        libc::syscall(libc::SYS_exit_group, IDENTITY_LOOKUP_REFUSED_EXIT_STATUS);
+    }
+    unreachable!("exit_group returned")
+}
+
 pub use tool_local::Detcore;
 pub use tool_local::FileMetadata;
 /// Returns whether the audited runtime policy classifies `sysno` as unsupported.
@@ -3054,6 +3134,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             return res;
         }
 
+        // A refused identity lookup ends the refusing process before anything
+        // else of this call runs, on a backend that would otherwise return the
+        // tool error to the guest as an errno.
+        if let Some(refused) = refusal_to_exit_on(&self.cfg, &res) {
+            exit_refusing_process(refused);
+        }
+
         detlog!(
             event = crate::detlog::DetLogEvent::SyscallResult {
                 finished_syscall_number: new_count,
@@ -4238,5 +4325,60 @@ mod finished_syscall_display_tests {
         for result in [Ok(0), Err(Errno::EBADF.into())] {
             assert_no_struct_rendered(&finish_line(&call, result));
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_lookup_refusal_tests {
+    use super::*;
+
+    fn refused() -> Result<i64, Error> {
+        Err(
+            IdentityLookupRefused("could not ask the guest to stat \"/x\": EMFILE".into())
+                .into_error(),
+        )
+    }
+
+    fn exiting_config() -> Config {
+        Config {
+            exit_process_on_identity_lookup_refusal: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_carried_inside_a_tool_error_with_its_message() {
+        let res = refused();
+        let error = res.as_ref().unwrap_err();
+        assert!(matches!(error, Error::Tool(_)), "{error:?}");
+        assert_eq!(
+            IdentityLookupRefused::carried_by(error).map(|refused| refused.to_string()),
+            Some("could not ask the guest to stat \"/x\": EMFILE".to_owned())
+        );
+    }
+
+    #[test]
+    fn detcore_exits_on_a_refusal_only_when_the_config_asks() {
+        assert!(refusal_to_exit_on(&exiting_config(), &refused()).is_some());
+        assert!(refusal_to_exit_on(&Config::default(), &refused()).is_none());
+    }
+
+    #[test]
+    fn detcore_does_not_exit_on_any_other_result() {
+        let config = exiting_config();
+        let other_tool_error: Result<i64, Error> =
+            Err(Error::Tool(anyhow::anyhow!("some other tool error")));
+        let unsupported: Result<i64, Error> = Err(Error::Tool(anyhow::Error::new(
+            UnsupportedSyscallError(Sysno::read),
+        )));
+        let errno: Result<i64, Error> = Err(Error::Errno(Errno::EIO));
+        for res in [Ok(0), errno, other_tool_error, unsupported] {
+            assert!(refusal_to_exit_on(&config, &res).is_none(), "{res:?}");
+        }
+    }
+
+    #[test]
+    fn no_backend_exits_on_a_refusal_by_default() {
+        assert!(!Config::default().exit_process_on_identity_lookup_refusal);
     }
 }

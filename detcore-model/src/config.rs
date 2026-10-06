@@ -111,6 +111,15 @@ pub struct Config {
     // TODO-HUMAN-REVIEW(PR-845): Review backend-owned syscall-clobber determinism.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review backend-local exit-group RPC cancellation.
+    /// Detcore runs inside the guest process, and the backend would return a tool error to the
+    /// guest as an errno and let it continue. Detcore then ends the process itself, with a raw
+    /// `exit_group(125)`, when a syscall's identity lookup is refused, because the refused call
+    /// may have changed the guest in a way it could not undo. A backend whose own tool-error path
+    /// already stops the process leaves this false.
+    #[serde(default)]
+    #[clap(skip)]
+    pub exit_process_on_identity_lookup_refusal: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
     // AUTONOMOUS-BOT-IMPLEMENTED

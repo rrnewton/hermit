@@ -2994,6 +2994,7 @@ mod dbt_detconfig_tests {
 const POST_BASELINE_DBT_DETCONFIG_KEYS: &[(&str, &str)] = &[
     // (key, exact JSON text of its serde default), one entry per line.
     ("anonymous_object_devices", "null"),
+    ("exit_process_on_identity_lookup_refusal", "false"),
 ];
 
 /// Drop each listed member from a serialized [`DetConfig`] while its value is
@@ -3410,6 +3411,65 @@ mod dbt_detconfig_omit_tests {
         );
         assert_dbt_detconfig_round_trips(&config);
     }
+
+    /// `exit_process_on_identity_lookup_refusal` is listed with the text
+    /// `false`, and that is exactly what serde writes for the field's default.
+    #[test]
+    fn exit_process_on_identity_lookup_refusal_default_serializes_as_its_listed_text() {
+        assert!(
+            POST_BASELINE_DBT_DETCONFIG_KEYS
+                .contains(&("exit_process_on_identity_lookup_refusal", "false"))
+        );
+        let serialized = serde_json::to_string(&default_config()).unwrap();
+        assert_eq!(
+            serialized
+                .matches(r#""exit_process_on_identity_lookup_refusal":false"#)
+                .count(),
+            1,
+            "{serialized}"
+        );
+    }
+
+    /// With the field false, which is what `prepare_backend_config` gives
+    /// DBT, the key is absent from `HERMIT_DBT_DETCONFIG`, so the value the
+    /// guest can read keeps its baseline bytes.
+    #[test]
+    fn exit_process_on_identity_lookup_refusal_false_is_absent_from_the_dbt_config() {
+        for (name, config) in [
+            ("default", default_config()),
+            (
+                "dbt",
+                prepare_backend_config(default_config(), Backend::Dbt),
+            ),
+        ] {
+            assert!(!config.exit_process_on_identity_lookup_refusal, "{name}");
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert!(
+                !encoded.contains("exit_process_on_identity_lookup_refusal"),
+                "{name}: {encoded}"
+            );
+        }
+    }
+
+    /// The DBT config decodes back to the same config with the field false,
+    /// whose key is omitted, and with it true, whose key is emitted.
+    #[test]
+    fn exit_process_on_identity_lookup_refusal_round_trips_through_the_dbt_config() {
+        let mut config = default_config();
+        config.exit_process_on_identity_lookup_refusal = false;
+        assert_dbt_detconfig_round_trips(&config);
+
+        config.exit_process_on_identity_lookup_refusal = true;
+        let encoded = dbt_detconfig_json(&config).unwrap();
+        assert_eq!(
+            encoded
+                .matches(r#""exit_process_on_identity_lookup_refusal":true"#)
+                .count(),
+            1,
+            "{encoded}"
+        );
+        assert_dbt_detconfig_round_trips(&config);
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3647,6 +3707,14 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // TODO-HUMAN-REVIEW(PR-1122): Review concurrent KVM process-child scheduling.
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-3635): Review in-guest LiteInst killed-thread RPC cancellation.
+    // A refused identity lookup must end the refusing process. Ptrace (which
+    // e9patch preprocessing also runs under) and KVM end execution on any tool
+    // error that is not an errno, in-guest LiteInst ends the process on one,
+    // and detcore-dbt ends the runtime tree on this refusal. Reverie's SaBRe
+    // adapter would instead return the error to the guest as EIO, so on SaBRe
+    // Detcore, which runs inside the guest process there, ends the process
+    // itself.
+    config.exit_process_on_identity_lookup_refusal = backend == Backend::Sabre;
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
     // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
@@ -5941,6 +6009,28 @@ mod tests {
                 .backend
                 .needs_killed_thread_rpc_cancellation
         );
+    }
+
+    /// Only SaBRe returns a tool error to the guest as an errno, so only
+    /// SaBRe asks Detcore to end a process whose identity lookup it refused;
+    /// every other backend's own tool-error path stops that process.
+    #[test]
+    fn only_sabre_asks_detcore_to_exit_on_a_refused_identity_lookup() {
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Kvm,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::E9patch,
+        ] {
+            assert_eq!(
+                prepare_backend_config(super::DetConfig::default(), backend)
+                    .exit_process_on_identity_lookup_refusal,
+                backend == Backend::Sabre,
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]
