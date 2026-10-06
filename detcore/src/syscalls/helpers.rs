@@ -32,6 +32,7 @@ use crate::resources::ExternalOpId;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::RtSigsuspendWakers;
 use crate::syscalls::threads::KernelSigaction;
 use crate::syscalls::threads::KernelSigset;
 use crate::syscalls::threads::WaitSignalDisposition;
@@ -120,18 +121,20 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// Execute the real `rt_sigsuspend` outside the runnable set while preserving
-    /// its signal-only completion condition for the scheduler.
+    /// its signal-only completion condition for the scheduler. `wakers` names
+    /// the signals that certainly end the call.
     pub async fn record_or_replay_rt_sigsuspend<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::RtSigsuspend,
+        wakers: RtSigsuspendWakers,
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = ExternalOpId::new(dettid, guest.thread_state().stats.syscall_count);
         self.record_or_replay_blocking_resource(
             guest,
             call.into(),
-            ResourceID::BlockingRtSigsuspend(op_id),
+            ResourceID::BlockingRtSigsuspend(op_id, wakers),
         )
         .await
     }
@@ -144,7 +147,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let op_id = match &blocking_resource {
-            ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingRtSigsuspend(op_id) => {
+            ResourceID::BlockingExternalIO(op_id) | ResourceID::BlockingRtSigsuspend(op_id, _) => {
                 *op_id
             }
             _ => unreachable!("blocking syscall helper requires a blocking resource"),

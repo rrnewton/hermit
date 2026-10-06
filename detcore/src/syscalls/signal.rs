@@ -28,6 +28,7 @@ use crate::record_or_replay::RecordOrReplay;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::RtSigsuspendWakers;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::threads::KERNEL_SIGSET_SIZE;
 use crate::syscalls::threads::KernelSigaction;
@@ -121,6 +122,65 @@ fn validate_kernel_sigset_size(sigsetsize: usize) -> Result<(), Errno> {
     } else {
         Err(Errno::EINVAL)
     }
+}
+
+/// Signals that a backend whose signals interrupt real blocking syscalls
+/// holds pending while Detcore's own code runs on the guest thread.
+///
+/// Such a signal cannot be consumed between the scheduler's grant and the real
+/// `rt_sigsuspend`: if it arrives in that window the backend makes the call
+/// return `EINTR` at once, and if it arrives during the call the kernel does.
+/// That is what lets the scheduler count on the wake. The list mirrors the
+/// signals the SaBRe backend's central handler mediates (the standard signals
+/// except the synchronous SIGILL and SIGSEGV, the uncatchable SIGKILL and
+/// SIGSTOP, and its own SIGSTKFLT) in reverie's
+/// `experimental/reverie-sabre/src/signal.rs`. A signal missing from this list
+/// only keeps the scheduler's older behavior for it.
+fn backend_holds_signal_during_tool_code(signal: i32) -> bool {
+    (1..=31).contains(&signal)
+        && !matches!(
+            signal,
+            libc::SIGILL | libc::SIGKILL | libc::SIGSEGV | libc::SIGSTOP
+        )
+        && signal != reverie::PERF_EVENT_SIGNAL as i32
+}
+
+/// The signals certain to end an `rt_sigsuspend` with this temporary mask with
+/// `EINTR`: held pending by the backend (see
+/// `backend_holds_signal_during_tool_code`), outside the temporary mask, and
+/// with a real handler installed. A default or ignored action is excluded,
+/// because it either ends the process or does not end the call at all.
+async fn rt_sigsuspend_wakers<G, T>(
+    guest: &mut G,
+    temporary_mask: KernelSigset,
+) -> Result<RtSigsuspendWakers, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mut stack = guest.stack().await;
+    let action_addr = stack.reserve::<KernelSigaction>();
+    let guard = stack.commit()?;
+    let mut wakers: KernelSigset = 0;
+    for signal in 1..=KernelSigset::BITS as i32 {
+        let bit = 1_u64 << (signal - 1);
+        if temporary_mask & bit != 0 || !backend_holds_signal_during_tool_code(signal) {
+            continue;
+        }
+        let call = syscalls::RtSigaction::new()
+            .with_signum(signal)
+            .with_action(None)
+            .with_old_action(Some(action_addr.cast()))
+            .with_sigsetsize(KERNEL_SIGSET_SIZE);
+        guest.inject_with_retry(call).await?;
+        let action: KernelSigaction = guest.memory().read_value(action_addr)?;
+        let handler = action.handler as usize;
+        if handler != libc::SIG_DFL && handler != libc::SIG_IGN && handler != libc::SIG_ERR {
+            wakers |= bit;
+        }
+    }
+    drop(guard);
+    Ok(RtSigsuspendWakers(wakers))
 }
 
 fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
@@ -425,7 +485,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             // performs delivery and restores the old mask.
             self.record_or_replay_blocking(guest, call.into()).await
         } else {
-            self.record_or_replay_rt_sigsuspend(guest, call).await
+            let wakers = if guest.config().backend.signal_interrupts_external_syscalls {
+                rt_sigsuspend_wakers(guest, temporary_mask).await?
+            } else {
+                RtSigsuspendWakers::default()
+            };
+            self.record_or_replay_rt_sigsuspend(guest, call, wakers)
+                .await
         }
     }
 

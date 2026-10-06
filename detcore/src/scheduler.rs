@@ -85,6 +85,7 @@ use crate::resources::LOOPBACK_POLL_YIELD_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::resources::RtSigsuspendWakers;
 use crate::scheduler::replayer::StopReason;
 use crate::scheduler::replayer::events_consistent;
 use crate::scheduler::replayer::events_match;
@@ -297,6 +298,21 @@ pub struct BlockedPool {
     /// These retain the kernel's atomic temporary-mask semantics, but unlike
     /// arbitrary external IO they cannot complete without a signal.
     pub rt_sigsuspend_blockers: BTreeMap<DetTid, ExternalOpId>,
+
+    /// The signals certain to end each `rt_sigsuspend` with `EINTR`: those
+    /// outside its temporary mask whose action is a real handler. Recorded
+    /// when the request is granted; empty on backends where a signal does not
+    /// interrupt the real blocking syscall.
+    pub rt_sigsuspend_wakers: BTreeMap<DetTid, RtSigsuspendWakers>,
+
+    /// `rt_sigsuspend` threads that the scheduler has already sent (or watched
+    /// a guest send) a signal in their waking set. Each such thread's real
+    /// `rt_sigsuspend` is certain to return, so its continuation request is
+    /// on its way: the scheduler must not judge the program deadlocked, nor
+    /// fast-forward virtual time to a timer, before that continuation is
+    /// harvested. Cleared when the continuation is harvested or the thread
+    /// leaves the blocked set.
+    pub rt_sigsuspend_wake_owed: BTreeSet<DetTid>,
 
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
     ///
@@ -2706,6 +2722,8 @@ impl Scheduler {
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
+        let _ = self.blocked.rt_sigsuspend_wakers.remove(dtid);
+        self.blocked.rt_sigsuspend_wake_owed.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
@@ -2993,6 +3011,13 @@ impl Scheduler {
             .map(|(child, parent)| (*child, *parent))
             .collect();
         for (child, parent) in ready {
+            // The kernel sends the parent the child's clone exit signal, which
+            // is not always SIGCHLD (and is none at all for an exit signal of 0).
+            let exit_signal = self
+                .thread_tree
+                .process_wait
+                .get(&child)
+                .map(|metadata| metadata.exit_signal);
             self.child_exit_signals_owed.remove(&child);
             #[cfg(test)]
             {
@@ -3006,6 +3031,9 @@ impl Scheduler {
                     "[dtid {}] child {} exited; waking the parent for its pending SIGCHLD.",
                     target, child
                 );
+                if let Some(exit_signal) = exit_signal {
+                    self.note_rt_sigsuspend_wake_owed(target, exit_signal);
+                }
                 self.wake_signaled_guest(target, Signal::SIGCHLD);
             }
         }
@@ -3435,6 +3463,7 @@ impl Scheduler {
             }
             Err(errno) => panic!("signal::kill to go through, got {errno}"),
         }
+        self.note_rt_sigsuspend_wake_owed(dettid, signal as i32);
         self.wake_signaled_guest(dettid, signal);
     }
 
@@ -3579,6 +3608,7 @@ impl Scheduler {
     /// request rewrite is deferred to step2 so an asynchronous backend cannot
     /// mutate beneath a tentative selection.
     pub(crate) fn notify_signal_pending(&mut self, dettid: DetTid, signal: SigWrapper) {
+        self.note_rt_sigsuspend_wake_owed(dettid, signal.0);
         if self.waitid_signal_request(dettid).is_some()
             || self.restartable_internal_io_signals(dettid).is_some()
         {
@@ -3587,6 +3617,89 @@ impl Scheduler {
                 signals.push(signal);
             }
         }
+    }
+
+    /// True if `dettid` is the only live thread of its process.
+    ///
+    /// A process-directed signal may be taken by any thread that does not block
+    /// it, and any thread may change the process's signal actions, so only a
+    /// single-threaded process lets the scheduler know which thread a signal
+    /// wakes and that its action has not changed.
+    fn is_sole_live_thread(&mut self, dettid: DetTid) -> bool {
+        let leader = if self.thread_tree.thread_group_leaders.contains(&dettid) {
+            dettid
+        } else if let Some(leader) = self.thread_tree.thread_to_leader.get(&dettid) {
+            *leader
+        } else {
+            return false;
+        };
+        let live: Vec<DetTid> = self
+            .thread_tree
+            .my_thread_group(&leader)
+            .into_iter()
+            .filter(|tid| self.next_turns.contains_key(tid))
+            .collect();
+        live == [dettid]
+    }
+
+    /// The waking set carried by `dettid`'s not-yet-granted `rt_sigsuspend`
+    /// request, if that is what it is waiting to be granted.
+    fn pending_rt_sigsuspend_wakers(&self, dettid: DetTid) -> Option<RtSigsuspendWakers> {
+        let request = self.next_turns.get(&dettid)?.req.try_read()?.ok()?;
+        request
+            .resources
+            .keys()
+            .find_map(|resource| match resource {
+                ResourceID::BlockingRtSigsuspend(_, wakers) => Some(*wakers),
+                _ => None,
+            })
+    }
+
+    /// Record that `signal` has been physically sent to `dettid` and is certain
+    /// to end its `rt_sigsuspend`.
+    ///
+    /// Certain means all of: the backend lets a signal interrupt the real
+    /// blocking call; the thread is in, or waiting to be granted, an
+    /// `rt_sigsuspend` whose waking set contains `signal` (outside the
+    /// temporary mask, with a real handler); and the thread is the only live
+    /// thread of its process. The caller must already have sent the signal.
+    ///
+    /// The mark exists so that the scheduler waits for the thread's
+    /// continuation instead of judging the program deadlocked, or advancing
+    /// virtual time to a timer, while that continuation is in flight.
+    fn note_rt_sigsuspend_wake_owed(&mut self, dettid: DetTid, signal: i32) {
+        if !self.backend.signal_interrupts_external_syscalls {
+            return;
+        }
+        let wakers = match self.blocked.rt_sigsuspend_wakers.get(&dettid) {
+            Some(wakers) if self.blocked.rt_sigsuspend_blockers.contains_key(&dettid) => *wakers,
+            _ => match self.pending_rt_sigsuspend_wakers(dettid) {
+                Some(wakers) => wakers,
+                None => return,
+            },
+        };
+        if wakers.contains(signal) && self.is_sole_live_thread(dettid) {
+            debug!(
+                "[dtid {}] signal {} will end its rt_sigsuspend; awaiting its continuation.",
+                dettid, signal
+            );
+            self.blocked.rt_sigsuspend_wake_owed.insert(dettid);
+        }
+    }
+
+    /// True if a thread owed an `rt_sigsuspend` wake is still executing the
+    /// real call, so its continuation is not among the `ready` ones yet.
+    ///
+    /// The scheduler then waits for it before harvesting any continuation.
+    /// The wait cannot be endless: the signal was already sent, and its
+    /// waking-set membership makes the real call's return certain. Harvesting
+    /// the thread on the first harvest after the wake, rather than whenever
+    /// the host delivers the signal, makes the turn on which it rejoins a
+    /// scheduler decision instead of a host timing.
+    fn rt_sigsuspend_wake_in_flight(&self, ready: &[DetTid]) -> bool {
+        self.blocked.rt_sigsuspend_wake_owed.iter().any(|dettid| {
+            self.blocked.rt_sigsuspend_blockers.contains_key(dettid) && !ready.contains(dettid)
+        })
     }
 
     // Force a thread out blocking and into the runnable state, replacing its resource request.
@@ -3666,6 +3779,8 @@ impl Scheduler {
                     );
                     let external = scheduler.blocked.external_io_blockers.remove(ready_dtid);
                     let sigsuspend = scheduler.blocked.rt_sigsuspend_blockers.remove(ready_dtid);
+                    let _ = scheduler.blocked.rt_sigsuspend_wakers.remove(ready_dtid);
+                    scheduler.blocked.rt_sigsuspend_wake_owed.remove(ready_dtid);
                     assert!(
                         external.is_some() ^ sigsuspend.is_some(),
                         "ready thread must belong to exactly one blocking pool"
@@ -3697,6 +3812,13 @@ impl Scheduler {
                 // epoll_wait.
                 if !self.run_queue.is_empty() && !only_pollers {
                     return Ok(());
+                }
+
+                // A thread certain to be woken must join this harvest; see
+                // `rt_sigsuspend_wake_in_flight`.
+                if self.rt_sigsuspend_wake_in_flight(&ready) {
+                    std::thread::yield_now();
+                    return Err(SkipTurn);
                 }
 
                 // Reschedule every blocker whose IO has completed so its continuation can
@@ -3740,6 +3862,13 @@ impl Scheduler {
             };
             if !self.run_queue.is_empty() && !only_pollers {
                 return Ok(());
+            }
+
+            // A thread certain to be woken must join this harvest; see
+            // `rt_sigsuspend_wake_in_flight`.
+            if self.rt_sigsuspend_wake_in_flight(&ready) {
+                std::thread::yield_now();
+                return Err(SkipTurn);
             }
 
             if !ready.is_empty() {
@@ -4481,7 +4610,7 @@ impl Scheduler {
             // Thread BEGINS a blocking syscall outside the runnable set.
             ResourceID::BlockingExternalIO(op_id)
             | ResourceID::BlockingVfork(op_id)
-            | ResourceID::BlockingRtSigsuspend(op_id) => {
+            | ResourceID::BlockingRtSigsuspend(op_id, _) => {
                 if matches!(rid, ResourceID::BlockingVfork(_)) {
                     assert!(self.vfork_barriers.insert(dettid, None).is_none());
                     if let Some(origin) = self.next_turns[&dettid].protocol.origin {
@@ -4522,7 +4651,11 @@ impl Scheduler {
 
                 // Only once the ivars are cleared and the guest is ready to issue
                 // BlockedExternalContinue do we record which blocked pool owns it.
-                let old = if matches!(rid, ResourceID::BlockingRtSigsuspend(_)) {
+                let old = if let ResourceID::BlockingRtSigsuspend(_, wakers) = rid {
+                    // A wake owed from before this grant (the signal was sent
+                    // while the request waited) stays owed: the backend holds
+                    // that signal pending, so the real call returns at once.
+                    self.blocked.rt_sigsuspend_wakers.insert(dettid, *wakers);
                     self.blocked.rt_sigsuspend_blockers.insert(dettid, *op_id)
                 } else {
                     self.blocked.external_io_blockers.insert(dettid, *op_id)

@@ -2403,6 +2403,274 @@ fn reporting_backend_exit_of_a_parent_keeps_the_wakeup_it_owes_its_own_parent() 
     assert!(requests_inbound_sigchld(&s, grandparent));
 }
 
+/// The waking set holding exactly `signals`, in the kernel mask layout.
+fn rt_sigsuspend_wakers(signals: &[libc::c_int]) -> RtSigsuspendWakers {
+    RtSigsuspendWakers(
+        signals
+            .iter()
+            .fold(0, |set, signal| set | (1_u64 << (signal - 1))),
+    )
+}
+
+/// Queue `waiter` with its `rt_sigsuspend` request, carrying `wakers`, as the
+/// guest posts it before the scheduler grants it.
+fn post_rt_sigsuspend_request(
+    s: &mut Scheduler,
+    waiter: DetTid,
+    wakers: RtSigsuspendWakers,
+) -> ResourceID {
+    let rid = ResourceID::BlockingRtSigsuspend(ExternalOpId::new(waiter, 7), wakers);
+    let mut request = Resources::new(waiter);
+    request.insert(rid.clone(), Permission::RW);
+    s.next_turns.get_mut(&waiter).unwrap().req = Ivar::full(Ok(request));
+    s.runqueue_push_back(waiter);
+    rid
+}
+
+/// Grant the posted `rt_sigsuspend` through the complete resource arm, which
+/// records the waking set and leaves the thread executing the real call.
+fn grant_posted_rt_sigsuspend(s: &mut Scheduler, waiter: DetTid, rid: &ResourceID) -> ExternalOpId {
+    let ResourceID::BlockingRtSigsuspend(op_id, _) = rid else {
+        panic!("not an rt_sigsuspend request: {rid:?}");
+    };
+    assert_eq!(s.run_queue.tentative_pop_next(), Some(waiter));
+    assert!(
+        s.block_for_one_resource(waiter, rid, &Permission::RW, None, &Ivar::new())
+            .is_err()
+    );
+    assert_eq!(s.blocked.rt_sigsuspend_blockers.get(&waiter), Some(op_id));
+    *op_id
+}
+
+fn grant_rt_sigsuspend(
+    s: &mut Scheduler,
+    waiter: DetTid,
+    wakers: RtSigsuspendWakers,
+) -> ExternalOpId {
+    let rid = post_rt_sigsuspend_request(s, waiter, wakers);
+    grant_posted_rt_sigsuspend(s, waiter, &rid)
+}
+
+/// The interrupted real call returns and its continuation reaches the
+/// scheduler.
+fn post_rt_sigsuspend_continuation(s: &mut Scheduler, waiter: DetTid, op_id: ExternalOpId) {
+    let mut request = Resources::new(waiter);
+    request.insert(ResourceID::BlockedExternalContinue(op_id), Permission::RW);
+    s.next_turns.get_mut(&waiter).unwrap().req = Ivar::full(Ok(request));
+}
+
+/// Must wake: a signal certain to end a SaBRe `rt_sigsuspend` has been sent,
+/// so until its continuation arrives the thread is about to run, not
+/// deadlocked. Before the fix, `step2d` judged it deadlocked on the first pass.
+#[test]
+fn signaled_rt_sigsuspend_awaits_its_continuation_instead_of_a_deadlock_verdict() {
+    let mut s = physical_exit_reporting_scheduler();
+    let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let initial_time = global_time.lock().unwrap().as_nanos();
+    let (waiter, _, _) = add(&mut s, 100, 100);
+    let op_id = grant_rt_sigsuspend(&mut s, waiter, rt_sigsuspend_wakers(&[libc::SIGCHLD]));
+
+    s.notify_signal_pending(waiter, SigWrapper::from(Signal::SIGCHLD));
+    assert!(s.blocked.rt_sigsuspend_wake_owed.contains(&waiter));
+    for _ in 0..3 {
+        assert!(s.step2_process_blocked(&global_time).is_err());
+        assert!(
+            s.take_terminal_deadlock().is_none(),
+            "a thread whose rt_sigsuspend was just interrupted is not deadlocked"
+        );
+    }
+    assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+
+    // The first pass after the continuation arrives harvests it and settles
+    // the wake.
+    post_rt_sigsuspend_continuation(&mut s, waiter, op_id);
+    assert!(s.step2_process_blocked(&global_time).is_ok());
+    assert!(s.run_queue.contains_tid(waiter));
+    assert!(s.blocked.rt_sigsuspend_blockers.is_empty());
+    assert!(s.blocked.rt_sigsuspend_wakers.is_empty());
+    assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty());
+    assert!(s.take_terminal_deadlock().is_none());
+    assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+}
+
+/// Must wake: with another thread asleep, the same in-flight continuation must
+/// not let the scheduler advance virtual time to the sleeper's deadline. On
+/// which side of the jump the woken thread ran used to depend on host timing.
+#[test]
+fn signaled_rt_sigsuspend_holds_back_a_timer_fast_forward() {
+    let mut s = physical_exit_reporting_scheduler();
+    let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let initial_time = global_time.lock().unwrap().as_nanos();
+    let (waiter, _, _) = add(&mut s, 100, 100);
+    let (sleeper, _, _) = add(&mut s, 300, 300);
+    let op_id = grant_rt_sigsuspend(&mut s, waiter, rt_sigsuspend_wakers(&[libc::SIGUSR1]));
+    s.blocked
+        .timed_waiters
+        .insert(initial_time + LogicalTime::from_nanos(1_000), sleeper);
+
+    s.notify_signal_pending(waiter, SigWrapper::from(Signal::SIGUSR1));
+    for _ in 0..3 {
+        assert!(s.step2_process_blocked(&global_time).is_err());
+    }
+    assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+    assert!(!s.run_queue.contains_tid(sleeper));
+
+    post_rt_sigsuspend_continuation(&mut s, waiter, op_id);
+    assert!(s.step2_process_blocked(&global_time).is_ok());
+    assert!(s.run_queue.contains_tid(waiter));
+    assert!(!s.run_queue.contains_tid(sleeper));
+    assert_eq!(global_time.lock().unwrap().as_nanos(), initial_time);
+}
+
+/// Must wake: a signal sent while the request still waits for its grant is
+/// held pending by the backend, so the real call returns at once; the wake it
+/// owes survives the grant.
+#[test]
+fn rt_sigsuspend_wake_sent_before_the_grant_stays_owed_after_it() {
+    let mut s = physical_exit_reporting_scheduler();
+    let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let (waiter, _, _) = add(&mut s, 100, 100);
+    let rid = post_rt_sigsuspend_request(&mut s, waiter, rt_sigsuspend_wakers(&[libc::SIGCHLD]));
+
+    s.notify_signal_pending(waiter, SigWrapper::from(Signal::SIGCHLD));
+    assert!(s.blocked.rt_sigsuspend_wake_owed.contains(&waiter));
+    let op_id = grant_posted_rt_sigsuspend(&mut s, waiter, &rid);
+    assert!(s.blocked.rt_sigsuspend_wake_owed.contains(&waiter));
+
+    assert!(s.step2_process_blocked(&global_time).is_err());
+    assert!(s.take_terminal_deadlock().is_none());
+    post_rt_sigsuspend_continuation(&mut s, waiter, op_id);
+    assert!(s.step2_process_blocked(&global_time).is_ok());
+    assert!(s.run_queue.contains_tid(waiter));
+    assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty());
+}
+
+/// Must not: when the signal is not certain to end the call, nothing is owed
+/// and the existing verdict stands: the scheduler does not wait.
+#[test]
+fn rt_sigsuspend_wake_is_owed_only_when_the_signal_certainly_ends_the_call() {
+    let sigchld_only = rt_sigsuspend_wakers(&[libc::SIGCHLD]);
+    // (case, backend lets a signal interrupt the real call, waking set,
+    //  a second live thread in the waiter's process)
+    let cases = [
+        (
+            "signal outside the waking set (masked, SIG_DFL or SIG_IGN)",
+            true,
+            rt_sigsuspend_wakers(&[libc::SIGUSR1]),
+            false,
+        ),
+        (
+            "empty waking set",
+            true,
+            RtSigsuspendWakers::default(),
+            false,
+        ),
+        (
+            "backend whose signals do not interrupt the real call",
+            false,
+            sigchld_only,
+            false,
+        ),
+        (
+            "another live thread could take the signal or change its action",
+            true,
+            sigchld_only,
+            true,
+        ),
+    ];
+    for (case, interrupts, wakers, second_thread) in cases {
+        let mut s = Scheduler::new(&Config::default().with_backend(|backend| {
+            backend.reports_physical_process_exits = interrupts;
+            backend.signal_interrupts_external_syscalls = interrupts;
+        }));
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (waiter, _, _) = add(&mut s, 100, 100);
+        if second_thread {
+            add(&mut s, 100, 101);
+        }
+        grant_rt_sigsuspend(&mut s, waiter, wakers);
+
+        s.notify_signal_pending(waiter, SigWrapper::from(Signal::SIGCHLD));
+        assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty(), "{case}");
+        assert!(s.step2c_process_io_blockers().is_ok(), "{case}");
+        if !second_thread {
+            assert!(s.step2_process_blocked(&global_time).is_err(), "{case}");
+            let report = s
+                .take_terminal_deadlock()
+                .unwrap_or_else(|| panic!("{case}: the deadlock verdict must stand"));
+            assert!(
+                report.contains("thread(s) waiting in rt_sigsuspend with no possible signal"),
+                "{case}: unexpected report:\n{report}"
+            );
+        }
+    }
+}
+
+/// Must not: a thread the scheduler cannot place in a process, and a thread
+/// parked on something other than `rt_sigsuspend`, are owed nothing; a wake
+/// owed to a thread that is then killed does not outlive it.
+#[test]
+fn rt_sigsuspend_wake_is_owed_only_to_a_known_rt_sigsuspend_thread() {
+    let mut s = physical_exit_reporting_scheduler();
+    let stranger = DetTid::from_raw(400);
+    s.priorities.insert(stranger, DEFAULT_PRIORITY);
+    s.next_turns.insert(
+        stranger,
+        ThreadNextTurn {
+            dettid: stranger,
+            child_tid_addr: 0,
+            req: Ivar::new(),
+            resp: Ivar::new(),
+            protocol: Default::default(),
+        },
+    );
+    grant_rt_sigsuspend(&mut s, stranger, rt_sigsuspend_wakers(&[libc::SIGCHLD]));
+    s.notify_signal_pending(stranger, SigWrapper::from(Signal::SIGCHLD));
+    assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty());
+
+    let (waiter, waiter_mm, _) = add(&mut s, 100, 100);
+    grant_rt_sigsuspend(&mut s, waiter, rt_sigsuspend_wakers(&[libc::SIGCHLD]));
+    s.notify_signal_pending(waiter, SigWrapper::from(Signal::SIGCHLD));
+    assert!(s.blocked.rt_sigsuspend_wake_owed.contains(&waiter));
+    s.logically_kill_thread(&waiter, &DetPid::from_raw(100), waiter_mm);
+    assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty());
+    assert!(!s.blocked.rt_sigsuspend_wakers.contains_key(&waiter));
+
+    let (poller, _, _) = add(&mut s, 300, 300);
+    park_on_internal_poll(&mut s, poller);
+    s.notify_signal_pending(poller, SigWrapper::from(Signal::SIGCHLD));
+    assert!(s.blocked.rt_sigsuspend_wake_owed.is_empty());
+}
+
+/// A child's exit owes its parent's `rt_sigsuspend` a wake only for the
+/// child's real exit signal: the kernel sends that signal, not always SIGCHLD,
+/// and none at all for an exit signal of 0.
+#[test]
+fn child_exit_owes_an_rt_sigsuspend_wake_only_for_its_exit_signal() {
+    for (exit_signal, owed) in [(libc::SIGCHLD, true), (libc::SIGUSR1, false), (0, false)] {
+        let mut s = physical_exit_reporting_scheduler();
+        let (parent, _, _) = add(&mut s, 100, 100);
+        let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+        let child_process = DetPid::from_raw(200);
+        s.thread_tree
+            .process_wait
+            .get_mut(&child_process)
+            .unwrap()
+            .exit_signal = exit_signal;
+        grant_rt_sigsuspend(&mut s, parent, rt_sigsuspend_wakers(&[libc::SIGCHLD]));
+
+        grant_child_exit_and_remove_thread(&mut s, child, child_mm);
+        assert!(s.complete_physical_process_exit(child_process));
+        assert!(s.step2_drain_prefix().is_ok());
+        assert_eq!(s.owed_child_exit_wakeups, 1);
+        assert_eq!(
+            s.blocked.rt_sigsuspend_wake_owed.contains(&parent),
+            owed,
+            "exit signal {exit_signal}"
+        );
+    }
+}
+
 #[test]
 fn exit_boundary_reservation_failure_has_no_local_effect() {
     let (mut s, backend) = fixture();

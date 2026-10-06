@@ -83,6 +83,41 @@ impl ExternalOpId {
     }
 }
 
+/// The signals whose arrival certainly ends one real `rt_sigsuspend` with a
+/// continuation the scheduler will see.
+///
+/// A signal belongs here only if the call's temporary mask leaves it unblocked
+/// and the guest has installed a real handler for it: Linux always ends
+/// `rt_sigsuspend` with `EINTR` once such a handler runs, whether or not the
+/// handler asked for `SA_RESTART`. A signal whose disposition is `SIG_DFL` or
+/// `SIG_IGN` is left out, because it may end the process or be discarded
+/// instead of waking the call.
+///
+/// Bit `n - 1` stands for signal `n`, the layout of the kernel's own signal
+/// mask. It is empty on a backend whose signals do not interrupt a real
+/// blocking syscall outside the scheduler.
+#[derive(
+    PartialEq,
+    Debug,
+    Eq,
+    Clone,
+    Copy,
+    Serialize,
+    Deserialize,
+    Hash,
+    PartialOrd,
+    Ord,
+    Default
+)]
+pub struct RtSigsuspendWakers(pub u64);
+
+impl RtSigsuspendWakers {
+    /// Does the raw signal number `signal` certainly wake the call?
+    pub fn contains(self, signal: i32) -> bool {
+        (1..=64).contains(&signal) && self.0 & (1_u64 << (signal - 1)) != 0
+    }
+}
+
 /*
 NOTE [Blocking Syscalls via Internal Polling]
 ---------------------------------------------
@@ -323,8 +358,9 @@ pub enum ResourceID {
 
     /// A real `rt_sigsuspend` executing outside the runnable set while the kernel
     /// atomically installs its temporary signal mask. Unlike arbitrary external
-    /// IO, this operation cannot complete without a signal.
-    BlockingRtSigsuspend(ExternalOpId),
+    /// IO, this operation cannot complete without a signal. The second field
+    /// names the signals that certainly end it.
+    BlockingRtSigsuspend(ExternalOpId, RtSigsuspendWakers),
 }
 
 /// Permission to a device, which behaves like a predefined "inode".
@@ -526,6 +562,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn rt_sigsuspend_wakers_use_the_kernel_mask_layout() {
+        let wakers = RtSigsuspendWakers((1_u64 << (libc::SIGCHLD - 1)) | (1_u64 << 63));
+        assert!(wakers.contains(libc::SIGCHLD));
+        assert!(wakers.contains(64));
+        assert!(!wakers.contains(libc::SIGALRM));
+        assert!(!wakers.contains(0));
+        assert!(!wakers.contains(65));
+        assert!(!wakers.contains(-1));
+    }
+
+    #[test]
     fn control_tokens_do_not_alias_unrelated_operations() {
         let tid1 = DetTid::from_raw(1);
         let tid2 = DetTid::from_raw(2);
@@ -535,7 +582,10 @@ mod tests {
         );
         assert_ne!(
             ResourceID::BlockingExternalIO(ExternalOpId::new(tid1, 7)),
-            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(tid1, 7))
+            ResourceID::BlockingRtSigsuspend(
+                ExternalOpId::new(tid1, 7),
+                RtSigsuspendWakers::default()
+            )
         );
         assert_ne!(
             ResourceID::ParentContinue {
