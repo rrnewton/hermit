@@ -963,7 +963,51 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and verify::tests::a_recorded_branch_counter_verdict_is_stamped_on_every_report_once
     // retain all 859 (861, measured with cargo nextest list).
     // run.rs the_ptrace_runtime_guards_reverie_private_page retains all 861 (862).
-    ("test.hermit_unit", 862),
+    // The 40 --max-log-bytes unit tests of
+    // https://github.com/rrnewton/hermit/pull/3686 retain all 862 prior
+    // identities: 862 + 40 = 902 (`cargo nextest list --profile ci` with this
+    // node's filters lists 902). They are 25 tracing::tests
+    // (max_log_bytes_accepts_binary_suffixes,
+    // max_log_bytes_refusals_redirect_to_a_working_value,
+    // byte_sizes_render_in_the_accepted_spelling,
+    // the_budget_reports_the_crossing_exactly_once,
+    // capped_writer_counts_what_it_passes_through,
+    // capped_writer_counts_bytes_the_file_bound_discards,
+    // crossing_the_cap_exits_with_the_log_cap_status_and_says_why,
+    // a_refund_after_the_crossing_does_not_reopen_the_budget,
+    // crossing_the_cap_exits_even_when_no_sink_can_take_the_message,
+    // a_cap_diagnostic_to_a_departed_reader_raises_no_signal,
+    // the_diagnostic_signal_guard_consumes_only_the_signal_its_write_raised,
+    // the_proc_fd_path_names_the_descriptor,
+    // the_crossing_message_ends_with_the_class_line_at_every_limit,
+    // a_total_past_u64_max_crosses_even_the_largest_limit,
+    // a_log_ending_with_the_stop_message_reads_as_truncated,
+    // the_stop_message_is_not_appended_after_the_truncation_marker,
+    // a_failed_exit_timer_start_exits_with_the_log_cap_status_at_once,
+    // a_panic_after_the_cap_ended_the_run_still_exits_with_the_log_cap_status,
+    // the_outer_log_cap_diagnostic_is_attempted_at_most_once,
+    // a_write_in_progress_at_the_crossing_withholds_the_final_message,
+    // a_write_admitted_before_the_crossing_is_waited_for_even_after_a_refund,
+    // only_the_first_write_past_the_limit_claims_the_crossing,
+    // the_drain_wait_gives_up_at_its_bound,
+    // capped_writer_ends_every_admission_it_starts and
+    // the_final_message_is_the_last_line_when_writers_race_the_crossing);
+    // run::tests::forwarded_records_alone_cross_the_log_cap;
+    // run::{log_cap_is_refused_where_the_guest_could_outlive_hermit,
+    // log_cap_is_accepted_where_hermit_takes_the_guest_down_with_it,
+    // log_cap_refusal_table_covers_every_backend};
+    // container::tests::{log_cap_crossed_before_the_container_init_arms_stops_the_init,
+    // log_cap_crossed_before_the_namespace_only_guest_arms_stops_the_exec};
+    // analyze::rundata::tests::{analyze_trials_charge_the_invocations_log_budget,
+    // log_cap_refusal_reaches_analyze_and_bisect_trials};
+    // verify::tests::{log_cap_retention_report_survives_a_stderr_without_a_reader,
+    // log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe,
+    // retention_report_reads_as_before_when_stderr_has_room};
+    // analyze::phases::tests::a_failing_search_round_ends_the_search_with_its_error;
+    // analyze::minimize::tests::a_failing_minimize_trial_ends_minimization_with_its_error;
+    // and schedule_search::tests::{a_failing_trial_ends_the_schedule_search_with_its_error,
+    // a_failing_jitter_replay_returns_its_error}.
+    ("test.hermit_unit", 902),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1090,7 +1134,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detlog::tests::forwarded_records_are_written_at_points_the_schedule_fixes
     // and detlog::tests::split_forwarded_message_reads_the_sender_tag (967).
     // syscalls::files::untraced_code_tests' three tests retain all 967 (970).
-    ("test.detcore_unit", 970),
+    // logdiff::test::a_log_stopped_by_the_cap_is_refused_like_a_truncated_one
+    // (https://github.com/rrnewton/hermit/pull/3686) retains all 970 prior
+    // identities: 970 + 1 = 971, measured with cargo nextest list --profile ci
+    // -p hermit-detcore --lib --bins.
+    ("test.detcore_unit", 971),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1314,7 +1362,22 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // arguments.
     // ptrace_verification_reports_carry_the_exact_branch_counter_verdict
     // retains all 153 (154, measured with cargo nextest list).
-    ("test.cli", 154),
+    // The eleven --max-log-bytes CLI tests of
+    // https://github.com/rrnewton/hermit/pull/3686
+    // (max_log_bytes_aborts_a_run_whose_stderr_log_runs_away,
+    // max_log_bytes_aborts_a_run_whose_log_file_runs_away,
+    // max_log_bytes_leaves_a_run_under_the_cap_alone_and_refuses_zero,
+    // max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads,
+    // max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader,
+    // max_log_bytes_is_refused_where_the_guest_could_outlive_hermit,
+    // max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime,
+    // max_log_bytes_stopped_log_is_refused_by_log_diff,
+    // max_log_bytes_is_refused_for_sabre_strace_and_leaves_other_strace_alone,
+    // max_log_bytes_verify_keeps_the_cap_status_when_stderr_loses_its_reader
+    // and max_log_bytes_verify_exits_promptly_when_stderr_fills_after_run1)
+    // retain all 154 prior identities: 154 + 11 = 165 (`cargo nextest list
+    // --profile ci` with this node's skips lists 165).
+    ("test.cli", 165),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1392,7 +1455,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same DBT rdtsc test as test.cli retains all 121: 122, listed the
     // same way.
     // The same exact-branch-counter report test retains all 122 (123).
-    ("test.cli_on_host", 123),
+    // The same eleven https://github.com/rrnewton/hermit/pull/3686
+    // --max-log-bytes tests as test.cli retain all 123 prior identities:
+    // 123 + 11 = 134, listed with this node's arguments. None of them starts
+    // an in-guest LiteInst guest (the one LiteInst case is refused before
+    // launch), so the exact-name filterset is unchanged: 165 - 31 = 134.
+    ("test.cli_on_host", 134),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
@@ -1436,7 +1504,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the rebound-path test (958), the six mount-ID tests (964), and the
     // select-set test (965), and the two forwarded-record ordering tests (967).
     // And the three untraced-code tests (970).
-    ("test.detcore_unit_on_host", 970),
+    // The host twin selects the same
+    // https://github.com/rrnewton/hermit/pull/3686 logdiff test: 970 + 1 = 971.
+    ("test.detcore_unit_on_host", 971),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1491,7 +1561,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same --passthru-opt coverage test (850).
     // And the same two exact-branch-counter report tests (861).
     // And the same private-page range test (862).
-    ("test.hermit_unit_on_host", 862),
+    // The host twin selects the same 40
+    // https://github.com/rrnewton/hermit/pull/3686 --max-log-bytes tests:
+    // 862 + 40 = 902.
+    ("test.hermit_unit_on_host", 902),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
