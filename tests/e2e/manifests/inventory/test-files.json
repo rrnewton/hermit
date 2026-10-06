@@ -271,6 +271,12 @@
       "why": "tests/c/dlopen_cpuid_vendor_lib.c is owned by hermit-cli/tests/cli.rs: The in-guest LiteInst program tests compile this shared library, whose constructor executes CPUID leaf 0, and pass it to tests/c/dlopen_cpuid_vendor.c to load with dlopen; it remains a guest fixture because it is a shared object, not a runnable guest."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/dup_alias_after_fork.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/dup_alias_after_fork.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test runs this dup-then-fork random-stream probe on ptrace and on in-guest LiteInst and requires the same output from both; it remains a guest fixture because a generic manifest cannot express a cross-backend output equality."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/dup_shared_offset.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",

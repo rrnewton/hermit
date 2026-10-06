@@ -64,6 +64,7 @@ static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static USERFAULTFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static EXIT_REAPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static UNSCHEDULED_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static DUP_ALIAS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPRESSED_FIXTURES: OnceLock<[PathBuf; 2]> = OnceLock::new();
@@ -1630,4 +1631,41 @@ fn liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe() {
         ..super::CappedRun::default()
     }
     .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// Two descriptors aliasing one open file description (after dup) still
+/// share it in a forked child. In-guest LiteInst serializes the parent's
+/// Detcore state into the child, and before interning by OpenFileId the
+/// child's aliases came back as two copies: both read the same random bytes.
+/// The child's two reads must continue one stream, exactly as under ptrace.
+#[test]
+fn liteinst_in_guest_dup_aliases_share_one_cursor_after_fork() {
+    let _guard = hermit_run_guard();
+    let guest = c_guest(&DUP_ALIAS_GUEST, "dup_alias_after_fork");
+    let mut outputs = Vec::new();
+    for backend in ["ptrace", "liteinst"] {
+        let mut command = Command::new(hermit_binary());
+        command.args(["--log=info", "--backend", backend, "run"]);
+        if backend == "liteinst" {
+            command.arg("--max-timeslice=disabled");
+        }
+        let output = command
+            .arg(format!("--epoch={VIRTUAL_TIME_EPOCH}"))
+            .args(["--strict", "--"])
+            .arg(guest)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        assert!(output.status.success(), "{backend}: {output:?}");
+        assert!(
+            stdout.contains("aliases continue one stream=1"),
+            "{backend}: {stdout}"
+        );
+        outputs.push(stdout);
+    }
+    assert_eq!(
+        outputs[0], outputs[1],
+        "in-guest LiteInst differs from ptrace"
+    );
 }

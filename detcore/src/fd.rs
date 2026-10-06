@@ -388,6 +388,11 @@ impl DetFd {
         }
     }
 
+    /// Makes this descriptor refer to `other`'s open file description object.
+    fn share_open_file_with(&mut self, other: &DetFd) {
+        self.open_file = Arc::clone(&other.open_file);
+    }
+
     /// Stable identity shared by dup and fork aliases.
     pub fn open_file_id(&self) -> OpenFileId {
         self.description().id
@@ -876,6 +881,31 @@ impl DetFd {
 impl fmt::Display for DetFd {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "DetFd({})", self.fd)
+    }
+}
+
+/// Restores descriptor aliasing after deserialization: every descriptor with
+/// the same `OpenFileId` refers to one open file description object again.
+///
+/// Serialization writes an `Arc`'s contents, not its identity, so two
+/// descriptors that shared one description (after `dup`) come back as two
+/// independent copies, and a read through one would no longer move the
+/// other's cursor. Within one table an `OpenFileId` names exactly one open
+/// file description, so the copies with one id are identical, and the first
+/// (lowest descriptor number) is kept. Descriptor flags (`FD_CLOEXEC`) stay
+/// per descriptor.
+pub(crate) fn intern_open_files(handles: &mut std::collections::HashMap<RawFd, DetFd>) {
+    let mut fds: Vec<RawFd> = handles.keys().copied().collect();
+    fds.sort_unstable();
+    let mut first: std::collections::HashMap<OpenFileId, DetFd> = std::collections::HashMap::new();
+    for fd in fds {
+        let detfd = handles.get_mut(&fd).expect("listed descriptor");
+        match first.get(&detfd.open_file_id()) {
+            Some(kept) => detfd.share_open_file_with(kept),
+            None => {
+                first.insert(detfd.open_file_id(), detfd.clone());
+            }
+        }
     }
 }
 
