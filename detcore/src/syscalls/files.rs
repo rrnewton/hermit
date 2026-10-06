@@ -432,25 +432,81 @@ fn open_can_acquire_controlling_terminal(flags: OFlag) -> bool {
     !flags.intersects(OFlag::O_NOCTTY | OFlag::O_PATH)
 }
 
-/// Whether process `pid`, whose `/proc/<pid>/stat` lists `session` and the
-/// controlling terminal `tty` as a (major, minor) pair, leads its session and
-/// has the character device `rdev` as that terminal.
-fn leads_session_with_terminal(pid: i32, session: i32, tty: (i32, i32), rdev: libc::dev_t) -> bool {
-    session == pid
-        && tty != (0, 0)
-        && i64::from(tty.0) == i64::from(libc::major(rdev))
-        && i64::from(tty.1) == i64::from(libc::minor(rdev))
+/// Whether the character device `rdev` is a terminal that an `open` can make
+/// its caller's controlling terminal. `tty_drivers` is the text of
+/// `/proc/tty/drivers`, one line per range of device numbers a terminal
+/// driver serves, ending in the major number, the minor number or range, and
+/// the driver's type. A device no line names is not a terminal. Linux's
+/// `tty_open` never makes `/dev/console` (5:1), `/dev/vc/0` (4:0) or a
+/// pseudoterminal master controlling, and `/dev/ptmx` (5:2) opens a master
+/// without reaching `tty_open`. `/dev/tty` (5:0) stays in: it reopens the
+/// caller's controlling terminal, and if a hangup clears that terminal during
+/// the `open`, the `open` can make it controlling again. A table that could
+/// not be read (`None`), or a line that does not parse when no other line
+/// names the device, answers true.
+fn terminal_can_become_controlling(rdev: libc::dev_t, tty_drivers: Option<&str>) -> bool {
+    let (major, minor) = (libc::major(rdev), libc::minor(rdev));
+    if matches!((major, minor), (5, 1) | (5, 2) | (4, 0)) {
+        return false;
+    }
+    let Some(table) = tty_drivers else {
+        return true;
+    };
+    let mut unparsed = false;
+    for line in table.lines().filter(|line| !line.trim().is_empty()) {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let range = match fields[..] {
+            [.., line_major, minors, kind] => {
+                line_major.parse::<u32>().ok().and_then(|line_major| {
+                    let (first, last) = minors.split_once('-').unwrap_or((minors, minors));
+                    Some((
+                        line_major,
+                        first.parse::<u32>().ok()?,
+                        last.parse::<u32>().ok()?,
+                        kind,
+                    ))
+                })
+            }
+            _ => None,
+        };
+        match range {
+            Some((line_major, first, last, kind))
+                if line_major == major && (first..=last).contains(&minor) =>
+            {
+                return kind != "pty:master";
+            }
+            Some(_) => {}
+            None => unparsed = true,
+        }
+    }
+    unparsed
 }
 
-/// Whether, after an `open` in process `pid` returned `fd`, `pid` leads its
-/// session and the opened terminal is that session's controlling terminal:
-/// the state an `open` that acquired a controlling terminal leaves behind.
-/// `host_stat` is the descriptor's stat when the caller already read it. A
-/// session leader that reopens the terminal it already controls also answers
-/// true. Every host read that fails answers true as well: a needless record
-/// only holds the terminal's signals (`terminal_signals`) to the end of the
-/// gated waits that follow, while a missed one lets the terminal interrupt one
-/// at a turn the host chose.
+/// Whether an `open` in process `pid`, whose `/proc/<pid>/stat` lists
+/// `session`, of the character device `rdev` may have made that device
+/// `pid`'s controlling terminal: `pid` leads its session and the device is a
+/// terminal that can become controlling (`terminal_can_become_controlling`).
+/// Neither fact is the controlling terminal procfs lists, which a hangup of
+/// the terminal clears at any moment, so the answer does not depend on
+/// whether a hangup came before or after the read. A session leader that
+/// reopens the terminal it already controls, or opens a terminal while it
+/// controls another, also answers true.
+fn may_have_acquired_controlling_terminal(
+    pid: i32,
+    session: i32,
+    rdev: libc::dev_t,
+    tty_drivers: Option<&str>,
+) -> bool {
+    session == pid && terminal_can_become_controlling(rdev, tty_drivers)
+}
+
+/// Whether the `open` in process `pid` that returned `fd` may have made the
+/// opened terminal `pid`'s controlling terminal
+/// (`may_have_acquired_controlling_terminal`). `host_stat` is the
+/// descriptor's stat when the caller already read it. Every host read that
+/// fails answers true: a needless record only holds the terminal's signals
+/// (`terminal_signals`) to the end of the gated waits that follow, while a
+/// missed one lets the terminal interrupt one at a turn the host chose.
 fn opened_controlling_terminal(pid: i32, fd: RawFd, host_stat: Option<&libc::stat>) -> bool {
     let rdev = match host_stat {
         Some(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFCHR => stat.st_rdev,
@@ -461,10 +517,12 @@ fn opened_controlling_terminal(pid: i32, fd: RawFd, host_stat: Option<&libc::sta
             Err(_) => return true,
         },
     };
-    match procfs::process::Process::new(pid).and_then(|process| process.stat()) {
-        Ok(stat) => leads_session_with_terminal(pid, stat.session, stat.tty_nr(), rdev),
-        Err(_) => true,
-    }
+    let session = match procfs::process::Process::new(pid).and_then(|process| process.stat()) {
+        Ok(stat) => stat.session,
+        Err(_) => return true,
+    };
+    let tty_drivers = std::fs::read_to_string("/proc/tty/drivers").ok();
+    may_have_acquired_controlling_terminal(pid, session, rdev, tty_drivers.as_deref())
 }
 
 /// Why the pin failed, and which descriptors Linux had already created when it did.
@@ -6626,9 +6684,11 @@ mod test {
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
     use super::fcntl_host_timed_signals;
     use super::ioctl_host_timed_signals;
-    use super::leads_session_with_terminal;
+    use super::may_have_acquired_controlling_terminal;
     use super::open_can_acquire_controlling_terminal;
+    use super::opened_controlling_terminal;
     use super::pipe_capacity_request_exceeds_ceiling;
+    use super::terminal_can_become_controlling;
     use crate::test_pages::PAGE;
     use crate::test_pages::Pages;
 
@@ -6722,9 +6782,11 @@ mod test {
     }
 
     /// An `open` can give its caller a controlling terminal only without
-    /// O_NOCTTY and O_PATH, and the state it leaves behind is a session leader
-    /// whose controlling terminal is the opened device
-    /// (https://github.com/rrnewton/hermit/issues/3146).
+    /// O_NOCTTY and O_PATH, only in a session leader, and only of a terminal
+    /// Linux can make controlling. None of the inputs is the controlling
+    /// terminal procfs lists, which a hangup clears
+    /// (https://github.com/rrnewton/hermit/issues/3146,
+    /// https://github.com/rrnewton/hermit/pull/3361).
     #[test]
     fn an_open_acquires_a_controlling_terminal_only_as_a_session_leader() {
         assert!(open_can_acquire_controlling_terminal(OFlag::O_RDWR));
@@ -6732,19 +6794,184 @@ mod test {
             OFlag::O_RDWR | OFlag::O_NOCTTY
         ));
         assert!(!open_can_acquire_controlling_terminal(OFlag::O_PATH));
+        // A host's /proc/tty/drivers, plus a driver whose name has a space.
+        let table = Some(
+            "/dev/tty             /dev/tty        5       0 system:/dev/tty\n\
+             /dev/console         /dev/console    5       1 system:console\n\
+             /dev/ptmx            /dev/ptmx       5       2 system\n\
+             /dev/vc/0            /dev/vc/0       4       0 system:vtmaster\n\
+             serial_8250          /dev/ttyS       4 64-95 serial\n\
+             acm serial           /dev/ttyACM   166 0-255 serial\n\
+             pty_slave            /dev/pts      136 0-1048575 pty:slave\n\
+             pty_master           /dev/ptm      128 0-1048575 pty:master\n\
+             unknown              /dev/tty        4 1-63 console\n",
+        );
         // /dev/pts/3 is character device 136:3; minor 300 sets bits above 0xff.
         let pts3 = libc::makedev(136, 3);
         let pts300 = libc::makedev(136, 300);
-        assert!(leads_session_with_terminal(42, 42, (136, 3), pts3));
-        assert!(leads_session_with_terminal(42, 42, (136, 300), pts300));
-        // Not the session leader, no controlling terminal, another terminal.
-        assert!(!leads_session_with_terminal(43, 42, (136, 3), pts3));
-        assert!(!leads_session_with_terminal(42, 42, (0, 0), pts3));
-        assert!(!leads_session_with_terminal(42, 42, (136, 4), pts3));
-        assert!(!leads_session_with_terminal(42, 42, (136, 3), pts300));
-        // /dev/tty (5:0) is never the controlling terminal procfs lists.
-        let dev_tty = libc::makedev(5, 0);
-        assert!(!leads_session_with_terminal(42, 42, (136, 3), dev_tty));
+        assert!(may_have_acquired_controlling_terminal(42, 42, pts3, table));
+        assert!(may_have_acquired_controlling_terminal(
+            42, 42, pts300, table
+        ));
+        assert!(!may_have_acquired_controlling_terminal(43, 42, pts3, table));
+        // Serial lines, virtual consoles and /dev/tty can become controlling;
+        // /dev/console, /dev/ptmx, /dev/vc/0, pseudoterminal masters, minors
+        // outside every range and devices that are not terminals cannot.
+        for (major, minor) in [(4, 64), (4, 95), (166, 7), (4, 1), (4, 63), (5, 0)] {
+            let rdev = libc::makedev(major, minor);
+            assert!(
+                terminal_can_become_controlling(rdev, table),
+                "{major}:{minor}"
+            );
+        }
+        for (major, minor) in [(5, 1), (5, 2), (4, 0), (128, 3), (4, 96), (188, 0), (1, 3)] {
+            let rdev = libc::makedev(major, minor);
+            assert!(
+                !terminal_can_become_controlling(rdev, table),
+                "{major}:{minor}"
+            );
+        }
+        // A table that cannot be read answers true, except for the devices
+        // Linux never makes controlling. A line that does not parse answers
+        // true, unless another line names the device.
+        let null = libc::makedev(1, 3);
+        assert!(terminal_can_become_controlling(pts3, None));
+        assert!(terminal_can_become_controlling(null, None));
+        assert!(!terminal_can_become_controlling(libc::makedev(5, 1), None));
+        let garbled = Some("pty_slave /dev/pts 136 0-1048575 pty:slave\nnot a driver line\n");
+        assert!(terminal_can_become_controlling(null, garbled));
+        assert!(terminal_can_become_controlling(pts3, garbled));
+        let master = Some("pty_master /dev/ptm 128 0-1048575 pty:master\nnot a driver line\n");
+        assert!(!terminal_can_become_controlling(
+            libc::makedev(128, 3),
+            master
+        ));
+    }
+
+    /// A session leader that opens a pseudoterminal's slave without O_NOCTTY
+    /// gains it as its controlling terminal. Closing the master then hangs the
+    /// slave up, which clears the controlling terminal procfs lists but changes
+    /// neither the session nor the descriptor's device. A hangup that lands
+    /// after the `open`, whether before or after the descriptor's stat, must
+    /// not hide that the `open` may have acquired the terminal
+    /// (https://github.com/rrnewton/hermit/pull/3361).
+    #[test]
+    fn a_hangup_after_the_open_does_not_hide_the_acquired_terminal() {
+        use std::time::Duration;
+        use std::time::Instant;
+
+        struct Child(libc::pid_t);
+        impl Drop for Child {
+            fn drop(&mut self) {
+                // SAFETY: the pid is this test's own child, not yet reaped.
+                unsafe {
+                    libc::kill(self.0, libc::SIGKILL);
+                    libc::waitpid(self.0, std::ptr::null_mut(), 0);
+                }
+            }
+        }
+
+        // SAFETY (every block below): libc calls on descriptors, buffers and
+        // a child process this test owns.
+        let flags = libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC;
+        let master = unsafe { libc::posix_openpt(flags) };
+        assert!(
+            master >= 0,
+            "posix_openpt: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(unsafe { libc::grantpt(master) }, 0);
+        assert_eq!(unsafe { libc::unlockpt(master) }, 0);
+        let mut slave_path = [0 as libc::c_char; 64];
+        let path_len = slave_path.len();
+        assert_eq!(
+            unsafe { libc::ptsname_r(master, slave_path.as_mut_ptr(), path_len) },
+            0
+        );
+        // `ready` carries the slave's descriptor number to this process;
+        // nothing writes `release`, so this process's exit ends the child.
+        let (mut ready, mut release) = ([0; 2], [0; 2]);
+        assert_eq!(
+            unsafe { libc::pipe2(ready.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        assert_eq!(
+            unsafe { libc::pipe2(release.as_mut_ptr(), libc::O_CLOEXEC) },
+            0
+        );
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork: {}", std::io::Error::last_os_error());
+        if pid == 0 {
+            // The child makes only async-signal-safe calls and allocates
+            // nothing, so forking from a test harness thread is safe.
+            unsafe {
+                libc::alarm(60);
+                libc::signal(libc::SIGHUP, libc::SIG_IGN);
+                libc::close(master);
+                libc::close(ready[0]);
+                libc::close(release[1]);
+                if libc::setsid() < 0 {
+                    libc::_exit(2);
+                }
+                let slave = libc::open(slave_path.as_ptr(), libc::O_RDWR);
+                if slave < 0 {
+                    libc::_exit(3);
+                }
+                let bytes = slave.to_ne_bytes();
+                if libc::write(ready[1], bytes.as_ptr().cast(), bytes.len()) != 4 {
+                    libc::_exit(4);
+                }
+                let mut byte = [0_u8; 1];
+                libc::read(release[0], byte.as_mut_ptr().cast(), 1);
+                libc::_exit(0);
+            }
+        }
+        let child = Child(pid);
+        unsafe {
+            libc::close(ready[1]);
+            libc::close(release[0]);
+        }
+        let mut bytes = [0_u8; 4];
+        let got = unsafe { libc::read(ready[0], bytes.as_mut_ptr().cast(), bytes.len()) };
+        assert_eq!(got, 4, "the child did not open the slave");
+        let slave = i32::from_ne_bytes(bytes);
+        // The descriptor's stat, read before the hangup, as `handle_openat`
+        // reads it before it classifies the open.
+        let link = std::ffi::CString::new(format!("/proc/{pid}/fd/{slave}")).unwrap();
+        let mut host_stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::stat(link.as_ptr(), &mut host_stat) }, 0);
+        let terminal = (
+            libc::major(host_stat.st_rdev) as i32,
+            libc::minor(host_stat.st_rdev) as i32,
+        );
+        let process = procfs::process::Process::new(pid).unwrap();
+        let before = process.stat().unwrap();
+        assert_eq!(
+            (before.session, before.tty_nr()),
+            (pid, terminal),
+            "the child's open did not acquire the terminal"
+        );
+        assert!(opened_controlling_terminal(pid, slave, Some(&host_stat)));
+        // Hang the slave up: Linux clears the session's controlling terminal.
+        assert_eq!(unsafe { libc::close(master) }, 0);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while process.stat().unwrap().tty_nr() != (0, 0) {
+            assert!(
+                Instant::now() < deadline,
+                "the hangup did not clear the controlling terminal"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(process.stat().unwrap().session, pid);
+        assert!(
+            opened_controlling_terminal(pid, slave, Some(&host_stat)),
+            "a hangup after the descriptor's stat hid the acquisition"
+        );
+        assert!(
+            opened_controlling_terminal(pid, slave, None),
+            "a hangup before the descriptor's stat hid the acquisition"
+        );
+        drop(child);
     }
 
     /// The ceiling is inclusive. A guest that reads the advertised
