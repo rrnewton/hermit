@@ -739,6 +739,18 @@ pub struct Scheduler {
     /// syscall or preemption (`Scheduler::retire_answered_sigchld`). A subset of
     /// `sigchld_taken`'s keys.
     sigchld_answered: BTreeSet<DetTid>,
+    /// Processes in which a thread armed `SIGCHLD` as its parent-death signal
+    /// (`prctl(PR_SET_PDEATHSIG, SIGCHLD)`). The kernel sends that signal when
+    /// the thread that forked the process exits, at the host instant of the
+    /// physical exit. A parent that another guest kills while it is outside the
+    /// run queue exits before the scheduler deregisters it, so that instant is
+    /// not ordered against the child's probes. Such a `SIGCHLD` is neither
+    /// marked nor from outside the container, so these processes do not take
+    /// the childless exception of `sigchld_eligible`: their gated waits keep the
+    /// base behaviour and count only marked signals. Membership lasts for the
+    /// process's life; a later `PR_SET_PDEATHSIG` of another signal does not
+    /// restore the exception, which fails closed.
+    sigchld_parent_death_processes: BTreeSet<DetPid>,
 
     /// Parents whose kernel `SIGCHLD` a child's logical death made eligible
     /// (`Scheduler::note_child_exit_sigchld`), each with the thread the kernel
@@ -1945,6 +1957,7 @@ impl Scheduler {
             sigchld_eligible_processes: Default::default(),
             sigchld_taken: Default::default(),
             sigchld_answered: Default::default(),
+            sigchld_parent_death_processes: Default::default(),
             pending_child_exit_sigchld: Default::default(),
             sigchld_child_exit_timers: Default::default(),
             #[cfg(test)]
@@ -4449,7 +4462,10 @@ impl Scheduler {
     /// parent, so it came from a sender, either a guest one, which marked it,
     /// or one outside the container. No reservation is taken for it: every
     /// `SIGCHLD` of such a process counts, so a mark that its delivery clears
-    /// changes no answer.
+    /// changes no answer. A process that armed `SIGCHLD` as its parent-death
+    /// signal is excluded (`sigchld_parent_death_processes`): the kernel also
+    /// sends that signal itself, at a host-timed instant, so such a process
+    /// counts only marked signals, as every process did before this exception.
     pub(crate) fn sigchld_eligible(&mut self, thread: DetTid, pending: bool) -> bool {
         if !pending {
             self.release_sigchld_reservation(thread);
@@ -4459,9 +4475,23 @@ impl Scheduler {
             self.sigchld_answered.insert(thread);
             return true;
         }
-        !self
-            .thread_tree
-            .process_had_child(&self.sigchld_process(thread))
+        let process = self.sigchld_process(thread);
+        !self.thread_tree.process_had_child(&process)
+            && !self.sigchld_parent_death_processes.contains(&process)
+    }
+
+    /// `thread` armed `SIGCHLD` as its parent-death signal, so its process no
+    /// longer counts an unmarked `SIGCHLD` (`sigchld_parent_death_processes`).
+    pub(crate) fn note_parent_death_sigchld(&mut self, thread: DetTid) {
+        if !self.sigchld_eligibility {
+            return;
+        }
+        let process = self.sigchld_process(thread);
+        trace!(
+            "[dtid {}] process {} armed SIGCHLD as its parent-death signal; it no longer counts an unmarked SIGCHLD.",
+            thread, process
+        );
+        self.sigchld_parent_death_processes.insert(process);
     }
 
     /// Take one mark for a `SIGCHLD` that `thread` is about to be interrupted by,
@@ -9673,6 +9703,51 @@ mod test {
         scheduler.mark_sigchld_eligible(root, Some(root));
         assert!(scheduler.sigchld_eligible(root, true));
         assert!(scheduler.sigchld_eligible_processes.is_empty());
+    }
+
+    /// A process that armed `SIGCHLD` as its parent-death signal does not take
+    /// the childless exception: the kernel sends that signal when the parent
+    /// exits, at a host-timed instant when another guest killed the parent
+    /// outside the run queue, so only a marked `SIGCHLD` counts, as for every
+    /// process before the exception (round-8 High 3 on
+    /// https://github.com/rrnewton/hermit/pull/3361). Membership is per process
+    /// and outlives the arming thread's later choices.
+    #[test]
+    fn a_process_with_a_sigchld_parent_death_signal_counts_only_marked_sigchld() {
+        let mut scheduler = sigchld_gated_scheduler();
+        let root = DetTid::from_raw(100);
+        let worker = DetTid::from_raw(101);
+        let other = DetTid::from_raw(102);
+        scheduler.thread_tree.add_child(root, root, true);
+        scheduler.thread_tree.add_child(root, worker, false);
+        scheduler.thread_tree.add_child(other, other, true);
+        assert!(scheduler.sigchld_eligible(root, true));
+
+        // A thread that is not the leader arms it; the whole process is covered,
+        // because the kernel sends it to the thread group.
+        scheduler.note_parent_death_sigchld(worker);
+        assert!(
+            !scheduler.sigchld_eligible(root, true),
+            "an unmarked SIGCHLD may be the kernel's parent-death signal"
+        );
+        assert!(!scheduler.sigchld_eligible(worker, true));
+        assert!(scheduler.sigchld_taken.is_empty());
+        assert!(
+            scheduler.sigchld_eligible(other, true),
+            "another childless process keeps the exception"
+        );
+
+        // A mark still counts, once.
+        scheduler.mark_sigchld_eligible(worker, Some(root));
+        assert!(scheduler.sigchld_eligible(root, true));
+        assert!(!scheduler.sigchld_eligible(root, true));
+
+        // Without gating, nothing is recorded.
+        let mut ungated = sigchld_gated_scheduler();
+        ungated.sigchld_eligibility = false;
+        ungated.thread_tree.add_child(root, root, true);
+        ungated.note_parent_death_sigchld(root);
+        assert!(ungated.sigchld_parent_death_processes.is_empty());
     }
 
     /// Marks are taken in the kernel's dequeue order, private queue first, and a
