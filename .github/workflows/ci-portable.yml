@@ -978,6 +978,20 @@ jobs:
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
+      # Every shard node runs inside ci/run-hosted-node.sh's network namespace,
+      # where Cargo cannot download anything. lint.clippy compiles against the
+      # locked registry crates and git checkouts, and every prepared-Nextest
+      # consumer recomputes the recorded source identity of each git
+      # dependency by running git inside its Cargo checkout. The rust-cache
+      # restore above is not a source for either: its key hashes the runner's
+      # installed toolchains, so an image whose default stable rustc differs
+      # from build-debug's misses. Run 37469056816 split across two images:
+      # the 1.98.1 shards hit, while clippy, modes and strict-verify ran on
+      # 1.99.0, missed, and failed (clippy could not clone dagrun, the others
+      # refused with "cannot inspect preparation source"). Fetch the locked
+      # inputs here, before the namespace, as build-complete does.
+      - name: Fetch locked workspace dependencies
+        run: cargo fetch --locked
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
@@ -1230,6 +1244,13 @@ jobs:
             exit 1
           fi
           echo "rust-script resolved: $(command -v rust-script) $(rust-script --version)"
+      # test.sabre_examples_on_host verifies the prepared-Nextest record inside
+      # ci/run-hosted-node.sh's network namespace, which re-hashes each git
+      # dependency's Cargo checkout; see test-debug's fetch step for the
+      # rust-cache key miss that left those checkouts absent in run
+      # 37469056816.
+      - name: Fetch locked workspace dependencies
+        run: cargo fetch --locked
       - name: Enable unprivileged user and mount namespaces
         run: |
           if [[ -e /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]]; then
