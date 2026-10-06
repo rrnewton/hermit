@@ -1450,6 +1450,53 @@ fn ptrace_a_caught_signal_ends_a_timed_wait_resumed_after_sigcont() {
     assert_a_caught_signal_ends_the_wait_resumed_after_sigcont("ptrace");
 }
 
+/// A caught handler whose first syscall is `restart_syscall` resumes the wait
+/// the signal interrupted, as on Linux (the guest's `restartfirst` mode). A
+/// sibling thread interrupts a timed `FUTEX_WAIT` or `FUTEX_WAIT_BITSET`, made
+/// through libc's `syscall()`, with SIGUSR1 100 ms after it began, and the
+/// handler calls `syscall(SYS_restart_syscall)` through the same wrapper, so the
+/// call stops at the address of the interrupted one. Linux resets the restart
+/// block only at sigreturn (`restore_sigcontext`), so the handler's call runs
+/// `futex_wait_restart` with the copied arguments and absolute deadline: it
+/// returns ETIMEDOUT at the original deadline, and the interrupted call returns
+/// EINTR after the handler, 300 ms after it began. Round-10 finding Medium 3 on
+/// https://github.com/rrnewton/hermit/pull/3361 asked Detcore to discard its
+/// record when a handler takes control; a native run of this guest shows the
+/// Linux behavior asserted here instead.
+fn assert_a_handlers_first_restart_syscall_resumes_the_interrupted_wait(backend: &str) {
+    for call in ["futex", "bitset"] {
+        let args = [call, "restartfirst"];
+        let expected = format!("RESULT call={call} ret=-1 errno=EINTR handler=1");
+        let run = run_cell(backend, FutexMode::Precise, &args, false);
+        assert!(
+            run.status.success()
+                && run.result_line() == Some(expected.as_str())
+                && run
+                    .stdout
+                    .lines()
+                    .any(|line| line == "RESTART ret=-1 errno=ETIMEDOUT")
+                && run.stdout.lines().any(|line| line == "DONE"),
+            "{backend} {args:?}: expected `{expected}` and `RESTART ret=-1 errno=ETIMEDOUT`\n{}",
+            run.describe()
+        );
+        let elapsed = run.elapsed_ms();
+        assert!(
+            elapsed.is_some_and(|ms| {
+                (QUIET_TIMEOUT_MS..QUIET_TIMEOUT_MS + QUIET_OVERSHOOT_MS).contains(&ms)
+            }),
+            "{backend} {args:?}: the wait took {elapsed:?} ms, not its original \
+             {QUIET_TIMEOUT_MS} ms deadline\n{}",
+            run.describe()
+        );
+        assert_verified(backend, FutexMode::Precise, &args, &run);
+    }
+}
+
+#[test]
+fn ptrace_a_handlers_first_restart_syscall_resumes_the_interrupted_timed_futex_wait() {
+    assert_a_handlers_first_restart_syscall_resumes_the_interrupted_wait("ptrace");
+}
+
 /// Positive control: `select` already observed an external signal before the
 /// fix, on both backends.
 #[test]

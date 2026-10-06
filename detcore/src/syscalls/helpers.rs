@@ -1560,6 +1560,20 @@ where
 /// `futex_wait_restart`). Detcore emulates the wait, so the kernel's restart block
 /// does not describe it, and Detcore keeps its own
 /// (https://github.com/rrnewton/hermit/issues/3358).
+///
+/// The record lives until the thread's next syscall, which takes it
+/// (`Detcore::handle_syscall_event`). Other first syscalls, sigreturn and exec
+/// discard the record; separate threads and newly initialized children have
+/// independent records. A caught handler does not discard it: Linux resets its
+/// restart block at sigreturn (`restore_sigcontext`), not when it sets up the
+/// handler, so a handler whose first syscall is `restart_syscall` resumes the
+/// interrupted wait with the copied arguments and deadline. Detcore does the
+/// same when that call stops at the interrupted call's address, as it does
+/// through libc's `syscall()` (the `restartfirst` mode of the
+/// `external_signal_interrupt` guest). Linux also keeps its restart block across
+/// the handler's other syscalls and resumes it from any address; Detcore does
+/// not, so a `restart_syscall` after another syscall or at another address takes
+/// the unsupported-syscall policy.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct RestartBlock {
     /// The instruction pointer at the interrupted call's syscall stop: the address

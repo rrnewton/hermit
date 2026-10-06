@@ -225,6 +225,19 @@
  * restarts the call with that copy (futex_wait_restart), so the move has no
  * effect and the call returns -1 with ETIMEDOUT at the original deadline.
  *
+ * The `restartfirst` sender is a mode of its own, for the relative FUTEX_WAIT
+ * (`futex`) and the absolute FUTEX_WAIT_BITSET (`bitset`), each made through
+ * libc's syscall() with the QUIET_TIMEOUT_MS timeout. A sibling thread sends
+ * the guest's main thread SIGUSR1, caught with flags 0, 100 ms after the wait
+ * began, and the handler's first syscall is syscall(SYS_restart_syscall), made
+ * through the same wrapper, so it stops at the interrupted call's address.
+ * Linux resets the thread's restart block only at sigreturn
+ * (restore_sigcontext), not when it sets up the handler, so that call runs
+ * futex_wait_restart: it waits until the original absolute deadline and
+ * returns -1 with ETIMEDOUT, and the interrupted call then returns -1 with
+ * EINTR. A RESTART line reports the handler's call, and the ELAPSED line, as
+ * for the interrupted call, ends after the handler has returned.
+ *
  * Output is one deterministic RESULT line after the call returns, followed
  * by DONE once every helper has been reaped. A kernel-internal errno, which has
  * no name, prints as UNNAMED(<number>). */
@@ -988,6 +1001,65 @@ static int stopcont_main(const char *call, int then_usr1) {
   return 0;
 }
 
+/* The `restartfirst` mode (see the usage comment). */
+static volatile long restart_first_ret = 0;
+static volatile int restart_first_err = 0;
+
+static void on_usr1_restart_first(int sig) {
+  (void)sig;
+  int saved = errno;
+  errno = 0;
+  long ret = syscall(SYS_restart_syscall);
+  restart_first_ret = ret;
+  restart_first_err = ret < 0 ? errno : 0;
+  handled = 1;
+  errno = saved;
+}
+
+static void *restart_first_sender(void *arg) {
+  (void)arg;
+  sleep_ms(STOP_DELAY_MS);
+  if (pthread_kill(main_thread, SIGUSR1) != 0) _exit(91);
+  return NULL;
+}
+
+static int restart_first_main(const char *call) {
+  int is_bitset = !strcmp(call, "bitset");
+  if (!is_bitset && strcmp(call, "futex")) return 2;
+  set_handler(SIGUSR1, on_usr1_restart_first);
+  say("READY\n");
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  pthread_t sender;
+  if (pthread_create(&sender, NULL, restart_first_sender, NULL) != 0) return 3;
+  long ret;
+  errno = 0;
+  if (is_bitset) {
+    struct timespec deadline = start;
+    add_ms(&deadline, QUIET_TIMEOUT_MS);
+    ret = syscall(SYS_futex, &futex_word, FUTEX_WAIT_BITSET_PRIVATE, 0, &deadline, NULL,
+                  FUTEX_BITSET_MATCH_ANY);
+  } else {
+    struct timespec timeout = {0, QUIET_TIMEOUT_MS * 1000000L};
+    ret = syscall(SYS_futex, &futex_word, FUTEX_WAIT_PRIVATE, 0, &timeout, NULL, 0);
+  }
+  int err = errno;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  if (pthread_join(sender, NULL) != 0) return 3;
+  char buf[160];
+  snprintf(buf, sizeof buf, "RESULT call=%s ret=%ld errno=%s handler=%d\n", call,
+           ret < 0 ? -1L : ret, ret < 0 ? errno_name(err) : "none", (int)handled);
+  say(buf);
+  snprintf(buf, sizeof buf, "RESTART ret=%ld errno=%s\n",
+           restart_first_ret < 0 ? -1L : restart_first_ret,
+           restart_first_ret < 0 ? errno_name(restart_first_err) : "none");
+  say(buf);
+  snprintf(buf, sizeof buf, "ELAPSED ms=%ld\n", ms_between(&start, &end));
+  say(buf);
+  say("DONE\n");
+  return 0;
+}
+
 /* The `racing` sender (see the usage comment). */
 #define RACING_TRIALS 6
 #define RACING_TIMEOUT_MS 5000
@@ -1134,6 +1206,7 @@ int main(int argc, char **argv) {
         "       external_signal_interrupt sigsuspend creator\n"
         "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty|hupinherit>\n"
         "       external_signal_interrupt <poll|futex|bitset> <stopcont|stopcontusr1>\n"
+        "       external_signal_interrupt <futex|bitset> restartfirst\n"
         "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing\n");
     return 2;
   }
@@ -1151,6 +1224,7 @@ int main(int argc, char **argv) {
   if (!strcmp(sender, "racing")) return racing_main(call);
   if (!strcmp(sender, "stopcont")) return stopcont_main(call, 0);
   if (!strcmp(sender, "stopcontusr1")) return stopcont_main(call, 1);
+  if (!strcmp(sender, "restartfirst")) return restart_first_main(call);
   int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
   int chldflood = 0;
   enum extchld extchld = EXTCHLD_NONE;
