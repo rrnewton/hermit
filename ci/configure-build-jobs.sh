@@ -994,8 +994,24 @@ fi
 # recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
 # second budget are unchanged. Source identity carries the calibration;
 # no new timing sample or >=5-sample replacement claim is made.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0395a68f29dfb5f069b8deeb4ef6adef2327cdba ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0395a68f29dfb5f069b8deeb4ef6adef2327cdba (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO d2257c061c5bc6523cd9dc9b3a75dd898fd62d34 (2026-10-05): from
+# 0395a68f29dfb5f069b8deeb4ef6adef2327cdba. The four inputs the budget governs, the DynamoRIO content-key miss
+# hashed over reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, $CMAKE and
+# $CMAKE_GENERATOR, are unchanged: vendor/dynamorio and build.rs have the same
+# git object ids at both revisions, as do reverie-dbt/Cargo.toml,
+# reverie-dbt/native/CMakeLists.txt, third-party and rust-toolchain.toml. The
+# root Cargo.toml differs by one line, the workspace member reverie-preload
+# renamed to reverie-inguest; that cannot change the elapsed time of a
+# DynamoRIO content-key miss. The six-commit range (e1fbd91c, b6be55a9,
+# bffb408d, bb4cb136, 5399822f, d2257c06) renames reverie-preload to
+# reverie-inguest and moves LiteInst's in-guest Tool host, fallback
+# continuation and RCB clock into it; it does not touch reverie-dbt.
+# The available-CPU cap and f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
+# second budget are unchanged. Carry, not recalibration: no new timing sample
+# or >=5-sample replacement claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != d2257c061c5bc6523cd9dc9b3a75dd898fd62d34 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie d2257c061c5bc6523cd9dc9b3a75dd898fd62d34 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
