@@ -1501,9 +1501,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // On a backend whose kernel reports the guest's signal state, the
                     // wait names the signals that end it, so a blocked, ignored, or
                     // default-ignored one leaves it parked until its wakeup or its
-                    // original deadline. One already pending is delivered first and
-                    // the wait then runs again
-                    // (https://github.com/rrnewton/hermit/issues/3146).
+                    // original deadline. As in Linux, one already pending when the
+                    // value matches ends the wait at once with the futex's restart
+                    // errno (https://github.com/rrnewton/hermit/issues/3146).
                     let signal_interruption = guest
                         .config()
                         .backend_supports_blocked_wait_signal_interruption;
@@ -1511,12 +1511,14 @@ impl<T: RecordOrReplay> Detcore<T> {
                         let state = read_kernel_signal_state(guest.pid(), guest.tid())
                             .map_err(Error::Errno)?;
                         if state.pending_interrupting(state.blocked) != 0 {
+                            let errno = call.kernel_restart_errno();
                             trace!(
-                                "[detcore, dtid {}] futex wait restarts after pending signals {:#x}",
+                                "[detcore, dtid {}] futex wait interrupted by pending signals {:#x}: {:?}",
                                 &dettid,
-                                state.pending_interrupting(state.blocked)
+                                state.pending_interrupting(state.blocked),
+                                errno
                             );
-                            return Err(Error::Errno(Errno::ERESTARTNOINTR));
+                            return Err(Error::Errno(errno));
                         }
                         Some(state.interrupting(state.blocked))
                     } else {
