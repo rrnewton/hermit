@@ -82,7 +82,10 @@ pub struct DetStat {
 
 impl DetStat {
     /// The host file identity, device and inode, of a stat not yet
-    /// determinized.
+    /// determinized: the key the deterministic inode pool requires.
+    ///
+    /// Only meaningful for a stat taken from the kernel, before
+    /// `determinize_stat` overwrites `dev` and `inode`.
     pub fn raw_inode(&self) -> detcore_model::fd::RawInode {
         detcore_model::fd::RawInode::new(self.dev, self.inode)
     }
