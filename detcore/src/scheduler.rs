@@ -344,6 +344,16 @@ pub struct BlockedPool {
     /// arbitrary external IO they cannot complete without a signal.
     pub rt_sigsuspend_blockers: BTreeMap<DetTid, ExternalOpId>,
 
+    /// The signal mask each thread in `external_io_blockers` or
+    /// `rt_sigsuspend_blockers` sleeps under, recorded when the scheduler
+    /// committed its blocking request: the call's own temporary mask
+    /// (`Resources::blocked_signal_mask`), or else the thread's mask read
+    /// while it was still stopped at that request. `None` records a mask that
+    /// could not be read. Such a thread runs outside the schedule, so its live
+    /// mask is host-timed; `kernel_sigchld_target` uses this record instead.
+    /// An entry lives exactly as long as the thread's blocking-pool entry.
+    pub out_of_scheduler_masks: BTreeMap<DetTid, Option<u64>>,
+
     /// Parents parked awaiting deterministic delivery of a host-async `SIGCHLD`.
     ///
     /// When a guest child process exits, the kernel raises `SIGCHLD` on the
@@ -2959,6 +2969,7 @@ impl Scheduler {
         self.blocked.timed_waiters.remove(*dtid);
         let _ = self.blocked.external_io_blockers.remove(dtid);
         let _ = self.blocked.rt_sigsuspend_blockers.remove(dtid);
+        let _ = self.blocked.out_of_scheduler_masks.remove(dtid);
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
@@ -4139,19 +4150,38 @@ impl Scheduler {
     /// signal, and otherwise looks for another thread that does not. Under a
     /// tracer, a thread held in a ptrace stop does not qualify, and the kernel
     /// instead leaves the signal pending for whichever thread resumes first
-    /// without blocking it. Every thread the scheduler controls is in such a
-    /// stop here, and a parked waiter that is chosen is queued to run next
-    /// (`force_unblock_thread_at`), so the first non-blocking thread in this
-    /// order is the one that dequeues the signal: `preferred`, then the rest in
-    /// thread-ID order, which stands in for the kernel's round-robin
-    /// `curr_target`. A running thread counts as much as a parked one; if it is
-    /// chosen, no waiter is woken.
+    /// without blocking it. A parked waiter that is chosen is queued to run
+    /// next (`force_unblock_thread_at`), so the first non-blocking thread in
+    /// this order is the one that dequeues the signal: `preferred`, then the
+    /// rest in thread-ID order, which stands in for the kernel's round-robin
+    /// `curr_target`. A running thread counts as much as a parked one; if it
+    /// is chosen, no waiter is woken.
     ///
-    /// Call this only at the step2 drain or a step2b timed pop, where each
-    /// mask read is ordered by the schedule: a mask changes only in its own
-    /// thread's turn, except for the out-of-scheduler blockers named at
-    /// `parked_futex_interrupting_signals`. A thread whose mask cannot be read
-    /// is skipped, and returns `None` when every thread blocks the signal.
+    /// Every mask this uses is a function of the schedule, so the choice is
+    /// too. Call this only at the step2 drain or a step2b timed pop, where no
+    /// guest thread holds the turn. A thread then falls in one of two kinds:
+    ///
+    /// * One the scheduler controls is stopped at a request, filled or
+    ///   parked. Its mask changes only when it runs, in its own turn, so the
+    ///   mask read now is the one it stopped with.
+    /// * One sleeping in a call outside the runnable set
+    ///   (`external_io_blockers`, `rt_sigsuspend_blockers`) is not stopped:
+    ///   `rt_sigsuspend`, `ppoll` and `pselect6` install their temporary mask
+    ///   after the scheduler released the thread, and a handler delivered to
+    ///   it runs under a wider one, both at host-timed moments. Its live mask
+    ///   is never read here; the mask recorded when the scheduler committed
+    ///   its call is used instead (`BlockedPool::out_of_scheduler_masks`).
+    ///
+    /// A thread whose mask cannot be read is not a target, and only a thread
+    /// that no longer exists has one: a stopped thread's `/proc` entry stays
+    /// readable, and an out-of-scheduler thread's live mask is never read. A
+    /// thread the guest kills is retired at the turn that kills it
+    /// (`logically_kill_thread`), which takes it out of
+    /// `process_signal_targets` before it dies. So an unreadable thread was
+    /// killed from outside the container at a host-timed moment, the same
+    /// envelope as any signal sent from outside; the kernel does not choose a
+    /// dying thread either (`wants_signal` skips `PF_EXITING`). Returns `None`
+    /// when every thread blocks the signal.
     fn kernel_sigchld_target(&self, process: DetPid, preferred: DetTid) -> Option<DetTid> {
         let sigchld = kernel_signal_bit(libc::SIGCHLD);
         let mut threads = self.process_signal_targets(process);
@@ -4164,8 +4194,10 @@ impl Scheduler {
     }
 
     /// `thread`'s signal mask: the one its parked futex wait reported, which only
-    /// it can change and so cannot change while it is parked, and otherwise the
-    /// kernel's (`SigBlk`).
+    /// it can change and so cannot change while it is parked; for a thread
+    /// sleeping outside the runnable set, the one recorded when its call was
+    /// committed (`BlockedPool::out_of_scheduler_masks`); and otherwise the
+    /// kernel's (`SigBlk`) for a thread stopped at a request.
     fn thread_signal_mask(&self, thread: DetTid) -> Option<u64> {
         if let Some(watch) = self
             .parked_futex_waiter(thread)
@@ -4173,6 +4205,16 @@ impl Scheduler {
         {
             return Some(!watch.unblocked);
         }
+        if let Some(recorded) = self.blocked.out_of_scheduler_masks.get(&thread) {
+            return *recorded;
+        }
+        self.read_thread_blocked_mask(thread)
+    }
+
+    /// `thread`'s current signal mask (`SigBlk`), read from the kernel; `None`
+    /// when it cannot be read. Ordered by the schedule only while `thread` is
+    /// stopped at a request (`kernel_sigchld_target`).
+    fn read_thread_blocked_mask(&self, thread: DetTid) -> Option<u64> {
         #[cfg(test)]
         if let Some(state) = self.test_kernel_signal_states.get(&thread) {
             return Some(state.blocked);
@@ -4427,6 +4469,7 @@ impl Scheduler {
                     );
                     let external = scheduler.blocked.external_io_blockers.remove(ready_dtid);
                     let sigsuspend = scheduler.blocked.rt_sigsuspend_blockers.remove(ready_dtid);
+                    let _ = scheduler.blocked.out_of_scheduler_masks.remove(ready_dtid);
                     assert!(
                         external.is_some() ^ sigsuspend.is_some(),
                         "ready thread must belong to exactly one blocking pool"
@@ -5170,6 +5213,7 @@ impl Scheduler {
                         rid,
                         perm,
                         rs.signal_interrupt_errno(),
+                        rs.blocked_signal_mask,
                         resp,
                     )
                 }
@@ -5215,6 +5259,7 @@ impl Scheduler {
         rid: &ResourceID,
         _perm: &Permission,
         signal_interrupt_errno: Option<i32>,
+        blocked_signal_mask: Option<u64>,
         resp: &Ivar<SchedResponse>,
     ) -> Result<(), SkipTurn> {
         match rid {
@@ -5278,6 +5323,14 @@ impl Scheduler {
                 // scheduler commits, and thus it leans on an assumption of
                 // non-interference, or on interference *only* affecting the external
                 // actions that will be recorded anyway.
+                //
+                // Record the mask the thread will sleep under BEFORE releasing it:
+                // its call's own temporary mask, read in its turn, or else its
+                // current mask, which only it can change and cannot change while
+                // it is still stopped at this request. Once released, its live
+                // mask is host-timed (`kernel_sigchld_target`).
+                let sleeping_mask =
+                    blocked_signal_mask.or_else(|| self.read_thread_blocked_mask(dettid));
                 self.run_queue.consume_yield_exclusion();
                 self.unblock_guest(dettid, resp)?;
 
@@ -5289,6 +5342,9 @@ impl Scheduler {
                     self.blocked.external_io_blockers.insert(dettid, *op_id)
                 };
                 assert!(old.is_none(), "thread started a second external operation");
+                self.blocked
+                    .out_of_scheduler_masks
+                    .insert(dettid, sleeping_mask);
                 Err(SkipTurn)
             }
 
@@ -9551,6 +9607,144 @@ mod test {
         assert!(scheduler.sigchld_eligible_processes.contains(&parent));
     }
 
+    /// Commit `thread`'s request to begin a blocking call outside the runnable
+    /// set, as step3 does, with `mask` the call's own temporary mask.
+    fn commit_out_of_scheduler_call(
+        scheduler: &mut Scheduler,
+        thread: DetTid,
+        rid: ResourceID,
+        mask: Option<u64>,
+    ) {
+        scheduler.runqueue_push_back(thread);
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(thread), Some(thread));
+        assert!(
+            scheduler
+                .block_for_one_resource(thread, &rid, &Permission::RW, None, mask, &Ivar::new())
+                .is_err()
+        );
+    }
+
+    /// A thread sleeping in `rt_sigsuspend` or in other IO outside the runnable
+    /// set is not stopped, so its live mask changes at host-timed moments:
+    /// `rt_sigsuspend` installs its temporary mask only after the scheduler
+    /// released the thread. The `SIGCHLD` target is chosen from the mask the
+    /// scheduler recorded when it committed the call, the call's own mask or
+    /// else the mask read while the thread was still stopped at its request.
+    /// Before, the live mask was read when the child died, so whether the
+    /// creator or a sibling parked in a precise futex wait took the signal,
+    /// and whether that wait was woken, depended on host timing
+    /// (<https://github.com/rrnewton/hermit/issues/3146>).
+    #[test]
+    fn a_sigchld_target_sleeping_outside_the_scheduler_uses_the_mask_recorded_at_its_commit() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let blocking = |blocked: u64| KernelSignalState {
+            blocked,
+            ..signal_state(chld, 0)
+        };
+        let family_with_parked_sibling = || {
+            let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+            let sibling = DetTid::from_raw(102);
+            scheduler.thread_tree.add_child(parent, sibling, false);
+            register_known_thread(&mut scheduler, sibling);
+            park_for_sigchld(&mut scheduler, sibling, chld);
+            // The leader runs with SIGCHLD blocked, and so does the creator
+            // until its call installs a mask of its own.
+            scheduler
+                .test_kernel_signal_states
+                .insert(parent, blocking(chld));
+            scheduler
+                .test_kernel_signal_states
+                .insert(creator, blocking(chld));
+            (scheduler, parent, creator, child, sibling)
+        };
+
+        // The creator suspends with an rt_sigsuspend mask that unblocks SIGCHLD.
+        // Whether or not the host has installed that mask yet, the creator takes
+        // the signal, so the sibling's precise futex wait is left alone.
+        let (mut scheduler, parent, creator, child, sibling) = family_with_parked_sibling();
+        let op = ExternalOpId::new(creator, 1);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingRtSigsuspend(op),
+            Some(0),
+        );
+        assert_eq!(
+            scheduler.blocked.rt_sigsuspend_blockers.get(&creator),
+            Some(&op)
+        );
+        assert_eq!(
+            scheduler.blocked.out_of_scheduler_masks.get(&creator),
+            Some(&Some(0))
+        );
+        for live in [chld, 0] {
+            scheduler
+                .test_kernel_signal_states
+                .insert(creator, blocking(live));
+            assert_eq!(
+                scheduler.kernel_sigchld_target(parent, creator),
+                Some(creator)
+            );
+        }
+        scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
+        scheduler.drain_pending_cross_task_signals();
+        assert!(scheduler.is_parked_futex_waiter(sibling));
+        assert!(scheduler.sigchld_taken.is_empty());
+
+        // Other external IO sleeps under the thread's own mask, read while it is
+        // still stopped at its request: SIGCHLD blocked. A later change of its
+        // live mask does not make it the target; the sibling's wait is woken.
+        let (mut scheduler, parent, creator, child, sibling) = family_with_parked_sibling();
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingExternalIO(ExternalOpId::new(creator, 2)),
+            None,
+        );
+        assert_eq!(
+            scheduler.blocked.out_of_scheduler_masks.get(&creator),
+            Some(&Some(chld))
+        );
+        scheduler
+            .test_kernel_signal_states
+            .insert(creator, blocking(0));
+        assert_eq!(
+            scheduler.kernel_sigchld_target(parent, creator),
+            Some(sibling)
+        );
+        scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
+        scheduler.drain_pending_cross_task_signals();
+        assert!(!scheduler.is_parked_futex_waiter(sibling));
+        assert!(scheduler.sigchld_taken.contains_key(&sibling));
+
+        // A mask that could not be recorded is not a target, whatever the live
+        // one says, and the record goes when the thread leaves its pool.
+        let (mut scheduler, parent, creator, _child, sibling) = family_with_parked_sibling();
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingExternalIO(ExternalOpId::new(creator, 3)),
+            Some(0),
+        );
+        scheduler
+            .blocked
+            .out_of_scheduler_masks
+            .insert(creator, None);
+        scheduler
+            .test_kernel_signal_states
+            .insert(creator, blocking(0));
+        assert_eq!(
+            scheduler.kernel_sigchld_target(parent, creator),
+            Some(sibling)
+        );
+        scheduler.remove_blocking_entries(&creator);
+        assert!(scheduler.blocked.out_of_scheduler_masks.is_empty());
+        assert_eq!(
+            scheduler.kernel_sigchld_target(parent, creator),
+            Some(creator)
+        );
+    }
+
     /// A `SIGCHLD` whose delivery the scheduler placed, by committing a parked
     /// waiter's wake, is not deferred behind a runnable sibling as a host-async
     /// one is: neither the wake turn nor the handler turn the delivery then
@@ -9608,6 +9802,7 @@ mod test {
                         wake.resources.keys().next().unwrap(),
                         &Permission::W,
                         wake.signal_interrupt_errno(),
+                        None,
                         &Ivar::new(),
                     )
                     .is_ok()
@@ -9629,7 +9824,14 @@ mod test {
             );
             assert!(
                 scheduler
-                    .block_for_one_resource(creator, &inbound, &Permission::W, None, &Ivar::new())
+                    .block_for_one_resource(
+                        creator,
+                        &inbound,
+                        &Permission::W,
+                        None,
+                        None,
+                        &Ivar::new()
+                    )
                     .is_ok()
             );
             assert!(scheduler.blocked.sigchld_deferred.is_empty());
@@ -9647,7 +9849,14 @@ mod test {
             assert_eq!(scheduler.run_queue.tentative_pop_tid(parent), Some(parent));
             assert!(
                 scheduler
-                    .block_for_one_resource(parent, &inbound, &Permission::W, None, &Ivar::new())
+                    .block_for_one_resource(
+                        parent,
+                        &inbound,
+                        &Permission::W,
+                        None,
+                        None,
+                        &Ivar::new()
+                    )
                     .is_err()
             );
             assert!(scheduler.blocked.sigchld_deferred.contains(&parent));
@@ -9754,6 +9963,7 @@ mod test {
                         mm: MmId::initial(child),
                     },
                     &Permission::RW,
+                    None,
                     None,
                     &Ivar::new(),
                 )
@@ -10003,6 +10213,7 @@ mod test {
                     resources.resources.keys().next().unwrap(),
                     &Permission::W,
                     resources.signal_interrupt_errno(),
+                    None,
                     &Ivar::new(),
                 )
                 .is_ok()
@@ -10618,6 +10829,7 @@ mod test {
                     waiter,
                     &ResourceID::WaitPhysicalChild(child),
                     &Permission::W,
+                    None,
                     None,
                     &Ivar::new(),
                 )
