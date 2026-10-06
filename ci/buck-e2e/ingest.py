@@ -57,7 +57,9 @@ when both cells ran on the same route.
 
 --failed-verify-logs DIR: keep the verify logs of every execution that did not pass, as
 evidence that outlives IMPORT_DIR (validate passes a directory below its E2E result
-root). An execution did not pass when its row is not PASS, or when it wrote no row. Each
+root). An execution did not pass when its row is not PASS, when it wrote no row, or when
+its result.json does not record complete evidence (cell.sh then reports it to Tpx as an
+ERROR, whatever its row says). Each
 of hermit's verify logs (run1_log_*, and run2_log_*, which hermit keeps only when the
 two runs differ) that cell.sh returned from anywhere in the cell's directory is checked
 byte-exact against the sha256 its result.json recorded, decompressed, and written to
@@ -71,8 +73,10 @@ log hermit bounded is kept whole and anything longer is cut there. DIR/index.jso
 one line per execution that did not pass: its cell, run id, outcome (null without a
 row), route keys as above, and for each log the file written (relative to DIR) with its
 size and whether it was cut, or why it was not kept. DIR must be absent, empty, or a
-previous ingest's (it holds index.jsonl); it is replaced. A log that is not kept never
-fails the ingest.
+previous ingest's (it holds index.jsonl), and must neither contain nor lie inside IMPORT_DIR,
+--work or --local-artifacts; it is replaced. The logs are kept before the cells' coverage is
+checked, so a run that ingest refuses for a cell with no row (every attempt died) still
+leaves them. A log that is not kept never fails the ingest.
 
 --local-artifacts: Buck materializes each test's artifact directory locally
 (buck-out/v2/test/execution/<cell>/<target hash>/<config hash>/default/artifacts_directory),
@@ -329,6 +333,14 @@ def main():
             (os.listdir(failed_root) and not os.path.isfile(os.path.join(failed_root, FAILED_LOGS_INDEX)))):
         sys.exit(f"ingest: --failed-verify-logs {failed_root} is not absent, empty, or a previous ingest's "
                  f"(no {FAILED_LOGS_INDEX}); refusing to replace it")
+    if failed_root is not None:
+        def nested(a_path, b_path):
+            a_path, b_path = os.path.realpath(a_path), os.path.realpath(b_path)
+            return os.path.commonpath([a_path, b_path]) in (a_path, b_path)
+        for flag, other in (("--out", a.out), ("--work", a.work), ("--local-artifacts", a.local_artifacts)):
+            if other is not None and nested(failed_root, other):
+                sys.exit(f"ingest: --failed-verify-logs {failed_root} overlaps {flag} {other}; replacing it would "
+                         f"delete that directory's files")
     plan = json.load(open(a.plan))
     want = {"{}/{}@{}".format(c["test"], c["mode"], c["backend"]): c for c in plan["cells"]}
     work = a.work or tempfile.mkdtemp(prefix="buck-e2e-ingest-")
@@ -384,23 +396,27 @@ def main():
         # fetch them never fails the ingest.
         logs, log_dir, fetch_error = verify_logs(rows, names), d, None
         log_names = sorted({n for found in logs.values() if not isinstance(found, str) for n in found[2]})
-        passed = bool(rows) and all(row.get("outcome") == "PASS" for row in rows)
+        # As cell.sh reports it to Tpx: a PASS row whose evidence is incomplete is an ERROR.
+        passed = (bool(rows) and all(row.get("outcome") == "PASS" for row in rows)
+                  and isinstance(result, dict) and result.get("evidence_complete") is True)
         failed = run_logs(names) if failed_root is not None and not passed else None
-        if source == "testx" and (log_names or failed):
-            log_dir = d + "__verify-logs"
-        def get(wanted):
-            if source != "testx" or all(os.path.exists(os.path.join(log_dir, n)) for n in wanted):
+        def get(directory, wanted):
+            if all(os.path.exists(os.path.join(directory, n)) for n in wanted):
                 return None
-            args = ["artifacts", "get", f"{rid}.{tid}.{end}", "--output-dir", log_dir]
+            args = ["artifacts", "get", f"{rid}.{tid}.{end}", "--output-dir", directory]
             for n in wanted:
                 args += ["--artifact-names", n]
             return try_testx(*args)[1]
-        if log_names:
-            fetch_error = get(log_names)
-        # Fetched separately, so a failure here never takes the parity post-pass's logs.
-        failed_error = get(sorted(failed)) if failed else None
+        if source == "testx" and log_names:
+            log_dir = d + "__verify-logs"
+            fetch_error = get(log_dir, log_names)
+        # Into a directory of its own, so this fetch can never overwrite or fail the parity post-pass's logs.
+        failed_dir, failed_error = d, None
+        if source == "testx" and failed:
+            failed_dir = d + "__failed-verify-logs"
+            failed_error = get(failed_dir, sorted(failed))
         return (cell, end, marker, source, rows, summary, result, (logs, log_dir, fetch_error),
-                None if failed is None else (failed, failed_error))
+                None if failed is None else (failed, failed_dir, failed_error))
 
     with cf.ThreadPoolExecutor(a.j) as ex:
         fetched = list(ex.map(fetch, executions))
@@ -433,7 +449,20 @@ def main():
         log_sources.append((run_id, result, logs))
         # An execution with neither a row nor a log (one that claimed host inapplicability) has nothing to keep.
         if failed is not None and (rows or failed[0]):
-            failed_sources.append((cell, run_id, rows, result, failed[0], logs[1], failed[1]))
+            failed_sources.append((cell, run_id, rows, result, *failed))
+
+    # Kept before the coverage check below, which refuses a run with a cell that wrote no row:
+    # the logs of the executions that died are the evidence that refusal needs.
+    failed_entries = []
+    if failed_root is not None:
+        shutil.rmtree(failed_root, ignore_errors=True)
+        os.makedirs(failed_root)  # fails if a previous ingest's logs could not all be removed
+        with cf.ThreadPoolExecutor(a.j) as ex:
+            failed_entries = list(ex.map(lambda s: keep_failed_logs(failed_root, *s, a.failed_log_max_bytes), failed_sources))
+        with open(os.path.join(failed_root, FAILED_LOGS_INDEX), "w") as f:
+            for entry in sorted(failed_entries, key=lambda e: (e["cell"], str(e["run_id"]))):
+                f.write(json.dumps(entry, sort_keys=True) + "\n")
+    failed_logs = [one for entry in failed_entries for one in entry["logs"]]
 
     def covered(cell):
         runs = per_cell.get(cell, [])
@@ -504,16 +533,6 @@ def main():
             f.write(json.dumps({"schema": LOGS_SCHEMA, "verify_log_dir": r, "restored": restored, "reason": reason,
                                 **routes[r]}, sort_keys=True) + "\n")
     unrestored = sorted(f"{r}: {reason}" for r, (_, reason) in index.items() if reason is not None)
-    failed_entries = []
-    if failed_root is not None:
-        shutil.rmtree(failed_root, ignore_errors=True)
-        os.makedirs(failed_root)  # fails if a previous ingest's logs could not all be removed
-        with cf.ThreadPoolExecutor(a.j) as ex:
-            failed_entries = list(ex.map(lambda s: keep_failed_logs(failed_root, *s, a.failed_log_max_bytes), failed_sources))
-        with open(os.path.join(failed_root, FAILED_LOGS_INDEX), "w") as f:
-            for entry in sorted(failed_entries, key=lambda e: (e["cell"], str(e["run_id"]))):
-                f.write(json.dumps(entry, sort_keys=True) + "\n")
-    failed_logs = [one for entry in failed_entries for one in entry["logs"]]
     print(json.dumps({"sources": dict(sources), "cells": len(per_cell), "buckets": len(set(buckets) | set(summaries)), "rows": sum(attempts.values()),
                       "attempts": dict(attempts), "final_outcomes": dict(final),
                       "no_row_executions": len(no_row), "no_row_examples": sorted(no_row)[:20],

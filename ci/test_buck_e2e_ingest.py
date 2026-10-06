@@ -29,7 +29,9 @@ PLAN = {
     ]
 }
 # testx, for the two things ingest.py asks of it: `--as-json results list RUN`
-# and `artifacts get RUN.TEST.END --output-dir DIR --artifact-names NAME...`.
+# and `artifacts get RUN.TEST.END --output-dir DIR --artifact-names NAME...`. With
+# FAKE_TESTX_GARBLE, a get that asks for any name containing it writes garbage in
+# place of every file it was asked for, as a download cut short would.
 FAKE_TESTX = r"""#!/usr/bin/env python3
 import os, shutil, sys
 root, args = os.environ["FAKE_TESTX_DIR"], sys.argv[1:]
@@ -38,9 +40,13 @@ if args[:3] == ["--as-json", "results", "list"]:
 elif args[:2] == ["artifacts", "get"]:
     out = args[args.index("--output-dir") + 1]
     os.makedirs(out, exist_ok=True)
-    for i, arg in enumerate(args):
-        if arg == "--artifact-names":
-            shutil.copy(os.path.join(root, "art", args[2], args[i + 1]), out)
+    names = [args[i + 1] for i, arg in enumerate(args) if arg == "--artifact-names"]
+    garble = os.environ.get("FAKE_TESTX_GARBLE")
+    for name in names:
+        if garble and any(garble in n for n in names):
+            open(os.path.join(out, name), "w").write("cut short")
+        else:
+            shutil.copy(os.path.join(root, "art", args[2], name), out)
 else:
     sys.exit("fake testx: unexpected " + repr(args))
 """
@@ -167,7 +173,7 @@ class IngestTest(unittest.TestCase):
         self.testx.chmod(0o755)
         (self.root / "plan.json").write_text(json.dumps(PLAN))
 
-    def ingest(self, runs, local=(), extra=()):
+    def ingest(self, runs, local=(), extra=(), **environment):
         """Run ingest.py on RUNS ({test run id: [execution, ...]}), with each
         execution in LOCAL copied into its own buck-out artifacts directory and
         EXTRA added to its arguments."""
@@ -190,7 +196,7 @@ class IngestTest(unittest.TestCase):
                 target = buck_out / "root" / f"target{index}" / "config" / "default"
                 write_artifacts(target / "artifacts_directory", uploaded)
             command += ["--local-artifacts", str(buck_out)]
-        environment = dict(os.environ, TESTX=str(self.testx), FAKE_TESTX_DIR=str(fake))
+        environment = dict(os.environ, TESTX=str(self.testx), FAKE_TESTX_DIR=str(fake), **environment)
         process = subprocess.run(
             command + list(extra) + list(runs), capture_output=True, text=True, env=environment
         )
@@ -516,6 +522,65 @@ class IngestTest(unittest.TestCase):
             work, process = self.ingest(runs, extra=["--failed-verify-logs", str(again)])
             self.assertEqual(process.returncode, 0, process.stderr)
         self.assertEqual(self.read_kept(again), ({}, {}))
+
+    def test_a_pass_row_with_incomplete_evidence_keeps_its_logs(self):
+        # cell.sh reports such an execution to Tpx as an ERROR, whatever its row says.
+        incomplete = with_logs(execution(Y, 150, "PASS", "ry1", complete=False), DIVERGED_LOGS)
+        work, process = self.ingest({"RUN": [execution(X, 100, "PASS", "rx1"), incomplete]},
+                                    extra=["--failed-verify-logs", str(self.root / "kept")])
+        self.assertEqual(process.returncode, 0, process.stderr)
+        index, files = self.read_kept(self.root / "kept")
+        self.assertEqual(sorted(files), ["ry1/verify-logs/verify-1/run1_log_detlog",
+                                         "ry1/verify-logs/verify-1/run2_log_detlog"])
+        self.assertEqual(index["ry1"]["outcome"], "PASS")
+
+    def test_logs_are_kept_from_a_run_refused_for_a_cell_with_no_row(self):
+        # Every attempt of X died before writing a row, so ingest refuses the run; the logs of
+        # those attempts are what explains it, and they must survive the refusal.
+        died = [with_logs(execution(X, end, None, f"rx{end}", complete=False), DIVERGED_LOGS) for end in (100, 200)]
+        work, process = self.ingest({"RUN": [*died, Y_PASSES]}, extra=["--failed-verify-logs", str(self.root / "kept")])
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        self.assertIn(f"neither a row nor a host-inapplicable claim from every execution: ['{X}'] (1)", process.stderr)
+        index, files = self.read_kept(self.root / "kept")
+        self.assertEqual(sorted(index), ["rx100", "rx200"])
+        self.assertEqual(len(files), 4)
+
+    def test_a_bad_failed_log_download_never_touches_the_parity_logs(self):
+        # Y diverged; its row records the verify-log directory, so the parity post-pass
+        # restores its run 1 log too. The download of the failed logs is cut short.
+        parity_row = dict(row(Y, "FAIL", "ry1"), argv=["--verify-log-dir", "/cell/verify-logs/verify-1"],
+                          artifact_dir="/cell")
+        diverged = with_logs(execution(Y, 150, "FAIL", "ry1", rows=[parity_row]), DIVERGED_LOGS)
+        work, process = self.ingest({"RUN": [execution(X, 100, "PASS", "rx1"), diverged]},
+                                    extra=["--failed-verify-logs", str(self.root / "kept")],
+                                    FAKE_TESTX_GARBLE="run2_log_")
+        self.assertEqual(process.returncode, 0, process.stderr)
+        parity = [json.loads(line) for line in (work / "out" / "retained-verify-logs" / "index.jsonl").read_text().splitlines()]
+        self.assertEqual([(entry["restored"], entry["reason"]) for entry in parity],
+                         [("retained-verify-logs/ry1/verify-logs/verify-1", None)])
+        self.assertEqual((work / "out" / "retained-verify-logs" / "ry1" / "verify-logs" / "verify-1" / "run1_log_detlog").read_bytes(),
+                         RUN1_LOG)
+        index, files = self.read_kept(self.root / "kept")
+        self.assertEqual(files, {})
+        self.assertEqual([one["reason"] for one in index["ry1"]["logs"]],
+                         ["it does not have the sha256 its cell recorded"] * 2)
+
+    def test_a_directory_overlapping_the_ingests_own_output_is_refused(self):
+        diverged = with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS)
+        # (case, --out, --failed-verify-logs), below a fresh directory: none exists yet.
+        for name, out, target in (("--out itself", "out", "out"), ("the parity logs", "out", "out/retained-verify-logs"),
+                                  ("a parent of --out", "nest/out", "nest"), ("inside --work", "out", "fetched/kept")):
+            with self.subTest(name):
+                work = Path(tempfile.mkdtemp(dir=self.root))
+                fake = work / "fake"
+                write_test_runs(fake, {"RUN": [execution(X, 100, "PASS", "rx1"), diverged]})
+                process = subprocess.run(
+                    [sys.executable, str(INGEST), "--plan", str(self.root / "plan.json"), "--out", str(work / out),
+                     "--work", str(work / "fetched"), "--failed-verify-logs", str(work / target), "RUN"],
+                    capture_output=True, text=True, env=dict(os.environ, TESTX=str(self.testx), FAKE_TESTX_DIR=str(fake)))
+                self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+                self.assertIn("overlaps", process.stderr)
+                self.assertFalse((work / out).exists(), "ingest wrote before refusing")
 
 
 if __name__ == "__main__":
