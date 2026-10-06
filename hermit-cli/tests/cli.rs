@@ -1335,14 +1335,15 @@ fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
 }
 
 /// Deny `ioctl(fd, TCGETS)`, the terminal query behind glibc's `isatty`, with
-/// `EPERM` in hermit and everything it starts, and leave every other ioctl
+/// `errno` in hermit and everything it starts, and leave every other ioctl
 /// alone. A terminal then looks to `isatty` like something that is not a
-/// terminal, but the error is `EPERM` and not the `ENOTTY` that a descriptor
-/// which really is not a terminal answers.
-fn deny_terminal_query(command: &mut Command) {
+/// terminal. With `EPERM` the error still differs from the `ENOTTY` that a
+/// descriptor which really is not a terminal answers; with `ENOTTY` nothing
+/// does.
+fn deny_terminal_query(command: &mut Command, errno: i32) {
     // SAFETY: The callback makes only async-signal-safe syscalls before exec.
     unsafe {
-        command.pre_exec(|| {
+        command.pre_exec(move || {
             let mut filter = [
                 libc::sock_filter {
                     code: 0x20, // BPF_LD | BPF_W | BPF_ABS
@@ -1374,7 +1375,73 @@ fn deny_terminal_query(command: &mut Command) {
                     code: 0x06, // BPF_RET | BPF_K
                     jt: 0,
                     jf: 0,
-                    k: 0x0005_0000 | libc::EPERM as u32, // SECCOMP_RET_ERRNO
+                    k: 0x0005_0000 | errno as u32, // SECCOMP_RET_ERRNO
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: 0x7fff_0000, // SECCOMP_RET_ALLOW
+                },
+            ];
+            set_seccomp_filter(&mut filter)
+        });
+    }
+}
+
+/// Answer `statx`, `newfstatat` and `fstat` with `errno` when their descriptor
+/// argument is 2, in hermit and everything it starts, and leave every other
+/// call alone, those three on other descriptors included. Nothing can then
+/// learn what kind of file stderr is. With `errno` 0 each of those calls
+/// returns 0 and fills in nothing: it feigns success.
+fn deny_file_type_queries_on_stderr(command: &mut Command, errno: i32) {
+    // SAFETY: The callback makes only async-signal-safe syscalls before exec.
+    unsafe {
+        command.pre_exec(move || {
+            let mut filter = [
+                libc::sock_filter {
+                    code: 0x20, // BPF_LD | BPF_W | BPF_ABS
+                    jt: 0,
+                    jf: 0,
+                    k: 0, // offsetof(seccomp_data, nr)
+                },
+                libc::sock_filter {
+                    code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
+                    jt: 2,      // to the descriptor check
+                    jf: 0,
+                    k: libc::SYS_statx as u32,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 1,
+                    jf: 0,
+                    k: libc::SYS_newfstatat as u32,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 3, // another call: allow
+                    k: libc::SYS_fstat as u32,
+                },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    // offsetof(seccomp_data, args[0]): the low 32 bits of the
+                    // descriptor on a little-endian host.
+                    k: 16,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1, // another descriptor: allow
+                    k: 2,
+                },
+                libc::sock_filter {
+                    code: 0x06, // BPF_RET | BPF_K
+                    jt: 0,
+                    jf: 0,
+                    k: 0x0005_0000 | errno as u32, // SECCOMP_RET_ERRNO
                 },
                 libc::sock_filter {
                     code: 0x06,
@@ -7209,8 +7276,9 @@ fn max_log_bytes_without_a_log_file_exits_promptly_when_the_log_fills_the_stderr
 /// log sink learns from `statx` whether fd 2 is a pipe, a socket or a regular
 /// file. When `statx` failed it used to fall back to a plain `write(2)`, which
 /// waits forever on a full pipe, and this run was killed at the 45 s bound.
-/// It now writes nothing when it cannot tell, and the dropped bytes still
-/// count against the cap, so the run ends with 123.
+/// It now asks `fstat`, learns that fd 2 is a pipe, and writes through a
+/// non-blocking open of it, which the full pipe refuses; the dropped bytes
+/// still count against the cap, so the run ends with 123.
 #[test]
 fn max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_log_fills_the_stderr_pipe()
  {
@@ -7245,6 +7313,115 @@ fn max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_
     let mut command = hermit_command(&args);
     command.stdin(Stdio::null()).env("LC_ALL", "C");
     deny_syscall(&mut command, libc::SYS_statx);
+    let status = exit_status_with_full_unread_stderr(&mut command);
+    assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_log_fills_the_stderr_pipe`]
+/// with stderr read. When `statx` failed, the capped stderr writers wrote
+/// nothing at all, so under such a policy a capped run lost every debug line
+/// and the cap's own class line, and this test found neither. They now learn
+/// the file type from `fstat`, and both arrive.
+#[test]
+fn max_log_bytes_without_a_log_file_still_logs_to_a_read_stderr_when_statx_is_denied() {
+    let _lock = hermit_run_guard();
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_syscall(&mut command, libc::SYS_statx);
+    let (status, elapsed, stderr) = stderr_when_read(&mut command);
+    assert!(
+        stderr.contains(" DEBUG "),
+        "without statx and with stderr read, the capped run ({status:?} after {elapsed:?}) \
+         logged no debug line there; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_LOG_CAP class=log-cap"),
+        "without statx and with stderr read, the capped run ({status:?} after {elapsed:?}) \
+         printed no class line; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_LOG_CAP_EXIT),
+        "without statx and with stderr read: {status:?} after {elapsed:?}; stderr:\n{stderr}"
+    );
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_log_fills_the_stderr_pipe`]
+/// where `fstat` and `newfstatat` on stderr fail too, so nothing can tell what
+/// kind of file stderr is. The capped stderr writers must then write nothing,
+/// since a plain `write(2)` to the full pipe would wait forever; the dropped
+/// bytes still count against the cap, so the run ends with 123. A writer that
+/// fell back to a plain write here would be killed at the 45 s bound.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_no_file_type_query_answers_and_the_log_fills_the_stderr_pipe()
+ {
+    capped_run_exits_promptly_on_a_full_pipe_with_the_file_type_queries_on_stderr_denied(
+        libc::EPERM,
+    );
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_no_file_type_query_answers_and_the_log_fills_the_stderr_pipe`]
+/// where every file-type query on stderr returns 0 and fills in nothing. The
+/// stderr log sink used to read the zeroed type as "anything else", which
+/// gets a plain `write(2)`, so this run was killed at the 45 s bound. A query
+/// that names no type now counts as failed.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_every_file_type_query_feigns_success_and_the_log_fills_the_stderr_pipe()
+ {
+    capped_run_exits_promptly_on_a_full_pipe_with_the_file_type_queries_on_stderr_denied(0);
+}
+
+/// A capped run at debug, with every file-type query on stderr answered with
+/// `errno` and stderr a full pipe that nobody reads, ends with 123; uncapped,
+/// with stderr read, it logs and exits 0.
+fn capped_run_exits_promptly_on_a_full_pipe_with_the_file_type_queries_on_stderr_denied(
+    errno: i32,
+) {
+    let _lock = hermit_run_guard();
+    // Premise: hermit runs, and logs to stderr, when no file-type query on
+    // stderr answers. Uncapped, so the log takes the plain write it always
+    // took.
+    let mut premise =
+        hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
+    premise.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_file_type_queries_on_stderr(&mut premise, errno);
+    let (status, elapsed, stderr) = stderr_when_read(&mut premise);
+    assert!(
+        stderr.contains(" DEBUG "),
+        "the premise does not hold: with no file-type query on stderr answering and stderr \
+         read, the uncapped run ({status:?} after {elapsed:?}) logged no debug line there; \
+         stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "with no file-type query on stderr answering and stderr read: {status:?} after \
+         {elapsed:?}; stderr:\n{stderr}"
+    );
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_file_type_queries_on_stderr(&mut command, errno);
     let status = exit_status_with_full_unread_stderr(&mut command);
     assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
 }
@@ -7323,23 +7500,41 @@ fn full_unread_pseudo_terminal() -> (fs::File, fs::File) {
 /// The run of
 /// [`max_log_bytes_without_a_log_file_exits_promptly_when_the_log_fills_the_stderr_pipe`]
 /// with stderr a terminal that nobody reads and that is full, under a seccomp
-/// policy that denies the terminal query `isatty` makes. The stderr log sink
-/// writes plainly to a character device that is not a terminal, such as
-/// `/dev/null`. It used to take any failed terminal query to mean "not a
-/// terminal", so here it made a plain `write(2)` to the full terminal, which
-/// waits for a reader forever, and this run was killed at the 45 s bound. Only
-/// `ENOTTY` means "not a terminal" now; for anything else the sink writes
-/// through a non-blocking open of the terminal, and the run ends with 123.
+/// policy that denies the terminal query `isatty` makes with `EPERM`. The
+/// stderr log sink used to write plainly to any character device the terminal
+/// query did not call a terminal, so here it made a plain `write(2)` to the
+/// full terminal, which waits for a reader forever, and this run was killed at
+/// the 45 s bound. It now writes to every character device through a
+/// non-blocking open of it, and the run ends with 123.
 #[test]
 fn max_log_bytes_without_a_log_file_exits_promptly_when_the_terminal_query_is_denied_and_the_log_fills_a_terminal()
  {
+    capped_run_exits_promptly_on_a_full_terminal_with_the_terminal_query_denied(libc::EPERM);
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_the_terminal_query_is_denied_and_the_log_fills_a_terminal`]
+/// where the policy answers the terminal query with `ENOTTY`, exactly what a
+/// descriptor that really is not a terminal answers. The stderr log sink used
+/// to trust `ENOTTY` and write plainly, so this run was killed at the 45 s
+/// bound.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_the_terminal_query_answers_enotty_and_the_log_fills_a_terminal()
+ {
+    capped_run_exits_promptly_on_a_full_terminal_with_the_terminal_query_denied(libc::ENOTTY);
+}
+
+/// A capped run at debug, with the terminal query denied with `errno` and
+/// stderr a full terminal that nobody reads, ends with 123 within
+/// [`LOG_CAP_RUN_WAIT_BOUND`]; uncapped, with stderr read, it logs and exits 0.
+fn capped_run_exits_promptly_on_a_full_terminal_with_the_terminal_query_denied(errno: i32) {
     let _lock = hermit_run_guard();
     // Premise: hermit runs, and logs to stderr, when the terminal query is
     // denied. Uncapped, so the log takes the plain write it always took.
     let mut premise =
         hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
     premise.stdin(Stdio::null()).env("LC_ALL", "C");
-    deny_terminal_query(&mut premise);
+    deny_terminal_query(&mut premise, errno);
     let (status, elapsed, stderr) = stderr_when_read(&mut premise);
     assert!(
         stderr.contains(" DEBUG "),
@@ -7364,7 +7559,7 @@ fn max_log_bytes_without_a_log_file_exits_promptly_when_the_terminal_query_is_de
     args.extend(LOG_CAP_NOISY_GUEST);
     let mut command = hermit_command(&args);
     command.stdin(Stdio::null()).env("LC_ALL", "C");
-    deny_terminal_query(&mut command);
+    deny_terminal_query(&mut command, errno);
     let (master, slave) = full_unread_pseudo_terminal();
     let mut child = command
         .stdout(Stdio::null())

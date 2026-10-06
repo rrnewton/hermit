@@ -1442,7 +1442,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two fail-closed stderr-writer tests (statx denied, and the terminal
     // query denied with stderr a full terminal) retain all 193: 193 + 2 = 195,
     // listed the same way.
-    ("test.cli", 195),
+    // Four more stderr-writer tests (the terminal query answered with ENOTTY,
+    // statx denied with stderr read, and every file-type query on stderr
+    // denied or feigning success with stderr a full pipe) retain all 195:
+    // 195 + 4 = 199, listed the same way.
+    ("test.cli", 199),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1549,7 +1553,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same two fail-closed stderr-writer tests as test.cli retain all 161
     // (163, listed with this node's arguments); neither starts a LiteInst
     // guest, so the filterset is unchanged: 195 - 32 = 163.
-    ("test.cli_on_host", 163),
+    // The same four stderr-writer tests as test.cli retain all 163 (167,
+    // listed with this node's arguments); none starts a LiteInst guest, so
+    // the filterset is unchanged: 199 - 32 = 167.
+    ("test.cli_on_host", 167),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
