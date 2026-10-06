@@ -74,6 +74,7 @@ const WATCHDOG_PHASE: &str = "in-guest LiteInst exit watchdog";
 
 /// The phase named in the `BackendFailure` a refused admission reports.
 const ADMISSION_PHASE: &str = "in-guest LiteInst admission";
+const COORDINATOR_PHASE: &str = "in-guest LiteInst coordinator";
 
 #[derive(Clone, Copy)]
 struct Limits {
@@ -185,18 +186,36 @@ impl ConnectionAdmission for InGuestExitAdmission {
 }
 
 impl InGuestExitAdmission {
-    /// Fails the run for a refused connection: the named diagnostic, the
-    /// persistent run failure, Detcore's `backend_failed`, and `SIGKILL` to
-    /// every watched guest.
+    /// Fails the run for a refused connection.
     fn fail_admission(&self, error: &io::Error) {
-        let diagnostic = format!("in-guest LiteInst refused a guest connection: {error}");
+        self.fail_now(
+            format!("in-guest LiteInst refused a guest connection: {error}"),
+            ADMISSION_PHASE,
+        );
+    }
+
+    /// Fails the run when the coordinator itself stopped (for example, its
+    /// RPC listener failed). The launch calls this before it returns the
+    /// error, so that no guest outlives the run: the backend's blocking wait
+    /// for the root guest would otherwise hold the runtime's shutdown open.
+    pub(crate) fn fail_launch(&self, error: &dyn std::fmt::Display) {
+        self.fail_now(
+            format!("in-guest LiteInst coordinator failed: {error}"),
+            COORDINATOR_PHASE,
+        );
+    }
+
+    /// The named diagnostic, the persistent run failure, Detcore's
+    /// `backend_failed`, and `SIGKILL` to every watched guest, including any
+    /// admitted later.
+    fn fail_now(&self, diagnostic: String, phase: &'static str) {
         eprintln!("hermit: {diagnostic}");
         record_failure(&self.outcome, diagnostic);
         if let Some(Ok(Started { watching, .. })) = self.started.lock().unwrap().as_ref() {
             watching.reporter.backend_failed(reverie::BackendFailure {
                 pid: reverie::Pid::from_raw(0),
                 tid: reverie::Tid::from_raw(0),
-                phase: ADMISSION_PHASE,
+                phase,
             });
             if let Err(error) = watching.watch.fail_and_kill_all() {
                 eprintln!(
@@ -600,6 +619,36 @@ mod tests {
             "{failure}"
         );
         admission.drain(Duration::from_secs(30)).await.unwrap();
+    }
+
+    /// A coordinator failure (for example, its RPC listener stopped) fails
+    /// the run and kills every guest, including one admitted afterwards, so
+    /// no guest outlives the run (Codex review of 2e52514d, both HIGH).
+    #[tokio::test]
+    async fn a_coordinator_failure_kills_every_guest_including_a_later_one() {
+        let tool = Arc::new(FakeTool::default());
+        let admission = admission(PRODUCTION, &tool);
+        let mut early = Reaped(Command::new("sleep").arg("60").spawn().unwrap());
+        admission.admit(pidfd_open(early.0.id())).unwrap();
+        admission.fail_launch(&"the RPC listener failed");
+        let mut late = Reaped(Command::new("sleep").arg("60").spawn().unwrap());
+        admission.admit(pidfd_open(late.0.id())).unwrap();
+        admission.drain(Duration::from_secs(30)).await.unwrap();
+        let mut reported = admission.reported_exits();
+        reported.sort_unstable();
+        let mut expected = vec![early.0.id() as i32, late.0.id() as i32];
+        expected.sort_unstable();
+        assert_eq!(reported, expected);
+        assert_eq!(early.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(late.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+        assert_eq!(*tool.failures.lock().unwrap(), [(0, COORDINATOR_PHASE)]);
+        let failure = admission
+            .failure()
+            .expect("a coordinator failure is a run failure");
+        assert!(
+            failure.starts_with("in-guest LiteInst coordinator failed:"),
+            "{failure}"
+        );
     }
 
     #[tokio::test]
