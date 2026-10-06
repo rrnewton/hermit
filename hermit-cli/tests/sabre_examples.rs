@@ -1225,13 +1225,19 @@ fn sabre_names_no_host_input_change_for_a_guest_that_replaced_a_file_after_diver
 // reports.
 #[test]
 fn sabre_other_process_links_resolve_with_a_full_descriptor_table() {
-    // As in every test here: with HERMIT_SABRE_BINARY unset and no built
-    // artifacts, this prints "skipping SaBRe example parity: artifacts are
-    // unavailable: ..." to stderr and passes. The validation gate sets
-    // HERMIT_SABRE_BINARY, and there a missing artifact panics.
-    let Some(loader) = sabre_loader() else {
-        return;
-    };
+    // With HERMIT_SABRE_BINARY set, as the validation gate sets it, a missing
+    // artifact panics inside sabre_loader, as for every test here. Unlike the
+    // parity cases above, this case also fails when HERMIT_SABRE_BINARY is
+    // unset and no artifacts are built: sabre_loader prints its "skipping"
+    // line and returns None, and a test that returned here would be counted
+    // as a pass for a check it never ran.
+    let loader = sabre_loader().unwrap_or_else(|| {
+        panic!(
+            "this case needs the SaBRe loader and libdetcore_sabre.so (see the \"skipping\" \
+             line above): build them, or set HERMIT_SABRE_BINARY; it fails rather than \
+             report a pass for a check it did not run"
+        )
+    });
     let guest = inode_identity_views::compile_guest("sabre-proc-fd-links");
     let mut command = Command::new(hermit_binary());
     command
