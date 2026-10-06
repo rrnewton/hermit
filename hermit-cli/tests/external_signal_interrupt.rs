@@ -287,11 +287,20 @@ fn guest() -> &'static Path {
         // an isolated directory, making a host /tmp fixture invisible.
         let guest = root.join("external_signal_interrupt");
         let source = repository.join("tests/c/external_signal_interrupt.c");
+        // Nextest runs every test in a process of its own, so each test
+        // compiles the guest. Each compiles into a file of its own and renames
+        // it into place: rename(2) replaces the name atomically, so no test
+        // executes a binary that another test's compiler is still writing, and
+        // a guest that is already running keeps the copy it started from.
+        let partial = root.join(format!(
+            "external_signal_interrupt.{}.partial",
+            std::process::id()
+        ));
         let compile = Command::new("cc")
             .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"])
             .arg(&source)
             .arg("-o")
-            .arg(&guest)
+            .arg(&partial)
             .output()
             .unwrap_or_else(|error| panic!("failed to compile the guest: {error}"));
         assert!(
@@ -300,6 +309,13 @@ fn guest() -> &'static Path {
             source.display(),
             String::from_utf8_lossy(&compile.stderr),
         );
+        fs::rename(&partial, &guest).unwrap_or_else(|error| {
+            panic!(
+                "failed to move the guest from {} to {}: {error}",
+                partial.display(),
+                guest.display()
+            )
+        });
         guest
     })
 }
@@ -915,41 +931,54 @@ fn untimed_futex_wait_restarts_under_sa_restart() {
 
 /// `poll`, `epoll_wait`, glibc `select` (pselect6 with no mask), and the
 /// `select` system call end with EINTR for a caught signal from a sibling
-/// thread or a live sibling process, SA_RESTART or not, as Linux does.
-fn assert_readiness_waits_are_interrupted(backend: &str) {
+/// thread or a live sibling process, SA_RESTART or not, as Linux does. The 16
+/// cells of each backend are split by sender, the `thread` cells in one test
+/// and the `process` cells in another, so that each test stays inside the
+/// per-test CPU bound with room to spare.
+fn assert_readiness_waits_are_interrupted(backend: &str, sender: &str) {
     for call in READINESS_CALLS {
-        for sender in ["thread", "process"] {
-            for restart in [None, Some("restart")] {
-                let mut args = vec![call, sender];
-                args.extend(restart);
-                assert_cell(
-                    backend,
-                    FutexMode::Precise,
-                    &args,
-                    false,
-                    &format!("RESULT call={call} ret=-1 errno=EINTR handler=1"),
-                );
-            }
+        for restart in [None, Some("restart")] {
+            let mut args = vec![call, sender];
+            args.extend(restart);
+            assert_cell(
+                backend,
+                FutexMode::Precise,
+                &args,
+                false,
+                &format!("RESULT call={call} ret=-1 errno=EINTR handler=1"),
+            );
         }
     }
 }
 
 #[test]
 fn ptrace_readiness_waits_are_interrupted_by_internal_signals() {
-    assert_readiness_waits_are_interrupted("ptrace");
+    assert_readiness_waits_are_interrupted("ptrace", "thread");
+}
+
+#[test]
+fn ptrace_readiness_waits_are_interrupted_by_internal_process_signals() {
+    assert_readiness_waits_are_interrupted("ptrace", "process");
 }
 
 #[test]
 fn liteinst_readiness_waits_are_interrupted_by_internal_signals() {
-    assert_readiness_waits_are_interrupted("liteinst");
+    assert_readiness_waits_are_interrupted("liteinst", "thread");
+}
+
+#[test]
+fn liteinst_readiness_waits_are_interrupted_by_internal_process_signals() {
+    assert_readiness_waits_are_interrupted("liteinst", "process");
 }
 
 /// An ignored, blocked, or default-ignored signal does not end `poll`,
 /// `epoll_wait`, or either `select`: each returns 0 at its 300 ms timeout.
-/// Every one of these 48 cells is strict-verified, so they are split by backend
-/// and sender to keep each test inside the per-test wall and CPU bounds.
-fn assert_readiness_waits_are_not_ended(backend: &str, sender: &str) {
-    for call in READINESS_CALLS {
+/// Every one of these 48 cells is strict-verified, so they are split by backend,
+/// sender and pair of calls, `poll` and `epoll_wait` in one test and the two
+/// `select`s in another, to keep each test inside the per-test wall and CPU
+/// bounds with room to spare.
+fn assert_readiness_waits_are_not_ended(backend: &str, sender: &str, calls: [&str; 2]) {
+    for call in calls {
         for quiet in ["ignored", "blocked", "winch"] {
             assert_quiet_cell(
                 backend,
@@ -961,24 +990,60 @@ fn assert_readiness_waits_are_not_ended(backend: &str, sender: &str) {
     }
 }
 
+/// The two halves of `READINESS_CALLS` that `assert_readiness_waits_are_not_ended`
+/// runs in separate tests.
+const POLL_AND_EPOLL: [&str; 2] = ["poll", "epoll"];
+const SELECTS: [&str; 2] = ["select", "rawselect"];
+
 #[test]
 fn ptrace_readiness_waits_are_not_ended_by_non_interrupting_thread_signals() {
-    assert_readiness_waits_are_not_ended("ptrace", "thread");
+    assert_readiness_waits_are_not_ended("ptrace", "thread", POLL_AND_EPOLL);
+}
+
+#[test]
+fn ptrace_selects_are_not_ended_by_non_interrupting_thread_signals() {
+    assert_readiness_waits_are_not_ended("ptrace", "thread", SELECTS);
 }
 
 #[test]
 fn ptrace_readiness_waits_are_not_ended_by_non_interrupting_process_signals() {
-    assert_readiness_waits_are_not_ended("ptrace", "process");
+    assert_readiness_waits_are_not_ended("ptrace", "process", POLL_AND_EPOLL);
+}
+
+#[test]
+fn ptrace_selects_are_not_ended_by_non_interrupting_process_signals() {
+    assert_readiness_waits_are_not_ended("ptrace", "process", SELECTS);
 }
 
 #[test]
 fn liteinst_readiness_waits_are_not_ended_by_non_interrupting_thread_signals() {
-    assert_readiness_waits_are_not_ended("liteinst", "thread");
+    assert_readiness_waits_are_not_ended("liteinst", "thread", POLL_AND_EPOLL);
+}
+
+#[test]
+fn liteinst_selects_are_not_ended_by_non_interrupting_thread_signals() {
+    assert_readiness_waits_are_not_ended("liteinst", "thread", SELECTS);
 }
 
 #[test]
 fn liteinst_readiness_waits_are_not_ended_by_non_interrupting_process_signals() {
-    assert_readiness_waits_are_not_ended("liteinst", "process");
+    assert_readiness_waits_are_not_ended("liteinst", "process", POLL_AND_EPOLL);
+}
+
+#[test]
+fn liteinst_selects_are_not_ended_by_non_interrupting_process_signals() {
+    assert_readiness_waits_are_not_ended("liteinst", "process", SELECTS);
+}
+
+/// `POLL_AND_EPOLL` and `SELECTS` together are exactly `READINESS_CALLS`, so
+/// splitting the not-ended cells between them drops none.
+#[test]
+fn the_not_ended_call_pairs_cover_every_readiness_call() {
+    let mut split: Vec<&str> = POLL_AND_EPOLL.iter().chain(&SELECTS).copied().collect();
+    let mut all = READINESS_CALLS.to_vec();
+    split.sort_unstable();
+    all.sort_unstable();
+    assert_eq!(split, all);
 }
 
 /// A call that does not wait reports its result although a caught signal races
@@ -1600,33 +1665,43 @@ fn liteinst_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld() {
 /// https://github.com/rrnewton/hermit/pull/3361 was fixed the spinning sibling
 /// took the SIGCHLD: an untimed wait was ended only by the sibling's wake, and a
 /// timed one ran to its 10 s timeout. Precise mode only; see the module
-/// documentation for polling mode.
-fn assert_waiting_forker_takes_the_sigchld(backend: &str) {
+/// documentation for polling mode. The untimed and the timed (`timed`) cells
+/// are separate tests, so that each stays inside the per-test CPU bound with
+/// room to spare.
+fn assert_waiting_forker_takes_the_sigchld(backend: &str, timed: Option<&str>) {
     for death in ["spin", "spinkill", "spinthrexit"] {
-        for timed in [None, Some("timed")] {
-            let mut args = vec!["futex", "exit"];
-            args.extend(timed);
-            args.push(death);
-            assert_role_cell(
-                backend,
-                FutexMode::Precise,
-                &args,
-                EINTR_FUTEX,
-                HANDLED_BY_MAIN,
-                EXIT_WAKE_FLOOR_MS..SPIN_WAKE_BOUND_MS,
-            );
-        }
+        let mut args = vec!["futex", "exit"];
+        args.extend(timed);
+        args.push(death);
+        assert_role_cell(
+            backend,
+            FutexMode::Precise,
+            &args,
+            EINTR_FUTEX,
+            HANDLED_BY_MAIN,
+            EXIT_WAKE_FLOOR_MS..SPIN_WAKE_BOUND_MS,
+        );
     }
 }
 
 #[test]
 fn ptrace_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
-    assert_waiting_forker_takes_the_sigchld("ptrace");
+    assert_waiting_forker_takes_the_sigchld("ptrace", None);
+}
+
+#[test]
+fn ptrace_precise_timed_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
+    assert_waiting_forker_takes_the_sigchld("ptrace", Some("timed"));
 }
 
 #[test]
 fn liteinst_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
-    assert_waiting_forker_takes_the_sigchld("liteinst");
+    assert_waiting_forker_takes_the_sigchld("liteinst", None);
+}
+
+#[test]
+fn liteinst_precise_timed_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
+    assert_waiting_forker_takes_the_sigchld("liteinst", Some("timed"));
 }
 
 /// A thread other than the thread-group leader forks a child and waits for it in
