@@ -637,45 +637,16 @@ pub fn repo_root() -> Result<PathBuf, String> {
 }
 
 fn generated_plan(root: &Path, scratch: &Path) -> Result<DagConfig, String> {
-    let path = scratch.join("generated.json");
-    let mut command = Command::new(root.join("scripts/validate.rs"));
-    command
-        .current_dir(root)
-        .arg("--write-generated-plan")
-        .arg(&path);
-    command
-        .env(
-            "HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT",
-            "cpuid-faulting,kvm",
-        )
-        .env("SUPER_REPETITIONS", SUPER_REPETITIONS)
-        .env("VALIDATE_VERBOSITY", "1");
-    for name in [
-        "VALIDATE_LEVEL",
-        "VALIDATE_FORCE_FULL",
-        "VALIDATE_GATE_TIMEOUT_SECONDS",
-        "VALIDATE_GATE_CPU_TIMEOUT_SECONDS",
-        "HERMIT_VALIDATE_RUN_TIMEOUT_SECONDS",
-        "DAGRUN_CPU_TIMEOUT_MULTIPLIER",
-        "DAGRUN_CPU_TIMEOUT_PLATFORM",
-        "VALIDATE_RUN_STATE",
-    ] {
-        command.env_remove(name);
-    }
-    let output = command
-        .output()
-        .map_err(|error| format!("cannot run scripts/validate.rs for generated nodes: {error}"))?;
-    if !output.status.success() {
-        return Err(format!(
-            "generated-partition export failed with {}:\nstdout:\n{}\nstderr:\n{}",
-            output.status,
-            String::from_utf8_lossy(&output.stdout).trim(),
-            String::from_utf8_lossy(&output.stderr).trim()
-        ));
-    }
-    let text = fs::read_to_string(&path)
-        .map_err(|error| format!("cannot read generated {}: {error}", path.display()))?;
-    dag_from_json(&text).map_err(|error| format!("invalid generated {}: {error}", path.display()))
+    // In-process, so neither generate-validation-dag nor the freshness test
+    // compiles scripts/validate.rs (see scripts/lib/validate_generator.rs).
+    let repetitions = SUPER_REPETITIONS
+        .parse::<i64>()
+        .map_err(|error| format!("invalid SUPER_REPETITIONS {SUPER_REPETITIONS:?}: {error}"))?;
+    crate::validate_generator::committed_generated_partition(
+        root,
+        &scratch.join("run-state"),
+        repetitions,
+    )
 }
 
 /// The required cells each run type's manifest bucket nodes own: the default

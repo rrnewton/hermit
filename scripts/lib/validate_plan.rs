@@ -380,14 +380,31 @@ pub fn preflight_nodes(root: &Path) -> Result<Vec<Step>, String> {
 mod tests {
     use super::*;
 
+    /// The checkout this file belongs to. rust-script compiles it under its
+    /// absolute path; the hermit-manifest-plan library includes it by a path
+    /// relative to the workspace root, and runs its tests in ci/manifest-plan.
+    fn checkout_root() -> std::path::PathBuf {
+        let source = Path::new(file!());
+        if source.is_absolute() {
+            return source
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+                .expect("validate_plan.rs lives under scripts/lib")
+                .to_path_buf();
+        }
+        std::env::current_dir()
+            .expect("current directory")
+            .ancestors()
+            .find(|dir| dir.join(source).is_file())
+            .expect("an ancestor of the test's directory holds validate_plan.rs")
+            .to_path_buf()
+    }
+
     #[test]
     fn manifest_audit_uses_its_measured_cold_cache_cpu_budget_only() {
-        let root = Path::new(file!())
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .expect("validate_plan.rs lives under scripts/lib");
-        let nodes = preflight_nodes(root).unwrap();
+        let root = checkout_root();
+        let nodes = preflight_nodes(&root).unwrap();
         // Each cap is the committed, measured one; see the node descriptions.
         // setup.manifest_plan: 300 s wall since fe11e3855, 1.5 x the 187 s at
         // which its pinned-root clone was killed against the old 180 s cap

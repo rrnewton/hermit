@@ -784,7 +784,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detcore-model's config::tests::a_saved_shared_dequeue_timers_field_is_ignored
     // and config::tests::a_controlled_key_that_contradicts_the_capabilities_fails_the_parse
     // retain all 977 (979, measured with cargo nextest list --profile ci).
-    ("test.regular_crates", 979),
+    // validate_plan::tests::manifest_audit_uses_its_measured_cold_cache_cpu_budget_only,
+    // which manifest-plan now path-includes from scripts/lib with the in-process
+    // generator, retains all 979 (980, measured with cargo nextest list --profile ci).
+    ("test.regular_crates", 980),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1656,7 +1659,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The report exact-branch-counter test listed there retains all 975: 976.
     // The same detcore-sabre fingerprint test retains all 976: 977.
     // The two shared_dequeue_timers tests listed there retain all 977: 979.
-    ("test.regular_crates_on_host", 979),
+    // The path-included validate_plan test listed there retains all 979: 980.
+    ("test.regular_crates_on_host", 980),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

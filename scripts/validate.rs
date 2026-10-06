@@ -113,6 +113,17 @@ use validate_classification::validation_is_complete;
 #[path = "lib/safe_ci_scope.rs"]
 mod safe_ci_scope;
 
+// Shared with the hermit-manifest-plan library, which builds the committed
+// DAG's generated partition from it in-process; its
+// `committed_generated_partition` serves only that library.
+#[allow(dead_code)]
+#[path = "lib/validate_generator.rs"]
+mod validate_generator;
+use validate_generator::COMPAT_DIAGNOSTIC_WALL_S;
+use validate_generator::RUST_SCRIPT_COMMAND_PREFIX;
+use validate_generator::materialize_source_cpu_timeouts;
+use validate_generator::step_with_caps;
+
 #[path = "lib/validate_super.rs"]
 mod validate_super; // Normalizes and audits extracted Cargo tests/synthetic args onto nextest.
 
@@ -10759,9 +10770,6 @@ fn require_committed_scheduler_input(plan: &Plan) -> Result<(), String> {
 }
 
 const RUST_SCRIPT_PRODUCER_TAG: &str = "build.rust_scripts";
-const RUST_SCRIPT_COMMAND_PREFIX: &str = "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; \
-    export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; \
-    export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ";
 const DAGRUN_PREPARE_BODY: &str = "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun";
 const RUST_SCRIPT_PRODUCER_BODY: &str =
     "AGENT_UTILS_RS_ENSURE_ONLY=1 ./agent-utils/rs/bin/dagrun && ./ci/prepare-rust-scripts.sh";
@@ -11971,6 +11979,22 @@ fn classify_withheld_dependents(
     (droppable, refusals)
 }
 
+/// Rebuild only the mechanically derived partition of the committed DAG
+/// (`validate_generator::generated_partition_steps`), as one plan.
+fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, String> {
+    let steps =
+        validate_generator::generated_partition_steps(root, tmp, validate_super::repetitions())?;
+    let cfg = validate_plan::config_from(steps, "generated validation DAG partition");
+    Ok(Plan {
+        planned_test_nodes: test_nodes_of(&cfg),
+        cfg,
+        profile: "generated-validation-dag".into(),
+        selection_mode: "generator",
+        cacheable: false,
+        ..Default::default()
+    })
+}
+
 fn test_nodes_of(cfg: &DagConfig) -> BTreeSet<String> {
     cfg.steps
         .iter()
@@ -12566,332 +12590,6 @@ fn build_plan(root: &Path, args: &Args, _tmp: &Path) -> Result<Plan, String> {
     ))
 }
 
-/// Make every inherited CPU budget explicit before a source plan crosses the
-/// DAG document boundary. `dag_to_json` intentionally does not serialize the
-/// execution-only default, so leaving zeroes here would turn validate's 7200s
-/// fallback into dagrun's 10s undeclared-node forcing function on reload.
-fn materialize_source_cpu_timeouts(cfg: &mut DagConfig) -> Result<(), String> {
-    if cfg.default_step_cpu_timeout <= 0 {
-        return Err(format!(
-            "source plan has no positive default CPU timeout (got {})",
-            cfg.default_step_cpu_timeout
-        ));
-    }
-    for step in &mut cfg.steps {
-        if step.cpu_timeout <= 0 {
-            step.cpu_timeout = cfg.default_step_cpu_timeout;
-        }
-    }
-    Ok(())
-}
-
-fn generated_focused_compat_partition(
-    root: &Path,
-    tmp: &Path,
-    mode: CompatMode,
-    namespace: &str,
-    label: &str,
-) -> Result<Vec<Step>, String> {
-    // The portable focused lane runs the compat.yaml bucket, whose rows read
-    // their fixtures under $VALIDATE_RUN_STATE/strict-compat.
-    let run_root = if mode == CompatMode::PortableStrict {
-        tmp.join("strict-compat")
-    } else {
-        tmp.join(namespace)
-    };
-    let fixtures = run_root.join("real-compat-fixtures");
-    let shell_build = run_root.join("shell-build");
-    let nsswitch = run_root.join("nsswitch.conf");
-    let paths = validate_corpus::CorpusPaths {
-        root_dir: &root.to_string_lossy(),
-        real_compat_fixtures: &fixtures.to_string_lossy(),
-        validation_tmp_dir: &run_root.to_string_lossy(),
-        shell_build_dir: &shell_build.to_string_lossy(),
-    };
-    let prep_tag = format!("{namespace}prep.fixtures");
-    let mut prep = prepare_fixtures_node_dep(&prep_tag, &fixtures, "compatprep.hermit_release");
-    prep.group = format!("{namespace}prep");
-    prep.labels = vec![label.into()];
-    if mode == CompatMode::PortableStrict {
-        prep.desc = "Prepare the fixture files the corpus-only lane's compat bucket reads".into();
-        prep.description = format!(
-            "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after the lane's pinned-root release build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of portablecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the lane before the bucket runs.",
-            fixtures.display()
-        );
-    } else if mode == CompatMode::E9patch {
-        prep.description = format!(
-            "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after compatprep.hermit_release and the files-only NSS fixture: {REAL_COMPAT_FIXTURE_CONTENTS}. Every {namespace} probe depends on it, and the rows that run tests/compat/real_compat_workload.sh read these run-owned files through REAL_COMPAT_FIXTURES instead of the checkout. A fixture that fails to build or a missing host tool stops the e9patch-compat-only profile before any probe runs.",
-            fixtures.display()
-        );
-    }
-
-    let mut steps = Vec::new();
-    if mode == CompatMode::E9patch {
-        // The e9patch cells run the host release Hermit built by
-        // compatprep.hermit_release, which resolves its packaged resources
-        // (the e9patch and e9tool binaries among them) through the host's
-        // target/install_pkg. The retired host build.runtime_release staged that
-        // tree as a side effect until 2026-09-30; this lane-local node stages it
-        // for the same release profile, so the lane keeps its own host release
-        // build and does not pull in the validation's pinned-root build.
-        let mut install = step_with_caps(
-            &format!("{namespace}prep"),
-            "release_resources",
-            "Stage the release backend resources for the host e9patch cells",
-            "./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p detcore-dbt && ./ci/run-with-reverie-dbt-budget.sh cargo build --release --locked -p hermit --features third-party-backends -p detcore-dbt -p detcore-sabre -p hermit-install && test -x target/install_pkg/rsrcs/e9patch && test -x target/install_pkg/rsrcs/e9tool".into(),
-            vec!["compatprep.hermit_release".into()],
-            1200,
-            7200,
-            9 * 1024 * 1024 * 1024,
-        );
-        install.labels = vec![label.into()];
-        install.description = format!(
-            "Runs `cargo build --release --locked -p detcore-dbt`, then a release build of hermit with third-party-backends together with detcore-dbt, detcore-sabre and hermit-install, both through ci/run-with-reverie-dbt-budget.sh (which sets Cargo's job count from the calibrated DBT build budget), and finally `test -x` on target/install_pkg/rsrcs/e9patch and e9tool. The {namespace} probes run the host release Hermit built by compatprep.hermit_release, which finds its packaged resources, the e9patch and e9tool binaries among them, through target/install_pkg; this node stages that tree for the e9patch-compat-only profile. If hermit-install stops staging e9tool, the final `test -x` fails here instead of in every probe."
-        );
-        let mut nss = nsswitch_fixture_node(&nsswitch);
-        nss.group = format!("{namespace}prep");
-        nss.labels = vec![label.into()];
-        nss.description = format!(
-            "Writes a files-only nsswitch.conf (every database, aliases through shadow, set to \"files\") to {} with mkdir and printf. The six probes whoami, groups, pinky, logname, tar and chown bind it read-only over /etc/nsswitch.conf, because they look up user and group names that the host may resolve through an identity daemon; pinning them to files keeps that host race out of the e9patch compatibility measurement. It runs after release_resources, and the lane's fixtures node waits for it. It fails only if the run-state directory cannot be created or written, which shows as a mkdir or printf error.",
-            nsswitch.display()
-        );
-        nss.deps = vec![install.tag()];
-        prep.deps.push(nss.tag());
-        steps.push(install);
-        steps.push(nss);
-    }
-    steps.push(prep);
-    if mode == CompatMode::PortableStrict {
-        // The rows themselves are tests/e2e/manifests/compat.yaml, run by the
-        // static bucket node portablecompat.manifest_compat.
-        return Ok(steps);
-    }
-    let mut probes = validate_plan::compat_nodes(
-        root,
-        mode,
-        &root.join("target/release/hermit").to_string_lossy(),
-        &nsswitch.to_string_lossy(),
-        &paths,
-        Some(&prep_tag),
-    )?;
-    for step in &mut probes {
-        step.group = namespace.into();
-        step.labels = vec![label.into()];
-    }
-    steps.extend(probes);
-    Ok(steps)
-}
-
-/// Rebuild only the mechanically derived partition of the committed DAG.
-///
-/// Static nodes are authored in the private `validation_dag_static` module.
-/// Compatibility rows come from the checked-in corpus, while stress repetitions
-/// come from the typed probe definitions below. The maintenance generator combines
-/// those independent inputs into the committed `ci/dag/validate.json`.
-fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, String> {
-    // These nodes exist only to satisfy dependency closure while the typed
-    // compat/stress builders emit their generator-owned partitions. They are
-    // discarded before the committed DAG is written; authoritative definitions
-    // live in hermit-manifest-plan's private static source.
-    let anchor_tags = [
-        "build.e2e_artifact",
-        "build.host_hermit_link",
-        "compatprep.hermit_release",
-        "gate.manifest",
-        "setup.nextest",
-        "doc.doctests",
-        "doc.rustdoc",
-        "lint.clippy",
-        "test.detcore_unit",
-        "test.hermit_unit",
-        "test.regular_crates",
-        "test.rr_suite_contract",
-        "super.build_release_hermit",
-        "super.build_workspace",
-    ];
-    let mut steps = anchor_tags
-        .iter()
-        .map(|tag| {
-            let (group, job) = tag
-                .split_once('.')
-                .ok_or_else(|| format!("invalid generator dependency anchor {tag}"))?;
-            let mut step = step_with_caps(
-                group,
-                job,
-                "Generator dependency anchor",
-                "true".into(),
-                Vec::new(),
-                1,
-                1,
-                1,
-            );
-            step.labels = vec!["generator-dependency-anchor".into()];
-            Ok(step)
-        })
-        .collect::<Result<Vec<_>, String>>()?;
-
-    // The portable strict corpus itself is the manifest bucket
-    // e2e.manifest_compat (tests/e2e/manifests/compat.yaml); this node only
-    // prepares the files its rows read.
-    let portable_root = tmp.join("strict-compat");
-    let portable_fixtures = portable_root.join("real-compat-fixtures");
-    let mut portable_prep = prepare_fixtures_node("compatprep.fixtures", &portable_fixtures);
-    portable_prep.deps = [
-        "build.e2e_artifact",
-        "doc.doctests",
-        "doc.rustdoc",
-        "lint.clippy",
-        "test.detcore_unit",
-        "test.hermit_unit",
-        "test.regular_crates",
-        "test.rr_suite_contract",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
-    portable_prep.desc =
-        "Prepare the fixture files the portable strict compatibility corpus reads".into();
-    portable_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {}: {REAL_COMPAT_FIXTURE_CONTENTS}, \
-         so the corpus rows of e2e.manifest_compat read run-owned files instead of the \
-         checkout. It starts after every non-guest Cargo node so the corpus's shell-build \
-         row cannot observe a concurrent target or cache mutation.",
-        portable_fixtures.display()
-    );
-    portable_prep.labels = vec!["full".into(), "portable".into()];
-    steps.push(portable_prep);
-
-    // The SaBRe run type's rows are the compat.yaml cells labelled
-    // sabre-compat-only, run by the static node sabrecompat.manifest_compat
-    // against the validation's one Hermit build; this node prepares the files
-    // those rows read, at the path the rows name.
-    let mut sabre_prep = prepare_fixtures_node_dep(
-        "sabrecompatprep.fixtures",
-        &portable_fixtures,
-        "build.host_hermit_link",
-    );
-    sabre_prep.group = "sabrecompatprep".into();
-    sabre_prep.desc = "Prepare the fixture files the SaBRe run type's compat cells read".into();
-    sabre_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of sabrecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
-        portable_fixtures.display()
-    );
-    sabre_prep.labels = vec!["sabre-compat-only".into()];
-    steps.push(sabre_prep);
-
-    // The strict run type's rows are the compat.yaml cells labelled
-    // strict-compat-only, run the same way by strictcompat.manifest_compat.
-    let mut strict_prep = prepare_fixtures_node_dep(
-        "strictcompatprep.fixtures",
-        &portable_fixtures,
-        "build.host_hermit_link",
-    );
-    strict_prep.group = "strictcompatprep".into();
-    strict_prep.desc = "Prepare the fixture files the strict run type's compat cells read".into();
-    strict_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of strictcompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
-        portable_fixtures.display()
-    );
-    strict_prep.labels = vec!["strict-compat-only".into()];
-    steps.push(strict_prep);
-
-    // The rr run type's rows are the compat.yaml replay cells labelled
-    // rr-compat-only, run the same way by rrcompat.manifest_compat.
-    let mut rr_prep = prepare_fixtures_node_dep(
-        "rrcompatprep.fixtures",
-        &portable_fixtures,
-        "build.host_hermit_link",
-    );
-    rr_prep.group = "rrcompatprep".into();
-    rr_prep.desc = "Prepare the fixture files the rr run type's compat cells read".into();
-    rr_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of rrcompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
-        portable_fixtures.display()
-    );
-    rr_prep.labels = vec!["rr-compat-only".into()];
-    steps.push(rr_prep);
-
-    for (mode, namespace, label) in [
-        (
-            CompatMode::PortableStrict,
-            "portablecompat",
-            "portable-strict-compat-only",
-        ),
-        (CompatMode::E9patch, "e9patchcompat", "e9patch-compat-only"),
-    ] {
-        steps.extend(generated_focused_compat_partition(
-            root, tmp, mode, namespace, label,
-        )?);
-    }
-
-    let super_fixtures = tmp.join("super-compat-fixtures");
-    let super_shell_build = tmp.join("super-compat-shell-build");
-    let super_paths = validate_corpus::CorpusPaths {
-        root_dir: &root.to_string_lossy(),
-        real_compat_fixtures: &super_fixtures.to_string_lossy(),
-        validation_tmp_dir: &tmp.to_string_lossy(),
-        shell_build_dir: &super_shell_build.to_string_lossy(),
-    };
-    let mut super_prep = prepare_fixtures_node_dep(
-        "super-compatprep.fixtures",
-        &super_fixtures,
-        "super.build_release_hermit",
-    );
-    super_prep.group = "super-compatprep".into();
-    super_prep.labels = vec!["super".into()];
-    super_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after super.build_release_hermit: {REAL_COMPAT_FIXTURE_CONTENTS}. The super-only compatibility rows ({}) depend on it; the rows that run tests/compat/real_compat_workload.sh read these files through REAL_COMPAT_FIXTURES, and rustc calls the toolchain link it makes because --base-env=minimal keeps the user's rustup directory off PATH. A fixture that fails to build or a missing host tool stops those rows.",
-        super_fixtures.display(),
-        validate_corpus::portable_super_only()
-            .keys()
-            .map(|label| format!("compat.{label}"))
-            .collect::<Vec<_>>()
-            .join(", ")
-    );
-    steps.push(super_prep);
-    let only = validate_corpus::portable_super_only()
-        .keys()
-        .map(|label| label.to_string())
-        .collect::<BTreeSet<_>>();
-    let mut super_compat = validate_plan::compat_nodes_for(
-        root,
-        CompatMode::PortableStrict,
-        &root.join("target/release/hermit").to_string_lossy(),
-        "",
-        &super_paths,
-        Some("super-compatprep.fixtures"),
-        Some(&only),
-        Some(validate_super::DEFAULT_GATE_TIMEOUT_S),
-    )?;
-    for step in &mut super_compat {
-        step.labels = vec!["super".into()];
-    }
-    steps.extend(super_compat);
-
-    let mut stress = validate_super::stress_nodes(
-        &root.join("target/release/hermit").to_string_lossy(),
-        &root.join("target/debug/hermit").to_string_lossy(),
-        tmp,
-        validate_super::repetitions(),
-        "super.build_release_hermit",
-        "super.build_workspace",
-    );
-    for step in &mut stress {
-        step.labels = vec!["super".into()];
-    }
-    steps.extend(stress);
-
-    let cfg = validate_plan::config_from(steps, "generated validation DAG partition");
-    Ok(Plan {
-        planned_test_nodes: test_nodes_of(&cfg),
-        cfg,
-        profile: "generated-validation-dag".into(),
-        selection_mode: "generator",
-        cacheable: false,
-        ..Default::default()
-    })
-}
-
 const HOSTED_VARIANT_SUFFIX: &str = "_on_host";
 
 fn local_validation_step_tag(tag: &str) -> String {
@@ -13004,15 +12702,6 @@ fn first_dependency_cycle(steps: &[Step]) -> Option<Vec<String>> {
     }
 }
 
-/// Heavy compatibility preparation is the innermost bound in the validation ladder:
-///
-/// `420 prep < 480 gate clamp < 600 whole run < 660 local scope < 720 node < 900 job`.
-///
-/// A 3600s preparation allowance inside a 900s job was unreachable by
-/// construction. This bound fires while the scheduler can still name the node
-/// and flush its profile row.
-const COMPAT_DIAGNOSTIC_WALL_S: i64 = 420;
-
 fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
     let default = bin.ends_with("target/release/hermit");
     let cmd = if default {
@@ -13043,14 +12732,6 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
         step.hint.preferred_inner_jobs = Some(8);
     }
     step
-}
-
-/// What tests/compat/prepare_real_compat_fixtures.sh writes, for the paragraphs
-/// of the nodes that run it.
-const REAL_COMPAT_FIXTURE_CONTENTS: &str = "a copy of README.md, compiled binutils, gprof, gcov and lsof inputs, a loopback HTTP server, df's mount fixture, and cargo/rustc links into the active toolchain";
-
-fn prepare_fixtures_node(_tag: &str, fixtures: &Path) -> dagrun::model::Step {
-    prepare_fixtures_node_dep(_tag, fixtures, "compatprep.hermit_release")
 }
 
 /// One row of the strict compatibility corpus as e2e.manifest_compat runs it.
@@ -14377,117 +14058,12 @@ fn raw_run_dag_scan_marker_bracket(root: &Path) -> Result<String, String> {
     ))
 }
 
-/// The functional-fixture prep node, with an explicit predecessor.
-///
-/// The `super` suite already builds a release Hermit under its own tag, so it
-/// hangs the fixtures off THAT node instead of adding a second identical build.
-fn prepare_fixtures_node_dep(_tag: &str, fixtures: &Path, dep: &str) -> dagrun::model::Step {
-    step_with_caps(
-        "compatprep",
-        "fixtures",
-        "Functional compatibility fixtures",
-        format!(
-            "./tests/compat/prepare_real_compat_fixtures.sh {}",
-            validate_plan::shell_quote(&fixtures.to_string_lossy())
-        ),
-        vec![dep.to_string()],
-        COMPAT_DIAGNOSTIC_WALL_S,
-        COMPAT_DIAGNOSTIC_WALL_S,
-        4 * 1024 * 1024 * 1024,
-    )
-}
-
-/// `require_e9patch_artifacts`' files-only NSS fixture (validate.sh:4095): keeps
-/// host identity-daemon races out of the e9patch compatibility measurement.
-fn nsswitch_fixture_node(path: &Path) -> dagrun::model::Step {
-    let entries = [
-        "aliases",
-        "automount",
-        "ethers",
-        "group",
-        "gshadow",
-        "hosts",
-        "initgroups",
-        "netgroup",
-        "netmasks",
-        "networks",
-        "passwd",
-        "protocols",
-        "publickey",
-        "rpc",
-        "services",
-        "shadow",
-    ]
-    .iter()
-    .map(|k| format!("{k}: files"))
-    .collect::<Vec<_>>()
-    .join("\\n");
-    step_with_caps(
-        "compatprep",
-        "nsswitch",
-        "e9patch files-only NSS fixture",
-        format!(
-            "mkdir -p $(dirname {p}) && printf '{entries}\\n' > {p}",
-            p = validate_plan::shell_quote(&path.to_string_lossy())
-        ),
-        vec![],
-        60,
-        30,
-        512 * 1024 * 1024,
-    )
-}
-
 // `shard_node` used to live here: it wrapped the selected node in a synthetic
 // `shard.*` step whose command was `./ci/run-node.sh`, nesting a second
 // dagrun under this one. See the `Focused::Only` branch in
 // `build_plan` for why that broke `--only` and what replaced it. `ci/run-node.sh`
 // itself is UNCHANGED and still serves the hosted GitHub fan-out, which really
 // does need a standalone runner per shard job.
-
-fn step_with_caps(
-    group: &str,
-    job: &str,
-    desc: &str,
-    cmd: String,
-    deps: Vec<String>,
-    timeout: i64,
-    cpu_timeout: i64,
-    mem: i64,
-) -> dagrun::model::Step {
-    dagrun::model::Step {
-        group: group.into(),
-        job: job.into(),
-        desc: desc.into(),
-        description: String::new(),
-        cmd,
-        cmdtype: CmdType::Unknown,
-        manifest: None,
-        integration_test_binaries: None,
-        result_manifests: None,
-        labels: Vec::new(),
-        deps,
-        env: BTreeMap::new(),
-        hint: dagrun::model::ResourceHint {
-            rss_baseline_bytes: Some(mem),
-            hard_mem_max_bytes: Some(mem),
-            ..Default::default()
-        },
-        networkonly: false,
-        engine_only: false,
-        delegated_children: false,
-        timeout,
-        cpu_timeout,
-        jobs_flag: None,
-        jobs_env: None,
-        skip_reason: None,
-        // Undeclared, as these nodes were before the runner grew the fields. See
-        // validate_plan::node for why this is not `Some(vec![])`.
-        write_domains: None,
-        write_domain_guarantee: None,
-        explains: Vec::new(),
-        fail_fast_family: None,
-    }
-}
 
 // --------------------------------------------------------------------------- reporting
 
