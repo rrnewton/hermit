@@ -451,6 +451,19 @@ fn resolved_at_fdcwd_path(pid: i32, path: &Path) -> Option<PathBuf> {
     Some(Path::new("/").join(guest_cwd).join(path))
 }
 
+/// The path to report for one operand of a successful namespace change (see
+/// `Detcore::record_host_namespace_change`): the operand made absolute, or
+/// `/` when it could not be read or made absolute. A tracer that may not read
+/// a non-dumpable guest's memory, for one, cannot read it while the change
+/// itself succeeds. `/` is an ancestor of every path, so no host input change
+/// is named in that run, rather than one the guest may have made.
+fn rebound_path(observed: Option<PathBuf>) -> String {
+    match observed {
+        Some(path) if path.is_absolute() => path.to_string_lossy().into_owned(),
+        _ => String::from("/"),
+    }
+}
+
 /// Writes back the guest bytes that the utimensat lookup buffer covered.
 fn restore_lookup_buffer<M: MemoryAccess>(memory: &mut M, buffer: StatPtr, saved: &[u8]) {
     if memory.write_exact(buffer.0.cast(), saved).is_err() {
@@ -1026,6 +1039,77 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// `path`, as a guest syscall named it relative to `dirfd`, made
+    /// absolute in the guest's view. A relative spelling is not the object:
+    /// absolute paths are already bound, a dirfd supplies its own prefix, and
+    /// AT_FDCWD-relative spellings are resolved through the guest's root and
+    /// cwd, so the result does not depend on Replayer's placeholder
+    /// descriptor. A spelling that cannot be resolved is kept as given.
+    fn observed_path<G: Guest<Self>>(guest: &G, dirfd: i32, path: &Path) -> Result<PathBuf, Error> {
+        Ok(if path.is_absolute() {
+            path.to_path_buf()
+        } else if dirfd == libc::AT_FDCWD {
+            resolved_at_fdcwd_path(guest.pid().as_raw(), path).unwrap_or_else(|| path.to_path_buf())
+        } else {
+            guest
+                .thread_state()
+                .with_detfd(dirfd, |detfd| detfd.path())?
+                .map_or_else(|| path.to_path_buf(), |directory| directory.join(path))
+        })
+    }
+
+    /// For `hermit run --verify`, report each path `call` may rebind in the
+    /// guest's file namespace: both names of a rename, the new name of a link
+    /// or symlink, an unlinked name, and a node, directory or file it makes
+    /// or removes (see `detcore_model::host_input::HostMutationRecord`). A
+    /// host file whose path the guest rebinds may have been replaced by the
+    /// guest itself. Called before the call runs, whatever its outcome.
+    pub(crate) async fn record_host_namespace_change<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: &Syscall,
+    ) {
+        let at = libc::AT_FDCWD;
+        let changed: Vec<(i32, Option<syscalls::PathPtr>)> = match call {
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Rename(c) => vec![(at, c.oldpath()), (at, c.newpath())],
+            Syscall::Renameat(c) => vec![(c.olddirfd(), c.oldpath()), (c.newdirfd(), c.newpath())],
+            Syscall::Renameat2(c) => {
+                vec![(c.olddirfd(), c.oldpath()), (c.newdirfd(), c.newpath())]
+            }
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Link(c) => vec![(at, c.newpath())],
+            Syscall::Linkat(c) => vec![(c.newdirfd(), c.newpath())],
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Unlink(c) => vec![(at, c.path())],
+            Syscall::Unlinkat(c) => vec![(c.dirfd(), c.path())],
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Symlink(c) => vec![(at, c.linkpath())],
+            Syscall::Symlinkat(c) => vec![(c.newdirfd(), c.linkpath())],
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Mknod(c) => vec![(at, c.path())],
+            Syscall::Mknodat(c) => vec![(c.dirfd(), c.path())],
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Mkdir(c) => vec![(at, c.path())],
+            Syscall::Mkdirat(c) => vec![(c.dirfd(), c.path())],
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Rmdir(c) => vec![(at, c.path())],
+            #[cfg(not(target_arch = "aarch64"))]
+            Syscall::Creat(c) => vec![(at, c.path())],
+            _ => return,
+        };
+        for (dirfd, path) in changed {
+            let observed = match path.map(|path| path.read(&guest.memory())) {
+                Some(Ok(path)) => {
+                    let path: PathBuf = path;
+                    Self::observed_path(guest, dirfd, &path).ok()
+                }
+                _ => None,
+            };
+            crate::tool_global::record_host_mutation(guest, rebound_path(observed)).await;
+        }
+    }
+
     /// Openat system call.
     pub async fn handle_openat<G: Guest<Self>>(
         &self,
@@ -1041,16 +1125,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         // bound; a dirfd supplies its own prefix; AT_FDCWD-relative spellings
         // are resolved through the guest's root and cwd before the open so the
         // result does not depend on Replayer's placeholder descriptor.
-        let observed_path = if path.is_absolute() {
-            path.clone()
-        } else if call.dirfd() == libc::AT_FDCWD {
-            resolved_at_fdcwd_path(guest.pid().as_raw(), &path).unwrap_or_else(|| path.clone())
-        } else {
-            guest
-                .thread_state()
-                .with_detfd(call.dirfd(), |detfd| detfd.path())?
-                .map_or_else(|| path.clone(), |directory| directory.join(&path))
-        };
+        let observed_path = Self::observed_path(guest, call.dirfd(), &path)?;
+        if guest.config().record_host_inputs && call.flags().contains(OFlag::O_CREAT) {
+            // It may create the file it opens. Reported before the open runs,
+            // as `record_host_namespace_change` reports the other changes.
+            crate::tool_global::record_host_mutation(
+                guest,
+                rebound_path(Some(observed_path.clone())),
+            )
+            .await;
+        }
 
         let resource = ResourceID::Path(path.clone());
         // Ask for permission to resolve this path into a file:
@@ -6987,5 +7071,24 @@ mod inject_fstat_scratch {
             Err(Errno::EBADF),
             "a descriptor that failed registration must not be modeled"
         );
+    }
+}
+
+#[cfg(test)]
+mod rebound_path_tests {
+    use std::path::PathBuf;
+
+    use super::rebound_path;
+
+    /// A namespace change's operand is reported as the path it names, made
+    /// absolute. One that could not be read (a tracer may not read a
+    /// non-dumpable guest's memory) or made absolute is reported as `/`, the
+    /// ancestor of every path, so that no host input change is named in that
+    /// run instead of one the guest may have made.
+    #[test]
+    fn an_operand_that_cannot_be_established_is_reported_as_the_root() {
+        assert_eq!(rebound_path(Some(PathBuf::from("/data/F"))), "/data/F");
+        assert_eq!(rebound_path(None), "/");
+        assert_eq!(rebound_path(Some(PathBuf::from("F"))), "/");
     }
 }

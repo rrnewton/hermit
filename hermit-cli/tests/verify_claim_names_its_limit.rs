@@ -288,3 +288,42 @@ fn a_guest_that_replaces_a_file_after_diverging_names_no_host_input_change() {
     assert_eq!(report.infrastructure_error, None, "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
 }
+
+/// The counterexample a log prefix cannot refuse: the guest replaces `F` with
+/// raw calls whose differing effects the compared log does not show (see
+/// [`host_input::rebinding_guest`]). The opens' identities differ as a host
+/// replacement's would, and the first difference comes after the second
+/// open, but the guest renamed onto `F`, so the change is not named and the
+/// run stays a divergence.
+#[test]
+fn a_guest_that_rebinds_the_path_itself_names_no_host_input_change() {
+    let guest = host_input::rebinding_guest(&host_input::python_interpreter());
+    let (_root, stderr, report) =
+        verify_across_host_action("host-input-rebound", &guest, false, ["go", "go"]);
+    assert_eq!(
+        report.verdict,
+        hermit::canonical_verdict::Verdict::Diverged,
+        "{stderr}"
+    );
+    assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGE"), "{stderr}");
+}
+
+/// The guest's namespace changes are recorded before they run, whatever their
+/// outcome, so that a change the kernel commits is never missing from the
+/// record, even when the run ends before Hermit sees the result. A host
+/// replacement of `F` in run 1 is therefore not named when the guest also
+/// tried to rename onto `F`, though that rename failed and changed nothing.
+#[test]
+fn a_replacement_where_the_guest_tried_to_rebind_the_path_names_no_host_input_change() {
+    let guest = host_input::failed_rename_guest(&host_input::python_interpreter());
+    let (_root, stderr, report) =
+        verify_across_host_action("host-input-failed-rename", &guest, true, ["go", "go"]);
+    assert_eq!(
+        report.verdict,
+        hermit::canonical_verdict::Verdict::Diverged,
+        "{stderr}"
+    );
+    assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGE"), "{stderr}");
+}

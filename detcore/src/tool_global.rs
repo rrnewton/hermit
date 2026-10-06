@@ -539,6 +539,12 @@ pub struct GlobalState {
     // when the run ends normally; dropped with this state otherwise.
     host_inputs: Mutex<Vec<HostInputRecord>>,
 
+    // The paths the guest itself rebound in its file namespace in this run,
+    // when `Config::record_host_inputs` is set (see
+    // `detcore_model::host_input::HostMutationRecord`). Written beside
+    // `host_inputs`.
+    host_mutations: Mutex<BTreeSet<String>>,
+
     // Optional append-only sink shared by DBT fork descendants.
     unsupported_syscall_report_fd: Option<Mutex<File>>,
 
@@ -695,6 +701,7 @@ impl GlobalState {
             used_ports: Mutex::new(HashSet::new()),
             unsupported_syscalls: Mutex::new(BTreeSet::new()),
             host_inputs: Mutex::new(Vec::new()),
+            host_mutations: Mutex::new(BTreeSet::new()),
             unsupported_syscall_report_fd,
             port_start_range: AtomicU16::new(range[0]),
             port_end_range: AtomicU16::new(range[1]),
@@ -959,7 +966,11 @@ impl GlobalState {
         let recording_destination = self.cfg.record_preemptions_to.clone();
         // The run is over: write what it opened for --verify.
         if let Some(log) = &self.cfg.host_input_log {
-            crate::host_inputs::write(log, &self.host_inputs.lock().unwrap());
+            crate::host_inputs::write(
+                log,
+                &self.host_inputs.lock().unwrap(),
+                &self.host_mutations.lock().unwrap(),
+            );
         }
         let (mut summary, info_reprio_descrip) = self.into_run_summary_for_log().unwrap();
         summary.dispatch_stats = dispatch_stats;
@@ -1200,6 +1211,10 @@ impl GlobalTool for GlobalState {
             });
             return (None, R::RecordHostInput(()));
         }
+        if let GlobalRequest::RecordHostMutation { path } = request {
+            self.host_mutations.lock().unwrap().insert(path);
+            return (None, R::RecordHostMutation(()));
+        }
         if let GlobalRequest::SignalDequeued {
             detpid,
             identity,
@@ -1399,7 +1414,7 @@ impl GlobalTool for GlobalState {
             GlobalRequest::SignalDequeued { .. } => {
                 unreachable!("consuming path handled before ordinary cancellation")
             }
-            GlobalRequest::RecordHostInput { .. } => {
+            GlobalRequest::RecordHostInput { .. } | GlobalRequest::RecordHostMutation { .. } => {
                 unreachable!("host-input observation answered before clock accounting")
             }
             GlobalRequest::ParkedRequest(rs, pid, capability) => {
@@ -3307,6 +3322,15 @@ pub enum GlobalRequest {
         syscall: u64,
         identity: HostFileIdentity,
     },
+
+    /// Record that the sending thread rebound `path` in the guest's file
+    /// namespace (see `detcore_model::host_input::HostMutationRecord`). An
+    /// observation for `hermit run --verify` only, answered like
+    /// [`Self::RecordHostInput`]. Last, so that adding it left every earlier
+    /// variant's encoded tag unchanged.
+    RecordHostMutation {
+        path: String,
+    },
 }
 
 /// Responses from the global object
@@ -3384,6 +3408,8 @@ pub enum GlobalResponse {
     Network(Result<NetworkReply, NetworkEngineError>),
     /// Last, so that adding it left every earlier variant's tag unchanged.
     RecordHostInput(()),
+    /// Last, so that adding it left every earlier variant's tag unchanged.
+    RecordHostMutation(()),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3482,6 +3508,23 @@ where
     assert_eq!(
         (time, response),
         (None, GlobalResponse::RecordHostInput(()))
+    );
+}
+
+/// Report to the global state that this thread rebound `path` in the guest's
+/// file namespace, for `hermit run --verify` (see
+/// `detcore_model::host_input::HostMutationRecord`). The answer carries no
+/// time.
+pub(crate) async fn record_host_mutation<G, T>(guest: &mut G, path: String)
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let (time, response) =
+        send_and_update_time(guest, GlobalRequest::RecordHostMutation { path }).await;
+    assert_eq!(
+        (time, response),
+        (None, GlobalResponse::RecordHostMutation(()))
     );
 }
 
@@ -7407,8 +7450,9 @@ mod tests {
         assert_eq!(a, a_again, "mapping must be stable per host inode");
     }
 
-    /// A host-input observation belongs to the run whose global state receives
-    /// it. It is answered with no logical time, before any clock accounting,
+    /// A host-input observation, and a report of a path the guest rebound,
+    /// belong to the run whose global state receives them. Each is answered
+    /// with no logical time, before any clock accounting,
     /// so it cannot move the global clock or the sender's, and the run's
     /// records are written with their end line at normal clean-up. The same
     /// request reaches this state from every backend: the openat handler sends
@@ -7445,7 +7489,7 @@ mod tests {
             .receive_rpc(
                 reverie::Tid::from_raw(dettid.as_raw()),
                 (
-                    sender_time,
+                    sender_time.clone(),
                     MmId::initial(dettid),
                     GlobalRequest::RecordHostInput {
                         path: "/etc/ld.so.cache".into(),
@@ -7456,6 +7500,21 @@ mod tests {
             )
             .await;
         assert_eq!(response, (None, GlobalResponse::RecordHostInput(())));
+        for _ in 0..2 {
+            let response = state
+                .receive_rpc(
+                    reverie::Tid::from_raw(dettid.as_raw()),
+                    (
+                        sender_time.clone(),
+                        MmId::initial(dettid),
+                        GlobalRequest::RecordHostMutation {
+                            path: "/data/F".into(),
+                        },
+                    ),
+                )
+                .await;
+            assert_eq!(response, (None, GlobalResponse::RecordHostMutation(())));
+        }
         {
             let global_time = state.global_time.lock().unwrap();
             assert_eq!(global_time.as_nanos(), global_before, "no clock accounting");
@@ -7469,7 +7528,7 @@ mod tests {
         state.clean_up(false, &None).await;
         let text = std::fs::read_to_string(&log).unwrap();
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 2, "{text}");
+        assert_eq!(lines.len(), 3, "{text}");
         assert_eq!(
             serde_json::from_str::<HostInputRecord>(lines[0]).unwrap(),
             HostInputRecord {
@@ -7479,9 +7538,16 @@ mod tests {
                 identity,
             }
         );
+        // A path rebound twice is one line.
         assert_eq!(
-            serde_json::from_str::<HostInputLogEnd>(lines[1]).unwrap(),
-            HostInputLogEnd { records: 1 }
+            serde_json::from_str::<detcore_model::host_input::HostMutationRecord>(lines[1])
+                .unwrap()
+                .mutated,
+            "/data/F"
+        );
+        assert_eq!(
+            serde_json::from_str::<HostInputLogEnd>(lines[2]).unwrap(),
+            HostInputLogEnd { records: 2 }
         );
     }
 

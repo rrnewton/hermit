@@ -81,8 +81,21 @@ pub struct HostInputRecord {
     pub identity: HostFileIdentity,
 }
 
-/// The last line of a complete host-input log: how many records precede it.
-/// A log without it, or with another count, is incomplete.
+/// A path the guest itself rebound in its file namespace during the run:
+/// renamed to or from, linked, unlinked, made as a symlink, node or directory,
+/// removed as a directory, or opened to create (see
+/// [`crate::config::Config::record_host_inputs`]). Made absolute as an open's
+/// path is. A host file whose path, or a directory above it, the guest
+/// rebound may have been replaced by the guest, so such a change is never
+/// named as a host input change.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct HostMutationRecord {
+    pub mutated: String,
+}
+
+/// The last line of a complete host-input log: how many records, of both
+/// kinds, precede it. A log without it, or with another count, is incomplete.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct HostInputLogEnd {

@@ -119,7 +119,15 @@ ends. A cause is named only when all of these hold:
   failure. Positions are records in the log, so this holds where the log is
   not one stream in time order: SaBRe appends the records its guest forwards
   after the coordinator's own, each part is in time order, and the comparator
-  reports the first difference in the earliest part.
+  reports the first difference in the earliest part;
+- the guest did not itself rebind, or try to rebind, that path or a
+  directory above it in either run: no rename to or from it, link, unlink,
+  symlink, node, directory or file created there, whether or not the call
+  succeeded (each is recorded before it runs), and the open's path could be
+  made absolute. Those operations can replace a file without the
+  compared log showing any difference: in a directory that keeps its state
+  between the runs, a rename onto a name that already names the same file
+  succeeds and changes nothing, so the runs agree until some later call.
 
 Then the report's verdict is `infrastructure_error` with
 `infrastructure_error.kind` `host_input_changed`, naming the run, the path and

@@ -913,7 +913,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 837 + 1 = 838.
     // tests::sabre_detlog_forwarding_answers_each_target_as_the_cli_filter_does
     // retains all 838 prior identities: 838 + 1 = 839.
-    ("test.hermit_unit", 839),
+    // host_input_change::tests::a_replacement_where_the_guest_rebound_the_path_is_not_named
+    // and host_input_change::tests::a_log_with_mutation_lines_is_complete_when_its_end_counts_them
+    // retain all 839 (841, measured with cargo nextest list).
+    ("test.hermit_unit", 841),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1029,7 +1032,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detlog::tests::forward_policy_most_specific_target_decides and
     // detlog::tests::forward_policy_encoding_round_trips_and_refuses_malformed_values
     // retain all 954 prior identities: 954 + 3 = 957.
-    ("test.detcore_unit", 957),
+    // syscalls::files::rebound_path_tests::an_operand_that_cannot_be_established_is_reported_as_the_root
+    // retains all 957 (958, measured with cargo nextest list).
+    ("test.detcore_unit", 958),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1096,7 +1101,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_guest_that_replaces_a_file_after_diverging_names_no_host_input_change;
     // they retain all 195 prior identities (198, measured with cargo nextest
     // list).
-    ("test.hermit_integration", 198),
+    // a_guest_that_rebinds_the_path_itself_names_no_host_input_change and
+    // a_replacement_where_the_guest_tried_to_rebind_the_path_names_no_host_input_change
+    // retain all 198 (200, measured with cargo nextest list).
+    ("test.hermit_integration", 200),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but two (`cargo nextest list` lists 108):
     // the --skip waivers of record_node_eventfd_epoll_sequence
@@ -1341,7 +1349,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // host-input observation test (952).
     // The same two forwarded-record tests retain all 952: 952 + 2 = 954.
     // The same three DETLOG forwarding-policy tests retain all 954: 957.
-    ("test.detcore_unit_on_host", 957),
+    // And the rebound-path test (958).
+    ("test.detcore_unit_on_host", 958),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1354,8 +1363,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3639).
     // The host twin also selects the two utimensat_mtime tests
     // (https://github.com/rrnewton/hermit/issues/3565).
-    // The host twin also selects the three host-input-change verify tests.
-    ("test.hermit_integration_on_host", 198),
+    // The host twin also selects the five host-input-change verify tests (200).
+    ("test.hermit_integration_on_host", 200),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -1387,7 +1396,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 833 + 4 = 837.
     // The same forwarded-record bound test retains all 837: 837 + 1 = 838.
     // The same SaBRe DETLOG forwarding-policy test retains all 838: 839.
-    ("test.hermit_unit_on_host", 839),
+    // And the two guest-rebinding host_input_change tests (841).
+    ("test.hermit_unit_on_host", 841),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

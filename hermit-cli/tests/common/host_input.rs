@@ -43,6 +43,62 @@ pub const SELF_REPLACING_GUEST: &str = r#"
     cat "$1/F" > /dev/null || exit 3
 "#;
 
+/// A guest that rebinds `F` itself with raw calls, in a directory that keeps
+/// its state between the two runs: after the host's line, `python` opens `F`,
+/// renames `A` onto it, opens it again and links `F` back to `A`. In run 1
+/// the rename replaces `F` and the link succeeds, leaving both names on one
+/// file. In run 2 the rename therefore succeeds without changing anything,
+/// and the link fails with EEXIST. The two runs' logs agree through the
+/// second open, and the opens' identities differ as a host replacement's
+/// would, but the guest made the replacement.
+pub fn rebinding_guest(python: &Path) -> String {
+    format!(
+        r#"
+    read line < "$1/fifo" || exit 3
+    '{}' -c 'import os, sys
+d = sys.argv[1]
+open(d + "/F").read()
+os.rename(d + "/A", d + "/F")
+open(d + "/F").read()
+os.link(d + "/F", d + "/A")' "$1"
+"#,
+        python.display()
+    )
+}
+
+/// A guest that tries to rename onto `F` and fails: it opens `F`, waits for
+/// the host's line, tries `rename(missing, F)` (ENOENT), opens `F` again and
+/// prints the inode number of `G`. A failed rename changes nothing, but
+/// Hermit cannot tell, before the call runs, that it will fail, so `F` counts
+/// as rebound and a host replacement of it is not named.
+pub fn failed_rename_guest(python: &Path) -> String {
+    format!(
+        r#"
+    '{}' -c 'import os, sys
+d = sys.argv[1]
+open(d + "/F").read()
+open(d + "/fifo").readline()
+try:
+    os.rename(d + "/missing", d + "/F")
+except FileNotFoundError:
+    pass
+open(d + "/F").read()
+print(os.stat(d + "/G").st_ino)' "$1"
+"#,
+        python.display()
+    )
+}
+
+/// The Python interpreter itself, not a launcher that might use CLONE_VFORK.
+pub fn python_interpreter() -> std::path::PathBuf {
+    let output = Command::new("python3")
+        .args(["-c", "import sys; print(sys.executable)"])
+        .output()
+        .expect("run python3");
+    assert!(output.status.success(), "python3 failed: {output:?}");
+    std::path::PathBuf::from(String::from_utf8(output.stdout).unwrap().trim())
+}
+
 /// Open `fifo` for writing once a reader has it open, or panic at `deadline`.
 fn open_fifo_writer(fifo: &Path, deadline: std::time::Instant) -> std::fs::File {
     use std::os::unix::fs::OpenOptionsExt;

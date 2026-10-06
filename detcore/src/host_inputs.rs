@@ -18,23 +18,31 @@
 //! writes nothing, which leaves its divergence unexplained rather than
 //! explained by partial evidence.
 
+use std::collections::BTreeSet;
 use std::path::Path;
 
 use detcore_model::host_input::HostInputLogEnd;
 use detcore_model::host_input::HostInputRecord;
+use detcore_model::host_input::HostMutationRecord;
 use tracing::warn;
 
-/// Write `records` to `log`, one JSON line each, followed by a
-/// [`HostInputLogEnd`] line naming how many there are, so that a reader can
-/// tell a complete log from a cut one.
-pub(crate) fn write(log: &Path, records: &[HostInputRecord]) {
+/// Write `records` to `log`, one JSON line each, then one
+/// [`HostMutationRecord`] line for each path in `mutated`, followed by a
+/// [`HostInputLogEnd`] line naming how many lines precede it, so that a
+/// reader can tell a complete log from a cut one.
+pub(crate) fn write(log: &Path, records: &[HostInputRecord], mutated: &BTreeSet<String>) {
     let mut text = Vec::new();
     let end = HostInputLogEnd {
-        records: records.len() as u64,
+        records: (records.len() + mutated.len()) as u64,
     };
     let encoded = records
         .iter()
         .map(serde_json::to_vec)
+        .chain(mutated.iter().map(|path| {
+            serde_json::to_vec(&HostMutationRecord {
+                mutated: path.clone(),
+            })
+        }))
         .chain(std::iter::once(serde_json::to_vec(&end)))
         .try_for_each(|line| {
             text.extend(line?);

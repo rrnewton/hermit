@@ -41,6 +41,13 @@
 //! part. An open in a later part than that difference is therefore refused,
 //! and an open before it in the same part did happen before it.
 //!
+//! Nor is a change named when the guest itself rebound that path, or a
+//! directory above it, in either run: renamed to or from it, linked or
+//! unlinked it, or created something there. Those operations can replace the
+//! file without the compared log showing any difference (a rename onto a name
+//! that already names the same file succeeds and changes nothing), so a
+//! replacement there may be the guest's own.
+//!
 //! Nothing else is concluded. The walk stops at the first open whose path,
 //! thread or syscall differs between the runs and at the first difference that
 //! is not a replacement, an incomplete log names nothing, an open whose finish
@@ -55,6 +62,7 @@ use detcore::detlog::DetLogEvent;
 use detcore_model::host_input::HostFileIdentity;
 use detcore_model::host_input::HostInputLogEnd;
 use detcore_model::host_input::HostInputRecord;
+use detcore_model::host_input::HostMutationRecord;
 
 use crate::canonical_verdict::InfrastructureError;
 use crate::canonical_verdict::VerificationRun;
@@ -64,8 +72,11 @@ use crate::canonical_verdict::VerificationRun;
 pub struct HostInputs {
     /// The records, in the order the run made the opens.
     pub records: Vec<HostInputRecord>,
+    /// The paths the guest itself rebound in its file namespace during the
+    /// run ([`HostMutationRecord`]).
+    pub mutated: Vec<String>,
     /// Whether every line parsed and the log ends with the
-    /// [`HostInputLogEnd`] line counting exactly these records. Detcore writes
+    /// [`HostInputLogEnd`] line counting exactly these lines. Detcore writes
     /// the log once, when the run ends, so a run that did not end normally, a
     /// failed write or a cut file leaves it incomplete.
     pub complete: bool,
@@ -85,20 +96,37 @@ fn parse_host_inputs(text: &str) -> HostInputs {
     let end = lines
         .pop()
         .and_then(|line| serde_json::from_str::<HostInputLogEnd>(line).ok());
-    let records: Option<Vec<HostInputRecord>> = lines
-        .iter()
-        .map(|line| serde_json::from_str(line).ok())
-        .collect();
-    match (records, end) {
-        (Some(records), Some(end)) if end.records == records.len() as u64 => HostInputs {
-            records,
-            complete: true,
-        },
-        (records, _) => HostInputs {
-            records: records.unwrap_or_default(),
-            complete: false,
-        },
+    let mut records = Vec::new();
+    let mut mutated = Vec::new();
+    let mut parsed = true;
+    for line in &lines {
+        if let Ok(record) = serde_json::from_str::<HostInputRecord>(line) {
+            records.push(record);
+        } else if let Ok(mutation) = serde_json::from_str::<HostMutationRecord>(line) {
+            mutated.push(mutation.mutated);
+        } else {
+            parsed = false;
+        }
     }
+    let complete = parsed && end.is_some_and(|end| end.records == lines.len() as u64);
+    HostInputs {
+        records,
+        mutated,
+        complete,
+    }
+}
+
+/// Whether the guest may have rebound `path`, or a directory above it, in its
+/// file namespace: one of `mutated` is `path` or an ancestor of it. Detcore
+/// reports `/`, the ancestor of every absolute path, for a change whose path
+/// it could not establish. An open whose path could not be made absolute
+/// cannot be matched against those changes at all, so it counts as rebound
+/// too.
+fn guest_rebound(mutated: &[String], path: &str) -> bool {
+    !Path::new(path).is_absolute()
+        || mutated
+            .iter()
+            .any(|rebound| Path::new(path).starts_with(Path::new(rebound)))
 }
 
 /// Kernel objects rather than host input files; see the module documentation.
@@ -199,6 +227,15 @@ pub fn find_pattern_difference(run1: &HostInputs, run2: &HostInputs) -> Option<P
         // path seen before reaches this point.
         let before = previous?;
         if (before.dev, before.ino) == (record.identity.dev, record.identity.ino) {
+            return None;
+        }
+        // The guest may have replaced it itself, through operations whose
+        // effects the compared log does not show (a rename onto a name that
+        // already names the same file succeeds and changes nothing).
+        if [run1, run2]
+            .iter()
+            .any(|run| guest_rebound(&run.mutated, &record.path))
+        {
             return None;
         }
         return Some(PatternDifference {
@@ -308,6 +345,7 @@ mod tests {
                     identity: identity(*ino),
                 })
                 .collect(),
+            mutated: Vec::new(),
             complete: true,
         }
     }
@@ -556,6 +594,51 @@ mod tests {
             [Some(10), Some(10)],
             Some((Some(40), None))
         ));
+    }
+
+    /// A replacement of a file whose path, or a directory above it, the
+    /// guest rebound in either run is not named: the guest may have made it
+    /// with operations whose effects the compared log does not show.
+    #[test]
+    fn a_replacement_where_the_guest_rebound_the_path_is_not_named() {
+        let run1 = opens(&[("/data/F", 1), ("/data/F", 2)]);
+        let run2 = opens(&[("/data/F", 2), ("/data/F", 2)]);
+        assert!(find_pattern_difference(&run1, &run2).is_some());
+        for (in_run1, rebound) in [(true, "/data/F"), (false, "/data/F"), (false, "/data")] {
+            let (mut run1, mut run2) = (run1.clone(), run2.clone());
+            let run = if in_run1 { &mut run1 } else { &mut run2 };
+            run.mutated.push(rebound.into());
+            assert_eq!(find_pattern_difference(&run1, &run2), None, "{rebound}");
+        }
+        let mut unrelated = run1.clone();
+        unrelated.mutated = vec!["/data/F.tmp".into(), "/tmp".into(), "/data/Fx".into()];
+        assert!(find_pattern_difference(&unrelated, &run2).is_some());
+        assert!(guest_rebound(&["/".into()], "/etc/ld.so.cache"));
+        assert!(!guest_rebound(&["/etc/ld.so".into()], "/etc/ld.so.cache"));
+        // An open recorded under a path that could not be made absolute
+        // (through a directory descriptor with no known path) cannot be
+        // matched against the guest's changes, so it is never named, with or
+        // without them.
+        assert!(guest_rebound(&[], "F"));
+        assert!(guest_rebound(&["/".into()], "F"));
+        let relative1 = opens(&[("F", 1), ("F", 2)]);
+        let relative2 = opens(&[("F", 2), ("F", 2)]);
+        assert_eq!(find_pattern_difference(&relative1, &relative2), None);
+    }
+
+    /// A log's mutation lines count toward its end line like its records.
+    #[test]
+    fn a_log_with_mutation_lines_is_complete_when_its_end_counts_them() {
+        let record = serde_json::to_string(&opens(&[("/etc/a", 1)]).records[0]).unwrap();
+        let mutation = serde_json::to_string(&HostMutationRecord {
+            mutated: "/data/F".into(),
+        })
+        .unwrap();
+        let parsed = parse_host_inputs(&format!("{record}\n{mutation}\n{{\"records\":2}}\n"));
+        assert!(parsed.complete);
+        assert_eq!(parsed.records.len(), 1);
+        assert_eq!(parsed.mutated, vec!["/data/F".to_string()]);
+        assert!(!parse_host_inputs(&format!("{record}\n{mutation}\n{{\"records\":1}}\n")).complete);
     }
 
     /// A change of size or time that keeps the host inode is not the

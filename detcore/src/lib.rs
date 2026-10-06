@@ -2157,6 +2157,15 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             resource_request(guest, request).await;
         }
 
+        // For `hermit run --verify`: a name the guest itself rebinds is not a
+        // host input change (see `detcore_model::host_input`). Reported before
+        // the call runs, whatever its outcome, so that a change the kernel
+        // commits is never missing from the record, even if the run ends
+        // before this handler returns.
+        if self.cfg.record_host_inputs {
+            self.record_host_namespace_change(guest, &call).await;
+        }
+
         // Only an emulated RNG readv supplies authoritative imported geometry.
         // A generic pre-dispatch snapshot would become stale across pipe waits.
         let mut rng_readv_output = None;
