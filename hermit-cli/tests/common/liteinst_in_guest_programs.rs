@@ -1494,8 +1494,8 @@ fn liteinst_in_guest_exit_reaping_matches_ptrace() {
     let guest = c_guest(&EXIT_REAPING_GUEST, "exit_reaping_probe");
     for (mode, pending, wait, status) in [
         ("sigign", None, "ECHILD", -1),
-        ("nocldwait", Some(1), "ECHILD", -1),
-        ("rawexit", Some(1), "child", 7),
+        ("nocldwait", Some("1"), "ECHILD", -1),
+        ("rawexit", Some("1"), "child", 7),
     ] {
         let mut outputs = Vec::new();
         for backend in ["ptrace", "liteinst"] {
