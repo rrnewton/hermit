@@ -2633,6 +2633,7 @@ impl GlobalState {
                     fyi: String::new(),
                     signal_interrupt_errno: None,
                     backend_runtime_bootstrap: false,
+                    blocked_signal_mask: None,
                 }
             };
             let nextturn = match sched.next_turns.entry(dettid) {

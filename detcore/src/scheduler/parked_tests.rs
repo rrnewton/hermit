@@ -2189,6 +2189,7 @@ fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
             },
             &Permission::RW,
             None,
+            None,
             &response,
         )
         .is_ok()
@@ -2215,6 +2216,7 @@ fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
                     mm: child_mm,
                 },
                 &Permission::RW,
+                None,
                 None,
                 &Ivar::new(),
             )
@@ -2278,6 +2280,7 @@ fn selected_exit_reservation_failure_closes_tentative_pop_exactly_once() {
                 mm: child_mm,
             },
             &Permission::RW,
+            None,
             None,
             &response,
         )

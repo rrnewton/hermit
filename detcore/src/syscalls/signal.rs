@@ -126,6 +126,14 @@ fn validate_kernel_sigset_size(sigsetsize: usize) -> Result<(), Errno> {
     }
 }
 
+/// The mask Linux installs when a call names `mask` as the signal mask to sleep
+/// under (`rt_sigsuspend`, `ppoll`, `pselect6`): `set_current_blocked` drops
+/// `SIGKILL` and `SIGSTOP`, which can never be blocked.
+pub(crate) fn kernel_installed_signal_mask(mask: KernelSigset) -> KernelSigset {
+    let unblockable = (1_u64 << (libc::SIGKILL - 1)) | (1_u64 << (libc::SIGSTOP - 1));
+    mask & !unblockable
+}
+
 fn without_perf_event_signal(mask: KernelSigset) -> KernelSigset {
     let bit = (reverie::PERF_EVENT_SIGNAL as u32) - 1;
     mask & !(1_u64 << bit)
@@ -421,14 +429,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         let pending: u64 = guest.memory().read_value(pending_addr)?;
         drop(pending_guard);
 
+        // The scheduler records the mask the call sleeps under, read here in
+        // this thread's turn, to choose a SIGCHLD target while the thread is
+        // outside the runnable set (`Resources::blocked_signal_mask`).
+        let installed_mask = kernel_installed_signal_mask(temporary_mask);
         if pending & !temporary_mask != 0 {
             // The kernel will consume an already-pending signal as soon as it
             // atomically installs the temporary mask. Keep this immediate case
             // out of the terminal-wait classification; the real syscall still
             // performs delivery and restores the old mask.
-            self.record_or_replay_blocking(guest, call.into()).await
+            self.record_or_replay_blocking_with_mask(guest, call.into(), Some(installed_mask))
+                .await
         } else {
-            self.record_or_replay_rt_sigsuspend(guest, call).await
+            self.record_or_replay_rt_sigsuspend(guest, call, installed_mask)
+                .await
         }
     }
 
