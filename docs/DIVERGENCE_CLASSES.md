@@ -156,6 +156,31 @@ the verdict stays a divergence. In-guest LiteInst records too, but refuses
 launcher and verifier, which do not collect the records. On all three a
 divergence stays red.
 
+The same refusal holds on any backend under `--passthru-opt`. There Detcore
+subscribes only to a short allow-list of syscalls and every other one, `rename`
+and `link` among them, runs without Detcore seeing it, so the guest's own
+rebinding of a path is never recorded. The opens are still recorded and show
+such a rebinding exactly as a host replacement, so the change is reported as
+`HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED` and not named.
+
+ptrace has one window by design. Reverie's seccomp filter lets a syscall
+through untraced when it is issued from the untraced stub of Reverie's private
+page (`TRAMPOLINE_BASE`, 0x7100_0000), which Reverie needs to inject syscalls.
+Ordinary guest code never runs there, but a guest can jump into it on purpose.
+The instruction after the stub is `ud2`, so such a guest faults with SIGILL as
+soon as its syscall returns. Detcore records any SIGILL a guest takes during a
+verify run as a namespace change at `/`, which it could not establish, so no
+host input change is named in that run. A false alarm only withholds a name.
+Two ways around the fault remain, and both need a guest that deliberately
+attacks the tool. One rewrites Reverie's private page first: it makes the page
+writable with `mprotect` and replaces the `ud2`, maps a page over it with
+`MAP_FIXED`, or writes it through `/proc/self/mem`, and then uses the stub
+without faulting. That is not covered yet; a follow-up guards every operation
+that can change the page. The other has a signal delivered at the syscall's
+return, by racing a signal into those two instructions, and never returns to
+the stub (its handler jumps elsewhere, or SIGKILL ends the process). Both
+defeat ptrace's determinism guarantee itself, not only this attribution.
+
 The one remaining case is a coincidence: a host file replaced during an attempt
 before the divergence, and an unrelated flaky product divergence in that same
 attempt. That attempt earns the one retry.

@@ -66,6 +66,38 @@ os.link(d + "/F", d + "/A")' "$1"
     )
 }
 
+/// [`rebinding_guest`]'s sequence with the rename issued past the tracer: a
+/// forked child jumps to the untraced `syscall` of Reverie's private page
+/// (0x7100_0000) with `rename(A, F)` in its registers. The kernel runs it
+/// untraced, and the child then dies on the `ud2` that follows the stub
+/// (SIGILL). Detcore never sees the rename, so the guest's rebinding of `F` is
+/// absent from its records while the opens around it are not.
+pub fn private_page_rebinding_guest(python: &Path) -> String {
+    format!(
+        r#"
+    read line < "$1/fifo" || exit 3
+    '{}' -c 'import ctypes, mmap, os, sys
+d = sys.argv[1]
+open(d + "/F").read()
+pid = os.fork()
+if pid == 0:
+    # mov eax, 82 (rename); movabs r11, 0x71000000; jmp r11
+    code = bytes([0xb8, 0x52, 0, 0, 0, 0x49, 0xbb, 0, 0, 0, 0x71, 0, 0, 0, 0, 0x41, 0xff, 0xe3])
+    page = mmap.mmap(-1, mmap.PAGESIZE, prot=mmap.PROT_READ | mmap.PROT_WRITE | mmap.PROT_EXEC)
+    page.write(code)
+    stub = ctypes.CFUNCTYPE(ctypes.c_long, ctypes.c_char_p, ctypes.c_char_p)(
+        ctypes.addressof(ctypes.c_char.from_buffer(page)))
+    stub((d + "/A").encode(), (d + "/F").encode())
+    os._exit(9)
+_, status = os.waitpid(pid, 0)
+print(status)
+open(d + "/F").read()
+os.link(d + "/F", d + "/A")' "$1"
+"#,
+        python.display()
+    )
+}
+
 /// A guest that tries to rename onto `F` and fails: it opens `F`, waits for
 /// the host's line, tries `rename(missing, F)` (ENOENT), opens `F` again and
 /// prints the inode number of `G`. A failed rename changes nothing, but
@@ -141,6 +173,35 @@ pub fn verify_across_host_action(
     String,
     hermit::canonical_verdict::VerificationReport,
 ) {
+    verify_across_host_action_with(
+        hermit,
+        global_args,
+        &["--strict"],
+        envs,
+        name,
+        guest,
+        replace_in_run1,
+        lines,
+    )
+}
+
+/// [`verify_across_host_action`] with `run_args` in place of `--strict`, for
+/// a run mode that `--strict` refuses (such as `--passthru-opt`).
+#[allow(clippy::too_many_arguments)]
+pub fn verify_across_host_action_with(
+    hermit: &Path,
+    global_args: &[&str],
+    run_args: &[&str],
+    envs: &[(&str, &Path)],
+    name: &str,
+    guest: &str,
+    replace_in_run1: bool,
+    lines: [&str; 2],
+) -> (
+    std::path::PathBuf,
+    String,
+    hermit::canonical_verdict::VerificationReport,
+) {
     use std::io::Write;
 
     let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
@@ -163,13 +224,9 @@ pub fn verify_across_host_action(
         .args(["--kill-after", "5s", "180s"])
         .arg(hermit)
         .args(global_args)
-        .args([
-            "run",
-            "--strict",
-            "--verify",
-            "--verify-strict",
-            "--verify-json",
-        ])
+        .arg("run")
+        .args(run_args)
+        .args(["--verify", "--verify-strict", "--verify-json"])
         .arg(&report_path)
         .args([
             "--base-env=minimal",

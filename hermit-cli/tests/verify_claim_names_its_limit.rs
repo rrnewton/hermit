@@ -202,6 +202,30 @@ fn verify_across_host_action(
     )
 }
 
+/// [`verify_across_host_action`] under `--passthru-opt`, which needs
+/// `--allow-unsupported-syscalls` and refuses `--strict`.
+fn verify_across_host_action_passthru(
+    name: &str,
+    guest: &str,
+    replace_in_run1: bool,
+    lines: [&str; 2],
+) -> (
+    std::path::PathBuf,
+    String,
+    hermit::canonical_verdict::VerificationReport,
+) {
+    host_input::verify_across_host_action_with(
+        Path::new(env!("CARGO_BIN_EXE_hermit")),
+        &[],
+        &["--allow-unsupported-syscalls", "--passthru-opt"],
+        &[],
+        name,
+        guest,
+        replace_in_run1,
+        lines,
+    )
+}
+
 /// The sar divergence in miniature: a host file replaced between run 1's two
 /// opens of it. `--verify` reports the divergence as a typed host input
 /// change, naming the run, the file and both of its host identities, and
@@ -307,6 +331,84 @@ fn a_guest_that_rebinds_the_path_itself_names_no_host_input_change() {
     );
     assert_eq!(report.infrastructure_error, None, "{stderr}");
     assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGE"), "{stderr}");
+}
+
+/// A syscall issued from the untraced stub of Reverie's private page passes
+/// the ptrace backend unobserved, so a guest that rebinds `F` that way leaves
+/// no record of it. It cannot avoid the illegal instruction after the stub,
+/// and Detcore reports that SIGILL as a change it could not establish, so no
+/// host input change is named and the run stays a divergence.
+#[test]
+fn a_rebinding_through_reverie_private_page_names_no_host_input_change() {
+    let guest = host_input::private_page_rebinding_guest(&host_input::python_interpreter());
+    let (_root, stderr, report) =
+        verify_across_host_action("host-input-private-page", &guest, false, ["go", "go"]);
+    assert_eq!(
+        report.verdict,
+        hermit::canonical_verdict::Verdict::Diverged,
+        "{stderr}"
+    );
+    assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+}
+
+/// Under `--passthru-opt` every syscall outside Detcore's short allow-list
+/// bypasses it, `rename` and `link` among them, so the guest's own rebinding
+/// is never reported. The opens still are, and they show the guest's
+/// replacement of `F` exactly as a host replacement would. A host input change
+/// is therefore never named there: it is reported as unattributed, and the run
+/// stays a divergence.
+#[test]
+fn under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change() {
+    let guest = host_input::rebinding_guest(&host_input::python_interpreter());
+    let (_root, stderr, report) = verify_across_host_action_passthru(
+        "host-input-rebound-passthru",
+        &guest,
+        false,
+        ["go", "go"],
+    );
+    assert_eq!(
+        report.verdict,
+        hermit::canonical_verdict::Verdict::Diverged,
+        "{stderr}"
+    );
+    assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    assert!(
+        stderr.contains("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED")
+            && stderr.contains("--passthru-opt"),
+        "{stderr}"
+    );
+}
+
+/// The same refusal for a genuine host replacement under `--passthru-opt`:
+/// Hermit cannot tell it from an unobserved guest rebinding, so it is
+/// reported, with the run and the file, and not named as the cause.
+#[test]
+fn under_passthru_opt_a_host_replacement_is_reported_but_not_named() {
+    let (root, stderr, report) = verify_across_host_action_passthru(
+        "host-input-replaced-passthru",
+        host_input::HOST_INPUT_GUEST,
+        true,
+        ["go", "go"],
+    );
+    assert_eq!(
+        report.verdict,
+        hermit::canonical_verdict::Verdict::Diverged,
+        "{stderr}"
+    );
+    assert_eq!(report.infrastructure_error, None, "{stderr}");
+    assert!(!stderr.contains("HERMIT_HOST_INPUT_CHANGED"), "{stderr}");
+    let unattributed = stderr
+        .lines()
+        .find(|line| line.starts_with("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED"))
+        .unwrap_or_else(|| panic!("no unattributed report:\n{stderr}"));
+    assert!(unattributed.contains("run 1"), "{unattributed}");
+    assert!(
+        unattributed.contains(&root.join("F").display().to_string()),
+        "{unattributed}"
+    );
+    assert!(unattributed.contains("--passthru-opt"), "{unattributed}");
 }
 
 /// The guest's namespace changes are recorded before they run, whatever their

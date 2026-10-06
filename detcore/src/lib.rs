@@ -1521,6 +1521,17 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         } else {
             self.pre_handler_hook(guest, false).await;
 
+            // For `hermit run --verify`: a guest that faulted on an illegal
+            // instruction may have run code that made syscalls Detcore never
+            // saw. On ptrace that is the one way past the tracer: a syscall
+            // issued from the untraced stub of Reverie's private page is let
+            // through, and the instruction after it is `ud2`. So the run
+            // reports `/`, the ancestor of every path, and names no host input
+            // change. A false alarm only withholds a name.
+            if signal == Signal::SIGILL && self.cfg.record_host_inputs {
+                tool_global::record_host_mutation(guest, String::from("/")).await;
+            }
+
             let dettid = guest.thread_state().dettid;
             let mycount = guest.thread_state().stats.signal_count;
             info!(

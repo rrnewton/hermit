@@ -346,13 +346,33 @@ fn place_host_input_change(
     Some((difference, positions))
 }
 
-/// Why `backend` can run guest code that Hermit does not observe, or `None`
-/// when Hermit sees every syscall of every guest process from its first
-/// instruction after exec. Under such a backend a host file change found
-/// before the first divergence is not evidence that the guest did not make
-/// the change itself (see `hermit::host_input_change`).
-fn unobserved_guest_execution(backend: Backend) -> Option<&'static str> {
+/// Why a run on `backend`, with `--passthru-opt` when `passthru_opt` is set,
+/// can run guest code or syscalls that Hermit does not observe, or `None` when
+/// Hermit sees every syscall of every guest process from its first
+/// instruction after exec. In such a run a host file change found before the
+/// first divergence is not evidence that the guest did not make the change
+/// itself (see `hermit::host_input_change`).
+fn unobserved_guest_execution(backend: Backend, passthru_opt: bool) -> Option<&'static str> {
+    if passthru_opt {
+        // Detcore subscribes only to its passthrough allow-list, so the
+        // guest's own rename, link and unlink calls are never reported.
+        return Some(
+            "--passthru-opt lets every syscall outside Detcore's allow-list, rename and link \
+             among them, run unobserved",
+        );
+    }
     match backend {
+        // These observe every syscall Detcore subscribes to, from the first
+        // instruction after exec. ptrace leaves one window open by design:
+        // Reverie's seccomp filter lets a syscall through untraced when it is
+        // issued from the untraced stub of Reverie's private page
+        // (`cp::TRAMPOLINE_BASE`, reverie-ptrace `seccomp_filter`), which
+        // Reverie needs to inject syscalls. The instruction after that stub is
+        // `ud2`, so a guest that uses it faults with SIGILL, and Detcore then
+        // records a change it could not establish, so that no host input
+        // change is named in that run (detcore `handle_signal_event`). See
+        // docs/DIVERGENCE_CLASSES.md for the two ways around the fault that
+        // remain, both by a guest that deliberately attacks the tool.
         Backend::Ptrace | Backend::E9patch | Backend::Kvm => None,
         Backend::Sabre => Some(
             "SaBRe's loader runs an exec'd program's .preinit_array before Detcore starts \
@@ -2367,6 +2387,35 @@ fn panic_on_rbc_overshoot_flag_wires_to_detcore_config() {
         format!("{}", opts),
         " --panic-on-rbc-overshoot --epoch=2026-01-01T00:00:00+00:00 -- fakeprog"
     );
+}
+
+#[test]
+fn passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend() {
+    for backend in [
+        Backend::Ptrace,
+        Backend::E9patch,
+        Backend::Kvm,
+        Backend::Sabre,
+        Backend::Liteinst,
+        Backend::Dbt,
+    ] {
+        let reason = unobserved_guest_execution(backend, true)
+            .unwrap_or_else(|| panic!("{backend:?} under --passthru-opt observes everything"));
+        assert!(reason.contains("--passthru-opt"), "{backend:?}: {reason}");
+    }
+    for backend in [Backend::Ptrace, Backend::E9patch, Backend::Kvm] {
+        assert_eq!(
+            unobserved_guest_execution(backend, false),
+            None,
+            "{backend:?}"
+        );
+    }
+    for backend in [Backend::Sabre, Backend::Liteinst, Backend::Dbt] {
+        assert!(
+            unobserved_guest_execution(backend, false).is_some(),
+            "{backend:?}"
+        );
+    }
 }
 
 #[test]
@@ -5910,7 +5959,10 @@ impl RunOpts {
             })
             .map(|(difference, _)| difference.into_infrastructure_error())
             .filter(|change| {
-                let unobserved = unobserved_guest_execution(self.selected_backend());
+                let unobserved = unobserved_guest_execution(
+                    self.selected_backend(),
+                    self.det_opts.det_config.passthru_opt,
+                );
                 if let Some(reason) = unobserved {
                     eprintln!("HERMIT_HOST_INPUT_CHANGE_UNATTRIBUTED {change}; not named as the cause: {reason}");
                 }

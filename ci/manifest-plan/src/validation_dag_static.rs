@@ -938,7 +938,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // strict_refusal_needs_strict_a_pmu_backend_and_an_inexact_counter and
     // strict_run_refuses_an_inexact_branch_counter_before_it_looks_at_the_program)
     // retain all 843: 843 + 6 = 849.
-    ("test.hermit_unit", 849),
+    // run::passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend
+    // retains all 849 (850, measured with cargo nextest list).
+    ("test.hermit_unit", 850),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1128,7 +1130,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_guest_that_rebinds_the_path_itself_names_no_host_input_change and
     // a_replacement_where_the_guest_tried_to_rebind_the_path_names_no_host_input_change
     // retain all 198 (200, measured with cargo nextest list).
-    ("test.hermit_integration", 200),
+    // under_passthru_opt_an_unobserved_rebinding_names_no_host_input_change,
+    // under_passthru_opt_a_host_replacement_is_reported_but_not_named and
+    // a_rebinding_through_reverie_private_page_names_no_host_input_change
+    // retain all 200 (203, measured with cargo nextest list).
+    ("test.hermit_integration", 203),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but two (`cargo nextest list` lists 110):
     // the --skip waivers of record_node_eventfd_epoll_sequence
@@ -1401,7 +1407,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin also selects the two utimensat_mtime tests
     // (https://github.com/rrnewton/hermit/issues/3565).
     // The host twin also selects the five host-input-change verify tests (200).
-    ("test.hermit_integration_on_host", 200),
+    // And the two --passthru-opt host-input verify tests and the
+    // private-page rebinding test (203).
+    ("test.hermit_integration_on_host", 203),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -1436,7 +1444,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two guest-rebinding host_input_change tests (841).
     // And the same two LiteInst DETLOG forwarding-policy tests (843).
     // The host twin selects the same six exact-branch-counter tests: 843 + 6 = 849.
-    ("test.hermit_unit_on_host", 849),
+    // And the same --passthru-opt coverage test (850).
+    ("test.hermit_unit_on_host", 850),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
