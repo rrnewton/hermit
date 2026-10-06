@@ -377,6 +377,16 @@ pub struct BlockedPool {
     /// reserved it (`request_put`). Their `InboundSignal` turn must be granted
     /// rather than deferred (again) on the turn the scheduler selects them.
     pub sigchld_ready: BTreeSet<DetTid>,
+
+    /// Threads in `external_io_blockers` or `rt_sigsuspend_blockers` that the
+    /// scheduler signaled at a committed point (`wake_signaled_guest`) while
+    /// they slept with no posted request. Their request was consumed when they
+    /// were backgrounded, so the scheduler cannot counterfeit one; it waits
+    /// for each one's own continuation (the InboundSignal its signal stop
+    /// posts) and requeues them all at the top of the next scheduler pass
+    /// (`step2_release_signaled_background`), so host delivery timing decides
+    /// only how long the scheduler spins, not where they enter the run queue.
+    pub signaled_background: BTreeSet<DetTid>,
 }
 
 impl BlockedPool {
@@ -778,6 +788,10 @@ pub struct Scheduler {
 
     /// How the backend runs the guest. See [`Config::backend`].
     backend: BackendCapabilities,
+    /// When the release barrier (`step2_release_signaled_background`) began
+    /// waiting for the threads in `blocked.signaled_background` to post their
+    /// continuations; `None` while the set is empty.
+    signaled_background_since: Option<std::time::Instant>,
     #[cfg(test)]
     host_signal_attempts: u64,
     /// Turns that `do_a_turn_blocking` ran through the controlled loop.
@@ -1924,6 +1938,7 @@ impl Scheduler {
             backend_failure_sender: Some(backend_failure_sender),
             backend_failure_wake: backend_failure_wake.shared(),
             backend: cfg.backend,
+            signaled_background_since: None,
             #[cfg(test)]
             host_signal_attempts: 0,
             #[cfg(test)]
@@ -2973,6 +2988,7 @@ impl Scheduler {
         self.blocked.timed_out_futex_waiters.remove(dtid);
         self.blocked.sigchld_deferred.remove(dtid);
         self.blocked.sigchld_ready.remove(dtid);
+        self.blocked.signaled_background.remove(dtid);
         self.blocked.child_waiters.remove(dtid);
         self.blocked.physical_child_ready.remove(dtid);
         self.blocked.physical_child_waiters.retain(|_, waiters| {
@@ -3233,14 +3249,104 @@ impl Scheduler {
         &mut self,
         global_time: &Arc<Mutex<GlobalTime>>,
     ) -> Result<(), SkipTurn> {
+        self.step2_release_signaled_background()?;
         self.step2_drain_prefix()?;
         self.step2b_process_timed();
-        if self.backend_failed() || self.control_barrier() {
+        // A timed signal that just armed a background thread is followed by an
+        // empty pass, so the barrier above requeues it at the top of the next
+        // one whether or not its continuation is already posted.
+        if self.backend_failed()
+            || self.control_barrier()
+            || !self.blocked.signaled_background.is_empty()
+        {
             return Err(SkipTurn);
         }
         self.step2c_process_io_blockers()?;
         self.step2e_process_signal_deferred();
         self.step2d_handle_empty_queue(global_time)
+    }
+
+    /// How long the release barrier waits for an armed thread's continuation
+    /// before it gives up on ordering it (see `step2_release_signaled_background`).
+    const SIGNALED_BACKGROUND_VALVE: Duration = Duration::from_secs(30);
+
+    /// Requeue, at a fixed point, the background-pool threads that a committed
+    /// signal armed (`BlockedPool::signaled_background`, set by
+    /// `arm_signaled_background`).
+    ///
+    /// This runs first in every scheduler pass: before the drain prefix, any
+    /// timer pop, and any selection. While an armed thread is still in its pool
+    /// with no posted request, the kernel is still delivering its signal, and
+    /// the pass does nothing else: it returns `SkipTurn`. Once every armed
+    /// thread has posted its continuation (or left its pool, or exited), all of
+    /// them are requeued in `DetTid` order exactly as
+    /// `step2c_process_io_blockers` requeues a ready backgrounded call. No
+    /// guest turn and no other scheduler event can commit between the signal
+    /// and the requeue, so host delivery time decides only how many empty
+    /// passes spin, never where the threads enter the run queue.
+    ///
+    /// The valve is liveness insurance, not part of the order: an armed thread
+    /// is woken because its recorded mask does not block the signal and a traced
+    /// thread is never spared a signal at generation, so it always stops and
+    /// posts. If that ever fails to happen within the valve, the barrier warns
+    /// and leaves the thread in its pool for `step2c` to harvest as before.
+    fn step2_release_signaled_background(&mut self) -> Result<(), SkipTurn> {
+        if self.blocked.signaled_background.is_empty() {
+            self.signaled_background_since = None;
+            return Ok(());
+        }
+        let armed: Vec<DetTid> = self.blocked.signaled_background.iter().copied().collect();
+        let mut unposted = Vec::new();
+        for dtid in armed {
+            let in_pool = self.blocked.external_io_blockers.contains_key(&dtid)
+                || self.blocked.rt_sigsuspend_blockers.contains_key(&dtid);
+            match self.next_turns.get(&dtid).map(|nt| nt.req.try_read()) {
+                Some(Some(Ok(_))) if in_pool => {}
+                Some(None) if in_pool => unposted.push(dtid),
+                // Left its pool, exited, or unregistered: nothing to order.
+                _ => {
+                    self.blocked.signaled_background.remove(&dtid);
+                }
+            }
+        }
+        if !unposted.is_empty() {
+            let since = *self
+                .signaled_background_since
+                .get_or_insert_with(std::time::Instant::now);
+            if since.elapsed() < Self::SIGNALED_BACKGROUND_VALVE {
+                trace!(
+                    "[step2] waiting for signaled background dtids {:?} to post their continuations",
+                    unposted
+                );
+                std::thread::yield_now();
+                return Err(SkipTurn);
+            }
+            tracing::warn!(
+                "[step2] signaled background dtids {:?} posted no continuation within {:?}; leaving them to step2c",
+                unposted,
+                Self::SIGNALED_BACKGROUND_VALVE
+            );
+            for dtid in &unposted {
+                self.blocked.signaled_background.remove(dtid);
+            }
+        }
+        let ready = std::mem::take(&mut self.blocked.signaled_background);
+        self.signaled_background_since = None;
+        for dtid in ready {
+            info!(
+                "[step2] Reschedule signaled background dtid {:?} at its fixed point",
+                dtid
+            );
+            let external = self.blocked.external_io_blockers.remove(&dtid);
+            let sigsuspend = self.blocked.rt_sigsuspend_blockers.remove(&dtid);
+            let _ = self.blocked.out_of_scheduler_masks.remove(&dtid);
+            assert!(
+                external.is_some() ^ sigsuspend.is_some(),
+                "ready thread must belong to exactly one blocking pool"
+            );
+            self.run_queue.push_eager_io_repoll(dtid);
+        }
+        Ok(())
     }
 
     /// Re-admit parents whose host-async `SIGCHLD` was parked in
@@ -3667,6 +3773,48 @@ impl Scheduler {
         self.wake_signaled_guest(dettid, signal);
     }
 
+    /// `wake_signaled_guest` for a thread asleep in a real blocking call outside
+    /// the run queue (`rt_sigsuspend_blockers` or `external_io_blockers`) on a
+    /// traced backend, just sent `signal` at a committed point.
+    ///
+    /// Linux wakes a thread sleeping interruptibly when a signal it does not
+    /// block is queued for it, and a traced thread is never spared one at
+    /// generation (`sig_ignored` is false under ptrace), so it stops for
+    /// delivery and the backend posts its `InboundSignal` continuation. Such a
+    /// thread is armed for the release barrier
+    /// (`step2_release_signaled_background`), which requeues it at the top of
+    /// the next pass once that continuation is posted. A `SIGCHLD` target is
+    /// also marked `sigchld_ready`, as a woken futex waiter is, so its delivery
+    /// commits rather than being deferred behind runnable siblings.
+    ///
+    /// Not armed, and left in its pool for `step2c` exactly as before, is a
+    /// thread the signal does not wake at a known point: a vfork parent (it
+    /// sleeps killable, so a non-fatal signal does not wake it) and a thread
+    /// whose recorded sleeping mask is unknown or blocks the signal.
+    fn arm_signaled_background(&mut self, dettid: DetTid, signal: Signal) {
+        let bit = kernel_signal_bit(signal as i32);
+        let wakes = !self.vfork_barriers.contains_key(&dettid)
+            && matches!(
+                self.blocked.out_of_scheduler_masks.get(&dettid),
+                Some(Some(mask)) if mask & bit == 0
+            );
+        if !wakes {
+            debug!(
+                "[dtid {}] signal {} does not wake its background call at a known point; leaving it to step2c.",
+                dettid, signal
+            );
+            return;
+        }
+        info!(
+            "[dtid {}] signal {} armed signaled background thread; awaiting its continuation.",
+            dettid, signal
+        );
+        self.blocked.signaled_background.insert(dettid);
+        if signal == Signal::SIGCHLD {
+            self.blocked.sigchld_ready.insert(dettid);
+        }
+    }
+
     /// Wake a scheduler-parked target after another guest has successfully
     /// queued a physical signal for it. The signal itself is not sent here;
     /// this only prevents an internal polling request from hiding a pending
@@ -3683,6 +3831,15 @@ impl Scheduler {
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
         let await_external_continuation =
             self.backend.signal_interrupts_external_syscalls && has_external_blocker;
+        // On a traced backend (the same condition as `sigchld_eligibility`:
+        // ptrace and LiteInst's host-hybrid runtime), such a thread awaits its
+        // own continuation too. Its request was consumed when it was
+        // backgrounded, so nothing may be counterfeited for it; the scheduler
+        // orders the continuation the signal provokes instead.
+        if self.sigchld_eligibility && has_external_blocker && !await_external_continuation {
+            self.arm_signaled_background(dettid, signal);
+            return;
+        }
         if cfg!(debug_assertions) && !await_external_continuation {
             let nxtturn = self
                 .next_turns
@@ -9753,6 +9910,309 @@ mod test {
             scheduler.kernel_sigchld_target(parent, creator),
             Some(creator)
         );
+    }
+
+    /// Post `signal`'s delivery stop for `thread`, as its backend does when the
+    /// kernel wakes it for the signal.
+    fn post_inbound_signal(
+        scheduler: &mut Scheduler,
+        thread: DetTid,
+        signal: libc::c_int,
+        global_time: &Arc<Mutex<GlobalTime>>,
+    ) {
+        let req = scheduler.next_turns.get(&thread).unwrap().req.clone();
+        let mut delivered = Resources::new(thread);
+        delivered.insert(ResourceID::InboundSignal(SigWrapper(signal)), Permission::W);
+        scheduler.request_put(&req, delivered, global_time);
+    }
+
+    /// A committed signal to a thread asleep in a real blocking call outside
+    /// the run queue, on a traced backend, counterfeits no request for it: its
+    /// request was consumed when it was backgrounded. The thread is armed, and
+    /// every scheduler pass is empty until the delivery stop the signal
+    /// provokes is posted; the next pass then requeues it, before anything
+    /// else, and its `SIGCHLD` delivery is granted rather than deferred behind
+    /// a runnable sibling. Before, a debug build asserted here and a release
+    /// build counterfeited a request for a thread still in its pool
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn a_signal_to_a_thread_sleeping_outside_the_scheduler_is_requeued_after_its_own_stop() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 1);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingRtSigsuspend(op),
+            Some(0),
+        );
+        scheduler.runqueue_push_back(parent);
+
+        scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
+        assert!(scheduler.blocked.signaled_background.contains(&creator));
+        assert!(scheduler.blocked.sigchld_ready.contains(&creator));
+        assert!(
+            scheduler
+                .next_turns
+                .get(&creator)
+                .unwrap()
+                .req
+                .try_read()
+                .is_none()
+        );
+        assert_eq!(
+            scheduler.blocked.rt_sigsuspend_blockers.get(&creator),
+            Some(&op)
+        );
+        assert!(!scheduler.run_queue.contains_tid(creator));
+
+        // The kernel has not delivered yet: every pass is empty.
+        for _ in 0..3 {
+            assert!(scheduler.step2_release_signaled_background().is_err());
+            assert!(!scheduler.run_queue.contains_tid(creator));
+        }
+
+        // The thread's own stop posts its continuation; the next pass requeues it.
+        post_inbound_signal(&mut scheduler, creator, libc::SIGCHLD, &global_time);
+        assert!(scheduler.step2_release_signaled_background().is_ok());
+        assert!(scheduler.run_queue.contains_tid(creator));
+        assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
+        assert!(scheduler.blocked.out_of_scheduler_masks.is_empty());
+        assert!(scheduler.blocked.signaled_background.is_empty());
+        assert!(scheduler.signaled_background_since.is_none());
+
+        // Its delivery commits although the leader is runnable.
+        let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(creator),
+            Some(creator)
+        );
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    creator,
+                    &inbound,
+                    &Permission::W,
+                    None,
+                    None,
+                    &Ivar::new()
+                )
+                .is_ok()
+        );
+        assert!(scheduler.blocked.sigchld_deferred.is_empty());
+    }
+
+    /// Armed threads are released together, only once every one has posted,
+    /// in an order fixed by thread ID alone: the barrier pushes them in
+    /// ascending DetTid order to the front of the run queue (as `step2e` admits
+    /// deferred parents), so the highest DetTid runs first. Which stop the host
+    /// reports first does not decide the order: both posting orders give the
+    /// same run-queue order. A thread that leaves its pool another way (here it
+    /// exits) is dropped rather than waited for.
+    #[test]
+    fn signaled_background_threads_are_released_together_in_thread_id_order() {
+        for creator_posts_first in [false, true] {
+            let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+            let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+            let sibling = DetTid::from_raw(102);
+            scheduler.thread_tree.add_child(parent, sibling, false);
+            register_known_thread(&mut scheduler, sibling);
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                creator,
+                ResourceID::BlockingRtSigsuspend(ExternalOpId::new(creator, 1)),
+                Some(0),
+            );
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                sibling,
+                ResourceID::BlockingExternalIO(ExternalOpId::new(sibling, 1)),
+                Some(0),
+            );
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                child,
+                ResourceID::BlockingExternalIO(ExternalOpId::new(child, 1)),
+                Some(0),
+            );
+            for thread in [sibling, child, creator] {
+                scheduler.wake_signaled_guest(thread, Signal::SIGUSR1);
+            }
+            assert_eq!(scheduler.blocked.signaled_background.len(), 3);
+            assert!(scheduler.blocked.sigchld_ready.is_empty());
+
+            let (first, last) = if creator_posts_first {
+                (creator, sibling)
+            } else {
+                (sibling, creator)
+            };
+            post_inbound_signal(&mut scheduler, first, libc::SIGUSR1, &global_time);
+            assert!(scheduler.step2_release_signaled_background().is_err());
+            scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
+            assert!(scheduler.step2_release_signaled_background().is_err());
+            assert!(!scheduler.run_queue.contains_tid(first));
+            assert!(scheduler.signaled_background_since.is_some());
+
+            post_inbound_signal(&mut scheduler, last, libc::SIGUSR1, &global_time);
+            assert!(scheduler.step2_release_signaled_background().is_ok());
+            assert!(scheduler.blocked.signaled_background.is_empty());
+            assert!(scheduler.signaled_background_since.is_none());
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(sibling));
+            assert_eq!(scheduler.run_queue.commit_tentative_pop(), sibling);
+            assert_eq!(scheduler.run_queue.tentative_pop_next(), Some(creator));
+            assert_eq!(scheduler.run_queue.commit_tentative_pop(), creator);
+            assert!(!scheduler.run_queue.contains_tid(child));
+            assert!(scheduler.blocked.external_io_blockers.is_empty());
+            assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
+            assert!(scheduler.blocked.out_of_scheduler_masks.is_empty());
+        }
+    }
+
+    /// A signal that does not wake a background call at a known point arms
+    /// nothing and counterfeits nothing: the thread stays in its pool for
+    /// `step2c` to harvest. That is a vfork parent, which sleeps killable, and
+    /// a thread whose recorded sleeping mask blocks the signal or is unknown.
+    #[test]
+    fn a_signal_that_cannot_wake_a_background_call_leaves_it_in_its_pool() {
+        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let cases: [(&str, Option<u64>, bool); 3] = [
+            ("vfork parent", Some(0), true),
+            ("blocked", Some(chld), false),
+            ("unknown mask", None, false),
+        ];
+        for (case, mask, vfork_parent) in cases {
+            let (mut scheduler, _parent, creator, child) = sigchld_family(libc::SIGCHLD);
+            let op = ExternalOpId::new(creator, 1);
+            commit_out_of_scheduler_call(
+                &mut scheduler,
+                creator,
+                ResourceID::BlockingExternalIO(op),
+                Some(0),
+            );
+            scheduler
+                .blocked
+                .out_of_scheduler_masks
+                .insert(creator, mask);
+            if vfork_parent {
+                scheduler.vfork_barriers.insert(creator, Some(child));
+            }
+            scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
+            assert!(scheduler.blocked.signaled_background.is_empty(), "{case}");
+            assert!(!scheduler.blocked.sigchld_ready.contains(&creator), "{case}");
+            assert_eq!(
+                scheduler.blocked.external_io_blockers.get(&creator),
+                Some(&op),
+                "{case}"
+            );
+            assert!(!scheduler.run_queue.contains_tid(creator), "{case}");
+            assert!(
+                scheduler
+                    .next_turns
+                    .get(&creator)
+                    .unwrap()
+                    .req
+                    .try_read()
+                    .is_none(),
+                "{case}"
+            );
+            assert!(scheduler.step2_release_signaled_background().is_ok(), "{case}");
+        }
+    }
+
+    /// The invariant that guards the counterfeit request still holds for every
+    /// thread outside the background pools: a signaled thread there must be
+    /// parked at a posted request.
+    #[test]
+    #[should_panic(expected = "signal_guest: thread should be parked in the scheduler")]
+    fn a_signal_to_an_unposted_thread_outside_the_background_pools_still_asserts() {
+        let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
+    }
+
+    /// A child-exit timer whose creator already dequeued the kernel's own
+    /// `SIGCHLD` for the process, and had that delivery deferred, commits that
+    /// delivery instead of sending a second signal. Before, only the leader was
+    /// looked up, so the timer sent again and found the deferred creator in no
+    /// pool (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn a_child_exit_timer_commits_a_deferred_creator_delivery_without_sending() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        // A send that this test reaches must not reach a real host thread.
+        scheduler.backend.requires_thread_directed_process_signals = true;
+        let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
+        scheduler.runqueue_push_back(parent);
+        scheduler.runqueue_push_back(creator);
+        post_inbound_signal(&mut scheduler, creator, libc::SIGCHLD, &global_time);
+        assert_eq!(
+            scheduler.run_queue.tentative_pop_tid(creator),
+            Some(creator)
+        );
+        assert!(
+            scheduler
+                .block_for_one_resource(
+                    creator,
+                    &inbound,
+                    &Permission::W,
+                    None,
+                    None,
+                    &Ivar::new()
+                )
+                .is_err()
+        );
+        assert!(scheduler.blocked.sigchld_deferred.contains(&creator));
+        assert!(!scheduler.run_queue.contains_tid(creator));
+
+        let attempts = scheduler.host_signal_attempts;
+        scheduler.dispatch_timed_signal(
+            LogicalTime::from_nanos(1),
+            timed_waiters::SignalTimerId::ChildExit {
+                child,
+                parent,
+            },
+            creator,
+            Signal::SIGCHLD,
+            true,
+        );
+        assert_eq!(scheduler.host_signal_attempts, attempts);
+        assert!(scheduler.terminal_deadlock.is_none());
+        assert!(scheduler.blocked.sigchld_deferred.is_empty());
+        assert!(scheduler.blocked.sigchld_ready.contains(&creator));
+        assert!(scheduler.run_queue.contains_tid(creator));
+    }
+
+    /// The barrier runs before anything else in a pass: while an armed thread
+    /// has posted nothing, a due timer is not popped and the pass is empty;
+    /// once it has posted, the pass requeues it first and then goes on.
+    #[test]
+    fn the_signaled_background_barrier_runs_before_any_timer_pop() {
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        // A send that this test reaches must not reach a real host thread.
+        scheduler.backend.requires_thread_directed_process_signals = true;
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingRtSigsuspend(ExternalOpId::new(creator, 1)),
+            Some(0),
+        );
+        scheduler.wake_signaled_guest(creator, Signal::SIGUSR1);
+        scheduler.blocked.timed_waiters.insert_child_exit(
+            LogicalTime::from_nanos(0),
+            child,
+            parent,
+            creator,
+        );
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert_eq!(scheduler.blocked.timed_waiters.iter().count(), 1);
+        assert!(!scheduler.run_queue.contains_tid(creator));
+
+        post_inbound_signal(&mut scheduler, creator, libc::SIGUSR1, &global_time);
+        let _ = scheduler.step2_process_blocked(&global_time);
+        assert!(scheduler.run_queue.contains_tid(creator));
+        assert!(scheduler.blocked.signaled_background.is_empty());
+        assert!(scheduler.blocked.rt_sigsuspend_blockers.is_empty());
+        assert_eq!(scheduler.blocked.timed_waiters.iter().count(), 0);
     }
 
     /// A `SIGCHLD` whose delivery the scheduler placed, by committing a parked
