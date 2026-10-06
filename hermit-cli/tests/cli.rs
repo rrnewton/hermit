@@ -101,6 +101,7 @@ static DBT_PRLIMIT_SELF_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_WAIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_EXACT_CHILD_WAITS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static KVM_GETTIMEOFDAY_EFAULT_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static KVM_TASK_IDS_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_UNSUPPORTED_SYSCALL_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_SELF_SIGQUEUE_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static DBT_STDERR_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -792,6 +793,29 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
         assert!(
             output.status.success(),
             "KVM exact-child wait guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+fn kvm_task_ids_guest() -> &'static Path {
+    KVM_TASK_IDS_GUEST.get_or_init(|| {
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kvm_task_ids.c");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-task-ids");
+        fs::create_dir_all(&build_root).expect("failed to create KVM task-ID guest directory");
+        let guest = build_root.join("kvm_task_ids");
+        let output = Command::new("cc")
+            .args(["-O0", "-Wall", "-Wextra", "-Werror", "-pthread"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile KVM task-ID guest");
+        assert!(
+            output.status.success(),
+            "KVM task-ID guest compilation failed:\nstdout:\n{}\nstderr:\n{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr),
         );
@@ -3871,6 +3895,31 @@ fn run_dbt_rejects_unfollowed_execveat() {
         "DBT determinism confirmation missing:\n{}",
         stderr(&output),
     );
+}
+
+/// Hermit numbers KVM guest tasks as its ptrace backend does
+/// (`reverie::task_ids::HERMIT_PTRACE_IDS_PER_TASK`): the same guest sees the
+/// same task IDs under both. Root 3; its first child 5 forks grandchild 7, so
+/// the next fork is 9; thread 11 starts nested thread 13; after exec, forks 15
+/// and 17. Plain Linux numbering would give 4, 5, 6, 7, 8, 9, 10.
+#[test]
+fn run_kvm_numbers_guest_tasks_as_the_ptrace_backend() {
+    if !Path::new("/dev/kvm").exists() {
+        eprintln!("skipping KVM task IDs: /dev/kvm is unavailable");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let program = kvm_task_ids_guest()
+        .to_str()
+        .expect("task-ID guest path should be UTF-8");
+    let expected = "root 3\ngrandchild 7\nfork 5\nfork 9\nthread 11\nnested 13\n\
+                    fork-after-exec 15\nfork-after-exec 17\n";
+    for backend in ["--backend=kvm", "--backend=ptrace"] {
+        let args = [backend, "run", "--strict", "--tmp=/tmp", "--", program];
+        let output = hermit(&args);
+        assert_success(&output, &args);
+        assert_eq!(stdout(&output), expected, "{backend}");
+    }
 }
 
 #[test]
