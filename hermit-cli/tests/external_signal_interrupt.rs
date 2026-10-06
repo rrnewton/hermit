@@ -1217,17 +1217,20 @@ fn ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals() {
 }
 
 /// The waits whose Linux restart keeps the absolute deadline (`poll` with a
-/// positive timeout and a timed `FUTEX_WAIT`) keep it when a SIGTSTP left at
-/// SIG_DFL arrives in an orphaned process group (the guest's `tstp` option).
-/// Linux discards that signal: the process does not stop, no handler runs, and
-/// the kernel restarts the interrupted call with the end time it saved, so
-/// `poll` and a timed `FUTEX_WAIT` return their timeout result at 300 ms.
-/// Detcore leaves these two calls waiting through a default SIGTSTP, SIGTTIN or
-/// SIGTTOU, as hermit main does, instead of ending them: the backend holds such
-/// a signal, and a wait ended for a held signal other than SIGSTOP restarts as
-/// ERESTARTNOHAND, which re-arms the relative timeout. Ending them returned
+/// positive timeout, a timed `FUTEX_WAIT`, and a timed `FUTEX_WAIT_BITSET`, here
+/// glibc's `sem_timedwait`) keep it when a SIGTSTP left at SIG_DFL arrives in an
+/// orphaned process group (the guest's `tstp` option). Linux discards that
+/// signal: the process does not stop, no handler runs, and the kernel restarts
+/// the interrupted call with the end time it saved, so these calls return their
+/// timeout result at 300 ms. Detcore leaves them waiting through a default
+/// SIGTSTP, SIGTTIN or SIGTTOU, as hermit main does for the first two, instead
+/// of ending them: the backend holds such a signal, and a wait ended for a held
+/// signal other than SIGSTOP restarts as ERESTARTNOHAND, which re-arms a
+/// relative timeout and reads an absolute deadline again. Ending them returned
 /// near 400 ms (review of https://github.com/rrnewton/hermit/pull/3361 at
-/// `cbb36408`, finding 4).
+/// `cbb36408`, finding 4). `sem_timedwait` joined this group when its restart
+/// began to keep the deadline it copied (round-10 finding Medium 4); its cell
+/// was in the control test below before, with the same expected result.
 fn assert_discarded_default_stop_leaves_rearming_waits(backend: &str) {
     for sender in ["thread", "process"] {
         for mode in [FutexMode::Precise, FutexMode::Polling] {
@@ -1245,6 +1248,12 @@ fn assert_discarded_default_stop_leaves_rearming_waits(backend: &str) {
             "RESULT call=poll ret=0 errno=none handler=0",
         );
     }
+    assert_quiet_cell(
+        backend,
+        FutexMode::Precise,
+        &["sem", "thread", "tstp"],
+        "RESULT call=sem ret=-1 errno=ETIMEDOUT handler=0",
+    );
 }
 
 #[test]
@@ -1311,12 +1320,11 @@ fn ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_sigchld_flood(
 }
 
 /// Control for the test above: the same discarded SIGTSTP still ends, or
-/// restarts, every other wait as Linux does. glibc `select`, the `select`
-/// system call, and `sem_timedwait` restart with their deadline kept (Detcore
-/// writes the time left back for both selects, and `sem_timedwait` passes an
-/// absolute deadline), so they return their timeout result at 300 ms.
-/// `epoll_wait` is not restarted: Linux returns EINTR when the signal arrives,
-/// although no handler runs.
+/// restarts, every other wait as Linux does. glibc `select` and the `select`
+/// system call restart with their deadline kept (Detcore writes the time left
+/// back for both), so they return their timeout result at 300 ms. `epoll_wait`
+/// is not restarted: Linux returns EINTR when the signal arrives, although no
+/// handler runs. (`sem_timedwait` moved to the test above in round 11.)
 fn assert_discarded_default_stop_is_handled_as_on_linux(backend: &str) {
     for (call, expected) in [
         ("select", "RESULT call=select ret=0 errno=none handler=0"),
@@ -1324,7 +1332,6 @@ fn assert_discarded_default_stop_is_handled_as_on_linux(backend: &str) {
             "rawselect",
             "RESULT call=rawselect ret=0 errno=none handler=0",
         ),
-        ("sem", "RESULT call=sem ret=-1 errno=ETIMEDOUT handler=0"),
     ] {
         assert_quiet_cell(
             backend,
@@ -1378,6 +1385,31 @@ fn assert_stop_and_continue_keep_the_deadline(backend: &str) {
 #[test]
 fn ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_sigstop_and_sigcont() {
     assert_stop_and_continue_keep_the_deadline("ptrace");
+}
+
+/// A timed `FUTEX_WAIT_BITSET` keeps the absolute deadline it copied when the
+/// wait began (the guest's `bitset` call in its `stopcont` mode). The guest's
+/// child moves that deadline 200 ms later in shared memory and then sends
+/// SIGSTOP and SIGCONT. Linux copied the deadline into the restart block, which
+/// `futex_wait_restart` uses, so the move has no effect and the call returns
+/// ETIMEDOUT 300 ms after it began. Detcore used to end this wait with
+/// `ERESTARTNOHAND`, so the kernel ran the call again with its original
+/// arguments, which read the moved deadline (round-10 finding Medium 4 on
+/// https://github.com/rrnewton/hermit/pull/3361).
+fn assert_a_timed_bitset_wait_keeps_its_copied_deadline(backend: &str) {
+    for mode in [FutexMode::Precise, FutexMode::Polling] {
+        assert_quiet_cell(
+            backend,
+            mode,
+            &["bitset", "stopcont"],
+            "RESULT call=bitset ret=-1 errno=ETIMEDOUT handler=0",
+        );
+    }
+}
+
+#[test]
+fn ptrace_a_timed_futex_wait_bitset_keeps_its_copied_deadline_through_sigstop_and_sigcont() {
+    assert_a_timed_bitset_wait_keeps_its_copied_deadline("ptrace");
 }
 
 /// The wait that resumes after SIGCONT is still a wait a caught signal ends:

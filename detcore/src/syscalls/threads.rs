@@ -847,7 +847,7 @@ impl KernelSignalState {
     ///
     /// A wait sets it when Linux's restart of the call keeps its deadline
     /// (`NonblockableSyscall::restart_keeps_deadline`): a `poll` with a positive
-    /// timeout, and a timed `FUTEX_WAIT`. Detcore keeps that deadline for the
+    /// timeout, and a timed futex wait. Detcore keeps that deadline for the
     /// kernel's restart only when the wait ends with `ERESTART_RESTARTBLOCK`, which
     /// a stop signal the backend holds does not (`held_signal_restart_errno`), so
     /// ending such a wait for a default stop that Linux discards in an orphaned
@@ -1226,7 +1226,7 @@ fn absolute_timeout_uses_host_clock(
 pub(crate) enum FutexDeadline {
     /// The call's own timeout.
     FromCall,
-    /// The deadline an interrupted `FUTEX_WAIT` kept for the kernel's restart
+    /// The deadline an interrupted timed futex wait kept for the kernel's restart
     /// (`RestartBlock`).
     Restart(Option<LogicalTime>),
 }
@@ -1697,7 +1697,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// `handle_futex`, taking a wait's deadline from `deadline`. A `restart_syscall`
-    /// resumes an interrupted `FUTEX_WAIT` here with the deadline the wait kept,
+    /// resumes an interrupted timed futex wait here with the deadline it kept,
     /// and the value is compared again, as in Linux's `futex_wait_restart`
     /// (`Detcore::handle_restart_syscall`).
     pub(crate) async fn handle_futex_from<G: Guest<Self>>(
@@ -1884,7 +1884,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                                 Ok(state) => state,
                                 Err(error) => break Err(error),
                             };
-                            // A timed `FUTEX_WAIT` lets a default job-control stop
+                            // A timed futex wait lets a default job-control stop
                             // wait for its deadline (`KernelSignalState::interrupting_wait`).
                             let defers_default_stops = call.restart_keeps_deadline();
                             let held =
