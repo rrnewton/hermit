@@ -138,13 +138,15 @@ def note(event):
     with open(log, "a") as f:
         f.write(f"{event} {label} {time.monotonic():.3f} {target_dir}\n")
 # A child that records the SIGTERM it gets, so a test can tell a group-wide SIGTERM from
-# a later SIGKILL.
+# a later SIGKILL. It reports "ready" only once its handler is installed: a SIGTERM that
+# arrives before then kills it silently, which reads as no SIGTERM at all.
 CHILD = '''import signal, sys, time
 def term(*_):
     with open(sys.argv[1], "a") as f:
         f.write(f"child-term {sys.argv[2]} {time.monotonic():.3f} -\\n")
     sys.exit(143)
 signal.signal(signal.SIGTERM, term)
+print("ready", flush=True)
 time.sleep(30)
 '''
 def killed(*_):
@@ -153,20 +155,26 @@ def killed(*_):
 # Like cargo, SIGTERM stops only this process: a child it started (rustc, a build
 # script) keeps running unless its whole process group is signalled.
 signal.signal(signal.SIGTERM, killed)
+if os.environ.get("FAKE_CARGO_CHILDREN"):
+    # The child is started, and its SIGTERM handler installed, before the build notes
+    # "start", so a build that has started has a child able to record a SIGTERM.
+    child = subprocess.Popen([sys.executable, "-c", CHILD, log, label], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    if child.stdout.readline() != b"ready\n":
+        note("child-not-ready")
+        sys.exit(98)
+    with open(os.environ["FAKE_CARGO_CHILDREN"], "a") as f:
+        f.write(f"{label} {child.pid}\n")
 note("start")
 with open(log, "a") as f:
     f.write(f"argv {label} {json.dumps(args)}\n")
-if os.environ.get("FAKE_CARGO_CHILDREN"):
-    child = subprocess.Popen([sys.executable, "-c", CHILD, log, label], stdin=subprocess.DEVNULL,
-                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    with open(os.environ["FAKE_CARGO_CHILDREN"], "a") as f:
-        f.write(f"{label} {child.pid}\n")
 print(f"fake cargo {label} output", file=sys.stderr)
 if os.environ.get("FAKE_CARGO_FAIL") == label:
-    # Fail only once the named build has started, so the test sees it running.
-    waited_for = os.environ.get("FAKE_CARGO_FAIL_AFTER_START")
+    # Fail only once every named build (comma-separated) has started, so the test sees
+    # each one running.
+    waited_for = [name for name in os.environ.get("FAKE_CARGO_FAIL_AFTER_START", "").split(",") if name]
     deadline = time.monotonic() + 20
-    while waited_for and f"start {waited_for} " not in open(log).read():
+    while not all(f"start {name} " in open(log).read() for name in waited_for):
         if time.monotonic() > deadline:
             note("never-started")
             sys.exit(99)
@@ -302,7 +310,7 @@ class StageCargoOverlapTest(unittest.TestCase):
 
     def test_a_failed_validate_build_stops_both_running_background_builds(self) -> None:
         children = self.tmp / "children"
-        proc = self.run_stage(FAKE_CARGO_FAIL="detcore-dbt", FAKE_CARGO_FAIL_AFTER_START="hermit",
+        proc = self.run_stage(FAKE_CARGO_FAIL="detcore-dbt", FAKE_CARGO_FAIL_AFTER_START="hermit,release",
                               FAKE_CARGO_SECONDS_release="30", FAKE_CARGO_SECONDS_hermit="30",
                               FAKE_CARGO_CHILDREN=str(children))
         self.assertEqual(proc.returncode, 3, proc.stderr)
