@@ -261,7 +261,13 @@ impl Scheduler {
     ///   state exists, and the backend observes dequeues only within that
     ///   bound, so a control taken outside it would never see the dequeues it
     ///   orders. The contradiction is refused, never resolved silently either
-    ///   way.
+    ///   way;
+    /// - one from a backend whose process exits complete asynchronously
+    ///   (`process_exits_complete_asynchronously`). The controlled turn loop
+    ///   releases the scheduler mutex between its phases, so an exit barrier
+    ///   installed between them would escape the hold in `step2_drain_prefix`.
+    ///   No backend reports both today; the combination is refused rather
+    ///   than run.
     pub(crate) fn install_signal_control(
         &mut self,
         control: Option<BackendSignalControl>,
@@ -274,6 +280,7 @@ impl Scheduler {
             return Ok(BackendSignalControlMode::Unchanged);
         }
         if !self.backend.provides_process_signal_control
+            || self.backend.process_exits_complete_asynchronously
             || self.parked.control.is_some()
             || !self.next_turns.is_empty()
             || self.turn != 0

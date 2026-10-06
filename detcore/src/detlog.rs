@@ -613,6 +613,49 @@ struct ForwardedSource {
 
 static FORWARDED_SOURCE: Mutex<Option<ForwardedSource>> = Mutex::new(None);
 
+/// The first determinism loss recorded in this process, never cleared: a run
+/// that recorded one must not be compared, whatever reached its log (see
+/// [`determinism_loss`]).
+static DETERMINISM_LOSS: Mutex<Option<String>> = Mutex::new(None);
+
+/// Records that this run's records can no longer be trusted to compare: a
+/// record was lost, or an event happened at a moment the host chose. The first
+/// reason is kept. Verification refuses to compare a run whose
+/// [`determinism_loss`] is set, independently of whether the corresponding
+/// loss notice reached the log.
+pub fn record_determinism_loss(reason: &str) {
+    let mut loss = DETERMINISM_LOSS.lock().unwrap();
+    if loss.is_none() {
+        *loss = Some(reason.to_owned());
+    }
+}
+
+/// The first determinism loss [`record_determinism_loss`] recorded in this
+/// process, if any.
+pub fn determinism_loss() -> Option<String> {
+    DETERMINISM_LOSS.lock().unwrap().clone()
+}
+
+/// Writes a [`FORWARDING_LOSS_NOTICE`] line with `reason` through the
+/// registered forwarding sink, the unfiltered raw path, and records the
+/// determinism loss. Without a registered source the loss is still recorded.
+pub fn write_loss_notice(reason: &str) {
+    let line = format!("{FORWARDING_LOSS_NOTICE} 0 0 {reason}\n");
+    record_determinism_loss(reason);
+    if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
+        (source.sink)(line.as_bytes());
+    }
+}
+
+/// Writes one forwarded record through `source`'s sink, recording a
+/// determinism loss when the record is a loss notice.
+fn emit(source: &mut ForwardedSource, record: &[u8]) {
+    if record.starts_with(FORWARDING_LOSS_NOTICE.as_bytes()) {
+        record_determinism_loss(&String::from_utf8_lossy(record));
+    }
+    (source.sink)(record);
+}
+
 /// Registers the receiving end of the socket an in-guest Tool sends its records on
 /// ([`send_forwarded_record`]) and the sink that writes them to the run's log.
 ///
@@ -709,7 +752,7 @@ pub fn drain_forwarded_at_request(tid: i32) {
 
 fn write_records(source: &mut ForwardedSource, records: Vec<Vec<u8>>) {
     for record in records {
-        (source.sink)(&record);
+        emit(source, &record);
     }
 }
 
@@ -754,7 +797,7 @@ fn collect_forwarded(source: &mut ForwardedSource) {
             Some((tid, record)) => source.order.queue(tid, record.to_vec()),
             None => {
                 for record in source.order.untagged(message) {
-                    (source.sink)(&record);
+                    emit(source, &record);
                 }
             }
         }
@@ -1020,6 +1063,18 @@ mod tests {
             text(order.untagged(b"INFO detcore: DETLOG legacy-2\n")),
             ["INFO detcore: DETLOG legacy-2\n"]
         );
+    }
+
+    #[test]
+    fn a_loss_notice_records_the_determinism_loss_latch() {
+        // The latch is the verification safeguard, independent of whether the
+        // notice line reaches a log: it is set even with no registered source.
+        super::write_loss_notice("test: an unscheduled exit");
+        let loss = super::determinism_loss().expect("the latch must be set");
+        assert!(!loss.is_empty());
+        // It keeps the first reason and is never cleared by later ones.
+        super::record_determinism_loss("test: a later reason");
+        assert_eq!(super::determinism_loss(), Some(loss));
     }
 
     #[test]

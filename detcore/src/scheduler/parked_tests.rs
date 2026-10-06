@@ -228,6 +228,24 @@ fn fixture_with_control(installed: bool) -> (Scheduler, Arc<Backend>) {
     assert_eq!(s.signal_control_installed(), installed);
     (s, backend)
 }
+#[test]
+fn async_exit_completion_refuses_signal_control() {
+    // The controlled turn loop releases the scheduler mutex between phases,
+    // which would let an exit barrier escape the asynchronous-exit hold; a
+    // backend reporting both capabilities is refused rather than run.
+    let config = Config::default().with_backend(|backend| {
+        backend.provides_process_signal_control = true;
+        backend.process_exits_complete_asynchronously = true;
+    });
+    let mut s = Scheduler::new(&config);
+    let backend = Arc::new(Backend::default());
+    assert!(
+        s.install_signal_control(Some(BackendSignalControl { process: backend }), true)
+            .is_err()
+    );
+    assert!(!s.signal_control_installed());
+}
+
 fn add(s: &mut Scheduler, pid: i32, tid: i32) -> (DetTid, MmId, reverie::CallbackSignalSite) {
     add_with_mm(s, pid, tid, MmId::initial(DetTid::from_raw(pid)))
 }

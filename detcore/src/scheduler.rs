@@ -574,6 +574,13 @@ pub struct Scheduler {
     /// when Linux reused a TID retired by an earlier transferred exec.
     vfork_registration_origins: BTreeMap<DetTid, MmId>,
 
+    /// Vfork parents that died, without an Exit grant, before their child
+    /// registered: the barrier is cancelled so no other turn is excluded, but
+    /// the child's still-outstanding `CreateVforkChildThread` must settle
+    /// against this record instead of the barrier (asynchronous exit
+    /// completion only; see [`Scheduler::consume_unreported_exit`]).
+    dead_vfork_parents: BTreeSet<DetTid>,
+
     /// Threads whose run-queue admission was recorded by a global-request
     /// handler while a `tentative_pop` transaction was live, deferred to the
     /// next deterministic drain point (`step2`) so it cannot mutate the run
@@ -1758,6 +1765,7 @@ impl Scheduler {
             blocked: Default::default(),
             vfork_barriers: Default::default(),
             vfork_registration_origins: Default::default(),
+            dead_vfork_parents: Default::default(),
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
@@ -2646,7 +2654,17 @@ impl Scheduler {
     /// Install a barrier between SaBRe's logical process-leader exit hook and the final ptrace
     /// wait status. Other backends retain their existing lifecycle behavior.
     pub(crate) fn begin_physical_process_exit(&mut self, detpid: DetPid) -> bool {
-        if self.backend.reports_physical_process_exits {
+        if self.backend.process_exits_complete_asynchronously
+            && self.completed_physical_process_exits.contains(&detpid)
+        {
+            // Monotone lifetime: an exit the backend already reported complete
+            // (before its grant, or before a late deregistration) never
+            // becomes pending again.
+            return false;
+        }
+        if self.backend.reports_physical_process_exits
+            || self.backend.process_exits_complete_asynchronously
+        {
             self.completed_physical_process_exits.remove(&detpid);
             let inserted = self.pending_physical_process_exits.insert(detpid);
             if inserted {
@@ -2668,8 +2686,85 @@ impl Scheduler {
         if removed {
             self.completed_physical_process_exits.insert(detpid);
             self.wake_physical_child_waiters(detpid);
+        } else if self.backend.process_exits_complete_asynchronously {
+            // A completion that arrives before any grant (or after a death
+            // without one) is kept, so a later begin is a no-op.
+            self.completed_physical_process_exits.insert(detpid);
         }
         removed
+    }
+
+    /// The processes held between their exit grant and their physical exit,
+    /// when exits complete asynchronously; otherwise none.
+    pub(crate) fn pending_async_process_exits(&self) -> Vec<DetPid> {
+        if !self.backend.process_exits_complete_asynchronously {
+            return Vec::new();
+        }
+        self.pending_physical_process_exits
+            .iter()
+            .copied()
+            .collect()
+    }
+
+    /// Whether the backend has reported `detpid` physically gone.
+    pub(crate) fn process_physically_gone(&self, detpid: DetPid) -> bool {
+        self.completed_physical_process_exits.contains(&detpid)
+    }
+
+    /// Begin the asynchronous-exit barrier for `process` at its Exit grant.
+    /// The hold in `step2_drain_prefix` selects no further turn while any exit
+    /// is pending, so a second grant cannot happen first: at most one process
+    /// is ever pending.
+    fn begin_exit_at_grant(&mut self, process: DetPid) {
+        assert!(
+            self.pending_physical_process_exits
+                .iter()
+                .all(|pending| *pending == process),
+            "asynchronous exit completion: process {process} was granted an exit while {:?} is \
+             still pending; the hold must allow at most one",
+            self.pending_physical_process_exits
+        );
+        if self.begin_physical_process_exit(process) {
+            trace!(
+                "[detcore, dpid {}] holding turn selection until the exit completes",
+                process
+            );
+        }
+    }
+
+    /// Retire, at its completion, every registration of `detpid` that the
+    /// process did not deregister itself: it died without finishing its exit
+    /// hook (without an Exit grant, or between its grant and its
+    /// `DeregisterThread`), at a moment the host chose. Returns whether anything
+    /// was consumed; the caller then records determinism loss.
+    ///
+    /// A dead vfork parent's barrier is cancelled so no other turn stays
+    /// excluded. If its child has not registered yet, a tombstone lets the
+    /// child's outstanding registration settle without the barrier.
+    pub(crate) fn consume_unreported_exit(&mut self, detpid: DetPid) -> bool {
+        let unreported: Vec<DetTid> = self
+            .thread_tree
+            .my_thread_group(&detpid)
+            .into_iter()
+            .filter(|tid| {
+                self.next_turns.contains_key(tid) && !self.deregistration_accounted.contains(tid)
+            })
+            .collect();
+        for tid in &unreported {
+            // A late DeregisterThread from the same incarnation, if one was
+            // still in flight, is then acknowledged as already accounted.
+            self.deregistration_accounted.insert(*tid);
+            if self.vfork_barriers.remove(tid) == Some(None) {
+                self.dead_vfork_parents.insert(*tid);
+            }
+            let mm = self
+                .physical_thread_pidfds
+                .get(tid)
+                .map(|(mm, ..)| *mm)
+                .unwrap_or(MmId::initial(*tid));
+            self.logically_kill_thread(tid, &detpid, mm);
+        }
+        !unreported.is_empty()
     }
 
     /// Release every physical-exit barrier after the backend supervisor has drained all tracees.
@@ -2918,6 +3013,16 @@ impl Scheduler {
         self.drain_pending_run_queue_removals();
         self.drain_pending_cross_task_signals();
         self.drain_pending_run_queue_admissions();
+        if self.backend.process_exits_complete_asynchronously
+            && !self.pending_physical_process_exits.is_empty()
+        {
+            // A granted exit has not completed physically yet: the exiting
+            // process may still hold descriptors a peer would observe. Select
+            // no turn until the backend reports it gone; the completion's host
+            // timing decides only how long this lasts, never which turn is next.
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
         if self
             .blocked
             .physical_child_waiters
@@ -4542,6 +4647,20 @@ impl Scheduler {
                         return Err(SkipTurn);
                     }
                 };
+                // An exit that ends its process leaves the host some time after
+                // this grant. Hold turn selection from here until the backend
+                // reports the process physically gone (asynchronous exit
+                // completion), so no peer observes its descriptors still open.
+                if self.backend.process_exits_complete_asynchronously
+                    && (*group
+                        || !self
+                            .thread_tree
+                            .my_thread_group(process)
+                            .into_iter()
+                            .any(|tid| tid != dettid && self.next_turns.contains_key(&tid)))
+                {
+                    self.begin_exit_at_grant(*process);
+                }
                 if reserve_mode == signal_control::ExitReserveMode::Uncontrolled
                     && *group
                     && let Some(parent) = self.thread_tree.parent_process(process)
@@ -4601,6 +4720,12 @@ impl Scheduler {
 
     // TODO-HUMAN-REVIEW(PR-868): Review the vfork registration scheduler barrier.
     pub(crate) fn complete_vfork_registration(&mut self, parent: DetTid, child: DetTid) {
+        if self.dead_vfork_parents.remove(&parent) {
+            // The parent died before this registration; its barrier is already
+            // cancelled. The child registers as any orphan does.
+            self.vfork_registration_origins.remove(&parent);
+            return;
+        }
         let registered_child = self
             .vfork_barriers
             .get_mut(&parent)
@@ -8180,6 +8305,151 @@ mod test {
                 SigWrapper::from(Signal::SIGUSR2)
             ]
         );
+    }
+
+    /// A scheduler for a backend whose process exits complete asynchronously
+    /// (in-guest LiteInst), with killed-thread RPC cancellation as that backend
+    /// has it.
+    fn async_exit_scheduler() -> Scheduler {
+        let config = Config::default().with_backend(|backend| {
+            backend.process_exits_complete_asynchronously = true;
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
+        Scheduler::new(&config)
+    }
+
+    /// Registers single-threaded process `tid` with an empty pending request.
+    fn register_process(scheduler: &mut Scheduler, tid: DetTid) {
+        scheduler.thread_tree.add_child(tid, tid, true);
+        scheduler.next_turns.insert(
+            tid,
+            ThreadNextTurn {
+                dettid: tid,
+                child_tid_addr: 0,
+                req: Ivar::new(),
+                resp: Ivar::new(),
+                protocol: Default::default(),
+            },
+        );
+    }
+
+    #[test]
+    fn async_exit_holds_selection_from_the_grant_until_completion() {
+        let mut scheduler = async_exit_scheduler();
+        let process = DetPid::from_raw(100);
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        scheduler.begin_exit_at_grant(process);
+        assert_eq!(
+            scheduler.pending_physical_process_exits,
+            BTreeSet::from([process])
+        );
+        // What the backend's watchdog reads.
+        assert_eq!(scheduler.pending_async_process_exits(), [process]);
+        // Every pass skips while the exit is pending, however many there are.
+        for _ in 0..3 {
+            assert!(scheduler.step2_drain_prefix().is_err());
+        }
+        assert!(scheduler.complete_physical_process_exit(process));
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(scheduler.process_physically_gone(process));
+        assert!(scheduler.pending_async_process_exits().is_empty());
+    }
+
+    #[test]
+    fn without_async_exit_completion_the_grant_holds_nothing() {
+        let config = Config::default();
+        let mut scheduler = Scheduler::new(&config);
+        let process = DetPid::from_raw(100);
+        assert!(!scheduler.begin_physical_process_exit(process));
+        assert!(scheduler.pending_physical_process_exits.is_empty());
+        assert!(scheduler.step2_drain_prefix().is_ok());
+        assert!(!scheduler.complete_physical_process_exit(process));
+        assert!(!scheduler.process_physically_gone(process));
+    }
+
+    #[test]
+    fn async_exit_lifetime_is_monotone() {
+        // A completion that arrives first is kept, and a later begin, from the
+        // grant or from a late deregistration, is a no-op.
+        let mut scheduler = async_exit_scheduler();
+        let process = DetPid::from_raw(100);
+        assert!(!scheduler.complete_physical_process_exit(process));
+        assert!(scheduler.process_physically_gone(process));
+        scheduler.begin_exit_at_grant(process);
+        assert!(!scheduler.begin_physical_process_exit(process));
+        assert!(scheduler.pending_physical_process_exits.is_empty());
+        assert!(scheduler.step2_drain_prefix().is_ok());
+
+        // After a grant and its completion, a late begin is a no-op too.
+        let other = DetPid::from_raw(200);
+        scheduler.begin_exit_at_grant(other);
+        assert!(scheduler.complete_physical_process_exit(other));
+        assert!(!scheduler.begin_physical_process_exit(other));
+        assert!(scheduler.pending_physical_process_exits.is_empty());
+    }
+
+    #[test]
+    #[should_panic(expected = "the hold must allow at most one")]
+    fn a_second_exit_grant_while_one_is_pending_is_an_invariant_violation() {
+        let mut scheduler = async_exit_scheduler();
+        scheduler.begin_exit_at_grant(DetPid::from_raw(100));
+        scheduler.begin_exit_at_grant(DetPid::from_raw(200));
+    }
+
+    #[test]
+    fn completion_consumes_only_registrations_the_process_did_not_deregister() {
+        let mut scheduler = async_exit_scheduler();
+        let dead = DetTid::from_raw(100);
+        let deregistered = DetTid::from_raw(200);
+        register_process(&mut scheduler, dead);
+        register_process(&mut scheduler, deregistered);
+        // `deregistered` finished its exit hook before exiting.
+        assert!(scheduler.note_deregistration_accounted(deregistered));
+        scheduler.logically_kill_thread(&deregistered, &deregistered, MmId::initial(deregistered));
+
+        assert!(!scheduler.consume_unreported_exit(deregistered));
+        assert!(scheduler.consume_unreported_exit(dead));
+        assert!(!scheduler.next_turns.contains_key(&dead));
+        // A late DeregisterThread for the consumed thread is already accounted.
+        assert!(!scheduler.note_deregistration_accounted(dead));
+        // Consuming twice is a no-op.
+        assert!(!scheduler.consume_unreported_exit(dead));
+    }
+
+    #[test]
+    fn a_dead_vfork_parent_cancels_its_barrier_and_settles_a_late_child() {
+        let mut scheduler = async_exit_scheduler();
+        let parent = DetTid::from_raw(100);
+        let child = DetTid::from_raw(101);
+        register_process(&mut scheduler, parent);
+        // The parent is in vfork; its child has not registered yet.
+        scheduler.vfork_barriers.insert(parent, None);
+        assert!(scheduler.consume_unreported_exit(parent));
+        assert!(!scheduler.vfork_barriers.contains_key(&parent));
+        // The child's outstanding registration settles without a barrier,
+        // without panicking.
+        scheduler.complete_vfork_registration(parent, child);
+        assert!(!scheduler.vfork_barriers.contains_key(&parent));
+        assert!(!scheduler.dead_vfork_parents.contains(&parent));
+    }
+
+    #[test]
+    fn a_dead_vfork_parent_with_an_admitted_child_only_cancels_its_barrier() {
+        let mut scheduler = async_exit_scheduler();
+        let parent = DetTid::from_raw(100);
+        let child = DetTid::from_raw(101);
+        register_process(&mut scheduler, parent);
+        scheduler.vfork_barriers.insert(parent, Some(child));
+        assert!(scheduler.consume_unreported_exit(parent));
+        assert!(!scheduler.vfork_barriers.contains_key(&parent));
+        assert!(!scheduler.dead_vfork_parents.contains(&parent));
+    }
+
+    #[test]
+    #[should_panic(expected = "vfork child registered without a pending parent")]
+    fn a_vfork_registration_without_barrier_or_tombstone_is_still_an_invariant_violation() {
+        let mut scheduler = async_exit_scheduler();
+        scheduler.complete_vfork_registration(DetTid::from_raw(100), DetTid::from_raw(101));
     }
 
     #[test]

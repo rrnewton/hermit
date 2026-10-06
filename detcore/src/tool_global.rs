@@ -865,9 +865,14 @@ impl GlobalState {
 
     /// Reports that a backend supervisor received a process's final kernel exit status.
     ///
-    /// This only records a barrier observation when the backend advertises physical-exit
-    /// reporting; it is therefore a no-op for ptrace, DBT, KVM, and LiteInst execution. The
-    /// exact process's barrier is released at this physical-waitability boundary.
+    /// This records a barrier observation when the backend advertises physical-exit
+    /// reporting or asynchronous exit completion; it is a no-op for ptrace, DBT and KVM.
+    /// The exact process's barrier is released at this physical-waitability boundary.
+    ///
+    /// With asynchronous exit completion, registrations the process did not deregister
+    /// itself are retired here first, in the same locked step, and a determinism loss is
+    /// recorded: such a process died without finishing its exit hook, at a moment the host
+    /// chose, so the run must not be compared.
     pub fn complete_physical_process_exit(&self, raw_pid: i32) {
         let detpid = DetPid::from_raw(raw_pid);
         self.pending_exec_states.lock().unwrap().remove(&detpid);
@@ -876,16 +881,22 @@ impl GlobalState {
             .unwrap()
             .remove(&detpid);
         self.post_exec_fd_blocking.lock().unwrap().remove(&detpid);
-        if self
-            .sched
-            .lock()
-            .unwrap()
-            .complete_physical_process_exit(detpid)
-        {
+        let (completed, consumed) = {
+            let mut sched = self.sched.lock().unwrap();
+            let consumed = self.cfg.backend.process_exits_complete_asynchronously
+                && sched.consume_unreported_exit(detpid);
+            (sched.complete_physical_process_exit(detpid), consumed)
+        };
+        if completed {
             trace!(
                 "[detcore, dpid {}] backend completed final physical process exit",
                 detpid
             );
+        }
+        if consumed {
+            crate::detlog::write_loss_notice(&format!(
+                "process {detpid} exited without deregistering; its exit was not scheduled"
+            ));
         }
     }
 
@@ -1186,6 +1197,24 @@ impl GlobalTool for GlobalState {
             let _ = wake.send(());
         }
         result
+    }
+
+    /// A backend whose process exits complete asynchronously reports each
+    /// physical exit here; see [`GlobalState::complete_physical_process_exit`].
+    fn on_backend_process_exited(&self, pid: i32) {
+        self.complete_physical_process_exit(pid);
+    }
+
+    /// The processes held between their exit grant and their physical exit,
+    /// for the backend's watchdog.
+    fn backend_pending_process_exits(&self) -> Vec<i32> {
+        self.sched
+            .lock()
+            .unwrap()
+            .pending_async_process_exits()
+            .into_iter()
+            .map(|detpid| detpid.as_raw())
+            .collect()
     }
 
     fn report_backend_failure(&self, event: reverie::BackendFailure) {
@@ -2318,6 +2347,26 @@ impl GlobalState {
             {
                 return SchedulerRpcResult::ThreadExited;
             }
+            // A process the backend already reported physically gone must not
+            // be admitted: the scheduler would wait for a request it can never
+            // send. A forked child is its own process.
+            let child_detpid =
+                if flags.is_some_and(|flags| flags.contains(CloneFlags::CLONE_THREAD)) {
+                    parent_detpid
+                } else {
+                    DetPid::from_raw(child_dettid.as_raw())
+                };
+            if self.cfg.backend.process_exits_complete_asynchronously
+                && sched.process_physically_gone(child_detpid)
+            {
+                drop(sched);
+                self.report_backend_failure(reverie::BackendFailure {
+                    pid: reverie::Pid::from_raw(child_detpid.as_raw()),
+                    tid: Tid::from_raw(child_dettid.as_raw()),
+                    phase: "a process was already physically gone when it was registered",
+                });
+                return SchedulerRpcResult::ThreadExited;
+            }
 
             if parent_is_kernel_blocked && self.cfg.sequentialize_threads {
                 sched.complete_vfork_registration(parent_dettid, child_dettid);
@@ -2483,6 +2532,17 @@ impl GlobalState {
             if sched.thread_is_logically_killed(dettid)
                 || !sched.rpc_incarnation_matches(dettid, request_mm)
             {
+                return SchedulerRpcResult::ThreadExited;
+            }
+            if self.cfg.backend.process_exits_complete_asynchronously
+                && sched.process_physically_gone(detpid)
+            {
+                drop(sched);
+                self.report_backend_failure(reverie::BackendFailure {
+                    pid: reverie::Pid::from_raw(detpid.as_raw()),
+                    tid: Tid::from_raw(dettid.as_raw()),
+                    phase: "a process was already physically gone when it started",
+                });
                 return SchedulerRpcResult::ThreadExited;
             }
             if self.cfg.backend.requires_thread_directed_process_signals && physical_ids.is_none() {
@@ -5157,6 +5217,41 @@ mod tests {
         assert_eq!(pool.determinize(0, None), Some(0));
         assert_eq!(pool.determinize(20, None), Some(1));
         assert_eq!(pool.determinize(0, None), Some(0));
+    }
+
+    #[test]
+    fn completing_an_unreported_exit_retires_it_and_records_determinism_loss() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.process_exits_complete_asynchronously = true;
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
+        let state = GlobalState::initialize(&config, false);
+        let dettid = DetTid::from_raw(41);
+        {
+            let mut sched = state.sched.lock().unwrap();
+            sched.thread_tree.add_child(dettid, dettid, true);
+            sched.next_turns.insert(
+                dettid,
+                crate::scheduler::ThreadNextTurn {
+                    dettid,
+                    child_tid_addr: 0,
+                    req: Ivar::new(),
+                    resp: Ivar::new(),
+                    protocol: Default::default(),
+                },
+            );
+        }
+        // The process died without deregistering (no exit hook ran).
+        state.complete_physical_process_exit(41);
+        let sched = state.sched.lock().unwrap();
+        assert!(!sched.next_turns.contains_key(&dettid));
+        assert!(sched.process_physically_gone(DetPid::from_raw(41)));
+        drop(sched);
+        assert!(crate::detlog::determinism_loss().is_some());
     }
 
     #[test]

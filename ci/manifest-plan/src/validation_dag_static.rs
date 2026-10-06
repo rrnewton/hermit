@@ -1162,7 +1162,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // procfs::tests::proc_modules_does_not_depend_on_the_host_module_set
     // (https://github.com/rrnewton/hermit/issues/3815) retains all 975 (976,
     // measured with cargo nextest list).
-    ("test.detcore_unit", 976),
+    // Eleven C3.5 exit-hold tests (scheduler and tool_global) retain all 976: 987.
+    ("test.detcore_unit", 987),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1552,7 +1553,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3686 logdiff test: 970 + 1 = 971.
     // The same four signal-control tests retain all 971: 975.
     // And the host-independent /proc/modules test (976).
-    ("test.detcore_unit_on_host", 976),
+    // The host twin selects the same eleven exit-hold tests: 987.
+    ("test.detcore_unit_on_host", 987),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
