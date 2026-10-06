@@ -10,7 +10,8 @@
  *
  * usage: external_signal_interrupt <futex|select|rawselect|poll|epoll|wait4|waitid>
  *            <external|process|thread|timer|exit> [restart] [timed]
- *            [ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign]
+ *            [ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign|
+ *             chldkill|chldthrexit]
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
  * select system call itself.
@@ -39,7 +40,7 @@
  * timeout, the sender does not wake the futex, and an ELAPSED line reports the
  * CLOCK_MONOTONIC time the call took, so the wait must run to its deadline.
  *
- * The next four options change a disposition while the waiter is already
+ * The next six options change a disposition while the waiter is already
  * parked; they need the `thread` sender. The sibling thread blocks SIGUSR1 and
  * SIGCHLD, so only the waiter can take the signal, and after 100 ms it:
  *   ign2caught: installs the SIGUSR1 handler over SIG_IGN, then pthread_kill.
@@ -48,13 +49,20 @@
  *               that exits at once.
  *   chldign:    resets a caught SIGCHLD to SIG_DFL (ignored by default), then
  *               forks a child that exits at once.
- * ign2caught and chldlate must end the wait with EINTR near 100 ms; the
- * sibling wakes the futex (and writes the pipe) only after the handler ran.
+ *   chldkill:   as chldlate, but the child dies by sending itself SIGKILL.
+ *   chldthrexit: as chldlate, but the child's only thread calls the exit
+ *               system call rather than exit_group.
+ * chldkill and chldthrexit end the child without exit_group, so Hermit's
+ * scheduler sends no child-exit SIGCHLD of its own: the only SIGCHLD is the
+ * kernel's, which the scheduler makes eligible at the child's logical death.
+ * ign2caught, chldlate, chldkill and chldthrexit must end the wait with EINTR
+ * near 100 ms; the sibling wakes the futex (and writes the pipe) only after
+ * the handler ran.
  * caught2ign and chldign must not end it: a `timed` wait then returns at its
  * original 300 ms deadline, and an untimed one is ended by the sibling's
  * FUTEX_WAKE (or pipe write) 200 ms after the signal.
  *
- * `exit` and these four options also print the ELAPSED line.
+ * `exit` and these six options also print the ELAPSED line.
  *
  * Output is one deterministic RESULT line after the call returns, followed
  * by DONE once every helper has been reaped. */
@@ -83,7 +91,7 @@ static pthread_t main_thread;
 static int sent_signal = SIGUSR1;
 static int quiet = 0;
 /* A disposition change while the waiter is parked (see the usage comment). */
-enum flip { FLIP_NONE, IGN2CAUGHT, CAUGHT2IGN, CHLDLATE, CHLDIGN };
+enum flip { FLIP_NONE, IGN2CAUGHT, CAUGHT2IGN, CHLDLATE, CHLDIGN, CHLDKILL, CHLDTHREXIT };
 static enum flip flip = FLIP_NONE;
 static int flip_timed = 0;
 /* Write end of the pipe a readiness call waits on. */
@@ -141,6 +149,18 @@ static void wait_for_handler(void) {
   }
 }
 
+/* Whether the flip makes the signal caught, so it must end the wait. */
+static int flip_catches(void) {
+  return flip == IGN2CAUGHT || flip == CHLDLATE || flip == CHLDKILL || flip == CHLDTHREXIT;
+}
+
+/* The child of the SIGCHLD options, which never returns. */
+static void flip_child(void) {
+  if (flip == CHLDKILL) syscall(SYS_kill, syscall(SYS_getpid), SIGKILL);
+  if (flip == CHLDTHREXIT) syscall(SYS_exit, 0);
+  _exit(0);
+}
+
 /* The sibling for the disposition-change options. */
 static void flip_sender(void) {
   pid_t child = -1;
@@ -155,15 +175,17 @@ static void flip_sender(void) {
       break;
     case CHLDLATE:
     case CHLDIGN:
-      set_handler(SIGCHLD, flip == CHLDLATE ? on_usr1 : SIG_DFL);
+    case CHLDKILL:
+    case CHLDTHREXIT:
+      set_handler(SIGCHLD, flip == CHLDIGN ? SIG_DFL : on_usr1);
       child = fork();
       if (child < 0) _exit(96);
-      if (child == 0) _exit(0);
+      if (child == 0) flip_child();
       break;
     case FLIP_NONE:
       _exit(97);
   }
-  if (flip == IGN2CAUGHT || flip == CHLDLATE) {
+  if (flip_catches()) {
     /* Wake only after the handler ran, so a wait the signal did not end is
      * not rescued by this wake. */
     wait_for_handler();
@@ -214,7 +236,7 @@ int main(int argc, char **argv) {
   if (argc < 3) {
     say("usage: external_signal_interrupt <futex|select|rawselect|poll|epoll|wait4|waitid> "
         "<external|process|thread|timer|exit> [restart] [timed] "
-        "[ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign]\n");
+        "[ignored|blocked|winch|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit]\n");
     return 2;
   }
   const char *call = argv[1];
@@ -232,6 +254,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "caught2ign")) flip = CAUGHT2IGN;
     else if (!strcmp(argv[i], "chldlate")) flip = CHLDLATE;
     else if (!strcmp(argv[i], "chldign")) flip = CHLDIGN;
+    else if (!strcmp(argv[i], "chldkill")) flip = CHLDKILL;
+    else if (!strcmp(argv[i], "chldthrexit")) flip = CHLDTHREXIT;
     else return 2;
   }
   if (ignored + blocked + (sent_signal == SIGWINCH) + (flip != FLIP_NONE) > 1) return 2;
