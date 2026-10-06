@@ -852,6 +852,60 @@ impl KernelSignalState {
     ) -> KernelSigset {
         self.pending & self.interrupting_wait(mask, defers_default_stops)
     }
+
+    /// The signal the kernel dequeues next for this thread while `mask` is
+    /// blocked, and the queue it comes from, or `None` if no unblocked signal is
+    /// pending.
+    ///
+    /// As in `dequeue_signal` and `next_signal` (`kernel/signal.c`), the thread's
+    /// private queue goes before the thread group's shared queue, and within a
+    /// queue a synchronous signal (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGTRAP`,
+    /// `SIGFPE`, `SIGSYS`) goes before the lowest-numbered other one.
+    pub(crate) fn next_dequeued(&self, mask: KernelSigset) -> Option<(i32, SignalQueue)> {
+        let synchronous = SYNCHRONOUS_SIGNALS
+            .into_iter()
+            .fold(0, |set, signal| set | kernel_sigset_bit(signal));
+        let first = |queued: KernelSigset| {
+            let deliverable = queued & !mask;
+            let preferred = if deliverable & synchronous != 0 {
+                deliverable & synchronous
+            } else {
+                deliverable
+            };
+            (preferred != 0).then(|| preferred.trailing_zeros() as i32 + 1)
+        };
+        first(self.thread_pending)
+            .map(|signal| (signal, SignalQueue::Thread))
+            .or_else(|| first(self.shared_pending).map(|signal| (signal, SignalQueue::Shared)))
+    }
+
+    /// The signals pending on `queue`.
+    pub(crate) fn queued(&self, queue: SignalQueue) -> KernelSigset {
+        match queue {
+            SignalQueue::Thread => self.thread_pending,
+            SignalQueue::Shared => self.shared_pending,
+        }
+    }
+}
+
+/// The signals an instruction raises, which the kernel dequeues before any other
+/// signal on the same queue (`SYNCHRONOUS_MASK` in `kernel/signal.c`).
+const SYNCHRONOUS_SIGNALS: [i32; 6] = [
+    libc::SIGSEGV,
+    libc::SIGBUS,
+    libc::SIGILL,
+    libc::SIGTRAP,
+    libc::SIGFPE,
+    libc::SIGSYS,
+];
+
+/// One of a thread's two queues of pending signals.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SignalQueue {
+    /// The thread's private queue (`SigPnd`).
+    Thread,
+    /// The thread group's shared queue (`ShdPnd`).
+    Shared,
 }
 
 /// Read `tid`'s signal state from the kernel.
