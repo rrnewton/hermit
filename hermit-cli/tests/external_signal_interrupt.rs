@@ -1091,14 +1091,16 @@ fn ptrace_timed_futex_wait_is_not_ended_by_non_interrupting_signals() {
     assert_timed_futex_wait_is_not_ended("ptrace");
 }
 
-/// The waits whose restart re-arms a relative timeout keep their deadline when
-/// a SIGTSTP left at SIG_DFL arrives in an orphaned process group (the guest's
-/// `tstp` option). Linux discards that signal: the process does not stop, no
-/// handler runs, and the kernel restarts the interrupted call with the end time
-/// it saved, so `poll` and a timed `FUTEX_WAIT` return their timeout result at
-/// 300 ms. Detcore restarts these two calls with their relative timeout
-/// re-armed, so it leaves them waiting through a default SIGTSTP, SIGTTIN or
-/// SIGTTOU, as hermit main does, instead of ending them. Ending them returned
+/// The waits whose Linux restart keeps the absolute deadline (`poll` with a
+/// positive timeout and a timed `FUTEX_WAIT`) keep it when a SIGTSTP left at
+/// SIG_DFL arrives in an orphaned process group (the guest's `tstp` option).
+/// Linux discards that signal: the process does not stop, no handler runs, and
+/// the kernel restarts the interrupted call with the end time it saved, so
+/// `poll` and a timed `FUTEX_WAIT` return their timeout result at 300 ms.
+/// Detcore leaves these two calls waiting through a default SIGTSTP, SIGTTIN or
+/// SIGTTOU, as hermit main does, instead of ending them: the backend holds such
+/// a signal, and a wait ended for a held signal other than SIGSTOP restarts as
+/// ERESTARTNOHAND, which re-arms the relative timeout. Ending them returned
 /// near 400 ms (review of https://github.com/rrnewton/hermit/pull/3361 at
 /// `cbb36408`, finding 4).
 fn assert_discarded_default_stop_leaves_rearming_waits(backend: &str) {
@@ -1219,6 +1221,76 @@ fn assert_discarded_default_stop_is_handled_as_on_linux(backend: &str) {
 #[test]
 fn ptrace_other_waits_take_a_discarded_default_stop_as_on_linux() {
     assert_discarded_default_stop_is_handled_as_on_linux("ptrace");
+}
+
+/// SIGSTOP and then SIGCONT, neither with a handler, interrupt `poll` and a
+/// relative timed `FUTEX_WAIT` 100 ms into their 300 ms timeout (the guest's
+/// `stopcont` mode). Linux restarts both through the restart block it saved
+/// (`do_restart_poll`, `futex_wait_restart`), which keeps the original absolute
+/// deadline, so they return their timeout result 300 ms after they began.
+/// Detcore ends these waits with Linux's code, `ERESTART_RESTARTBLOCK`, and
+/// resumes the `restart_syscall` the kernel then runs with the deadline it
+/// kept. It used to end them with `ERESTARTNOHAND`, so the kernel ran the
+/// original call again and its relative timeout started again: they returned
+/// near 400 ms (https://github.com/rrnewton/hermit/issues/3358, item 1).
+fn assert_stop_and_continue_keep_the_deadline(backend: &str) {
+    for mode in [FutexMode::Precise, FutexMode::Polling] {
+        assert_quiet_cell(
+            backend,
+            mode,
+            &["futex", "stopcont"],
+            "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=0",
+        );
+    }
+    assert_quiet_cell(
+        backend,
+        FutexMode::Precise,
+        &["poll", "stopcont"],
+        "RESULT call=poll ret=0 errno=none handler=0",
+    );
+}
+
+#[test]
+fn ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_sigstop_and_sigcont() {
+    assert_stop_and_continue_keep_the_deadline("ptrace");
+}
+
+/// The wait that resumes after SIGCONT is still a wait a caught signal ends:
+/// SIGUSR1, caught with flags 0, arrives 50 ms after SIGCONT (the guest's
+/// `stopcontusr1` mode), and the call returns -1 with EINTR before its deadline,
+/// as on Linux, where a handler turns the restart code into EINTR. The wait
+/// cannot end before the SIGSTOP 100 ms in, and must end before its 300 ms
+/// deadline.
+fn assert_a_caught_signal_ends_the_wait_resumed_after_sigcont(backend: &str) {
+    for (call, mode) in [
+        ("futex", FutexMode::Precise),
+        ("futex", FutexMode::Polling),
+        ("poll", FutexMode::Precise),
+    ] {
+        let args = [call, "stopcontusr1"];
+        let expected = format!("RESULT call={call} ret=-1 errno=EINTR handler=1");
+        let run = run_cell(backend, mode, &args, false);
+        assert!(
+            run.status.success()
+                && run.result_line() == Some(expected.as_str())
+                && run.stdout.lines().any(|line| line == "DONE"),
+            "{backend} {mode:?} {args:?}: expected `{expected}`\n{}",
+            run.describe()
+        );
+        let elapsed = run.elapsed_ms();
+        assert!(
+            elapsed.is_some_and(|ms| (SIGNAL_DELAY_MS..QUIET_TIMEOUT_MS).contains(&ms)),
+            "{backend} {mode:?} {args:?}: the wait took {elapsed:?} ms, not between the \
+             SIGSTOP at {SIGNAL_DELAY_MS} ms and its {QUIET_TIMEOUT_MS} ms deadline\n{}",
+            run.describe()
+        );
+        assert_verified(backend, mode, &args, &run);
+    }
+}
+
+#[test]
+fn ptrace_a_caught_signal_ends_a_timed_wait_resumed_after_sigcont() {
+    assert_a_caught_signal_ends_the_wait_resumed_after_sigcont("ptrace");
 }
 
 /// Positive control: `select` already observed an external signal before the

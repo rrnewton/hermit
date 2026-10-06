@@ -414,6 +414,51 @@ impl<T: RecordOrReplay> Detcore<T> {
         self.passthrough(guest, call).await
     }
 
+    /// Linux's `restart_syscall`. When no handler runs, the kernel restarts a wait
+    /// that returned `ERESTART_RESTARTBLOCK` by running this call at the
+    /// interrupted call's address, and the wait resumes with its original deadline
+    /// (https://github.com/rrnewton/hermit/issues/3358). Detcore emulates those
+    /// waits, so it resumes them from the record the wait kept
+    /// (`syscalls::helpers::RestartBlock`). Any other `restart_syscall` keeps the
+    /// unsupported-syscall policy.
+    async fn handle_restart_syscall<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: Syscall,
+        restart_block: Option<syscalls::helpers::RestartBlock>,
+        dettid: DetTid,
+        panic_on_unsupported_syscalls: bool,
+    ) -> Result<i64, Error> {
+        let rip = guest.regs().await.rip;
+        let Some(block) = restart_block.and_then(|block| block.resumed_at(rip)) else {
+            trace!(
+                "[detcore, dtid {}] restart_syscall at {:#x} restarts no wait Detcore emulated ({:?})",
+                dettid, rip, restart_block
+            );
+            return self
+                .handle_unsupported_syscall(guest, call, dettid, panic_on_unsupported_syscalls)
+                .await;
+        };
+        trace!(
+            "[detcore, dtid {}] restart_syscall resumes {:?}",
+            dettid, block
+        );
+        match block.call {
+            syscalls::helpers::RestartCall::Poll(poll) => {
+                self.handle_internal_poll_until(guest, poll, block.deadline)
+                    .await
+            }
+            syscalls::helpers::RestartCall::Futex(futex) => {
+                self.handle_futex_from(
+                    guest,
+                    futex,
+                    syscalls::FutexDeadline::Restart(block.deadline),
+                )
+                .await
+            }
+        }
+    }
+
     /// Defense-in-depth determinism for the registers the syscall instruction
     /// clobbers.
     ///
@@ -1722,6 +1767,8 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     } else {
                         None
                     },
+                    // A new thread has made no syscall yet.
+                    restart_block: None,
                     last_accounted_user_time,
                     last_accounted_system_time,
                     thread_cpu_start_user_time: last_accounted_user_time,
@@ -2045,6 +2092,11 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         call: Syscall,
     ) -> Result<i64, Error> {
         self.pre_handler_hook(guest, false).await;
+
+        // Linux's restart of an interrupted wait is the thread's very next syscall,
+        // so the record a wait kept for it lives only until then
+        // (`handle_restart_syscall`).
+        let restart_block = guest.thread_state_mut().restart_block.take();
 
         let dettid = guest.thread_state().dettid;
 
@@ -3033,6 +3085,18 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-644): Keep dispatch aligned with the reviewed classification.
             SyscallClassification::PassThrough => self.passthrough(guest, call).await,
+            // The kernel's restart of a wait Detcore emulates resumes it; any other
+            // `restart_syscall` keeps the unsupported-syscall policy below.
+            SyscallClassification::Unsupported if call.number() == Sysno::restart_syscall => {
+                self.handle_restart_syscall(
+                    guest,
+                    call,
+                    restart_block,
+                    dettid,
+                    panic_on_unsupported_syscalls,
+                )
+                .await
+            }
             SyscallClassification::Unsupported => {
                 self.handle_unsupported_syscall(guest, call, dettid, panic_on_unsupported_syscalls)
                     .await

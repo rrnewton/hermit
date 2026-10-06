@@ -1945,6 +1945,12 @@ pub struct ThreadState<T> {
     #[serde(skip)]
     pub(crate) parent_cpu_publication: Option<Arc<ChildCpuPublication>>,
 
+    /// The deadline of a wait this thread's last syscall ended with
+    /// `ERESTART_RESTARTBLOCK`, for the `restart_syscall` Linux runs next when no
+    /// handler runs. The next syscall takes it (`Detcore::handle_syscall_event`).
+    #[serde(skip)]
+    pub(crate) restart_block: Option<crate::syscalls::helpers::RestartBlock>,
+
     /// Per-thread checkpoints used to add only new work to the process totals.
     pub(crate) last_accounted_user_time: LogicalTime,
     pub(crate) last_accounted_system_time: LogicalTime,
@@ -2482,6 +2488,7 @@ impl<T> ThreadState<T> {
             guest_clock: Arc::new(Mutex::new(GuestClock::default())),
             parent_process_cpu_time: None,
             parent_cpu_publication: None,
+            restart_block: None,
             last_accounted_user_time,
             last_accounted_system_time,
             thread_cpu_start_user_time: last_accounted_user_time,

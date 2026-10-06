@@ -41,6 +41,8 @@ use crate::resources::Resources;
 use crate::scheduler::runqueue::FIRST_PRIORITY;
 use crate::syscalls::helpers::KernelSignalWait;
 use crate::syscalls::helpers::NonblockableSyscall;
+use crate::syscalls::helpers::RestartCall;
+use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
@@ -1295,11 +1297,27 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(guest.inject(call).await?) // Already non-blocking.
         } else {
             let maybe_timeout_ns = millis_duration_to_absolute_timeout(guest, timeout_millis).await;
-            let mut rsrc = Resources::new(guest.thread_state().dettid);
-            rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
-            rsrc.fyi("poll");
-            retry_nonblocking_syscall_with_timeout(guest, call, rsrc, maybe_timeout_ns).await
+            self.handle_internal_poll_until(guest, call, maybe_timeout_ns)
+                .await
         }
+    }
+
+    /// The blocking half of `handle_internal_poll`, waiting until `deadline`. A
+    /// `restart_syscall` resumes an interrupted `poll` here with the deadline the
+    /// wait kept, as Linux's `do_restart_poll` does
+    /// (`Detcore::handle_restart_syscall`).
+    pub(crate) async fn handle_internal_poll_until<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Poll,
+        deadline: Option<LogicalTime>,
+    ) -> Result<i64, Error> {
+        let mut rsrc = Resources::new(guest.thread_state().dettid);
+        rsrc.insert(ResourceID::InternalIOPolling, Permission::W);
+        rsrc.fyi("poll");
+        let result = retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await;
+        keep_restart_block(guest, &result, RestartCall::Poll(call), deadline).await;
+        result
     }
 
     /// Handle a poll syscall that deponds on external, nondeterminstic IO.

@@ -28,6 +28,9 @@ mod signal;
 pub(crate) mod socket_timestamp_ioctl;
 mod sysinfo;
 mod threads;
+/// Where a futex wait takes its deadline from; a `restart_syscall` resumes an
+/// interrupted wait with the deadline it kept.
+pub(crate) use threads::FutexDeadline;
 /// The kernel's view of a guest thread's signals, which the scheduler reads when
 /// it commits a wake for a parked precise-mode futex waiter.
 #[cfg(test)]
