@@ -1020,7 +1020,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // analyze::minimize::tests::a_failing_minimize_trial_ends_minimization_with_its_error;
     // and schedule_search::tests::{a_failing_trial_ends_the_schedule_search_with_its_error,
     // a_failing_jitter_replay_returns_its_error}.
-    ("test.hermit_unit", 902),
+    // The shared physical-exit watcher's four runtime-mode tests and the three
+    // in_guest_exits admission tests retain all 902 prior IDs: 909.
+    ("test.hermit_unit", 909),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1608,7 +1610,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same 40
     // https://github.com/rrnewton/hermit/pull/3686 --max-log-bytes tests:
     // 862 + 40 = 902.
-    ("test.hermit_unit_on_host", 902),
+    // The host twin selects the same seven watcher and admission tests: 909.
+    ("test.hermit_unit_on_host", 909),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

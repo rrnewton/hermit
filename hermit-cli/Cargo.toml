@@ -33,7 +33,7 @@ kvm-native-test-support = ["reverie-kvm/native-test-support"]
 dbt = ["dep:detcore-dbt", "dep:reverie-dbt", "dep:hermit-test-workdir"]
 sabre = ["dep:reverie-rpc-transport", "dep:reverie-sabre-stats"]
 e9patch = []
-liteinst = ["dep:reverie-liteinst"]
+liteinst = ["dep:reverie-liteinst", "dep:reverie-rpc-transport"]
 third-party-backends = ["dbt", "sabre", "e9patch", "liteinst"]
 # Hardware qualification selected only by the existing KVM validation nodes.
 kvm-execution-tests = []

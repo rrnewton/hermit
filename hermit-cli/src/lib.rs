@@ -27,6 +27,8 @@ mod fd;
 pub mod happens_before;
 pub mod host_input_change;
 mod id;
+#[cfg(feature = "liteinst")]
+mod in_guest_exits;
 pub mod instruction_map;
 mod interp;
 pub mod liteinst_bootstrap;
@@ -3235,6 +3237,21 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
     }
 }
 
+/// After an in-guest LiteInst run, waits (bounded) until the watcher has
+/// reported every admitted process's physical exit, then releases any exit
+/// barrier still recorded. Release comes only after that drain: an exit still
+/// in flight is reported first.
+#[cfg(feature = "liteinst")]
+async fn settle_in_guest_exits(
+    exits: &in_guest_exits::InGuestExitAdmission,
+    global_state: &detcore::GlobalState,
+) {
+    if let Err(error) = exits.drain(std::time::Duration::from_secs(10)).await {
+        tracing::warn!("in-guest LiteInst: not every guest exit was reported: {error:?}");
+    }
+    global_state.release_all_physical_process_exits();
+}
+
 // TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
 //
 // ⚠️ THIS PREDICATE AND THE CLASSIFIER MUST AGREE ABOUT THE SIGNAL BAND, AND A
@@ -3397,22 +3414,32 @@ async fn dispatch_backend(
                 &in_guest_detlog_forward_policy(),
             )?;
             let preload = liteinst_tool_runtime_library_path()?;
-            let (exit_status, mut global_state, dispatch_stats) = if stats_request.is_enabled() {
-                let (exit_status, global_state, source) =
-                    reverie_liteinst::LiteinstBackend::run_with_preload_and_stats::<Detcore>(
-                        command, config, preload,
-                    )
-                    .await?;
-                let dispatch_stats = backend_stats::report(backend, stats_request, &source);
-                (exit_status, global_state, dispatch_stats)
-            } else {
-                let (exit_status, global_state) =
-                    reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
-                        command, config, preload,
-                    )
-                    .await?;
-                (exit_status, global_state, None)
-            };
+            let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
+            let (exit_status, mut global_state, dispatch_stats) =
+                reverie_liteinst::LiteinstBackend::with_connection_admission(
+                    exits.clone(),
+                    async {
+                        if stats_request.is_enabled() {
+                            let (exit_status, global_state, source) =
+                                reverie_liteinst::LiteinstBackend::run_with_preload_and_stats::<
+                                    Detcore,
+                                >(command, config, preload)
+                                .await?;
+                            let dispatch_stats =
+                                backend_stats::report(backend, stats_request, &source);
+                            Ok::<_, reverie::Error>((exit_status, global_state, dispatch_stats))
+                        } else {
+                            let (exit_status, global_state) =
+                                reverie_liteinst::LiteinstBackend::run_with_preload::<Detcore>(
+                                    command, config, preload,
+                                )
+                                .await?;
+                            Ok((exit_status, global_state, None))
+                        }
+                    },
+                )
+                .await?;
+            settle_in_guest_exits(&exits, &global_state).await;
             if liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
@@ -3682,22 +3709,28 @@ async fn dispatch_output_backend(
                 &in_guest_detlog_forward_policy(),
             )?;
             let preload = liteinst_tool_runtime_library_path()?;
-            let (output, mut global_state, dispatch_stats) = if stats_request.is_enabled() {
-                let (output, global_state, source) =
-                    reverie_liteinst::LiteinstBackend::run_with_output_and_preload_and_stats::<
-                        Detcore,
-                    >(command, config, preload)
-                    .await?;
-                let dispatch_stats = backend_stats::report(backend, stats_request, &source);
-                (output, global_state, dispatch_stats)
-            } else {
-                let (output, global_state) =
-                    reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
-                        command, config, preload,
-                    )
-                    .await?;
-                (output, global_state, None)
-            };
+            let exits = std::sync::Arc::new(in_guest_exits::InGuestExitAdmission::default());
+            let (output, mut global_state, dispatch_stats) =
+                reverie_liteinst::LiteinstBackend::with_connection_admission(exits.clone(), async {
+                    if stats_request.is_enabled() {
+                        let (output, global_state, source) =
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload_and_stats::<
+                                Detcore,
+                            >(command, config, preload)
+                            .await?;
+                        let dispatch_stats = backend_stats::report(backend, stats_request, &source);
+                        Ok::<_, reverie::Error>((output, global_state, dispatch_stats))
+                    } else {
+                        let (output, global_state) =
+                            reverie_liteinst::LiteinstBackend::run_with_output_and_preload::<Detcore>(
+                                command, config, preload,
+                            )
+                            .await?;
+                        Ok((output, global_state, None))
+                    }
+                })
+                .await?;
+            settle_in_guest_exits(&exits, &global_state).await;
             let output = Output {
                 status: output.status.into(),
                 stdout: output.stdout,

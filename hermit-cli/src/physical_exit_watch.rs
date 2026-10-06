@@ -32,6 +32,12 @@
 //!
 //! The watcher never waits on or reaps a process: the guest's own parent, or
 //! the backend's launcher for the root, stays the only reaper.
+//!
+//! [`PhysicalExitWatch::new`] watches on a thread of its own.
+//! [`PhysicalExitWatch::on_runtime`] watches on an existing tokio runtime
+//! instead, for a launcher that must not create a thread: in-guest LiteInst's
+//! coordinator shares the guest's PID namespace, where every thread takes a
+//! process id the guest would otherwise see.
 
 use std::io;
 use std::os::fd::AsRawFd;
@@ -44,17 +50,21 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 use std::time::Instant;
 
+use tokio::io::Interest;
+use tokio::io::unix::AsyncFd;
+
 /// Why [`PhysicalExitWatch::drain`] returned without every watched process gone.
 #[derive(Debug)]
 pub enum DrainError {
     /// Some watched processes had not exited when the timeout expired; their ids.
     TimedOut(Vec<i32>),
-    /// The watcher thread failed, so exits are no longer observed.
+    /// The watcher failed, so exits are no longer observed.
     Watcher(io::Error),
 }
 
 struct Entry {
-    pidfd: OwnedFd,
+    /// Shared with the entry's task in runtime mode.
+    pidfd: Arc<OwnedFd>,
     raw_pid: i32,
 }
 
@@ -100,19 +110,66 @@ struct State {
     delivering: Vec<i32>,
     /// Set by `Drop`; the thread exits at its next wakeup.
     shutdown: bool,
-    /// The watcher thread's terminal error, if it stopped observing.
+    /// The watcher's terminal error, if it stopped observing.
     failure: Option<io::Error>,
+}
+
+impl State {
+    /// `Some` once a drain can return: every report delivered, or a failure.
+    fn drain_outcome(&self) -> Option<Result<(), DrainError>> {
+        if let Some(failure) = &self.failure {
+            return Some(Err(DrainError::Watcher(io::Error::new(
+                failure.kind(),
+                failure.to_string(),
+            ))));
+        }
+        (self.live.is_empty() && self.delivering.is_empty()).then_some(Ok(()))
+    }
+
+    fn pending(&self) -> Vec<i32> {
+        let mut pending: Vec<i32> = self.live.iter().map(|entry| entry.raw_pid).collect();
+        pending.extend(&self.delivering);
+        pending
+    }
+
+    fn fail(&mut self, error: io::Error) {
+        if self.failure.is_none() {
+            self.failure = Some(error);
+        }
+    }
 }
 
 struct Shared {
     state: Mutex<State>,
     /// Notified whenever a callback returns or the watcher fails.
     changed: Condvar,
+    /// The same notification for [`PhysicalExitWatch::drain_async`].
+    changed_async: tokio::sync::Notify,
     /// Wakes the watcher thread's poll after `live` grows or on shutdown.
     wake: OwnedFd,
 }
 
 impl Shared {
+    fn notify_changed(&self) {
+        self.changed.notify_all();
+        self.changed_async.notify_waiters();
+    }
+
+    fn record_failure(&self, error: io::Error) {
+        self.state.lock().unwrap().fail(error);
+        self.notify_changed();
+    }
+
+    /// Ends `raw_pid`'s delivery after its callback returned.
+    fn delivered(&self, raw_pid: i32) {
+        let mut state = self.state.lock().unwrap();
+        if let Some(index) = state.delivering.iter().position(|&pid| pid == raw_pid) {
+            state.delivering.remove(index);
+        }
+        drop(state);
+        self.notify_changed();
+    }
+
     fn wake_thread(&self) {
         let one: u64 = 1;
         // An eventfd write only fails if the counter would overflow, which
@@ -127,25 +184,64 @@ impl Shared {
     }
 }
 
-/// One watcher thread over a set of pidfds. See the module documentation.
+type ExitCallback = Arc<dyn Fn(i32) + Send + Sync>;
+
+/// How the watched pidfds are polled.
+enum Driver {
+    /// One thread polls every pidfd.
+    Thread(Option<JoinHandle<()>>),
+    /// One task per pidfd on an existing tokio runtime.
+    Runtime {
+        handle: tokio::runtime::Handle,
+        on_exit: ExitCallback,
+        tasks: Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    },
+}
+
+/// A watcher over a set of pidfds. See the module documentation.
 pub struct PhysicalExitWatch {
     shared: Arc<Shared>,
-    thread: Option<JoinHandle<()>>,
+    driver: Driver,
 }
 
 impl PhysicalExitWatch {
-    /// Starts the watcher thread. `on_exit` is called on that thread, once per
-    /// watched process, with the id given to [`PhysicalExitWatch::watch`].
-    pub fn new(on_exit: impl Fn(i32) + Send + 'static) -> io::Result<Self> {
+    fn shared() -> io::Result<Arc<Shared>> {
         let wake = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
         if wake < 0 {
             return Err(io::Error::last_os_error());
         }
-        let shared = Arc::new(Shared {
+        Ok(Arc::new(Shared {
             state: Mutex::new(State::default()),
             changed: Condvar::new(),
+            changed_async: tokio::sync::Notify::new(),
             wake: unsafe { OwnedFd::from_raw_fd(wake) },
-        });
+        }))
+    }
+
+    /// Watches on `handle`'s runtime and creates no thread. `on_exit` is called
+    /// on that runtime, once per watched process, with the id given to
+    /// [`PhysicalExitWatch::watch`]. Wait for the reports with
+    /// [`PhysicalExitWatch::drain_async`]: on a current-thread runtime the
+    /// blocking [`PhysicalExitWatch::drain`] would stop the very tasks it
+    /// waits for.
+    pub fn on_runtime(
+        handle: tokio::runtime::Handle,
+        on_exit: impl Fn(i32) + Send + Sync + 'static,
+    ) -> io::Result<Self> {
+        Ok(Self {
+            shared: Self::shared()?,
+            driver: Driver::Runtime {
+                handle,
+                on_exit: Arc::new(on_exit),
+                tasks: Mutex::new(Vec::new()),
+            },
+        })
+    }
+
+    /// Starts the watcher thread. `on_exit` is called on that thread, once per
+    /// watched process, with the id given to [`PhysicalExitWatch::watch`].
+    pub fn new(on_exit: impl Fn(i32) + Send + 'static) -> io::Result<Self> {
+        let shared = Self::shared()?;
         let thread_shared = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
             .name("physical-exit-watch".to_string())
@@ -162,15 +258,12 @@ impl PhysicalExitWatch {
                     Err(_) => Some(io::Error::other("the physical-exit callback panicked")),
                 };
                 if let Some(error) = failure {
-                    let mut state = thread_shared.state.lock().unwrap();
-                    state.failure = Some(error);
-                    drop(state);
-                    thread_shared.changed.notify_all();
+                    thread_shared.record_failure(error);
                 }
             })?;
         Ok(Self {
             shared,
-            thread: Some(thread),
+            driver: Driver::Thread(Some(thread)),
         })
     }
 
@@ -181,9 +274,31 @@ impl PhysicalExitWatch {
         if let Some(failure) = &state.failure {
             return Err(io::Error::new(failure.kind(), failure.to_string()));
         }
-        state.live.push(Entry { pidfd, raw_pid });
+        let pidfd = Arc::new(pidfd);
+        state.live.push(Entry {
+            pidfd: Arc::clone(&pidfd),
+            raw_pid,
+        });
         drop(state);
-        self.shared.wake_thread();
+        match &self.driver {
+            Driver::Thread(_) => self.shared.wake_thread(),
+            Driver::Runtime {
+                handle,
+                on_exit,
+                tasks,
+            } => {
+                let shared = Arc::clone(&self.shared);
+                let on_exit = Arc::clone(on_exit);
+                let task = handle.spawn(async move {
+                    if let Err(error) = watch_one(&shared, pidfd, raw_pid, &on_exit).await {
+                        shared.record_failure(error);
+                    }
+                });
+                let mut tasks = tasks.lock().unwrap();
+                tasks.retain(|task| !task.is_finished());
+                tasks.push(task);
+            }
+        }
         Ok(())
     }
 
@@ -219,20 +334,15 @@ impl PhysicalExitWatch {
     }
 
     /// Waits until every watched process has exited and its callback has
-    /// returned, or until `timeout` expires.
+    /// returned, or until `timeout` expires. Blocks the calling thread, so a
+    /// runtime-mode watcher is drained with [`PhysicalExitWatch::drain_async`].
     pub fn drain(&self, timeout: Duration) -> Result<(), DrainError> {
         // An unrepresentable deadline (for example Duration::MAX) waits forever.
         let deadline = Instant::now().checked_add(timeout);
         let mut state = self.shared.state.lock().unwrap();
         loop {
-            if let Some(failure) = &state.failure {
-                return Err(DrainError::Watcher(io::Error::new(
-                    failure.kind(),
-                    failure.to_string(),
-                )));
-            }
-            if state.live.is_empty() && state.delivering.is_empty() {
-                return Ok(());
+            if let Some(outcome) = state.drain_outcome() {
+                return outcome;
             }
             let Some(deadline) = deadline else {
                 state = self.shared.changed.wait(state).unwrap();
@@ -240,9 +350,7 @@ impl PhysicalExitWatch {
             };
             let now = Instant::now();
             if now >= deadline {
-                let mut pending: Vec<i32> = state.live.iter().map(|entry| entry.raw_pid).collect();
-                pending.extend(&state.delivering);
-                return Err(DrainError::TimedOut(pending));
+                return Err(DrainError::TimedOut(state.pending()));
             }
             state = self
                 .shared
@@ -252,16 +360,89 @@ impl PhysicalExitWatch {
                 .0;
         }
     }
+
+    /// [`PhysicalExitWatch::drain`] without blocking the thread, so the
+    /// watcher's own tasks keep running when it shares a runtime with the
+    /// caller.
+    pub async fn drain_async(&self, timeout: Duration) -> Result<(), DrainError> {
+        let deadline = tokio::time::Instant::now().checked_add(timeout);
+        loop {
+            // Registered before the state is read, so a change in between
+            // still wakes this wait.
+            let changed = self.shared.changed_async.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            {
+                let state = self.shared.state.lock().unwrap();
+                if let Some(outcome) = state.drain_outcome() {
+                    return outcome;
+                }
+                if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                    return Err(DrainError::TimedOut(state.pending()));
+                }
+            }
+            match deadline {
+                Some(deadline) => {
+                    let _ = tokio::time::timeout_at(deadline, changed).await;
+                }
+                None => changed.await,
+            }
+        }
+    }
 }
 
 impl Drop for PhysicalExitWatch {
     fn drop(&mut self) {
         self.shared.state.lock().unwrap().shutdown = true;
-        self.shared.wake_thread();
-        if let Some(thread) = self.thread.take() {
-            let _ = thread.join();
+        match &mut self.driver {
+            Driver::Thread(thread) => {
+                self.shared.wake_thread();
+                if let Some(thread) = thread.take() {
+                    let _ = thread.join();
+                }
+            }
+            Driver::Runtime { tasks, .. } => {
+                for task in tasks.get_mut().unwrap().drain(..) {
+                    task.abort();
+                }
+            }
         }
     }
+}
+
+/// Runtime mode: observes one process's exit and reports it.
+async fn watch_one(
+    shared: &Shared,
+    pidfd: Arc<OwnedFd>,
+    raw_pid: i32,
+    on_exit: &ExitCallback,
+) -> io::Result<()> {
+    // A pidfd is readable once its process has exited; POLLHUP after it is
+    // reaped is reported as readable too. The registration is dropped before
+    // the entry is.
+    {
+        let registration = AsyncFd::with_interest(Arc::clone(&pidfd), Interest::READABLE)?;
+        let _ready = registration.readable().await?;
+    }
+    let entry = {
+        let mut state = shared.state.lock().unwrap();
+        let Some(index) = state
+            .live
+            .iter()
+            .position(|entry| Arc::ptr_eq(&entry.pidfd, &pidfd))
+        else {
+            return Ok(());
+        };
+        let entry = state.live.remove(index);
+        state.delivering.push(raw_pid);
+        entry
+    };
+    await_publication(&entry)?;
+    // As on the thread: a panicking callback becomes the watcher's failure.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| on_exit(raw_pid)))
+        .map_err(|_| io::Error::other("the physical-exit callback panicked"))?;
+    shared.delivered(raw_pid);
+    Ok(())
 }
 
 fn watch_loop(shared: &Shared, on_exit: &impl Fn(i32)) -> io::Result<()> {
@@ -328,14 +509,8 @@ fn watch_loop(shared: &Shared, on_exit: &impl Fn(i32)) -> io::Result<()> {
         // `drain` cannot succeed before the report has been delivered.
         for entry in reported {
             await_publication(&entry)?;
-            let raw_pid = entry.raw_pid;
-            on_exit(raw_pid);
-            let mut state = shared.state.lock().unwrap();
-            if let Some(index) = state.delivering.iter().position(|&pid| pid == raw_pid) {
-                state.delivering.remove(index);
-            }
-            drop(state);
-            shared.changed.notify_all();
+            on_exit(entry.raw_pid);
+            shared.delivered(entry.raw_pid);
         }
     }
 }
@@ -556,6 +731,135 @@ mod tests {
             pid as i32
         );
         child.0.wait().unwrap();
+    }
+
+    fn thread_count() -> usize {
+        std::fs::read_dir("/proc/self/task").unwrap().count()
+    }
+
+    #[test]
+    fn runtime_mode_reports_each_exit_once_and_creates_no_thread() {
+        // Counting this process's threads needs a process no other test
+        // shares, so the test re-runs itself alone in a fresh one.
+        if std::env::var_os(INNER_RUN).is_none() {
+            return run_in_fresh_process(
+                "physical_exit_watch::tests::runtime_mode_reports_each_exit_once_and_creates_no_thread",
+                false,
+            );
+        }
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let threads = thread_count();
+        runtime.block_on(async {
+            let (sender, receiver) = mpsc::channel();
+            let watch =
+                PhysicalExitWatch::on_runtime(tokio::runtime::Handle::current(), move |pid| {
+                    sender.send(pid).unwrap()
+                })
+                .unwrap();
+            let mut children: Vec<Reaped> = (0..3)
+                .map(|code| Reaped::spawn(Command::new("sh").args(["-c", &format!("exit {code}")])))
+                .collect();
+            for child in &children {
+                watch
+                    .watch(pidfd_open(child.pid()), child.pid() as i32)
+                    .unwrap();
+            }
+            watch.drain_async(Duration::from_secs(30)).await.unwrap();
+            assert_eq!(
+                thread_count(),
+                threads,
+                "the runtime-mode watcher started a thread"
+            );
+            let mut reported: Vec<i32> = receiver.try_iter().collect();
+            reported.sort_unstable();
+            let mut expected: Vec<i32> = children.iter().map(|child| child.pid() as i32).collect();
+            expected.sort_unstable();
+            assert_eq!(reported, expected);
+            // The watcher never reaps: each status is still the parent's to collect.
+            for (code, child) in children.iter_mut().enumerate() {
+                assert_eq!(child.0.wait().unwrap().code(), Some(code as i32));
+            }
+            drop(watch);
+            assert!(
+                receiver.try_recv().is_err(),
+                "an exit was reported more than once"
+            );
+        });
+    }
+
+    #[tokio::test]
+    async fn runtime_mode_drain_honours_its_timeout() {
+        let (sender, receiver) = mpsc::channel();
+        let watch = PhysicalExitWatch::on_runtime(tokio::runtime::Handle::current(), move |pid| {
+            sender.send(pid).unwrap()
+        })
+        .unwrap();
+        let mut sleeper = Reaped::spawn(Command::new("sleep").arg("60"));
+        let pid = sleeper.pid();
+        watch.watch(pidfd_open(pid), pid as i32).unwrap();
+        let start = Instant::now();
+        match watch.drain_async(Duration::from_millis(200)).await {
+            Err(DrainError::TimedOut(live)) => assert_eq!(live, [pid as i32]),
+            other => panic!("expected a timeout, got {other:?}"),
+        }
+        let waited = start.elapsed();
+        assert!(
+            waited >= Duration::from_millis(200),
+            "returned early: {waited:?}"
+        );
+        assert!(waited < Duration::from_secs(20), "overran: {waited:?}");
+        assert!(receiver.try_recv().is_err(), "reported a live process");
+        sleeper.0.kill().unwrap();
+        watch.drain_async(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), pid as i32);
+        assert_eq!(sleeper.0.wait().unwrap().signal(), Some(libc::SIGKILL));
+    }
+
+    #[tokio::test]
+    async fn runtime_mode_reports_an_already_exited_process() {
+        let (sender, receiver) = mpsc::channel();
+        let watch = PhysicalExitWatch::on_runtime(tokio::runtime::Handle::current(), move |pid| {
+            sender.send(pid).unwrap()
+        })
+        .unwrap();
+        let mut child = Reaped::spawn(&mut Command::new("true"));
+        let pid = child.pid();
+        let pidfd = pidfd_open(pid);
+        // Readable before it is registered: the registration must still fire.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let rc =
+            unsafe { libc::waitid(libc::P_PID, pid, &mut info, libc::WEXITED | libc::WNOWAIT) };
+        assert_eq!(rc, 0, "waitid: {}", io::Error::last_os_error());
+        watch.watch(pidfd, pid as i32).unwrap();
+        watch.drain_async(Duration::from_secs(30)).await.unwrap();
+        assert_eq!(receiver.try_recv().unwrap(), pid as i32);
+        child.0.wait().unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_mode_panicking_callback_fails_the_watcher() {
+        let watch = PhysicalExitWatch::on_runtime(tokio::runtime::Handle::current(), |_| {
+            panic!("callback failure under test")
+        })
+        .unwrap();
+        let mut child = Reaped::spawn(&mut Command::new("true"));
+        let pid = child.pid();
+        watch.watch(pidfd_open(pid), pid as i32).unwrap();
+        match watch.drain_async(Duration::from_secs(30)).await {
+            Err(DrainError::Watcher(_)) => {}
+            other => panic!("expected the watcher's failure, got {other:?}"),
+        }
+        child.0.wait().unwrap();
+        let other = Reaped::spawn(Command::new("sleep").arg("60"));
+        assert!(
+            watch
+                .watch(pidfd_open(other.pid()), other.pid() as i32)
+                .is_err(),
+            "a failed watcher accepted a new process"
+        );
     }
 
     /// Set in a test's own fresh process; see [`run_in_fresh_process`].
