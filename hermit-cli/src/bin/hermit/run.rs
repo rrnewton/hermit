@@ -113,7 +113,7 @@ use super::verify::write_verification_json;
 const TMP_DIR: &str = "/tmp";
 
 fn warn_bind_outside_tmp(bind: &Bind) {
-    eprintln!(
+    crate::tracing::diagnostic_eprintln!(
         "WARNING: --bind target {} is outside guest /tmp, so this option has no \
          effect; files outside /tmp are already visible unless another mount hides them",
         bind.target.to_string_lossy()
@@ -4556,7 +4556,7 @@ impl RunOpts {
             ))?;
         }
         if self.allow_unsupported_syscalls {
-            eprintln!(
+            crate::tracing::diagnostic_eprintln!(
                 "WARNING: --allow-unsupported-syscalls permits unmodeled syscalls to reach the \
                  host; a successful exit does not establish complete deterministic execution."
             );
@@ -4701,7 +4701,7 @@ impl RunOpts {
         if backend == Backend::Liteinst && self.uses_in_guest_liteinst() {
             // Nothing has started the guest yet, so this names the
             // configuration, not an outcome.
-            eprintln!(
+            crate::tracing::diagnostic_eprintln!(
                 "hermit: [liteinst in-guest] selected: the guest preload is to host the Detcore Tool"
             );
         }
@@ -4950,7 +4950,7 @@ impl RunOpts {
                 SeedFrom::SystemRandom => rand::random::<u64>(),
             };
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            eprintln!(
+            crate::tracing::diagnostic_eprintln!(
                 "[hermit] auto setting --seed {0:?} --sched-seed {0:?}",
                 seed
             );
@@ -5006,7 +5006,7 @@ impl RunOpts {
                 );
             }
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            eprintln!(
+            crate::tracing::diagnostic_eprintln!(
                 "WARNING: --gdbserver requires host networking so a host gdb client can reach \
                  the gdbserver port; overriding --network=local with --network=host for this \
                  debug session. Network isolation and deterministic networking are disabled \
@@ -5074,7 +5074,7 @@ impl RunOpts {
             vmm_time_virtualization_warning(&self.program, &self.args, virtualize_time)
         {
             // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            eprintln!("{warning}");
+            crate::tracing::diagnostic_eprintln!("{warning}");
         }
 
         Ok(())
@@ -5341,7 +5341,7 @@ impl RunOpts {
             Ok(resolver) if !resolver.is_empty() => {
                 let unresolved = resolve_program(&mut program, &resolver);
                 if !unresolved.is_empty() {
-                    eprintln!(
+                    crate::tracing::diagnostic_eprintln!(
                         "hermit: {} happens-before anchor(s) with unresolved code locations \
                          (they will never fire): {}",
                         unresolved.len(),
@@ -5355,7 +5355,7 @@ impl RunOpts {
                     .map(|a| a.name.clone())
                     .collect();
                 if !unresolved.is_empty() {
-                    eprintln!(
+                    crate::tracing::diagnostic_eprintln!(
                         "hermit: {} has no usable symbol/debug info; {} code-location anchor(s) \
                          will never fire: {}",
                         host.display(),
@@ -5365,7 +5365,7 @@ impl RunOpts {
                 }
             }
             Err(err) => {
-                eprintln!(
+                crate::tracing::diagnostic_eprintln!(
                     "hermit: could not read debug info from {}: {:#}; code-location anchors will \
                      never fire",
                     host.display(),
@@ -5387,7 +5387,7 @@ impl RunOpts {
         let resolver = match DebugInfoResolver::open(&host) {
             Ok(r) if !r.is_empty() => Some(r),
             Ok(_) => {
-                eprintln!(
+                crate::tracing::diagnostic_eprintln!(
                     "hermit: {} has no usable symbol/debug info; code-location anchors will not \
                      resolve",
                     host.display()
@@ -5395,7 +5395,7 @@ impl RunOpts {
                 None
             }
             Err(err) => {
-                eprintln!(
+                crate::tracing::diagnostic_eprintln!(
                     "hermit: could not read debug info from {}: {:#}",
                     host.display(),
                     err
@@ -5434,7 +5434,7 @@ impl RunOpts {
             println!("  {} {} {}", edge.before, op, edge.after);
         }
         if !unresolved.is_empty() {
-            eprintln!(
+            crate::tracing::diagnostic_eprintln!(
                 "hermit: {} anchor(s) with unresolved code locations: {}",
                 unresolved.len(),
                 unresolved.join(", ")
@@ -5688,7 +5688,7 @@ impl RunOpts {
                 b0_sites: 0,
             });
             self.e9patch_sites = Some(reverie::SiteCounters::default());
-            eprintln!(
+            crate::tracing::diagnostic_eprintln!(
                 ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
                  main_executable=non-ELF; preprocessing=not-applicable"
             );
@@ -5725,7 +5725,7 @@ impl RunOpts {
         } else {
             "miss"
         };
-        eprintln!(
+        crate::tracing::diagnostic_eprintln!(
             ":: Backend: e9patch preprocessing + ptrace runtime; candidate_sites={}; \
              mapped_sites={}; b0_sites={}; \
              instruction_map_cache={:?}; rewrite_cache={}; artifact_sha256={}; \
@@ -5743,7 +5743,7 @@ impl RunOpts {
         // `e9patch` spelling runs on the ptrace runtime, so this measures the
         // preprocessing shape, not any runtime instrumentation cost.
         if let Some(shape) = &prepared.patch_shape {
-            eprintln!(
+            crate::tracing::diagnostic_eprintln!(
                 ":: e9patch patch-shape stats (selected=e9patch, runtime=ptrace, \
                  scope=root-image): {shape}"
             );
@@ -6028,7 +6028,7 @@ impl RunOpts {
         // See the restore call below for the measurement this exists for.
         let fd_flags_before_run1 = standard_fd_status_flags();
 
-        eprintln!(":: {}", "Run1...".yellow().bold());
+        crate::tracing::diagnostic_eprintln!(":: {}", "Run1...".yellow().bold());
 
         let (out1, skid_overshoots_run1) = match run_verification_execution(
             self.verify_json.as_deref(),
@@ -6193,7 +6193,7 @@ impl RunOpts {
         // housekeeping, and the comparison reports the divergence as before.
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
-        eprintln!(":: {}", "Run2...".yellow().bold());
+        crate::tracing::diagnostic_eprintln!(":: {}", "Run2...".yellow().bold());
         let (out2, skid_overshoots_run2) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run2,

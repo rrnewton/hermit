@@ -6351,7 +6351,7 @@ fn wait_at_most(
 /// a wide margin. The measured time is printed.
 #[test]
 fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
-    assert_capped_run_exits_promptly_with_full_unread_stderr(|_| {});
+    CappedRun::default().assert_exits_promptly_with_full_unread_stderr(|_| {});
 }
 
 /// The same capped run on a host where `perf_event_open` fails, as on the
@@ -6383,35 +6383,115 @@ fn max_log_bytes_exits_promptly_when_perf_is_unavailable_and_stderr_is_a_full_pi
             output.status
         );
     }
-    assert_capped_run_exits_promptly_with_full_unread_stderr(|command| {
+    CappedRun::default().assert_exits_promptly_with_full_unread_stderr(|command| {
         deny_syscall(command, libc::SYS_perf_event_open);
     });
 }
 
-/// Run a capped, noisy guest with stderr a full pipe nobody reads (see
-/// [`max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads`]),
-/// after `configure` adjusts the hermit command, and require exit 123 within
-/// [`LOG_CAP_RUN_WAIT_BOUND`].
-fn assert_capped_run_exits_promptly_with_full_unread_stderr(configure: impl FnOnce(&mut Command)) {
-    let _lock = hermit_run_guard();
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let log = directory.path().join("hermit.log");
+/// A capped run with stderr a full pipe nobody reads (see
+/// [`max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads`]).
+/// Its arguments are `--log=debug --max-log-bytes=64K --log-file <log>`,
+/// `global`, `run`, `run_options`, `--timeout 120` when `timeout` is set, `--`
+/// and `guest`. The default is the plain run of [`LOG_CAP_NOISY_GUEST`], which
+/// the cap ends with 123.
+struct CappedRun<'a> {
+    /// Builds the command from the arguments: [`hermit_command`], or
+    /// [`readonly_proc_command`] to deny every writable mount.
+    build: fn(&[&str]) -> Command,
+    global: &'a [&'a str],
+    run_options: &'a [&'a str],
+    timeout: bool,
+    guest: &'a [&'a str],
+    /// The exit code the run must reach within [`LOG_CAP_RUN_WAIT_BOUND`]. For
+    /// 123, the log file must also be non-empty.
+    exit_code: i32,
+    /// A diagnostic this configuration writes to stderr. When set, the same
+    /// run is made first with stderr a pipe that is read, and its stderr must
+    /// contain this text. That shows the run with the full pipe writes it too,
+    /// so it would hang there if the write waited.
+    prints: Option<&'a str>,
+    /// The `--max-log-bytes` value. 64K is crossed early in a run; a larger
+    /// cap lets a quiet first verify run finish under it.
+    max_log_bytes: &'a str,
+}
+
+impl Default for CappedRun<'_> {
+    fn default() -> Self {
+        CappedRun {
+            build: hermit_command,
+            global: &[],
+            run_options: &[],
+            timeout: true,
+            guest: &LOG_CAP_NOISY_GUEST,
+            exit_code: HERMIT_LOG_CAP_EXIT,
+            prints: None,
+            max_log_bytes: "64K",
+        }
+    }
+}
+
+impl CappedRun<'_> {
+    fn command(&self, log: &Path, configure: &impl Fn(&mut Command)) -> Command {
+        let cap = format!("--max-log-bytes={}", self.max_log_bytes);
+        let mut args = vec![
+            "--log=debug",
+            cap.as_str(),
+            "--log-file",
+            log.to_str().unwrap(),
+        ];
+        args.extend_from_slice(self.global);
+        args.push("run");
+        args.extend_from_slice(self.run_options);
+        if self.timeout {
+            args.extend_from_slice(&["--timeout", "120"]);
+        }
+        args.push("--");
+        args.extend_from_slice(self.guest);
+        let mut command = (self.build)(&args);
+        command.stdin(Stdio::null());
+        configure(&mut command);
+        command
+    }
+
+    /// Require [`Self::exit_code`] within [`LOG_CAP_RUN_WAIT_BOUND`] with
+    /// stderr a full pipe nobody reads, after `configure` adjusts the command.
+    /// Stdin is `/dev/null` unless `configure` replaces it.
+    fn assert_exits_promptly_with_full_unread_stderr(&self, configure: impl Fn(&mut Command)) {
+        let _lock = hermit_run_guard();
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        if let Some(text) = self.prints {
+            let mut command = self.command(&directory.path().join("premise.log"), &configure);
+            let (status, elapsed, stderr) = stderr_when_read(&mut command);
+            assert!(
+                stderr.contains(text),
+                "the premise does not hold: with stderr read, the run ({status:?} after \
+                 {elapsed:?}) did not print {text:?}; stderr:\n{stderr}"
+            );
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(self.exit_code),
+                "with stderr read: {status:?} after {elapsed:?}; stderr:\n{stderr}"
+            );
+        }
+        let log = directory.path().join("hermit.log");
+        let status = exit_status_with_full_unread_stderr(&mut self.command(&log, &configure));
+        assert_eq!(status.code(), Some(self.exit_code), "{status:?}");
+        if self.exit_code == HERMIT_LOG_CAP_EXIT {
+            assert!(
+                fs::metadata(&log).unwrap().len() > 0,
+                "the run logged to the file"
+            );
+        }
+    }
+}
+
+/// Spawn `command` with stdout discarded and stderr a full pipe nobody reads
+/// ([`full_unread_stderr_pipe`]), wait for it at most
+/// [`LOG_CAP_RUN_WAIT_BOUND`], and return its exit status. Fails, with the
+/// time waited, when hermit was still running at the bound and was killed.
+fn exit_status_with_full_unread_stderr(command: &mut Command) -> std::process::ExitStatus {
     let (reader, writer) = full_unread_stderr_pipe();
-    let mut args = vec![
-        "--log=debug",
-        "--max-log-bytes=64K",
-        "--log-file",
-        log.to_str().unwrap(),
-        "run",
-        "--timeout",
-        "120",
-        "--",
-    ];
-    args.extend(LOG_CAP_NOISY_GUEST);
-    let mut command = hermit_command(&args);
-    configure(&mut command);
     let mut child = command
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(writer))
         .spawn()
@@ -6422,16 +6502,429 @@ fn assert_capped_run_exits_promptly_with_full_unread_stderr(configure: impl FnOn
     // died with it; this closes the read end, the last descriptor of the pipe.
     drop(reader);
     eprintln!("capped run, stderr a full unread pipe: {status:?} after {elapsed:?}");
-    let status = status.unwrap_or_else(|| {
+    status.unwrap_or_else(|| {
         panic!(
             "hermit was still running after {elapsed:?} (bound {bound:?}) and was killed: \
              a diagnostic waited on the full stderr pipe"
         )
+    })
+}
+
+/// Spawn `command` with stdout discarded and stderr a pipe that a thread reads
+/// to its end, wait for it at most [`LOG_CAP_RUN_WAIT_BOUND`] (killing it on
+/// expiry), and return its exit status (`None` when it was killed), the time
+/// waited and its stderr.
+fn stderr_when_read(command: &mut Command) -> (Option<std::process::ExitStatus>, Duration, String) {
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = child.stderr.take().unwrap();
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+        bytes
     });
-    assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
+    let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    let (status, elapsed) = wait_at_most(&mut child, bound);
+    let stderr = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
+    (status, elapsed, stderr)
+}
+
+/// The options [`run_uses_readonly_proc_after_permission_denial`] runs with
+/// under [`readonly_proc_command`]: local networking would need another
+/// writable mount, for sysfs.
+const READONLY_PROC_RUN_OPTIONS: [&str; 3] = [
+    "--network=host",
+    "--max-timeslice=disabled",
+    "--no-virtualize-cpuid",
+];
+
+/// The capped run of
+/// [`max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads`] on a
+/// host where `/proc` can only be mounted read-only, as
+/// [`run_uses_readonly_proc_after_permission_denial`] arranges with
+/// [`readonly_proc_command`]. The container init then warns about it
+/// (`hermit::proc_mount::warn_if_readonly_proc` in `run_in_container`) before
+/// it starts the guest, so before the cap can cross. That warning was a
+/// blocking `write(2)`, and this run was still running when it was killed at
+/// the 45 s bound.
+#[test]
+fn max_log_bytes_exits_promptly_when_proc_is_readonly_and_stderr_is_a_full_pipe() {
+    CappedRun {
+        build: readonly_proc_command,
+        global: &["--backend=ptrace"],
+        run_options: &READONLY_PROC_RUN_OPTIONS,
+        prints: Some(hermit::proc_mount::READONLY_WARNING.trim()),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// The same read-only `/proc` warning under `--namespace-only`, where it is
+/// written in the `pre_exec` callback, in the forked child before it executes
+/// the guest. The non-waiting write is safe there: it makes only syscalls.
+/// Nothing logs enough here to reach the cap, so the run must end with the
+/// guest's own exit status, 0.
+#[test]
+fn max_log_bytes_namespace_only_exits_promptly_when_proc_is_readonly_and_stderr_is_a_full_pipe() {
+    CappedRun {
+        build: readonly_proc_command,
+        run_options: &["--namespace-only", "--network=host"],
+        guest: &["/bin/true"],
+        exit_code: 0,
+        prints: Some(hermit::proc_mount::READONLY_WARNING.trim()),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `run --verify` writes its `:: Run1...` banner before the first run starts,
+/// so before the cap can cross.
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_stderr_is_a_full_pipe() {
+    CappedRun {
+        run_options: &["--verify"],
+        prints: Some("Run1..."),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `run --verify` writes its `:: Run2...` banner before the second run
+/// starts. The cap counts both runs' logs together, so a first run that stays
+/// under it is followed by that banner, and a second run that crosses the cap
+/// comes after it. The guest exits at once when the marker is absent (run 1,
+/// which creates it) and loops when it is present (run 2, which removes it
+/// first). A first run of this guest logged 401361 bytes at debug when measured,
+/// so the cap here is 2M rather than 64K. The marker is removed before each
+/// hermit run, so the premise run cannot leave it for the run under test, and
+/// its absence afterwards shows that run 2's guest started in that run too.
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_run2_crosses_the_cap_and_stderr_is_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let marker = directory.path().join("run1-finished");
+    let marker_arg = marker.to_str().unwrap();
+    CappedRun {
+        run_options: &["--verify"],
+        guest: &[
+            "/bin/sh",
+            "-c",
+            r#"if [ -e "$1" ]; then rm "$1"; while :; do /bin/true; done; else : > "$1"; fi"#,
+            "sh",
+            marker_arg,
+        ],
+        prints: Some("Run2..."),
+        max_log_bytes: "2M",
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| match fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("removing {}: {error}", marker.display()),
+    });
     assert!(
-        fs::metadata(&log).unwrap().len() > 0,
-        "the run logged to the file"
+        !marker.exists(),
+        "run 2's guest did not remove {}: the cap crossed in run 1, so this run never \
+         reached the Run2 banner",
+        marker.display()
+    );
+}
+
+/// `run --verify` on a read-only `/proc`: the first run's container init
+/// warns about it from `run_verify_in_container`, a different call site from
+/// the plain run's.
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_proc_is_readonly_and_stderr_is_a_full_pipe() {
+    let mut run_options = vec!["--verify"];
+    run_options.extend(READONLY_PROC_RUN_OPTIONS);
+    CappedRun {
+        build: readonly_proc_command,
+        global: &["--backend=ptrace"],
+        run_options: &run_options,
+        prints: Some(hermit::proc_mount::READONLY_WARNING.trim()),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `run --verify` with stdin a pipe: the library notes on stderr that it is
+/// buffering stdin (`hermit::reserve_output_stdin_snapshot`) before either run
+/// starts. The pipe's writer is closed, so stdin ends at once.
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_stdin_is_a_pipe_and_stderr_is_a_full_pipe() {
+    CappedRun {
+        run_options: &["--verify"],
+        prints: Some("hermit: --verify is buffering stdin from a non-seekable stream"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|command| {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(writer);
+        command.stdin(reader);
+    });
+}
+
+/// `--seed-from` names the seed it chose on stderr while the outer process
+/// prepares the run, before any container exists. That line was a blocking
+/// `eprintln!`, and this run was still running when it was killed at the
+/// 45 s bound.
+#[test]
+fn max_log_bytes_exits_promptly_with_seed_from_and_stderr_a_full_pipe() {
+    CappedRun {
+        run_options: &["--seed-from=args"],
+        prints: Some("[hermit] auto setting --seed"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `--allow-unsupported-syscalls` warns on stderr before the run starts.
+#[test]
+fn max_log_bytes_exits_promptly_with_allow_unsupported_syscalls_and_stderr_a_full_pipe() {
+    CappedRun {
+        run_options: &["--allow-unsupported-syscalls"],
+        prints: Some("WARNING: --allow-unsupported-syscalls permits unmodeled syscalls"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// A `--bind` whose target is outside guest `/tmp` is ignored with a warning
+/// on stderr while the outer process prepares the container's mounts.
+#[test]
+fn max_log_bytes_exits_promptly_with_a_bind_outside_tmp_and_stderr_a_full_pipe() {
+    CappedRun {
+        run_options: &["--bind=/usr"],
+        prints: Some("WARNING: --bind target /usr is outside guest /tmp"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// A noisy shell script at `directory/name`, which every run in this file can
+/// execute: `CARGO_TARGET_TMPDIR` is not under the host `/tmp` that hermit
+/// hides.
+fn noisy_guest_script(directory: &Path, name: &str) -> String {
+    let script = directory.join(name);
+    fs::write(&script, "#!/bin/sh\nwhile :; do /bin/true; done\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script.to_str().unwrap().to_owned()
+}
+
+/// A guest named like a QEMU system emulator gets the advisory about
+/// virtualized time on stderr while the outer process prepares the run
+/// (`vmm_time_virtualization_warning`). The guest is the noisy shell loop
+/// under that name.
+#[test]
+fn max_log_bytes_exits_promptly_with_a_vmm_guest_and_stderr_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let emulator = noisy_guest_script(directory.path(), "qemu-system-x86_64");
+    CappedRun {
+        guest: &[&emulator],
+        prints: Some("looks like a hardware emulator (VMM)"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `--backend=e9patch` (e9patch preprocessing with the ptrace backend) names
+/// its engagement on stderr before the run starts. For a main executable that
+/// is not ELF there is nothing to rewrite, and the tools are never run. Hermit
+/// still requires both to be executable files before it starts, and no
+/// validation node stages e9patch, so the test names `/bin/false` for each:
+/// had hermit run either, the run would fail rather than reach the cap.
+#[test]
+fn max_log_bytes_exits_promptly_with_e9patch_on_a_script_and_stderr_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let script = noisy_guest_script(directory.path(), "noisy.sh");
+    CappedRun {
+        global: &["--backend=e9patch"],
+        guest: &[&script],
+        prints: Some(
+            ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
+             main_executable=non-ELF; preprocessing=not-applicable",
+        ),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|command| {
+        command
+            .env(hermit::e9patch::E9TOOL_ENV, "/bin/false")
+            .env(hermit::e9patch::E9PATCH_BACKEND_ENV, "/bin/false");
+    });
+}
+
+/// A `--happens-before` spec with one anchor at a function the guest does not
+/// have.
+fn unresolvable_happens_before_spec(directory: &Path) -> String {
+    let spec = directory.join("happens-before.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1, "events": {"A": {"thread": "1", "func": "no_such_function"}}, "edges": []}"#,
+    )
+    .unwrap();
+    spec.to_str().unwrap().to_owned()
+}
+
+/// `--happens-before` reports anchors it cannot resolve on stderr before the
+/// run starts. Whatever debug info the guest has, one line says the anchor
+/// will never fire.
+#[test]
+fn max_log_bytes_exits_promptly_with_an_unresolved_happens_before_anchor_and_stderr_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let spec = unresolvable_happens_before_spec(directory.path());
+    CappedRun {
+        run_options: &["--happens-before", &spec],
+        prints: Some("never fire"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `--hb-list-events` prints the resolved spec and exits 0 without running
+/// the guest; the anchors it cannot resolve are named on stderr.
+#[test]
+fn max_log_bytes_hb_list_events_exits_promptly_with_stderr_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let spec = unresolvable_happens_before_spec(directory.path());
+    CappedRun {
+        run_options: &["--happens-before", &spec, "--hb-list-events"],
+        exit_code: 0,
+        prints: Some("anchor(s) with unresolved code locations: A"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// Without `--log-file`, hermit writes its virtual-time epoch line to stderr
+/// (`GlobalOpts::write_controller_diagnostic`) before the guest starts. The
+/// default log level writes nothing else there for `/bin/true`, so the run
+/// must end with the guest's exit status, 0.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_stderr_is_a_full_pipe() {
+    let _lock = hermit_run_guard();
+    let args = [
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+        "/bin/true",
+    ];
+    let (status, elapsed, stderr) = stderr_when_read(hermit_command(&args).stdin(Stdio::null()));
+    assert!(
+        stderr.contains("hermit: virtual-time epoch="),
+        "the premise does not hold: with stderr read, the run ({status:?} after {elapsed:?}) \
+         printed no epoch line; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "with stderr read: {status:?} after {elapsed:?}; stderr:\n{stderr}"
+    );
+    let status = exit_status_with_full_unread_stderr(hermit_command(&args).stdin(Stdio::null()));
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// Spawn `command`, whose stderr is already set, and wait at most
+/// [`LOG_CAP_RUN_WAIT_BOUND`] for something to listen on TCP `port`; then kill
+/// and reap hermit. Returns whether it listened, the time waited and, when
+/// stderr is [`Stdio::piped`], everything hermit wrote there, which a thread
+/// reads throughout. Fails if hermit exits first.
+fn gdbserver_listens_promptly(command: &mut Command, port: u16) -> (bool, Duration, String) {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let reader = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            bytes
+        })
+    });
+    let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    let start = Instant::now();
+    let (listened, exited) = loop {
+        if tcp_port_is_listening(port) {
+            break (true, None);
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break (false, Some(status));
+        }
+        if start.elapsed() >= bound {
+            break (false, None);
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let elapsed = start.elapsed();
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = reader
+        .map(|reader| String::from_utf8_lossy(&reader.join().unwrap()).into_owned())
+        .unwrap_or_default();
+    if let Some(status) = exited {
+        panic!(
+            "hermit run --gdbserver exited {status:?} before it listened on port {port}; \
+             stderr:\n{stderr}"
+        );
+    }
+    (listened, elapsed, stderr)
+}
+
+/// `--gdbserver` with the default local network warns on stderr that it
+/// switches to host networking, while the outer process prepares the run.
+/// The gdbserver then waits for a client and the cap is not reached, so the
+/// test requires that it listens on its port within
+/// [`LOG_CAP_RUN_WAIT_BOUND`], and kills it.
+#[test]
+fn max_log_bytes_gdbserver_listens_promptly_when_stderr_is_a_full_pipe() {
+    let _lock = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log = directory.path().join("hermit.log");
+    let command = |port: &str| {
+        hermit_command(&[
+            "--log=debug",
+            "--max-log-bytes=64K",
+            "--log-file",
+            log.to_str().unwrap(),
+            "run",
+            "--timeout",
+            "120",
+            "--gdbserver",
+            "--gdbserver-port",
+            port,
+            "--",
+            "/bin/true",
+        ])
+    };
+
+    // A pipe that is read, not a file: under the cap a diagnostic to a
+    // regular file on btrfs or tmpfs is omitted (see
+    // `hermit::nonwaiting_write::write_without_waiting`).
+    let port = unused_local_port();
+    let (listened, elapsed, stderr) =
+        gdbserver_listens_promptly(command(&port.to_string()).stderr(Stdio::piped()), port);
+    assert!(
+        listened && stderr.contains("WARNING: --gdbserver requires host networking"),
+        "the premise does not hold: with stderr read, listened={listened} after {elapsed:?}; \
+         stderr:\n{stderr}"
+    );
+
+    let (reader, writer) = full_unread_stderr_pipe();
+    let port = unused_local_port();
+    let (listened, elapsed, _) =
+        gdbserver_listens_promptly(command(&port.to_string()).stderr(writer), port);
+    drop(reader);
+    eprintln!(
+        "capped gdbserver run, stderr a full unread pipe: listened={listened} after {elapsed:?}"
+    );
+    assert!(
+        listened,
+        "hermit run --gdbserver did not listen on port {port} within {elapsed:?} and was \
+         killed: a diagnostic waited on the full stderr pipe"
     );
 }
 
