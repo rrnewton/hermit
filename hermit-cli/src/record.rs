@@ -69,7 +69,7 @@ impl Record {
         config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
-        config.fdinfo_unlisted_mount_ids = metadata.fdinfo_unlisted_mount_ids.clone();
+        config.mount_id_assignment_order = metadata.mount_id_assignment_order.clone();
 
         let tracer = reverie_ptrace::TracerBuilder::<RecordTool>::new(command)
             .config(config)
@@ -91,10 +91,10 @@ impl Record {
         metadata_path: &Path,
         provenance: Option<(Vec<u64>, Vec<u64>)>,
     ) -> Result<(), Error> {
-        if let Some((mountinfo_order, unlisted_order)) = provenance {
+        if let Some((mountinfo_order, assignment_order)) = provenance {
             metadata.mountinfo_mount_ids = mountinfo_order;
             metadata.mountinfo_mount_ids_captured = true;
-            metadata.fdinfo_unlisted_mount_ids = unlisted_order;
+            metadata.mount_id_assignment_order = assignment_order;
         }
         // Also persist the proc mode observed after guest setup, even when no
         // mount-identity provenance was collected. Do this only after joining
@@ -122,7 +122,7 @@ impl Record {
         let (exit_status, global_state) = ptrace_completion::wait(tracer, control).await?;
         let provenance = global_state
             .mount_identity_provenance()
-            .map(|value| value.map(|p| (p.mountinfo_order, p.unlisted_order)))
+            .map(|value| value.map(|p| (p.mountinfo_order, p.assignment_order)))
             .map_err(Error::msg);
         global_state.clean_up(false, &None).await;
         // Publish final metadata only after the original successful state joined.
@@ -140,7 +140,7 @@ impl Record {
         let (output, global_state) = ptrace_completion::wait_with_output(tracer, control).await?;
         let provenance = global_state
             .mount_identity_provenance()
-            .map(|value| value.map(|p| (p.mountinfo_order, p.unlisted_order)))
+            .map(|value| value.map(|p| (p.mountinfo_order, p.assignment_order)))
             .map_err(Error::msg);
         global_state.clean_up(false, &None).await;
         // Publish final metadata only after the original successful state joined.

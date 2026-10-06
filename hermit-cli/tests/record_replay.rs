@@ -115,10 +115,10 @@ fn public_record_uses_the_completed_command_namespace_and_stdio() {
         "completed recording mountinfo order was not persisted"
     );
     assert!(
-        metadata["fdinfo_unlisted_mount_ids"]
+        metadata["mount_id_assignment_order"]
             .as_array()
             .is_some_and(|ids| !ids.is_empty()),
-        "recording-time pipe mount identity was not persisted"
+        "recording-time mount-ID assignment order was not persisted"
     );
     let replay = hermit::replay_with_output(data.path()).expect("public recording should replay");
     assert_eq!(replay.status, reverie::process::ExitStatus::Exited(0));

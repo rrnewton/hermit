@@ -601,6 +601,34 @@ impl MountInfoSnapshot {
         self.mount_ids.get(&raw_mount_id).copied()
     }
 
+    /// Replace this snapshot's positional mount IDs with run-global ones.
+    ///
+    /// `virtual_ids[i]` is the run-global ID of `raw_order[i]`, and `raw_order`
+    /// must name exactly this snapshot's raw IDs. The positional numbering from
+    /// [`Self::new`] only orders the entries for that request. Rendering uses
+    /// the run-global numbers so mountinfo agrees with fdinfo and neither
+    /// depends on rows the guest never observed. Returns false, leaving the
+    /// snapshot unchanged, on a length, membership, or distinctness mismatch.
+    pub(crate) fn use_run_mount_ids(&mut self, raw_order: &[u64], virtual_ids: &[u64]) -> bool {
+        let mut distinct_raw = std::collections::BTreeSet::new();
+        let mut distinct_virtual = std::collections::BTreeSet::new();
+        if raw_order.len() != virtual_ids.len()
+            || raw_order.len() != self.mount_ids.len()
+            || !raw_order
+                .iter()
+                .all(|raw| self.mount_ids.contains_key(raw) && distinct_raw.insert(*raw))
+            || !virtual_ids.iter().all(|id| distinct_virtual.insert(*id))
+        {
+            return false;
+        }
+        self.mount_ids = raw_order
+            .iter()
+            .copied()
+            .zip(virtual_ids.iter().copied())
+            .collect();
+        true
+    }
+
     /// Raw mount IDs in the canonical order assigned by this snapshot.
     pub(crate) fn raw_mount_id_order(&self) -> Vec<u64> {
         let mut ordered = self
@@ -4826,6 +4854,50 @@ Rss:                   4 kB\n" as &[u8];
         let rendered = sanitize_mountinfo(&filtered, &snapshot);
         assert!(rendered.windows(6).any(|w| w == b"/child"));
         assert!(!rendered.windows(7).any(|w| w == b"xarfuse"));
+    }
+
+    /// Mountinfo renders the run-global numbers, not the snapshot's
+    /// positional ones, and a mismatched assignment leaves it unchanged.
+    #[test]
+    fn run_mount_ids_replace_positional_ids_only_when_they_cover_the_snapshot() {
+        let contents =
+            b"20 10 8:1 / /a rw - ext4 /dev/a rw\n30 20 8:2 / /a/b rw - ext4 /dev/b rw\n";
+        let snapshot = || {
+            let rows = parse_mountinfo(contents).unwrap();
+            MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new()).unwrap()
+        };
+        let positional = snapshot();
+        let raw_order = positional.raw_mount_id_order();
+        assert_eq!(raw_order, [20, 30, 10]);
+
+        for (raw, virtual_ids) in [
+            (vec![20, 30], vec![5, 6]),
+            (vec![20, 30, 10, 40], vec![5, 6, 7, 8]),
+            (vec![20, 30, 99], vec![5, 6, 7]),
+            (vec![20, 20, 10], vec![5, 6, 7]),
+            (vec![20, 30, 10], vec![5, 5, 7]),
+            (vec![20, 30, 10], vec![5, 6]),
+        ] {
+            let mut refused = snapshot();
+            assert!(
+                !refused.use_run_mount_ids(&raw, &virtual_ids),
+                "{raw:?} -> {virtual_ids:?} must be refused"
+            );
+            assert_eq!(
+                sanitize_mountinfo(contents, &refused),
+                sanitize_mountinfo(contents, &positional)
+            );
+        }
+
+        let mut run_global = snapshot();
+        assert!(run_global.use_run_mount_ids(&raw_order, &[7, 3, 9]));
+        assert_eq!(run_global.canonical_mount_id(20), Some(7));
+        assert_eq!(run_global.canonical_mount_id(30), Some(3));
+        assert_eq!(run_global.canonical_mount_id(10), Some(9));
+        assert_eq!(
+            sanitize_mountinfo(contents, &run_global),
+            b"7 9 8:1 / /a rw - ext4 /dev/a rw\n3 7 8:2 / /a/b rw - ext4 /dev/b rw\n"
+        );
     }
 
     #[test]

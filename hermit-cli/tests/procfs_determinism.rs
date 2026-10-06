@@ -1290,20 +1290,38 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
 
     let captured_mount_ids =
         hermit::capture_mountinfo_identity_order().expect("capture producer mount identity order");
-    let raw_proc_mount_id = fs::read_to_string("/proc/self/mountinfo")
+    let producer_rows = fs::read_to_string("/proc/self/mountinfo")
         .expect("read producer mountinfo")
         .lines()
-        .find_map(|row| {
-            let mut fields = row.split(' ');
-            let raw_mount_id = fields.next()?.parse::<u64>().ok()?;
-            let _parent = fields.next()?;
-            let _device = fields.next()?;
-            let _root = fields.next()?;
-            (fields.next()? == proc_target.to_str()?).then_some(raw_mount_id)
+        .map(|row| {
+            let fields = row.split(' ').collect::<Vec<_>>();
+            let id = |index: usize| -> u64 {
+                fields[index]
+                    .parse()
+                    .expect("producer mountinfo ID should be decimal")
+            };
+            (id(0), id(1), fields[4].to_owned())
+        })
+        .collect::<Vec<_>>();
+    let raw_proc_mount_id = producer_rows
+        .iter()
+        .find_map(|(raw, _, mountpoint)| {
+            (Some(mountpoint.as_str()) == proc_target.to_str()).then_some(*raw)
         })
         .expect("find chroot proc mount in producer mountinfo");
+    // Detcore numbers mount IDs in the order the guest first observes them.
+    // The guest reads mountinfo before fdinfo, and its chroot view lists only
+    // the mounts under the chroot, so that first view numbers those rows and
+    // their parents in captured order. Rows outside the chroot get no number.
+    let chroot_prefix = format!("{}/", root.path().to_str().expect("UTF-8 chroot path"));
+    let chroot_view = producer_rows
+        .iter()
+        .filter(|(_, _, mountpoint)| mountpoint.starts_with(&chroot_prefix))
+        .flat_map(|(raw, parent, _)| [*raw, *parent])
+        .collect::<BTreeSet<_>>();
     let expected_proc_mount_id = captured_mount_ids
         .iter()
+        .filter(|raw| chroot_view.contains(raw))
         .position(|raw| *raw == raw_proc_mount_id)
         .map(|index| index as u64 + 1)
         .expect("proc mount must be present in captured identity order");
