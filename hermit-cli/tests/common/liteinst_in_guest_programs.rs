@@ -1305,6 +1305,21 @@ fn userfaultfd_guest() -> &'static Path {
 /// printed, where the kernel refuses an unprivileged userfaultfd.
 #[test]
 fn liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered() {
+    // Skip only when the host itself refuses an unprivileged userfaultfd, so
+    // a backend failure can never pass as an unavailable host.
+    let native = Command::new(userfaultfd_guest())
+        .output()
+        .expect("failed to run the userfaultfd guest natively");
+    let native_stdout = String::from_utf8_lossy(&native.stdout);
+    assert!(native.status.success(), "native run failed: {native:?}");
+    if let Some(reason) = native_stdout.strip_prefix("userfaultfd-unavailable ") {
+        eprintln!(
+            "skipping: this host refuses an unprivileged userfaultfd ({})",
+            reason.trim()
+        );
+        return;
+    }
+    assert_eq!(native_stdout, "userfaultfd-served pages=2 sum=798720\n");
     let _guard = hermit_run_guard();
     let output = liteinst_command("info")
         .args(["--verify", "--verify-strict"])
@@ -1315,13 +1330,6 @@ fn liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered() {
         .expect("failed to run Hermit LiteInst on the userfaultfd guest");
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    if let Some(reason) = stdout.strip_prefix("userfaultfd-unavailable ") {
-        eprintln!(
-            "skipping: this kernel refuses an unprivileged userfaultfd ({})",
-            reason.trim()
-        );
-        return;
-    }
     assert!(
         output.status.success(),
         "status={:?}\nstdout={stdout}\nstderr={stderr}",
@@ -1381,6 +1389,16 @@ fn liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse() {
         "{stderr}"
     );
     assert_in_guest_selected(&stderr);
+
+    // ptrace runs the same program: the refusal is in-guest LiteInst's.
+    let output = Command::new(hermit_binary())
+        .args(["--log=info", "run", "--strict", "--"])
+        .args(["/bin/sh", "-c", ": < /dev/fuse; echo opened"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit with ptrace");
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "opened\n");
 }
 
 /// The other half of ruling A: a plain file on a FUSE filesystem is not

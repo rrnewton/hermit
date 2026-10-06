@@ -5254,6 +5254,28 @@ mod tests {
         assert!(crate::detlog::determinism_loss().is_some());
     }
 
+    /// An admitted process can die before any registration names it. The
+    /// production completion callback must then record it physically gone,
+    /// without panicking on the unknown thread group, so that its late
+    /// registration is refused (Codex implementation review, HIGH 1).
+    #[test]
+    fn completing_a_process_that_never_registered_records_it_gone() {
+        let config = Config {
+            sequentialize_threads: true,
+            ..Config::default()
+        }
+        .with_backend(|backend| {
+            backend.process_exits_complete_asynchronously = true;
+            backend.needs_killed_thread_rpc_cancellation = true;
+        });
+        let state = GlobalState::initialize(&config, false);
+        state.complete_physical_process_exit(57);
+        let sched = state.sched.lock().unwrap();
+        assert!(sched.process_physically_gone(DetPid::from_raw(57)));
+        assert!(!sched.thread_tree.contains(&DetTid::from_raw(57)));
+        assert!(!sched.next_turns.contains_key(&DetTid::from_raw(57)));
+    }
+
     #[test]
     fn recorded_assignment_order_rebuilds_the_same_mapping_in_any_replay_order() {
         let mut recording = MountIdPool::from_config(&[], false, &[]);

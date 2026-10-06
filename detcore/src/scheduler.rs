@@ -1082,6 +1082,12 @@ impl ThreadTree {
     /// Return the set of thread IDs in the "same process" as me (same TGID), including
     /// myself.
     ///
+    /// Whether `tid` has been registered in the tree. A process the backend
+    /// reports gone before it registers is not (asynchronous exit completion).
+    pub fn contains(&self, tid: &DetTid) -> bool {
+        self.thread_group_leaders.contains(tid) || self.thread_to_leader.contains_key(tid)
+    }
+
     /// Locks: takes scheduler lock.
     pub fn my_thread_group(&mut self, me: &DetTid) -> Vec<DetTid> {
         let root_tid: DetTid = if self.thread_group_leaders.contains(me) {
@@ -2742,6 +2748,13 @@ impl Scheduler {
     /// excluded. If its child has not registered yet, a tombstone lets the
     /// child's outstanding registration settle without the barrier.
     pub(crate) fn consume_unreported_exit(&mut self, detpid: DetPid) -> bool {
+        // An admitted process can die before its parent's fork turn, or its
+        // own startup, registers it. Then it has nothing to consume; the
+        // completion still records it physically gone, so its registration
+        // is refused when it arrives.
+        if !self.thread_tree.contains(&detpid) {
+            return false;
+        }
         let unreported: Vec<DetTid> = self
             .thread_tree
             .my_thread_group(&detpid)

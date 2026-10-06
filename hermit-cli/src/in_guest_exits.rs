@@ -72,6 +72,9 @@ const PF_EXITING: u64 = 0x4;
 /// The phase named in the `BackendFailure` the watchdog reports.
 const WATCHDOG_PHASE: &str = "in-guest LiteInst exit watchdog";
 
+/// The phase named in the `BackendFailure` a refused admission reports.
+const ADMISSION_PHASE: &str = "in-guest LiteInst admission";
+
 #[derive(Clone, Copy)]
 struct Limits {
     exit: Duration,
@@ -89,6 +92,26 @@ struct Watching {
     watch: PhysicalExitWatch,
     reporter: Arc<dyn ExitReporter>,
     proc_dirs: ProcDirs,
+    outcome: Outcome,
+}
+
+/// What the launcher needs after the run, kept by the admission itself: the
+/// backend's reference to the global state ends with the run, so neither
+/// reports nor failures can rely on reaching it.
+#[derive(Default)]
+struct ExitOutcome {
+    /// Every exit the watcher reported, in order.
+    reported: Vec<i32>,
+    /// The first failure: a fired watchdog, a stopped watcher, or a refused
+    /// admission. The run must not report a result with it set.
+    failure: Option<String>,
+}
+
+type Outcome = Arc<Mutex<ExitOutcome>>;
+
+/// Records `failure` unless one is already recorded.
+fn record_failure(outcome: &Outcome, failure: String) {
+    outcome.lock().unwrap().failure.get_or_insert(failure);
 }
 
 /// The watcher and its watchdog task, once the reporter is attached.
@@ -103,6 +126,7 @@ pub(crate) struct InGuestExitAdmission {
     limits: Limits,
     /// `None` before the reporter is attached and after the drain.
     started: Mutex<Option<io::Result<Started>>>,
+    outcome: Outcome,
 }
 
 impl Default for InGuestExitAdmission {
@@ -124,14 +148,17 @@ impl ConnectionAdmission for InGuestExitAdmission {
                 let proc_dirs = ProcDirs::default();
                 let exits = Arc::clone(&reporter);
                 let gone = Arc::clone(&proc_dirs);
+                let reports = Arc::clone(&self.outcome);
                 let watch = PhysicalExitWatch::on_runtime(handle.clone(), move |pid| {
                     gone.lock().unwrap().remove(&pid);
+                    reports.lock().unwrap().reported.push(pid);
                     exits.process_exited(pid);
                 })?;
                 let watching = Arc::new(Watching {
                     watch,
                     reporter,
                     proc_dirs,
+                    outcome: Arc::clone(&self.outcome),
                 });
                 let watchdog = handle.spawn(watchdog(Arc::clone(&watching), self.limits));
                 Ok(Started { watching, watchdog })
@@ -139,7 +166,34 @@ impl ConnectionAdmission for InGuestExitAdmission {
         *self.started.lock().unwrap() = Some(started);
     }
 
+    /// A refused connection fails the run at once: its process may already be
+    /// registered with Detcore, which would otherwise wait for a request it
+    /// can never send.
     fn admit(&self, peer: OwnedFd) -> io::Result<Admitted> {
+        let admitted = self.admit_and_watch(peer);
+        if let Err(error) = &admitted {
+            let diagnostic = format!("in-guest LiteInst refused a guest connection: {error}");
+            eprintln!("hermit: {diagnostic}");
+            record_failure(&self.outcome, diagnostic);
+            if let Some(Ok(Started { watching, .. })) = self.started.lock().unwrap().as_ref() {
+                watching.reporter.backend_failed(reverie::BackendFailure {
+                    pid: reverie::Pid::from_raw(0),
+                    tid: reverie::Tid::from_raw(0),
+                    phase: ADMISSION_PHASE,
+                });
+                if let Err(error) = watching.watch.fail_and_kill_all() {
+                    eprintln!(
+                        "hermit: in-guest LiteInst could not kill every guest after that failure: {error}"
+                    );
+                }
+            }
+        }
+        admitted
+    }
+}
+
+impl InGuestExitAdmission {
+    fn admit_and_watch(&self, peer: OwnedFd) -> io::Result<Admitted> {
         let process_id = guest_visible_pid(&peer)?;
         let proc_dir = open_proc_dir(&peer)?;
         let started = self.started.lock().unwrap();
@@ -166,14 +220,23 @@ impl ConnectionAdmission for InGuestExitAdmission {
         }
         Ok(Admitted { process_id })
     }
-}
 
-impl InGuestExitAdmission {
     fn with_limits(limits: Limits) -> Self {
         Self {
             limits,
             started: Mutex::new(None),
+            outcome: Outcome::default(),
         }
+    }
+
+    /// Every exit the watcher reported, in the order reported.
+    pub(crate) fn reported_exits(&self) -> Vec<i32> {
+        self.outcome.lock().unwrap().reported.clone()
+    }
+
+    /// The first failure recorded during the run, if any.
+    pub(crate) fn failure(&self) -> Option<String> {
+        self.outcome.lock().unwrap().failure.clone()
     }
 
     /// Waits, bounded, until every admitted process's exit has been reported.
@@ -203,6 +266,10 @@ impl Drop for InGuestExitAdmission {
 /// Polls the exits Detcore holds until it fails the run or is aborted.
 async fn watchdog(watching: Arc<Watching>, limits: Limits) {
     let mut held_since: HashMap<i32, Instant> = HashMap::new();
+    // When each held process was first seen asleep in its exit path, without
+    // a sample since then showing it awake: the kernel-wait check needs the
+    // sleep itself to last, not just the hold.
+    let mut asleep_since: HashMap<i32, Instant> = HashMap::new();
     loop {
         tokio::time::sleep(WATCHDOG_POLL).await;
         if let Some(error) = watching.watch.failure() {
@@ -216,6 +283,7 @@ async fn watchdog(watching: Arc<Watching>, limits: Limits) {
         }
         let pending = watching.reporter.pending_process_exits();
         held_since.retain(|pid, _| pending.contains(pid));
+        asleep_since.retain(|pid, _| pending.contains(pid));
         let now = Instant::now();
         for pid in pending {
             let held = now.duration_since(*held_since.entry(pid).or_insert(now));
@@ -229,9 +297,12 @@ async fn watchdog(watching: Arc<Watching>, limits: Limits) {
                     ),
                 );
             }
-            if held >= limits.kernel_wait
-                && let Some(state) = (limits.exit_path_probe)(&watching.proc_dirs, pid)
-            {
+            let Some(state) = (limits.exit_path_probe)(&watching.proc_dirs, pid) else {
+                asleep_since.remove(&pid);
+                continue;
+            };
+            let asleep = now.duration_since(*asleep_since.entry(pid).or_insert(now));
+            if asleep >= limits.kernel_wait {
                 return fail_run(
                     &watching,
                     pid,
@@ -249,6 +320,7 @@ async fn watchdog(watching: Arc<Watching>, limits: Limits) {
 /// `SIGKILL` to every watched process.
 fn fail_run(watching: &Watching, pid: i32, diagnostic: String) {
     eprintln!("hermit: {diagnostic}");
+    record_failure(&watching.outcome, diagnostic);
     watching.reporter.backend_failed(reverie::BackendFailure {
         pid: reverie::Pid::from_raw(pid),
         tid: reverie::Tid::from_raw(pid),
@@ -453,12 +525,42 @@ mod tests {
         assert_eq!(admitted.process_id, pid);
         admission.drain(Duration::from_secs(30)).await.unwrap();
         assert_eq!(*tool.exited.lock().unwrap(), [pid]);
+        assert_eq!(admission.reported_exits(), [pid]);
         child.0.wait().unwrap();
         assert!(tool.failures.lock().unwrap().is_empty());
+        assert_eq!(admission.failure(), None);
         assert!(
             admission.admit(pidfd_open(std::process::id())).is_err(),
             "a drained admission admitted a connection"
         );
+        assert!(
+            admission.failure().is_some(),
+            "a refused admission must fail the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refused_admission_fails_the_run_at_once() {
+        let tool = Arc::new(FakeTool::default());
+        let admission = admission(PRODUCTION, &tool);
+        // A connection whose process is already reaped cannot be admitted.
+        let mut child = Command::new("true").spawn().unwrap();
+        let pidfd = pidfd_open(child.id());
+        child.wait().unwrap();
+        assert!(admission.admit(pidfd).is_err());
+        assert_eq!(
+            *tool.failures.lock().unwrap(),
+            [(0, ADMISSION_PHASE)],
+            "the refusal must reach the scheduler as a backend failure"
+        );
+        let failure = admission
+            .failure()
+            .expect("a refused admission is a run failure");
+        assert!(
+            failure.starts_with("in-guest LiteInst refused a guest connection:"),
+            "{failure}"
+        );
+        admission.drain(Duration::from_secs(30)).await.unwrap();
     }
 
     #[test]
@@ -494,6 +596,11 @@ mod tests {
         admission.drain(Duration::from_secs(30)).await.unwrap();
         assert_eq!(*tool.exited.lock().unwrap(), [pid]);
         assert_eq!(tool.failures.lock().unwrap().len(), 1);
+        // The failure persists for the launcher, which fails the run with it.
+        let failure = admission
+            .failure()
+            .expect("a fired watchdog is a run failure");
+        assert!(failure.contains("did not complete within"), "{failure}");
     }
 
     #[tokio::test]
@@ -548,6 +655,59 @@ mod tests {
         assert!(waited >= KERNEL_WAIT, "failed the run early: {waited:?}");
         assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
         admission.drain(Duration::from_secs(30)).await.unwrap();
+        let failure = admission.failure().expect("a kernel wait is a run failure");
+        assert!(
+            failure.contains("waited on a kernel dependency"),
+            "{failure}"
+        );
+    }
+
+    /// Set by the brief-sleep test: whether its stand-in probe reports the
+    /// held process asleep in its exit path.
+    static ASLEEP_IN_EXIT: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+
+    /// A process held for over a second, but asleep in its exit path only
+    /// briefly, is not a kernel wait: the sleep itself must last a second
+    /// (Codex implementation review: a healthy delayed exit sampled once in a
+    /// brief exit-path sleep must not fail the run).
+    #[tokio::test]
+    async fn a_long_hold_with_a_brief_exit_path_sleep_is_not_a_kernel_wait() {
+        fn asleep_when_told(_: &ProcDirs, _: i32) -> Option<char> {
+            ASLEEP_IN_EXIT
+                .load(std::sync::atomic::Ordering::SeqCst)
+                .then_some('D')
+        }
+        let tool = Arc::new(FakeTool::default());
+        let admission = admission(
+            Limits {
+                exit_path_probe: asleep_when_told,
+                ..PRODUCTION
+            },
+            &tool,
+        );
+        let mut child = Reaped(Command::new("sleep").arg("60").spawn().unwrap());
+        let pid = child.0.id() as i32;
+        admission.admit(pidfd_open(child.0.id())).unwrap();
+        tool.pending.lock().unwrap().push(pid);
+        // Held, and awake, for longer than the limit.
+        tokio::time::sleep(KERNEL_WAIT + Duration::from_millis(300)).await;
+        // Then asleep in the exit path: not yet a second of sleep.
+        ASLEEP_IN_EXIT.store(true, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            failure_within(&tool, KERNEL_WAIT / 2).await,
+            None,
+            "a sleep shorter than the limit failed the run"
+        );
+        // Once the sleep itself lasts the limit, the check fires.
+        assert_eq!(
+            failure_within(&tool, Duration::from_secs(20)).await,
+            Some((pid, WATCHDOG_PHASE))
+        );
+        ASLEEP_IN_EXIT.store(false, std::sync::atomic::Ordering::SeqCst);
+        child.0.kill().unwrap();
+        admission.drain(Duration::from_secs(30)).await.unwrap();
+        child.0.wait().unwrap();
     }
 
     #[tokio::test]
@@ -597,5 +757,12 @@ mod tests {
             admission.drain(Duration::from_secs(30)).await,
             Err(DrainError::Watcher(_))
         ));
+        let failure = admission
+            .failure()
+            .expect("a stopped watcher is a run failure");
+        assert!(
+            failure.contains("stopped observing guest exits"),
+            "{failure}"
+        );
     }
 }

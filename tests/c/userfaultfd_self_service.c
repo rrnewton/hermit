@@ -15,7 +15,9 @@
  * and still supports it (coord ruling D.2).
  *
  * Prints "userfaultfd-unavailable <errno name>" and exits 0 when the kernel
- * refuses an unprivileged userfaultfd, so the caller can skip.
+ * refuses an unprivileged userfaultfd (EPERM, ENOSYS, or EINVAL for a kernel
+ * without UFFD_USER_MODE_ONLY), so the caller can skip. Any other failure is
+ * a failure.
  */
 
 #ifndef _GNU_SOURCE
@@ -49,8 +51,11 @@ int main(void) {
   int uffd = (int)syscall(
       SYS_userfaultfd, O_CLOEXEC | O_NONBLOCK | UFFD_USER_MODE_ONLY);
   if (uffd < 0) {
-    printf("userfaultfd-unavailable %s\n", strerrorname_np(errno));
-    return 0;
+    if (errno == EPERM || errno == ENOSYS || errno == EINVAL) {
+      printf("userfaultfd-unavailable %s\n", strerrorname_np(errno));
+      return 0;
+    }
+    fail("userfaultfd");
   }
   struct uffdio_api api = {.api = UFFD_API, .features = 0};
   if (ioctl(uffd, UFFDIO_API, &api) != 0) {

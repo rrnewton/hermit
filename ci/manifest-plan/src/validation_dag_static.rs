@@ -1025,7 +1025,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The exit watchdog's six tests (in_guest_exits) retain all 909: 915.
     // The two verification-latch tests and the in-guest kernel-floor test retain all 915: 918.
     // The watcher's two auto-reap tests retain all 918: 920.
-    ("test.hermit_unit", 920),
+    // Three C3.5 fix-forward tests (a refused admission, a brief exit-path sleep, a recorded failure failing the run) retain all 920: 923.
+    ("test.hermit_unit", 923),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1167,7 +1168,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // measured with cargo nextest list).
     // Eleven C3.5 exit-hold tests (scheduler and tool_global) retain all 976: 987.
     // Six exit_dependencies tests (rulings A and D.1) retain all 987: 993.
-    ("test.detcore_unit", 993),
+    // The completion-before-registration test (C3.5 fix-forward) retains all 993: 994.
+    ("test.detcore_unit", 994),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1563,7 +1565,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the host-independent /proc/modules test (976).
     // The host twin selects the same eleven exit-hold tests: 987.
     // The host twin selects the same six exit_dependencies tests: 993.
-    ("test.detcore_unit_on_host", 993),
+    // The host twin selects the same test: 994.
+    ("test.detcore_unit_on_host", 994),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1625,7 +1628,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same six watchdog tests: 915.
     // The host twin selects the same three latch and kernel-floor tests: 918.
     // The host twin selects the same two auto-reap tests: 920.
-    ("test.hermit_unit_on_host", 920),
+    // The host twin selects the same three tests: 923.
+    ("test.hermit_unit_on_host", 923),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

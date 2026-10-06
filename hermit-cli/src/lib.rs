@@ -3287,15 +3287,37 @@ pub fn backend_capabilities(backend: Backend) -> reverie::BackendCapabilities {
 /// reported every admitted process's physical exit, then releases any exit
 /// barrier still recorded. Release comes only after that drain: an exit still
 /// in flight is reported first.
+///
+/// Every report is applied again to the run's returned state. The backend
+/// lets go of its own reference to that state when the run ends, and a report
+/// that arrived afterwards reached nothing; applying a report twice consumes
+/// nothing the second time.
+///
+/// A failed drain, a fired watchdog or a refused admission fails the run:
+/// it records a determinism loss, so verification refuses to compare it, and
+/// returns the failure, after the barriers are released.
 #[cfg(feature = "liteinst")]
 async fn settle_in_guest_exits(
     exits: &in_guest_exits::InGuestExitAdmission,
     global_state: &detcore::GlobalState,
-) {
-    if let Err(error) = exits.drain(std::time::Duration::from_secs(10)).await {
-        tracing::warn!("in-guest LiteInst: not every guest exit was reported: {error:?}");
+) -> Result<(), Error> {
+    let drained = exits.drain(std::time::Duration::from_secs(10)).await;
+    for pid in exits.reported_exits() {
+        global_state.complete_physical_process_exit(pid);
     }
     global_state.release_all_physical_process_exits();
+    let failure = exits.failure().or_else(|| {
+        drained
+            .err()
+            .map(|error| format!("not every in-guest LiteInst guest exit was reported: {error:?}"))
+    });
+    match failure {
+        Some(reason) => {
+            detcore::detlog::record_determinism_loss(&reason);
+            Err(Error::msg(reason))
+        }
+        None => Ok(()),
+    }
 }
 
 // TODO-HUMAN-REVIEW(PR-736): Review reserved LiteInst runtime failure statuses.
@@ -3485,8 +3507,8 @@ async fn dispatch_backend(
                     },
                 )
                 .await?;
-            settle_in_guest_exits(&exits, &global_state).await;
-            if liteinst_requires_forced_shutdown(exit_status) {
+            let settled = settle_in_guest_exits(&exits, &global_state).await;
+            if settled.is_err() || liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
@@ -3497,6 +3519,7 @@ async fn dispatch_backend(
                     dispatch_stats,
                 )
                 .await;
+            settled?;
             return Ok(exit_status);
         }
         #[cfg(not(feature = "liteinst"))]
@@ -3776,14 +3799,14 @@ async fn dispatch_output_backend(
                     }
                 })
                 .await?;
-            settle_in_guest_exits(&exits, &global_state).await;
+            let settled = settle_in_guest_exits(&exits, &global_state).await;
             let output = Output {
                 status: output.status.into(),
                 stdout: output.stdout,
                 stderr: output.stderr,
             };
             let status = output.status;
-            if liteinst_requires_forced_shutdown(status) {
+            if settled.is_err() || liteinst_requires_forced_shutdown(status) {
                 global_state.force_shutdown_with_error();
                 global_state.cancel_internal_scheduler().await;
             }
@@ -3794,6 +3817,7 @@ async fn dispatch_output_backend(
                     dispatch_stats,
                 )
                 .await;
+            settled?;
             return Ok(Output {
                 status,
                 stdout: output.stdout,
@@ -4664,6 +4688,39 @@ mod tests {
                 "{name}: {gap}"
             );
         }
+    }
+
+    /// A failure recorded during an in-guest run fails the settle step and
+    /// latches a determinism loss, so verification refuses the run (Codex
+    /// implementation review, HIGH 3 and 4).
+    #[tokio::test]
+    #[cfg(feature = "liteinst")]
+    async fn a_recorded_in_guest_failure_fails_the_run_and_latches_a_loss() {
+        use std::os::fd::FromRawFd;
+
+        use reverie::GlobalTool;
+        use reverie_rpc_transport::ConnectionAdmission;
+
+        let config = DetConfig::default().with_backend(|backend| {
+            backend.process_exits_complete_asynchronously = true;
+        });
+        let global_state = detcore::GlobalState::init_global_state(&config).await;
+        let exits = in_guest_exits::InGuestExitAdmission::default();
+        // Admitting before any reporter is attached is refused and recorded.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, std::process::id() as i32, 0) };
+        assert!(fd >= 0);
+        let pidfd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        assert!(exits.admit(pidfd).is_err());
+        let error = settle_in_guest_exits(&exits, &global_state)
+            .await
+            .expect_err("a recorded failure must fail the run");
+        assert!(
+            error
+                .to_string()
+                .starts_with("in-guest LiteInst refused a guest connection:"),
+            "{error}"
+        );
+        assert!(detcore::detlog::determinism_loss().is_some());
     }
 
     #[test]
