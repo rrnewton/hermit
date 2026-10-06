@@ -47,6 +47,7 @@ use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::refuse_held_signal_loss;
+use crate::syscalls::helpers::result_after_restore;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
@@ -789,9 +790,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             .await
         };
-        if let Some(signals) = &mut signals {
-            signals.restore(guest, mask_cell).await?;
-        }
+        let result = match &mut signals {
+            Some(signals) => result_after_restore(signals.restore(guest, mask_cell).await, result)?,
+            None => result,
+        };
         refuse_held_signal_loss(guest, Sysno::pselect6, result).await
     }
 
@@ -1061,9 +1063,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             .await
         };
-        if let Some(signals) = &mut signals {
-            signals.restore(guest, mask_cell).await?;
-        }
+        let result = match &mut signals {
+            Some(signals) => result_after_restore(signals.restore(guest, mask_cell).await, result)?,
+            None => result,
+        };
         refuse_held_signal_loss(guest, Sysno::select, result).await
     }
 
