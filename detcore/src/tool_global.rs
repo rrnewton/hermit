@@ -4170,7 +4170,7 @@ where
 }
 
 /// What a guest turn tells or asks the scheduler about a `SIGCHLD` that a gated
-/// wait may count (https://github.com/rrnewton/hermit/issues/3146). See the
+/// wait may count (<https://github.com/rrnewton/hermit/issues/3146>). See the
 /// `SIGCHLD` eligibility section of `Scheduler` for why only a deterministic send
 /// makes one eligible.
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
@@ -4661,7 +4661,7 @@ where
 }
 
 /// Record or query `SIGCHLD` eligibility for gated waits
-/// (https://github.com/rrnewton/hermit/issues/3146). Only a `Take` answer is
+/// (<https://github.com/rrnewton/hermit/issues/3146>). Only a `Take` answer is
 /// meaningful; `Mark` and `Flush` answer `false`.
 pub async fn sigchld_eligibility<G, T>(guest: &mut G, request: SigchldEligibilityRequest) -> bool
 where

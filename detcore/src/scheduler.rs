@@ -166,7 +166,7 @@ pub enum SchedValue {
     TimeOut,
     /// A signal ended a futex wait (`SchedResponse::Signaled`), as distinct from a
     /// wakeup or from the `EINTR` value some non-signal early returns carry
-    /// (https://github.com/rrnewton/hermit/issues/3146).
+    /// (<https://github.com/rrnewton/hermit/issues/3146>).
     Signaled,
     // TODO(T137799529) make this more strongly typed, an enum for different scenarios:
     Value(u64),
@@ -231,7 +231,7 @@ pub struct FutexWaiter {
 
 /// What a precise-mode futex waiter's backend tells the scheduler about the
 /// waiter's signals when the wait begins
-/// (https://github.com/rrnewton/hermit/issues/3146).
+/// (<https://github.com/rrnewton/hermit/issues/3146>).
 ///
 /// Only the mask is captured. It belongs to the waiting thread, and only that
 /// thread can change it, so it cannot change while the thread is parked. The
