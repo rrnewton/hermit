@@ -560,13 +560,20 @@ class CellTest(unittest.TestCase):
     def test_only_local_kvm_cells_take_a_slot(self) -> None:
         env = self.slot_env(1)
         self.hold_slot(0)
+        # A cell that waited for the held slot would block for half its deadline, 50 s here,
+        # before running without one. The wall-clock bound sits well below that wait and well
+        # above the few seconds a loaded host adds to a cell's startup (5.7 s measured under a
+        # full local validate, which a 4 s bound reported as a wait).
+        deadline_s = 100
         for backend, route in (("ptrace", "local"), ("dbt", "local"), ("kvm", "re")):
             with self.subTest(backend=backend, route=route):
                 started = time.monotonic()
-                done, result = self.run_cell(backend, HERMIT_E2E_ROUTE=route, **env)
+                done, result = self.run_cell(backend, HERMIT_E2E_ROUTE=route,
+                                             CELL_DEADLINE_S=str(deadline_s), **env)
                 self.assertEqual(done["status"], "passed", done)
                 self.assertEqual((result["kvm_slot"], result["kvm_slot_wait_ms"]), ("", 0), result)
-                self.assertLess(time.monotonic() - started, 4, "a cell that takes no slot must not wait")
+                self.assertLess(time.monotonic() - started, deadline_s / 4,
+                                "a cell that takes no slot must not wait")
 
     def test_bad_kvm_slot_count_is_an_error(self) -> None:
         done, _ = self.run_cell("kvm", **dict(self.slot_env(1), HERMIT_E2E_KVM_SLOTS="0"))
