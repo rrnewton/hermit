@@ -1209,12 +1209,18 @@ fn the_not_ended_call_pairs_cover_every_readiness_call() {
 /// calls saw the pending signal first and returned EINTR in the trial where
 /// the signal was already pending when the call began (`matched=5`).
 fn assert_racing_call(backend: &str, call: &str) {
+    assert_racing_sender(backend, call, "racing");
+}
+
+/// `assert_racing_call` with the guest's `sender`: `racing` sends SIGUSR1 and
+/// `racingchld` sends SIGCHLD, caught in both.
+fn assert_racing_sender(backend: &str, call: &str, sender: &str) {
     assert_cell(
         backend,
         FutexMode::Precise,
-        &[call, "racing"],
+        &[call, sender],
         false,
-        &format!("RESULT call={call} role=racing trials={RACING_TRIALS} matched={RACING_TRIALS}"),
+        &format!("RESULT call={call} role={sender} trials={RACING_TRIALS} matched={RACING_TRIALS}"),
     );
 }
 
@@ -1251,6 +1257,38 @@ fn ptrace_epoll_wait_reports_ebadf_for_a_closed_descriptor_before_a_racing_signa
 #[test]
 fn ptrace_rt_sigtimedwait_reports_efault_for_an_unreadable_set_before_a_racing_signal() {
     assert_racing_call("ptrace", "sigtimedwaitfault");
+}
+
+/// `select` and `pselect6` report a ready descriptor although a caught SIGCHLD
+/// races them: Linux's core_sys_select returns the count of ready descriptors
+/// and looks at pending signals only when none is ready. So in each of the six
+/// trials of the guest's `select racingchld` (glibc's select, which issues
+/// pselect6 with no mask) and `rawselect racingchld` (the select system call),
+/// wherever the sibling's SIGCHLD lands, the call returns 1 with the pipe set
+/// and the handler runs once; each cell is strict-verified. A select wait holds
+/// no signal until it returns (`KernelSignalWait::for_select`), so a pending
+/// caught SIGCHLD does end it when nothing is ready, as on Linux. Before round
+/// 12 of https://github.com/rrnewton/hermit/pull/3361, Hermit read the kernel's
+/// signal state before the first probe of these calls and returned EINTR in a
+/// trial where the signal was already pending when the call began (round-11
+/// self-finding "select and pselect6 report a pending signal before a ready
+/// descriptor or EBADF").
+#[test]
+fn ptrace_selects_report_a_ready_descriptor_before_a_racing_sigchld() {
+    for call in SELECTS {
+        assert_racing_sender("ptrace", call, "racingchld");
+    }
+}
+
+/// `select` and `pselect6` report EBADF for a descriptor that is not open
+/// although a caught SIGUSR1 races them: core_sys_select rejects it
+/// (max_select_fd) before it looks at pending signals. The guest's
+/// `selectbadf racing` and `rawselectbadf racing` cells, as above.
+#[test]
+fn ptrace_selects_report_ebadf_for_a_closed_descriptor_before_a_racing_signal() {
+    for call in ["selectbadf", "rawselectbadf"] {
+        assert_racing_call("ptrace", call);
+    }
 }
 
 /// An ignored, blocked, or default-ignored signal does not end a timed futex wait
