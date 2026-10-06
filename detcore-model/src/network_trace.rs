@@ -514,7 +514,7 @@ fn read_frame<R: Read>(mut reader: R) -> Result<(u32, Vec<u8>), NetworkTraceCode
         .by_ref()
         .take(payload_len)
         .read_to_end(&mut payload)?;
-    if u64::try_from(read).map_err(|_| NetworkTraceCodecError::TooLarge)? != payload_len {
+    if read as u64 != payload_len {
         return Err(NetworkTraceCodecError::Truncated);
     }
     let mut trailing = [0u8; 1];
@@ -544,8 +544,7 @@ fn encode_frame<T: Serialize>(version: u32, value: &T) -> Result<Vec<u8>, Networ
     frame.extend_from_slice(&[0; 8]);
     bincode::serde::encode_into_std_write(value, &mut frame, bincode::config::standard())
         .map_err(NetworkTraceCodecError::Encode)?;
-    let payload_len = u64::try_from(frame.len() - FRAME_HEADER_LEN)
-        .map_err(|_| NetworkTraceCodecError::TooLarge)?;
+    let payload_len = (frame.len() - FRAME_HEADER_LEN) as u64;
     frame[FRAME_HEADER_LEN - 8..FRAME_HEADER_LEN].copy_from_slice(&payload_len.to_le_bytes());
     Ok(frame)
 }
@@ -966,7 +965,6 @@ pub enum NetworkTraceCodecError {
     Truncated,
     BadMagic,
     UnsupportedVersion(u32),
-    TooLarge,
     TrailingData,
     TrailingPayloadData,
     Encode(bincode::error::EncodeError),
@@ -1595,6 +1593,36 @@ mod tests {
             NetworkTraceV2::read_framed(Cursor::new(bytes)).unwrap(),
             trace
         );
+    }
+
+    #[test]
+    fn frames_are_the_header_then_the_bincode_payload() {
+        // The layout every earlier writer produced: magic, version, payload
+        // length, then the payload encoded on its own.
+        let v1 = valid_trace();
+        assert_eq!(framed(&v1), framed_without_validation(&v1));
+        let trace = valid_trace_v2();
+        let wire = NetworkTraceV2Wire {
+            epoch: trace.epoch,
+            channels: trace.channels.clone(),
+            inputs: trace.inputs.clone(),
+            outputs: trace
+                .outputs
+                .iter()
+                .map(|output| NetworkOutputV1 {
+                    channel: output.channel,
+                    stream_offset: output.stream_offset,
+                    bytes: output.bytes.clone(),
+                })
+                .collect(),
+        };
+        let payload = bincode::serde::encode_to_vec(&wire, bincode::config::standard()).unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&NETWORK_TRACE_MAGIC);
+        expected.extend_from_slice(&NETWORK_TRACE_VERSION_V2.to_le_bytes());
+        expected.extend_from_slice(&(payload.len() as u64).to_le_bytes());
+        expected.extend_from_slice(&payload);
+        assert_eq!(trace.encode_framed().unwrap(), expected);
     }
 
     #[test]
