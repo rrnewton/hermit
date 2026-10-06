@@ -1157,6 +1157,45 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(())
     }
 
+    /// The raw identity the `ino:` line of `/proc/*/fdinfo/<target_fd>` is
+    /// keyed on: the descriptor's cached stat, or an `fstat` of it.
+    ///
+    /// With `virtualize_metadata` that is the object's device and inode, as
+    /// `stat` reports them. Without it -- `hermit record` and `hermit replay`
+    /// -- a pipe or a socket is keyed on its inode alone, on device 0, which
+    /// is how its `/proc/<pid>/fd/<fd>` link is keyed in that mode
+    /// (`canonicalize_other_proc_fd_target` and `own_proc_fd_link_identity`),
+    /// so the link's `pipe:[N]` and the fdinfo `ino:` line name one inode, as
+    /// they do on Linux. Every other file keeps its device, so the same inode
+    /// number on two filesystems still names two files
+    /// (<https://github.com/rrnewton/hermit/issues/3307>).
+    ///
+    /// ⚠️ THE FILE TYPE ALONE DECIDES. A named FIFO, or a socket file reached
+    /// through an `O_PATH` descriptor, is keyed on device 0 as well, although
+    /// its link names a path. Its inode can then share a deterministic inode
+    /// with an anonymous pipe or socket whose inode number happens to be
+    /// equal, as every file could before the pool was keyed on devices.
+    pub(crate) async fn fdinfo_raw_file_id<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        target_fd: i32,
+        cached_stat: Option<crate::stat::DetStat>,
+    ) -> Result<RawInode, Error> {
+        let (mode, raw) = match cached_stat {
+            Some(stat) => (stat.mode, stat.raw_inode()),
+            None => {
+                let stat = self.inject_fstat(guest, target_fd).await?;
+                (stat.st_mode, RawInode::new(stat.st_dev, stat.st_ino))
+            }
+        };
+        let pipe_or_socket = matches!(mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK);
+        Ok(if pipe_or_socket && !guest.config().virtualize_metadata {
+            RawInode::new(0, raw.ino)
+        } else {
+            raw
+        })
+    }
+
     /// Inject an extra fstat to retrieve file metadata.
     ///
     /// The kernel needs a writable `struct stat` in the guest. It is staged
@@ -1374,6 +1413,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// reader's own. A path that exists also goes unresolved when
     /// `stat_guest_path` cannot map the transient page it falls back to,
     /// which is not always a function of guest state (see there).
+    ///
+    /// ⚠️ WITHOUT `virtualize_metadata` THE SPLIT REACHES FDINFO TOO. There
+    /// the header's pair keys every line, while the `ino:` line of
+    /// `/proc/*/fdinfo/<fd>` is keyed on `fstat`'s device and inode
+    /// (`fdinfo_raw_file_id`). On btrfs and overlayfs the two devices differ,
+    /// so a file that is both mapped and open shows one inode in `maps` and
+    /// another in its fdinfo, where Linux shows the same number in both.
+    /// `stat` itself is not determinized in that mode. Both values stay
+    /// deterministic.
     ///
     /// Directory entries have the same overlayfs gap: `getdents` keys `d_ino`
     /// on the directory's device (`raw_device_of_fd`), but with `xino=off` and
@@ -2558,13 +2606,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                         deterministic_stdio_inode_for_resource(target_fd, detfd.resource()),
                     )
                 })?;
-            let raw_inode = match cached_stat {
-                Some(stat) => stat.raw_inode(),
-                None => {
-                    let stat = self.inject_fstat(guest, target_fd).await?;
-                    RawInode::new(stat.st_dev, stat.st_ino)
-                }
-            };
+            let raw_inode = self
+                .fdinfo_raw_file_id(guest, target_fd, cached_stat)
+                .await?;
             let virtual_inode = match inode_override {
                 Some(inode) => inode,
                 None => determinize_inode(guest, raw_inode).await.0,
