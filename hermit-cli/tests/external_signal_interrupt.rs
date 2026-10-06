@@ -19,7 +19,14 @@
 //! wait: `poll`, `epoll_wait`, `select`, and a timed futex wait then run to
 //! their 300 ms deadline.
 //!
-//! Every ptrace cell with only Hermit-internal senders runs under
+//! Signal dispositions belong to the whole process, so a sibling can change
+//! one while a waiter is parked. The disposition that counts is the one in
+//! force when the signal arrives, not the one when the wait began: a signal
+//! caught after the wait parked ends it near the 100 ms send, and one ignored
+//! after the wait parked leaves it running to its original deadline. A
+//! SIGCHLD from an exiting child ends a wait whose handler is installed.
+//!
+//! Every cell with only Hermit-internal senders, on both backends, runs under
 //! `--verify --verify-strict` and requires a matched strict report.
 //!
 //! The watchdog lives in this host process, as in
@@ -78,6 +85,16 @@ const QUIET_TIMEOUT_MS: u64 = 300;
 /// wait that a signal at 100 ms restarts with a fresh 300 ms timeout returns
 /// near 400 ms, so the slack must stay well below 100 ms to catch it.
 const QUIET_OVERSHOOT_MS: u64 = 50;
+/// When the guest's in-Hermit senders send their signal, after the wait began.
+const SIGNAL_DELAY_MS: u64 = 100;
+/// Slack past `SIGNAL_DELAY_MS` for a wait the signal must end. Natively these
+/// waits return at 100-101 ms (measured 2026-09-29). A wait the signal did not
+/// end returns at its 300 ms timeout or later, far outside this window.
+const WAKE_SLACK_MS: u64 = 100;
+/// Strict-verified repetitions of each child-exit SIGCHLD cell. The kernel also
+/// posts its own SIGCHLD for the exit at a host-timed moment, so a single
+/// matched pair of runs is weak evidence that the result ignores it.
+const SIGCHLD_TRIALS: usize = 3;
 
 static GUEST: OnceLock<PathBuf> = OnceLock::new();
 
@@ -107,7 +124,8 @@ impl GuestRun {
         )
     }
 
-    /// The `ELAPSED ms=` value a must-not-wake cell prints.
+    /// The `ELAPSED ms=` value a must-not-wake, disposition-change, or
+    /// child-exit cell prints.
     fn elapsed_ms(&self) -> Option<u64> {
         self.stdout
             .lines()
@@ -201,8 +219,7 @@ fn run_cell(backend: &str, mode: FutexMode, args: &[&str], external: bool) -> Gu
     let stdout_writer = fs::File::create(&stdout_path).expect("failed to create guest stdout");
 
     // Strict verification replays the guest, so it needs a sender inside Hermit.
-    let verify_report =
-        (backend == "ptrace" && !external).then(|| trial.path().join("verify.json"));
+    let verify_report = (!external).then(|| trial.path().join("verify.json"));
     let mut command = Command::new(hermit_binary::hermit_binary());
     if verify_report.is_some() {
         command.arg("--log=info");
@@ -405,6 +422,27 @@ fn assert_quiet_cell(backend: &str, mode: FutexMode, args: &[&str], expected: &s
         }),
         "{backend} {mode:?} {args:?}: the wait took {elapsed:?} ms, not its \
          {QUIET_TIMEOUT_MS} ms timeout\n{}",
+        run.describe()
+    );
+    assert_verified(backend, mode, args, &run);
+}
+
+/// A signal the wait must end: the call returns `expected`, and it returned near
+/// the signal, well before any timeout.
+fn assert_woken_cell(backend: &str, mode: FutexMode, args: &[&str], expected: &str) {
+    let run = run_cell(backend, mode, args, false);
+    assert!(
+        run.status.success()
+            && run.result_line() == Some(expected)
+            && run.stdout.lines().any(|line| line == "DONE"),
+        "{backend} {mode:?} {args:?}: expected `{expected}`\n{}",
+        run.describe()
+    );
+    let elapsed = run.elapsed_ms();
+    assert!(
+        elapsed.is_some_and(|ms| (SIGNAL_DELAY_MS..SIGNAL_DELAY_MS + WAKE_SLACK_MS).contains(&ms)),
+        "{backend} {mode:?} {args:?}: the wait took {elapsed:?} ms, not the \
+         {SIGNAL_DELAY_MS} ms until the signal\n{}",
         run.describe()
     );
     assert_verified(backend, mode, args, &run);
@@ -626,4 +664,121 @@ fn child_waits_are_interrupted_by_a_live_sibling_process_signal() {
             );
         }
     }
+}
+
+/// A signal whose disposition a sibling changes to caught while the waiter is
+/// parked ends the wait with EINTR near the send, timed or not, as Linux does:
+/// SIGUSR1 turned from SIG_IGN to a handler, and SIGCHLD turned from its
+/// default to a handler before a child exits. Before
+/// https://github.com/rrnewton/hermit/pull/3361 stopped filtering on the
+/// disposition read when the wait began, the precise wait ran to its timeout
+/// and the untimed one never ended.
+fn assert_caught_after_parking_ends_futex_wait(backend: &str) {
+    for mode in [FutexMode::Precise, FutexMode::Polling] {
+        for flip in ["ign2caught", "chldlate"] {
+            for timed in [None, Some("timed")] {
+                let mut args = vec!["futex", "thread", flip];
+                args.extend(timed);
+                assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
+            }
+        }
+    }
+}
+
+#[test]
+fn ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked() {
+    assert_caught_after_parking_ends_futex_wait("ptrace");
+}
+
+#[test]
+fn liteinst_futex_wait_is_ended_by_a_signal_caught_after_it_parked() {
+    assert_caught_after_parking_ends_futex_wait("liteinst");
+}
+
+/// A signal whose disposition a sibling changes to ignored while the waiter is
+/// parked does not end the wait: a timed wait returns ETIMEDOUT at its original
+/// 300 ms deadline, not after a restart with a fresh timeout, and an untimed
+/// wait is ended only by the sibling's FUTEX_WAKE 200 ms after the signal.
+/// Precise mode reports that wake as 0; polling mode runs its next probe after
+/// the sibling set the word and reports EAGAIN, as in
+/// `untimed_futex_wait_restarts_under_sa_restart`.
+fn assert_ignored_after_parking_leaves_futex_wait(backend: &str) {
+    for mode in [FutexMode::Precise, FutexMode::Polling] {
+        for flip in ["caught2ign", "chldign"] {
+            assert_quiet_cell(
+                backend,
+                mode,
+                &["futex", "thread", flip, "timed"],
+                "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=0",
+            );
+            let untimed = match mode {
+                FutexMode::Precise => "RESULT call=futex ret=0 errno=none handler=0",
+                FutexMode::Polling => "RESULT call=futex ret=-1 errno=EAGAIN handler=0",
+            };
+            assert_quiet_cell(backend, mode, &["futex", "thread", flip], untimed);
+        }
+    }
+}
+
+#[test]
+fn ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked() {
+    assert_ignored_after_parking_leaves_futex_wait("ptrace");
+}
+
+#[test]
+fn liteinst_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked() {
+    assert_ignored_after_parking_leaves_futex_wait("liteinst");
+}
+
+/// A caught SIGCHLD from a child that exits during the wait ends a timed or
+/// untimed futex wait in either mode with EINTR near the exit. Hermit's
+/// scheduler delivers the child-exit SIGCHLD at a deterministic point; the
+/// kernel's own SIGCHLD for the same exit arrives at a host-timed moment and
+/// must not decide the result, so each cell is strict-verified
+/// `SIGCHLD_TRIALS` times.
+fn assert_child_exit_ends_futex_wait(backend: &str) {
+    for _ in 0..SIGCHLD_TRIALS {
+        for mode in [FutexMode::Precise, FutexMode::Polling] {
+            for timed in [None, Some("timed")] {
+                let mut args = vec!["futex", "exit"];
+                args.extend(timed);
+                assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
+            }
+        }
+    }
+}
+
+#[test]
+fn ptrace_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_futex_wait("ptrace");
+}
+
+#[test]
+fn liteinst_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_futex_wait("liteinst");
+}
+
+/// The same child-exit SIGCHLD ends `poll`, `epoll_wait`, and both `select`s
+/// with EINTR near the exit, each strict-verified `SIGCHLD_TRIALS` times.
+fn assert_child_exit_ends_readiness_waits(backend: &str) {
+    for _ in 0..SIGCHLD_TRIALS {
+        for call in READINESS_CALLS {
+            assert_woken_cell(
+                backend,
+                FutexMode::Precise,
+                &[call, "exit"],
+                &format!("RESULT call={call} ret=-1 errno=EINTR handler=1"),
+            );
+        }
+    }
+}
+
+#[test]
+fn ptrace_readiness_waits_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_readiness_waits("ptrace");
+}
+
+#[test]
+fn liteinst_readiness_waits_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
+    assert_child_exit_ends_readiness_waits("liteinst");
 }
