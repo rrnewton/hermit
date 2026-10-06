@@ -1410,5 +1410,65 @@ mod tests {
                 );
             }
         }
+
+        /// `hermit record`: a pipe's own link and the `ino:` line of its
+        /// fdinfo name one deterministic inode, because without
+        /// `virtualize_metadata` both are keyed on the inode alone, on device
+        /// 0. Linux names the same inode in both.
+        #[tokio::test]
+        async fn without_virtualized_metadata_a_pipes_link_and_fdinfo_name_one_inode() {
+            let (reader, device, inode) = pipe_reader();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.config.virtualize_metadata = false;
+            assert_ne!(device, 0, "precondition: pipefs is not device 0");
+            assert_ne!(inode, cached_stdin_inode(&guest));
+            let target = format!("pipe:[{inode}]");
+
+            let link =
+                rewrite_own(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes(), 64).await;
+            let fdinfo = tool
+                .fdinfo_raw_file_id(&mut guest, reader.as_raw_fd(), None)
+                .await
+                .unwrap();
+            let fdinfo_inode = determinize_inode(&mut guest, fdinfo).await.0;
+
+            assert_eq!(
+                fdinfo,
+                RawInode::new(0, inode),
+                "fdinfo must key the pipe as its link does"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&link),
+                format!("pipe:[{}]", fdinfo_inode.as_raw()),
+                "the link and the fdinfo ino: line must name one deterministic inode"
+            );
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [RawInode::new(0, inode), RawInode::new(0, inode)]
+            );
+        }
+
+        /// Control for the test above: without `virtualize_metadata` a
+        /// regular file's fdinfo stays keyed on its device as well as its
+        /// inode, so an equal inode number on another filesystem names
+        /// another file (<https://github.com/rrnewton/hermit/issues/3307>).
+        #[tokio::test]
+        async fn without_virtualized_metadata_fdinfo_keeps_a_regular_files_device() {
+            let file = tempfile::tempfile().unwrap();
+            let metadata = file.metadata().unwrap();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.config.virtualize_metadata = false;
+
+            let fdinfo = tool
+                .fdinfo_raw_file_id(&mut guest, file.as_raw_fd(), None)
+                .await
+                .unwrap();
+
+            assert_eq!(fdinfo, RawInode::new(metadata.dev(), metadata.ino()));
+            assert_eq!(guest.injected, [Sysno::fstat]);
+        }
     }
 }
