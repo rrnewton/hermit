@@ -326,8 +326,10 @@ impl AnonymousProcFdIdentity {
 /// Callers exclude ordinary replacement objects before filling this array.
 ///
 /// When stdio descriptors alias, the LOWEST matching descriptor wins, as in
-/// the maps sanitizer's `stdio_by_raw_file` table. The tracer-side backends
-/// cache the tracer's `fstat(0)` for all three descriptors, so the stdin object
+/// the maps sanitizer's `stdio_by_raw_file` table. Every backend but SaBRe
+/// caches one `fstat(0)` for all three descriptors (`setup_stdio` in
+/// `tool_local.rs`), taken in the process that runs Detcore -- Hermit's on
+/// ptrace and KVM, the guest's on DBT and LiteInst -- so the stdin object
 /// matches every slot, and only the lowest agrees with the guest's `fstat(0)`
 /// and with its own `/proc/self/fd/0` link.
 fn deterministic_stdio_inode_for_raw(
@@ -1015,7 +1017,7 @@ mod tests {
             deterministic_stdio_inode_for_raw(id(55), &aliased),
             Some(DetInode::mint(1001))
         );
-        // What the tracer-side backends cache: fstat(0) in every slot.
+        // What every backend but SaBRe caches: fstat(0) in every slot.
         let all_stdin = [Some(id(66)); 3];
         assert_eq!(
             deterministic_stdio_inode_for_raw(id(66), &all_stdin),

@@ -3246,12 +3246,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             // (https://github.com/rrnewton/hermit/issues/3307).
             //
             // When several stdio descriptors share one raw identity the LOWEST
-            // descriptor's inode wins. The tracer-side backends cache the
-            // tracer's own `fstat(0)` for all three descriptors (see
-            // `setup_stdio`), so every mapping of the stdin file matches all
-            // three; letting the last insert win reported it as stderr's inode
-            // (1002) while `fstat(0)` reports 1000. `namespace.rs`'s
-            // `deterministic_stdio_inode_for_raw` applies the same precedence.
+            // descriptor's inode wins. Every backend but SaBRe caches one
+            // `fstat(0)` for all three descriptors (see `setup_stdio`), taken
+            // in the process that runs Detcore -- Hermit's on ptrace and KVM,
+            // the guest's on DBT and LiteInst -- so every mapping of the stdin
+            // file matches all three; letting the last insert win reported it
+            // as stderr's inode (1002) while `fstat(0)` reports 1000.
+            // `namespace.rs`'s `deterministic_stdio_inode_for_raw` applies the
+            // same precedence.
             let mut stdio_by_raw_file: BTreeMap<RawInode, DetInode> = BTreeMap::new();
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
                 let cached = guest
