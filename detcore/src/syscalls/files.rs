@@ -1720,8 +1720,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// `mountinfo` is read on the tool's side, as the fdinfo mount-id check
     /// reads it: mounts and namespace changes are refused once Detcore
-    /// starts, so the guest's mount table cannot change under it, and no
-    /// guest descriptor is spent.
+    /// starts, so the guest's mount table cannot change under it. On ptrace
+    /// the read spends a tracer descriptor. On DBT, SaBRe and LiteInst the
+    /// tool runs in the guest process and shares its descriptor table, so the
+    /// read holds one guest descriptor until it returns; at the guest's
+    /// descriptor limit it fails, which is a refusal like any other
+    /// `mountinfo` that cannot be read.
     async fn proves_header_device<G: Guest<Self>>(
         guest: &mut G,
         path: &[u8],
