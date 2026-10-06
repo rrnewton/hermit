@@ -28,6 +28,11 @@ mod signal;
 pub(crate) mod socket_timestamp_ioctl;
 mod sysinfo;
 mod threads;
+/// The kernel's view of a guest thread's signals, which the scheduler reads when
+/// it commits a wake for a parked precise-mode futex waiter.
+#[cfg(test)]
+pub(crate) use threads::KernelSignalState;
+pub(crate) use threads::read_kernel_signal_state;
 pub(crate) mod time;
 
 use crate::consts::DET_SPECIAL_INODE_OFFSET;
