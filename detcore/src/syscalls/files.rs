@@ -3116,18 +3116,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_target_fd())?;
         let fdinfo_identity = if let Some(target_fd) = target_fd {
-            let (cached_stat, logical_flags, open_file_id, fd_type, inode_override) =
+            let (logical_flags, open_file_id, fd_type, inode_override) =
                 guest.thread_state().with_detfd(target_fd, |detfd| {
                     (
-                        detfd.stat(),
                         detfd.status_flags(),
                         detfd.open_file_id(),
                         detfd.ty(),
                         deterministic_stdio_inode_for_resource(target_fd, detfd.resource()),
                     )
                 })?;
+            // The descriptor's own identity rather than its cached stat: an
+            // inherited stdio descriptor's cached stat is a stand-in for stdin
+            // (`descriptor_identity_stat`), which keyed the `ino:` line of a
+            // dup of stdout, at descriptor 3 or above, on stdin's file while
+            // its `fstat` reports stdout's.
+            let identity_stat = self.descriptor_identity_stat(guest, target_fd).await?;
             let raw_inode = self
-                .fdinfo_raw_file_id(guest, target_fd, cached_stat, &contents)
+                .fdinfo_raw_file_id(guest, target_fd, identity_stat, &contents)
                 .await?;
             let virtual_inode = match inode_override {
                 Some(inode) => inode,
@@ -3235,8 +3240,11 @@ impl<T: RecordOrReplay> Detcore<T> {
             // A mapping backed by stdio must report the SAME inode fdinfo
             // reports for that fd, which is the fixed `deterministic_stdio_inode`
             // value rather than a pooled one. Matching is by the raw device and
-            // inode `stat` reported for the stdio descriptor, read from its
-            // cached stat.
+            // inode of the stdio descriptor's own identity
+            // (`inherited_stdio_identity_stats`): its own `fstat`, not the
+            // stand-in `setup_stdio` caches for all three descriptors, which
+            // is stdin's file and matched a mapping of stdin's file as stdout
+            // as well even where stdout is another file.
             //
             // The inode alone is not enough: an unrelated file on another
             // filesystem can share the stdio inode number (a fresh tmpfs
@@ -3246,26 +3254,26 @@ impl<T: RecordOrReplay> Detcore<T> {
             // (https://github.com/rrnewton/hermit/issues/3307).
             //
             // When several stdio descriptors share one raw identity the LOWEST
-            // descriptor's inode wins. Every backend but SaBRe caches one
-            // `fstat(0)` for all three descriptors (see `setup_stdio`), taken
-            // in the process that runs Detcore -- Hermit's on ptrace and KVM,
-            // the guest's on DBT and LiteInst -- so every mapping of the stdin
-            // file matches all three; letting the last insert win reported it
-            // as stderr's inode (1002) while `fstat(0)` reports 1000.
-            // `namespace.rs`'s `deterministic_stdio_inode_for_raw` applies the
-            // same precedence.
+            // descriptor's inode wins: `2>&1`, or one terminal on all three,
+            // gives several descriptors one file, which a mapping can name
+            // with only one inode. For stdin's file the lowest is the one
+            // `fstat(0)` reports (1000); letting the last insert win reported
+            // stderr's (1002). Without `virtualize_metadata` every
+            // descriptor's identity is still the stand-in, so every mapping of
+            // the stdin file matches all three. `namespace.rs`'s
+            // `deterministic_stdio_inode_for_raw` applies the same precedence.
+            let stdio_stats = self.inherited_stdio_identity_stats(guest).await?;
             let mut stdio_by_raw_file: BTreeMap<RawInode, DetInode> = BTreeMap::new();
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
-                let cached = guest
+                let inode = guest
                     .thread_state()
                     .with_detfd(fd, |detfd| {
-                        let inode = deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
-                        detfd.stat().map(|stat| (stat.raw_inode(), inode))
+                        deterministic_stdio_inode_for_resource(fd, detfd.resource())
                     })
                     .ok()
                     .flatten();
-                if let Some((raw, det)) = cached {
-                    stdio_by_raw_file.entry(raw).or_insert(det);
+                if let (Some(det), Some(stat)) = (inode, stdio_stats[fd as usize]) {
+                    stdio_by_raw_file.entry(stat.raw_inode()).or_insert(det);
                 }
             }
             // The reader's mapping records describe this snapshot only when it
@@ -6606,6 +6614,97 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(fd as i64)
     }
 
+    /// The stat that identifies the object behind descriptor `fd`, for the
+    /// identity lookups that key a deterministic inode on it; `Ok(None)` when
+    /// Detcore tracks no such descriptor or has no stat for it.
+    ///
+    /// An ordinary descriptor's cached stat is its own and is returned as it
+    /// is. An inherited stdio descriptor, or a dup of one, is the exception:
+    /// `setup_stdio` gives descriptors 0, 1 and 2 one stand-in, the `fstat(0)`
+    /// of the process that runs Detcore (Hermit's on ptrace and KVM, the
+    /// guest's on DBT and LiteInst), so a stdout or stderr on another device
+    /// than stdin, and every dup of one, would be keyed on stdin's file. With
+    /// `virtualize_metadata` its identity is an injected `fstat` of the
+    /// descriptor itself, cached on its open file description
+    /// (`DetFd::identity_stat`), which every alias shares: an alias's `fstat`
+    /// describes the same object, so it does not matter which alias asks
+    /// first.
+    ///
+    /// Without `virtualize_metadata` -- `hermit record` and `hermit replay`
+    /// -- the stand-in is still returned, as before: no `fstat` is injected
+    /// in that mode, as in `handle_mmap`, because at replay it would describe
+    /// the replayer's descriptor rather than the recorded one.
+    ///
+    /// `EBADF` from the `fstat` is the kernel's answer that the descriptor is
+    /// not open, and is returned as that errno. Any other failure means
+    /// Detcore could not ask, and is refused (`identity_lookup_refused`).
+    pub(crate) async fn descriptor_identity_stat<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        fd: RawFd,
+    ) -> Result<Option<DetStat>, Error> {
+        let Ok((stat, stdio, identity_stat)) = guest.thread_state().with_detfd(fd, |detfd| {
+            (
+                detfd.stat(),
+                is_container_stdio(detfd.resource()),
+                detfd.identity_stat(),
+            )
+        }) else {
+            return Ok(None);
+        };
+        if !stdio || !guest.config().virtualize_metadata {
+            return Ok(stat);
+        }
+        if identity_stat.is_some() {
+            return Ok(identity_stat);
+        }
+        match self.inject_fstat(guest, fd).await {
+            Ok(own) => {
+                let own = DetStat::from(own);
+                guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| detfd.set_identity_stat(own))?;
+                Ok(Some(own))
+            }
+            Err(Errno::EBADF) => Err(Error::Errno(Errno::EBADF)),
+            Err(errno) => Err(identity_lookup_refused(
+                "fstat the inherited stdio descriptor",
+                format!("fd {fd}").as_bytes(),
+                errno,
+            )),
+        }
+    }
+
+    /// [`Self::descriptor_identity_stat`] of each inherited stdio descriptor,
+    /// 0 to 2, indexed by descriptor number: `None` where the descriptor is
+    /// not open, or no longer carries an inherited stdio resource
+    /// (`dup2(file, 1)` gives descriptor 1 the file's).
+    pub(crate) async fn inherited_stdio_identity_stats<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<[Option<DetStat>; 3], Error> {
+        let mut stats = [None; 3];
+        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+            let inherited = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| {
+                    deterministic_stdio_inode_for_resource(fd, detfd.resource()).is_some()
+                })
+                .unwrap_or(false);
+            if !inherited {
+                continue;
+            }
+            stats[fd as usize] = match self.descriptor_identity_stat(guest, fd).await {
+                Ok(stat) => stat,
+                // The kernel holds no descriptor there, so no object is that
+                // descriptor's.
+                Err(Error::Errno(Errno::EBADF)) => None,
+                Err(error) => return Err(error),
+            };
+        }
+        Ok(stats)
+    }
+
     /// The raw device of the filesystem an open descriptor refers to.
     ///
     /// getdents system call.
@@ -6860,8 +6959,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// every inode number its entries carry (a mount point's entry names the
     /// directory beneath the mount, on the same device). That is also the
     /// device `stat` reports for each entry, except on overlayfs (see
-    /// `mapping_stat_identity`). It is the cached stat's when Detcore tracks
-    /// `fd`, and an injected `fstat` otherwise.
+    /// `mapping_stat_identity`). It is the device of the descriptor's identity
+    /// stat (`descriptor_identity_stat`: its cached stat, or an inherited
+    /// stdio descriptor's own `fstat` in place of the stand-in it was given)
+    /// when there is one, and an injected `fstat` otherwise.
     ///
     /// A descriptor Detcore does not track (one received over `SCM_RIGHTS`,
     /// for example) has no cached stat, which is not an error: the kernel owns
@@ -6883,11 +6984,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         fd: RawFd,
     ) -> Result<u64, Error> {
-        let cached = guest
-            .thread_state()
-            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.dev))
-            .ok()
-            .flatten();
+        let cached = self
+            .descriptor_identity_stat(guest, fd)
+            .await?
+            .map(|stat| stat.dev);
         match cached {
             Some(device) => Ok(device),
             None => match self.inject_fstat(guest, fd).await {
@@ -10204,6 +10304,161 @@ pub(crate) mod inject_fstat_scratch {
             "a device lookup Detcore could not ask must be a tool error, not an errno \
              for the guest's getdents: {result:?}"
         );
+    }
+
+    // `prog > dir`: the dup's cached stat is the `fstat(0)` stand-in
+    // `setup_stdio` gives every inherited stdio descriptor, so a getdents
+    // through it keyed every entry on stdin's device, and the maps, fdinfo
+    // and `/proc/<pid>/fd` views matched stdin's file as stdout
+    // (https://github.com/rrnewton/hermit/issues/3307).
+    #[tokio::test]
+    async fn stdio_descriptor_identity_is_its_own_fstat_cached_on_its_description() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        let (fd, identity) = stdio_backed_by_a_file(&mut guest);
+
+        let device: Result<u64, Error> = tool.directory_device(&mut guest, fd).await;
+        let again = tool.descriptor_identity_stat(&mut guest, fd).await;
+        // In the guest's table descriptor 1 shares the dup's open file
+        // description, as every alias of one does, so it finds the identity
+        // the dup's lookup cached.
+        let alias = tool
+            .descriptor_identity_stat(&mut guest, libc::STDOUT_FILENO)
+            .await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert_eq!(
+            device.ok(),
+            Some(identity.dev),
+            "a getdents through a stdio dup must key its entries on the file's own device"
+        );
+        assert_eq!(
+            again.ok().flatten().map(|stat| stat.raw_inode()),
+            Some(identity),
+            "a stdio descriptor's identity must be the file's own fstat, not the stand-in"
+        );
+        assert_eq!(
+            alias.ok().flatten().map(|stat| stat.raw_inode()),
+            Some(identity),
+            "every alias of the description must find the one cached identity"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::fstat],
+            "one fstat for the description; every later lookup, through any alias, \
+             must use the cached identity"
+        );
+    }
+
+    #[tokio::test]
+    async fn stdio_descriptor_identity_keeps_the_stand_in_without_virtualized_metadata() {
+        // `hermit record` and `hermit replay`: at replay an fstat would
+        // describe the replayer's descriptor rather than the recorded one.
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.virtualize_metadata = false;
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+        let stand_in = guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+            .unwrap();
+
+        let identity = tool.descriptor_identity_stat(&mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+
+        assert!(
+            stand_in.is_some(),
+            "precondition: the dup carries the stand-in"
+        );
+        assert_eq!(
+            identity.ok().flatten().map(|stat| stat.raw_inode()),
+            stand_in
+        );
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    #[tokio::test]
+    async fn stdio_descriptor_identity_refuses_what_it_could_not_ask() {
+        // No writable stack scratch and no transient page. Answering with the
+        // stand-in here would key the descriptor on stdin's file again.
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let result = tool.descriptor_identity_stat(&mut guest, fd).await;
+        let cached = guest
+            .thread
+            .with_detfd(fd, |detfd| detfd.identity_stat().is_some())
+            .unwrap();
+        close_unless_detcore_did(&guest, fd);
+
+        assert_typed_refusal("stdio identity", result.map(|_| ()), Errno::ENOMEM);
+        assert!(!cached, "a refused lookup must cache nothing");
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "only the failed transient page for the fstat"
+        );
+    }
+
+    // The table the maps and `/proc/<pid>/fd` views match stdio objects
+    // against: each inherited descriptor's own identity, here the test
+    // process's own descriptors 0 to 2, where the stand-in gave all three
+    // the identity of its stdin.
+    #[tokio::test]
+    async fn inherited_stdio_identities_are_each_descriptors_own() {
+        let expected: Vec<Option<RawInode>> = (libc::STDIN_FILENO..=libc::STDERR_FILENO)
+            .map(|fd| {
+                let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+                (unsafe { libc::fstat(fd, &mut stat) } == 0)
+                    .then(|| RawInode::new(stat.st_dev, stat.st_ino))
+            })
+            .collect();
+        assert!(
+            expected.iter().all(Option::is_some),
+            "precondition: the test process's descriptors 0 to 2 are open: {expected:?}"
+        );
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+
+        let first = tool.inherited_stdio_identity_stats(&mut guest).await;
+        let injected_first = std::mem::take(&mut guest.injected);
+        let second = tool.inherited_stdio_identity_stats(&mut guest).await;
+
+        let identities = |stats: Result<[Option<crate::stat::DetStat>; 3], Error>| {
+            stats
+                .expect("the test process's descriptors can be asked")
+                .map(|stat| stat.map(|stat| stat.raw_inode()))
+                .to_vec()
+        };
+        assert_eq!(identities(first), expected);
+        assert_eq!(identities(second), expected);
+        assert_eq!(
+            injected_first,
+            [Sysno::fstat, Sysno::fstat, Sysno::fstat],
+            "one fstat per inherited descriptor"
+        );
+        assert!(
+            guest.injected.is_empty(),
+            "a second lookup must use the cached identities: injected {:?}",
+            guest.injected
+        );
+
+        // Without virtualize_metadata the stand-ins, as before, and no fstat.
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.virtualize_metadata = false;
+        let stand_ins: Vec<Option<RawInode>> = (libc::STDIN_FILENO..=libc::STDERR_FILENO)
+            .map(|fd| {
+                guest
+                    .thread
+                    .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+        assert!(
+            stand_ins.iter().all(Option::is_some),
+            "precondition: the scripted guest tracks descriptors 0 to 2: {stand_ins:?}"
+        );
+        let recorded = tool.inherited_stdio_identity_stats(&mut guest).await;
+        assert_eq!(identities(recorded), stand_ins);
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
     }
 
     #[tokio::test]
