@@ -676,6 +676,12 @@ jobs:
           require -s target/install_pkg/rsrcs/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so
           require -s target/validate/libreverie_liteinst.so.revision
+          # The in-guest LiteInst runtime. Hermit and the CLI tests look for it
+          # beside the Cargo-built hermit in target/validate; build.workspace
+          # builds it, but a consumer sees only what this tarball carries (run
+          # 37383177918: run_liteinst_finds_the_runtime_staged_as_an_installed_resource
+          # failed with "target/validate/libdetcore_liteinst.so is missing").
+          require -s target/validate/libdetcore_liteinst.so
           if ((missing > 0)); then
             echo "Pack debug prebuilt tree: $missing required input(s) missing; nothing was packed" >&2
             exit 1
@@ -712,6 +718,7 @@ jobs:
             target/validate/deps/libdetcore_dbt.so \
             target/validate/libreverie_liteinst.so \
             target/validate/libreverie_liteinst.so.revision \
+            target/validate/libdetcore_liteinst.so \
             target/install_pkg \
             target/ci/bin/cargo-nextest \
             target/ci/nextest-binaries \
@@ -1005,6 +1012,7 @@ jobs:
           test -x target/validate/verification-report
           test -x target/debug/nextest-cpu-wrapper
           test -f target/validate/deps/libdetcore_dbt.so
+          test -f target/validate/libdetcore_liteinst.so
           test -f target/install_pkg/rsrcs/libdetcore_dbt.so
           test -x target/ci/bin/cargo-nextest
           test -f target/ci/nextest-binaries/current.json
