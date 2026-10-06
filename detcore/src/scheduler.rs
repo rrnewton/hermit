@@ -728,6 +728,18 @@ pub struct Scheduler {
     /// (`Scheduler::note_inbound_sigchld`).
     sigchld_taken: BTreeMap<DetTid, SigchldQueue>,
 
+    /// Threads whose reservation in `sigchld_taken` has already answered one
+    /// gated wait. That wait returned its restart errno and the kernel dequeued
+    /// the signal as the call returned, so the reservation names no pending
+    /// signal once the thread runs on, whether or not the backend reported the
+    /// delivery: pinned Reverie delivers a signal it held during an injection
+    /// without a report when another signal is pending. A reservation is
+    /// therefore single-use. A later take by the same thread retires an
+    /// answered one instead of finding it again, and so does the thread's next
+    /// syscall or preemption (`Scheduler::retire_answered_sigchld`). A subset of
+    /// `sigchld_taken`'s keys.
+    sigchld_answered: BTreeSet<DetTid>,
+
     /// Parents whose kernel `SIGCHLD` a child's logical death made eligible
     /// (`Scheduler::note_child_exit_sigchld`), each with the thread the kernel
     /// tries first: the one that created the child. A logical death is recorded
@@ -1932,6 +1944,7 @@ impl Scheduler {
             sigchld_eligible_threads: Default::default(),
             sigchld_eligible_processes: Default::default(),
             sigchld_taken: Default::default(),
+            sigchld_answered: Default::default(),
             pending_child_exit_sigchld: Default::default(),
             sigchld_child_exit_timers: Default::default(),
             #[cfg(test)]
@@ -2487,7 +2500,7 @@ impl Scheduler {
         // A shared one it had reserved is still pending on its process's queue,
         // for another thread to take.
         self.sigchld_eligible_threads.remove(dtid);
-        if let Some(SigchldQueue::Process(process)) = self.sigchld_taken.remove(dtid) {
+        if let Some(SigchldQueue::Process(process)) = self.release_sigchld_reservation(*dtid) {
             self.sigchld_eligible_processes.insert(process);
         }
 
@@ -4416,10 +4429,20 @@ impl Scheduler {
     /// whether a `SIGCHLD` it found pending (`pending`) counts. The wait issues
     /// this whenever `SIGCHLD` could interrupt it, pending or not, so the
     /// question itself is part of the deterministic schedule. A `true` answer
-    /// takes one mark, or finds the one this thread already reserved: the wait
-    /// then returns its restart errno and the kernel delivers the signal as the
-    /// call returns. A `false` answer with nothing pending also releases a
-    /// reservation this thread held, since the signal it named is gone.
+    /// takes one mark, or finds the one a committed wake reserved for this
+    /// thread: the wait then returns its restart errno and the kernel delivers
+    /// the signal as the call returns. A `false` answer with nothing pending
+    /// also releases a reservation this thread held, since the signal it named
+    /// is gone.
+    ///
+    /// A reservation answers one wait (`sigchld_answered`). A true answer ends
+    /// the wait, so a later take by the same thread comes from a later wait, by
+    /// which time the kernel has dequeued the signal the answer named. The
+    /// backend may not have reported that delivery, so the reservation can still
+    /// be held: it is retired here instead of answering again, and the take goes
+    /// on as if it were absent. Otherwise a reservation that outlived its
+    /// signal would count a later `SIGCHLD` nobody marked, at a turn set by host
+    /// timing.
     ///
     /// A `SIGCHLD` pending for a process that never had a child counts without
     /// a mark: the kernel sends `SIGCHLD` for a child only to the child's
@@ -4429,13 +4452,16 @@ impl Scheduler {
     /// changes no answer.
     pub(crate) fn sigchld_eligible(&mut self, thread: DetTid, pending: bool) -> bool {
         if !pending {
-            self.sigchld_taken.remove(&thread);
+            self.release_sigchld_reservation(thread);
             return false;
         }
-        self.take_sigchld_eligibility(thread)
-            || !self
-                .thread_tree
-                .process_had_child(&self.sigchld_process(thread))
+        if self.take_sigchld_eligibility(thread) {
+            self.sigchld_answered.insert(thread);
+            return true;
+        }
+        !self
+            .thread_tree
+            .process_had_child(&self.sigchld_process(thread))
     }
 
     /// Take one mark for a `SIGCHLD` that `thread` is about to be interrupted by,
@@ -4443,12 +4469,16 @@ impl Scheduler {
     /// its process's shared queue. The taken mark is remembered as `thread`'s
     /// reservation (`sigchld_taken`), so the delivery the backend then reports
     /// for `thread` accounts for it instead of clearing another mark
-    /// (`note_inbound_sigchld`). A thread that already holds a reservation takes
-    /// nothing more: its woken wait re-checking after the step2 drain took the
-    /// mark for it finds the same signal.
+    /// (`note_inbound_sigchld`). A thread whose reservation has not answered a
+    /// wait yet takes nothing more: its woken wait re-checking after the step2
+    /// drain took the mark for it finds the same signal. A reservation that has
+    /// answered one is stale (`sigchld_answered`) and is retired first.
     fn take_sigchld_eligibility(&mut self, thread: DetTid) -> bool {
         if self.sigchld_taken.contains_key(&thread) {
-            return true;
+            if !self.sigchld_answered.contains(&thread) {
+                return true;
+            }
+            self.release_sigchld_reservation(thread);
         }
         let process = self.sigchld_process(thread);
         let queue = if self.sigchld_eligible_threads.remove(&thread) {
@@ -4460,6 +4490,32 @@ impl Scheduler {
         };
         self.sigchld_taken.insert(thread, queue);
         true
+    }
+
+    /// Release `thread`'s reservation, answered or not, returning the queue it
+    /// named.
+    fn release_sigchld_reservation(&mut self, thread: DetTid) -> Option<SigchldQueue> {
+        self.sigchld_answered.remove(&thread);
+        self.sigchld_taken.remove(&thread)
+    }
+
+    /// `thread`, whose gated wait a reserved `SIGCHLD` answered, entered its next
+    /// syscall or was preempted. The answered wait returned before either, and
+    /// the kernel dequeued the signal as it returned, so the reservation names
+    /// no pending signal even when the backend did not report that delivery
+    /// (`sigchld_answered`). Retiring it here, at a point the thread always
+    /// reaches before it runs on into another turn, keeps it from absorbing a
+    /// later send to the same queue (`sigchld_reserved_on`) or from claiming a
+    /// later delivery (`note_inbound_sigchld`). A reservation a committed wake
+    /// took for a parked waiter that has not re-checked yet is kept.
+    pub(crate) fn retire_answered_sigchld(&mut self, thread: DetTid) {
+        if self.sigchld_answered.contains(&thread) {
+            trace!(
+                "[dtid {}] retiring the SIGCHLD reservation its gated wait answered",
+                thread
+            );
+            self.release_sigchld_reservation(thread);
+        }
     }
 
     /// Whether a thread's reservation names a `SIGCHLD` still pending on `queue`
@@ -4489,14 +4545,14 @@ impl Scheduler {
     /// wait that took the mark, not by host timing.
     fn note_inbound_sigchld(&mut self, thread: DetTid) -> bool {
         if self.sigchld_taken.get(&thread) == Some(&SigchldQueue::Thread) {
-            self.sigchld_taken.remove(&thread);
+            self.release_sigchld_reservation(thread);
             return true;
         }
         if self.sigchld_eligible_threads.remove(&thread) {
             return false;
         }
         if let Some(SigchldQueue::Process(_)) = self.sigchld_taken.get(&thread) {
-            self.sigchld_taken.remove(&thread);
+            self.release_sigchld_reservation(thread);
             return true;
         }
         let process = self.sigchld_process(thread);
@@ -4507,6 +4563,9 @@ impl Scheduler {
         // a reserved shared `SIGCHLD` is the only one that queue held.
         self.sigchld_taken
             .retain(|_, reserved| *reserved != SigchldQueue::Process(process));
+        let taken = &self.sigchld_taken;
+        self.sigchld_answered
+            .retain(|thread| taken.contains_key(thread));
         false
     }
 
@@ -4527,6 +4586,9 @@ impl Scheduler {
         self.sigchld_eligible_threads
             .retain(|thread| !in_process(thread));
         self.sigchld_taken.retain(|thread, _| !in_process(thread));
+        let taken = &self.sigchld_taken;
+        self.sigchld_answered
+            .retain(|thread| taken.contains_key(thread));
         self.sigchld_eligible_processes.remove(&process);
     }
 
@@ -9381,9 +9443,9 @@ mod test {
     }
 
     /// A gated wait counts a pending `SIGCHLD` only when a deterministic sender
-    /// marked one, and one mark answers one delivery: the thread that took it
-    /// finds it again until the backend reports the delivery, and nobody finds
-    /// it after (https://github.com/rrnewton/hermit/issues/3146).
+    /// marked one, and one mark answers one delivery: a parked waiter whose
+    /// committed wake took it finds it at its own re-check, and nobody finds it
+    /// after (https://github.com/rrnewton/hermit/issues/3146).
     #[test]
     fn a_gated_wait_counts_a_sigchld_only_with_a_mark_and_a_pending_signal() {
         let mut scheduler = sigchld_gated_scheduler();
@@ -9411,10 +9473,6 @@ mod test {
             scheduler.sigchld_taken.get(&thread),
             Some(&SigchldQueue::Process(process))
         );
-        assert!(
-            scheduler.sigchld_eligible(thread, true),
-            "the woken wait's own re-check finds the signal it reserved"
-        );
         assert_eq!(scheduler.sigchld_taken.len(), 1);
         assert!(scheduler.note_inbound_sigchld(thread));
         assert!(scheduler.sigchld_taken.is_empty());
@@ -9423,12 +9481,136 @@ mod test {
             "one mark answers one delivery"
         );
 
+        // The step2 drain's committed wake takes the mark for a parked waiter,
+        // whose own re-check then finds the signal reserved for it.
+        scheduler.mark_sigchld_eligible(thread, Some(process));
+        assert!(scheduler.take_sigchld_eligibility(thread));
+        assert!(scheduler.sigchld_eligible_processes.is_empty());
+        assert!(
+            scheduler.sigchld_eligible(thread, true),
+            "the woken wait's own re-check finds the signal it reserved"
+        );
+        assert_eq!(scheduler.sigchld_taken.len(), 1);
+        assert!(scheduler.note_inbound_sigchld(thread));
+        assert!(scheduler.sigchld_taken.is_empty());
+        assert!(scheduler.sigchld_answered.is_empty());
+
         // A re-check that finds nothing pending releases the reservation.
         scheduler.mark_sigchld_eligible(thread, Some(process));
         assert!(scheduler.sigchld_eligible(thread, true));
         assert!(!scheduler.sigchld_eligible(thread, false));
         assert!(scheduler.sigchld_taken.is_empty());
         assert!(scheduler.sigchld_eligible_processes.is_empty());
+    }
+
+    /// A reservation answers one wait. Pinned Reverie delivers a `SIGCHLD` it
+    /// held during an injection without an `InboundSignal` report when another
+    /// signal is pending, so the reservation a wait's answer used can outlive
+    /// the signal it named. The thread's next take must not find it again: a
+    /// later `SIGCHLD` that nobody marked, which may be the kernel's host-timed
+    /// report of a child's exit, would then end that wait at a turn set by host
+    /// timing (round-8 High 2 on https://github.com/rrnewton/hermit/pull/3361).
+    #[test]
+    fn a_reservation_answers_one_wait_even_when_its_delivery_is_not_reported() {
+        let mut scheduler = sigchld_gated_scheduler();
+        let thread = DetTid::from_raw(100);
+        let process = DetPid::from_raw(100);
+        scheduler.thread_tree.add_child(thread, thread, true);
+        scheduler
+            .thread_tree
+            .add_child(thread, DetTid::from_raw(101), true);
+
+        for queue in [Some(process), None] {
+            scheduler.mark_sigchld_eligible(thread, queue);
+            assert!(scheduler.sigchld_eligible(thread, true));
+            // The kernel delivers the signal as the wait returns; the backend
+            // does not report it, so `note_inbound_sigchld` never runs.
+            assert!(
+                !scheduler.sigchld_eligible(thread, true),
+                "a reservation that answered a wait counted an unmarked SIGCHLD ({:?})",
+                queue
+            );
+            assert!(scheduler.sigchld_taken.is_empty());
+            assert!(scheduler.sigchld_answered.is_empty());
+        }
+
+        // The answered reservation is retired, not re-armed: a later mark is
+        // taken afresh and answers exactly one more wait.
+        scheduler.mark_sigchld_eligible(thread, Some(process));
+        assert!(scheduler.sigchld_eligible(thread, true));
+        assert!(!scheduler.sigchld_eligible(thread, true));
+        assert!(scheduler.sigchld_eligible_processes.is_empty());
+
+        // A committed wake that finds an answered reservation still held takes
+        // the new mark instead of reusing the stale one.
+        scheduler.mark_sigchld_eligible(thread, Some(process));
+        assert!(scheduler.sigchld_eligible(thread, true));
+        scheduler.mark_sigchld_eligible(thread, None);
+        assert!(scheduler.take_sigchld_eligibility(thread));
+        assert!(scheduler.sigchld_eligible_threads.is_empty());
+        assert_eq!(
+            scheduler.sigchld_taken.get(&thread),
+            Some(&SigchldQueue::Thread)
+        );
+        assert!(!scheduler.sigchld_answered.contains(&thread));
+        assert!(scheduler.sigchld_eligible(thread, true));
+    }
+
+    /// The thread's next handler retires the reservation its answered wait used
+    /// (`retire_answered_sigchld`), so a stale reservation neither absorbs a
+    /// later send to the same queue nor claims a later delivery. Both would
+    /// otherwise depend on whether the backend reported the first delivery,
+    /// which pinned Reverie decides from whether another signal is pending
+    /// (round-8 High 2 on https://github.com/rrnewton/hermit/pull/3361). A
+    /// reservation a committed wake took for a waiter that has not re-checked
+    /// yet is kept.
+    #[test]
+    fn the_next_handler_retires_a_reservation_whose_delivery_was_not_reported() {
+        let mut scheduler = sigchld_gated_scheduler();
+        let thread = DetTid::from_raw(100);
+        let sibling = DetTid::from_raw(101);
+        let process = DetPid::from_raw(100);
+        scheduler.thread_tree.add_child(thread, thread, true);
+        scheduler.thread_tree.add_child(thread, sibling, false);
+        scheduler
+            .thread_tree
+            .add_child(thread, DetTid::from_raw(102), true);
+
+        // The wait's answer reserves the shared signal; its delivery goes
+        // unreported, and the thread's next handler retires the reservation.
+        scheduler.mark_sigchld_eligible(thread, Some(process));
+        assert!(scheduler.sigchld_eligible(thread, true));
+        scheduler.retire_answered_sigchld(thread);
+        assert!(scheduler.sigchld_taken.is_empty());
+        assert!(scheduler.sigchld_answered.is_empty());
+
+        // A sibling's later send is a new pending signal and gets its own mark,
+        // which another waiter of the process may take.
+        scheduler.mark_sigchld_eligible(sibling, Some(process));
+        assert!(
+            scheduler.sigchld_eligible_processes.contains(&process),
+            "a stale reservation absorbed a send made after its signal was dequeued"
+        );
+
+        // A later delivery to the thread is accounted for as an unreserved one:
+        // it clears the mark for the queue it emptied and its handler turn is
+        // not granted as if the scheduler had placed it.
+        assert!(!scheduler.note_inbound_sigchld(thread));
+        assert!(scheduler.sigchld_eligible_processes.is_empty());
+
+        // A committed wake's reservation has not answered a wait yet: the
+        // waiter's handlers before its re-check leave it in place.
+        scheduler.mark_sigchld_eligible(thread, Some(process));
+        assert!(scheduler.take_sigchld_eligibility(thread));
+        scheduler.retire_answered_sigchld(thread);
+        assert_eq!(
+            scheduler.sigchld_taken.get(&thread),
+            Some(&SigchldQueue::Process(process))
+        );
+        assert!(scheduler.sigchld_eligible(thread, true));
+        assert!(scheduler.note_inbound_sigchld(thread));
+        assert!(scheduler.sigchld_taken.is_empty());
+        assert!(scheduler.sigchld_answered.is_empty());
     }
 
     /// The kernel sends `SIGCHLD` for a child only to the child's parent, so a
