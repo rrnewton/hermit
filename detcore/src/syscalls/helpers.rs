@@ -1847,6 +1847,10 @@ pub(crate) struct KernelSignalWait {
     /// The errno that ends the wait for an interrupting signal: the restart code
     /// Linux uses for the call (`NonblockableSyscall::kernel_restart_errno`).
     restart_errno: Errno,
+    /// Whether a pending `SIGCHLD` must also be made eligible by the scheduler
+    /// before it ends the wait (`gates_sigchld`). Every wait is gated except
+    /// `select`'s and `pselect6`'s (`for_select`).
+    sigchld_gated: bool,
     /// The guest's own mask while the wait runs with every signal blocked.
     saved_mask: Option<KernelSigset>,
     /// `block` could not change the mask, so probes run under the guest's own.
@@ -1907,9 +1911,42 @@ impl KernelSignalWait {
             consumed,
             defers_default_stops,
             restart_errno,
+            sigchld_gated: true,
             saved_mask: None,
             unblockable: false,
             held: None,
+        }
+    }
+
+    /// The wait of `select`, or of `pselect6` without a temporary mask, which a
+    /// pending `SIGCHLD` that could interrupt it ends without asking the
+    /// scheduler (`gates_sigchld` is false).
+    ///
+    /// Linux ends these calls with `ERESTARTNOHAND` whenever no descriptor is
+    /// ready and a signal is pending (`core_sys_select`), so a caught `SIGCHLD`
+    /// ends them whoever sent it. Detcore's select and pselect6 waits did the
+    /// same before the gate existed: their probes ran under the guest's own
+    /// mask, and a pending caught signal stopped one. The gate cannot tell a
+    /// `SIGCHLD` sent from outside the container from the kernel's report of a
+    /// child event, because `/proc` shows no siginfo, so in a process that has
+    /// had a child it would hold the external one until the scheduler made
+    /// another `SIGCHLD` eligible, which may never happen
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    ///
+    /// The cost is the one those earlier waits paid. In these two calls, the
+    /// `SIGCHLD` the kernel posts for a child's exit, stop or continue ends the
+    /// wait at the first turn whose read sees it, and host timing decides which
+    /// turn that is when the kernel's copy comes before the scheduler's
+    /// `ChildExit` send, or when there is no such send. Every other wait keeps
+    /// the gate.
+    pub(crate) fn for_select<T, G>(guest: &G) -> Self
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        Self {
+            sigchld_gated: false,
+            ..Self::new(guest, 0, false, Errno::ERESTARTNOHAND)
         }
     }
 
@@ -1927,13 +1964,14 @@ impl KernelSignalWait {
     }
 
     /// Whether a pending `SIGCHLD` counts only once the scheduler made it eligible
-    /// (`eligible_pending_signals`).
+    /// (`eligible_pending_signals`): in every wait but `select`'s and
+    /// `pselect6`'s (`for_select`), when the scheduler tracks eligibility.
     fn gates_sigchld<T, G>(&self, guest: &G) -> bool
     where
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
-        sigchld_eligibility_is_tracked(guest)
+        self.sigchld_gated && sigchld_eligibility_is_tracked(guest)
     }
 
     /// `interrupted_with_state` without the state, for the tests.
@@ -1953,10 +1991,12 @@ impl KernelSignalWait {
     /// intercepted, so such a signal arrived while the call was waiting, and Linux
     /// returns the restart errno for that. Linux would still report sources that
     /// were ready when the call began, which this check puts behind the signal, as
-    /// the scheduler's `Signaled` path did. A `SIGCHLD` counts only once the
-    /// scheduler made it eligible (`eligible_pending_signals`), and a `SIGCHLD` that
-    /// the backend holds since `inject_absorbing` absorbed it counts as pending. A
-    /// failed read is never returned as the call's errno (`read_wait_signal_state`).
+    /// the scheduler's `Signaled` path did. In a gated wait (`gates_sigchld`), a
+    /// `SIGCHLD` counts only once the scheduler made it eligible
+    /// (`eligible_pending_signals`); the waits of `select` and `pselect6` do not
+    /// ask (`for_select`). A `SIGCHLD` that the backend holds since
+    /// `inject_absorbing` absorbed it counts as pending. A failed read is never
+    /// returned as the call's errno (`read_wait_signal_state`).
     pub(crate) async fn interrupted_with_state<T, G>(
         &self,
         guest: &mut G,
@@ -1969,7 +2009,11 @@ impl KernelSignalWait {
         let could_interrupt = self.could_interrupt(&state);
         let held = self.held.map_or(0, |held| kernel_sigset_bit(held.signal));
         let pending = (state.pending | held) & could_interrupt;
-        let interrupting = eligible_pending_signals(guest, pending, could_interrupt).await;
+        let interrupting = if self.gates_sigchld(guest) {
+            eligible_pending_signals(guest, pending, could_interrupt).await
+        } else {
+            pending
+        };
         if interrupting != 0 {
             tracing::trace!(
                 "[tid {}] pending signals {:#x} interrupt a blocking wait",
@@ -1996,8 +2040,9 @@ impl KernelSignalWait {
     /// - A signal the wait consumes (`consumed`) ends it with `ERESTARTNOINTR`:
     ///   it is delivered rather than consumed, and the call runs again.
     /// - A signal that would end the wait natively ends it with the restart
-    ///   errno, except a `SIGCHLD` the scheduler has not made eligible, which is
-    ///   held and counts in `interrupted_with_state` once it is.
+    ///   errno, except, in a gated wait (`gates_sigchld`), a `SIGCHLD`, which is
+    ///   held and counts in `interrupted_with_state` once the scheduler makes it
+    ///   eligible.
     /// - Any other `SIGCHLD`, and a default job-control stop that the wait
     ///   defers, are held, and so are an ignored signal and a default-ignored
     ///   one. The injection runs again.
@@ -2037,13 +2082,13 @@ impl KernelSignalWait {
     /// `/proc` once, as it did before injections absorbed stops. The caller must
     /// run nothing between the two that resumes the guest thread or changes its
     /// signal state. `retry_blocking_wait_with_kernel_signal_state`, which serves
-    /// poll, epoll_wait, futex, wait4, rt_sigtimedwait and pipe and socket IO,
-    /// runs nothing there; the `select` and `pselect6` waits write the probe's
-    /// timeout and descriptor sets into guest memory, which Detcore in a tracer
-    /// (ptrace, LiteInst's default runtime) does without resuming the thread. So
-    /// between the two reads the guest thread stays stopped and only it can
-    /// change its own mask, and with threads sequentialized no other guest thread
-    /// runs in its turn, so a signal that arrives meanwhile arrives at a
+    /// ppoll, poll, epoll_pwait, epoll_wait, rt_sigtimedwait and polling futex
+    /// waits, runs nothing there; the `select` and `pselect6` waits write the
+    /// probe's timeout and descriptor sets into guest memory, which Detcore in a
+    /// tracer (ptrace, LiteInst's default runtime) does without resuming the
+    /// thread. So between the two reads the guest thread stays stopped and only
+    /// it can change its own mask, and with threads sequentialized no other guest
+    /// thread runs in its turn, so a signal that arrives meanwhile arrives at a
     /// host-timed moment: sent from outside the guest, or posted by the kernel.
     /// A signal that the full mask blocks stays pending, cannot stop the
     /// injection, and is classified at the next turn's read, as one that arrives
@@ -2667,6 +2712,9 @@ mod kernel_signal_wait_failures {
     use crate::syscalls::threads::KernelSignalState;
     use crate::syscalls::threads::kernel_sigset_bit;
     use crate::syscalls::threads::signal_state_read_seam;
+    use crate::tool_global::GlobalRequest;
+    use crate::tool_global::GlobalResponse;
+    use crate::tool_global::SigchldEligibilityRequest;
     use crate::types::DetPid;
 
     /// What an injected `rt_sigprocmask` does.
@@ -2763,6 +2811,11 @@ mod kernel_signal_wait_failures {
         commit_fails: bool,
         arena: Box<[u64; ARENA_WORDS]>,
         kernel: Kernel,
+        /// The scheduler's answer to a `SIGCHLD` eligibility `Take`
+        /// (`sigchld_tracking_guest`); while `None`, every RPC panics.
+        sigchld_answer: Option<bool>,
+        /// The `SIGCHLD` eligibility requests the waits sent, in order.
+        sigchld_requests: Mutex<Vec<SigchldEligibilityRequest>>,
     }
 
     impl WaitGuest {
@@ -2783,6 +2836,8 @@ mod kernel_signal_wait_failures {
                 commit_fails: false,
                 arena: Box::new([u64::MAX; ARENA_WORDS]),
                 kernel: kernel.clone(),
+                sigchld_answer: None,
+                sigchld_requests: Mutex::new(Vec::new()),
             };
             (guest, kernel)
         }
@@ -2819,7 +2874,18 @@ mod kernel_signal_wait_failures {
             &self,
             message: <GlobalState as GlobalTool>::Request,
         ) -> <GlobalState as GlobalTool>::Response {
-            panic!("these waits must not send an RPC: {:?}", message.2)
+            match (message.2, self.sigchld_answer) {
+                (
+                    GlobalRequest::SigchldEligibility(
+                        request @ SigchldEligibilityRequest::Take { .. },
+                    ),
+                    Some(answer),
+                ) => {
+                    self.sigchld_requests.lock().unwrap().push(request);
+                    (None, GlobalResponse::SigchldEligibility(answer))
+                }
+                (request, _) => panic!("these waits must not send an RPC: {request:?}"),
+            }
         }
         fn config(&self) -> &Config {
             &self.config
@@ -3236,6 +3302,106 @@ mod kernel_signal_wait_failures {
         );
         assert_eq!(kernel.pending, kernel_sigset_bit(libc::SIGWINCH));
         assert_eq!(wait.held.map(|held| held.kind), Some(HeldKind::Precious));
+    }
+
+    /// A guest whose scheduler tracks `SIGCHLD` eligibility, as with threads
+    /// sequentialized on a backend that reports the kernel's signal state, and
+    /// answers every `Take` with `answer`. It is the container's first thread,
+    /// so its RPCs pass `send_and_update_time`'s identity check. A caught
+    /// `SIGCHLD` is pending, outside the guest's mask.
+    fn sigchld_tracking_guest(answer: bool) -> (WaitGuest, Kernel) {
+        let (mut guest, kernel) = WaitGuest::new(Pid::from_raw(1), guest_mask());
+        guest.config.sequentialize_threads = true;
+        guest
+            .config
+            .backend_supports_blocked_wait_signal_interruption = true;
+        guest.sigchld_answer = Some(answer);
+        {
+            let mut kernel = kernel.lock().unwrap();
+            kernel.pending = kernel_sigset_bit(libc::SIGCHLD);
+            kernel.caught = kernel_sigset_bit(libc::SIGCHLD);
+        }
+        (guest, kernel)
+    }
+
+    /// A `SIGCHLD` sent from outside the container to a process that has had a
+    /// child is pending and caught, and the scheduler never makes it eligible,
+    /// because `/proc` cannot tell it from the kernel's report of a child event
+    /// (https://github.com/rrnewton/hermit/issues/3146). A gated wait asks and
+    /// keeps waiting. The waits of `select` and `pselect6` end for it without
+    /// asking, as Linux ends them for any caught signal (`core_sys_select`);
+    /// gated, they waited until their timeout or forever.
+    #[tokio::test]
+    async fn a_pending_caught_sigchld_ends_a_select_wait_without_asking_the_scheduler() {
+        let (mut guest, kernel) = sigchld_tracking_guest(false);
+        let _proc = scripted_proc(&kernel);
+
+        let gated = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        assert!(
+            !gated.interrupted(&mut guest).await.unwrap(),
+            "a gated wait goes on while the scheduler has not made the SIGCHLD eligible"
+        );
+        assert_eq!(
+            *guest.sigchld_requests.lock().unwrap(),
+            vec![SigchldEligibilityRequest::Take {
+                thread: DetTid::from_raw(1),
+                pending: true,
+            }]
+        );
+
+        let select = KernelSignalWait::for_select(&guest);
+        assert!(
+            select.interrupted(&mut guest).await.unwrap(),
+            "the pending caught SIGCHLD ends a select wait"
+        );
+        assert_eq!(
+            guest.sigchld_requests.lock().unwrap().len(),
+            1,
+            "a select wait does not ask the scheduler"
+        );
+        assert_eq!(
+            kernel.lock().unwrap().pending,
+            kernel_sigset_bit(libc::SIGCHLD),
+            "the signal stays queued for the guest's handler"
+        );
+    }
+
+    /// The same `SIGCHLD` ends a select wait before its probe is injected, with
+    /// `ERESTARTNOHAND`, which the handler's run turns into `EINTR`. A gated
+    /// wait makes the injection, and the `SIGCHLD` that stops it is held until
+    /// the scheduler makes it eligible.
+    #[tokio::test]
+    async fn a_pending_caught_sigchld_ends_a_select_wait_before_the_injection() {
+        let (mut guest, kernel) = sigchld_tracking_guest(false);
+        kernel.lock().unwrap().stops_for_pending = true;
+        let _proc = scripted_proc(&kernel);
+
+        let mut select = KernelSignalWait::for_select(&guest);
+        let result = inject_mask_absorbing(&mut select, &mut guest, guest_mask()).await;
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTNOHAND))),
+            "{result:?}"
+        );
+        {
+            let kernel = kernel.lock().unwrap();
+            assert!(kernel.requested.is_empty(), "nothing is injected");
+            assert_eq!(kernel.pending, kernel_sigset_bit(libc::SIGCHLD));
+        }
+        assert_eq!(select.held, None);
+
+        let mut gated = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND);
+        let result = inject_mask_absorbing(&mut gated, &mut guest, guest_mask()).await;
+        assert!(matches!(result, Ok(Ok(0))), "{result:?}");
+        {
+            let kernel = kernel.lock().unwrap();
+            assert_eq!(kernel.taken, vec![libc::SIGCHLD]);
+            assert_eq!(kernel.requested.len(), 2, "stopped once, then ran");
+        }
+        assert_eq!(gated.held.map(|held| held.kind), Some(HeldKind::Precious));
+        assert!(
+            guest.sigchld_requests.lock().unwrap().is_empty(),
+            "an injection does not ask the scheduler"
+        );
     }
 
     /// The kernel's next dequeue: the private queue before the shared one, a

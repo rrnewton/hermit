@@ -12,7 +12,8 @@
  *            <external|process|thread|timer|exit> [restart] [timed] [warm]
  *            [ignored|blocked|winch|tstp|ign2caught|caught2ign|chldlate|chldign|
  *             chldkill|chldthrexit|chldpend|stealgrp|stealkill|stealthrexit|
- *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2]
+ *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
+ *             extchld|extchldreaped|extchldlive]
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
  * select system call itself. `sem` is glibc's sem_timedwait, a FUTEX_WAIT_BITSET
@@ -132,6 +133,23 @@
  * waits, boundedly, for both handlers and prints how often each ran on a
  * HANDLED line (`HANDLED usr1=1 usr2=1` when neither signal was lost).
  *
+ * `extchld`, `extchldreaped` and `extchldlive` need the `external` sender and
+ * the `select` or `rawselect` call, whose wait is then unbounded. The guest
+ * catches SIGCHLD (flags 0), and the harness sends SIGCHLD rather than SIGUSR1
+ * with kill(2), so its siginfo code is SI_USER, not a child event.
+ *   extchld:       the process never has a child.
+ *   extchldreaped: before READY the guest forks a child that exits at once and
+ *                  reaps it, sets SIGCHLD to SIG_DFL, which discards that
+ *                  child's SIGCHLD if it is still pending, and only then
+ *                  installs the handler, so the handler cannot run for it.
+ *   extchldlive:   before READY the guest forks a child that stays blocked
+ *                  reading a pipe until the guest closes the pipe after the
+ *                  RESULT line. The child first changes its copy of argv[0],
+ *                  so the harness, which looks the guest up by argv[0],
+ *                  signals the parent alone.
+ * Linux ends the wait with EINTR as soon as the signal arrives, with or
+ * without a child, and the handler has run once by the RESULT line.
+ *
  * Output is one deterministic RESULT line after the call returns, followed
  * by DONE once every helper has been reaped. A kernel-internal errno, which has
  * no name, prints as UNNAMED(<number>). */
@@ -181,6 +199,8 @@ static enum role role = ROLE_NONE;
 /* How the child of the `exit` sender or of a role dies. */
 enum death { DEATH_GROUP, DEATH_KILL, DEATH_THREXIT };
 static enum death death = DEATH_GROUP;
+/* A caught SIGCHLD sent from outside Hermit (see the usage comment). */
+enum extchld { EXTCHLD_NONE, EXTCHLD_CHILDLESS, EXTCHLD_REAPED, EXTCHLD_LIVE };
 /* The fork role's own wait on sibling_word, as the main thread reports it. */
 static uint32_t sibling_word = 0;
 static long sibling_ret = 0;
@@ -468,7 +488,7 @@ int main(int argc, char **argv) {
         "<external|process|thread|timer|exit> [restart] [timed] [warm] "
         "[ignored|blocked|winch|tstp|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit|"
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
-        "spinthrexit|usr2]\n");
+        "spinthrexit|usr2|extchld|extchldreaped|extchldlive]\n");
     return 2;
   }
   /* Before any handler is installed: the handler compares against it. */
@@ -476,6 +496,7 @@ int main(int argc, char **argv) {
   const char *call = argv[1];
   const char *sender = argv[2];
   int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
+  enum extchld extchld = EXTCHLD_NONE;
   static const struct {
     const char *name;
     enum role role;
@@ -517,9 +538,13 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "chldthrexit")) flip = CHLDTHREXIT;
     else if (!strcmp(argv[i], "chldpend")) flip = CHLDPEND;
     else if (!strcmp(argv[i], "usr2")) usr2 = 1;
+    else if (!strcmp(argv[i], "extchld")) extchld = EXTCHLD_CHILDLESS;
+    else if (!strcmp(argv[i], "extchldreaped")) extchld = EXTCHLD_REAPED;
+    else if (!strcmp(argv[i], "extchldlive")) extchld = EXTCHLD_LIVE;
     else return 2;
   }
-  if (ignored + blocked + (sent_signal == SIGWINCH) + tstp + (flip != FLIP_NONE) + options + usr2 >
+  if (ignored + blocked + (sent_signal == SIGWINCH) + tstp + (flip != FLIP_NONE) + options + usr2 +
+          (extchld != EXTCHLD_NONE) >
       1)
     return 2;
   flip_timed = timed;
@@ -550,6 +575,9 @@ int main(int argc, char **argv) {
   if (warm && !is_futex && !is_rawselect && !is_sem && !is_wait) return 2;
   if (is_sem && timed) return 2;
   if (usr2 && strcmp(sender, "external")) return 2;
+  if (extchld != EXTCHLD_NONE && (strcmp(sender, "external") || restart || timed || warm || quiet ||
+                                  (!is_rawselect && strcmp(call, "select"))))
+    return 2;
   int report_elapsed =
       quiet || flip != FLIP_NONE || from_exit || role != ROLE_NONE || warm || (is_wait && restart);
   stamp_handler = is_wait && restart;
@@ -612,6 +640,46 @@ int main(int argc, char **argv) {
   pid_t parent = getpid();
   pid_t child = -1;
   pthread_t thread;
+  if (extchld == EXTCHLD_REAPED) {
+    pid_t reaped = fork();
+    if (reaped < 0) return 3;
+    if (reaped == 0) _exit(0);
+    int st;
+    while (waitpid(reaped, &st, 0) < 0)
+      if (errno != EINTR) return 3;
+    /* Setting SIG_DFL discards a pending SIGCHLD (POSIX sigaction, Linux
+     * do_sigaction), so the handler installed next cannot run for this child. */
+    struct sigaction dfl;
+    memset(&dfl, 0, sizeof dfl);
+    dfl.sa_handler = SIG_DFL;
+    sigemptyset(&dfl.sa_mask);
+    if (sigaction(SIGCHLD, &dfl, NULL) != 0) return 3;
+  }
+  if (extchld != EXTCHLD_NONE && sigaction(SIGCHLD, &sa, NULL) != 0) return 3;
+  if (extchld == EXTCHLD_LIVE) {
+    int renamed[2];
+    if (pipe(renamed) != 0) return 3;
+    child = fork();
+    if (child < 0) return 3;
+    if (child == 0) {
+      /* The harness signals the one process whose argv[0] is the guest's path.
+       * Change this copy of argv[0] in place, so that process is the parent,
+       * and tell the parent before it prints READY. */
+      argv[0][0] = '-';
+      close(renamed[0]);
+      if (write(renamed[1], "x", 1) != 1) _exit(9);
+      close(renamed[1]);
+      /* Stay alive until the parent closes the pipe after its RESULT line. */
+      close(pfd[1]);
+      char c;
+      ssize_t r = read(pfd[0], &c, 1);
+      _exit(r == 0 ? 7 : 8);
+    }
+    close(renamed[1]);
+    char c;
+    if (read(renamed[0], &c, 1) != 1) return 3;
+    close(renamed[0]);
+  }
   if (from_exit) {
     child = fork();
     if (child < 0) return 3;
