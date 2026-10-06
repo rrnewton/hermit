@@ -1024,7 +1024,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // in_guest_exits admission tests retain all 902 prior IDs: 909.
     // The exit watchdog's six tests (in_guest_exits) retain all 909: 915.
     // The two verification-latch tests and the in-guest kernel-floor test retain all 915: 918.
-    ("test.hermit_unit", 918),
+    // The watcher's two auto-reap tests retain all 918: 920.
+    ("test.hermit_unit", 920),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1421,7 +1422,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/actions/runs/37489014478) retains
     // all 165: 165 + 1 = 166, listed the same way.
     // The two in-guest FUSE tests (ruling A) and the userfaultfd test (ruling D.2): 169.
-    ("test.cli", 169),
+    // The exit-reaping and unscheduled-death probes (C3.5 evidence): 171.
+    ("test.cli", 171),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1510,7 +1512,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 134 (135, listed with this node's arguments); it starts no LiteInst
     // guest, so the filterset is unchanged: 166 - 31 = 135.
     // The host twin selects the same three exit-dependency tests: 138.
-    ("test.cli_on_host", 138),
+    // The host twin selects the same two probes: 140.
+    ("test.cli_on_host", 140),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
@@ -1621,7 +1624,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same seven watcher and admission tests: 909.
     // The host twin selects the same six watchdog tests: 915.
     // The host twin selects the same three latch and kernel-floor tests: 918.
-    ("test.hermit_unit_on_host", 918),
+    // The host twin selects the same two auto-reap tests: 920.
+    ("test.hermit_unit_on_host", 920),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

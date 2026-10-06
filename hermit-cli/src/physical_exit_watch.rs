@@ -1031,4 +1031,79 @@ mod tests {
         );
         child.reap();
     }
+
+    /// A parent that auto-reaps (SIGCHLD set to SIG_IGN, or SA_NOCLDWAIT)
+    /// never holds a zombie: the kernel reaps the child as it exits. The exit
+    /// is still reported exactly once, through the reaped (ECHILD) path of the
+    /// publication barrier. The disposition is process-wide, so each case runs
+    /// alone in a fresh process.
+    #[test]
+    fn a_child_of_a_parent_ignoring_sigchld_is_reported_once() {
+        if std::env::var_os(INNER_RUN).is_none() {
+            return run_in_fresh_process(
+                "physical_exit_watch::tests::a_child_of_a_parent_ignoring_sigchld_is_reported_once",
+                false,
+            );
+        }
+        auto_reaped_inner(libc::SIG_IGN, 0);
+    }
+
+    #[test]
+    fn a_child_of_a_parent_with_sa_nocldwait_is_reported_once() {
+        if std::env::var_os(INNER_RUN).is_none() {
+            return run_in_fresh_process(
+                "physical_exit_watch::tests::a_child_of_a_parent_with_sa_nocldwait_is_reported_once",
+                false,
+            );
+        }
+        auto_reaped_inner(libc::SIG_DFL, libc::SA_NOCLDWAIT);
+    }
+
+    fn auto_reaped_inner(handler: libc::sighandler_t, flags: libc::c_int) {
+        let mut action: libc::sigaction = unsafe { std::mem::zeroed() };
+        action.sa_sigaction = handler;
+        action.sa_flags = flags;
+        assert_eq!(
+            unsafe { libc::sigaction(libc::SIGCHLD, &action, std::ptr::null_mut()) },
+            0
+        );
+        let (sender, receiver) = mpsc::channel();
+        let watch = PhysicalExitWatch::new(move |pid| sender.send(pid).unwrap()).unwrap();
+        for _ in 0..20 {
+            // The child waits on a pipe until it is watched, so it cannot be
+            // reaped before its pidfd exists.
+            let mut pipe = [0; 2];
+            assert_eq!(
+                unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) },
+                0
+            );
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                let mut byte = 0u8;
+                unsafe {
+                    libc::close(pipe[1]);
+                    libc::read(pipe[0], (&raw mut byte).cast(), 1);
+                    libc::_exit(0)
+                };
+            }
+            unsafe { libc::close(pipe[0]) };
+            watch.watch(pidfd_open(pid as u32), pid).unwrap();
+            unsafe { libc::close(pipe[1]) };
+            assert_eq!(receiver.recv_timeout(Duration::from_secs(30)).unwrap(), pid);
+            // Auto-reaped: there is no zombie left to collect.
+            let mut status = 0;
+            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, -1);
+            assert_eq!(
+                io::Error::last_os_error().raw_os_error(),
+                Some(libc::ECHILD)
+            );
+        }
+        watch.drain(Duration::from_secs(30)).unwrap();
+        drop(watch);
+        assert!(
+            receiver.try_recv().is_err(),
+            "an exit was reported more than once"
+        );
+    }
 }

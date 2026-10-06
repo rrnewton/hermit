@@ -331,6 +331,12 @@
       "why": "tests/c/exec_clock_continuity.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this self-re-execing guest and asserts that guest virtual time is strictly monotonic ACROSS the execve boundary, comparing pre-exec and post-exec CLOCK_REALTIME samples handed through argv; it remains a guest fixture because a generic manifest cannot express the exec-boundary hand-off contract or the cross-image ordering assertion."
     },
     {
+      "disposition": "guest-fixture",
+      "path": "tests/c/exit_reaping_probe.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/exit_reaping_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this auto-reap and SIGCHLD probe and runs its three modes under strict verification on ptrace and on in-guest LiteInst, asserting the same exact output from both; it remains a guest fixture because a generic manifest cannot express one program run in three modes with per-mode expected lines on two backends in one test."
+    },
+    {
       "disposition": "manifest-test",
       "path": "tests/c/faccessat2_flags.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
@@ -2003,6 +2009,12 @@
       "path": "tests/c/unix_autobind_stream.c",
       "runner": "target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false)",
       "why": "tests/c/unix_autobind_stream.c is owned by target/debug/test-harness via tests/e2e/manifests/c-programs.yaml (explicit mode selection; ci=false): Direct C guest is centrally discoverable with ptrace verification enabled for explicit runs; it remains outside blocking CI until its standalone build and output contract are calibrated"
+    },
+    {
+      "disposition": "guest-fixture",
+      "path": "tests/c/unscheduled_exit_probe.c",
+      "runner": "hermit-cli/tests/cli.rs",
+      "why": "tests/c/unscheduled_exit_probe.c is owned by hermit-cli/tests/cli.rs: The Rust CLI integration test compiles this probe of host-timed deaths (PR_SET_PDEATHSIG, a killed vfork parent), requires each in-guest LiteInst run to complete with its output, and requires verification to refuse with a recorded determinism loss; it remains a guest fixture because a generic manifest cannot express an expected verification refusal."
     },
     {
       "disposition": "manifest-test",

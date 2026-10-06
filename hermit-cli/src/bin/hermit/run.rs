@@ -6120,6 +6120,14 @@ impl RunOpts {
             }
         };
         let mut out1 = out1;
+        // The latches first: a determinism loss is named as one, even when its
+        // loss notice also reached the forwarded records.
+        if let Err(error) = latches1.refuse_comparison("run 1") {
+            if self.keep_logs {
+                retain_verification_logs([("run 1", log1_path)])?;
+            }
+            return Err(error);
+        }
         let forwarded_syscalls1 =
             match self.take_forwarded_detlogs(&log1_path, &mut out1.stderr, forwarded1) {
                 Ok(count) => count,
@@ -6130,12 +6138,6 @@ impl RunOpts {
                     return Err(error);
                 }
             };
-        if let Err(error) = latches1.refuse_comparison("run 1") {
-            if self.keep_logs {
-                retain_verification_logs([("run 1", log1_path)])?;
-            }
-            return Err(error);
-        }
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -6292,6 +6294,12 @@ impl RunOpts {
             }
         };
         let mut out2 = out2;
+        if let Err(error) = latches2.refuse_comparison("run 2") {
+            if self.keep_logs {
+                retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+            }
+            return Err(error);
+        }
         if let Some(forwarded_syscalls1) = forwarded_syscalls1 {
             let backend = if self.selected_backend() == Backend::Sabre {
                 "SaBRe"
@@ -6322,12 +6330,6 @@ impl RunOpts {
             eprintln!(
                 ":: {backend} syscall DETLOG records included: run1={forwarded_syscalls1}, run2={forwarded_syscalls2}"
             );
-        }
-        if let Err(error) = latches2.refuse_comparison("run 2") {
-            if self.keep_logs {
-                retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
-            }
-            return Err(error);
         }
 
         // Say what was actually established. Buffer hashing is ON BY DEFAULT, so

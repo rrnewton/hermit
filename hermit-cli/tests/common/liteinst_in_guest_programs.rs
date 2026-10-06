@@ -61,6 +61,8 @@ use super::hermit_run_guard;
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static USERFAULTFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static EXIT_REAPING_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static UNSCHEDULED_EXIT_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPRESSED_FIXTURES: OnceLock<[PathBuf; 2]> = OnceLock::new();
@@ -1422,4 +1424,160 @@ fn liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem() {
         .expect("failed to run Hermit LiteInst");
     let output = assert_liteinst_in_guest_output(output);
     assert_eq!(output.stdout, expected, "{}", file.display());
+}
+
+/// Compiles `tests/c/<name>.c` once per test process into `cell`.
+fn c_guest(cell: &'static OnceLock<PathBuf>, name: &str) -> &'static Path {
+    cell.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        fs::create_dir_all(&build_root).expect("failed to create LiteInst guest directory");
+        let guest = build_root.join(name);
+        let source = repository.join(format!("tests/c/{name}.c"));
+        let output = Command::new("cc")
+            .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(&source)
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to run cc");
+        assert!(
+            output.status.success(),
+            "{} compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            source.display(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// The C3.5 auto-reap and SIGCHLD cases (dev-hermit
+/// ai_docs/transient/liteinst-inguest-exit-control-design-20261006.md,
+/// "Evidence planned"), under strict verification on ptrace and on in-guest
+/// LiteInst, whose exits hold the schedule until they are physically
+/// complete. The parent blocks SIGCHLD and learns of each exit from EOF on a
+/// pipe the child held. Every run matches, and both backends print the same
+/// lines:
+///
+/// - SA_NOCLDWAIT: wait reports ECHILD (auto-reaped) and SIGCHLD is pending,
+///   as on Linux.
+/// - a raw exit system call: SIGCHLD is pending and wait returns status 7, as
+///   on Linux.
+/// - SIGCHLD ignored: wait reports ECHILD, as on Linux. The pending bit is
+///   compared only between the backends: Linux sends no SIGCHLD to a parent
+///   that ignores it (`do_notify_parent`), but both Hermit backends leave one
+///   pending today, a Detcore defect outside exit completion.
+#[test]
+fn liteinst_in_guest_exit_reaping_matches_ptrace() {
+    let _guard = hermit_run_guard();
+    let guest = c_guest(&EXIT_REAPING_GUEST, "exit_reaping_probe");
+    for (mode, pending, wait, status) in [
+        ("sigign", None, "ECHILD", -1),
+        ("nocldwait", Some(1), "ECHILD", -1),
+        ("rawexit", Some(1), "child", 7),
+    ] {
+        let mut outputs = Vec::new();
+        for backend in ["ptrace", "liteinst"] {
+            let mut command = Command::new(hermit_binary());
+            command.args(["--log=info", "--backend", backend, "run"]);
+            if backend == "liteinst" {
+                command.arg("--max-timeslice=disabled");
+            }
+            let output = command
+                .args(["--strict", "--verify", "--verify-strict", "--"])
+                .arg(guest)
+                .arg(mode)
+                .stdin(Stdio::null())
+                .output()
+                .expect("failed to run Hermit");
+            let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                output.status.success(),
+                "{backend} {mode}: status={:?}\nstdout={stdout}\nstderr={stderr}",
+                output.status
+            );
+            assert!(
+                stderr.contains("bitwise parity established"),
+                "{backend} {mode}: {stderr}"
+            );
+            let lines: Vec<&str> = stdout.lines().collect();
+            assert_eq!(lines.len(), 3, "{backend} {mode}: {stdout}");
+            for (round, line) in lines.iter().enumerate() {
+                let prefix = format!("{mode} round={round} read=0 sigchld_pending=");
+                let suffix = format!(" wait={wait} status={status}");
+                assert!(
+                    line.starts_with(&prefix) && line.ends_with(&suffix),
+                    "{backend} {mode}: {line}"
+                );
+                if let Some(pending) = pending {
+                    assert_eq!(
+                        *line,
+                        format!("{prefix}{pending}{suffix}"),
+                        "{backend} {mode}"
+                    );
+                }
+            }
+            outputs.push(stdout);
+        }
+        assert_eq!(
+            outputs[0], outputs[1],
+            "{mode}: ptrace and in-guest LiteInst differ"
+        );
+    }
+}
+
+/// Processes that die at a moment the host chooses, without an exit system
+/// call of their own: a child killed by PR_SET_PDEATHSIG while its parent
+/// exits, and a vfork parent killed by its child while the grandparent goes
+/// on. In-guest LiteInst cannot schedule such a death, so it retires the
+/// process when its exit completes and records a determinism loss (the C3.5
+/// design's consumption case). Each run completes with the program's output,
+/// never a hang, and verification refuses to compare it, never a match.
+#[test]
+fn liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification() {
+    let _guard = hermit_run_guard();
+    let guest = c_guest(&UNSCHEDULED_EXIT_GUEST, "unscheduled_exit_probe");
+    for (mode, expected) in [
+        (
+            "pdeathsig",
+            "parent exits with its child armed\npdeathsig parent-status=0 armed-child-gone=1\n",
+        ),
+        (
+            "vfork-parent-killed",
+            "vfork-parent-killed parent-signal=9 surviving-work-done=1\n",
+        ),
+    ] {
+        let output = liteinst_command("info")
+            .arg("--")
+            .arg(guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit LiteInst");
+        let output = assert_liteinst_in_guest_output(output);
+        assert_eq!(String::from_utf8_lossy(&output.stdout), expected, "{mode}");
+
+        let output = liteinst_command("info")
+            .args(["--verify", "--verify-strict", "--"])
+            .arg(guest)
+            .arg(mode)
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run Hermit LiteInst with --verify");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !output.status.success(),
+            "{mode}: verification matched: {stderr}"
+        );
+        assert!(
+            stderr.contains("run 1: determinism loss recorded: process ")
+                && stderr.contains(" exited without deregistering; its exit was not scheduled"),
+            "{mode}: {stderr}"
+        );
+        assert!(!stderr.contains("Determinism verified"), "{mode}: {stderr}");
+    }
 }
