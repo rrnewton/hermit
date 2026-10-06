@@ -7337,8 +7337,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// entry removed or replaced after the read. `device` also keys the
     /// entry when the guest's filesystem answers that the name reaches
     /// nothing (`ENOENT`, `ENOTDIR`, `ELOOP`, `ENAMETOOLONG`, or `EACCES`
-    /// from a directory that may be read but not searched), where no `stat`
-    /// the guest makes of the entry can report a contradicting identity.
+    /// from a directory that may be read but not searched). That is a guess,
+    /// not a proof. No `stat` through this name can contradict it, but the
+    /// same object may have another link, in a directory the guest can
+    /// search, whose `stat` reports it on another device; then the two views
+    /// key different identities. This is a known gap.
     ///
     /// Any other failure is a refusal, and `ESRCH` its errno, as for every
     /// guest stat (see [`Self::stat_guest_path`]). The getdents has already
