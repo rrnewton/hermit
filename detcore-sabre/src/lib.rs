@@ -113,6 +113,30 @@ fn remember_coordinator_socket(
     })
 }
 
+// The coordinator publishes its fingerprint in the environment of the image it
+// starts, and take_private_env erases it there. A forked child constructs the
+// plugin again from the parent's memory, where the variable is already gone, so
+// without this memo the child took the "published no fingerprint" branch and
+// wrote that warning, with this build's fingerprint, to the guest's own fd 2.
+// Fork inherits this slot as it inherits RPC_SOCKET; execve starts a new image,
+// where reverie-sabre re-injects the REVERIE_SABRE_* variables.
+static COORDINATOR_FINGERPRINT: OnceLock<Option<String>> = OnceLock::new();
+
+/// What the coordinator published to this process image (`None`: nothing),
+/// read once. The flag is true only for the call that read it; later calls,
+/// including a forked child's construction, reuse that reading.
+fn remember_coordinator_fingerprint(
+    slot: &OnceLock<Option<String>>,
+    take: impl FnOnce() -> Option<String>,
+) -> (Option<String>, bool) {
+    let mut first = false;
+    let published = slot.get_or_init(|| {
+        first = true;
+        take()
+    });
+    (published.clone(), first)
+}
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-845): Review SaBRe guest comm-name restoration.
 fn guest_comm_from_args(args: impl IntoIterator<Item = OsString>) -> Option<CString> {
@@ -286,9 +310,12 @@ impl Plugin {
     /// Checked BEFORE the RPC connect so the mismatch is reported instead of
     /// being re-encountered as a codec error a few frames later.
     fn check_coordinator_compatibility() {
-        // SAFETY: plugin construction runs before SaBRe starts guest callbacks.
-        let expected = unsafe { sabre::take_private_env(CONFIG_FINGERPRINT_ENV) }
-            .map(|v| v.to_string_lossy().into_owned());
+        let (expected, first_reading) =
+            remember_coordinator_fingerprint(&COORDINATOR_FINGERPRINT, || {
+                // SAFETY: plugin construction runs before SaBRe starts guest callbacks.
+                unsafe { sabre::take_private_env(CONFIG_FINGERPRINT_ENV) }
+                    .map(|v| v.to_string_lossy().into_owned())
+            });
         let ours = config_wire_fingerprint();
         match expected {
             Some(expected) if expected == ours => {}
@@ -301,11 +328,13 @@ impl Plugin {
             // An older coordinator does not publish the fingerprint. Say so and
             // continue: refusing here would break pairs that are actually fine,
             // and a guard that rejects matched pairs is worse than no guard.
-            None => eprintln!(
+            None if first_reading => eprintln!(
                 "detcore-sabre: coordinator published no configuration and clock RPC fingerprint \
                  ({CONFIG_FINGERPRINT_ENV} unset); proceeding unguarded. This plugin's fingerprint \
                  is {ours}."
             ),
+            // A forked child of an image that already said so.
+            None => {}
         }
     }
 
@@ -822,6 +851,30 @@ mod tests {
         assert_eq!(
             remember_coordinator_socket(&socket, None),
             Some(PathBuf::from("/tmp/coordinator.sock"))
+        );
+    }
+
+    #[test]
+    fn coordinator_fingerprint_survives_plugin_reinitialization() {
+        let published = OnceLock::new();
+        assert_eq!(
+            remember_coordinator_fingerprint(&published, || Some("0123456789abcdef".to_owned())),
+            (Some("0123456789abcdef".to_owned()), true)
+        );
+        // A forked child's construction finds the variable already erased.
+        assert_eq!(
+            remember_coordinator_fingerprint(&published, || None),
+            (Some("0123456789abcdef".to_owned()), false)
+        );
+
+        let unpublished = OnceLock::new();
+        assert_eq!(
+            remember_coordinator_fingerprint(&unpublished, || None),
+            (None, true)
+        );
+        assert_eq!(
+            remember_coordinator_fingerprint(&unpublished, || panic!("read twice")),
+            (None, false)
         );
     }
 

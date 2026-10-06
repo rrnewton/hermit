@@ -971,6 +971,95 @@ int main(void) {
     assert_backend_parity_and_sabre_verify(&program, &[], &loader, "public libc getrandom");
 }
 
+/// The SaBRe plugin is constructed again in every forked child. Before the
+/// coordinator fingerprint was remembered across fork, that construction wrote
+/// the plugin's "published no fingerprint" warning, with build-dependent bytes,
+/// to the child's fd 2. This guest points its stderr at a pipe, forks a child
+/// that only exits, and reports what the child's stderr received. The parity
+/// runs use `--log=warn`, and at that level the pipe must receive nothing on
+/// either backend: the warning is gone. This does not claim that the plugin
+/// never writes to a forked child's fd 2: at `--log=info` the inherited DETLOG
+/// forwarder still writes the child's records there, and the INFO `--verify`
+/// run at the end checks only that those bytes repeat.
+#[test]
+fn sabre_forked_child_gets_no_plugin_warning_on_guest_stderr() {
+    let Some(loader) = sabre_loader() else {
+        return;
+    };
+
+    let guest_dir = tempfile::Builder::new()
+        .prefix("sabre-fork-stderr-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create SaBRe fork-stderr guest directory");
+    let source = guest_dir.path().join("fork-stderr.c");
+    let program = guest_dir.path().join("fork-stderr");
+    std::fs::write(
+        &source,
+        r#"#include <stdio.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+int main(void) {
+  int pipefd[2];
+  int saved = dup(2);
+  if (saved < 0 || pipe(pipefd) != 0) return 1;
+  if (dup2(pipefd[1], 2) != 2) return 2;
+  close(pipefd[1]);
+  pid_t child = fork();
+  if (child < 0) return 3;
+  if (child == 0) _exit(0);
+  if (dup2(saved, 2) != 2) return 4;
+  close(saved);
+  int status;
+  if (waitpid(child, &status, 0) != child || !WIFEXITED(status) ||
+      WEXITSTATUS(status) != 0)
+    return 5;
+  char bytes[4096];
+  size_t total = 0;
+  ssize_t count;
+  while ((count = read(pipefd[0], bytes, sizeof(bytes))) > 0) {
+    fwrite(bytes, 1, (size_t)count, stdout);
+    total += (size_t)count;
+  }
+  if (count < 0) return 6;
+  printf("forked child wrote %zu bytes to its stderr\n", total);
+  return 0;
+}
+"#,
+    )
+    .expect("failed to write SaBRe fork-stderr guest source");
+    let build = Command::new("cc")
+        .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+        .arg(&source)
+        .arg("-o")
+        .arg(&program)
+        .output()
+        .expect("failed to compile SaBRe fork-stderr guest");
+    assert!(
+        build.status.success(),
+        "fork-stderr guest compilation failed:\n{}",
+        String::from_utf8_lossy(&build.stderr),
+    );
+
+    const EXPECTED: &str = "forked child wrote 0 bytes to its stderr\n";
+    let ptrace = parity_run(&program, &[], None, "ptrace forked-child stderr");
+    let sabre = parity_run(&program, &[], Some(&loader), "SaBRe forked-child stderr");
+    for (output, backend) in [(&ptrace, "ptrace"), (&sabre, "SaBRe")] {
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "{backend} fork-stderr guest failed: {output:?}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            EXPECTED,
+            "{backend}: a forked child's guest stderr received bytes at --log=warn",
+        );
+    }
+    assert_eq!(sabre.stderr, ptrace.stderr, "stderr parity: fork-stderr");
+    assert_sabre_verify(&program, &[], &loader, "fork-stderr");
+}
+
 /// SaBRe's dispatch record: its rewrite sites are measured, and every tracer
 /// syscall-exit stop follows an entry stop.
 #[test]

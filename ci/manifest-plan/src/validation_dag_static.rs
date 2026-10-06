@@ -779,7 +779,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // canonical_verdict::tests::the_exact_branch_counter_verdict_is_optional_and_strictly_typed,
     // which manifest-plan path-includes, retains all 975 (976, measured with
     // cargo nextest list).
-    ("test.regular_crates", 976),
+    // detcore-sabre's tests::coordinator_fingerprint_survives_plugin_reinitialization
+    // retains all 976 (977, measured with cargo nextest list --profile ci).
+    ("test.regular_crates", 977),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1387,7 +1389,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 9 (12, measured with cargo nextest list).
     // sabre_forwards_a_target_scoped_detlog_filter_as_ptrace_applies_it
     // retains all 12 prior identities: 13.
-    ("test.sabre_examples", 13),
+    // sabre_forked_child_gets_no_plugin_warning_on_guest_stderr retains all
+    // 13: 14.
+    ("test.sabre_examples", 14),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -1633,12 +1637,14 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two network trace codec tests listed there retain all 972: 974.
     // The row-recording exact-branch-counter test listed there retains all 974: 975.
     // The report exact-branch-counter test listed there retains all 975: 976.
-    ("test.regular_crates_on_host", 976),
+    // The same detcore-sabre fingerprint test retains all 976: 977.
+    ("test.regular_crates_on_host", 977),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
-    // And the same target-scoped DETLOG forwarding test (13).
-    ("test.sabre_examples_on_host", 13),
+    // And the same target-scoped DETLOG forwarding test (13), and the same
+    // forked-child stderr test (14).
+    ("test.sabre_examples_on_host", 14),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
@@ -4339,7 +4345,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"sabre_examples"########,
         desc: r########"SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity"########,
-        description: r########"Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. SaBRe letting getrandom return host entropy, or a controller line leaking into guest stderr, is caught."########,
+        description: r########"Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. A guest that points its stderr at a pipe and forks a child that only exits must, at --log=warn, read nothing from that pipe on either backend (at --log=info the plugin's DETLOG forwarding still writes there, and that run is only checked for repeatability). SaBRe letting getrandom return host entropy, a controller line leaking into guest stderr, or the plugin's fingerprint warning reaching a forked child's guest stderr, is caught."########,
         labels: &[
             r########"full"########,
             r########"hosted-portable"########,

@@ -13386,7 +13386,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "976",
+        "NEXTEST_EXPECTED_EXECUTED": "977",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -13970,7 +13970,7 @@
       "group": "test",
       "job": "sabre_examples",
       "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
-      "description": "Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. SaBRe letting getrandom return host entropy, or a controller line leaking into guest stderr, is caught.",
+      "description": "Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. A guest that points its stderr at a pipe and forks a child that only exits must, at --log=warn, read nothing from that pipe on either backend (at --log=info the plugin's DETLOG forwarding still writes there, and that run is only checked for repeatability). SaBRe letting getrandom return host entropy, a controller line leaking into guest stderr, or the plugin's fingerprint warning reaching a forked child's guest stderr, is caught.",
       "labels": [
         "full",
         "portable"
@@ -13997,7 +13997,7 @@
       "env": {
         "HERMIT_E2E_EMPTY_WORKDIR": "/test",
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "13",
+        "NEXTEST_EXPECTED_EXECUTED": "14",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"sabre_examples\"]"
       },
       "networkonly": false,
@@ -34075,7 +34075,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "976",
+        "NEXTEST_EXPECTED_EXECUTED": "977",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"--workspace\",\"--exclude\",\"hermit-detcore\",\"--exclude\",\"hermit\",\"--exclude\",\"hermetic_infra_hermit_flaky-tests\"]"
       },
       "networkonly": false,
@@ -34480,7 +34480,7 @@
       "group": "test",
       "job": "sabre_examples_on_host",
       "desc": "SaBRe non-racy examples: per-backend time determinism and non-time ptrace parity",
-      "description": "Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. SaBRe letting getrandom return host entropy, or a controller line leaking into guest stderr, is caught.",
+      "description": "Holds the SaBRe backend to ptrace's results on non-racy examples: hermit-cli/tests/sabre_examples.rs runs one test at a time, its count pinned by NEXTEST_EXPECTED_EXECUTED, against an explicitly configured SaBRe loader, so a missing loader, libdetcore_sabre.so or revision file fails rather than skips. examples/devrand.sh, a root-PID shell probe and a glibc getrandom caller must give identical status, stdout and stderr under ptrace and --backend sabre; examples/date.sh and a clock-progress guest must repeat across three runs on each backend; and every SaBRe guest must pass `--verify --verify-strict` with bitwise_parity true. A guest that points its stderr at a pipe and forks a child that only exits must, at --log=warn, read nothing from that pipe on either backend (at --log=info the plugin's DETLOG forwarding still writes there, and that run is only checked for repeatability). SaBRe letting getrandom return host entropy, a controller line leaking into guest stderr, or the plugin's fingerprint warning reaching a forked child's guest stderr, is caught.",
       "labels": [
         "hosted-portable"
       ],
@@ -34504,7 +34504,7 @@
       ],
       "env": {
         "HERMIT_PREPARED_NEXTEST_REQUIRED": "1",
-        "NEXTEST_EXPECTED_EXECUTED": "13",
+        "NEXTEST_EXPECTED_EXECUTED": "14",
         "NEXTEST_PREPARED_BUILD_SELECTION": "[\"-p\",\"hermit\",\"--features\",\"third-party-backends\",\"--test\",\"sabre_examples\"]"
       },
       "networkonly": false,
