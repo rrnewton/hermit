@@ -9066,6 +9066,9 @@ pub(crate) mod inject_fstat_scratch {
         /// (from 0) is answered with the same deterministic inode,
         /// `FIRST_SCRIPTED_INODE + n`.
         pub(crate) determinized: std::sync::Mutex<Vec<RawInode>>,
+        /// What `detlog_memory_regions` reports: `None`, as ptrace does, or
+        /// the guest ranges a test wants the memory-map DETLOG to hash.
+        detlog_regions: Option<Vec<reverie::DetlogMemoryRegion>>,
     }
 
     /// The deterministic inode `send_rpc` gives the first `DeterminizeInode`
@@ -9114,6 +9117,7 @@ pub(crate) mod inject_fstat_scratch {
                 closed: Vec::new(),
                 answers_determinize_inode: false,
                 determinized: std::sync::Mutex::new(Vec::new()),
+                detlog_regions: None,
             };
             (tool, guest)
         }
@@ -9468,6 +9472,9 @@ pub(crate) mod inject_fstat_scratch {
         }
         fn read_clock(&mut self) -> Result<u64, Error> {
             panic!("fd registration must not read a clock")
+        }
+        fn detlog_memory_regions(&self) -> Option<Vec<reverie::DetlogMemoryRegion>> {
+            self.detlog_regions.clone()
         }
     }
 
@@ -11434,6 +11441,199 @@ pub(crate) mod inject_fstat_scratch {
             guest.injected,
             [Sysno::mmap],
             "getdents64: the refusal comes before the real call"
+        );
+    }
+
+    /// Enables every event at INFO and above, as `--log info` does, and keeps
+    /// the memory-map DETLOG records. INFO is what makes that DETLOG read the
+    /// guest at all.
+    #[derive(Clone, Default)]
+    struct MemoryRecords(Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl MemoryRecords {
+        fn taken(&self) -> Vec<String> {
+            std::mem::take(&mut *self.0.lock().unwrap())
+        }
+    }
+
+    struct MessageText(Option<String>);
+
+    impl tracing::field::Visit for MessageText {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            if field.name() == "message" {
+                self.0 = Some(format!("{value:?}"));
+            }
+        }
+    }
+
+    impl tracing::Subscriber for MemoryRecords {
+        fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+            *metadata.level() <= tracing::Level::INFO
+        }
+
+        fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+            tracing::span::Id::from_u64(1)
+        }
+
+        fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            let mut text = MessageText(None);
+            event.record(&mut text);
+            if let Some(text) = text.0
+                && text.contains("[memory]")
+            {
+                self.0.lock().unwrap().push(text);
+            }
+        }
+
+        fn enter(&self, _: &tracing::span::Id) {}
+
+        fn exit(&self, _: &tracing::span::Id) {}
+    }
+
+    /// A guest for calls dispatched through the whole `handle_syscall_event`,
+    /// and the Detcore a backend builds from that guest's config. With
+    /// `heap`, the run has `--detlog-heap` and the backend reports `heap` as
+    /// the guest's heap, for the memory-map DETLOG to hash after each call.
+    /// The harness reads no clock and no registers, so the config has no PMU
+    /// timeslice and the backend owns the syscall-clobbered registers, as DBT
+    /// does.
+    fn dispatched_guest(
+        stack_writable: bool,
+        mmap_fails: bool,
+        heap: Option<&Pages>,
+    ) -> (Detcore, ScriptedGuest) {
+        let (_, mut guest) = ScriptedGuest::new(stack_writable, mmap_fails);
+        guest.config.max_timeslice = None;
+        guest.config.sequentialize_threads = false;
+        guest.config.backend.virtualizes_syscall_clobbers = true;
+        if let Some(heap) = heap {
+            guest.config.detlog_heap = true;
+            guest.detlog_regions = Some(vec![reverie::DetlogMemoryRegion {
+                kind: reverie::DetlogRegionKind::Heap,
+                start: heap.address as u64,
+                end: (heap.address + heap.len) as u64,
+            }]);
+        }
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        (tool, guest)
+    }
+
+    /// A private read-only `mmap` of `fd`, a regular file the guest has as
+    /// stdout, whose handler asks the guest for the file's own identity.
+    fn stdio_file_mmap(fd: RawFd) -> Syscall {
+        Syscall::Mmap(
+            syscalls::Mmap::new()
+                .with_addr(None)
+                .with_len(page_size())
+                .with_prot(ProtFlags::PROT_READ)
+                .with_flags(MapFlags::MAP_PRIVATE)
+                .with_fd(fd)
+                .with_offset(0),
+        )
+    }
+
+    fn unmap_file_mappings(guest: &ScriptedGuest) {
+        for &(address, len) in &guest.file_mapped {
+            assert_eq!(unsafe { libc::munmap(address as *mut libc::c_void, len) }, 0);
+        }
+    }
+
+    // A refusal is the call's result through the whole dispatcher, whatever
+    // an observer that runs after the handler does. Here the memory-map
+    // DETLOG (`--detlog-heap` under INFO logging) fails on its own, reading a
+    // heap page the guest cannot read, while the `mmap` handler refuses (no
+    // stack scratch, no transient page for the stdio identity). Were the
+    // observer to run, its EFAULT would take the refusal's place: an errno
+    // DBT hands the guest, which then runs on.
+    #[tokio::test]
+    async fn a_refusal_outlives_a_failing_observer_in_the_dispatcher() {
+        let records = MemoryRecords::default();
+        let _info = tracing::subscriber::set_default(records.clone());
+        let unreadable = Pages::map(1, 0);
+        let (tool, mut guest) = dispatched_guest(false, true, Some(&unreadable));
+        let observed = tool.detlog_memory_maps(&mut guest);
+        assert!(
+            matches!(observed, Err(Error::Errno(Errno::EFAULT))),
+            "precondition: the memory-map DETLOG fails on its own: {observed:?}"
+        );
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let result = tool
+            .handle_syscall_event(&mut guest, stdio_file_mmap(fd))
+            .await;
+        unmap_file_mappings(&guest);
+        close_unless_detcore_did(&guest, fd);
+
+        assert_typed_refusal("dispatched mmap", result.map(|_| ()), Errno::ENOMEM);
+        assert_eq!(records.taken(), Vec::<String>::new());
+    }
+
+    // The control: a call that is not refused still runs the observers after
+    // its handler. Same guest and call, with a stack scratch to ask in and a
+    // readable heap page, so the handler maps the file and the memory-map
+    // DETLOG records the heap.
+    #[tokio::test]
+    async fn an_unrefused_call_still_runs_the_observers_in_the_dispatcher() {
+        let records = MemoryRecords::default();
+        let _info = tracing::subscriber::set_default(records.clone());
+        let readable = Pages::map(1, 1);
+        let (tool, mut guest) = dispatched_guest(true, false, Some(&readable));
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let result = tool
+            .handle_syscall_event(&mut guest, stdio_file_mmap(fd))
+            .await;
+        unmap_file_mappings(&guest);
+        close_unless_detcore_did(&guest, fd);
+
+        assert!(result.is_ok(), "the dispatched mmap failed: {result:?}");
+        assert_eq!(guest.file_mapped.len(), 1, "the handler mapped the file");
+        let records = records.taken();
+        assert!(
+            records.len() == 1 && records[0].contains("Heap"),
+            "the memory-map DETLOG must record the heap once after the call: {records:?}"
+        );
+    }
+
+    // A refused call takes no turn after its handler: the post-hook would end
+    // an expired timeslice and hand the turn to another thread before the
+    // backend stops the refusing process. Threads are sequentialized, as in a
+    // `hermit run`, so ending a slice asks the scheduler for the next turn,
+    // an RPC the harness panics on. The thread's slice ends 1 ns after its
+    // current time, so the call's own charge expires it.
+    #[tokio::test]
+    async fn a_refused_call_leaves_the_dispatcher_before_the_post_hook_takes_a_turn() {
+        let (_, mut guest) = dispatched_guest(false, true, None);
+        guest.config.sequentialize_threads = true;
+        let tool = <Detcore as Tool>::new(Pid::from_raw(1), &guest.config);
+        assert!(
+            crate::syscall_time::cost_ns(Sysno::mmap) > 0,
+            "precondition: the call's charge advances the thread's time"
+        );
+        let slice_end = guest.thread.thread_logical_time.as_nanos() + LogicalTime::from_nanos(1);
+        guest.thread.end_of_timeslice = Some(slice_end);
+        let slices = guest.thread.stats.timeslice_count;
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+
+        let result = tool
+            .handle_syscall_event(&mut guest, stdio_file_mmap(fd))
+            .await;
+        unmap_file_mappings(&guest);
+        close_unless_detcore_did(&guest, fd);
+
+        assert_typed_refusal("dispatched mmap", result.map(|_| ()), Errno::ENOMEM);
+        assert!(
+            guest.thread.timeslice_expired(),
+            "precondition: the call's charge expired the slice"
+        );
+        assert_eq!(
+            (guest.thread.end_of_timeslice, guest.thread.stats.timeslice_count),
+            (Some(slice_end), slices),
+            "the refused call must leave the expired slice for the backend's stop"
         );
     }
 
