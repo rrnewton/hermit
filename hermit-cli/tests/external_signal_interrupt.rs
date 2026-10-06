@@ -1942,13 +1942,19 @@ fn liteinst_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignore
 /// Reverie, Hermit resumed the guest at a LiteInst patched site to read a
 /// handler's SA_RESTART flag, which let the second signal replace the first.
 /// External signals arrive at host-timed moments, so each backend runs
-/// `EXTERNAL_TRIALS` trials.
-fn assert_two_external_signals_are_both_delivered(backend: &str, warm: bool) {
+/// `EXTERNAL_TRIALS` trials, split into two tests of half as many each
+/// (`trials`) so that each test stays inside the per-test CPU bound with room
+/// to spare.
+fn assert_two_external_signals_are_both_delivered(
+    backend: &str,
+    warm: bool,
+    trials: std::ops::Range<usize>,
+) {
     let mut args = vec!["futex", "external", "usr2"];
     if warm {
         args.push("warm");
     }
-    for trial in 0..EXTERNAL_TRIALS {
+    for trial in trials {
         let run = run_cell_with_external_signals(
             backend,
             FutexMode::Polling,
@@ -1967,12 +1973,32 @@ fn assert_two_external_signals_are_both_delivered(backend: &str, warm: bool) {
     }
 }
 
+/// The first half of `EXTERNAL_TRIALS`; the second half is
+/// `SECOND_HALF_OF_EXTERNAL_TRIALS`.
+const FIRST_HALF_OF_EXTERNAL_TRIALS: std::ops::Range<usize> = 0..EXTERNAL_TRIALS / 2;
+const SECOND_HALF_OF_EXTERNAL_TRIALS: std::ops::Range<usize> = EXTERNAL_TRIALS / 2..EXTERNAL_TRIALS;
+
 #[test]
 fn ptrace_polling_futex_wait_delivers_both_of_two_external_signals() {
-    assert_two_external_signals_are_both_delivered("ptrace", false);
+    assert_two_external_signals_are_both_delivered("ptrace", false, FIRST_HALF_OF_EXTERNAL_TRIALS);
+}
+
+#[test]
+fn ptrace_polling_futex_wait_delivers_both_of_two_external_signals_in_later_trials() {
+    assert_two_external_signals_are_both_delivered("ptrace", false, SECOND_HALF_OF_EXTERNAL_TRIALS);
 }
 
 #[test]
 fn liteinst_polling_futex_wait_at_a_patched_call_site_delivers_both_of_two_external_signals() {
-    assert_two_external_signals_are_both_delivered("liteinst", true);
+    assert_two_external_signals_are_both_delivered("liteinst", true, FIRST_HALF_OF_EXTERNAL_TRIALS);
+}
+
+#[test]
+fn liteinst_polling_futex_wait_at_a_patched_call_site_delivers_both_of_two_external_signals_in_later_trials()
+ {
+    assert_two_external_signals_are_both_delivered(
+        "liteinst",
+        true,
+        SECOND_HALF_OF_EXTERNAL_TRIALS,
+    );
 }
