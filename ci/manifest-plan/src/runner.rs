@@ -62,6 +62,8 @@ use crate::cpu_evidence::WaitCpuObservation;
 use crate::cpu_evidence::WaitOperation;
 use crate::environmental_block::EnvBlockClass;
 use crate::environmental_block::environmental_block_observation;
+use crate::host_capability::CapabilityVerdict;
+use crate::host_capability::HostCapabilitiesReport;
 use crate::host_capability::probe_host_capabilities;
 use crate::invocation_cgroup::ALLOW_PROCESS_GROUP_CPU_SCAN_ENV;
 use crate::invocation_cgroup::InvocationCgroup;
@@ -290,6 +292,38 @@ pub fn validate_golden_kernel_floor(
 /// token: a kvm cell cannot run where KVM is proven absent.
 pub fn backend_capability(backend: &str) -> Option<HostCapability> {
     (backend == "kvm").then_some(HostCapability::Kvm)
+}
+
+/// Whether `hermit run --strict` on `backend` reads its virtual clock from the
+/// host's retired-conditional-branch counter, and so refuses where the hermit
+/// binary reports no `exact_branch_counter`.
+///
+/// Unlike [`backend_capability`], this is decided on the machine that runs the
+/// cell and never enters a plan row: a plan row that names a host capability
+/// routes the cell off remote execution, and remote workers differ in CPU
+/// model, so the plan cannot say which of them count exactly.
+pub fn pmu_clock_backend(backend: &str) -> bool {
+    matches!(backend, "ptrace" | "e9patch")
+}
+
+/// Whether the hermit binary refuses `cell` where it reports no
+/// `exact_branch_counter`: the cell runs `hermit run --strict` on a
+/// [`pmu_clock_backend`]. Verify and chaos cells always pass `--strict` to
+/// `run`, and a custom cell does when its arguments say so, unless they also
+/// select `--namespace-only` (alias `--lite`), which arms no branch counter. A
+/// replay cell runs `record start`, which does not refuse, and a naked cell
+/// runs no hermit.
+pub fn refused_on_an_inexact_branch_counter(cell: &SelectedCell) -> bool {
+    let strict_run = match cell.id.mode.as_str() {
+        "verify" | "chaos" => true,
+        "custom" => {
+            let args = &cell.test.modes["custom"].args;
+            let has = |flag: &str| args.iter().any(|arg| arg == flag);
+            has("--strict") && !has("--namespace-only") && !has("--lite")
+        }
+        _ => false,
+    };
+    strict_run && cell.id.backend.as_deref().is_some_and(pmu_clock_backend)
 }
 
 pub fn requires_capability(token: &str) -> Result<Option<HostCapability>, String> {
@@ -2837,6 +2871,12 @@ pub struct RunContext {
     pub machine_shortname: String,
     pub kernel_version: String,
     pub host_capabilities: HostCapabilities,
+    /// The hermit binary's own `exact_branch_counter` verdict, from
+    /// `hermit host-capabilities --json`; `None` when the binary was not
+    /// probed or did not answer. Where it is absent, the cells that the binary
+    /// then refuses are HOST-INAPPLICABLE (see
+    /// [`refused_on_an_inexact_branch_counter`]).
+    pub exact_branch_counter: Option<CapabilityVerdict>,
     pub attempt: u64,
     pub run_index: Option<u64>,
     /// One concrete CLI input shared by comparison operands and outer retries.
@@ -2982,6 +3022,11 @@ impl RunContext {
         let binary_build_sha = probe_hermit
             .then(|| probe_binary_build_sha(&hermit_bin))
             .flatten();
+        // Only the binary can run Reverie's counter validation, and it is the
+        // binary that refuses `--strict` when the validation fails.
+        let exact_branch_counter = probe_hermit
+            .then(|| probe_exact_branch_counter(&hermit_bin))
+            .flatten();
         // Published main still exposes the legacy `--verify-strict` spelling;
         // the canonical-only cutover removes it and makes bare `--verify`
         // canonical.  Detect the running binary rather than keying behavior to
@@ -3016,6 +3061,7 @@ impl RunContext {
             machine_shortname,
             kernel_version,
             host_capabilities,
+            exact_branch_counter,
             attempt: 1,
             run_index,
             epoch: resolve_run_epoch(std::env::var_os("HERMIT_EPOCH"), SystemTime::now)?,
@@ -8225,6 +8271,38 @@ fn git(root: &Path, args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The binary's `exact_branch_counter` verdict, or `None` (with a note on
+/// stderr) when it cannot be read. `None` withholds no cell: a binary that
+/// then refuses `--strict` fails its cells loudly instead.
+fn probe_exact_branch_counter(program: &Path) -> Option<CapabilityVerdict> {
+    let read = || -> Result<CapabilityVerdict, String> {
+        let output = Command::new(program)
+            .args(["host-capabilities", "--json"])
+            .output()
+            .map_err(|error| format!("cannot run it: {error}"))?;
+        if !output.status.success() {
+            return Err(format!("it exited {}", output.status));
+        }
+        parse_exact_branch_counter(&output.stdout)
+    };
+    read()
+        .map_err(|error| {
+            eprintln!(
+                "test-harness: no exact_branch_counter verdict from `{} host-capabilities --json` \
+                 ({error}); strict ptrace and e9patch cells run regardless",
+                program.display()
+            )
+        })
+        .ok()
+}
+
+fn parse_exact_branch_counter(bytes: &[u8]) -> Result<CapabilityVerdict, String> {
+    let report = serde_json::from_slice::<HostCapabilitiesReport>(bytes)
+        .map_err(|error| format!("unreadable report: {error}"))?;
+    report.validate()?;
+    Ok(report.exact_branch_counter)
+}
+
 /// Ask the hermit binary which commit it was built from.
 ///
 /// The producer-owned `version --json` record is the authority. Human-readable
@@ -9282,6 +9360,7 @@ mod tests {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         build_spec(
             &context,
@@ -9427,6 +9506,7 @@ mod tests {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: Some(PathBuf::from("/test")),
+            exact_branch_counter: None,
         };
         let spec = build_spec(
             &context,
@@ -9925,6 +10005,7 @@ mod tests {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         }
     }
 
@@ -10121,6 +10202,7 @@ mod tests {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         assert_eq!(
             infrastructure_error_result(&context, &cell, "fixture".into()).classification,
@@ -13864,6 +13946,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
 
         let result = run_cell(&context, &cell).unwrap();
@@ -13939,6 +14022,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let result = host_inapplicable_result(
             &context,
@@ -14064,6 +14148,7 @@ int main(int argc, char **argv) {
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let path = root.join("results.jsonl");
         prepare_result_path(&path).unwrap();
@@ -14340,6 +14425,7 @@ backends_disabled:
                 timeout_multipliers: TimeoutMultipliers::default(),
                 scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
                 isolated_workdir: None,
+                exact_branch_counter: None,
             };
             let spec = build_spec(
                 &context,
@@ -14416,6 +14502,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let spec = build_spec(
             &context,
@@ -14474,6 +14561,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: Some(PathBuf::from("/test")),
+            exact_branch_counter: None,
         };
         let spec = build_spec(
             &context,
@@ -14779,6 +14867,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let spec = build_spec(
             &context,
@@ -15143,6 +15232,7 @@ backends_disabled:
             timeout_multipliers: crate::timeouts::timeout_multipliers_from_env().unwrap(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir,
+            exact_branch_counter: None,
         };
         let manifests = ManifestSet::load(&root).unwrap();
         let [cell] = manifests
@@ -15274,6 +15364,7 @@ backends_disabled:
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(7),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let spec = build_spec(
             &context,
@@ -20949,6 +21040,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let error = run_preparation(
             &context,
@@ -21008,6 +21100,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
         let test = recipe(true);
         let cell = SelectedCell {
@@ -21190,6 +21283,7 @@ cp "{}" "$verdict"
             timeout_multipliers: TimeoutMultipliers::default(),
             scheduled_worker_capacity: ScheduledWorkerCapacity::new(1),
             isolated_workdir: None,
+            exact_branch_counter: None,
         };
 
         fs::create_dir_all(cell_dir.join("fixtures")).unwrap();
@@ -21224,6 +21318,31 @@ cp "{}" "$verdict"
             },
         })
         .unwrap()
+    }
+
+    /// The harness takes `exact_branch_counter` only from a complete, current
+    /// report; an old binary's schema-1 report, which has no such verdict, is
+    /// refused rather than read as one.
+    #[test]
+    fn exact_branch_counter_is_read_from_the_typed_host_report() {
+        let absent = CapabilityVerdict {
+            present: false,
+            evidence: "CPU fixture: Reverie performance-counter validation failed".into(),
+        };
+        let report = serde_json::to_vec(&HostCapabilitiesReport::probe(absent.clone())).unwrap();
+        assert_eq!(parse_exact_branch_counter(&report).unwrap(), absent);
+
+        let mut old: serde_json::Value = serde_json::from_slice(&report).unwrap();
+        old["schema"] = 1.into();
+        old.as_object_mut().unwrap().remove("exact_branch_counter");
+        let error = parse_exact_branch_counter(&serde_json::to_vec(&old).unwrap()).unwrap_err();
+        assert!(error.contains("exact_branch_counter"), "{error}");
+
+        let mut unevidenced: serde_json::Value = serde_json::from_slice(&report).unwrap();
+        unevidenced["exact_branch_counter"]["evidence"] = "".into();
+        let error =
+            parse_exact_branch_counter(&serde_json::to_vec(&unevidenced).unwrap()).unwrap_err();
+        assert!(error.contains("evidence must be nonempty"), "{error}");
     }
 
     /// The binary's own revision is read from its typed record, including the

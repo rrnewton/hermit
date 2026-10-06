@@ -6048,7 +6048,8 @@ mod tests {
             "host_capabilities": {
                 "cpuid-faulting": {"present": true, "evidence": cpuid_evidence},
                 "kvm": {"present": false, "evidence": "open /dev/kvm = ENOENT"}
-            }
+            },
+            "exact_branch_counter": {"present": true, "evidence": "Reverie PMU validation passed"}
         })
         .to_string()
     }
@@ -6267,9 +6268,28 @@ mod tests {
             ),
             (
                 "wrong-schema",
-                spaced.replacen(r#""schema":1"#, r#""schema":2"#, 1),
+                spaced.replacen(
+                    &format!(r#""schema":{}"#, HostCapabilitiesReport::SCHEMA),
+                    &format!(r#""schema":{}"#, HostCapabilitiesReport::SCHEMA + 1),
+                    1,
+                ),
+            ),
+            (
+                "schema-1-without-branch-counter",
+                spaced
+                    .replacen(
+                        &format!(r#""schema":{}"#, HostCapabilitiesReport::SCHEMA),
+                        r#""schema":1"#,
+                        1,
+                    )
+                    .replacen(
+                        r#","exact_branch_counter":{"evidence":"Reverie PMU validation passed","present":true}"#,
+                        "",
+                        1,
+                    ),
             ),
         ] {
+            assert_ne!(value, spaced, "mutation {name} changed nothing");
             assert!(
                 decode_host_capabilities(&value, "fixture").is_err(),
                 "accepted {name}: {value}"

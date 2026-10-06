@@ -45,6 +45,7 @@ use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::host_input_change_only;
 use hermit_manifest_plan::runner::is_diagnostic_cell;
 use hermit_manifest_plan::runner::prepare_result_path;
+use hermit_manifest_plan::runner::refused_on_an_inexact_branch_counter;
 use hermit_manifest_plan::runner::requires_capability;
 use hermit_manifest_plan::runner::retries_product_failures;
 use hermit_manifest_plan::runner::run_cell;
@@ -55,7 +56,6 @@ use hermit_manifest_plan::self_test_selection;
 use hermit_manifest_plan::stress_series::HostCapabilities;
 #[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapability;
-#[cfg(test)]
 use hermit_manifest_plan::stress_series::HostCapabilityVerdict;
 use hermit_manifest_plan::validation_dag::PINNED_ROOT_COMMAND_GUARD;
 use hermit_manifest_plan::validation_dag::TOOL_SELF_TESTS;
@@ -717,12 +717,32 @@ fn accumulate_cell_cpu_usage(
     }
 }
 
+/// [`host_inapplicable_reason`] for `cell`. The hermit binary's
+/// `exact_branch_counter` verdict counts only for a cell the binary refuses on
+/// an inexact counter (see [`refused_on_an_inexact_branch_counter`]); a replay
+/// cell or a custom cell without `--strict` still runs.
+fn cell_host_inapplicable_reason(
+    cell: &SelectedCell,
+    verdicts: &HostCapabilities,
+    exact_branch_counter: Option<&HostCapabilityVerdict>,
+) -> Option<(Vec<String>, String)> {
+    host_inapplicable_reason(
+        &cell.test.requires,
+        cell.id.backend.as_deref(),
+        verdicts,
+        exact_branch_counter.filter(|_| refused_on_an_inexact_branch_counter(cell)),
+    )
+}
+
 /// Why a cell cannot run on this machine, if it cannot: a capability its
-/// `requires` tokens or its backend need is proven absent.
+/// `requires` tokens or its backend need is proven absent, or the hermit
+/// binary's `exact_branch_counter` verdict, passed only for a cell the binary
+/// refuses without it, is absent. `None` withholds nothing.
 fn host_inapplicable_reason(
     requires: &[String],
     backend: Option<&str>,
     verdicts: &HostCapabilities,
+    exact_branch_counter: Option<&HostCapabilityVerdict>,
 ) -> Option<(Vec<String>, String)> {
     let mut absent = requires
         .iter()
@@ -734,6 +754,11 @@ fn host_inapplicable_reason(
                 .filter(|verdict| !verdict.present)
                 .map(|verdict| (capability.value().to_string(), verdict.evidence.clone()))
         })
+        .chain(
+            exact_branch_counter
+                .filter(|verdict| !verdict.present)
+                .map(|verdict| ("exact-branch-counter".to_string(), verdict.evidence.clone())),
+        )
         .collect::<Vec<_>>();
     absent.sort();
     absent.dedup();
@@ -3044,10 +3069,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             attempt_earns_retry(args.retries, cell, row)
         };
         let host_inapplicable = |cell: &SelectedCell| {
-            host_inapplicable_reason(
-                &cell.test.requires,
-                cell.id.backend.as_deref(),
+            cell_host_inapplicable_reason(
+                cell,
                 &context.host_capabilities,
+                context.exact_branch_counter.as_ref(),
             )
             .map(|(_, reason)| reason)
         };
@@ -3091,10 +3116,10 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
                 }
                 return;
             }
-            if let Some((_, reason)) = host_inapplicable_reason(
-                &cell.test.requires,
-                cell.id.backend.as_deref(),
+            if let Some((_, reason)) = cell_host_inapplicable_reason(
+                cell,
                 &context.host_capabilities,
+                context.exact_branch_counter.as_ref(),
             ) {
                 let _ = emit(host_inapplicable_result(&context, cell, reason), false);
                 return;
@@ -3960,6 +3985,7 @@ mod tests {
     use super::audit_run_dag_workflow_runner;
     use super::audit_validation_levels_policy;
     use super::build_worker_capacity;
+    use super::cell_host_inapplicable_reason;
     use super::cell_result_is_retryable;
     use super::command_jobs;
     use super::command_runs_exactly;
@@ -7594,13 +7620,13 @@ sys.exit(1 if failed else 0)
         )]);
         let requires = vec!["linux".to_string(), "cpuid".to_string()];
         let (capabilities, reason) =
-            host_inapplicable_reason(&requires, Some("ptrace"), &absent).unwrap();
+            host_inapplicable_reason(&requires, Some("ptrace"), &absent, None).unwrap();
         assert_eq!(capabilities, ["cpuid-faulting"]);
         assert!(reason.contains("NOT RUN, NOT a pass, no coverage"));
         assert!(reason.contains("planted absence"));
 
         let undeclared = vec!["linux".to_string(), "ptrace".to_string()];
-        assert!(host_inapplicable_reason(&undeclared, Some("ptrace"), &absent).is_none());
+        assert!(host_inapplicable_reason(&undeclared, Some("ptrace"), &absent, None).is_none());
 
         let present = BTreeMap::from([(
             HostCapability::CpuidFaulting,
@@ -7609,7 +7635,7 @@ sys.exit(1 if failed else 0)
                 evidence: "planted presence".into(),
             },
         )]);
-        assert!(host_inapplicable_reason(&requires, Some("ptrace"), &present).is_none());
+        assert!(host_inapplicable_reason(&requires, Some("ptrace"), &present, None).is_none());
     }
 
     /// A kvm cell needs KVM whatever its `requires` say (the kvm backend cells do
@@ -7632,12 +7658,106 @@ sys.exit(1 if failed else 0)
             "ptrace".to_string(),
         ];
         let (capabilities, reason) =
-            host_inapplicable_reason(&requires, Some("kvm"), &verdicts(false)).unwrap();
+            host_inapplicable_reason(&requires, Some("kvm"), &verdicts(false), None).unwrap();
         assert_eq!(capabilities, ["kvm"]);
         assert!(reason.contains("errno=2"), "{reason}");
-        assert!(host_inapplicable_reason(&requires, Some("ptrace"), &verdicts(false)).is_none());
-        assert!(host_inapplicable_reason(&requires, None, &verdicts(false)).is_none());
-        assert!(host_inapplicable_reason(&requires, Some("kvm"), &verdicts(true)).is_none());
+        assert!(
+            host_inapplicable_reason(&requires, Some("ptrace"), &verdicts(false), None).is_none()
+        );
+        assert!(host_inapplicable_reason(&requires, None, &verdicts(false), None).is_none());
+        assert!(host_inapplicable_reason(&requires, Some("kvm"), &verdicts(true), None).is_none());
+    }
+
+    /// Where the hermit binary reports an inexact branch counter it refuses
+    /// `hermit run --strict` on ptrace and e9patch, so exactly the cells that
+    /// run that are withheld, with the binary's evidence. A replay cell runs
+    /// `record start` and a custom cell without `--strict` runs plain `run`;
+    /// the binary runs both, so they still run here. An unprobed binary
+    /// withholds nothing.
+    #[test]
+    fn strict_run_pmu_clock_cells_are_withheld_where_the_binary_reports_an_inexact_counter() {
+        let manifests = ManifestSet::load(&super::root(None)).unwrap();
+        let cell = |test: &str, mode: &str| {
+            manifests
+                .select(&hermit_manifest_plan::runner::Selection {
+                    test: Some(test.into()),
+                    mode: Some(mode.into()),
+                    backend: Some("ptrace".into()),
+                    population: Some(hermit_manifest_plan::runner::Population::Required),
+                    ..hermit_manifest_plan::runner::Selection::default()
+                })
+                .unwrap()
+                .remove(0)
+        };
+        let present = BTreeMap::from([(
+            HostCapability::Kvm,
+            HostCapabilityVerdict {
+                present: true,
+                evidence: "planted presence".into(),
+            },
+        )]);
+        let counter = |present| HostCapabilityVerdict {
+            present,
+            evidence: "CPU fixture: Reverie performance-counter validation failed".into(),
+        };
+        let withheld = |cell: &SelectedCell| {
+            cell_host_inapplicable_reason(cell, &present, Some(&counter(false)))
+        };
+
+        let strict_runs = [
+            cell("c-programs/random-readv-stream", "verify"),
+            cell("c-programs/ipc-determinism", "chaos"),
+            cell("c-programs/environment-and-workdir", "custom"),
+        ];
+        for mut strict_run in strict_runs {
+            for backend in ["ptrace", "e9patch"] {
+                strict_run.id.backend = Some(backend.into());
+                let (capabilities, reason) = withheld(&strict_run).unwrap();
+                assert_eq!(capabilities, ["exact-branch-counter"]);
+                assert!(
+                    reason.contains("NOT RUN, NOT a pass, no coverage"),
+                    "{reason}"
+                );
+                assert!(reason.contains("validation failed"), "{reason}");
+                assert!(
+                    cell_host_inapplicable_reason(&strict_run, &present, Some(&counter(true)))
+                        .is_none()
+                );
+                assert!(cell_host_inapplicable_reason(&strict_run, &present, None).is_none());
+            }
+            for backend in [
+                Some("kvm"),
+                Some("dbt"),
+                Some("sabre"),
+                Some("liteinst"),
+                None,
+            ] {
+                strict_run.id.backend = backend.map(Into::into);
+                assert!(withheld(&strict_run).is_none(), "{:?}", strict_run.id);
+            }
+        }
+
+        let replay = cell("c-programs/random-readv-stream", "replay");
+        let custom = cell("system-utils/clock-determinism", "custom");
+        assert!(
+            !custom.test.modes["custom"]
+                .args
+                .iter()
+                .any(|arg| arg == "--strict")
+        );
+        // `--namespace-only` arms no branch counter, so the binary does not
+        // refuse it for the counter even with `--strict` (with the harness's
+        // explicit `--backend` it is a usage error, which must fail visibly).
+        let mut namespace_only = cell("c-programs/environment-and-workdir", "custom");
+        for flag in ["--namespace-only", "--lite"] {
+            let args = &mut namespace_only.test.modes.get_mut("custom").unwrap().args;
+            args.retain(|arg| arg != "--namespace-only" && arg != "--lite");
+            args.push(flag.into());
+            assert!(withheld(&namespace_only).is_none(), "{flag}");
+        }
+        for runs in [replay, custom] {
+            assert!(withheld(&runs).is_none(), "{:?}", runs.id);
+        }
     }
 
     const GUARDED_WORKFLOW: &str = r#"    # --allow-cgroup-failure is documented here but not executed.

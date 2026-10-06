@@ -75,6 +75,8 @@ use super::container::image_container;
 use super::global_opts::GlobalOpts;
 use super::guest_capture::GuestRunCapturePaths;
 use super::guest_capture::GuestRunCaptureSession;
+use super::host_capabilities::cpu_identity;
+use super::host_capabilities::host_inexact_branch_counter;
 use super::record_envelope::RecordEnvelope;
 use super::tracing::BoundedWriter;
 use super::tracing::init_sync_file_tracing;
@@ -690,7 +692,9 @@ pub struct RunOpts {
     /// syscalls already fail closed in ordinary runs. `--no-virtualize-time` is still accepted:
     /// clock syscalls then return host time, so the run is not reproducible; record it with
     /// `hermit record` to reproduce it. `--verify --verify-strict` reports the difference; plain
-    /// `--verify` reports it only when host time reaches the guest's output.
+    /// `--verify` reports it only when host time reaches the guest's output. On the ptrace and
+    /// e9patch backends, `--strict` also refuses to run when the host's performance counters fail
+    /// Reverie's validation, because the virtual clock counts retired branches and cannot be exact.
     #[clap(
         long,
         conflicts_with_all = ["no_sequentialize_threads", "no_deterministic_io", "strace_only"]
@@ -1088,6 +1092,12 @@ pub struct RunOpts {
     /// count is unmeasured when the root executable was not an ELF image.
     #[clap(skip)]
     e9patch_sites: Option<reverie::SiteCounters>,
+
+    /// Why this host's retired-branch counter is inexact, if it is. Only the
+    /// `--strict` refusal consults it; tests replace it to reach that refusal
+    /// on a host whose counters pass.
+    #[clap(skip = host_inexact_branch_counter as fn() -> Option<String>)]
+    inexact_branch_counter: fn() -> Option<String>,
 }
 
 pub(super) fn parse_assignment(src: &str) -> Result<(String, Option<String>), Error> {
@@ -2860,6 +2870,84 @@ fn strict_rejects_every_route_to_host_networking() {
 }
 
 #[test]
+fn strict_refuses_an_inexact_branch_counter_on_the_pmu_backends() {
+    for backend in ["ptrace", "e9patch"] {
+        let backend_flag = format!("--backend={backend}");
+        let mut options = run_opts_for(&["hermit", &backend_flag, "run", "--strict", "fakeprog"]);
+        options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+        let error = options
+            .refuse_strict_with_inexact_branch_counter()
+            .expect_err(backend);
+        assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+        let message = error.to_string();
+        for expected in [
+            "--strict",
+            &format!("`{backend}` backend"),
+            "SpecLockMap is enabled",
+            "CPU ",
+            "issues/3794",
+        ] {
+            assert!(
+                message.contains(expected),
+                "{backend}: {expected:?}: {message}"
+            );
+        }
+    }
+}
+
+#[test]
+fn strict_refusal_needs_strict_a_pmu_backend_and_an_inexact_counter() {
+    let check = |argv: &[&str], inexact_branch_counter: fn() -> Option<String>| {
+        let mut options = run_opts_for(argv);
+        options.inexact_branch_counter = inexact_branch_counter;
+        options
+            .refuse_strict_with_inexact_branch_counter()
+            .unwrap_or_else(|error| panic!("{argv:?}: {error:#}"));
+    };
+    let unreachable = || -> Option<String> { panic!("the counter is not consulted") };
+    check(
+        &["hermit", "--backend=ptrace", "run", "fakeprog"],
+        unreachable,
+    );
+    check(
+        &["hermit", "--backend=ptrace", "run", "--strict", "fakeprog"],
+        || None,
+    );
+    for backend in ["kvm", "dbt", "sabre"] {
+        let backend_flag = format!("--backend={backend}");
+        check(
+            &["hermit", &backend_flag, "run", "--strict", "fakeprog"],
+            unreachable,
+        );
+    }
+    check(
+        &["hermit", "run", "--strict", "--namespace-only", "fakeprog"],
+        unreachable,
+    );
+}
+
+#[test]
+fn strict_run_refuses_an_inexact_branch_counter_before_it_looks_at_the_program() {
+    // Through `main`: the refusal must be wired into the run's preflight, not
+    // only callable. The program does not exist, so a run that passed the
+    // refusal fails on the missing program instead.
+    let global = GlobalOpts::parse_from(["hermit"]);
+    let mut options = RunOpts::parse_from(["run", "--strict", "/nonexistent-strict-pmu-guest"]);
+    assert!(!options.program.exists());
+    options.inexact_branch_counter = || Some("SpecLockMap is enabled".to_string());
+    let error = options.main(&global).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_some(), "{error:#}");
+    assert!(
+        error.to_string().contains("SpecLockMap is enabled"),
+        "{error:#}"
+    );
+
+    options.inexact_branch_counter = || None;
+    let error = options.main(&global).unwrap_err();
+    assert!(error.downcast_ref::<PolicyRefusal>().is_none(), "{error:#}");
+}
+
+#[test]
 fn non_strict_runs_still_allow_host_networking() {
     // The refusal is about `--strict` claiming something it did not enforce,
     // not about forbidding host networking outright.
@@ -3133,6 +3221,7 @@ fn strict_help_describes_compatibility_and_opt_outs() {
         "This weakens determinism",
         "--panic-on-rbc-overshoot",
         "--max-timeslice",
+        "Reverie's validation",
         "--preemption-timeout",
         "--target-timeslice",
         "syscall boundaries",
@@ -4082,6 +4171,8 @@ impl RunOpts {
             backend.ensure_available()?;
         }
         self.install_pmu_config()?;
+        // After the PMU configuration: Reverie's validation reads it.
+        self.refuse_strict_with_inexact_branch_counter()?;
         // The KVM backend reaches real reverie-kvm code from its dispatch path
         // and reports an accurate, program-specific error there, so it is not
         // pre-empted by the generic availability probe above. E9patch is a CLI
@@ -6215,6 +6306,33 @@ impl RunOpts {
     fn run_timeout(&self) -> Option<Duration> {
         self.timeout
             .map(|seconds| Duration::from_secs(seconds.get()))
+    }
+
+    /// `--strict` promises a deterministic run, and on the ptrace and e9patch
+    /// backends the virtual clock and the preemption points are the guest's
+    /// retired conditional branches, read from a performance counter. Where
+    /// that counter miscounts, two runs of one program diverge by a few
+    /// branches: measured on an AMD EPYC 9D64 (family 0x19, model 0xA0), around
+    /// locked instructions (<https://github.com/rrnewton/hermit/issues/3794>).
+    /// Refuse rather than run a strict guest on a clock that is not exact.
+    /// Runs without `--strict` go ahead, and Reverie logs the failed
+    /// validation.
+    fn refuse_strict_with_inexact_branch_counter(&self) -> Result<(), Error> {
+        if !self.strict || !self.arms_reverie_ptrace_pmu_timer() {
+            return Ok(());
+        }
+        let Some(reason) = (self.inexact_branch_counter)() else {
+            return Ok(());
+        };
+        Err(Error::new(PolicyRefusal).context(format!(
+            "--strict refuses the `{}` backend on this host: its retired-conditional-branch \
+             counter failed Reverie's performance-counter validation ({reason}; {}). That counter \
+             is the virtual clock on this backend, so two runs of one program could diverge. Run \
+             on a host whose counters pass the validation, or drop --strict to run without the \
+             determinism guarantee (see https://github.com/rrnewton/hermit/issues/3794).",
+            self.selected_backend().as_str(),
+            cpu_identity()
+        )))
     }
 
     /// Refuse `--timeout` on a backend where it has not been shown to bound the
