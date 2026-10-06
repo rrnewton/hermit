@@ -137,11 +137,18 @@ const _: () = assert!(
 
 /// The poll events Linux's `select` reports as readable, writable and
 /// exceptional (`POLLIN_SET`, `POLLOUT_SET` and `POLLEX_SET` in
-/// `fs/select.c`).
+/// `fs/select.c`). Newer kernels include `POLLNVAL` in all three, so a
+/// descriptor closed during the wait reports ready in every set it is in;
+/// older ones fail such a wait with `EBADF`.
 const SELECT_REPORTED: [i16; 3] = [
-    libc::POLLRDNORM | libc::POLLRDBAND | libc::POLLIN | libc::POLLHUP | libc::POLLERR,
-    libc::POLLWRBAND | libc::POLLWRNORM | libc::POLLOUT | libc::POLLERR,
-    libc::POLLPRI,
+    libc::POLLRDNORM
+        | libc::POLLRDBAND
+        | libc::POLLIN
+        | libc::POLLHUP
+        | libc::POLLERR
+        | libc::POLLNVAL,
+    libc::POLLWRBAND | libc::POLLWRNORM | libc::POLLOUT | libc::POLLERR | libc::POLLNVAL,
+    libc::POLLPRI | libc::POLLNVAL,
 ];
 
 /// The poll events a descriptor in each `select` set asks for. `POLLERR` and
@@ -165,11 +172,11 @@ fn select_bits(pollfd: &libc::pollfd) -> [bool; 3] {
     })
 }
 
-/// Whether a `select` has a bit to report, or must fail with `EBADF`.
+/// Whether a `select` has a bit to report.
 fn select_ready(pollfds: &[libc::pollfd]) -> bool {
     pollfds
         .iter()
-        .any(|pollfd| pollfd.revents & libc::POLLNVAL != 0 || select_bits(pollfd).contains(&true))
+        .any(|pollfd| select_bits(pollfd).contains(&true))
 }
 
 /// The pollfd entries for `select`'s descriptor sets: one per descriptor below
@@ -2021,10 +2028,13 @@ impl<T: RecordOrReplay> Detcore<T> {
             Some(address) => Some(ppoll_timeout_duration(guest.memory().read_value(address)?)?),
             None => None,
         };
+        // Any signal mask pointer is refused, even one naming an empty set or
+        // paired with a sigsetsize Linux would reject with EINVAL.
         if sigmask != 0 {
             self.network_refuse(
                 guest,
-                "network trace does not model pselect6 with a signal mask on a recorded socket",
+                "network trace does not model pselect6 with a signal mask pointer on a \
+                 recorded socket",
                 UNSUPPORTED_REMEDY,
             )
             .await
@@ -2050,7 +2060,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Wait on `select`'s descriptor sets as on the pollfd entries they name,
     /// then write the sets of ready descriptors back and return how many bits
     /// they hold, as Linux's `select` does. A descriptor that is not open
-    /// fails the call with `EBADF` and leaves the sets alone.
+    /// when the call starts fails it with `EBADF`, before any wait or signal
+    /// check, and leaves the sets alone; Linux checks its descriptor table
+    /// once, up front, and counts an `O_PATH` descriptor as open.
     async fn network_select_wait<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -2082,6 +2094,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             .iter()
             .map(|pollfd| Self::polled_channel(guest, pollfd.fd))
             .collect();
+        for (pollfd, channel) in pollfds.iter().zip(&channels) {
+            if channel.is_none() {
+                let call = syscalls::Fcntl::new()
+                    .with_fd(pollfd.fd)
+                    .with_cmd(FcntlCmd::F_GETFD);
+                if let Err(Errno::EBADF) = guest.inject(call).await {
+                    return Err(Errno::EBADF.into());
+                }
+            }
+        }
         let pollfds = self
             .network_wait(
                 guest,
@@ -2095,12 +2117,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 select_ready,
             )
             .await?;
-        if pollfds
-            .iter()
-            .any(|pollfd| pollfd.revents & libc::POLLNVAL != 0)
-        {
-            return Err(Errno::EBADF.into());
-        }
         let (result, count) = select_result(&pollfds, &sets, len);
         for (set, address) in result.iter().zip(addresses) {
             write_pselect6_fd_set(guest, address, set)?;
@@ -2396,6 +2412,55 @@ mod tests {
             masked_revents(libc::POLLOUT | libc::POLLHUP | libc::POLLERR, libc::POLLIN),
             libc::POLLHUP | libc::POLLERR
         );
+    }
+
+    #[test]
+    fn select_sets_report_each_set_s_events_as_fs_select_c_does() {
+        // Descriptor 1 is in the readable and exceptional sets, 3 in all
+        // three, 9 in the writable set; 0 and 2 are in none.
+        let set = |fds: &[usize]| {
+            let mut set = vec![0u8; 2];
+            for fd in fds {
+                set[fd / 8] |= 1 << (fd % 8);
+            }
+            Some(set)
+        };
+        let sets = [set(&[1, 3]), set(&[3, 9]), set(&[1, 3])];
+        let mut pollfds = select_pollfds(10, &sets);
+        let read = SELECT_REQUESTED[0];
+        let write = SELECT_REQUESTED[1];
+        assert_eq!(
+            pollfds
+                .iter()
+                .map(|pollfd| (pollfd.fd, pollfd.events))
+                .collect::<Vec<_>>(),
+            [
+                (1, read | libc::POLLPRI),
+                (3, read | write | libc::POLLPRI),
+                (9, write)
+            ]
+        );
+        assert!(!select_ready(&pollfds));
+
+        // Readable 1 is not exceptional; readable and writable 3 is two bits;
+        // hung-up 9 is not writable.
+        pollfds[0].revents = libc::POLLIN | libc::POLLRDNORM;
+        pollfds[1].revents = libc::POLLIN | libc::POLLOUT;
+        pollfds[2].revents = libc::POLLHUP;
+        assert!(select_ready(&pollfds));
+        let (result, count) = select_result(&pollfds, &sets, 2);
+        assert_eq!(result, [set(&[1, 3]), set(&[3]), set(&[])]);
+        assert_eq!(count, 3);
+
+        // A descriptor closed during the wait reports ready in every set it
+        // is in; an unpassed set stays unpassed.
+        pollfds[0].revents = libc::POLLNVAL;
+        pollfds[1].revents = 0;
+        pollfds[2].revents = 0;
+        let sets = [sets[0].clone(), None, sets[2].clone()];
+        let (result, count) = select_result(&pollfds, &sets, 2);
+        assert_eq!(result, [set(&[1]), None, set(&[1])]);
+        assert_eq!(count, 2);
     }
 
     #[test]

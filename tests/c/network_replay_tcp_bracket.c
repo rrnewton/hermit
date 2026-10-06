@@ -24,7 +24,7 @@
  * The other client modes each do one thing network record/replay must
  * refuse: end before sending the whole request, send with sendmsg or
  * sendfile, select or pselect6 on an alias of the socket above FD_SETSIZE,
- * pselect6 with a signal mask, connect to the unspecified address, send
+ * pselect6 with a signal mask pointer, connect to the unspecified address, send
  * UDP, or listen. The
  * guard modes each try a way around the channel before any connection: a
  * 24-byte IPv6 connect, a netlink socket, an abstract AF_UNIX connect, a
@@ -792,20 +792,53 @@ static int run_select_client(const char *port_text) {
   if (wait.tv_sec < 0 || wait.tv_sec > 5 || wait.tv_usec < 0 || wait.tv_usec >= 1000000 ||
       (wait.tv_sec == 5 && wait.tv_usec != 0))
     fail_message("select reported an impossible remaining time");
+
+  /* With the socket readable and writable and a byte in the pipe, each set
+   * reports only its own events: the result counts bits, not descriptors,
+   * the pipe's read end is never writable, and nothing is exceptional. */
+  if (write(pipe_fds[1], "p", 1) != 1)
+    fail("write pipe");
+  FD_ZERO(&readable);
+  FD_SET(socket_fd, &readable);
+  FD_SET(pipe_fds[0], &readable);
+  writable = readable;
+  exceptional = readable;
+  ready = syscall(SYS_pselect6, nfds, &readable, &writable, &exceptional, &zero, NULL);
+  if (ready != 3)
+    fail_message("pselect6 over three sets did not report three bits");
+  FD_ZERO(&expected);
+  FD_SET(socket_fd, &expected);
+  FD_SET(pipe_fds[0], &expected);
+  expect_set(nfds, &readable, &expected, "three-set pselect6 readable");
+  FD_ZERO(&expected);
+  FD_SET(socket_fd, &expected);
+  expect_set(nfds, &writable, &expected, "three-set pselect6 writable");
+  expect_set(nfds, &exceptional, &none, "three-set pselect6 exceptional");
+  char pipe_byte;
+  if (read(pipe_fds[0], &pipe_byte, 1) != 1)
+    fail("read pipe");
   char first[PAYLOAD_SIZE];
   receive_exact(socket_fd, first, sizeof(first));
   if (memcmp(first, FIRST_INPUT, sizeof(first)) != 0)
     fail_message("select client received the wrong first input");
   send_all(socket_fd, PROGRESS, sizeof(PROGRESS) - 1);
 
-  /* glibc's pselect passes the mask wrapper even with no mask. */
+  /* Glibc's pselect passes the mask wrapper even with no mask, but keeps the
+   * kernel's remaining time from its caller; pass the wrapper directly. */
   FD_ZERO(&readable);
   FD_SET(socket_fd, &readable);
   struct timespec long_wait = {.tv_sec = 5, .tv_nsec = 0};
-  ready = pselect(nfds, &readable, NULL, NULL, &long_wait, NULL);
+  struct {
+    const sigset_t *mask;
+    size_t size;
+  } no_mask = {NULL, _NSIG / 8};
+  ready = syscall(SYS_pselect6, nfds, &readable, NULL, NULL, &long_wait, &no_mask);
   if (ready != 1)
-    fail_message("pselect did not report the second input");
-  expect_set(nfds, &readable, &expected, "second-input pselect");
+    fail_message("pselect6 did not report the second input");
+  expect_set(nfds, &readable, &expected, "second-input pselect6");
+  if (long_wait.tv_sec < 0 || long_wait.tv_sec > 4 || long_wait.tv_nsec < 0 ||
+      long_wait.tv_nsec >= 1000000000)
+    fail_message("pselect6 did not report a remaining time below its timeout");
   char second[PAYLOAD_SIZE];
   receive_exact(socket_fd, second, sizeof(second));
   if (memcmp(second, SECOND_INPUT, sizeof(second)) != 0)
@@ -823,7 +856,7 @@ static int run_select_client(const char *port_text) {
   if (recv(socket_fd, &eof_byte, 1, 0) != 0)
     fail_message("peer half-close did not produce EOF after abcdef");
 
-  printf("select=ebadf,timeout,pipe-writable,first,second,eof aggregate=abcdef "
+  printf("select=ebadf,timeout,pipe-writable,first,three-sets,second,eof aggregate=abcdef "
          "outbound_hex=%s outbound_fnv1a64=%016llx\n",
          OUTBOUND_HEX, (unsigned long long)expected_outbound_digest());
   close(pipe_fds[0]);

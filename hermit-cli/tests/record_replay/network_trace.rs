@@ -63,7 +63,7 @@ fn expected_invariant() -> String {
 /// The select client's whole stdout: every check it makes passed.
 fn expected_select_output() -> String {
     format!(
-        "select=ebadf,timeout,pipe-writable,first,second,eof aggregate=abcdef \
+        "select=ebadf,timeout,pipe-writable,first,three-sets,second,eof aggregate=abcdef \
          outbound_hex={OUTBOUND_HEX} outbound_fnv1a64={:016x}\n",
         fnv1a64(b"request\nnext\ndone\n")
     )
@@ -1157,7 +1157,7 @@ fn tcp_replay_refuses_divergence_and_operations_outside_a_channel() {
         ),
         (
             "pselect-mask",
-            "does not model pselect6 with a signal mask on a recorded socket",
+            "does not model pselect6 with a signal mask pointer on a recorded socket",
             "--network=host",
         ),
         (
