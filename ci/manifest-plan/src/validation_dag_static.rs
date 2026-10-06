@@ -1971,8 +1971,9 @@ pub(super) fn config() -> DagConfig {
                 deps: &["gate.manifest"],
                 env: &[],
                 hint: HintSpec {
-                    rss_baseline_bytes: Some(node.memory_bytes),
+                    rss_baseline_bytes: Some(node.rss_baseline_bytes),
                     hard_mem_max_bytes: Some(node.memory_bytes),
+                    preferred_inner_jobs: Some(node.inner_jobs),
                     ..gate.hint
                 },
                 timeout: node.timeout,
@@ -1993,9 +1994,9 @@ pub(super) fn config() -> DagConfig {
 
 pub(super) const RUST_SCRIPT_ENVIRONMENT: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; "########;
 
-/// The measured budget of one `selftest.<name>` node. Every other field is the
-/// ordinary manifest gate's: the same labels, admitted two-worker width carried
-/// through CARGO_BUILD_JOBS, and no appended -j argument.
+/// The measured budget and width of one `selftest.<name>` node. Every other
+/// field is the ordinary manifest gate's: the same labels, the admitted width
+/// carried through CARGO_BUILD_JOBS, and no appended -j argument.
 struct ToolSelfTestNode {
     name: &'static str,
     desc: &'static str,
@@ -2004,6 +2005,12 @@ struct ToolSelfTestNode {
     timeout: i64,
     cpu_timeout: i64,
     memory_bytes: i64,
+    /// The declared working set, which the plan view prints and profile
+    /// estimates start from; the hard bound above is what dagrun enforces.
+    rss_baseline_bytes: i64,
+    /// The node's preferred_inner_jobs, which dagrun also carries through
+    /// CARGO_BUILD_JOBS.
+    inner_jobs: i64,
 }
 
 // Each cap below is at least 1.5 times the largest measured sample named in
@@ -2017,15 +2024,19 @@ const TOOL_SELF_TEST_NODES: &[ToolSelfTestNode] = &[
         timeout: 120,
         cpu_timeout: 30,
         memory_bytes: 5368709120,
+        rss_baseline_bytes: 5368709120,
+        inner_jobs: 2,
     },
     ToolSelfTestNode {
         name: "scorecard_commands",
         desc: "Compatibility scorecard commands-tier self-test, when its paths change",
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness selftest scorecard_commands"########,
-        description: r########"TOOL SELF-TEST NODE, COMMANDS TIER 2026-09-29 (https://github.com/rrnewton/hermit/issues/3381): runs `ci/compat-envelope/scorecard.rs self-test-commands` through `test-harness selftest scorecard_commands`: the regression-tier brackets of selftest.scorecard again, then the brackets that run the scorecard's own commands against a scratch clone of this checkout, a scratch ledger repository and a scratch reverie repository (the command-line, retained-history and series-worktree brackets, including the empty-result command, the replacement-ref guard, the dirty-worktree refusal and the missing-tree refusal). It needs the pinned ledger corpus through DEV_HERMIT_TEST_LEDGER_ROOT. WHEN IT RUNS: test-harness decides before starting it (ci/manifest-plan/src/self_test_selection.rs). It runs when any path changed since the merge base with origin/main, committed or not, is under one of its known inputs (SCORECARD_INPUTS in ci/manifest-plan/src/validation_dag.rs: the directories ci/compat-envelope/, ci/manifest-plan/, detcore-model/, ci/rust-script-bin/ and tests/e2e/manifests/, and the paths agent-utils (a submodule, whose commit moving counts), .gitmodules, Cargo.toml, Cargo.lock, rust-toolchain.toml, scripts/lib/rust_script_prelude.rs, ci/prepare-rust-scripts.sh, ci/prepare-scorecard-self-test-corpus.sh and ci/expected-e2e-plan.json; a deleted or renamed path counts under its old and its new name); it always runs when HEAD is contained in main (refs/heads/main or any refs/remotes/*/main); it also runs when the change set cannot be resolved (a shallow clone, no origin/main, an empty change set, any git failure) and when HERMIT_SELFTEST_SELECTION=all. Otherwise it prints one line containing "NOT RUN by file selection:" that names the merge base and the changed paths, and passes; that line is the node's summary. This node is a leaf: a failure makes the validation red and no node depends on it. It keeps the gate's admitted two-core width. Measured 2026-09-29 on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", at Hermit 84da7b81 plus this change, load average 158 falling to 89, with the prepared release scorecard binary: 480.80 s wall and 459.65 CPU seconds (220.42 user, 239.23 system). Earlier the same brackets, inside the undivided self-test, took 1183.84 s wall and 914.53 CPU seconds at load average 215-233 with the telemetry git wrapper first on PATH; that is the largest sample, and the 1800-second wall and 1500 CPU seconds are 1.52 and 1.64 times it. The cost is process creation (system CPU) for the scratch repositories' git commands; removing those repositories is the remaining step recorded in https://github.com/rrnewton/hermit/issues/3381. It does not take the prepared helper that selftest.scorecard uses: it refuses HERMIT_MANIFEST_PLAN_BIN, because its command-line brackets check the helper that Cargo builds in the shared target directory. KNOWN WALL RISK, NOT MEASURED: it runs `cargo build` and `cargo run -p hermit-manifest-plan` against the checkout's target directory, and forces CARGO_TARGET_DIR=<checkout>/target for its result commands, so it waits on Cargo's build-directory lock while a concurrent product build holds it. In the full local validation of Hermit 84da7b816939, build.workspace held that directory for 618.8 seconds (379.0 to 997.9 s after the start); that window plus the 480.80-second sample is 1099.6 seconds, inside the 1800-second wall. Memory keeps the 5-GiB bound the seven audits shared in the gate."########,
+        description: r########"TOOL SELF-TEST NODE, COMMANDS TIER 2026-09-29 (https://github.com/rrnewton/hermit/issues/3381): runs `ci/compat-envelope/scorecard.rs self-test-commands` through `test-harness selftest scorecard_commands`: the regression-tier brackets of selftest.scorecard again, then the brackets that run the scorecard's own commands against a scratch clone of this checkout, a scratch ledger repository and a scratch reverie repository (the command-line, retained-history and series-worktree brackets, including the empty-result command, the replacement-ref guard, the dirty-worktree refusal and the missing-tree refusal). It needs the pinned ledger corpus through DEV_HERMIT_TEST_LEDGER_ROOT. WHEN IT RUNS: test-harness decides before starting it (ci/manifest-plan/src/self_test_selection.rs). It runs when any path changed since the merge base with origin/main, committed or not, is under one of its known inputs (SCORECARD_INPUTS in ci/manifest-plan/src/validation_dag.rs: the directories ci/compat-envelope/, ci/manifest-plan/, detcore-model/, ci/rust-script-bin/ and tests/e2e/manifests/, and the paths agent-utils (a submodule, whose commit moving counts), .gitmodules, Cargo.toml, Cargo.lock, rust-toolchain.toml, scripts/lib/rust_script_prelude.rs, ci/prepare-rust-scripts.sh, ci/prepare-scorecard-self-test-corpus.sh and ci/expected-e2e-plan.json; a deleted or renamed path counts under its old and its new name); it always runs when HEAD is contained in main (refs/heads/main or any refs/remotes/*/main); it also runs when the change set cannot be resolved (a shallow clone, no origin/main, an empty change set, any git failure) and when HERMIT_SELFTEST_SELECTION=all. Otherwise it prints one line containing "NOT RUN by file selection:" that names the merge base and the changed paths, and passes; that line is the node's summary. This node is a leaf: a failure makes the validation red and no node depends on it. PARTS: the tier runs as four child processes (`self-test-commands --parts 4` is the default). Each child builds the same scratch fixtures and runs its share of the 42 commands segments, assigned by their measured times; every segment runs in exactly one child. The child that runs a segment restores the fixture paths it lists (every fixture path except the Git repositories' internals, of which only HEAD, packed-refs and refs/ count) and fails if the segment changed the clone's Git status, any fixture repository's index, worktree list or configuration, or the clone's ignored files, none of which a restore returns; reflogs, object stores and state outside the fixtures (the plan caches, the shared Cargo target directory) are not compared. The parent fails unless every child passes and all report the same segment table, the same fixture state before each segment and the same final fixture state; that shows the children built the same fixtures, and is not a second check of a segment's restore, since each segment runs in one child. Each child's output is copied line by line as it arrives, after `[part K/N]`, and the parent waits for every child before it returns. Measured 2026-10-06 on the development host recorded in docs/TESTING_ENVIRONMENTS.md, "Named measurement hosts", at Hermit 6a029e95 plus this change, with the prepared scorecard binary, each run in a systemd scope, alternating with main's single-process tier: four parts under a 6-core quota and a 14 GiB bound took 77.68-78.90 s wall and 396.5-403.1 CPU seconds in four runs at load average 14-47 (one more run failed in 12 s because a concurrent cargo test in the same checkout swapped the shared helper binary, which the tier refuses); without the Git-state check above they took 72.45-81.85 s and 363.6-402.3 CPU seconds in six runs at load average 14-36, and 95.74 s and 521.1 CPU seconds (307.2 of them system) in one run at load average 73; main's tier under its 2-core quota and 5 GiB bound took 207.10-209.36 s and 274.3-276.3 CPU seconds in five runs. A 4-core quota gave 91.26-93.84 s, so the node asks for 6 cores. The extra CPU is the fixture setup each child repeats, mostly system CPU. MEMORY: each child holds the tier's own working set, about 0.9-1.2 GB resident (the decoded pinned ledger corpus, the derived catalogue and the in-process commands' data; main's single process holds 1.3 GB plus 0.67 GB for its observe-results child, and the corpus and derived fixture state are freed once the fixtures are written), so four children peaked at 5.96-6.38 GB anonymous and 7.94-9.71 GB cgroup memory.peak (page cache included; GB here is 10^9 bytes); before the corpus was freed, six runs (under 4- and 6-core quotas) peaked at 6.95-7.43 GB anonymous and 9.40-9.94 GB memory.peak. The declared working set is 10 GiB, above every memory.peak measured, and the hard bound is 14 GiB, 1.51 times the largest (9.94 GB, 9.26 GiB). Under the old 5 GiB bound four children hit memory.max 56,776 times and ran 109 s, and eight thrashed (682 s of system CPU). The 1800-second wall comes from the single-process tier's largest sample, 1183.84 s wall and 914.53 CPU seconds at load average 215-233, inside the undivided self-test with the telemetry git wrapper first on PATH; it is 1.52 times that sample. The four parts were not measured under that load. At equal load they use 1.46 times the single process's CPU (402.3 against 275.8 CPU seconds), the fixture setup that each child repeats, which projects that sample to 1334 CPU seconds; the 2100 CPU seconds are 1.57 times that projection and 5.2 times the largest four-part sample at low load. The cost is process creation (system CPU) for the scratch repositories' git commands; removing those repositories is the remaining step recorded in https://github.com/rrnewton/hermit/issues/3381. It does not take the prepared helper that selftest.scorecard uses: it refuses HERMIT_MANIFEST_PLAN_BIN, because its command-line brackets check the helper that Cargo builds in the shared target directory. KNOWN WALL RISK, NOT MEASURED: it runs `cargo build` and `cargo run -p hermit-manifest-plan` against the checkout's target directory, and forces CARGO_TARGET_DIR=<checkout>/target for its result commands, so it waits on Cargo's build-directory lock while a concurrent product build holds it. In the full local validation of Hermit 84da7b816939, build.workspace held that directory for 618.8 seconds (379.0 to 997.9 s after the start); that window plus the single-process tier's 480.80-second sample (2026-09-29, at Hermit 84da7b81, load average 158 falling to 89) is 1099.6 seconds, inside the 1800-second wall."########,
         timeout: 1800,
-        cpu_timeout: 1500,
-        memory_bytes: 5368709120,
+        cpu_timeout: 2100,
+        memory_bytes: 15032385536,
+        rss_baseline_bytes: 10737418240,
+        inner_jobs: 6,
     },
     ToolSelfTestNode {
         name: "pressure_test",
@@ -2035,6 +2046,8 @@ const TOOL_SELF_TEST_NODES: &[ToolSelfTestNode] = &[
         timeout: 900,
         cpu_timeout: 900,
         memory_bytes: 5368709120,
+        rss_baseline_bytes: 5368709120,
+        inner_jobs: 2,
     },
     ToolSelfTestNode {
         name: "validate_rs",
@@ -2044,6 +2057,8 @@ const TOOL_SELF_TEST_NODES: &[ToolSelfTestNode] = &[
         timeout: 600,
         cpu_timeout: 600,
         memory_bytes: 5368709120,
+        rss_baseline_bytes: 5368709120,
+        inner_jobs: 2,
     },
     ToolSelfTestNode {
         name: "manifest_cli",
@@ -2053,6 +2068,8 @@ const TOOL_SELF_TEST_NODES: &[ToolSelfTestNode] = &[
         timeout: 120,
         cpu_timeout: 60,
         memory_bytes: 2147483648,
+        rss_baseline_bytes: 2147483648,
+        inner_jobs: 2,
     },
     ToolSelfTestNode {
         name: "dbt_budget",
@@ -2062,6 +2079,8 @@ const TOOL_SELF_TEST_NODES: &[ToolSelfTestNode] = &[
         timeout: 120,
         cpu_timeout: 60,
         memory_bytes: 2147483648,
+        rss_baseline_bytes: 2147483648,
+        inner_jobs: 2,
     },
 ];
 
