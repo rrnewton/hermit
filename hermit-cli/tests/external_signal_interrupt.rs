@@ -51,7 +51,8 @@
 //! waiting to its original deadline or its wakeup. A sibling that forks the
 //! child and then parks in a wait of its own holds it until that wait returns.
 //! A waiting main thread that forks the child while a sibling spins does not
-//! take it: the sibling does, and the sibling's wake ends the wait.
+//! take it: the sibling does, and the sibling's wake ends the wait, or, for a
+//! timed wait the sibling does not wake, the wait runs to its deadline.
 //!
 //! Every cell with only Hermit-internal senders runs under strict verification
 //! (`--verify --verify-strict`) and requires a matched strict report.
@@ -168,6 +169,9 @@ const STEAL_WAKE_MS: u64 = 2 * SIGNAL_DELAY_MS;
 /// ended the main thread's wait with EINTR, it ended at 450-652 ms on
 /// 2026-09-29 and at 454-656 ms on 2026-10-05.
 const SPIN_WAKE_BOUND_MS: u64 = 1_000;
+/// The guest's timeout for a `timed` futex wait outside the must-not-wake
+/// options: 10 s, far beyond every signal and wake in the cell.
+const LONG_TIMEOUT_MS: u64 = 10_000;
 /// When a wait that the signal interrupted near 100 ms and that Linux then
 /// restarted ends: 100 ms after the signal, when the `thread` sender wakes the
 /// futex or the `process` sender's child exits. A wait that returned at the
@@ -1653,38 +1657,69 @@ fn ptrace_futex_wait_of_the_thread_that_forked_the_child_holds_its_sigchld_until
 
 /// The thread that forked the child does not take its SIGCHLD while it waits,
 /// although Linux offers the signal to that thread first. Here the main thread
-/// forks a child that dies after 100 ms and waits with no timeout, while a
-/// sibling that does not block SIGCHLD spins in user code, with no system
-/// calls, until a handler has run, and then wakes the futex. The handler runs
-/// once, on the sibling, and the sibling's wake ends the main thread's wait,
-/// which returns 0 within `SPIN_WAKE_BOUND_MS` for every death: at 456-457 ms
-/// when the child calls `exit_group` or its only thread calls `exit`, and at
-/// 254 ms when it sends itself SIGKILL (measured on 2026-10-05). Linux instead
-/// ends the main thread's wait with EINTR near the child's death and runs the
-/// handler there. Until round 9 of https://github.com/rrnewton/hermit/pull/3361
-/// this cell asserted that EINTR and the main thread's handler, for an untimed
-/// and a timed (10 s) wait, in two tests. The sibling does not wake a timed
-/// wait, which now runs to its 10 s timeout (ETIMEDOUT at 10003 ms, measured
-/// on 2026-10-05), so only the untimed wait is tested. Hermit's main branch
-/// behaved the same way before https://github.com/rrnewton/hermit/pull/3361:
-/// the spinning sibling took the SIGCHLD there too. Precise mode only; see the
-/// module documentation for polling mode.
-fn assert_waiting_forker_leaves_the_sigchld_to_the_sibling(backend: &str) {
+/// forks a child that dies after 100 ms and waits, while a sibling that does
+/// not block SIGCHLD spins in user code, with no system calls, until a handler
+/// has run. The handler runs once, on the sibling, before the main thread's
+/// wait returns. Linux instead ends the main thread's wait with EINTR near the
+/// child's death and runs the handler there. Hermit's main branch behaved the
+/// same way before https://github.com/rrnewton/hermit/pull/3361: the spinning
+/// sibling took the SIGCHLD there too. Precise mode only; see the module
+/// documentation for polling mode.
+///
+/// - Untimed (`timed` is false): the sibling then wakes the futex, and the
+///   wait returns 0 within `SPIN_WAKE_BOUND_MS` for every death: at 456-457 ms
+///   when the child calls `exit_group` or its only thread calls `exit`, and at
+///   254 ms when it sends itself SIGKILL (measured on 2026-10-05).
+/// - Timed (`timed`, a 10 s timeout): the sibling does not wake the futex, so
+///   the held SIGCHLD neither ends nor restarts the wait, and the wait returns
+///   ETIMEDOUT at its original deadline, within `QUIET_OVERSHOOT_MS` of
+///   `LONG_TIMEOUT_MS`, for every death (at 10003 ms for all three, measured
+///   on 2026-10-06). The child dies at least `EXIT_WAKE_FLOOR_MS` into the
+///   wait, so a wait its SIGCHLD restarted with a fresh timeout would return
+///   at least 100 ms late, and a wait the SIGCHLD ended would return EINTR.
+///   Only this cell checks that the wait ends at its deadline: the untimed
+///   cell's wake would hide a wait that never did.
+///
+/// Until round 9 of https://github.com/rrnewton/hermit/pull/3361 both cells
+/// asserted that EINTR and the main thread's handler. The untimed and the timed
+/// cells are separate tests, so that each stays inside the per-test CPU and
+/// wall bounds with room to spare.
+fn assert_waiting_forker_leaves_the_sigchld_to_the_sibling(backend: &str, timed: bool) {
     for death in ["spin", "spinkill", "spinthrexit"] {
+        let timed_args = ["futex", "exit", "timed", death];
+        let untimed_args = ["futex", "exit", death];
+        let (args, expected, elapsed) = if timed {
+            (
+                timed_args.as_slice(),
+                "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=1",
+                LONG_TIMEOUT_MS..LONG_TIMEOUT_MS + QUIET_OVERSHOOT_MS,
+            )
+        } else {
+            (
+                untimed_args.as_slice(),
+                "RESULT call=futex ret=0 errno=none handler=1",
+                EXIT_WAKE_FLOOR_MS..SPIN_WAKE_BOUND_MS,
+            )
+        };
         assert_role_cell(
             backend,
             FutexMode::Precise,
-            &["futex", "exit", death],
-            "RESULT call=futex ret=0 errno=none handler=1",
+            args,
+            expected,
             HANDLED_BY_SIBLING,
-            EXIT_WAKE_FLOOR_MS..SPIN_WAKE_BOUND_MS,
+            elapsed,
         );
     }
 }
 
 #[test]
 fn ptrace_precise_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling() {
-    assert_waiting_forker_leaves_the_sigchld_to_the_sibling("ptrace");
+    assert_waiting_forker_leaves_the_sigchld_to_the_sibling("ptrace", false);
+}
+
+#[test]
+fn ptrace_precise_timed_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling() {
+    assert_waiting_forker_leaves_the_sigchld_to_the_sibling("ptrace", true);
 }
 
 /// A thread other than the thread-group leader forks a child and waits for it in
