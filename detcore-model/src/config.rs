@@ -1464,8 +1464,18 @@ impl Default for Config {
 /// under the names and in the order it carried them, each with a value
 /// computed from `config`. [`Config::record_host_inputs`], which the legacy
 /// form never had, is left out too, and reads back as false: this form serves
-/// only DBT, whose launcher collects no host inputs. Every other field is
-/// serialized exactly as `serde_json::to_string(config)` serializes it.
+/// only DBT, whose launcher collects no host inputs.
+///
+/// [`Config::anonymous_object_devices`],
+/// [`Config::exit_process_on_identity_lookup_refusal`] and
+/// [`Config::tool_opens_outside_guest_descriptor_table`] came after the bytes
+/// this form preserves, and DBT's launcher leaves each at its serde default
+/// (`None`, `false` and `false`). Each is left out while it holds that default,
+/// so a configuration that does not use it encodes to the earlier bytes, and is
+/// written at its usual position, exactly as `serde_json::to_string(config)`
+/// writes it, when it does not; [`from_legacy_backend_json`] reads an absent
+/// key as the default. Every other field is serialized exactly as
+/// `serde_json::to_string(config)` serializes it.
 ///
 /// Use this wherever the JSON is visible to the guest. `hermit run
 /// --backend=dbt` passes the configuration to the in-guest DBT runtime in the
@@ -1602,10 +1612,13 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// - A JSON array lists the fields by position, as serde reads any derived
 ///   struct. The positions are those of the legacy form, which are the key
 ///   order of [`to_legacy_backend_json`]: the fifteen legacy keys stand where
-///   [`Config::backend`] stands. Too many elements fail the parse; too few
-///   leave the fields
-///   after them missing, each taking its default or failing the parse as the
-///   derived deserializer decides for that field.
+///   [`Config::backend`] stands. None of the three fields the encoder leaves
+///   out at their defaults has a position: each takes its serde default, as
+///   an absent key does, so an array cannot set one, and an array that lists
+///   a value for one has an element too many. Too many elements fail the
+///   parse; too few leave the fields after them missing, each taking its
+///   default or failing the parse as the derived deserializer decides for
+///   that field.
 pub fn from_legacy_backend_json(json: &str) -> serde_json::Result<Config> {
     let mut deserializer = serde_json::Deserializer::from_str(json);
     let (mut config, legacy) = serde::Deserializer::deserialize_struct(
@@ -1737,8 +1750,8 @@ impl LegacyBackendKeys {
 /// The serializer adapter wraps the JSON serializer only at the top level,
 /// where `Config`'s derived `Serialize` opens one struct and writes its fields
 /// in declaration order. Nested values go straight to the wrapped serializer,
-/// so they, and every field other than the two it replaces, are encoded
-/// unchanged.
+/// so they, and every field other than the two it replaces and the ones it
+/// leaves out, are encoded unchanged.
 ///
 /// The deserializer adapters likewise wrap only the top-level object or array,
 /// and hand every nested value to the wrapped JSON deserializer.
@@ -1775,6 +1788,47 @@ mod legacy_backend_json {
     /// form serves only DBT, whose launcher collects no host inputs, so it is
     /// never written and always reads as false.
     const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 2] = ["backend", "record_host_inputs"];
+
+    /// The fields `Config` gained after the bytes the legacy form preserves,
+    /// each with a test of whether a configuration holds the field's serde
+    /// default. DBT's launcher leaves each at that default.
+    ///
+    /// The encoder leaves such a field out while it holds its default, so a
+    /// configuration that does not use it still encodes to the earlier bytes,
+    /// and writes it under its own name at its usual position when it does
+    /// not. Each field is `#[serde(default)]`, so `Config`'s derived
+    /// deserializer reads an absent key, and an array element the decoder
+    /// does not supply, as that default.
+    ///
+    /// Only this encoder may leave a field out. `Config` itself never skips
+    /// one, because it also crosses positional bincode, which has no field
+    /// names and would misread every field after a skipped one.
+    pub(super) const FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS: [(&str, fn(&Config) -> bool); 3] = [
+        ("anonymous_object_devices", |config| {
+            config.anonymous_object_devices.is_none()
+        }),
+        ("exit_process_on_identity_lookup_refusal", |config| {
+            !config.exit_process_on_identity_lookup_refusal
+        }),
+        ("tool_opens_outside_guest_descriptor_table", |config| {
+            !config.tool_opens_outside_guest_descriptor_table
+        }),
+    ];
+
+    /// Whether `field` is one of [`FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS`].
+    fn is_left_out_at_its_default(field: &str) -> bool {
+        FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS
+            .iter()
+            .any(|(name, _)| *name == field)
+    }
+
+    /// Whether `field` is one of [`FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS`] and
+    /// `config` holds its default, so the encoder leaves it out.
+    fn holds_a_default_left_out(config: &Config, field: &str) -> bool {
+        FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS
+            .iter()
+            .any(|(name, holds_default)| *name == field && holds_default(config))
+    }
 
     /// Reads the top-level object or array of a legacy configuration. The
     /// derived `Config` deserializer reads every field; this takes the legacy
@@ -1864,6 +1918,9 @@ mod legacy_backend_json {
     /// elements as the legacy backend keys, and neither the field it asks for
     /// there nor [`Config::record_host_inputs`] takes an element. Both get a
     /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
+    /// A field of [`FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS`] takes no element
+    /// either: this supplies none, and the derived deserializer gives the
+    /// field its serde default, as it does for an absent key.
     struct LegacyPositions<'f, 'l, A> {
         inner: A,
         fields: std::slice::Iter<'f, String>,
@@ -1895,6 +1952,7 @@ mod legacy_backend_json {
                 Some("record_host_inputs") => {
                     seed.deserialize(BoolDeserializer::new(false)).map(Some)
                 }
+                Some(field) if is_left_out_at_its_default(field) => Ok(None),
                 _ => self.inner.next_element_seed(seed),
             }
         }
@@ -2135,6 +2193,8 @@ mod legacy_backend_json {
                 }
                 // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
                 "record_host_inputs" => Ok(()),
+                // Left out at its default; see FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS.
+                key if holds_a_default_left_out(self.config, key) => Ok(()),
                 _ => self.inner.serialize_field(key, value),
             }
         }
@@ -2570,7 +2630,10 @@ mod tests {
 
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
-    /// `record_host_inputs`, which is the key order the encoder writes.
+    /// `record_host_inputs`, and none of the fields left out at their
+    /// defaults, which is the key order the encoder writes for a
+    /// configuration holding those defaults. A field left out at its default
+    /// is written, when set, at its own place in that order.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2581,23 +2644,48 @@ mod tests {
         )
         .unwrap()
         .0;
-        let mut expected = Vec::new();
-        for field in &fields {
-            match field.as_str() {
-                "backend" => expected.extend(names.map(str::to_owned)),
-                "record_host_inputs" => {}
-                other => expected.push(other.to_owned()),
-            }
+        let left_out = legacy_backend_json::FIELDS_LEFT_OUT_AT_THEIR_DEFAULTS;
+        for (field, holds_default) in left_out {
+            assert_eq!(fields.iter().filter(|name| *name == field).count(), 1);
+            assert!(holds_default(&Config::default()), "{field}");
         }
-        let encoded = to_legacy_backend_json(&Config::default()).unwrap();
-        let keys: Vec<String> = ordered_entries(&encoded)
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
-        assert_eq!(keys, expected);
-        // `backend` becomes fifteen keys; `record_host_inputs` none.
+        let expected_keys = |written: &[&str]| {
+            let mut expected = Vec::new();
+            for field in &fields {
+                match field.as_str() {
+                    "backend" => expected.extend(names.map(str::to_owned)),
+                    "record_host_inputs" => {}
+                    other if left_out.iter().any(|(name, _)| *name == other) => {
+                        if written.contains(&other) {
+                            expected.push(other.to_owned());
+                        }
+                    }
+                    other => expected.push(other.to_owned()),
+                }
+            }
+            expected
+        };
+        let encoded_keys = |config: &Config| -> Vec<String> {
+            ordered_entries(&to_legacy_backend_json(config).unwrap())
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect()
+        };
+        let keys = encoded_keys(&Config::default());
+        assert_eq!(keys, expected_keys(&[]));
+        // `backend` becomes fifteen keys; `record_host_inputs` and each field
+        // at its default none.
         assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
-        assert_eq!(fields.len() + 13, keys.len());
+        assert_eq!(fields.len() + 13 - left_out.len(), keys.len());
+
+        let set = Config {
+            anonymous_object_devices: Some(AnonymousObjectDevices { pipe: 1, socket: 2 }),
+            exit_process_on_identity_lookup_refusal: true,
+            tool_opens_outside_guest_descriptor_table: true,
+            ..Config::default()
+        };
+        let all: Vec<&str> = left_out.iter().map(|(name, _)| *name).collect();
+        assert_eq!(encoded_keys(&set), expected_keys(&all));
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2702,6 +2790,89 @@ mod tests {
                 assert!(parse(&mistyped).is_err(), "{key}");
             }
         }
+    }
+
+    /// `field` is absent from the legacy form of a configuration that holds its
+    /// default, which reads back holding it. `set` holds another value, which
+    /// the legacy form carries as `"<field>":<written>`, exactly once, and
+    /// which reads back unchanged. The array form has no position for the
+    /// field, so the array listing `set` has an element too many and fails the
+    /// parse rather than reading as some other configuration.
+    fn assert_left_out_at_its_default_and_written_when_set(
+        field: &str,
+        set: Config,
+        written: &str,
+    ) {
+        for unset in [
+            Config::default(),
+            Config {
+                backend: BackendCapabilities::DBT,
+                ..Config::default()
+            },
+        ] {
+            let json = to_legacy_backend_json(&unset).unwrap();
+            assert!(!json.contains(&format!("\"{field}\"")), "{json}");
+            let received = from_legacy_backend_json(&json).unwrap();
+            assert_eq!(
+                serde_json::to_string(&received).unwrap(),
+                serde_json::to_string(&unset).unwrap(),
+                "{field}"
+            );
+        }
+
+        let json = to_legacy_backend_json(&set).unwrap();
+        let member = format!("\"{field}\":{written}");
+        assert_eq!(json.matches(&member).count(), 1, "{member} in {json}");
+        let received = from_legacy_backend_json(&json).unwrap();
+        assert_eq!(
+            serde_json::to_string(&received).unwrap(),
+            serde_json::to_string(&set).unwrap(),
+            "{field}"
+        );
+        assert_eq!(to_legacy_backend_json(&received).unwrap(), json, "{field}");
+        assert!(
+            from_legacy_backend_json(&positional(&json)).is_err(),
+            "{field}"
+        );
+    }
+
+    #[test]
+    fn anonymous_object_devices_are_written_when_set_and_read_back() {
+        assert_left_out_at_its_default_and_written_when_set(
+            "anonymous_object_devices",
+            Config {
+                anonymous_object_devices: Some(AnonymousObjectDevices {
+                    pipe: 0x0e,
+                    socket: 0x08,
+                }),
+                ..Config::default()
+            },
+            r#"{"pipe":14,"socket":8}"#,
+        );
+    }
+
+    #[test]
+    fn exit_process_on_identity_lookup_refusal_is_written_when_set_and_reads_back() {
+        assert_left_out_at_its_default_and_written_when_set(
+            "exit_process_on_identity_lookup_refusal",
+            Config {
+                exit_process_on_identity_lookup_refusal: true,
+                ..Config::default()
+            },
+            "true",
+        );
+    }
+
+    #[test]
+    fn tool_opens_outside_guest_descriptor_table_is_written_when_set_and_reads_back() {
+        assert_left_out_at_its_default_and_written_when_set(
+            "tool_opens_outside_guest_descriptor_table",
+            Config {
+                tool_opens_outside_guest_descriptor_table: true,
+                ..Config::default()
+            },
+            "true",
+        );
     }
 
     /// Selects the child half of

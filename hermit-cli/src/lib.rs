@@ -2706,10 +2706,10 @@ const LEGACY_DBT_DETCONFIG_KEYS: [(&str, bool, &str); 3] = [
 /// The output is byte-identical to what the same config produced before
 /// either change. That is pinned by golden bytes in the tests below.
 ///
-/// Fields added since are the reverse case. A key in
-/// `POST_BASELINE_DBT_DETCONFIG_KEYS` is dropped first while it holds its serde
-/// default, and the legacy keys are inserted second, so a new field at its
-/// default keeps those bytes too. A non-default value is still serialized.
+/// Fields added since are the reverse case. Those DBT's launcher leaves at
+/// their serde defaults are left out by [`detcore::to_legacy_backend_json`]
+/// while they hold those defaults, so they keep those bytes too; a non-default
+/// value is still serialized.
 ///
 /// Remove this shim when the config reaches the DBT runtime through a private
 /// channel that is stripped before the guest starts. SaBRe already works that
@@ -2719,10 +2719,7 @@ const LEGACY_DBT_DETCONFIG_KEYS: [(&str, bool, &str); 3] = [
 /// mattering.
 #[doc(hidden)]
 pub fn dbt_detconfig_json(config: &DetConfig) -> serde_json::Result<String> {
-    insert_legacy_dbt_detconfig_keys(&omit_post_baseline_dbt_detconfig_keys(
-        &detcore::to_legacy_backend_json(config)?,
-        POST_BASELINE_DBT_DETCONFIG_KEYS,
-    )?)
+    insert_legacy_dbt_detconfig_keys(&detcore::to_legacy_backend_json(config)?)
 }
 
 /// Re-insert [`LEGACY_DBT_DETCONFIG_KEYS`] into a serialized [`DetConfig`].
@@ -2969,105 +2966,9 @@ mod dbt_detconfig_tests {
     }
 }
 
-/// Keys of [`DetConfig`] fields added after the baseline that DBT guests observe
-/// in `HERMIT_DBT_DETCONFIG`. Each entry is the key and the exact JSON text of
-/// the field's serde default.
-///
-/// A listed key is omitted from the variable while its field holds that
-/// default, so the guest-visible bytes stay as they were before the field
-/// existed. The DBT runtime decodes the variable into [`DetConfig`] with
-/// [`detcore::from_legacy_backend_json`], where the missing key decodes to the
-/// field's default (through `#[serde(default)]`, or as `None` for an
-/// `Option`), so the runtime gets the same value back. A
-/// non-default value is emitted unchanged. That deliberately changes what the
-/// guest sees, and the change that makes a backend produce it needs its own
-/// review.
-///
-/// This is not `#[serde(skip_serializing_if)]` on the field because
-/// [`DetConfig`] also crosses Reverie's legacy positional bincode RPC (see
-/// `config_wire_fingerprint` in detcore-model). A positional format has no
-/// field names, so it cannot leave a field out, and a skipped field would break
-/// that wire.
-///
-/// An entry's JSON text must be exactly what `serde_json::to_string` produces
-/// for the default, for example `"false"` or `"null"`.
-const POST_BASELINE_DBT_DETCONFIG_KEYS: &[(&str, &str)] = &[
-    // (key, exact JSON text of its serde default), one entry per line.
-    ("anonymous_object_devices", "null"),
-    ("exit_process_on_identity_lookup_refusal", "false"),
-    ("tool_opens_outside_guest_descriptor_table", "false"),
-];
-
-/// Drop each listed member from a serialized [`DetConfig`] while its value is
-/// exactly the listed JSON text. Every other member keeps its exact bytes and
-/// its place in the order.
-///
-/// The omission works on the parsed top-level object, never on substrings, so
-/// a key name inside a string value or a nested object is never touched. It
-/// refuses, rather than guessing, when a listed key is missing or appears more
-/// than once. A missing key means the field was renamed or removed and the
-/// list is stale.
-fn omit_post_baseline_dbt_detconfig_keys(
-    serialized: &str,
-    keys: &[(&str, &str)],
-) -> serde_json::Result<String> {
-    use serde::de::MapAccess;
-    use serde::ser::Error as _;
-    use serde::ser::SerializeMap;
-    use serde_json::value::RawValue;
-
-    /// The top-level members of a JSON object in document order, each value
-    /// kept as its exact serialized bytes.
-    struct Members<'a>(Vec<(&'a str, &'a RawValue)>);
-
-    impl<'de> serde::Deserialize<'de> for Members<'de> {
-        fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-            struct MembersVisitor;
-            impl<'de> serde::de::Visitor<'de> for MembersVisitor {
-                type Value = Members<'de>;
-                fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                    formatter.write_str("a serialized Detcore config object")
-                }
-                fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
-                    let mut members = Vec::new();
-                    while let Some(member) = map.next_entry()? {
-                        members.push(member);
-                    }
-                    Ok(Members(members))
-                }
-            }
-            deserializer.deserialize_map(MembersVisitor)
-        }
-    }
-
-    impl serde::Serialize for Members<'_> {
-        fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-            let mut map = serializer.serialize_map(Some(self.0.len()))?;
-            for (key, value) in &self.0 {
-                map.serialize_entry(key, value)?;
-            }
-            map.end()
-        }
-    }
-
-    let mut members: Members<'_> = serde_json::from_str(serialized)?;
-    for (key, _) in keys {
-        let count = members.0.iter().filter(|(member, _)| member == key).count();
-        if count != 1 {
-            return Err(serde_json::Error::custom(format!(
-                "cannot omit post-baseline DBT config key {key:?}: it appears {count} times, \
-                 expected exactly once"
-            )));
-        }
-    }
-    members.0.retain(|(member, value)| {
-        !keys
-            .iter()
-            .any(|(key, omitted)| member == key && value.get() == *omitted)
-    });
-    serde_json::to_string(&members)
-}
-
+/// The DBT config leaves each field DBT's launcher holds at its serde default
+/// out of `HERMIT_DBT_DETCONFIG` ([`detcore::to_legacy_backend_json`] does),
+/// carries a value that is not the default, and decodes back either way.
 #[cfg(test)]
 mod dbt_detconfig_omit_tests {
     use std::path::PathBuf;
@@ -3077,31 +2978,8 @@ mod dbt_detconfig_omit_tests {
 
     use super::Backend;
     use super::DetConfig;
-    use super::POST_BASELINE_DBT_DETCONFIG_KEYS;
     use super::dbt_detconfig_json;
-    use super::omit_post_baseline_dbt_detconfig_keys;
     use super::prepare_backend_config;
-
-    /// `omit_post_baseline_dbt_detconfig_keys`, failing the test on a refusal.
-    fn omit(serialized: &str, keys: &[(&str, &str)]) -> String {
-        omit_post_baseline_dbt_detconfig_keys(serialized, keys)
-            .unwrap_or_else(|error| panic!("omitting {keys:?} from {serialized} refused: {error}"))
-    }
-
-    /// The refusal message for `keys`, failing the test if they are accepted.
-    fn refusal(serialized: &str, keys: &[(&str, &str)]) -> String {
-        match omit_post_baseline_dbt_detconfig_keys(serialized, keys) {
-            Ok(output) => panic!("omitting {keys:?} from {serialized} was accepted: {output}"),
-            Err(error) => error.to_string(),
-        }
-    }
-
-    /// Require `serialized` to parse as one JSON object.
-    fn assert_is_a_json_object(serialized: &str) {
-        let value: serde_json::Value = serde_json::from_str(serialized)
-            .unwrap_or_else(|error| panic!("{serialized} is not valid JSON: {error}"));
-        assert!(value.is_object(), "{serialized} is not a JSON object");
-    }
 
     /// Require the DBT runtime to decode exactly `config` from
     /// [`dbt_detconfig_json`]'s output.
@@ -3109,11 +2987,11 @@ mod dbt_detconfig_omit_tests {
     /// The output is parsed back into [`DetConfig`] the way the runtime parses
     /// `HERMIT_DBT_DETCONFIG`, with [`detcore::from_legacy_backend_json`], and
     /// the parsed config must serialize to the same
-    /// bytes as `config` ([`DetConfig`] has no `PartialEq`). An omitted key
-    /// therefore has to come back as the value it held, which proves that the
-    /// listed text is the field's serde default and that a missing key decodes
-    /// to it. A change that lists a key calls this with that field at its
-    /// default and at another value.
+    /// bytes as `config` ([`DetConfig`] has no `PartialEq`). A key the encoder
+    /// leaves out therefore has to come back as the value it held, which proves
+    /// that it was left out only at its serde default and that a missing key
+    /// decodes to that default. Each field the encoder can leave out is checked
+    /// here at its default and at another value.
     fn assert_dbt_detconfig_round_trips(config: &DetConfig) {
         let encoded = dbt_detconfig_json(config)
             .unwrap_or_else(|error| panic!("DBT config does not serialize: {error}"));
@@ -3179,194 +3057,14 @@ mod dbt_detconfig_omit_tests {
         ]
     }
 
+    /// Every real config's full `HERMIT_DBT_DETCONFIG` value, legacy keys
+    /// included, decodes back to the config. The golden test in
+    /// `dbt_detconfig_tests` pins the bytes of that value.
     #[test]
-    fn drops_a_listed_key_holding_its_default_and_keeps_every_other_byte() {
-        assert_eq!(
-            omit(r#"{"a":1,"k":false,"b":"x"}"#, &[("k", "false")]),
-            r#"{"a":1,"b":"x"}"#
-        );
-        assert_eq!(
-            omit(
-                r#"{"a":1.5,"k":false,"b":[{"c":null}],"m":null,"d":"y"}"#,
-                &[("k", "false"), ("m", "null")]
-            ),
-            r#"{"a":1.5,"b":[{"c":null}],"d":"y"}"#
-        );
-    }
-
-    #[test]
-    fn keeps_a_listed_key_holding_any_other_value_byte_for_byte() {
-        for serialized in [
-            r#"{"a":1,"k":true,"b":"x"}"#,
-            r#"{"a":1,"k":"false","b":"x"}"#,
-        ] {
-            assert_eq!(omit(serialized, &[("k", "false")]), serialized);
-        }
-        for serialized in [
-            r#"{"a":1,"k":{"major":8,"minor":0},"b":"x"}"#,
-            r#"{"a":1,"k":"null","b":"x"}"#,
-        ] {
-            assert_eq!(omit(serialized, &[("k", "null")]), serialized);
-        }
-    }
-
-    #[test]
-    fn drops_the_first_last_or_only_member_leaving_valid_json() {
-        for (serialized, expected) in [
-            (r#"{"k":false,"a":1,"b":2}"#, r#"{"a":1,"b":2}"#),
-            (r#"{"a":1,"b":2,"k":false}"#, r#"{"a":1,"b":2}"#),
-            (r#"{"k":false}"#, "{}"),
-        ] {
-            let output = omit(serialized, &[("k", "false")]);
-            assert_eq!(output, expected);
-            assert_is_a_json_object(&output);
-        }
-    }
-
-    #[test]
-    fn refuses_a_missing_listed_key_and_names_it() {
-        let error = refusal(r#"{"a":1,"b":2}"#, &[("renamed_switch", "false")]);
-        assert!(
-            error.contains(r#""renamed_switch""#) && error.contains("appears 0 times"),
-            "unexpected error: {error}"
-        );
-    }
-
-    #[test]
-    fn refuses_a_repeated_listed_key_and_names_it() {
-        for serialized in [
-            r#"{"repeated_switch":false,"a":1,"repeated_switch":false}"#,
-            r#"{"repeated_switch":true,"repeated_switch":false}"#,
-        ] {
-            let error = refusal(serialized, &[("repeated_switch", "false")]);
-            assert!(
-                error.contains(r#""repeated_switch""#) && error.contains("appears 2 times"),
-                "unexpected error: {error}"
-            );
-        }
-    }
-
-    #[test]
-    fn leaves_the_key_inside_a_string_value_or_a_nested_object_untouched() {
-        let keys = &[("k", "false")];
-        let kept = r#"{"s":",\"k\":false,","n":{"k":false},"k":true}"#;
-        assert_eq!(omit(kept, keys), kept);
-        assert_eq!(
-            omit(r#"{"s":",\"k\":false,","k":false,"n":{"k":false}}"#, keys),
-            r#"{"s":",\"k\":false,","n":{"k":false}}"#
-        );
-        let error = refusal(r#"{"s":",\"k\":false,","n":{"k":false}}"#, keys);
-        assert!(
-            error.contains("appears 0 times"),
-            "a nested or quoted copy must not count as the top-level key: {error}"
-        );
-    }
-
-    /// `serialized` with each listed member that holds exactly its listed text
-    /// cut out together with one adjacent comma: the one after it, or the one
-    /// before it when the member is last. This works on the text alone,
-    /// independently of the helper under test, and fails unless each quoted key
-    /// and its colon occur exactly once.
-    fn cut_listed_defaults_out_as_text(serialized: &str, keys: &[(&str, &str)]) -> String {
-        let mut text = serialized.to_owned();
-        for (key, omitted) in keys {
-            let needle = format!("{}:", serde_json::to_string(key).unwrap());
-            let starts: Vec<usize> = text
-                .match_indices(needle.as_str())
-                .map(|(start, _)| start)
-                .collect();
-            assert_eq!(
-                starts.len(),
-                1,
-                "listed key {key:?} occurs {} times as {needle} in the serialized config, \
-                 expected exactly once",
-                starts.len()
-            );
-            let member = starts[0];
-            let value = member + needle.len();
-            if !text[value..].starts_with(omitted) {
-                continue;
-            }
-            let value_end = value + omitted.len();
-            match text.as_bytes().get(value_end).copied() {
-                Some(b',') => text.replace_range(member..=value_end, ""),
-                Some(b'}') if text[..member].ends_with(',') => {
-                    text.replace_range(member - 1..value_end, "")
-                }
-                Some(b'}') => text.replace_range(member..value_end, ""),
-                _ => {}
-            }
-        }
-        text
-    }
-
-    /// On every real config, the omission step is the legacy-form serialization
-    /// that `dbt_detconfig_json` starts from ([`detcore::to_legacy_backend_json`])
-    /// with each listed default cut out as text, and the full
-    /// `HERMIT_DBT_DETCONFIG` value, legacy keys included, decodes back to the
-    /// config. The golden test in `dbt_detconfig_tests` pins the bytes of that
-    /// full value. With the empty list the omission step is byte identity with
-    /// that serialization.
-    /// A change that lists a key does not edit this test; it adds its own
-    /// tests, which pass its field through [`assert_dbt_detconfig_round_trips`]
-    /// at the default and at another value.
-    #[test]
-    fn matches_plain_serialization_with_each_listed_default_cut_out_as_text() {
-        let mut listed = std::collections::BTreeSet::new();
-        for (key, _) in POST_BASELINE_DBT_DETCONFIG_KEYS {
-            assert!(
-                listed.insert(*key),
-                "{key:?} is listed more than once in POST_BASELINE_DBT_DETCONFIG_KEYS"
-            );
-        }
-
-        // The text cut itself, on literal input, so it is checked before any
-        // key is listed.
-        let keys = &[("k", "false")];
-        for (serialized, expected) in [
-            (r#"{"k":false,"a":1}"#, r#"{"a":1}"#),
-            (r#"{"a":1,"k":false}"#, r#"{"a":1}"#),
-            (r#"{"k":false}"#, "{}"),
-        ] {
-            assert_eq!(cut_listed_defaults_out_as_text(serialized, keys), expected);
-        }
-        for kept in [r#"{"a":1,"k":true}"#, r#"{"s":"\"k\":false","k":true}"#] {
-            assert_eq!(cut_listed_defaults_out_as_text(kept, keys), kept);
-        }
-        let kept = r#"{"k":10,"a":1}"#;
-        assert_eq!(cut_listed_defaults_out_as_text(kept, &[("k", "1")]), kept);
-
-        for (name, config) in real_configs() {
-            let serialized = detcore::to_legacy_backend_json(&config).unwrap();
-            let expected =
-                cut_listed_defaults_out_as_text(&serialized, POST_BASELINE_DBT_DETCONFIG_KEYS);
-            let actual = omit_post_baseline_dbt_detconfig_keys(
-                &serialized,
-                POST_BASELINE_DBT_DETCONFIG_KEYS,
-            )
-            .unwrap_or_else(|error| panic!("{name}: the omission step refused: {error}"));
-            assert_eq!(
-                actual, expected,
-                "{name}: the omission step differs from the legacy-form serialization with \
-                 the listed defaults cut out"
-            );
+    fn real_configs_round_trip_through_the_dbt_config() {
+        for (_, config) in real_configs() {
             assert_dbt_detconfig_round_trips(&config);
         }
-    }
-
-    /// `anonymous_object_devices` is listed with the text `null`, and that is
-    /// exactly what serde writes for the field's default, `None`.
-    #[test]
-    fn anonymous_object_devices_default_serializes_as_its_listed_text() {
-        assert!(POST_BASELINE_DBT_DETCONFIG_KEYS.contains(&("anonymous_object_devices", "null")));
-        let serialized = serde_json::to_string(&default_config()).unwrap();
-        assert_eq!(
-            serialized
-                .matches(r#""anonymous_object_devices":null"#)
-                .count(),
-            1,
-            "{serialized}"
-        );
     }
 
     /// With the field `None`, which is what `prepare_backend_config` gives
@@ -3413,24 +3111,6 @@ mod dbt_detconfig_omit_tests {
         assert_dbt_detconfig_round_trips(&config);
     }
 
-    /// `exit_process_on_identity_lookup_refusal` is listed with the text
-    /// `false`, and that is exactly what serde writes for the field's default.
-    #[test]
-    fn exit_process_on_identity_lookup_refusal_default_serializes_as_its_listed_text() {
-        assert!(
-            POST_BASELINE_DBT_DETCONFIG_KEYS
-                .contains(&("exit_process_on_identity_lookup_refusal", "false"))
-        );
-        let serialized = serde_json::to_string(&default_config()).unwrap();
-        assert_eq!(
-            serialized
-                .matches(r#""exit_process_on_identity_lookup_refusal":false"#)
-                .count(),
-            1,
-            "{serialized}"
-        );
-    }
-
     /// With the field false, which is what `prepare_backend_config` gives
     /// DBT, the key is absent from `HERMIT_DBT_DETCONFIG`, so the value the
     /// guest can read keeps its baseline bytes.
@@ -3470,24 +3150,6 @@ mod dbt_detconfig_omit_tests {
             "{encoded}"
         );
         assert_dbt_detconfig_round_trips(&config);
-    }
-
-    /// `tool_opens_outside_guest_descriptor_table` is listed with the text
-    /// `false`, and that is exactly what serde writes for the field's default.
-    #[test]
-    fn tool_opens_outside_guest_descriptor_table_default_serializes_as_its_listed_text() {
-        assert!(
-            POST_BASELINE_DBT_DETCONFIG_KEYS
-                .contains(&("tool_opens_outside_guest_descriptor_table", "false"))
-        );
-        let serialized = serde_json::to_string(&default_config()).unwrap();
-        assert_eq!(
-            serialized
-                .matches(r#""tool_opens_outside_guest_descriptor_table":false"#)
-                .count(),
-            1,
-            "{serialized}"
-        );
     }
 
     /// With the field false, which is what `prepare_backend_config` gives
