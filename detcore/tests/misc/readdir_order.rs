@@ -2421,3 +2421,48 @@ fn negative_count_untracked_guest() {
 fn negative_count_on_untracked_and_host_order_descriptors() {
     run_five_times(negative_count_untracked_guest);
 }
+
+/// Whether a host inode is new to Detcore depends on host state the guest does
+/// not control: a file another process replaced, an inode the filesystem
+/// reused, or, as here, a hard link. Even runs stat two names that are one
+/// host file and odd runs two names that are two host files, then list a
+/// third directory. Only the two stat'd names may tell the runs apart; the
+/// listing's `d_ino` values must not
+/// (https://github.com/rrnewton/hermit/issues/2897, where one replaced file
+/// renumbered every entry of a later `/sys` listing).
+fn host_dependent_inode_sighting_guest(root: &tempfile::TempDir) {
+    std::fs::metadata(root.path().join("a")).unwrap();
+    std::fs::metadata(root.path().join("b")).unwrap();
+    let dir = open_dir(&root.path().join("listed"));
+    let listing = read_listing(dir);
+    unsafe { libc::closedir(dir) };
+    assert_eq!(listing.names, [".", "..", "x", "y", "z"]);
+    println!("listed {:016x}", listing.digest);
+}
+
+#[test]
+fn host_dependent_inode_sighting_does_not_renumber_a_later_listing() {
+    let runs = std::sync::atomic::AtomicUsize::new(0);
+    run_five_times_on(
+        || {
+            let root = tempfile::tempdir().unwrap();
+            File::create(root.path().join("a")).unwrap();
+            if runs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .is_multiple_of(2)
+            {
+                std::fs::hard_link(root.path().join("a"), root.path().join("b")).unwrap();
+            } else {
+                File::create(root.path().join("b")).unwrap();
+            }
+            let listed = root.path().join("listed");
+            std::fs::create_dir(&listed).unwrap();
+            for name in ["x", "y", "z"] {
+                File::create(listed.join(name)).unwrap();
+            }
+            root
+        },
+        host_dependent_inode_sighting_guest,
+        true,
+    );
+}

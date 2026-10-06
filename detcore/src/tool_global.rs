@@ -131,6 +131,8 @@ struct InodePool {
     /// Counter backing the minted [`DetInode`]s. Deliberately a plain integer:
     /// it is the *source* of deterministic inodes, not one itself, and typing
     /// it `RawInode` previously blurred that distinction.
+    ///
+    /// It counts *requests*, not distinct host inodes: see [`Self::add_inode`].
     next_inode: u64,
 }
 
@@ -252,7 +254,9 @@ impl InodePool {
         InodePool {
             inodes: HashMap::new(),
             detinodes_info: HashMap::new(),
-            next_inode: 1,
+            // Above the fixed stdio inodes (`DET_SPECIAL_INODE_OFFSET`), so a
+            // pooled number can never collide with one of them.
+            next_inode: crate::consts::DET_INODE_OFFSET.as_raw(),
         }
     }
 
@@ -260,6 +264,16 @@ impl InodePool {
     // can return an existing mapping or extend the mapping by creating a
     // new deterministic inode. The returned inode is strictly increasing
     // to avoid inode re-use issue in some filesystem like ext4.
+    //
+    // Every call consumes the next counter value, whether or not it mints.
+    // Whether a host inode is "new" depends on host state the guest does not
+    // control (a file replaced by another process, an inode the filesystem
+    // reused, a hard link), while the sequence of requests is the guest's
+    // own. Counting only mints let one such host-dependent sighting shift the
+    // number of every file minted after it, on every device
+    // (https://github.com/rrnewton/hermit/issues/2897); counting requests
+    // confines the difference to the file whose host identity differed.
+    // Numbers stay unique and increasing, just not dense.
     //
     // Also return the virtual mtime. When it is still unresolved, `observed`
     // resolves it under the first-seen policy (see `ObservedMtime`); an
@@ -270,6 +284,8 @@ impl InodePool {
         observed: ObservedMtime,
         epoch: LogicalTime,
     ) -> (DetInode, LogicalTime) {
+        let ordinal = self.next_inode;
+        self.next_inode += 1;
         let dino = match self.inodes.get(&raw_inode) {
             Some(dino) => *dino,
             None => {
@@ -277,8 +293,7 @@ impl InodePool {
                 // is deliberately mapped to a deterministic one. The value is
                 // minted from a monotonic counter, never derived from the host
                 // inode's bits.
-                let new = DetInode::mint(self.next_inode);
-                self.next_inode += 1;
+                let new = DetInode::mint(ordinal);
                 assert!(self.inodes.insert(raw_inode, new).is_none());
                 let prev = self.detinodes_info.insert(
                     new,
@@ -7748,8 +7763,8 @@ mod tests {
     /// A deterministic inode must be minted from the monotonic counter, never
     /// derived from the host inode's bits. This is the behavioural half of the
     /// guarantee whose static half is `DetInode` being a newtype: even for a
-    /// large, realistic host inode the det value stays small and dense, so a
-    /// leaked host inode is distinguishable from a genuine det one.
+    /// large, realistic host inode the det value stays small, so a leaked host
+    /// inode is distinguishable from a genuine det one.
     #[test]
     fn det_inodes_are_minted_not_passed_through() {
         use crate::types::DetInode;
@@ -7774,12 +7789,74 @@ mod tests {
             host_b.ino,
             "det inode must not be the host inode"
         );
-        assert_eq!(a, DetInode::mint(1), "minting starts at 1");
-        assert_eq!(b, DetInode::mint(2), "minting is monotonic");
+        assert_eq!(
+            a,
+            crate::consts::DET_INODE_OFFSET,
+            "minting starts above the fixed stdio inodes"
+        );
+        assert_eq!(b, DetInode::mint(9001), "minting is monotonic");
 
         // Re-determinizing the same host inode is stable, not a fresh mint.
         let (a_again, _) = pool.add_inode(host_a, seen, t);
         assert_eq!(a, a_again, "mapping must be stable per host inode");
+    }
+
+    /// Whether a host inode is new to the pool depends on host state the guest
+    /// does not control. In https://github.com/rrnewton/hermit/issues/2897,
+    /// `sar` and its child `sadc` each opened one file; in one run another
+    /// process replaced it between the two opens, so the second open saw a new
+    /// host inode. Every later file, on every device, came out one number
+    /// higher, and every `getdents64` chunk of a `/sys` listing differed. Only
+    /// the file whose host identity differed may change number.
+    #[test]
+    fn a_host_dependent_new_inode_does_not_renumber_later_files() {
+        use crate::types::DetInode;
+        use crate::types::RawInode;
+
+        let t = LogicalTime::from_nanos(0);
+        let seen = super::ObservedMtime::Unobserved;
+        const ROOTFS: u64 = 2049;
+        const SYSFS: u64 = 22;
+        let later_files = |pool: &mut super::InodePool| -> Vec<DetInode> {
+            [
+                RawInode::new(SYSFS, 76_927),
+                RawInode::new(SYSFS, 76_925),
+                RawInode::new(SYSFS, 243_324),
+                RawInode::new(ROOTFS, 1_311),
+                RawInode::new(ROOTFS, 1_312),
+            ]
+            .into_iter()
+            .map(|raw| pool.add_inode(raw, seen, t).0)
+            .collect()
+        };
+
+        // Both opens find the same host file.
+        let mut unchanged = super::InodePool::new();
+        unchanged.add_inode(RawInode::new(ROOTFS, 94_136_091), seen, t);
+        unchanged.add_inode(RawInode::new(ROOTFS, 94_136_091), seen, t);
+        // The file is replaced between the two opens.
+        let mut replaced = super::InodePool::new();
+        replaced.add_inode(RawInode::new(ROOTFS, 94_136_091), seen, t);
+        replaced.add_inode(RawInode::new(ROOTFS, 94_154_661), seen, t);
+        assert_eq!(
+            later_files(&mut unchanged),
+            later_files(&mut replaced),
+            "a host-dependent new inode renumbered files minted after it"
+        );
+
+        // The converse: two paths that are one host file (a hard link, or an
+        // inode the filesystem reused) versus two separate host files.
+        let mut linked = super::InodePool::new();
+        linked.add_inode(RawInode::new(ROOTFS, 500), seen, t);
+        linked.add_inode(RawInode::new(ROOTFS, 500), seen, t);
+        let mut separate = super::InodePool::new();
+        separate.add_inode(RawInode::new(ROOTFS, 500), seen, t);
+        separate.add_inode(RawInode::new(ROOTFS, 501), seen, t);
+        assert_eq!(
+            later_files(&mut linked),
+            later_files(&mut separate),
+            "a host-dependent reused inode renumbered files minted after it"
+        );
     }
 
     /// A host-input observation, and a report of a path the guest rebound,

@@ -2179,9 +2179,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                     stdio_by_raw_inode.insert(raw, det);
                 }
             }
-            let raw_pairs: BTreeSet<(u64, u64)> = String::from_utf8_lossy(&contents)
+            // Mint in the order the mappings appear (address order, which the
+            // guest's own mmaps decide), never in raw `(dev, ino)` order: the
+            // pools hand out numbers in request order, so sorting by host
+            // values would let a host-assigned inode decide which file gets
+            // which number (https://github.com/rrnewton/hermit/issues/2897).
+            let mut seen_pairs: BTreeSet<(u64, u64)> = BTreeSet::new();
+            let raw_pairs: Vec<(u64, u64)> = String::from_utf8_lossy(&contents)
                 .lines()
                 .filter_map(crate::procfs::mapping_header_identity)
+                .filter(|pair| seen_pairs.insert(*pair))
                 .collect();
             for (raw_dev, raw_inode) in raw_pairs {
                 // The device a mapping names is the filesystem's own, which on

@@ -18,14 +18,19 @@ use std::path::Path;
 use std::process::Command;
 
 /// The guest: open `F`, wait for the host on `fifo`, print the line it sent,
-/// open `F` again, and print the (virtual) inode number of `G`, which it sees
-/// last.
+/// open `F` again, and print the (virtual) inode number of `F`. A host
+/// replacement of `F` between the opens is a new host inode, so it gets a new
+/// virtual number in that run only, and the runs' outputs differ.
+///
+/// (This used to print `G`'s number, which differed only because one new host
+/// inode renumbered every file Hermit met after it. Hermit no longer does
+/// that: https://github.com/rrnewton/hermit/issues/2897.)
 pub const HOST_INPUT_GUEST: &str = r#"
     cat "$1/F" > /dev/null || exit 3
     read line < "$1/fifo" || exit 3
     echo "$line"
     cat "$1/F" > /dev/null || exit 3
-    stat -c %i "$1/G" || exit 3
+    stat -c %i "$1/F" || exit 3
 "#;
 
 /// A guest that replaces `F` itself, in one run only: after the host's line
@@ -170,7 +175,8 @@ os.link(d + "/F", d + "/A")' "$1"
 
 /// A guest that tries to rename onto `F` and fails: it opens `F`, waits for
 /// the host's line, tries `rename(missing, F)` (ENOENT), opens `F` again and
-/// prints the inode number of `G`. A failed rename changes nothing, but
+/// prints the inode number of `F`, as [`HOST_INPUT_GUEST`] does. A failed
+/// rename changes nothing, but
 /// Hermit cannot tell, before the call runs, that it will fail, so `F` counts
 /// as rebound and a host replacement of it is not named.
 pub fn failed_rename_guest(python: &Path) -> String {
@@ -185,7 +191,7 @@ try:
 except FileNotFoundError:
     pass
 open(d + "/F").read()
-print(os.stat(d + "/G").st_ino)' "$1"
+print(os.stat(d + "/F").st_ino)' "$1"
 "#,
         python.display()
     )
@@ -278,7 +284,6 @@ pub fn verify_across_host_action_with(
     let _ = std::fs::remove_dir_all(&root);
     std::fs::create_dir_all(&root).expect("create test directory");
     std::fs::write(root.join("F"), "input\n").expect("write F");
-    std::fs::write(root.join("G"), "late\n").expect("write G");
     std::fs::write(root.join("A"), "input\n").expect("write A");
     std::fs::write(root.join("B"), "input\n").expect("write B");
     let fifo = root.join("fifo");
