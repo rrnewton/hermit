@@ -1030,7 +1030,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The watcher's two auto-reap tests retain all 918: 920.
     // Three C3.5 fix-forward tests (a refused admission, a brief exit-path sleep, a recorded failure failing the run) retain all 920: 923.
     // Re-listed with the admission-failed hook test: 924.
-    ("test.hermit_unit", 924),
+    // Re-listed with the coordinator-failure and late-watch kill tests: 926.
+    ("test.hermit_unit", 926),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1706,8 +1707,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same three latch and kernel-floor tests: 918.
     // The host twin selects the same two auto-reap tests: 920.
     // The host twin selects the same three tests: 923.
-    // The host twin selects the same tests: 924.
-    ("test.hermit_unit_on_host", 924),
+    // The host twin selects the same tests: 926.
+    ("test.hermit_unit_on_host", 926),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

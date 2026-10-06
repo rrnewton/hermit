@@ -112,6 +112,9 @@ struct State {
     shutdown: bool,
     /// The watcher's terminal error, if it stopped observing.
     failure: Option<io::Error>,
+    /// Set by `fail_and_kill_all`: the run has failed, so a process watched
+    /// from now on is killed as soon as it is registered.
+    killing: bool,
 }
 
 impl State {
@@ -279,7 +282,14 @@ impl PhysicalExitWatch {
             pidfd: Arc::clone(&pidfd),
             raw_pid,
         });
+        let killing = state.killing;
         drop(state);
+        if killing {
+            // Still watched, so its exit is reported and drained like any other.
+            if let Err(error) = send_sigkill(&pidfd, raw_pid) {
+                self.shared.record_failure(error);
+            }
+        }
         match &self.driver {
             Driver::Thread(_) => self.shared.wake_thread(),
             Driver::Runtime {
@@ -311,32 +321,20 @@ impl PhysicalExitWatch {
             .map(|failure| io::Error::new(failure.kind(), failure.to_string()))
     }
 
-    /// Sends `SIGKILL` to every watched process that has not exited yet. Used
-    /// when a run has failed, so that no guest outlives it; the exits that
-    /// follow are reported as usual. `SIGKILL` also ends a stopped process.
-    /// Every process is attempted; the first error other than `ESRCH` (the
-    /// process already exited, so its report is on the way) is returned.
+    /// Sends `SIGKILL` to every watched process that has not exited yet, and
+    /// to every process watched from now on. Used when a run has failed, so
+    /// that no guest outlives it, including one admitted after the failure;
+    /// the exits that follow are reported as usual. `SIGKILL` also ends a
+    /// stopped process. Every process is attempted; the first error other
+    /// than `ESRCH` (the process already exited, so its report is on the way)
+    /// is returned.
     pub fn fail_and_kill_all(&self) -> io::Result<()> {
-        let state = self.shared.state.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
+        state.killing = true;
         let mut first_error = None;
         for entry in &state.live {
-            let rc = unsafe {
-                libc::syscall(
-                    libc::SYS_pidfd_send_signal,
-                    entry.pidfd.as_raw_fd(),
-                    libc::SIGKILL,
-                    std::ptr::null::<libc::siginfo_t>(),
-                    0,
-                )
-            };
-            if rc < 0 {
-                let error = io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::ESRCH) && first_error.is_none() {
-                    first_error = Some(io::Error::new(
-                        error.kind(),
-                        format!("SIGKILL to watched process {}: {error}", entry.raw_pid),
-                    ));
-                }
+            if let Err(error) = send_sigkill(&entry.pidfd, entry.raw_pid) {
+                first_error.get_or_insert(error);
             }
         }
         first_error.map_or(Ok(()), Err)
@@ -420,6 +418,30 @@ impl Drop for PhysicalExitWatch {
 }
 
 /// Runtime mode: observes one process's exit and reports it.
+/// `SIGKILL` through `pidfd`. `ESRCH` (the process already exited, so its
+/// report is on the way) is not an error.
+fn send_sigkill(pidfd: &OwnedFd, raw_pid: i32) -> io::Result<()> {
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            pidfd.as_raw_fd(),
+            libc::SIGKILL,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    if rc < 0 {
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() != Some(libc::ESRCH) {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("SIGKILL to watched process {raw_pid}: {error}"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 async fn watch_one(
     shared: &Shared,
     pidfd: Arc<OwnedFd>,
@@ -720,6 +742,24 @@ mod tests {
         for child in &mut children {
             assert_eq!(child.0.wait().unwrap().signal(), Some(libc::SIGKILL));
         }
+    }
+
+    #[test]
+    fn a_process_watched_after_kill_all_is_killed_and_reported() {
+        let (sender, receiver) = mpsc::channel();
+        let watch = PhysicalExitWatch::new(move |pid| sender.send(pid).unwrap()).unwrap();
+        watch.fail_and_kill_all().unwrap();
+        // Admitted after the run failed: it must not outlive the run.
+        let mut late = Reaped::spawn(Command::new("sleep").arg("60"));
+        watch
+            .watch(pidfd_open(late.pid()), late.pid() as i32)
+            .unwrap();
+        watch.drain(Duration::from_secs(30)).unwrap();
+        assert_eq!(
+            receiver.try_iter().collect::<Vec<i32>>(),
+            [late.pid() as i32]
+        );
+        assert_eq!(late.0.wait().unwrap().signal(), Some(libc::SIGKILL));
     }
 
     #[test]
