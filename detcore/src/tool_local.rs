@@ -1946,8 +1946,9 @@ pub struct ThreadState<T> {
     pub(crate) parent_cpu_publication: Option<Arc<ChildCpuPublication>>,
 
     /// The deadline of a wait this thread's last syscall ended with
-    /// `ERESTART_RESTARTBLOCK`, for the `restart_syscall` Linux runs next when no
-    /// handler runs. The next syscall takes it (`Detcore::handle_syscall_event`).
+    /// `ERESTART_RESTARTBLOCK`, for the `restart_syscall` that resumes it
+    /// (`syscalls::helpers::RestartBlock`). The next syscall takes it
+    /// (`Detcore::handle_syscall_event`).
     #[serde(skip)]
     pub(crate) restart_block: Option<crate::syscalls::helpers::RestartBlock>,
 
