@@ -120,6 +120,18 @@ pub struct Config {
     #[clap(skip)]
     pub exit_process_on_identity_lookup_refusal: bool,
 
+    /// A file Detcore opens for itself takes a descriptor in a table that is not the guest's:
+    /// the tracer's on ptrace (which e9patch preprocessing also runs under), and the VMM's on
+    /// KVM, which translates guest descriptors. On DBT, SaBRe and LiteInst Detcore runs in the
+    /// guest process, and a file it opens takes the lowest free number in the guest's table
+    /// while it is open. False, the default, assumes that table, so
+    /// Detcore refuses an identity lookup that would read such a file (a maps line's
+    /// `mountinfo` fallback) rather than race the guest's own descriptor allocation. The
+    /// launcher sets it from the backend it runs; Detcore never infers it.
+    #[serde(default)]
+    #[clap(skip)]
+    pub tool_opens_outside_guest_descriptor_table: bool,
+
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1058): Review process-signal identity translation.
     // AUTONOMOUS-BOT-IMPLEMENTED

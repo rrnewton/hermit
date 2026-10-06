@@ -890,6 +890,8 @@ where
 /// fdinfo mount-id check reads it.
 fn guest_mountinfo<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &G) -> Result<Vec<u8>, Error> {
     #[cfg(test)]
+    inject_fstat_scratch::MOUNTINFO_READS.with(|reads| reads.set(reads.get() + 1));
+    #[cfg(test)]
     if let Some(scripted) =
         inject_fstat_scratch::SCRIPTED_MOUNTINFO.with(|scripted| scripted.borrow().clone())
     {
@@ -1750,11 +1752,16 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// `/proc/<pid>/mountinfo`, read on the tool's side as the fdinfo
     /// mount-id check reads it. So does a `statmount` that answers `ENOSYS`,
     /// as a seccomp policy can, after a second `statx` for the reusable id.
-    /// On ptrace that read spends a tracer descriptor. On DBT, SaBRe and
-    /// LiteInst it holds one guest descriptor until it returns, with the race
-    /// above, and fails at the guest's descriptor limit. The fallback is kept
-    /// rather than refused because refusing would stop every guest on such a
-    /// kernel that reads a btrfs or overlayfs mapping.
+    /// That read opens a file, so it is made only where the launcher says a
+    /// file Detcore opens takes a descriptor outside the guest's table
+    /// (`Config::tool_opens_outside_guest_descriptor_table`): the tracer's on
+    /// ptrace, the VMM's on KVM. Anywhere else -- DBT, SaBRe and LiteInst --
+    /// the read would hold a guest descriptor, with the race above, and fail
+    /// at the guest's descriptor limit, so the proof refuses before it opens
+    /// anything. On those backends a guest that reads a btrfs or overlayfs
+    /// mapping on a kernel before Linux 6.8, or under a policy that denies
+    /// `statmount`, is stopped by that refusal rather than given an identity
+    /// another source chose.
     ///
     /// `Ok(false)` -- no proof, so the line falls back to its header -- when
     /// that mount's superblock is another one, when the guest's filesystem
@@ -1790,6 +1797,16 @@ impl<T: RecordOrReplay> Detcore<T> {
             MountSuperblock::Unproven => return Ok(false),
             MountSuperblock::Listed(mount_id) => mount_id,
         };
+        if !guest.config().tool_opens_outside_guest_descriptor_table {
+            return Err(identity_lookup_refused(
+                "find the superblock of",
+                path,
+                format_args!(
+                    "the kernel reported only reusable mount id {mount_id}, and reading the \
+                     guest's mountinfo for it would hold a descriptor in the guest's own table"
+                ),
+            ));
+        }
         let mountinfo = guest_mountinfo(guest)?;
         match mountinfo_superblock_device(&mountinfo, mount_id) {
             Ok(Some(device)) => Ok(device == header_device),
@@ -8844,6 +8861,10 @@ pub(crate) mod inject_fstat_scratch {
         /// is not the test process.
         pub(crate) static SCRIPTED_MOUNTINFO: std::cell::RefCell<Option<Vec<u8>>> =
             const { std::cell::RefCell::new(None) };
+        /// How many times `guest_mountinfo` was called on this thread,
+        /// scripted or not.
+        pub(crate) static MOUNTINFO_READS: std::cell::Cell<usize> =
+            const { std::cell::Cell::new(0) };
         /// (unique mount id, superblock device) pairs an injected
         /// `statmount` answers from instead of running, while a test sets
         /// them: `ENOENT` for a mount not listed, as the guest's kernel
@@ -11249,6 +11270,8 @@ pub(crate) mod inject_fstat_scratch {
                     .with_superblocks(vec![(unique, device)]);
                 let (tool, mut guest) =
                     ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                // As on ptrace and KVM, where the mountinfo fallback is made.
+                guest.config.tool_opens_outside_guest_descriptor_table = true;
                 guest.statx_without_unique_mount_id = before_6_8;
                 let resolved = tool
                     .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
@@ -11279,6 +11302,77 @@ pub(crate) mod inject_fstat_scratch {
         }
     }
 
+    // https://github.com/rrnewton/hermit/pull/3255's ninth review: where a
+    // file Detcore opens for itself takes a number in the guest's descriptor
+    // table (DBT, SaBRe, LiteInst), the proof must not fall back to reading
+    // the guest's mountinfo. That read holds a guest descriptor while it
+    // runs, so another guest thread's `open` or `SCM_RIGHTS` receipt could be
+    // given another number, and at the guest's descriptor limit the read
+    // fails. Both ways into the fallback -- a kernel before Linux 6.8, and a
+    // `statmount` that answers `ENOSYS` -- refuse with the typed refusal,
+    // read no mountinfo, and unmap the page. The scripted mountinfo proves
+    // the header's superblock, so a read would show as a proof.
+    #[tokio::test]
+    async fn a_maps_proof_refuses_rather_than_read_mountinfo_in_the_guests_table() {
+        let (file, _identity, key) = mapped_path();
+        let scratch = Pages::map(1, 1);
+        let mut outcomes = Vec::new();
+        for (before_6_8, statmount_error, proof) in [
+            (
+                true,
+                None,
+                &[Sysno::mmap, Sysno::statx, Sysno::munmap][..],
+            ),
+            (
+                false,
+                Some(Errno::ENOSYS),
+                &[
+                    Sysno::mmap,
+                    Sysno::statx,
+                    Sysno::statmount,
+                    Sysno::statx,
+                    Sysno::munmap,
+                ][..],
+            ),
+        ] {
+            let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            let shares_table = !guest.config.tool_opens_outside_guest_descriptor_table;
+            guest.statx_without_unique_mount_id = before_6_8;
+            guest.statmount_error = statmount_error;
+            let reads = MOUNTINFO_READS.with(|reads| reads.get());
+            let resolved = tool
+                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .await;
+            let reads = MOUNTINFO_READS.with(|reads| reads.get()) - reads;
+            outcomes.push((before_6_8, shares_table, resolved, reads, guest.injected, proof));
+        }
+        for (before_6_8, shares_table, resolved, reads, injected, proof) in outcomes {
+            assert!(
+                shares_table,
+                "precondition: the default config assumes the guest's descriptor table"
+            );
+            let refused = resolved
+                .as_ref()
+                .err()
+                .and_then(IdentityLookupRefused::carried_by);
+            assert!(
+                refused.is_some_and(|refused| refused.to_string().contains("mountinfo")),
+                "before Linux 6.8: {before_6_8}: the fallback must refuse with an \
+                 IdentityLookupRefused naming mountinfo: {resolved:?}"
+            );
+            assert_eq!(
+                reads, 0,
+                "before Linux 6.8: {before_6_8}: no mountinfo may be read"
+            );
+            assert_eq!(
+                injected,
+                [&[Sysno::newfstatat][..], proof].concat(),
+                "before Linux 6.8: {before_6_8}"
+            );
+        }
+    }
+
     /// The unique mount id of `file`'s mount.
     fn file_unique(file: &tempfile::NamedTempFile) -> u64 {
         unique_mount_id_of(file.path()).expect("precondition: unique mount ids")
@@ -11288,7 +11382,8 @@ pub(crate) mod inject_fstat_scratch {
     // each: a mount outside the guest's namespace (`ENOENT`) or root
     // (`EPERM`) is the guest's own configuration, so no proof; `ENOSYS`, as
     // a seccomp policy can answer, falls back to the guest's mountinfo after
-    // a second `statx` for the reusable id; anything else could not be asked
+    // a second `statx` for the reusable id, where the launcher allows that
+    // read (ptrace and KVM; see the test above); anything else could not be asked
     // and refuses, as does an answer without the superblock it was asked
     // for. The page is unmapped on every path.
     #[tokio::test]
@@ -11323,9 +11418,11 @@ pub(crate) mod inject_fstat_scratch {
             assert_eq!(guest.statmount_mounts, [unique], "{errno}");
         }
 
-        // ENOSYS: the reusable id, then the guest's mountinfo, proves it.
+        // ENOSYS: the reusable id, then the guest's mountinfo, proves it, as
+        // on ptrace and KVM, where the fallback is made.
         let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.config.tool_opens_outside_guest_descriptor_table = true;
         guest.statmount_error = Some(Errno::ENOSYS);
         let resolved = tool
             .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
@@ -11342,6 +11439,7 @@ pub(crate) mod inject_fstat_scratch {
         let _mounts = ScriptedMountinfo::set(mount_row(mount_id_of(file.path()), RECORD_DEVICE))
             .with_superblocks(vec![(unique, HEADER_DEVICE)]);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.config.tool_opens_outside_guest_descriptor_table = true;
         guest.statmount_error = Some(Errno::ENOSYS);
         let resolved = tool
             .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
@@ -11510,6 +11608,8 @@ pub(crate) mod inject_fstat_scratch {
         let mut outcomes = Vec::new();
         for before_6_8 in [false, true] {
             let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            // As on ptrace and KVM, where the mountinfo fallback is made.
+            guest.config.tool_opens_outside_guest_descriptor_table = true;
             guest.statx_without_unique_mount_id = before_6_8;
             let resolved = tool
                 .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
