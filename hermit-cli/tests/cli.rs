@@ -6351,6 +6351,48 @@ fn wait_at_most(
 /// a wide margin. The measured time is printed.
 #[test]
 fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
+    assert_capped_run_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// The same capped run on a host where `perf_event_open` fails, as on the
+/// hosted GitHub runners, which have no PMU (docs/TESTING_ENVIRONMENTS.md).
+/// There the outer process downgrades the default `--max-timeslice` and says
+/// so on stderr while it validates its arguments, before any container
+/// exists. That warning was written with a blocking `write(2)`, so with
+/// stderr a full pipe nobody reads, the run waited forever and never reached
+/// the cap: https://github.com/rrnewton/hermit/actions/runs/37489014478 was
+/// killed at the 45 s bound on hosted while the test above passed on every
+/// host with a PMU. This test denies `perf_event_open` with `EPERM`, which
+/// Reverie's probe reads as "unsupported", and first checks that the warning
+/// is printed at all, so the capped run below really does write it.
+#[test]
+fn max_log_bytes_exits_promptly_when_perf_is_unavailable_and_stderr_is_a_full_pipe() {
+    {
+        let _lock = hermit_run_guard();
+        let mut command = hermit_command(&["run", "--timeout", "120", "--", "/bin/true"]);
+        deny_syscall(&mut command, libc::SYS_perf_event_open);
+        let output = command
+            .stdin(Stdio::null())
+            .output()
+            .expect("failed to run hermit without perf_event_open");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("--max-timeslice requires user-space perf counters"),
+            "the premise does not hold: without perf_event_open, an uncapped run printed no \
+             --max-timeslice downgrade warning ({:?}); stderr:\n{stderr}",
+            output.status
+        );
+    }
+    assert_capped_run_exits_promptly_with_full_unread_stderr(|command| {
+        deny_syscall(command, libc::SYS_perf_event_open);
+    });
+}
+
+/// Run a capped, noisy guest with stderr a full pipe nobody reads (see
+/// [`max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads`]),
+/// after `configure` adjusts the hermit command, and require exit 123 within
+/// [`LOG_CAP_RUN_WAIT_BOUND`].
+fn assert_capped_run_exits_promptly_with_full_unread_stderr(configure: impl FnOnce(&mut Command)) {
     let _lock = hermit_run_guard();
     let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
     let log = directory.path().join("hermit.log");
@@ -6366,7 +6408,9 @@ fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
         "--",
     ];
     args.extend(LOG_CAP_NOISY_GUEST);
-    let mut child = hermit_command(&args)
+    let mut command = hermit_command(&args);
+    configure(&mut command);
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(writer))
@@ -6381,7 +6425,7 @@ fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
     let status = status.unwrap_or_else(|| {
         panic!(
             "hermit was still running after {elapsed:?} (bound {bound:?}) and was killed: \
-             a cap diagnostic waited on the full stderr pipe"
+             a diagnostic waited on the full stderr pipe"
         )
     });
     assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");

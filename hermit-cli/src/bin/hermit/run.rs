@@ -4926,14 +4926,15 @@ impl RunOpts {
         // This is a Detcore Config-internal matter, but relies on reverie_ptrace, which detcore is
         // allowed to depend on:
         if config.max_timeslice.is_some() && !perf_supported {
-            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed:
-            let mut stderr = detcore::util::RetryingStderr;
-            let _ = writeln!(
-                stderr,
+            // TODO(T124429978): this could change back to tracing::warn! when the bug is fixed.
+            // With --max-log-bytes this must not wait on a stderr nobody reads: it runs before
+            // the container starts, so a blocked write would keep the run from ever reaching
+            // the cap.
+            crate::tracing::write_stderr_diagnostic(
                 "WARNING: --max-timeslice requires user-space perf counters, but \
                  perf_event_open is unavailable; continuing with \
                  --max-timeslice=disabled. Check the host perf_event_paranoid value and \
-                 container seccomp policy."
+                 container seccomp policy.\n",
             );
             config.max_timeslice = None;
         }

@@ -1077,6 +1077,23 @@ pub(crate) fn enable_log_cap_exit_bound() {
     LOG_CAP_EXIT_BOUND_ENABLED.store(true, Ordering::Relaxed);
 }
 
+/// Write a diagnostic `message` to stderr from the outer process.
+///
+/// While `--max-log-bytes` is in force, termination of the run must not
+/// depend on any diagnostic write (review of
+/// https://github.com/rrnewton/hermit/pull/3686), including the ones printed
+/// before the cap can cross at all. So the message is written once without
+/// waiting, and omitted when stderr cannot take it at once (see
+/// [`write_without_waiting`]). Without the cap it goes through
+/// `detcore::util::RetryingStderr`, as before.
+pub(crate) fn write_stderr_diagnostic(message: &str) {
+    if LOG_CAP_EXIT_BOUND_ENABLED.load(Ordering::Relaxed) {
+        write_without_waiting(libc::STDERR_FILENO, message.as_bytes());
+    } else {
+        let _ = detcore::util::RetryingStderr.write_all(message.as_bytes());
+    }
+}
+
 /// The process that classifies a container's 123 status must itself exit 123
 /// within a fixed bound, whatever its remaining diagnostics do: between the
 /// classification and `main`'s final report it can still print through

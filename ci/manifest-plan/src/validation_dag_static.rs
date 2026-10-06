@@ -1388,7 +1388,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and max_log_bytes_verify_exits_promptly_when_stderr_fills_after_run1)
     // retain all 154 prior identities: 154 + 11 = 165 (`cargo nextest list
     // --profile ci` with this node's skips lists 165).
-    ("test.cli", 165),
+    // max_log_bytes_exits_promptly_when_perf_is_unavailable_and_stderr_is_a_full_pipe
+    // (the hosted-runner hang of GitHub run
+    // https://github.com/rrnewton/hermit/actions/runs/37489014478) retains
+    // all 165: 165 + 1 = 166, listed the same way.
+    ("test.cli", 166),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1473,7 +1477,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 123 + 11 = 134, listed with this node's arguments. None of them starts
     // an in-guest LiteInst guest (the one LiteInst case is refused before
     // launch), so the exact-name filterset is unchanged: 165 - 31 = 134.
-    ("test.cli_on_host", 134),
+    // The same perf-unavailable --max-log-bytes test as test.cli retains all
+    // 134 (135, listed with this node's arguments); it starts no LiteInst
+    // guest, so the filterset is unchanged: 166 - 31 = 135.
+    ("test.cli_on_host", 135),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
