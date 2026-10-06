@@ -168,11 +168,12 @@ struct AnonymousProcFdIdentity {
 /// neither retries nor panics.
 ///
 /// Only a Config without `Config::anonymous_object_devices` needs this read.
-/// hermit-cli probes in the Hermit process before launch and passes the
-/// devices to every backend but DBT (`prepare_backend_config`); with them,
-/// Detcore neither reads here when it starts nor consults this for a link
-/// (`resolve_anonymous_object_devices`). Without virtualized metadata
-/// nothing reads the devices, so nothing reads here either.
+/// hermit-cli probes in the Hermit process before launch and, when that probe
+/// succeeds, passes the devices to every backend but DBT
+/// (`prepare_backend_config`); with them, Detcore neither reads here when it
+/// starts nor consults this for a link (`resolve_anonymous_object_devices`).
+/// Without virtualized metadata nothing reads the devices, so nothing reads
+/// here either.
 ///
 /// Why one read is enough: pipefs and sockfs are each a single
 /// kernel-internal mount made at boot (`kern_mount` in `init_pipe_fs` in
@@ -214,7 +215,11 @@ pub(crate) fn anonymous_object_devices() -> &'static Result<AnonymousObjectDevic
 /// Create and `fstat` one pipe and one socket, return the devices they
 /// report, and close them. hermit-cli calls this in the Hermit process before
 /// launch and passes the result in `Config::anonymous_object_devices`, so that
-/// on every backend but DBT no probe runs in a guest's descriptor table.
+/// on every backend but DBT no probe runs in a guest's descriptor table. Not
+/// on DBT: it receives `None`, which keeps the devices out of its
+/// guest-visible config, and Detcore probes in the guest process when it
+/// constructs the tool (`anonymous_object_devices`). Every other backend
+/// does the same if this call fails in the Hermit process.
 pub fn probe_anonymous_object_devices() -> std::io::Result<AnonymousObjectDevices> {
     use std::os::fd::AsFd;
     let device_of = |fd: std::os::fd::BorrowedFd<'_>| {

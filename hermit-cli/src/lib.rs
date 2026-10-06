@@ -6166,13 +6166,13 @@ mod tests {
     }
 
     /// Every backend except DBT receives the pipefs and sockfs devices the
-    /// Hermit process probed, so none of them probes in a guest's descriptor
-    /// table. DBT receives `None`, which keeps the key out of the guest-visible
-    /// HERMIT_DBT_DETCONFIG, and Detcore probes in the guest when it constructs
-    /// the tool. Without virtualized metadata nothing reads the devices and
-    /// nothing is probed.
+    /// Hermit process probed, so, when that probe succeeds, none of them
+    /// probes in a guest's descriptor table. DBT receives `None`, which keeps
+    /// the key out of the guest-visible HERMIT_DBT_DETCONFIG, and Detcore
+    /// probes in the guest when it constructs the tool. Without virtualized
+    /// metadata nothing reads the devices and nothing is probed.
     #[test]
-    fn every_backend_receives_the_hermit_process_anonymous_object_devices() {
+    fn every_backend_but_dbt_receives_the_hermit_process_anonymous_object_devices() {
         use std::os::unix::fs::MetadataExt;
 
         let (reader, _writer) = std::io::pipe().unwrap();
