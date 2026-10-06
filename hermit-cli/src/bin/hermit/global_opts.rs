@@ -92,14 +92,21 @@ pub struct GlobalOpts {
     /// comparison and retention report, and everything `log-diff` prints; and
     /// the private --run-evidence-dir log.
     ///
-    /// At the crossing hermit drops the write that crossed, tries once, without
-    /// waiting, to write "log output exceeded --max-log-bytes=SIZE" followed by
-    /// "HERMIT_LOG_CAP class=log-cap" to stderr and to --log-file, and exits
-    /// 123. That message is best effort: it is missing when, for example,
-    /// stderr is a full pipe or has no reader, and the exit status is then the
-    /// only signal. Where the flag is accepted the guest dies with hermit,
-    /// because it runs inside hermit's PID namespace or as a ptrace tracee that
-    /// the kernel kills when hermit's tracer exits.
+    /// At the crossing hermit drops the write that crossed and every tracing
+    /// write after it. It waits at most 50 ms for tracing writes already in
+    /// progress to finish, then tries once, without waiting, to write "log
+    /// output exceeded --max-log-bytes=SIZE" followed by "HERMIT_LOG_CAP
+    /// class=log-cap" to stderr and to --log-file, and exits 123. When that
+    /// message is written, no tracing output follows it; the guest's output
+    /// and hermit's error report, which are not tracing output, can. The
+    /// message is best effort: it is missing when, for example, stderr is a
+    /// full pipe or has no reader, or a tracing write is still in progress
+    /// after the 50 ms. A hermit process killed in the middle of a tracing
+    /// write never finishes it, so if the cap is crossed later in that
+    /// invocation, the message is missing. The exit status is then the only
+    /// signal. Where the flag is accepted the guest dies with hermit, because
+    /// it runs inside hermit's PID namespace or as a ptrace tracee that the
+    /// kernel kills when hermit's tracer exits.
     ///
     /// Refused with exit 122, before any guest starts, where the guest could
     /// outlive hermit: --backend=dbt; --backend=liteinst, sabre or kvm with

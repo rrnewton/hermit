@@ -19,6 +19,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
+use std::time::Instant;
 
 use hermit::Backend;
 use hermit::liteinst_bootstrap::EffectiveFilter;
@@ -347,15 +349,120 @@ pub fn format_byte_size(bytes: u64) -> String {
 
 /// The process-shared state of a [`LogBudget`].
 ///
-/// `crossed` is separate from `spent` because `spent` goes DOWN: a write the
-/// sink accepted only in part, or refused, is refunded. Deciding the crossing
-/// from the total alone made it reversible -- with a limit of 10, A charges 6,
-/// B charges 5 and crosses, A's failed write refunds 6, and C's 6 crosses a
-/// second time. The flag only ever goes from false to true.
+/// The crossing is recorded in `admission`, separate from `spent`, because
+/// `spent` goes DOWN: a write the sink accepted only in part, or refused, is
+/// refunded. Deciding the crossing from the total alone made it reversible --
+/// with a limit of 10, A charges 6, B charges 5 and crosses, A's failed write
+/// refunds 6, and C's 6 crosses a second time. [`CROSSED`] only ever goes from
+/// clear to set.
 #[repr(C)]
 struct BudgetCells {
     spent: AtomicU64,
-    crossed: AtomicBool,
+    /// The admission word. Bit 63 is [`CROSSED`]; the low 63 bits count the
+    /// charged writes that were admitted and have not finished yet, in every
+    /// process sharing the budget. See [`admit_write`].
+    admission: AtomicU64,
+}
+
+/// Bit 63 of [`BudgetCells::admission`]: a write has crossed the cap. Once it
+/// is set no write is admitted, so no new log bytes reach any sink.
+const CROSSED: u64 = 1 << 63;
+
+/// How long the crossing writer waits for log writes that were admitted
+/// before the crossing to finish. If they have not finished by then, it omits
+/// the final message: written while another write was still in progress, the
+/// message could be followed by that write's line.
+const LOG_CAP_DRAIN_BOUND: Duration = Duration::from_millis(50);
+
+/// The longest drain bound any caller may set. The crossing process must exit
+/// within one second of the crossing, whatever its sinks do (review of
+/// https://github.com/rrnewton/hermit/pull/3686, round 2, finding 1): this
+/// wait plus the final message's attempts, which never wait, stay far below
+/// that.
+const LOG_CAP_DRAIN_BOUND_MAX: Duration = Duration::from_millis(250);
+const _: () = assert!(LOG_CAP_DRAIN_BOUND.as_millis() <= LOG_CAP_DRAIN_BOUND_MAX.as_millis());
+
+/// How often the crossing writer looks at the admission word while it waits.
+const LOG_CAP_DRAIN_POLL: Duration = Duration::from_millis(1);
+
+/// Admit one charged write: count it as in progress, unless a write has
+/// already crossed the cap. One compare-and-swap, retried only when another
+/// writer changed the word first. The admitted writer must end its admission
+/// exactly once, with [`finish_write`] or [`claim_crossing`].
+///
+/// WHY ADMISSION AND THE CROSSING SHARE ONE WORD. Every change to it is a
+/// read-modify-write of the same location, so they happen in one order. A
+/// write admitted before the crossing's `fetch_or` is counted in the value that
+/// the crossing writer reads afterwards; a write that comes after it sees
+/// [`CROSSED`] and is refused. So once the count reaches zero no admitted
+/// write is left in progress and no new one can start, and the final message
+/// written then is the last line of every sink that charges this budget
+/// (review of https://github.com/rrnewton/hermit/pull/3686, round 3,
+/// finding 5).
+fn admit_write(admission: &AtomicU64) -> bool {
+    let mut current = admission.load(Ordering::Relaxed);
+    loop {
+        if current & CROSSED != 0 {
+            return false;
+        }
+        match admission.compare_exchange_weak(
+            current,
+            current + 1,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return true,
+            Err(actual) => current = actual,
+        }
+    }
+}
+
+/// End an admitted write once its bytes have reached the sink, or failed to.
+fn finish_write(admission: &AtomicU64) {
+    admission.fetch_sub(1, Ordering::Release);
+}
+
+/// For an admitted write whose charge went past the limit: set [`CROSSED`],
+/// then end this write's own admission. True only for the first such write,
+/// which is the crossing; every later one finds the bit already set.
+fn claim_crossing(admission: &AtomicU64) -> bool {
+    let before = admission.fetch_or(CROSSED, Ordering::AcqRel);
+    finish_write(admission);
+    before & CROSSED == 0
+}
+
+/// Admitted writes that have not finished.
+fn writes_in_progress(admission: &AtomicU64) -> u64 {
+    admission.load(Ordering::Acquire) & !CROSSED
+}
+
+/// Wait until no admitted write is in progress, polling with `nanosleep`, for
+/// at most `bound`. Returns whether none was left; a zero bound looks once.
+///
+/// A WRITER KILLED IN THE MIDDLE OF A WRITE NEVER FINISHES IT. Its count stays
+/// in the word for the rest of the invocation, so every later wait times out
+/// and the final message is omitted. That costs only the message: the exit
+/// status is still 123, and no line can follow a message that was never
+/// written.
+fn wait_for_writes_in_progress(admission: &AtomicU64, bound: Duration) -> bool {
+    let start = Instant::now();
+    loop {
+        if writes_in_progress(admission) == 0 {
+            return true;
+        }
+        let left = bound.saturating_sub(start.elapsed());
+        if left.is_zero() {
+            return false;
+        }
+        let step = left.min(LOG_CAP_DRAIN_POLL);
+        let pause = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: libc::c_long::from(step.subsec_nanos()),
+        };
+        // SAFETY: nanosleep reads one initialized timespec; the remainder
+        // pointer may be null. An interrupted sleep just polls again.
+        unsafe { libc::nanosleep(&pause, std::ptr::null_mut()) };
+    }
 }
 
 #[derive(Debug)]
@@ -392,16 +499,21 @@ pub struct LogBudget {
     /// Rendered up front so the abort path allocates nothing: it can run on
     /// any thread, with arbitrary locks held.
     message: Arc<str>,
+    /// [`LOG_CAP_DRAIN_BOUND`], except in tests.
+    drain_bound: Duration,
 }
 
 /// Outcome of charging one write against a [`LogBudget`].
 #[derive(Debug, PartialEq, Eq)]
 enum Charge {
-    /// The write fits; perform it.
+    /// The write fits and is admitted; perform it, then call
+    /// [`LogBudget::finish`] once.
     Within,
-    /// This write is the one that crossed the cap; abort the run.
+    /// This write is the one that crossed the cap; abort the run. Its
+    /// admission has already ended.
     Crossed,
-    /// Another write already crossed the cap and is aborting; drop this one.
+    /// A write already crossed the cap and is aborting; drop this one. Nothing
+    /// is left to finish.
     AlreadyOver,
 }
 
@@ -427,14 +539,23 @@ impl LogBudget {
         unsafe {
             address.as_ptr().write(BudgetCells {
                 spent: AtomicU64::new(0),
-                crossed: AtomicBool::new(false),
+                admission: AtomicU64::new(0),
             })
         };
         Ok(Self {
             limit,
             cells: Arc::new(SharedBudgetCells { address }),
             message: exceeded_message(limit).into(),
+            drain_bound: LOG_CAP_DRAIN_BOUND,
         })
+    }
+
+    /// This budget with another drain bound, never above
+    /// [`LOG_CAP_DRAIN_BOUND_MAX`].
+    #[cfg(test)]
+    fn with_drain_bound(mut self, bound: Duration) -> Self {
+        self.drain_bound = bound.min(LOG_CAP_DRAIN_BOUND_MAX);
+        self
     }
 
     /// The final message printed when the cap fires.
@@ -459,23 +580,29 @@ impl LogBudget {
         self.cells.address == other.cells.address
     }
 
-    /// Charge `len` bytes. Two relaxed loads and one relaxed compare-exchange
-    /// per write, retried only when another writer raced it: this sits on the
-    /// hot path of every log line. A write that would take the
-    /// total past the limit claims the one-way `crossed` flag; the single
-    /// claimant is the crossing, every other writer is already over. Refunds
-    /// lower `spent` but never clear `crossed`, so a crossing is final.
+    /// Charge `len` bytes: admit the write ([`admit_write`]), then account for
+    /// it. Two compare-exchange loops per write, each retried only when another
+    /// writer raced it: this sits on the hot path of every log line. A write
+    /// that would take the total past the limit claims the one-way [`CROSSED`]
+    /// bit; the single claimant is the crossing, every other writer is already
+    /// over. Refunds lower `spent` but never clear [`CROSSED`], so a crossing
+    /// is final.
+    fn charge(&self, len: u64) -> Charge {
+        if !admit_write(&self.cells().admission) {
+            return Charge::AlreadyOver;
+        }
+        self.account(len)
+    }
+
+    /// The second step of [`LogBudget::charge`], for a write already admitted.
     ///
     /// A TOTAL THAT WOULD OVERFLOW IS A CROSSING. `fetch_add` wrapped the stored
     /// total, and with the largest accepted limit (`u64::MAX`) no sum could
     /// ever compare above it, so that cap could never fire. The stored total
     /// saturates instead of wrapping, and an addition with no `u64` result is
     /// treated as past every limit.
-    fn charge(&self, len: u64) -> Charge {
+    fn account(&self, len: u64) -> Charge {
         let cells = self.cells();
-        if cells.crossed.load(Ordering::Relaxed) {
-            return Charge::AlreadyOver;
-        }
         let mut before = cells.spent.load(Ordering::Relaxed);
         while let Err(current) = cells.spent.compare_exchange_weak(
             before,
@@ -487,8 +614,8 @@ impl LogBudget {
         }
         match before.checked_add(len) {
             Some(total) if total <= self.limit => Charge::Within,
-            _ if cells.crossed.swap(true, Ordering::Relaxed) => Charge::AlreadyOver,
-            _ => Charge::Crossed,
+            _ if claim_crossing(&cells.admission) => Charge::Crossed,
+            _ => Charge::AlreadyOver,
         }
     }
 
@@ -496,6 +623,34 @@ impl LogBudget {
     /// the caller's retry of the remainder is not counted twice.
     fn refund(&self, len: u64) {
         self.cells().spent.fetch_sub(len, Ordering::Relaxed);
+    }
+
+    /// End a write that [`LogBudget::charge`] admitted as [`Charge::Within`].
+    fn finish(&self) {
+        finish_write(&self.cells().admission);
+    }
+
+    /// For the crossing writer: wait, up to the drain bound, until no admitted
+    /// write is in progress in any process sharing this budget. True when the
+    /// final message may be written as the last line.
+    fn writes_drained(&self) -> bool {
+        wait_for_writes_in_progress(&self.cells().admission, self.drain_bound)
+    }
+
+    /// Admitted writes in progress, for tests.
+    #[cfg(test)]
+    fn in_progress(&self) -> u64 {
+        writes_in_progress(&self.cells().admission)
+    }
+}
+
+/// Ends a [`Charge::Within`] write's admission when the write returns, by any
+/// path: success, an error, a partial write or a panic in the sink.
+struct AdmittedWrite<'a>(&'a LogBudget);
+
+impl Drop for AdmittedWrite<'_> {
+    fn drop(&mut self) {
+        self.0.finish();
     }
 }
 
@@ -542,11 +697,18 @@ fn exceeded_message(limit: u64) -> String {
 /// flushing: every sink here is unbuffered. The parent maps the status through
 /// `classify_container_result`.
 ///
-/// THE FINAL MESSAGE NEVER WAITS. It is written with [`write_without_waiting`],
-/// not through the inner writer or `RetryingStderr`: a blocking `write(2)` to a
-/// full pipe whose reader has stopped reading, or to a FIFO log sink, would
-/// hold the `_exit` -- and with it the guest teardown -- for as long as nobody
-/// drains the sink.
+/// THE FINAL MESSAGE NEVER WAITS FOR A SINK. It is written with
+/// [`write_without_waiting`], not through the inner writer or
+/// `RetryingStderr`: a blocking `write(2)` to a full pipe whose reader has
+/// stopped reading, or to a FIFO log sink, would hold the `_exit` -- and with
+/// it the guest teardown -- for as long as nobody drains the sink.
+///
+/// THE ONE WAIT IS BOUNDED, AND IT IS FOR OTHER WRITERS. Before the message the
+/// crossing writer waits at most [`LOG_CAP_DRAIN_BOUND`] for log writes that
+/// were admitted before the crossing to finish (see [`admit_write`]), so that
+/// none of them can put a line after the message. If one is still in progress
+/// then -- blocked on a full pipe, say -- the message is omitted, and the exit
+/// follows at once either way.
 pub struct CappedWriter<W: Write> {
     inner: W,
     budget: Option<LogBudget>,
@@ -575,6 +737,19 @@ impl<W: Write> CappedWriter<W> {
     }
 
     fn exceeded(&mut self, budget: &LogBudget) -> ! {
+        // No write is admitted any more. Wait, for at most the drain bound,
+        // for the writes admitted before the crossing; a line one of them
+        // wrote after the final message would leave the message not last. If
+        // they do not finish in time, omit the message and exit 123 anyway.
+        if budget.writes_drained() {
+            self.write_final_message(budget);
+        }
+        // SAFETY: _exit has no preconditions; see the type-level note for why
+        // the immediate exit is the teardown.
+        unsafe { libc::_exit(hermit::HERMIT_LOG_CAP_EXIT) }
+    }
+
+    fn write_final_message(&mut self, budget: &LogBudget) {
         let message = budget.exceeded_message().as_bytes();
         if let Some(fd) = self.final_message_fd {
             // Best effort: the log should say why it ends. Written to the
@@ -589,9 +764,6 @@ impl<W: Write> CappedWriter<W> {
             }
         }
         write_without_waiting(libc::STDERR_FILENO, message);
-        // SAFETY: _exit has no preconditions; see the type-level note for why
-        // the immediate exit is the teardown.
-        unsafe { libc::_exit(hermit::HERMIT_LOG_CAP_EXIT) }
     }
 }
 
@@ -913,6 +1085,8 @@ impl<W: Write> Write for CappedWriter<W> {
             // bytes consumed (as BoundedWriter does) rather than erroring.
             Charge::AlreadyOver => return Ok(buf.len()),
         }
+        // Ends the admission after the write, on every path out of it.
+        let _admitted = AdmittedWrite(budget);
         let written = self.inner.write(buf).inspect_err(|_| {
             budget.refund(buf.len() as u64);
         })?;
@@ -1717,6 +1891,243 @@ mod tests {
             "writer C must not cross a second time"
         );
         assert_eq!(budget.charge(1), Charge::AlreadyOver);
+    }
+
+    /// The interleaving from review of
+    /// https://github.com/rrnewton/hermit/pull/3686, round 3, finding 5, one
+    /// step at a time: writer A is admitted within the limit and has not
+    /// written yet when writer B crosses. B must not write the final message
+    /// while A's write is in progress, or A's line could follow it.
+    #[test]
+    fn a_write_in_progress_at_the_crossing_withholds_the_final_message() {
+        let budget = LogBudget::new(10).unwrap().with_drain_bound(Duration::ZERO);
+        assert_eq!(budget.charge(6), Charge::Within, "A is admitted");
+        assert_eq!(budget.in_progress(), 1);
+        assert_eq!(budget.charge(5), Charge::Crossed, "B crosses at 11");
+        assert_eq!(budget.in_progress(), 1, "B's own admission has ended");
+        assert!(
+            !budget.writes_drained(),
+            "A's write is in progress, so B must omit the final message"
+        );
+        budget.finish();
+        assert_eq!(budget.in_progress(), 0, "A has written");
+        assert!(
+            budget.writes_drained(),
+            "nothing is in progress, so the message may be written last"
+        );
+        assert_eq!(budget.charge(1), Charge::AlreadyOver, "C is refused");
+        assert_eq!(budget.in_progress(), 0, "and C was never admitted");
+        assert!(budget.writes_drained());
+    }
+
+    /// The second interleaving from the same finding: writer C read the
+    /// budget before the crossing, and its accounting retried after a refund
+    /// had lowered the total, so it came out within the limit after the
+    /// crossing. With admission, C was counted before the crossing, so the
+    /// crossing writer waits for it; and a writer that comes after the
+    /// crossing is refused before it charges anything, refund or not.
+    #[test]
+    fn a_write_admitted_before_the_crossing_is_waited_for_even_after_a_refund() {
+        let budget = LogBudget::new(10).unwrap().with_drain_bound(Duration::ZERO);
+        assert_eq!(budget.charge(6), Charge::Within, "A is admitted");
+        assert!(admit_write(&budget.cells().admission), "C is admitted");
+        assert_eq!(budget.charge(5), Charge::Crossed, "B crosses at 11");
+        budget.refund(6);
+        budget.finish();
+        assert_eq!(budget.spent(), 5, "A's failed write was refunded");
+        assert_eq!(
+            budget.account(1),
+            Charge::Within,
+            "C's accounting fits after the refund"
+        );
+        assert_eq!(budget.in_progress(), 1, "C is still in progress");
+        assert!(!budget.writes_drained(), "so the message is withheld");
+        assert_eq!(budget.charge(1), Charge::AlreadyOver, "D is refused");
+        assert_eq!(budget.spent(), 6, "D charged nothing");
+        budget.finish();
+        assert!(budget.writes_drained(), "C has written");
+    }
+
+    /// Two admitted writes both go past the limit: the first to set CROSSED is
+    /// the crossing, the other is already over, and both admissions end.
+    #[test]
+    fn only_the_first_write_past_the_limit_claims_the_crossing() {
+        let budget = LogBudget::new(10).unwrap();
+        let admission = &budget.cells().admission;
+        assert!(admit_write(admission), "A is admitted");
+        assert!(admit_write(admission), "B is admitted");
+        assert_eq!(budget.account(11), Charge::Crossed, "B crosses");
+        assert_eq!(budget.account(1), Charge::AlreadyOver, "A is over");
+        assert_eq!(budget.in_progress(), 0);
+        assert_eq!(admission.load(Ordering::Relaxed), CROSSED);
+        assert!(!admit_write(admission), "nothing is admitted after it");
+        assert_eq!(admission.load(Ordering::Relaxed), CROSSED);
+    }
+
+    /// A write that never finishes -- its process was killed in the middle of
+    /// it -- makes the crossing writer give up at the drain bound, and the
+    /// production bound keeps the crossing process inside the one-second exit
+    /// bound. A caller cannot set a bound above the maximum.
+    #[test]
+    fn the_drain_wait_gives_up_at_its_bound() {
+        let budget = LogBudget::new(10).unwrap();
+        assert_eq!(budget.charge(1), Charge::Within, "a write that never ends");
+        assert_eq!(budget.charge(10), Charge::Crossed);
+        for bound in [Duration::from_millis(30), LOG_CAP_DRAIN_BOUND] {
+            let started = Instant::now();
+            assert!(!wait_for_writes_in_progress(
+                &budget.cells().admission,
+                bound
+            ));
+            let waited = started.elapsed();
+            assert!(
+                waited >= bound,
+                "gave up after {waited:?}, before {bound:?}"
+            );
+            // A generous ceiling for a loaded host: the wait itself is the
+            // bound plus one poll of 1 ms; the rest is scheduling delay.
+            assert!(
+                waited < Duration::from_secs(1),
+                "waited {waited:?} for a bound of {bound:?}"
+            );
+        }
+        assert_eq!(
+            LogBudget::new(1)
+                .unwrap()
+                .with_drain_bound(Duration::from_secs(10))
+                .drain_bound,
+            LOG_CAP_DRAIN_BOUND_MAX
+        );
+    }
+
+    /// Every admission a CappedWriter starts ends when its write returns:
+    /// after a whole write, a partial one, an error and a panic in the sink.
+    /// A missed end would make every later crossing omit its final message.
+    #[test]
+    fn capped_writer_ends_every_admission_it_starts() {
+        struct Sink(fn(&[u8]) -> io::Result<usize>);
+        impl Write for Sink {
+            fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+                (self.0)(buf)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let budget = LogBudget::new(1 << 20).unwrap();
+        let mut whole = CappedWriter::new(Sink(|buf| Ok(buf.len())), Some(budget.clone()));
+        assert_eq!(whole.write(b"abcd").unwrap(), 4);
+        assert_eq!((budget.in_progress(), budget.spent()), (0, 4));
+        let mut partial = CappedWriter::new(Sink(|buf| Ok(buf.len() / 2)), Some(budget.clone()));
+        assert_eq!(partial.write(b"abcd").unwrap(), 2);
+        assert_eq!((budget.in_progress(), budget.spent()), (0, 6));
+        let mut refusing = CappedWriter::new(
+            Sink(|_| Err(io::Error::from_raw_os_error(libc::EIO))),
+            Some(budget.clone()),
+        );
+        assert!(refusing.write(b"abcd").is_err());
+        assert_eq!((budget.in_progress(), budget.spent()), (0, 6));
+        let mut panicking =
+            CappedWriter::new(Sink(|_| panic!("the sink panicked")), Some(budget.clone()));
+        let unwound =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| panicking.write(b"abcd")));
+        assert!(unwound.is_err());
+        assert_eq!(budget.in_progress(), 0);
+    }
+
+    /// Set in the re-executed child of the stress test below: the drain bound
+    /// in milliseconds.
+    const LOG_CAP_STRESS_CHILD: &str = "HERMIT_TEST_LOG_CAP_STRESS_DRAIN_MS";
+    const LOG_CAP_STRESS_LIMIT: u64 = 64 << 10;
+    const LOG_CAP_STRESS_WRITERS: usize = 8;
+    const LOG_CAP_STRESS_RUNS: usize = 20;
+
+    /// Real threads racing the crossing on one stderr pipe: whenever the final
+    /// message is delivered, it is the last line (review of
+    /// https://github.com/rrnewton/hermit/pull/3686, round 3, finding 5). The
+    /// child must be a fresh process with its own writer threads, and the cap
+    /// tests above fork, so this re-executes the test binary rather than
+    /// forking it. 20 runs at a zero drain bound and 20 at the production
+    /// bound. Run with --no-capture to see the delivery rates.
+    #[test]
+    fn the_final_message_is_the_last_line_when_writers_race_the_crossing() {
+        if let Ok(bound) = std::env::var(LOG_CAP_STRESS_CHILD) {
+            race_writers_to_the_crossing(Duration::from_millis(bound.parse().unwrap()));
+        }
+        let message = exceeded_message(LOG_CAP_STRESS_LIMIT);
+        let message = message.as_bytes();
+        for bound in [Duration::ZERO, LOG_CAP_DRAIN_BOUND] {
+            let mut delivered = 0;
+            for run in 0..LOG_CAP_STRESS_RUNS {
+                let output = std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "tracing::tests::the_final_message_is_the_last_line_when_writers_race_the_crossing",
+                        "--exact",
+                        "--nocapture",
+                        "--test-threads=1",
+                    ])
+                    .env(LOG_CAP_STRESS_CHILD, bound.as_millis().to_string())
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .output()
+                    .unwrap();
+                let stderr = &output.stderr;
+                let tail = String::from_utf8_lossy(&stderr[stderr.len().saturating_sub(600)..]);
+                assert_eq!(
+                    output.status.code(),
+                    Some(hermit::HERMIT_LOG_CAP_EXIT),
+                    "run {run} at drain bound {bound:?}; stderr tail:\n{tail}"
+                );
+                let copies = stderr
+                    .windows(message.len())
+                    .filter(|window| *window == message)
+                    .count();
+                assert!(copies <= 1, "run {run}: {copies} final messages");
+                if copies == 1 {
+                    delivered += 1;
+                    assert!(
+                        stderr.ends_with(message),
+                        "run {run} at drain bound {bound:?}: a line followed the final \
+                         message; stderr tail:\n{tail}"
+                    );
+                }
+            }
+            eprintln!(
+                "drain bound {bound:?}: the final message was delivered, last, in {delivered} \
+                 of {LOG_CAP_STRESS_RUNS} runs; every run exited {}",
+                hermit::HERMIT_LOG_CAP_EXIT
+            );
+        }
+    }
+
+    /// The child: writers on stderr, each through its own CappedWriter on one
+    /// budget, until one of them crosses and ends the process.
+    fn race_writers_to_the_crossing(drain_bound: Duration) -> ! {
+        let budget = LogBudget::new(LOG_CAP_STRESS_LIMIT)
+            .unwrap()
+            .with_drain_bound(drain_bound);
+        let start = Arc::new(std::sync::Barrier::new(LOG_CAP_STRESS_WRITERS));
+        let writers: Vec<_> = (0..LOG_CAP_STRESS_WRITERS)
+            .map(|writer| {
+                let budget = budget.clone();
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    let mut sink = CappedWriter::stderr(Some(budget));
+                    start.wait();
+                    for line in 0u64..=u64::MAX {
+                        // One write per line, so each line reaches the pipe whole.
+                        let _ = sink.write_all(format!("writer {writer} line {line}\n").as_bytes());
+                    }
+                })
+            })
+            .collect();
+        for writer in writers {
+            let _ = writer.join();
+        }
+        // Unreachable: the crossing write ends the process with exit 123.
+        // SAFETY: _exit has no preconditions.
+        unsafe { libc::_exit(1) }
     }
 
     #[test]
