@@ -31,7 +31,9 @@ use crate::random::getrandom_request_len;
 use crate::random::validate_getrandom_flags;
 use crate::random::write_random_chunk;
 use crate::record_or_replay::RecordOrReplay;
+use crate::scheduler::HostTimedSignalScope;
 use crate::tool_global::create_session;
+use crate::tool_global::record_host_timed_signals;
 use crate::tool_global::set_process_group;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
@@ -118,8 +120,11 @@ fn is_supported_prctl_option(option: libc::c_int) -> bool {
             // previously set. The result is a pure function of the guest's own
             // prior prctl calls and its argument, never host state, so
             // passthrough is deterministic and bitwise-identical across runs.
-            // The registered signal only ever fires on parent death, which is a
-            // deterministically scheduled event under Hermit. Supporting it lets
+            // The registered signal fires when the parent thread exits, and the
+            // kernel posts it at a moment set by host timing, so `handle_prctl`
+            // first records a nonzero PR_SET_PDEATHSIG signal as host-timed for
+            // the caller's process: no gated wait of that process ends for it
+            // (https://github.com/rrnewton/hermit/issues/3146). Supporting it lets
             // `setpriv --pdeathsig` run under --strict instead of aborting with
             // "set parent death signal failed: Function not implemented".
             | libc::PR_SET_PDEATHSIG
@@ -391,6 +396,30 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(0)
             }
             libc::PR_GET_TIMERSLACK => Ok(guest.thread_state().timer_slack_ns as i64),
+            // The kernel sends a parent-death signal process-directed
+            // (`group_send_sig_info` with `PIDTYPE_TGID`) when the parent thread
+            // exits, at a moment set by host timing. Record it in this turn,
+            // before the call reaches the kernel, for every thread of the
+            // caller's process, and never forget it: a later disarm or `exec`
+            // does not remove it (`Scheduler::record_host_timed_signals`). Linux
+            // accepts 0 (disarm) and 1 to 64; anything else fails with EINVAL in
+            // the kernel and arms nothing.
+            libc::PR_SET_PDEATHSIG => {
+                let signal = call.arg2();
+                if (1..=64).contains(&signal)
+                    && guest
+                        .config()
+                        .backend_supports_blocked_wait_signal_interruption
+                {
+                    record_host_timed_signals(
+                        guest,
+                        HostTimedSignalScope::Caller,
+                        1_u64 << (signal - 1),
+                    )
+                    .await;
+                }
+                self.passthrough(guest, call.into()).await
+            }
             option
                 if guest.config().backend.virtualizes_capability_prctls
                     && is_backend_virtualized_capability_prctl(option) =>

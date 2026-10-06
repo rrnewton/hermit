@@ -87,6 +87,7 @@ use crate::scheduler::ConsumeResult;
 use crate::scheduler::DEFAULT_PRIORITY;
 use crate::scheduler::ExecReconnect;
 use crate::scheduler::FutexSignalWatch;
+use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::MaybePrintStack;
 use crate::scheduler::Priority;
 use crate::scheduler::SchedResponse;
@@ -2038,6 +2039,16 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
             }
+            GlobalRequest::RecordHostTimedSignals(dtid, scope, signals) => R::HostTimedSignals(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .record_host_timed_signals(dtid, scope, signals),
+            ),
+            GlobalRequest::HostTimedSignals(dtid) => R::HostTimedSignals(
+                self.lock_rpc_scheduler(false)
+                    .await
+                    .host_timed_signals(dtid),
+            ),
             GlobalRequest::ExactChildWaitState(parent, child) => R::ExactChildWaitState(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -3530,6 +3541,14 @@ pub enum GlobalRequest {
     RecordHostMutation {
         path: String,
     },
+    /// This thread armed, in its turn, a host-timed source of these signals;
+    /// see [`record_host_timed_signals`]. Appended after `RecordHostMutation`,
+    /// so that adding it left every earlier variant's encoded tag unchanged.
+    RecordHostTimedSignals(DetTid, HostTimedSignalScope, u64),
+    /// The signals no gated wait of this thread ends for; see
+    /// [`host_timed_signals`]. Appended after `RecordHostTimedSignals`, for the
+    /// same reason.
+    HostTimedSignals(DetTid),
 }
 
 /// Responses from the global object
@@ -3612,6 +3631,9 @@ pub enum GlobalResponse {
     /// Appended at the end, so that adding it left every earlier variant's
     /// tag unchanged.
     RecordHostMutation(()),
+    /// Appended after `RecordHostMutation`, so that adding it left every
+    /// earlier variant's tag unchanged.
+    HostTimedSignals(u64),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -4613,6 +4635,47 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ThreadIsLive(dettid)).await;
     match response.1 {
         GlobalResponse::ThreadIsLive(live) => live,
+        _ => unreachable!(),
+    }
+}
+
+/// Records, in the calling thread's turn, that it armed a host-timed source of
+/// `signals` (a kernel sigset) reaching the processes in `scope`, before the
+/// arming call reaches the kernel. Returns the signals the caller's gated waits
+/// now hold (`Scheduler::record_host_timed_signals`).
+pub async fn record_host_timed_signals<G, T>(
+    guest: &mut G,
+    scope: HostTimedSignalScope,
+    signals: u64,
+) -> u64
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettid = guest.thread_state().dettid;
+    let response = send_and_update_time(
+        guest,
+        GlobalRequest::RecordHostTimedSignals(dettid, scope, signals),
+    )
+    .await;
+    match response.1 {
+        GlobalResponse::HostTimedSignals(signals) => signals,
+        _ => unreachable!(),
+    }
+}
+
+/// The signals (a kernel sigset) that no gated wait of the calling thread ends
+/// for, because a host-timed source a guest armed can post them to its process
+/// (`Scheduler::host_timed_signals`). Read it in the waiting thread's turn.
+pub async fn host_timed_signals<G, T>(guest: &mut G) -> u64
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let dettid = guest.thread_state().dettid;
+    let response = send_and_update_time(guest, GlobalRequest::HostTimedSignals(dettid)).await;
+    match response.1 {
+        GlobalResponse::HostTimedSignals(signals) => signals,
         _ => unreachable!(),
     }
 }
