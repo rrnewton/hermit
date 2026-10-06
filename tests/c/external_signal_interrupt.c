@@ -49,7 +49,8 @@
  * with SIG_IGN (`ignored`), SIGUSR1 blocked by the waiter (`blocked`), or
  * SIGWINCH, which is ignored by default (`winch`). The call then has a 300 ms
  * timeout, the sender does not wake the futex, and an ELAPSED line reports the
- * CLOCK_MONOTONIC time the call took, so the wait must run to its deadline.
+ * CLOCK_MONOTONIC time from just before the senders start until the call
+ * returns, so the wait must run to its deadline.
  *
  * `tstp` is a fourth such option, with one exception. The guest first forks,
  * and the child runs the whole test after setsid(), which makes it the only
@@ -925,6 +926,11 @@ int main(int argc, char **argv) {
     if (read(renamed[0], &c, 1) != 1) return 3;
     close(renamed[0]);
   }
+  /* The start stamp comes before every sender starts: the `exit` child below,
+   * the sender process and thread, and the timer. Each sender's 100 ms begins
+   * after it, so a wait that the signal ends reports ELAPSED of at least 100. */
+  struct timespec start;
+  clock_gettime(CLOCK_MONOTONIC, &start);
   if (from_exit) {
     child = fork();
     if (child < 0) return 3;
@@ -973,8 +979,6 @@ int main(int argc, char **argv) {
     epfd = epoll_create1(0);
     if (epfd < 0 || epoll_ctl(epfd, EPOLL_CTL_ADD, sp[0], &ev) != 0) return 3;
   }
-  struct timespec start;
-  clock_gettime(CLOCK_MONOTONIC, &start);
   errno = 0;
   /* A must-not-wake wait, or a timed disposition-change wait, has the short
    * timeout; a readiness wait is otherwise unbounded. */
