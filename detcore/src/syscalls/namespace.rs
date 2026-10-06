@@ -1531,7 +1531,7 @@ mod tests {
             let link =
                 rewrite_own(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes(), 64).await;
             let fdinfo = tool
-                .fdinfo_raw_file_id(&mut guest, reader.as_raw_fd(), None)
+                .fdinfo_raw_file_id(&mut guest, reader.as_raw_fd(), None, b"")
                 .await
                 .unwrap();
             let fdinfo_inode = determinize_inode(&mut guest, fdinfo).await.0;
@@ -1552,7 +1552,58 @@ mod tests {
             );
         }
 
-        /// Control for the test above: without `virtualize_metadata` a
+        /// Replay: the link target and the fdinfo bytes are the recording's,
+        /// naming the recorded inode R, while the replayer's recreated pipe
+        /// has its own live inode P. Both views must key on R, on device 0,
+        /// as they did in the recording; keying fdinfo on the live `fstat`
+        /// gave the two views two deterministic inodes whenever R != P.
+        #[tokio::test]
+        async fn at_replay_a_pipes_fdinfo_names_the_recorded_inode_its_link_names() {
+            let (reader, device, live_inode) = pipe_reader();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            guest.config.virtualize_metadata = false;
+            assert_ne!(device, 0, "precondition: pipefs is not device 0");
+            let recorded_inode = live_inode + 1_000_003;
+            assert_ne!(recorded_inode, cached_stdin_inode(&guest));
+            let target = format!("pipe:[{recorded_inode}]");
+            let recorded_fdinfo =
+                format!("pos:\t0\nflags:\t02000000\nmnt_id:\t15\nino:\t{recorded_inode}\n");
+
+            let link =
+                rewrite_own(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes(), 64).await;
+            let fdinfo = tool
+                .fdinfo_raw_file_id(
+                    &mut guest,
+                    reader.as_raw_fd(),
+                    None,
+                    recorded_fdinfo.as_bytes(),
+                )
+                .await
+                .unwrap();
+            let fdinfo_inode = determinize_inode(&mut guest, fdinfo).await.0;
+
+            assert_eq!(
+                fdinfo,
+                RawInode::new(0, recorded_inode),
+                "fdinfo must key the pipe on the recorded inode, not the replayer's {live_inode}"
+            );
+            assert_eq!(
+                String::from_utf8_lossy(&link),
+                format!("pipe:[{}]", fdinfo_inode.as_raw()),
+                "the link and the fdinfo ino: line must name one deterministic inode"
+            );
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [
+                    RawInode::new(0, recorded_inode),
+                    RawInode::new(0, recorded_inode)
+                ]
+            );
+        }
+
+        /// Control for the two pipe tests above: without `virtualize_metadata` a
         /// regular file's fdinfo stays keyed on its device as well as its
         /// inode, so an equal inode number on another filesystem names
         /// another file (<https://github.com/rrnewton/hermit/issues/3307>).
@@ -1565,7 +1616,7 @@ mod tests {
             guest.config.virtualize_metadata = false;
 
             let fdinfo = tool
-                .fdinfo_raw_file_id(&mut guest, file.as_raw_fd(), None)
+                .fdinfo_raw_file_id(&mut guest, file.as_raw_fd(), None, b"")
                 .await
                 .unwrap();
 
