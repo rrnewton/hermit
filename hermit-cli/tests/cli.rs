@@ -6307,10 +6307,11 @@ fn full_unread_stderr_pipe() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
 /// 8). So these tests wait at most 45 s times the same multiplier, then kill
 /// hermit with SIGKILL and reap it ([`wait_at_most`]), close their own pipe
 /// descriptors, and fail with the time they waited. Killing hermit also ends
-/// the guest: the container init, or under `--no-namespace` the tracer, dies
-/// with hermit through its parent-death signal, and the guest dies with it
-/// (with its PID namespace, or as a `PTRACE_O_EXITKILL` tracee). The 12 s left
-/// before nextest's kill cover the setup before spawn and that cleanup.
+/// the guest: every capped run here runs inside hermit's PID namespace (the
+/// flag is refused with `--no-namespace`), whose container init dies with
+/// hermit through its parent-death signal, and the guest dies with the
+/// namespace. The 12 s left before nextest's kill cover the setup before spawn
+/// and that cleanup.
 const LOG_CAP_RUN_WAIT_BOUND: Duration = Duration::from_secs(45);
 
 /// Wait for `child` for at most `bound`, killing it with SIGKILL and reaping it
@@ -6390,14 +6391,23 @@ fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
     );
 }
 
-/// A cap diagnostic must not raise SIGPIPE in the crossing process (round-2
-/// review of https://github.com/rrnewton/hermit/pull/3686, finding 4). Under
-/// `--no-namespace` the crossing process is the Reverie tracer, which restores
-/// SIGPIPE's default disposition; its crossing line to a stderr pipe whose
-/// reader is gone used to kill it by signal, and the outer process reported
-/// that as an internal failure (125) instead of the cap (123). Like the test
-/// above, it waits at most [`LOG_CAP_RUN_WAIT_BOUND`], so that a hang fails
-/// here, with the time waited, before nextest's own kill.
+/// A capped run whose stderr pipe has no reader still exits exactly 123.
+///
+/// Round 2 of the review of https://github.com/rrnewton/hermit/pull/3686
+/// (finding 4) ran this under `--no-namespace`, where the crossing process was
+/// the Reverie tracer with SIGPIPE at its default disposition: its crossing
+/// line to the reader-less pipe killed it, and the run exited 125. The cap is
+/// refused with `--no-namespace` now (round-4c review, finding 1), so the test
+/// runs in hermit's PID namespace. There the crossing process is the container
+/// init, PID 1 of the namespace, and the kernel discards a signal at its
+/// default disposition that the init raises in itself, so this test does not
+/// detect a revert of that fix. The fix keeps its unit coverage in tracing.rs
+/// (`a_cap_diagnostic_to_a_departed_reader_raises_no_signal` and
+/// `the_diagnostic_signal_guard_consumes_only_the_signal_its_write_raised`).
+/// This test still requires that nothing the outer process writes to the
+/// reader-less stderr turns the cap's 123 into a panic (101) or a hang. Like
+/// the test above, it waits at most [`LOG_CAP_RUN_WAIT_BOUND`], so that a hang
+/// fails here, with the time waited, before nextest's own kill.
 #[test]
 fn max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader() {
     let _lock = hermit_run_guard();
@@ -6420,7 +6430,6 @@ fn max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader() {
         "--log-file",
         log.to_str().unwrap(),
         "run",
-        "--no-namespace",
         "--timeout",
         "120",
         "--",
@@ -6434,15 +6443,15 @@ fn max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader() {
         .unwrap();
     let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
     let (status, elapsed) = wait_at_most(&mut child, bound);
-    eprintln!("capped --no-namespace run, stderr without a reader: {status:?} after {elapsed:?}");
+    eprintln!("capped run, stderr without a reader: {status:?} after {elapsed:?}");
     let status = status.unwrap_or_else(|| {
         panic!("hermit was still running after {elapsed:?} (bound {bound:?}) and was killed")
     });
     assert_eq!(
         status.code(),
         Some(HERMIT_LOG_CAP_EXIT),
-        "{status:?}; 125 is the crossing tracer killed by SIGPIPE from its own diagnostic. \
-         Log tail:\n{}",
+        "{status:?}; the cap must end the run with 123 when stderr has no reader. Log \
+         tail:\n{}",
         fs::read_to_string(&log)
             .map(|text| {
                 text.get(text.len().saturating_sub(1500)..)
@@ -6641,16 +6650,18 @@ fn max_log_bytes_verify_exits_promptly_when_stderr_fills_after_run1() {
 /// (round-3 review of the same pull request, finding 2). The refusal comes
 /// before backend availability and before any SaBRe artifact is resolved, so it
 /// holds in builds where none of these backends is available. `analyze` and `bisect` trials skip
-/// `run`'s own check, so both refuse KVM under `--no-namespace` before any
-/// trial, and bisect before it reads its schedules (the paths below do not
-/// exist). The accepted counterpart, ptrace under `--no-namespace` ending with
-/// 123, is `max_log_bytes_keeps_the_cap_status_when_stderr_has_no_reader`.
+/// `run`'s own check, so both refuse `--no-namespace` before any trial, with
+/// KVM and with the default ptrace backend, and bisect before it reads its
+/// schedules (the paths below do not exist). ptrace and e9patch under
+/// `--no-namespace` are refused too (round-4c review, finding 1); their cases,
+/// with the guest's marker and the run without the flag, are in
+/// `max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime`.
 #[test]
 fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
     let _lock = hermit_run_guard();
     /// Arguments and the configuration the refusal must name.
     type Case<'a> = (&'a [&'a str], &'a str);
-    let cases: [Case; 7] = [
+    let cases: [Case; 9] = [
         (
             &[
                 "--max-log-bytes=64K",
@@ -6719,10 +6730,10 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
             ],
             "--backend=kvm and --no-namespace",
         ),
-        // Round-4c review, finding 1: the ptrace tracer starts the GDB server
-        // after it spawns the guest and before PTRACE_O_EXITKILL binds it. The
-        // refusal comes before any GDB server is started, so nothing waits for
-        // a client here.
+        // Round-4c review, finding 1: the ptrace tracer sets PTRACE_O_EXITKILL
+        // only after it spawns the guest, and starts any GDB server in between.
+        // The refusal comes before any GDB server is started, so nothing waits
+        // for a client here.
         (
             &[
                 "--max-log-bytes=64K",
@@ -6732,7 +6743,31 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
                 "--",
                 "/bin/true",
             ],
-            "--gdbserver and --no-namespace",
+            "--no-namespace",
+        ),
+        // The default (ptrace) backend's trials under `--no-namespace`, the
+        // same window as `run --no-namespace`.
+        (
+            &[
+                "--max-log-bytes=64K",
+                "analyze",
+                "--run-arg=--no-namespace",
+                "--",
+                "/bin/true",
+            ],
+            "--no-namespace",
+        ),
+        (
+            &[
+                "--max-log-bytes=64K",
+                "bisect",
+                "--good=/nonexistent/hermit-3686/good.json",
+                "--bad=/nonexistent/hermit-3686/bad.json",
+                "--",
+                "--no-namespace",
+                "/bin/true",
+            ],
+            "--no-namespace",
         ),
     ];
     for (args, named) in cases {
@@ -6753,6 +6788,84 @@ fn max_log_bytes_is_refused_where_the_guest_could_outlive_hermit() {
             text.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
             "{args:?}: {text}"
         );
+    }
+}
+
+/// Round-4c review of https://github.com/rrnewton/hermit/pull/3686, finding 1.
+/// Reverie's ptrace tracer clones the guest and sets `PTRACE_O_EXITKILL` on it
+/// only afterwards, and Linux clears the inherited parent-death signal in the
+/// clone, so under `--no-namespace` the guest is bound to nothing in between.
+/// A charged write can cross the cap there (the outer process's asynchronous
+/// file appender draining a queued record), and exiting 123 would leave the
+/// guest running. So ptrace, and e9patch, whose guest runs on the ptrace
+/// runtime, refuse the flag under `--no-namespace` with 122, with or without
+/// `--log-file`, before the guest exists: the marker it would print is absent.
+/// Without the flag the same command is not refused: ptrace runs the guest,
+/// which prints its marker, and e9patch fails as it always has under
+/// `--no-namespace`, without naming the flag.
+#[test]
+fn max_log_bytes_is_refused_under_no_namespace_on_the_ptrace_runtime() {
+    let _lock = hermit_run_guard();
+    const MARKER: &str = "hermit-3686-guest-ran";
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log = directory.path().join("hermit.log");
+    let log = log.to_str().unwrap();
+    let guest = ["--", "/bin/sh", "-c", "echo hermit-3686-guest-ran"];
+    for backend in [None, Some("--backend=e9patch")] {
+        for log_file in [None, Some(log)] {
+            let mut without_flag: Vec<&str> = Vec::new();
+            without_flag.extend(backend);
+            if let Some(path) = log_file {
+                without_flag.extend(["--log-file", path]);
+            }
+            without_flag.extend(["run", "--no-namespace"]);
+            without_flag.extend(guest);
+            let mut capped = vec!["--max-log-bytes=64K"];
+            capped.extend(&without_flag);
+
+            let output = hermit_command(&capped)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let (out, err) = (stdout(&output), stderr(&output));
+            assert_eq!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{capped:?}: {output:?}"
+            );
+            assert!(
+                err.contains("--max-log-bytes cannot be enforced with --no-namespace: "),
+                "{capped:?}: {err}"
+            );
+            assert!(
+                err.contains("HERMIT_POLICY_REFUSAL class=policy-refusal"),
+                "{capped:?}: {err}"
+            );
+            assert!(
+                !out.contains(MARKER) && !err.contains(MARKER),
+                "{capped:?}: the guest ran: {out} {err}"
+            );
+
+            let output = hermit_command(&without_flag)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let (out, err) = (stdout(&output), stderr(&output));
+            assert_ne!(
+                output.status.code(),
+                Some(HERMIT_POLICY_REFUSAL_EXIT),
+                "{without_flag:?}: {output:?}"
+            );
+            assert!(!err.contains("--max-log-bytes"), "{without_flag:?}: {err}");
+            if backend.is_none() {
+                assert_eq!(
+                    output.status.code(),
+                    Some(0),
+                    "{without_flag:?}: {output:?}"
+                );
+                assert!(out.contains(MARKER), "{without_flag:?}: {out} {err}");
+            }
+        }
     }
 }
 

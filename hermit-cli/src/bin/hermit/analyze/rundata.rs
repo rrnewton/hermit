@@ -587,9 +587,9 @@ mod tests {
 
     /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
     /// 2: the refusal `RunOpts::main` makes never sees an analyze or bisect
-    /// trial, which goes straight to `RunOpts::run`. KVM is the one backend
-    /// those commands admit that has a refused mode: `--no-namespace`, passed
-    /// through the run arguments.
+    /// trial, which goes straight to `RunOpts::run`. Those commands admit
+    /// ptrace and KVM, and `--no-namespace`, passed through the run arguments,
+    /// is refused with either (round-4c review, finding 1).
     #[test]
     fn log_cap_refusal_reaches_analyze_and_bisect_trials() {
         let options = |argv: &[&str]| {
@@ -601,25 +601,56 @@ mod tests {
             options.apply_global(&args.global);
             options
         };
-        for refused in [
-            &[
-                "hermit",
-                "--max-log-bytes=4K",
-                "--backend=kvm",
-                "analyze",
-                "--run-arg=--no-namespace",
-                "--",
-                "/bin/true",
-            ][..],
-            &[
-                "hermit",
-                "--max-log-bytes=4K",
-                "--backend=kvm",
-                "analyze",
-                "--",
+        let kvm = "--backend=kvm and --no-namespace";
+        for (refused, named) in [
+            (
+                &[
+                    "hermit",
+                    "--max-log-bytes=4K",
+                    "--backend=kvm",
+                    "analyze",
+                    "--run-arg=--no-namespace",
+                    "--",
+                    "/bin/true",
+                ][..],
+                kvm,
+            ),
+            (
+                &[
+                    "hermit",
+                    "--max-log-bytes=4K",
+                    "--backend=kvm",
+                    "analyze",
+                    "--",
+                    "--no-namespace",
+                    "/bin/true",
+                ][..],
+                kvm,
+            ),
+            // The default (ptrace) backend: its tracer sets PTRACE_O_EXITKILL
+            // only after the trial's guest exists.
+            (
+                &[
+                    "hermit",
+                    "--max-log-bytes=4K",
+                    "analyze",
+                    "--run-arg=--no-namespace",
+                    "--",
+                    "/bin/true",
+                ][..],
                 "--no-namespace",
-                "/bin/true",
-            ][..],
+            ),
+            (
+                &[
+                    "hermit",
+                    "--max-log-bytes=4K",
+                    "analyze",
+                    "--",
+                    "--no-namespace",
+                    "/bin/true",
+                ][..],
+                "--no-namespace",
+            ),
         ] {
             let error = options(refused)
                 .refuse_unsupervised_log_cap()
@@ -631,9 +662,9 @@ mod tests {
                 "{refused:?}: {error:#}"
             );
             assert!(
-                error.to_string().starts_with(
-                    "--max-log-bytes cannot be enforced with --backend=kvm and --no-namespace: "
-                ),
+                error.to_string().starts_with(&format!(
+                    "--max-log-bytes cannot be enforced with {named}: "
+                )),
                 "{refused:?}: {error:#}"
             );
         }
@@ -656,12 +687,12 @@ mod tests {
             ][..],
             &[
                 "hermit",
-                "--max-log-bytes=4K",
                 "analyze",
                 "--run-arg=--no-namespace",
                 "--",
                 "/bin/true",
             ][..],
+            &["hermit", "--max-log-bytes=4K", "analyze", "--", "/bin/true"][..],
         ] {
             options(accepted)
                 .refuse_unsupervised_log_cap()

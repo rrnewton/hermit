@@ -687,11 +687,15 @@ fn exceeded_message(limit: u64) -> String {
 ///
 /// WHY `_exit` FROM INSIDE A WRITER. The writer runs wherever tracing does: the
 /// container init (PID 1 of the run's PID namespace, whose exit makes the
-/// kernel SIGKILL every guest in it), the `--no-namespace` tracer (whose guests
-/// are attached with PTRACE_O_EXITKILL), or the non-blocking appender's worker
-/// thread in one of those processes. In each case ending the process is
-/// exactly how hermit's other deliberate stops tear the guest tree down
-/// (`record --record-timeout`, the container-init stop-signal handler).
+/// kernel SIGKILL every guest in it), the outer hermit process (whose exit
+/// ends that init through its parent-death signal), or the non-blocking
+/// appender's worker thread in one of those processes. In each case ending the
+/// process is exactly how hermit's other deliberate stops tear the guest tree
+/// down (`record --record-timeout`, the container-init stop-signal handler).
+/// Where no PID namespace contains the guest -- `--no-namespace`, whose ptrace
+/// tracer binds the guest with PTRACE_O_EXITKILL only after it exists, and
+/// DBT -- the cap is refused before any guest starts
+/// (`RunOpts::log_cap_refusal`).
 /// `_exit` rather than `exit` because this can run on any thread, possibly
 /// while the subscriber's writer lock is held, and there is nothing left worth
 /// flushing: every sink here is unbuffered. The parent maps the status through
@@ -931,11 +935,17 @@ fn proc_self_fd_path(fd: RawFd) -> [u8; 32] {
 /// Run one diagnostic write (`write` returns its errno, 0 for none) so that no
 /// signal it generates escapes.
 ///
-/// The crossing process can be a Reverie tracer, which restores `SIGPIPE`'s
-/// default disposition and clears the signal mask. A `SIGPIPE` from a reader
-/// that left between the open and the write would kill it before `_exit(123)`,
-/// and the parent would classify the death by signal as an internal failure
-/// (125) -- review of https://github.com/rrnewton/hermit/pull/3686, round 2.
+/// Reverie's container setup restores `SIGPIPE`'s default disposition and
+/// clears the signal mask in the process that runs the tracer. Under
+/// `--no-namespace` that was an ordinary process, and round 2 of the review of
+/// https://github.com/rrnewton/hermit/pull/3686 found a `SIGPIPE` from its
+/// crossing line killing it before `_exit(123)`, reported as an internal
+/// failure (125); the cap is refused there now. In hermit's PID namespace the
+/// tracer runs in the container init, PID 1 of the namespace, and the kernel
+/// discards a signal at its default disposition that the init raises in
+/// itself, so there the guard is a defence rather than the fix: it keeps any
+/// process in which this writer runs with `SIGPIPE` at its default from dying
+/// before the exit.
 /// As in `proc_mount`'s warning writer, `SIGPIPE` and `SIGXFSZ` (a file-size
 /// limit) are blocked for the attempt, and a signal is consumed only when this
 /// write failed with the matching error and the signal was not already pending

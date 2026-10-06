@@ -2891,7 +2891,7 @@ fn log_cap_refusal_for(global: &[&str], options: &[&str]) -> Result<(), Error> {
 /// ends nothing where the guest is not bound to that process.
 #[test]
 fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
-    let refused: [(&[&str], &[&str], &str); 7] = [
+    let refused: [(&[&str], &[&str], &str); 10] = [
         (
             &["--max-log-bytes=4K", "--backend=liteinst"],
             &["--no-namespace", "--max-timeslice=disabled"],
@@ -2919,17 +2919,34 @@ fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
             &["--no-namespace"],
             "--backend=sabre and --no-namespace",
         ),
-        // Round-4c review, finding 1: the ptrace tracer starts the GDB server
-        // after it spawns the guest and before PTRACE_O_EXITKILL binds it.
+        // Round-4c review, finding 1: the ptrace tracer sets PTRACE_O_EXITKILL
+        // only after it has spawned the guest (and started any GDB server),
+        // and a charged write can cross the cap in between. e9patch's guest
+        // runs on the same ptrace runtime.
+        (
+            &["--max-log-bytes=4K", "--backend=ptrace"],
+            &["--no-namespace"],
+            "--no-namespace",
+        ),
+        (
+            &["--max-log-bytes=4K", "--backend=e9patch"],
+            &["--no-namespace"],
+            "--no-namespace",
+        ),
+        (
+            &["--max-log-bytes=4K"],
+            &["--no-namespace"],
+            "--no-namespace",
+        ),
         (
             &["--max-log-bytes=4K", "--backend=ptrace"],
             &["--no-namespace", "--gdbserver"],
-            "--gdbserver and --no-namespace",
+            "--no-namespace",
         ),
         (
             &["--max-log-bytes=4K"],
             &["--gdbserver", "--no-namespace"],
-            "--gdbserver and --no-namespace",
+            "--no-namespace",
         ),
     ];
     for (global, options, named) in refused {
@@ -2952,6 +2969,9 @@ fn log_cap_is_refused_where_the_guest_could_outlive_hermit() {
     }
 }
 
+/// Inside hermit's PID namespace, whose death takes every guest process with
+/// it, each backend but DBT is accepted. `--no-namespace` is refused on every
+/// backend (the test above).
 #[test]
 fn log_cap_is_accepted_where_hermit_takes_the_guest_down_with_it() {
     for backend in [
@@ -2961,17 +2981,8 @@ fn log_cap_is_accepted_where_hermit_takes_the_guest_down_with_it() {
         "--backend=e9patch",
         "--backend=liteinst",
     ] {
-        for options in [&[][..], &["--no-namespace"][..]] {
-            if (backend == "--backend=kvm"
-                || backend == "--backend=liteinst"
-                || backend == "--backend=sabre")
-                && !options.is_empty()
-            {
-                continue;
-            }
-            log_cap_refusal_for(&["--max-log-bytes=4K", backend], options)
-                .unwrap_or_else(|error| panic!("{backend} {options:?}: {error:#}"));
-        }
+        log_cap_refusal_for(&["--max-log-bytes=4K", backend], &[])
+            .unwrap_or_else(|error| panic!("{backend}: {error:#}"));
     }
     // LiteInst is accepted inside hermit's PID namespace, whose death takes the
     // untraced in-guest LiteInst guest with it.
@@ -2981,7 +2992,7 @@ fn log_cap_is_accepted_where_hermit_takes_the_guest_down_with_it() {
     )
     .unwrap();
     // The default backend, without --backend.
-    log_cap_refusal_for(&["--max-log-bytes=4K"], &["--no-namespace"]).unwrap();
+    log_cap_refusal_for(&["--max-log-bytes=4K"], &[]).unwrap();
     // --gdbserver inside hermit's PID namespace, whose death takes the guest
     // with it even before PTRACE_O_EXITKILL is set.
     log_cap_refusal_for(
@@ -3014,11 +3025,13 @@ fn log_cap_refusal_table_covers_every_backend() {
     assert_eq!(
         refused,
         [
+            (Backend::Ptrace, true),
             (Backend::Dbt, false),
             (Backend::Dbt, true),
             (Backend::Liteinst, true),
             (Backend::Sabre, true),
             (Backend::Kvm, true),
+            (Backend::E9patch, true),
         ]
     );
 }
@@ -4251,27 +4264,37 @@ impl RunOpts {
     }
 
     /// Why `--max-log-bytes` cannot end a run of this backend in this namespace
-    /// mode, or `None` when every guest process is bound to the hermit process
-    /// that would end it.
+    /// mode, or `None` when the guest runs inside hermit's PID namespace, which
+    /// dies with the hermit process that would end the run.
     ///
     /// The cap ends a run by `_exit(123)` in whichever hermit process crossed
-    /// it: the outer process, a container init, or the `--no-namespace` tracer.
-    /// That ends the RUN only if the guest tree cannot outlive that process,
-    /// and two mechanisms make sure it cannot:
+    /// it: the outer process or a container init. That ends the RUN only if the
+    /// guest tree cannot outlive that process. The one mechanism that makes sure
+    /// of it from before the guest exists is a PID namespace whose init is
+    /// hermit's container init: the namespace dies with its init, and the init
+    /// dies with the outer process through `container::arm_parent_death_signal`.
+    /// A ptrace tracee with `PTRACE_O_EXITKILL` also dies with its tracer, but
+    /// Reverie sets that option only after the guest exists (below), so it
+    /// binds the guest for the rest of the run, not for all of it.
     ///
-    /// - a PID namespace whose init is hermit's container init. The namespace
-    ///   dies with its init, and the init dies with the outer process through
-    ///   `container::arm_parent_death_signal`;
-    /// - every guest task being a ptrace tracee with `PTRACE_O_EXITKILL`, of a
-    ///   tracer that carries that same parent-death signal
-    ///   (`owned_container::run` arms it in `--no-namespace` mode as well).
-    ///
-    /// The configurations refused below have neither, or not for the whole run:
+    /// So every `--no-namespace` configuration is refused, and DBT, whose guest
+    /// is outside hermit's namespace in both modes, is refused in both:
     ///
     /// - DBT, in every namespace mode: `backends::run_dbt` starts `drrun` as a
     ///   plain child of the outer process. It creates no namespace, and Reverie's
     ///   DBT launcher sets only a process group and the personality: no
     ///   parent-death signal and no ptrace attachment.
+    /// - ptrace with `--no-namespace`, and `--backend=e9patch` with it (e9patch
+    ///   preprocessing, whose rewritten guest runs on the ptrace backend,
+    ///   `runtime_backend`): Reverie's
+    ///   `TracerBuilder::spawn` clones the guest, starts the `--gdbserver`
+    ///   server if one is asked for, and only then, in `postspawn`, sets
+    ///   `PTRACE_O_EXITKILL`. Linux clears the inherited parent-death signal in
+    ///   the clone, so in between the guest is bound to nothing, and a charged
+    ///   write can cross the cap there: the outer process's asynchronous file
+    ///   appender draining a queued record, or the GDB server's charged
+    ///   accepted-client event (round-4c review of
+    ///   https://github.com/rrnewton/hermit/pull/3686, finding 1).
     /// - LiteInst with `--no-namespace` (LiteInst runs only in-guest at this
     ///   base): Reverie spawns the guest directly and does not trace it, and
     ///   no PID namespace contains it.
@@ -4285,13 +4308,6 @@ impl RunOpts {
     ///   signal. Unproven is refused until each site is audited; inside
     ///   hermit's PID namespace the question does not arise.
     ///
-    /// One refusal does not depend on the backend, so
-    /// [`Self::refuse_unsupervised_log_cap`] adds it to this table: `--gdbserver`
-    /// with `--no-namespace`. Reverie's ptrace tracer spawns the guest, then
-    /// starts the GDB server, whose accepted-client event is charged, and sets
-    /// `PTRACE_O_EXITKILL` only after that (round-4c review of
-    /// https://github.com/rrnewton/hermit/pull/3686, finding 1).
-    ///
     /// The match has no wildcard arm, so a new backend must be classified here
     /// before it compiles. Not every subcommand that accepts the global flag
     /// passes through this check, and each one stands as follows (round-3
@@ -4301,13 +4317,14 @@ impl RunOpts {
     /// - `analyze` and `bisect` send their trials straight to `RunOpts::run`
     ///   and call it through `AnalyzeOpts::refuse_unsupervised_log_cap` before
     ///   any trial. `Subcommand::validate_backend_scope` admits only KVM there
-    ///   besides ptrace, so KVM with `--no-namespace` is the case it catches.
+    ///   besides ptrace, so `--no-namespace` given through `--run-arg` or after
+    ///   `--`, with either, is the case it catches. They add no
+    ///   `--no-namespace` of their own.
     /// - `record` and `replay` start their containers through
-    ///   `owned_container::run` and never call it. `validate_backend_scope`
-    ///   admits only ptrace there, plus e9patch preprocessing on the ptrace
-    ///   runtime for `record start`, and a ptrace guest is bound in both
-    ///   namespace modes. Their GDB servers (`replay` and `record start
-    ///   --verify-with-gdbex`) always run inside hermit's PID namespace.
+    ///   `owned_container::run` and never call it. They have no
+    ///   `--no-namespace` mode: every one of those containers asks for a
+    ///   private PID namespace, and their GDB servers (`replay` and `record
+    ///   start --verify-with-gdbex`) run inside it.
     /// - `hermit --backend=sabre strace` starts no container: `StraceOpts::main`
     ///   refuses the flag itself, and `strace` with any other backend fails
     ///   before it starts anything.
@@ -4337,6 +4354,12 @@ impl RunOpts {
                  host processes, and they are not shown to die with hermit, so exiting 123 at \
                  the cap might leave the guest running; drop --no-namespace",
             ),
+            Backend::Ptrace | Backend::E9patch if no_namespace => Some(
+                "--no-namespace: the ptrace tracer installs PTRACE_O_EXITKILL only after the \
+                 guest exists, and after it starts any --gdbserver server, so a log write can \
+                 cross the cap before the guest is bound to hermit; no PID namespace contains \
+                 the guest, so exiting 123 there would leave it running; drop --no-namespace",
+            ),
             Backend::Ptrace
             | Backend::Liteinst
             | Backend::Sabre
@@ -4346,10 +4369,12 @@ impl RunOpts {
     }
 
     /// Refuses `--max-log-bytes` (exit 122) where [`Self::log_cap_refusal`]
-    /// says the cap could end hermit and leave the guest running, and for
-    /// `--gdbserver` with `--no-namespace`, whatever the backend. Hermit does
-    /// not supervise the guest tree itself, so the honest answer is to refuse
-    /// the combination rather than report a run as stopped when it is not.
+    /// says the cap could end hermit and leave the guest running: DBT, and
+    /// `--no-namespace` with any backend (`--gdbserver` included, which used
+    /// to be a separate rule here and is now a case of `--no-namespace`).
+    /// Hermit does not supervise the guest tree itself, so the honest answer
+    /// is to refuse the combination rather than report a run as stopped when
+    /// it is not.
     pub(crate) fn refuse_unsupervised_log_cap(
         &self,
         max_log_bytes: Option<u64>,
@@ -4357,13 +4382,7 @@ impl RunOpts {
         if max_log_bytes.is_none() {
             return Ok(());
         }
-        const GDBSERVER: &str = "--gdbserver and --no-namespace: the ptrace tracer starts the \
-             GDB server after it spawns the guest and before PTRACE_O_EXITKILL binds the guest \
-             to it, and the server's log can cross the cap in that window; no PID namespace \
-             contains the guest, so exiting 123 there would leave it behind; drop --no-namespace";
-        let gdbserver_window = self.no_namespace && self.det_opts.det_config.gdbserver;
-        let refusal = Self::log_cap_refusal(self.selected_backend(), self.no_namespace)
-            .or(gdbserver_window.then_some(GDBSERVER));
+        let refusal = Self::log_cap_refusal(self.selected_backend(), self.no_namespace);
         match refusal {
             None => Ok(()),
             Some(reason) => Err(Error::new(PolicyRefusal)

@@ -105,13 +105,13 @@ pub struct GlobalOpts {
     /// write never finishes it, so if the cap is crossed later in that
     /// invocation, the message is missing. The exit status is then the only
     /// signal. Where the flag is accepted the guest dies with hermit, because
-    /// it runs inside hermit's PID namespace or as a ptrace tracee that the
-    /// kernel kills when hermit's tracer exits.
+    /// it runs inside hermit's PID namespace, which dies with hermit.
     ///
     /// Refused with exit 122, before any guest starts, where the guest could
-    /// outlive hermit: --backend=dbt; --backend=liteinst, sabre or kvm with
-    /// --no-namespace, including the KVM trials of `analyze` and `bisect`; and
-    /// `hermit --backend=sabre strace`.
+    /// outlive hermit: --backend=dbt; --no-namespace with every backend,
+    /// --gdbserver runs included, and so the trials of `analyze` and `bisect`
+    /// when their run arguments include --no-namespace; and `hermit
+    /// --backend=sabre strace`.
     ///
     /// SIZE is a byte count with an optional K/M/G/T suffix in powers of 1024,
     /// e.g. 8G. Omit the flag for no cap.
