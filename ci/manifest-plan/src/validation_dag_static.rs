@@ -1152,7 +1152,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and scheduler::parked_tests::real_timers_follow_the_installed_control
     // retain all 971: 971 + 4 = 975, measured with cargo nextest list
     // --profile ci -p hermit-detcore --lib --bins.
-    ("test.detcore_unit", 975),
+    // procfs::tests::proc_modules_does_not_depend_on_the_host_module_set
+    // (https://github.com/rrnewton/hermit/issues/3815) retains all 975 (976,
+    // measured with cargo nextest list).
+    ("test.detcore_unit", 976),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1530,7 +1533,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/pull/3686 logdiff test: 970 + 1 = 971.
     // The same four signal-control tests retain all 971: 975.
-    ("test.detcore_unit_on_host", 975),
+    // And the host-independent /proc/modules test (976).
+    ("test.detcore_unit_on_host", 976),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

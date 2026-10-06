@@ -140,8 +140,8 @@ enum ProcfsKind {
     // TODO-HUMAN-REVIEW(PR-883): Review module reference-count normalization.
     Modules,
     /// `/sys/module/<name>/refcnt`. Carries the module name so the value can be
-    /// derived from the SAME deterministic holder cardinality that
-    /// `sanitize_modules` publishes for `/proc/modules`.
+    /// derived from the SAME module table that `sanitize_modules` publishes for
+    /// `/proc/modules`.
     ModuleRefcnt(String),
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-958): Review host-global uevent sequence normalization.
@@ -303,8 +303,7 @@ fn is_cpuidle_counter_path(path: &Path) -> bool {
 }
 
 /// The module name for `/sys/module/<name>/refcnt`, or `None` for any other
-/// shape. Returning the name (rather than a bare bool) is what lets the sysfs
-/// value be derived from the same module's `/proc/modules` row.
+/// shape.
 fn module_refcnt_name(path: &Path) -> Option<String> {
     let relative = path.strip_prefix("/sys/module").ok()?;
     let mut components = relative.iter();
@@ -313,43 +312,6 @@ fn module_refcnt_name(path: &Path) -> Option<String> {
         return None;
     }
     components.next().is_none().then(|| module.to_owned())
-}
-
-/// The host `/proc/modules` text, or empty when it cannot be read. An empty
-/// source yields a holder count of zero, which is the same conservative value
-/// the pre-existing behaviour emitted -- so an unreadable source degrades to
-/// the old answer instead of leaking the native counter.
-fn read_host_modules() -> String {
-    std::fs::read_to_string("/proc/modules").unwrap_or_default()
-}
-
-/// The deterministic holder cardinality `sanitize_modules` publishes for
-/// `module` in `/proc/modules`: the number of comma-separated holder names in
-/// the fourth field, or zero when that field is `-`.
-///
-/// This is the SAME derivation `sanitize_modules` applies, so the two surfaces
-/// cannot disagree. Linux exposes structural dependency holds in both the
-/// `/proc/modules` use count and `/sys/module/<name>/refcnt`; publishing a
-/// normalized 1 in one place and a hard 0 in the other is not a coherent
-/// module view.
-fn deterministic_module_holder_count(modules: &str, module: &str) -> u64 {
-    modules
-        .lines()
-        .find_map(|line| {
-            let mut fields = line.split_whitespace();
-            (fields.next()? == module).then_some(fields)
-        })
-        .and_then(|mut fields| {
-            fields.next()?; // size
-            fields.next()?; // use count (volatile; recomputed below)
-            let holders = fields.next()?;
-            Some(if holders == "-" {
-                0
-            } else {
-                holders.split(',').filter(|h| !h.is_empty()).count() as u64
-            })
-        })
-        .unwrap_or(0)
 }
 
 fn sysfs_rtc_kind(path: &Path) -> Option<ProcfsKind> {
@@ -1040,9 +1002,7 @@ impl ProcfsFile {
             ProcfsKind::ThpCounter => sanitize_thp_counter(&contents),
             ProcfsKind::InterruptCounters => sanitize_interrupt_counters(&contents),
             ProcfsKind::Modules => sanitize_modules(&contents),
-            ProcfsKind::ModuleRefcnt(module) => {
-                sanitize_module_refcnt(&contents, module.as_str(), &read_host_modules())
-            }
+            ProcfsKind::ModuleRefcnt(module) => sanitize_module_refcnt(&contents, module.as_str()),
             ProcfsKind::Mountinfo => sanitize_mountinfo(
                 &contents,
                 mountinfo
@@ -3382,52 +3342,35 @@ fn sanitize_interrupt_counters(contents: &[u8]) -> Vec<u8> {
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
-// TODO-HUMAN-REVIEW(PR-883): Review synthetic module reference counts.
-fn sanitize_modules(contents: &[u8]) -> Vec<u8> {
-    let Ok(text) = std::str::from_utf8(contents) else {
-        return contents.to_vec();
-    };
-
-    let mut normalized = Vec::with_capacity(contents.len());
-    for line in text.split_inclusive('\n') {
-        let has_newline = line.ends_with('\n');
-        let body = line.strip_suffix('\n').unwrap_or(line);
-        let mut fields = body
-            .split_whitespace()
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        if fields.len() >= 4 {
-            let holders = if fields[3] == "-" {
-                0
-            } else {
-                fields[3]
-                    .split(',')
-                    .filter(|holder| !holder.is_empty())
-                    .count()
-            };
-            fields[2] = holders.to_string();
-        }
-        normalized.extend_from_slice(fields.join(" ").as_bytes());
-        if has_newline {
-            normalized.push(b'\n');
-        }
-    }
-    normalized
+// TODO-HUMAN-REVIEW(https://github.com/rrnewton/hermit/issues/3815): Review the
+// empty module table.
+/// The guest sees no loaded modules: an empty `/proc/modules`, which is what
+/// Linux shows when no module is loaded.
+///
+/// Every row of the host table is host state that can change while the guest
+/// runs: loading one module adds a row (about 48 bytes), and unloading removes
+/// one. A verify run diverged exactly this way
+/// (https://github.com/rrnewton/hermit/issues/3815). Normalizing the use count
+/// alone did not help, because the set of rows, their sizes and their holder
+/// lists all come from the host. An empty table is the only content that does
+/// not depend on the host.
+fn sanitize_modules(_contents: &[u8]) -> Vec<u8> {
+    Vec::new()
 }
 
-fn sanitize_module_refcnt(contents: &[u8], module: &str, modules: &str) -> Vec<u8> {
+/// `/sys/module/<name>/refcnt` agrees with the published `/proc/modules`: that
+/// table lists no module, so nothing holds `module` and its count is 0.
+/// Deriving the count from the host holder list would leak the same host
+/// state `sanitize_modules` hides (a module loaded between runs changes the
+/// holders of the modules it depends on).
+fn sanitize_module_refcnt(contents: &[u8], _module: &str) -> Vec<u8> {
     let has_newline = contents.ends_with(b"\n");
     let value = contents.strip_suffix(b"\n").unwrap_or(contents);
     if value.is_empty() || !value.iter().all(u8::is_ascii_digit) {
         return contents.to_vec();
     }
 
-    // Publish the same deterministic count the guest sees in /proc/modules.
-    // Volatile transient references (open fds, in-flight calls) are dropped;
-    // structural dependency holds are kept, because they are reproducible and
-    // are part of what Linux reports here.
-    let count = deterministic_module_holder_count(modules, module);
-    let mut normalized = count.to_string().into_bytes();
+    let mut normalized = b"0".to_vec();
     if has_newline {
         normalized.push(b'\n');
     }
@@ -5837,28 +5780,41 @@ RAW: inuse 5\n"
         );
 
         let modules = b"kvm_amd 212992 95 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n";
-        assert_eq!(
-            sanitize_modules(modules),
-            b"kvm_amd 212992 0 - Live 0x0\nkvm 1200128 1 kvm_amd, Live 0x0\nllc 20480 2 bridge,stp, Live 0x0\n"
-        );
-        // A module with no holders normalizes to 0, as before.
-        let source = std::str::from_utf8(modules).unwrap();
-        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm_amd", source), b"0\n");
-        assert_eq!(sanitize_module_refcnt(b"12", "kvm_amd", source), b"0");
-        // CROSS-SURFACE COHERENCE (the #1558 defect): kvm is held by kvm_amd,
-        // so /proc/modules publishes 1 and sysfs must publish 1 too -- not 0.
-        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm", source), b"1\n");
-        assert_eq!(sanitize_module_refcnt(b"9", "llc", source), b"2");
+        assert!(sanitize_modules(modules).is_empty());
+        assert!(sanitize_modules(b"").is_empty());
+        // No module is published, so nothing holds any module: every refcnt is 0.
+        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm_amd"), b"0\n");
+        assert_eq!(sanitize_module_refcnt(b"12", "kvm_amd"), b"0");
+        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm"), b"0\n");
+        assert_eq!(sanitize_module_refcnt(b"9", "llc"), b"0");
         // Malformed contents still pass through untouched (fail open, unchanged).
         assert_eq!(
-            sanitize_module_refcnt(b"not-a-count\n", "kvm", source),
+            sanitize_module_refcnt(b"not-a-count\n", "kvm"),
             b"not-a-count\n"
         );
-        assert!(sanitize_module_refcnt(b"", "kvm", source).is_empty());
-        // An unknown module or unreadable source degrades to 0, the old answer,
-        // rather than leaking the native counter.
-        assert_eq!(sanitize_module_refcnt(b"7\n", "absent", source), b"0\n");
-        assert_eq!(sanitize_module_refcnt(b"7\n", "kvm", ""), b"0\n");
+        assert!(sanitize_module_refcnt(b"", "kvm").is_empty());
+    }
+
+    /// https://github.com/rrnewton/hermit/issues/3815: a verify run read
+    /// `/proc/modules` as 1995 bytes in run 1 and 2043 bytes in run 2, because
+    /// the host loaded one module (one 48-byte row) between the runs. The
+    /// published table must not depend on which modules the host has loaded,
+    /// nor on their sizes, holders, state or addresses.
+    #[test]
+    fn proc_modules_does_not_depend_on_the_host_module_set() {
+        let before = b"nf_nat 61440 1 nft_chain_nat, Live 0x0000000000000000\n\
+                       kvm 1200128 0 - Live 0x0000000000000000\n";
+        let after = b"nft_chain_nat 12288 0 - Live 0x0000000000000000\n\
+                      nf_nat 61440 2 nft_chain_nat,xt_MASQUERADE, Live 0x0000000000000000\n\
+                      kvm 1200128 0 - Loading 0xffffffffc0a00000\n";
+        assert_eq!(sanitize_modules(before), sanitize_modules(after));
+        for module in ["nf_nat", "kvm", "nft_chain_nat"] {
+            assert_eq!(
+                sanitize_module_refcnt(b"1\n", module),
+                sanitize_module_refcnt(b"3\n", module),
+                "{module}: refcnt must not follow the host holder list"
+            );
+        }
     }
 
     #[test]
@@ -6737,38 +6693,19 @@ total_commit_ms 0\n"
         assert_eq!(refused_count, 8, "all eight refused shapes were checked");
     }
 
-    /// CROSS-SURFACE: the two module surfaces must agree. `/proc/modules` field
-    /// 3 and `/sys/module/<name>/refcnt` are both derived from the holder list,
-    /// so for every module in the table the sysfs value equals the use count
-    /// `sanitize_modules` publishes. #1558 emitted a hard 0 in sysfs while
-    /// /proc/modules kept the holder cardinality; that pair is what this pins.
+    /// CROSS-SURFACE: the two module surfaces must agree. #1558 emitted a hard
+    /// 0 in `/sys/module/<name>/refcnt` while `/proc/modules` published a
+    /// nonzero use count. `/proc/modules` now publishes no module, so no module
+    /// is held and every sysfs refcnt must be 0, never a host-derived count.
     #[test]
     fn sysfs_refcnt_agrees_with_proc_modules_use_count() {
         let modules = "kvm_amd 212992 95 - Live 0x0\n\
                        kvm 1200128 1 kvm_amd, Live 0x0\n\
                        llc 20480 2 bridge,stp, Live 0x0\n";
-        let normalized = sanitize_modules(modules.as_bytes());
-        let normalized = std::str::from_utf8(&normalized).unwrap();
-
-        let mut compared = 0;
-        for line in normalized.lines() {
-            let mut fields = line.split_whitespace();
-            let module = fields.next().unwrap();
-            fields.next().unwrap();
-            let proc_use_count: u64 = fields.next().unwrap().parse().unwrap();
-
-            let sysfs = sanitize_module_refcnt(b"999\n", module, modules);
-            let sysfs: u64 = std::str::from_utf8(&sysfs).unwrap().trim().parse().unwrap();
-
-            assert_eq!(
-                sysfs, proc_use_count,
-                "{module}: /proc/modules says {proc_use_count} but sysfs says {sysfs}"
-            );
-            compared += 1;
+        assert!(sanitize_modules(modules.as_bytes()).is_empty());
+        for module in ["kvm_amd", "kvm", "llc"] {
+            assert_eq!(sanitize_module_refcnt(b"999\n", module), b"0\n");
         }
-        assert_eq!(compared, 3, "all three modules were cross-checked");
-        // And the specific pair codex named: kvm is held by kvm_amd.
-        assert_eq!(sanitize_module_refcnt(b"1\n", "kvm", modules), b"1\n");
     }
 
     /// ROUND-2 REGRESSION GUARD for the scoped fd-resolution fallback.

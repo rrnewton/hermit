@@ -1694,24 +1694,20 @@ fn proc_random_uuid_is_deterministic() {
     });
 }
 
+/// The guest sees an empty module table, whatever the host has loaded
+/// (https://github.com/rrnewton/hermit/issues/3815). `assert_deterministic`
+/// refuses empty output, so this reads the file itself.
 #[test]
 fn proc_modules_are_deterministic() {
-    assert_deterministic("/proc/modules", |contents| {
-        let text = std::str::from_utf8(contents).expect("modules should be UTF-8");
-        for line in text.lines() {
-            let fields = line.split_whitespace().collect::<Vec<_>>();
-            assert!(fields.len() >= 4, "malformed module row: {line}");
-            let expected = if fields[3] == "-" {
-                0
-            } else {
-                fields[3]
-                    .split(',')
-                    .filter(|holder| !holder.is_empty())
-                    .count()
-            };
-            assert_eq!(fields[2].parse::<usize>().unwrap(), expected);
-        }
-    });
+    let _guard = hermit_run_lock();
+    for run in 1..=RUNS {
+        let contents = read_procfs_at_epoch("/proc/modules", None);
+        assert!(
+            contents.is_empty(),
+            "run {run}: /proc/modules published host modules:\n{}",
+            String::from_utf8_lossy(&contents)
+        );
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
