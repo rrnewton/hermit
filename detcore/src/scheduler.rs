@@ -1528,7 +1528,7 @@ pub struct SkipTurn;
 /// posted their continuations when it fired. Their admission point can no
 /// longer be fixed by the scheduler, so the run is refused instead of being
 /// continued with an order that host delivery time decides
-/// (https://github.com/rrnewton/hermit/pull/3361).
+/// (<https://github.com/rrnewton/hermit/pull/3361>).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignaledBackgroundRefusal {
     /// The armed threads that posted no continuation, in `DetTid` order.
