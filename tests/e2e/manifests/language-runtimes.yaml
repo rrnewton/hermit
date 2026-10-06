@@ -987,7 +987,7 @@ test:
         ci: false
         backends_enabled: []
         backends_disabled:
-          ptrace: The hash-seed probe is single-threaded
+          ptrace: The probe's output (string hash and set order) does not depend on scheduling, so a chaos sweep has no race to expose. It is not single-threaded - /usr/local/bin/python3 is a launcher that clones a child, which execs python3.12, and the logs show eight guest tasks
           dbt: Chaos scheduling is unsupported by DBT
           kvm: Chaos scheduling is unsupported by KVM
           sabre: Chaos scheduling is unsupported by SaBRe
