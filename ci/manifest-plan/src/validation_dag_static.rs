@@ -792,7 +792,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 980: 981.
     // detcore-model's config::tests::process_exits_complete_asynchronously_never_enters_the_legacy_form
     // (the C3.5 pin bump) retains all 981: 982.
-    ("test.regular_crates", 982),
+    // manifest-plan's
+    // stress_series::tests::ineligible_execution_path_evidence_is_the_passed_sabre_attempt_and_nothing_else
+    // retains all 982: 983.
+    ("test.regular_crates", 983),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1771,7 +1774,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The path-included validate_plan test listed there retains all 979: 980.
     // The chaos determinism-failure test listed there retains all 980: 981.
     // The same detcore-model legacy-form test retains all 981: 982.
-    ("test.regular_crates_on_host", 982),
+    // The ineligible-execution-path series test listed there retains all 982: 983.
+    ("test.regular_crates_on_host", 983),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
