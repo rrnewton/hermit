@@ -15,7 +15,7 @@
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
  *             extchld|extchldreaped|extchldlive|chldflood] [held]
  *        external_signal_interrupt sigsuspend creator
- *        external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1>
+ *        external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty>
  *        external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
@@ -210,6 +210,7 @@
  * no name, prints as UNNAMED(<number>). */
 #define _GNU_SOURCE
 #include <errno.h>
+#include <fcntl.h>
 #include <linux/futex.h>
 #include <poll.h>
 #include <pthread.h>
@@ -221,12 +222,14 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/ioctl.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/wait.h>
+#include <termios.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -774,6 +777,85 @@ static int exit_signal_main(const char *call) {
   return 0;
 }
 
+/* The `poll hupopen` and `poll hupctty` modes. Each of PDEATH_TRIALS trials
+ * opens a pseudoterminal master in the main process and forks a parent P. P
+ * calls setsid(), which makes it the leader of a new session and process group
+ * with no controlling terminal, and makes the pseudoterminal's slave that
+ * session's controlling terminal: `hupopen` opens the slave without O_NOCTTY,
+ * and `hupctty` opens it with O_NOCTTY and then issues TIOCSCTTY. Either way
+ * P's process group becomes the terminal's foreground group. P forks a child C,
+ * which stays in that group, and then sleeps, outside Hermit's run queue. C
+ * catches SIGHUP, checks that its group is the terminal's foreground group,
+ * tells the main process it is ready, and polls no descriptors for
+ * PDEATH_POLL_MS. The main process waits PDEATH_KILL_DELAY_MS, kills P with
+ * SIGKILL and reaps it. When a session leader whose controlling terminal is a
+ * pseudoterminal exits, Linux sends SIGHUP to the terminal's foreground group.
+ * On Linux the poll returns EINTR at the instant P dies; under Hermit that
+ * instant is the host's. So the poll must keep its deadline: it returns 0 after
+ * its full timeout and the handler runs once afterwards. C reports as in the
+ * parent-death modes. The main process closes the master after C has
+ * reported. Prints one TRIAL line per trial, then
+ * `RESULT call=poll role=<mode> trials=<n> matched=<m>`. */
+static void hangup_child(int slave, int ready_fd, int out_fd) {
+  set_handler(SIGHUP, on_pdeath);
+  /* P's exit signals the terminal's foreground group, which must be C's. */
+  if (tcgetpgrp(slave) != getpgrp()) _exit(70);
+  close(slave);
+  if (write(ready_fd, "R", 1) != 1) _exit(82);
+  close(ready_fd);
+  report_poll_to_deadline(out_fd);
+}
+
+static int hangup_main(const char *call, int by_ioctl, const char *role) {
+  if (strcmp(call, "poll")) return 2;
+  int matched = 0;
+  for (int i = 0; i < PDEATH_TRIALS; i++) {
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0 || grantpt(master) != 0 || unlockpt(master) != 0) return 71;
+    char slave_path[64];
+    if (ptsname_r(master, slave_path, sizeof slave_path) != 0) return 72;
+    int ready[2], out[2];
+    if (pipe(ready) != 0 || pipe(out) != 0) return 84;
+    pid_t parent = fork();
+    if (parent < 0) return 85;
+    if (parent == 0) {
+      close(master);
+      close(ready[0]);
+      close(out[0]);
+      if (setsid() < 0) _exit(73);
+      int slave = open(slave_path, by_ioctl ? O_RDWR | O_NOCTTY : O_RDWR);
+      if (slave < 0) _exit(74);
+      if (by_ioctl && ioctl(slave, TIOCSCTTY, 0) != 0) _exit(75);
+      /* The slave is P's controlling terminal now. */
+      if (tcgetsid(slave) != getpid()) _exit(76);
+      pid_t child = fork();
+      if (child < 0) _exit(86);
+      if (child == 0) hangup_child(slave, ready[1], out[1]);
+      close(slave);
+      close(ready[1]);
+      close(out[1]);
+      for (;;) sleep_ms(1000);
+    }
+    close(ready[1]);
+    close(out[1]);
+    char byte;
+    if (read(ready[0], &byte, 1) != 1) return 87;
+    close(ready[0]);
+    /* C is in its poll by now. */
+    sleep_ms(PDEATH_KILL_DELAY_MS);
+    if (kill(parent, SIGKILL) != 0) return 88;
+    reap(parent);
+    int trial = collect_trial(i, out[0]);
+    close(master);
+    if (trial < 0) return 89;
+    matched += trial;
+  }
+  printf("RESULT call=poll role=%s trials=%d matched=%d\n", role, PDEATH_TRIALS, matched);
+  printf("DONE\n");
+  fflush(stdout);
+  return 0;
+}
+
 /* The `racing` sender (see the usage comment). */
 #define RACING_TRIALS 6
 #define RACING_TIMEOUT_MS 5000
@@ -918,7 +1000,7 @@ int main(int argc, char **argv) {
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
         "spinthrexit|usr2|extchld|extchldreaped|extchldlive|chldflood]\n"
         "       external_signal_interrupt sigsuspend creator\n"
-        "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1>\n"
+        "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty>\n"
         "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing\n");
     return 2;
   }
@@ -930,6 +1012,8 @@ int main(int argc, char **argv) {
   if (!strcmp(sender, "pdeathchld")) return pdeath_main(call, SIGCHLD, "pdeathchld");
   if (!strcmp(sender, "pdeathusr1")) return pdeath_main(call, SIGUSR1, "pdeathusr1");
   if (!strcmp(sender, "exitusr1")) return exit_signal_main(call);
+  if (!strcmp(sender, "hupopen")) return hangup_main(call, 0, "hupopen");
+  if (!strcmp(sender, "hupctty")) return hangup_main(call, 1, "hupctty");
   if (!strcmp(sender, "racing")) return racing_main(call);
   int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
   int chldflood = 0;

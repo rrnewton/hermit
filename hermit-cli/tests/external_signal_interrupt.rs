@@ -181,8 +181,8 @@ const HANDLED_BEFORE_EXIT_MS: u64 = SIGNAL_DELAY_MS + SIGNAL_DELAY_MS / 2;
 /// Trials in the guest's `sigsuspend creator` mode (`CREATOR_TRIALS` in the
 /// guest).
 const CREATOR_TRIALS: usize = 6;
-/// Trials in the guest's `poll pdeathchld`, `poll pdeathusr1` and `poll exitusr1` modes
-/// (`PDEATH_TRIALS` in the guest).
+/// Trials in the guest's `poll pdeathchld`, `poll pdeathusr1`, `poll exitusr1`,
+/// `poll hupopen` and `poll hupctty` modes (`PDEATH_TRIALS` in the guest).
 const PDEATH_TRIALS: usize = 3;
 /// Unverified strict runs of a parent-death cell; each must match.
 const PDEATH_RUNS: usize = 3;
@@ -1758,6 +1758,39 @@ fn ptrace_child_exit_usr1_keeps_a_poll_to_its_deadline() {
         run.describe()
     );
     assert_verified(backend, FutexMode::Precise, &args, &run);
+}
+
+/// A terminal hangup (the guest's `poll hupopen` and `poll hupctty` modes). A
+/// session leader makes a pseudoterminal's slave its controlling terminal and
+/// sleeps outside Hermit's run queue; its child, in the terminal's foreground
+/// group, catches SIGHUP and polls no descriptors for 300 ms while another
+/// guest process kills the leader. When a session leader whose controlling
+/// terminal is a pseudoterminal exits, Linux sends SIGHUP to the terminal's
+/// foreground group, so natively the poll returns EINTR when the leader dies,
+/// 50 ms in. Under Hermit the leader exits physically at an instant set by the
+/// host, so the call that gives the session its controlling terminal records
+/// SIGHUP and SIGCONT as host-timed for every process of the container, in the
+/// caller's turn, and no gated wait ends for them afterwards: in each trial the
+/// poll returns 0 after its full timeout and the handler runs once afterwards.
+/// `hupopen` gains the terminal by opening the slave without O_NOCTTY,
+/// `hupctty` by TIOCSCTTY. Round-9 High 2 of
+/// https://github.com/rrnewton/hermit/pull/3361: neither call recorded those
+/// signals, and in every trial the poll returned EINTR at a turn the host
+/// chose, 51 to 54 ms in by the guest's clock
+/// (https://github.com/rrnewton/hermit/issues/3146).
+///
+/// Unverified for the reason given for the parent-death cells: killing a
+/// parked process from another guest is itself host-timed in Hermit, so the
+/// killer's side of two runs' INFO logs differs whatever the child does.
+#[test]
+fn ptrace_terminal_hangup_after_open_keeps_a_poll_to_its_deadline() {
+    assert_parent_death_signal_keeps_a_poll_to_its_deadline("ptrace", "hupopen");
+}
+
+/// The same cell, with the controlling terminal gained by TIOCSCTTY.
+#[test]
+fn ptrace_terminal_hangup_after_tiocsctty_keeps_a_poll_to_its_deadline() {
+    assert_parent_death_signal_keeps_a_poll_to_its_deadline("ptrace", "hupctty");
 }
 
 /// `wait4` and `waitid` restart under SA_RESTART, as Linux restarts them: the
