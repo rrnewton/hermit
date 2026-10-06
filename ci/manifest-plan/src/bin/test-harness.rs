@@ -9866,6 +9866,11 @@ sys.exit(1 if failed else 0)
     /// The subject is the plan's last row because the generator keeps the
     /// committed order and appends new rows, so a re-flipped row returns to the
     /// end of the plan: the order a hand flip by the generator gives too.
+    ///
+    /// When that row is a parity candidate (a non-ptrace verify cell that
+    /// tests/e2e/parity-selection.yaml lists), un-flipping it also takes it out
+    /// of the parity selection, whose rule admits only enabled candidate cells;
+    /// otherwise only the plan changes. Either way the re-flip restores both.
     #[test]
     fn sync_cells_round_trips_an_unflip_and_reflip_byte_for_byte() {
         let root = sync_cells_fixture("tail");
@@ -9882,9 +9887,37 @@ sys.exit(1 if failed else 0)
         let (test, mode, backend) = (field("test"), field("mode"), field("backend"));
         let manifest = root.join(format!("tests/e2e/manifests/{}.yaml", field("category")));
         let original = fs::read_to_string(&manifest).unwrap();
+        let selected_backends = |bytes: &[u8]| -> Vec<String> {
+            let selection: YamlValue = serde_yaml::from_slice(bytes).unwrap();
+            selection["cells"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["test"].as_str() == Some(test.as_str()))
+                .flat_map(|entry| entry["backends"].as_sequence().unwrap().clone())
+                .map(|name| name.as_str().unwrap().to_owned())
+                .collect()
+        };
+        let candidate =
+            mode == "verify" && selected_backends(&committed_selection).contains(&backend);
+        let changed: &[&str] = if candidate {
+            &[super::EXPECTED_PLAN_PATH, parity::PARITY_SELECTION_PATH]
+        } else {
+            &[super::EXPECTED_PLAN_PATH]
+        };
 
         fs::write(&manifest, unflip(&original, &test, &mode, &backend)).unwrap();
-        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        assert_eq!(sync(&root), changed);
+        if candidate {
+            let unflipped = fs::read(root.join(parity::PARITY_SELECTION_PATH)).unwrap();
+            let mut expected = selected_backends(&committed_selection);
+            expected.retain(|name| *name != backend);
+            assert_eq!(
+                selected_backends(&unflipped),
+                expected,
+                "the un-flipped {backend} cell of {test} must leave only the parity selection"
+            );
+        }
         let unflipped: serde_json::Value =
             serde_json::from_slice(&fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap())
                 .unwrap();
@@ -9896,7 +9929,7 @@ sys.exit(1 if failed else 0)
         );
 
         fs::write(&manifest, &original).unwrap();
-        assert_eq!(sync(&root), [super::EXPECTED_PLAN_PATH]);
+        assert_eq!(sync(&root), changed);
         assert_eq!(
             fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap(),
             committed_plan

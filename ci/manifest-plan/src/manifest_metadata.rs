@@ -1143,13 +1143,11 @@ test:
 
         let encoded = serde_json::to_string(&first).unwrap();
         // A relative authored citation can contain "/src", the pinned checkout
-        // root. Preserve it while refusing genuine absolute checkout paths.
+        // root. Preserve it while refusing genuine absolute checkout paths. No
+        // shipped cell has to cite one (the last did until its cell was
+        // switched on), so the oracle below also runs over the exports with one
+        // authored into a cell's not-selected evidence, identically in each.
         let citation = "hermit-cli/src/bin/hermit/run.rs:2163";
-        assert!(first.cells.iter().any(|cell| {
-            cell.not_selected_by_full_reason
-                .as_ref()
-                .is_some_and(|reason| reason.evidence.as_deref() == Some(citation))
-        }));
         let first_alias = TemporaryManifestRoot::alias_of(&root, "first-root");
         let second_alias = TemporaryManifestRoot::alias_of(&root, "second-root");
         let roots = [root.as_path(), first_alias.path(), second_alias.path()];
@@ -1159,6 +1157,25 @@ test:
             exports.push(serde_json::to_string(&exported).unwrap());
         }
         require_root_independent_exports(&exports, &roots).unwrap();
+        let cited = exports
+            .iter()
+            .map(|export| {
+                let mut value: Value = serde_json::from_str(export).unwrap();
+                let evidence = value["cells"]
+                    .as_array_mut()
+                    .unwrap()
+                    .iter_mut()
+                    .find_map(|cell| {
+                        cell.pointer_mut("/not_selected_by_full_reason/evidence")
+                            .filter(|evidence| evidence.is_string())
+                    })
+                    .expect("a shipped cell carries not-selected evidence to cite in");
+                *evidence = Value::String(citation.into());
+                serde_json::to_string(&value).unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert!(cited.iter().all(|export| export.contains(citation)));
+        require_root_independent_exports(&cited, &roots).unwrap();
 
         // Run the same oracle against a leak shared by every variant: alias
         // equality alone would miss a canonicalized or compile-time real root.
@@ -1171,6 +1188,7 @@ test:
                 leaked_root,
             ];
             require_root_independent_exports(&exports, &checked_roots).unwrap();
+            require_root_independent_exports(&cited, &checked_roots).unwrap();
 
             // Exercise each exported flag/argument surface through the same
             // oracle, including uniform leaks that root equality cannot catch.
