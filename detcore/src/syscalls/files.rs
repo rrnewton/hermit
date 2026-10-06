@@ -242,6 +242,49 @@ fn copy_timer_slack_output<M: MemoryAccess>(
     }
 }
 
+/// Copy sanitized procfs bytes to the caller's buffer as the kernel's
+/// `copy_to_user` does: through the guest's page protections, stopping at the
+/// first byte that cannot be written. Returns the bytes copied, or `EFAULT`
+/// when none could be. A debugger write is not equivalent: the ptrace
+/// backend writes exactly eight bytes with `PTRACE_POKEDATA`, which ignores
+/// `PROT_READ` and `PROT_NONE`.
+fn copy_procfs_output<M: MemoryAccess>(
+    memory: &mut M,
+    destination: Option<AddrMut<'_, u8>>,
+    bytes: &[u8],
+) -> Result<usize, Error> {
+    if bytes.is_empty() {
+        return Ok(0);
+    }
+    let destination = destination.ok_or(Errno::EFAULT)?;
+    let mut copied = 0;
+    while copied < bytes.len() {
+        let Some(address) = destination
+            .as_raw()
+            .checked_add(copied)
+            .and_then(AddrMut::<u8>::from_raw)
+        else {
+            break;
+        };
+        match memory.write_with_user_access(address, &bytes[copied..]) {
+            Ok(0) | Err(Errno::EFAULT) => break,
+            Ok(n) => copied += n,
+            // Any other failure is the backend's, not a guest fault: report it
+            // as a tool error and commit nothing.
+            Err(errno) => {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "procfs read publication failed after {copied} bytes: {errno}"
+                )));
+            }
+        }
+    }
+    if copied == 0 {
+        Err(Errno::EFAULT.into())
+    } else {
+        Ok(copied)
+    }
+}
+
 /// Capacity used for pipes that Detcore makes physically nonblocking.
 ///
 /// Linux normally creates 64-KiB pipes on this platform, but silently falls back to two pages
@@ -1724,9 +1767,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Read,
     ) -> Result<Vec<u8>, Error> {
-        const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
-        const CAPTURE_CHUNK_BYTES: usize = 64 * 1024;
-
         // A backend-owned read may have advanced the kernel cursor without
         // passing through Detcore's logical procfs cursor (KVM does this for
         // worker-shared descriptors). Rewind before taking the initial snapshot
@@ -1759,7 +1799,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(err) => return Err(err.into()),
         }
 
-        // Capture into a private mapping, never into the caller's buffer. The
+        // Capture into scratch memory, never into the caller's buffer. The
         // caller receives only the sanitized bytes, so every host byte a
         // capture read left in its buffer past that length would stay visible
         // after the read returns: all of a host `/proc/modules` chunk behind
@@ -1767,9 +1807,27 @@ impl<T: RecordOrReplay> Detcore<T> {
         // (https://github.com/rrnewton/hermit/issues/3815). Saving and
         // restoring the caller's buffer cannot cover every destination the
         // kernel may write, such as a PROT_WRITE-only page that the save
-        // cannot read. The mapping is unmapped before returning, so no host
-        // byte stays in guest memory, and the caller's buffer sees only the
-        // sanitized publication with its native access checks.
+        // cannot read. The caller's buffer sees only the sanitized
+        // publication, which checks its protection as the kernel's copy does.
+        let lists_address_space = guest
+            .thread_state()
+            .with_detfd(call.fd(), |detfd| detfd.procfs_lists_address_space())?;
+        if lists_address_space {
+            self.capture_procfs_on_stack(guest, call).await
+        } else {
+            self.capture_procfs_in_mapping(guest, call).await
+        }
+    }
+
+    /// Capture through a private anonymous mapping that is unmapped before
+    /// returning, so no host byte stays in guest memory.
+    async fn capture_procfs_in_mapping<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+    ) -> Result<Vec<u8>, Error> {
+        const CAPTURE_CHUNK_BYTES: usize = 64 * 1024;
+
         let mapped = guest
             .inject_with_retry(Syscall::Mmap(
                 syscalls::Mmap::new()
@@ -1785,26 +1843,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             .ok()
             .and_then(AddrMut::<u8>::from_raw)
             .ok_or(Errno::EFAULT)?;
-        let capture = call.with_buf(Some(mapping)).with_len(CAPTURE_CHUNK_BYTES);
-        let mut contents = Vec::new();
-        let result = loop {
-            let bytes_read = match self.record_or_replay(guest, capture).await {
-                Ok(bytes_read) => bytes_read as usize,
-                Err(err) => break Err(err.into()),
-            };
-            if bytes_read == 0 {
-                break Ok(contents);
-            }
-            if contents.len() + bytes_read > MAX_SNAPSHOT_BYTES {
-                break Err(Errno::EFBIG.into());
-            }
-
-            let mut chunk = vec![0; bytes_read];
-            if let Err(err) = guest.memory().read_exact(mapping, &mut chunk) {
-                break Err(err.into());
-            }
-            contents.extend_from_slice(&chunk);
-        };
+        let result = self
+            .drain_procfs(guest, call, mapping, CAPTURE_CHUNK_BYTES)
+            .await;
         guest
             .inject_with_retry(Syscall::Munmap(
                 syscalls::Munmap::new()
@@ -1813,6 +1854,58 @@ impl<T: RecordOrReplay> Detcore<T> {
             ))
             .await?;
         result
+    }
+
+    /// Capture a file that lists the address space (`maps`, `smaps`,
+    /// `numa_maps`, `smaps_rollup`) through the guest stack scratch. A
+    /// capture mapping would be listed in the snapshot, or merged into a
+    /// neighbouring row, and then be unmapped before the guest sees it. The
+    /// stack scratch changes no mapping; its original bytes are put back, so
+    /// no host byte stays below the stack pointer either.
+    async fn capture_procfs_on_stack<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+    ) -> Result<Vec<u8>, Error> {
+        const CAPTURE_CHUNK_BYTES: usize = 512;
+
+        let mut stack = guest.stack().await;
+        let scratch = stack.reserve::<[u8; CAPTURE_CHUNK_BYTES]>().cast::<u8>();
+        let mut original = [0_u8; CAPTURE_CHUNK_BYTES];
+        guest.memory().read_exact(scratch, &mut original)?;
+        let guard = stack.commit()?;
+        let result = self
+            .drain_procfs(guest, call, scratch, CAPTURE_CHUNK_BYTES)
+            .await;
+        guest.memory().write_exact(scratch, &original)?;
+        drop(guard);
+        result
+    }
+
+    /// Read the host file to EOF through `scratch`, `chunk` bytes at a time.
+    async fn drain_procfs<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Read,
+        scratch: AddrMut<'_, u8>,
+        chunk: usize,
+    ) -> Result<Vec<u8>, Error> {
+        const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+
+        let capture = call.with_buf(Some(scratch)).with_len(chunk);
+        let mut contents = Vec::new();
+        loop {
+            let bytes_read = self.record_or_replay(guest, capture).await? as usize;
+            if bytes_read == 0 {
+                return Ok(contents);
+            }
+            if contents.len() + bytes_read > MAX_SNAPSHOT_BYTES {
+                return Err(Errno::EFBIG.into());
+            }
+            let start = contents.len();
+            contents.resize(start + bytes_read, 0);
+            guest.memory().read_exact(scratch, &mut contents[start..])?;
+        }
     }
 
     async fn initialize_procfs_snapshot<G: Guest<Self>>(
@@ -2187,13 +2280,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             self.initialize_procfs_snapshot(guest, call).await?;
         }
 
-        let procfs_bytes = guest
+        // Like a seq_file read, advance the shared cursor only by the bytes
+        // actually copied: a read that faults before copying anything leaves
+        // it where it was.
+        let procfs_preview = guest
             .thread_state()
-            .with_detfd(call.fd(), |detfd| detfd.take_procfs(call.len()))?;
-        if let Some(bytes) = procfs_bytes {
-            let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-            guest.memory().write_exact(remote_buf, &bytes)?;
-            return Ok(bytes.len() as i64);
+            .with_detfd(call.fd(), |detfd| detfd.preview_procfs(call.len()))?;
+        if let Some((offset, bytes)) = procfs_preview {
+            let copied = copy_procfs_output(&mut guest.memory(), call.buf(), &bytes)?;
+            guest.thread_state().with_detfd(call.fd(), |detfd| {
+                detfd.commit_procfs_read(offset, copied);
+            })?;
+            return Ok(copied as i64);
         }
 
         let (fd_type, physically_nonblocking, logically_nonblocking, resource, random_device) =
@@ -2303,9 +2401,8 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.take_procfs_at(offset, call.len()))?;
         if let Some(bytes) = procfs_bytes {
-            let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-            guest.memory().write_exact(remote_buf, &bytes)?;
-            return Ok(bytes.len() as i64);
+            let copied = copy_procfs_output(&mut guest.memory(), call.buf(), &bytes)?;
+            return Ok(copied as i64);
         }
 
         let (fd_type, resource) = guest

@@ -495,6 +495,15 @@ impl DetFd {
             .is_some_and(ProcfsFile::needs_mapping_identities)
     }
 
+    /// Whether this procfs file lists the guest's own address space, so
+    /// its capture must not create a mapping that the listing would show.
+    pub(crate) fn procfs_lists_address_space(&self) -> bool {
+        self.description()
+            .procfs
+            .as_ref()
+            .is_some_and(ProcfsFile::lists_address_space)
+    }
+
     pub(crate) fn procfs_needs_mountinfo_identities(&self) -> bool {
         self.description()
             .procfs
@@ -527,12 +536,22 @@ impl DetFd {
             .initialize(contents, context);
     }
 
-    /// Read from the deterministic procfs snapshot at its shared offset.
-    pub(crate) fn take_procfs(&self, maximum: usize) -> Option<Vec<u8>> {
+    /// Preview the snapshot bytes at its shared offset, with that offset,
+    /// without consuming them.
+    pub(crate) fn preview_procfs(&self, maximum: usize) -> Option<(usize, Vec<u8>)> {
+        let description = self.description();
+        let procfs = description.procfs.as_ref()?;
+        let (offset, _) = procfs.position();
+        procfs.take_at(offset, maximum).map(|bytes| (offset, bytes))
+    }
+
+    /// Advance the shared offset by the bytes a read copied to the guest.
+    pub(crate) fn commit_procfs_read(&self, offset: usize, copied: usize) {
         self.description()
             .procfs
             .as_mut()
-            .and_then(|procfs| procfs.take(maximum))
+            .expect("procfs fd disappeared while committing a read")
+            .commit_read(offset, copied);
     }
 
     /// Read a deterministic procfs snapshot without changing its shared cursor.
@@ -1096,15 +1115,22 @@ mod tests {
         );
         let duplicate = original.clone().with_fd(4);
 
-        assert_eq!(original.take_procfs(2).unwrap(), b"0\t");
+        assert_eq!(original.preview_procfs(2).unwrap(), (0, b"0\t".to_vec()));
+        assert_eq!(duplicate.procfs_position().unwrap().0, 0);
+        original.commit_procfs_read(0, 2);
         assert_eq!(duplicate.procfs_position().unwrap().0, 2);
         assert_eq!(duplicate.take_procfs_at(4, 1).unwrap(), b"9");
         assert_eq!(original.procfs_position().unwrap().0, 2);
 
+        // A read that copied nothing leaves the shared cursor in place.
+        let (offset, _) = duplicate.preview_procfs(4).unwrap();
+        duplicate.commit_procfs_read(offset, 0);
+        assert_eq!(original.procfs_position().unwrap().0, 2);
+
         duplicate.set_procfs_offset(0);
         assert_eq!(
-            original.take_procfs(128).unwrap(),
-            b"0\t0\t9223372036854775807\n"
+            original.preview_procfs(128).unwrap(),
+            (0, b"0\t0\t9223372036854775807\n".to_vec())
         );
     }
 

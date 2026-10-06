@@ -853,6 +853,15 @@ impl ProcfsFile {
         matches!(self.kind, ProcfsKind::Maps | ProcfsKind::Smaps)
     }
 
+    /// True when this file lists the reading process's own virtual memory
+    /// areas, so a mapping created while capturing it would appear in it.
+    pub(crate) fn lists_address_space(&self) -> bool {
+        matches!(
+            self.kind,
+            ProcfsKind::Maps | ProcfsKind::Smaps | ProcfsKind::NumaMaps | ProcfsKind::SmapsRollup
+        )
+    }
+
     pub(crate) fn needs_mountinfo_identities(&self) -> bool {
         self.kind == ProcfsKind::Mountinfo
     }
@@ -1016,11 +1025,25 @@ impl ProcfsFile {
         });
     }
 
-    /// Returns the next bytes from the normalized snapshot.
+    /// Returns the next bytes from the normalized snapshot, consuming them as
+    /// a read that copies all of them would.
+    #[cfg(test)]
     pub(crate) fn take(&mut self, maximum: usize) -> Option<Vec<u8>> {
-        let bytes = self.take_at(self.offset, maximum)?;
-        self.offset = self.offset.saturating_add(bytes.len());
+        let offset = self.offset;
+        let bytes = self.take_at(offset, maximum)?;
+        self.commit_read(offset, bytes.len());
         Some(bytes)
+    }
+
+    /// Advance the shared cursor by the bytes a sequential read copied to the
+    /// caller. Like a seq_file read, a read that faults before copying
+    /// anything leaves the cursor where it was.
+    pub(crate) fn commit_read(&mut self, offset: usize, copied: usize) {
+        assert_eq!(
+            self.offset, offset,
+            "procfs cursor changed between preview and commit"
+        );
+        self.offset = self.offset.saturating_add(copied);
     }
 
     /// Return the task id bound to a top-level timer-slack procfs file.

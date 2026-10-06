@@ -6,15 +6,25 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-//! A sanitized procfs read changes only the bytes it returns.
+//! A sanitized procfs read behaves like a native one toward the caller.
 //!
-//! Detcore captures the host file by reading it into the caller's own buffer,
-//! then hands the caller the sanitized bytes. `/proc/modules` sanitizes to an
-//! empty file (https://github.com/rrnewton/hermit/issues/3815), so the first
-//! read returns 0, and the host module table the capture wrote into the buffer
-//! must not still be there. Each test uses a fresh descriptor, so its call is
-//! the one that performs the capture. The write-only cases cover a destination
-//! the kernel may write but a tracer's protection-respecting read cannot see.
+//! The first read of a snapshotted procfs file captures the whole host file
+//! and then hands the caller sanitized bytes. Each test uses a fresh
+//! descriptor, so its call is the one that performs the capture.
+//!
+//! - `/proc/modules` sanitizes to an empty file
+//!   (https://github.com/rrnewton/hermit/issues/3815), so the first read
+//!   returns 0, and no host module table may be left in the caller's buffer.
+//!   The write-only cases cover a destination the kernel may write but a
+//!   tracer's protection-respecting read cannot see.
+//! - The copy to the caller checks the destination as the kernel's
+//!   `copy_to_user` does: a read-only, inaccessible or unmapped destination
+//!   gets `EFAULT` and is not written, and a destination that becomes
+//!   inaccessible part way gets the bytes copied before that point.
+//! - Like a seq_file read, a sequential read advances the shared offset only by
+//!   the bytes it copied, so a read that faults leaves the data unread.
+//! - Capturing `/proc/self/maps` does not list a mapping that is gone by the
+//!   time the read returns.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -124,5 +134,251 @@ fn procfs_pread_leaves_no_host_bytes_in_a_write_only_buffer() {
         assert_write_only_destination_untouched("write-only pread", |fd, buf| unsafe {
             libc::pread(fd, buf, WRITE_ONLY_COUNT, 0)
         });
+    });
+}
+
+/// Sanitized `/proc/uptime` is a nonempty line longer than eight bytes, so an
+/// eight-byte read publishes eight bytes.
+const UPTIME_COUNT: usize = 8;
+
+fn errno() -> i32 {
+    std::io::Error::last_os_error().raw_os_error().unwrap()
+}
+
+/// Map `pages` read/write pages filled with the sentinel.
+fn sentinel_pages(pages: usize) -> (*mut u8, usize) {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            pages * page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    unsafe { std::ptr::write_bytes(mapping.cast::<u8>(), SENTINEL, pages * page) };
+    (mapping.cast(), page)
+}
+
+fn protect(address: *mut u8, len: usize, protection: libc::c_int) {
+    assert_eq!(
+        unsafe { libc::mprotect(address.cast(), len, protection) },
+        0
+    );
+}
+
+/// Read and pread of a fresh `/proc/uptime` into a page with `protection`,
+/// checking the result, the shared offset and which page bytes changed.
+fn read_uptime_into_page(protection: libc::c_int, expect_published: bool) {
+    for positioned in [false, true] {
+        let call = if positioned { "pread" } else { "read" };
+        let (page_start, page) = sentinel_pages(1);
+        protect(page_start, page, protection);
+        let file = File::open("/proc/uptime").unwrap();
+        let fd = file.as_raw_fd();
+        let n = unsafe {
+            if positioned {
+                libc::pread(fd, page_start.cast(), UPTIME_COUNT, 0)
+            } else {
+                libc::read(fd, page_start.cast(), UPTIME_COUNT)
+            }
+        };
+        let error = errno();
+        let offset = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+        protect(page_start, page, libc::PROT_READ | libc::PROT_WRITE);
+        let buf = unsafe { std::slice::from_raw_parts(page_start, page) };
+        if expect_published {
+            assert_eq!(
+                n, UPTIME_COUNT as isize,
+                "{call} with protection {protection}"
+            );
+            assert!(
+                buf[UPTIME_COUNT..].iter().all(|&byte| byte == SENTINEL),
+                "{call} of {UPTIME_COUNT} bytes changed the page past them"
+            );
+            assert_eq!(offset, if positioned { 0 } else { UPTIME_COUNT as i64 });
+        } else {
+            assert_eq!(
+                (n, error),
+                (-1, libc::EFAULT),
+                "{call} into a page with protection {protection} must fail EFAULT"
+            );
+            assert!(
+                buf.iter().all(|&byte| byte == SENTINEL),
+                "{call} that failed EFAULT changed a page with protection {protection}"
+            );
+            assert_eq!(offset, 0, "{call} that failed EFAULT moved the offset");
+        }
+        assert_eq!(unsafe { libc::munmap(page_start.cast(), page) }, 0);
+    }
+}
+
+#[test]
+fn procfs_first_read_into_a_read_only_page_fails_efault() {
+    super::det_test_fn_without_pmu(|| read_uptime_into_page(libc::PROT_READ, false));
+}
+
+#[test]
+fn procfs_first_read_into_an_inaccessible_page_fails_efault() {
+    super::det_test_fn_without_pmu(|| read_uptime_into_page(libc::PROT_NONE, false));
+}
+
+#[test]
+fn procfs_first_read_into_writable_pages_publishes() {
+    super::det_test_fn_without_pmu(|| {
+        read_uptime_into_page(libc::PROT_READ | libc::PROT_WRITE, true);
+        read_uptime_into_page(libc::PROT_WRITE, true);
+    });
+}
+
+#[test]
+fn procfs_first_read_into_an_unmapped_page_fails_efault() {
+    super::det_test_fn_without_pmu(|| {
+        let (page_start, page) = sentinel_pages(1);
+        assert_eq!(unsafe { libc::munmap(page_start.cast(), page) }, 0);
+        for positioned in [false, true] {
+            let file = File::open("/proc/uptime").unwrap();
+            let fd = file.as_raw_fd();
+            let n = unsafe {
+                if positioned {
+                    libc::pread(fd, page_start.cast(), UPTIME_COUNT, 0)
+                } else {
+                    libc::read(fd, page_start.cast(), UPTIME_COUNT)
+                }
+            };
+            assert_eq!((n, errno()), (-1, libc::EFAULT), "positioned: {positioned}");
+            assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) }, 0);
+        }
+    });
+}
+
+/// A destination whose second half is inaccessible gets the first half, and a
+/// sequential read advances the offset by exactly that much.
+#[test]
+fn procfs_first_read_across_an_inaccessible_page_copies_a_prefix() {
+    super::det_test_fn_without_pmu(|| {
+        for positioned in [false, true] {
+            let (mapping, page) = sentinel_pages(2);
+            let second_page = unsafe { mapping.add(page) };
+            protect(second_page, page, libc::PROT_NONE);
+            let destination = unsafe { second_page.sub(UPTIME_COUNT / 2) };
+            let file = File::open("/proc/uptime").unwrap();
+            let fd = file.as_raw_fd();
+            let n = unsafe {
+                if positioned {
+                    libc::pread(fd, destination.cast(), UPTIME_COUNT, 0)
+                } else {
+                    libc::read(fd, destination.cast(), UPTIME_COUNT)
+                }
+            };
+            assert_eq!(n, (UPTIME_COUNT / 2) as isize, "positioned: {positioned}");
+            let offset = unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) };
+            assert_eq!(
+                offset,
+                if positioned {
+                    0
+                } else {
+                    (UPTIME_COUNT / 2) as i64
+                }
+            );
+            protect(second_page, page, libc::PROT_READ | libc::PROT_WRITE);
+            let tail = unsafe { std::slice::from_raw_parts(second_page, page) };
+            assert!(tail.iter().all(|&byte| byte == SENTINEL));
+            assert_eq!(unsafe { libc::munmap(mapping.cast(), 2 * page) }, 0);
+        }
+    });
+}
+
+/// A first read that faults consumes nothing, through the descriptor or an
+/// alias that shares its offset.
+#[test]
+fn procfs_failed_first_read_leaves_the_content_unread() {
+    super::det_test_fn_without_pmu(|| {
+        let file = File::open("/proc/uptime").unwrap();
+        let fd = file.as_raw_fd();
+        let alias = unsafe { libc::dup(fd) };
+        assert!(alias >= 0);
+        let n = unsafe { libc::read(fd, std::ptr::null_mut(), UPTIME_COUNT) };
+        assert_eq!((n, errno()), (-1, libc::EFAULT));
+        assert_eq!(unsafe { libc::lseek(fd, 0, libc::SEEK_CUR) }, 0);
+        assert_eq!(unsafe { libc::lseek(alias, 0, libc::SEEK_CUR) }, 0);
+
+        let mut whole = [0_u8; 256];
+        let whole_len = unsafe { libc::pread(fd, whole.as_mut_ptr().cast(), whole.len(), 0) };
+        assert!(whole_len > UPTIME_COUNT as isize);
+        let mut read_back = [0_u8; 256];
+        let read_len = unsafe { libc::read(alias, read_back.as_mut_ptr().cast(), read_back.len()) };
+        assert_eq!(
+            &read_back[..read_len as usize],
+            &whole[..whole_len as usize],
+            "the read after the failed one must see the whole file"
+        );
+        assert_eq!(unsafe { libc::close(alias) }, 0);
+    });
+}
+
+/// Every row of a freshly read `/proc/self/maps` is still mapped when the read
+/// returns. A capture mapping created and removed inside the read would show
+/// either as its own row or merged into a neighbouring row, and in both cases
+/// part of that row's range is gone, so `mincore` fails with `ENOMEM`. A
+/// guarded read/write page must also keep a row of exactly its own extent.
+#[test]
+fn procfs_self_maps_lists_no_capture_mapping() {
+    super::det_test_fn_without_pmu(|| {
+        let file = File::open("/proc/self/maps").unwrap();
+        let fd = file.as_raw_fd();
+        let mut contents: Vec<u8> = Vec::with_capacity(1 << 20);
+        // A read/write page between two PROT_NONE pages cannot merge with
+        // an existing mapping, so its row is exactly one page.
+        let (guarded, page) = sentinel_pages(3);
+        protect(guarded, page, libc::PROT_NONE);
+        let neighbour = unsafe { guarded.add(page) };
+        protect(unsafe { neighbour.add(page) }, page, libc::PROT_NONE);
+
+        loop {
+            let spare = contents.capacity() - contents.len();
+            assert!(spare > 0, "/proc/self/maps outgrew the buffer");
+            let n =
+                unsafe { libc::read(fd, contents.as_mut_ptr().add(contents.len()).cast(), spare) };
+            assert!(n >= 0, "read failed: {}", errno());
+            if n == 0 {
+                break;
+            }
+            unsafe { contents.set_len(contents.len() + n as usize) };
+        }
+
+        let text = String::from_utf8(contents).unwrap();
+        let mut neighbour_row = None;
+        for line in text.lines() {
+            if line.ends_with("[vsyscall]") {
+                continue;
+            }
+            let range = line.split_whitespace().next().unwrap();
+            let (start, end) = range.split_once('-').unwrap();
+            let start = usize::from_str_radix(start, 16).unwrap();
+            let end = usize::from_str_radix(end, 16).unwrap();
+            let mut residency = vec![0_u8; (end - start).div_ceil(page)];
+            let rc = unsafe {
+                libc::mincore(
+                    start as *mut libc::c_void,
+                    end - start,
+                    residency.as_mut_ptr(),
+                )
+            };
+            assert_eq!(rc, 0, "row {line:?} is not mapped: errno {}", errno());
+            if (start..end).contains(&(neighbour as usize)) {
+                neighbour_row = Some((start, end, line.to_owned()));
+            }
+        }
+        let (start, end, line) = neighbour_row.expect("the guarded page has no row");
+        assert_eq!(
+            (start, end),
+            (neighbour as usize, neighbour as usize + page),
+            "the guarded page's row is {line:?}"
+        );
+        assert_eq!(unsafe { libc::munmap(guarded.cast(), 3 * page) }, 0);
     });
 }
