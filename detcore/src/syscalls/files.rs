@@ -37,6 +37,7 @@ use reverie::syscalls::ReadAddr;
 use reverie::syscalls::SockFlag;
 use reverie::syscalls::StatPtr;
 use reverie::syscalls::StatxMask;
+use reverie::syscalls::StatxPtr;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
@@ -762,6 +763,143 @@ fn transient_stat_page_len(path_len: usize) -> usize {
     ((path_len + 1).next_multiple_of(8) + std::mem::size_of::<libc::stat>()).next_multiple_of(page)
 }
 
+fn host_page_size() -> usize {
+    // SAFETY: sysconf has no preconditions.
+    usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+        .expect("page size must be positive")
+}
+
+/// Whether `errno` from a path lookup the guest made is its filesystem's
+/// answer that the path names nothing that lookup reaches, rather than a
+/// failure to ask (see `Detcore::stat_guest_path`).
+fn is_path_answer(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::ENOENT | Errno::ENOTDIR | Errno::ELOOP | Errno::ENAMETOOLONG | Errno::EACCES
+    )
+}
+
+/// The error of an identity lookup that could not be asked: a tool error,
+/// which fails the run on ptrace and is `EIO` to the guest on DBT and SaBRe,
+/// never an errno the guest's call would report as its own result.
+fn identity_lookup_refused(what: &str, path: &[u8], cause: impl std::fmt::Display) -> Error {
+    Error::Tool(anyhow::anyhow!(
+        "could not ask the guest to {what} {:?}: {cause}; refusing rather than \
+         keying the file's identity on another source",
+        String::from_utf8_lossy(path)
+    ))
+}
+
+/// A private anonymous mapping of `len` bytes in the guest, made for one
+/// identity lookup and unmapped by `unmap_identity_page` before the guest
+/// resumes; its address never reaches the guest. A failure is the lookup's
+/// refusal, as for the transient page of `Detcore::stat_guest_path`.
+async fn map_identity_page<'a, G, T>(
+    guest: &mut G,
+    len: usize,
+    what: &str,
+    path: &[u8],
+) -> Result<AddrMut<'a, u8>, Error>
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    let mapped = guest
+        .inject_with_retry(Syscall::Mmap(
+            syscalls::Mmap::new()
+                .with_addr(None)
+                .with_len(len)
+                .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                .with_fd(-1)
+                .with_offset(0),
+        ))
+        .await
+        .map_err(|errno| {
+            warn!(
+                "[detcore] could not map a transient page for a {what} of {:?} ({errno}); \
+                 refusing rather than keying on another identity",
+                String::from_utf8_lossy(path)
+            );
+            match errno {
+                Errno::ESRCH => Error::Errno(errno),
+                errno => identity_lookup_refused(what, path, errno),
+            }
+        })?;
+    Ok(usize::try_from(mapped)
+        .ok()
+        .and_then(AddrMut::<u8>::from_raw)
+        .unwrap_or_else(|| panic!("transient identity page mmap returned {mapped}")))
+}
+
+/// Unmaps a page `map_identity_page` made. A failure is only logged, as for
+/// `Detcore::stat_guest_path`'s transient page: the lookup's answer stands.
+async fn unmap_identity_page<G, T>(guest: &mut G, page: AddrMut<'_, u8>, len: usize, path: &[u8])
+where
+    G: Guest<Detcore<T>>,
+    T: RecordOrReplay,
+{
+    if let Err(errno) = guest
+        .inject_with_retry(Syscall::Munmap(
+            syscalls::Munmap::new()
+                .with_addr(Some(page.cast::<libc::c_void>().into()))
+                .with_len(len),
+        ))
+        .await
+    {
+        warn!(
+            "[detcore] could not unmap the transient identity page for {:?}: {errno}",
+            String::from_utf8_lossy(path)
+        );
+    }
+}
+
+/// The guest's `/proc/<pid>/mountinfo`, read on the tool's side as the
+/// fdinfo mount-id check reads it.
+fn guest_mountinfo<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &G) -> Result<Vec<u8>, Error> {
+    #[cfg(test)]
+    if let Some(scripted) =
+        inject_fstat_scratch::SCRIPTED_MOUNTINFO.with(|scripted| scripted.borrow().clone())
+    {
+        return Ok(scripted);
+    }
+    let path = format!("/proc/{}/mountinfo", guest.pid().as_raw());
+    std::fs::read(&path).map_err(|error| {
+        Error::Tool(anyhow::anyhow!(
+            "could not read {path} to prove a maps line's device: {error}; refusing \
+             rather than keying the file's identity on another source"
+        ))
+    })
+}
+
+/// The superblock device of mount `mount_id` in `mountinfo`: a row's first
+/// field is its mount id and its third the superblock's `major:minor`, in
+/// decimal (`show_mountinfo`). Only those fields are read. `Ok(None)` when no
+/// row has that id; an error when the row that has it does not give a
+/// device.
+fn mountinfo_superblock_device(mountinfo: &[u8], mount_id: u64) -> Result<Option<u64>, String> {
+    for row in mountinfo.split(|&byte| byte == b'\n') {
+        let mut fields = row.split(|&byte| byte == b' ');
+        let id = fields
+            .next()
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.parse::<u64>().ok());
+        if id != Some(mount_id) {
+            continue;
+        }
+        let device = fields
+            .nth(1)
+            .and_then(|field| std::str::from_utf8(field).ok())
+            .and_then(|field| field.split_once(':'))
+            .and_then(|(major, minor)| Some((major.parse().ok()?, minor.parse().ok()?)));
+        return match device {
+            Some((major, minor)) => Ok(Some(libc::makedev(major, minor))),
+            None => Err(format!("{:?}", String::from_utf8_lossy(row))),
+        };
+    }
+    Ok(None)
+}
+
 /// The run-global identity pools, reached through this guest's RPCs to the
 /// global tool: the same `InodePool`/`DevicePool` that `stat` determinizes
 /// through, so a mapping line and a `stat` of the same file agree. A header is
@@ -1271,8 +1409,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// stack scratch. Returns `EFAULT` when that scratch cannot be read,
     /// committed or written.
     ///
-    /// On ptrace and KVM the buffer is the guest's own memory below its red
-    /// zone, which the commit and the kernel's `fstat` overwrite. A guest that
+    /// On ptrace the buffer is the guest's own memory below its red zone,
+    /// which the commit and the kernel's `fstat` overwrite. (The KVM backend
+    /// of the pinned Reverie hands out its reserved `ToolScratch` region
+    /// instead, outside the guest's view, where the save and restore below
+    /// protect nothing of the guest's and cost only the copy.) A guest that
     /// issues raw system calls may keep live data there, and Linux never
     /// writes there for it, so the 144 bytes under the buffer are read before
     /// the scratch is committed and written back afterwards: on success, on a
@@ -1401,6 +1542,8 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    executable and the ELF interpreter, which `execve` maps without a
     ///    system call Detcore sees, and files mapped through a descriptor
     ///    Detcore does not track, such as one received over `SCM_RIGHTS`.
+    ///    The file it names keys the line only with proof that it lies on
+    ///    the superblock the header names (`Self::proves_header_device`).
     /// 3. Otherwise the guest `stat`s the executable link of the process
     ///    whose address space the snapshot shows: `/proc/self/exe` for the
     ///    reader's own, `/proc/<pid>/exe` for a task the file names by
@@ -1409,7 +1552,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    executable even after it is unlinked or replaced (the line then
     ///    reads ` (deleted)`, or its path names another inode), and `stat`
     ///    follows it to the file, so this covers the executable where step 2
-    ///    cannot. Linux binds a `maps` file's address space at open, while
+    ///    cannot. It keys the line only when the link reads as the line's
+    ///    pathname (`Self::link_names_mapping`) and the executable lies on
+    ///    the header's superblock (`Self::proves_header_device`): an
+    ///    executable that merely shares the line's inode number is another
+    ///    file. Linux binds a `maps` file's address space at open, while
     ///    `/proc/<pid>/exe` is resolved at read time; after that task exits or
     ///    calls `execve` the snapshot is empty, so no line asks.
     ///    `/proc/<pid>/map_files/<range>` would name every mapped
@@ -1418,7 +1565,10 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    (`proc_map_files_get_link`), so it is not used.
     ///
     /// Each answer is accepted only if its inode is the one the header
-    /// reports. For the record that check is a guard against staleness: the
+    /// reports, and a resolved path or executable link only with the
+    /// superblock proof as well: an inode number alone names no file, since
+    /// every filesystem, and every btrfs subvolume, numbers its own. For the
+    /// record the inode check is a guard against staleness: the
     /// record can outlive the mapping it describes, because `handle_mmap`,
     /// `handle_munmap` and `handle_mremap` update it only after a successful
     /// call, and only they (and `execve`, which starts an empty record) change
@@ -1434,12 +1584,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// A stale record names another file, which almost always has another
     /// inode, so the check discards it and the path or the header decides.
     /// ⚠️ A STALE RECORD WITH THE NEW FILE'S INODE NUMBER STILL WINS: the
-    /// same inode number on another device passes, because the check cannot
-    /// compare devices when the header's device is not `stat`'s. The same
-    /// holds for steps 2 and 3: a path renamed onto, or an executable link
-    /// naming, a file on another device with the header's inode number keys
-    /// the line on that file. No step compares devices, and step 3 does not
-    /// compare the link's text with the header's pathname.
+    /// same inode number on another device passes. A record is provenance,
+    /// not a path, so there is no mount to prove, and its device cannot be
+    /// compared with the header's when the header's device is not `stat`'s.
+    /// Steps 2 and 3 compare superblocks, which still passes two files with
+    /// one inode number on ONE superblock: two btrfs subvolumes of one
+    /// filesystem, or two overlayfs layers of one overlay mount.
     ///
     /// Falls back to the header's pair -- which IS `stat`'s identity on every
     /// filesystem whose `st_dev` is its superblock device, such as ext4, xfs
@@ -1449,19 +1599,27 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// ⚠️ ON BTRFS AND OVERLAYFS THAT FALLBACK DISAGREES WITH `stat`. The maps
     /// inode column then differs from `st_ino` for a file that is absent from
-    /// the record, unresolvable by path, and not the reader's own executable:
-    /// the ELF interpreter after it is unlinked or replaced, a file mapped
-    /// through an untracked descriptor and then unlinked, any unlinked file
-    /// other than the executable in another process's maps (whose records
-    /// Detcore does not consult), and an unlinked executable in maps whose
-    /// process is not known by number (`MappingSubject::Unknown`: a
-    /// `/proc/self/maps` descriptor read in another address space when the
-    /// opener's ids were not asked for). A lookup that cannot be asked --
-    /// `stat_guest_path` finds no scratch, faults in its own buffers, or the
-    /// injected stat fails with anything but the guest filesystem's answer
-    /// that the path names nothing -- is an error, never a step to the next
-    /// source or to this fallback, so host resources cannot choose the
-    /// identity (see there).
+    /// the record and that no step can prove: the ELF interpreter after it is
+    /// unlinked or replaced, a file mapped through an untracked descriptor
+    /// and then unlinked, any unlinked file other than the executable in
+    /// another process's maps (whose records Detcore does not consult), an
+    /// unlinked executable in maps whose process is not known by number
+    /// (`MappingSubject::Unknown`: a `/proc/self/maps` descriptor read in
+    /// another address space when the opener's ids were not asked for), and
+    /// a file on a mount outside the guest's root, which its mountinfo does
+    /// not list. Before the inode pool was keyed on the device as well, such a
+    /// line agreed with `st_ino` only because two files with one inode number
+    /// on different devices shared one deterministic inode; no unprivileged
+    /// kernel interface gives `stat`'s device for a mapping without a path,
+    /// so the line keeps the header's pair rather than borrow another file's
+    /// identity. On overlayfs before Linux 6.8 maps prints the real file's
+    /// device rather than the overlay's, so no overlay line is proven there.
+    /// A lookup that cannot be asked -- `stat_guest_path` finds no scratch,
+    /// faults in its own buffers, or an injected stat, `statx` or `readlink`
+    /// fails with anything but the guest filesystem's answer that the path
+    /// names nothing -- is an error, never a step to the next source or to
+    /// this fallback, so host resources cannot choose the identity (see
+    /// there).
     ///
     /// ⚠️ WITHOUT `virtualize_metadata` THE SPLIT REACHES FDINFO TOO. There
     /// the header's pair keys every line, while the `ino:` line of
@@ -1502,8 +1660,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
         }
         for candidate in crate::procfs::mapping_path_candidates(&key.pathname) {
-            if let Some(stat) = self.stat_guest_path(guest, candidate.as_bytes()).await?
+            let path = candidate.as_bytes();
+            if let Some(stat) = self.stat_guest_path(guest, path).await?
                 && stat.st_ino == key.inode
+                && Self::proves_header_device(guest, path, &stat, key.device).await?
             {
                 return Ok(RawInode::new(stat.st_dev, stat.st_ino));
             }
@@ -1519,10 +1679,260 @@ impl<T: RecordOrReplay> Detcore<T> {
             && let Some(link) = executable_link
             && let Some(stat) = self.stat_guest_path(guest, &link).await?
             && stat.st_ino == key.inode
+            && Self::link_names_mapping(guest, &link, &key.pathname).await?
+            && Self::proves_header_device(guest, &link, &stat, key.device).await?
         {
             return Ok(RawInode::new(stat.st_dev, stat.st_ino));
         }
         Ok(header)
+    }
+
+    /// Whether the file a guest `stat` of `path` returned, whose inode is
+    /// already the maps header's, lies on the superblock whose device that
+    /// header reports. An inode number alone names no file: every filesystem
+    /// numbers its own inodes, and btrfs numbers each subvolume's. So steps 2
+    /// and 3 of [`Self::mapping_stat_identity`] accept an answer only with
+    /// this proof as well.
+    ///
+    /// Proven at once when `stat`'s device IS the header's, as on ext4, xfs
+    /// and tmpfs. Otherwise -- on btrfs, where `stat` reports the subvolume's
+    /// device, and on overlayfs, where it can report a layer's -- the guest
+    /// `statx`es the same path for its mount id (`STATX_MNT_ID`), and that
+    /// mount's row of the guest's `/proc/<pid>/mountinfo` gives the
+    /// superblock's device, which is the device `maps` prints. The `statx`
+    /// must report the device and inode the `stat` did, or the path has
+    /// changed in between and proves nothing.
+    ///
+    /// `Ok(false)` -- no proof, so the line falls back to its header -- when
+    /// that mount's superblock is another one, or when the guest's filesystem
+    /// answers that the path no longer names that file. A proof that could
+    /// not be asked is an error, never a `false`, as in
+    /// [`Self::stat_guest_path`]: no transient page, a fault in Detcore's own
+    /// buffers, any other errno from the injected `statx`, a kernel that
+    /// reports no mount id, or a `mountinfo` that cannot be read or has no
+    /// row for that mount. Otherwise host resources would choose the
+    /// identity.
+    ///
+    /// ⚠️ THE SAME INODE NUMBER IN TWO BTRFS SUBVOLUMES OF ONE FILESYSTEM STILL
+    /// PASSES, and so do two overlayfs layers on one overlay mount: both share
+    /// the superblock device `maps` prints, which is all a maps line says
+    /// about where its file lives. For step 3, [`Self::link_names_mapping`]
+    /// also requires the executable link's text to be the line's pathname.
+    ///
+    /// `mountinfo` is read on the tool's side, as the fdinfo mount-id check
+    /// reads it: mounts and namespace changes are refused once Detcore
+    /// starts, so the guest's mount table cannot change under it, and no
+    /// guest descriptor is spent.
+    async fn proves_header_device<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        stat: &libc::stat,
+        header_device: u64,
+    ) -> Result<bool, Error> {
+        if stat.st_dev == header_device {
+            return Ok(true);
+        }
+        let Some(mount_id) = Self::guest_mount_id_of(guest, path, stat).await? else {
+            return Ok(false);
+        };
+        let mountinfo = guest_mountinfo(guest)?;
+        match mountinfo_superblock_device(&mountinfo, mount_id) {
+            Ok(Some(device)) => Ok(device == header_device),
+            // A mount outside the guest's root is not in its mountinfo: an
+            // exe link can name one. That is the guest's own configuration,
+            // the same on every host, so it is an answer -- no proof -- and
+            // not a failure to ask.
+            Ok(None) => {
+                trace!(
+                    "{:?} is on mount {mount_id}, which the guest's mountinfo does not list",
+                    String::from_utf8_lossy(path)
+                );
+                Ok(false)
+            }
+            Err(malformed) => Err(identity_lookup_refused(
+                "find the superblock of",
+                path,
+                format_args!("its mountinfo row is malformed: {malformed}"),
+            )),
+        }
+    }
+
+    /// The mount id of the file at `path`, from a `statx` the guest makes in
+    /// a transient page, when that file is still the one `stat` describes.
+    /// `None` when the guest's filesystem answers that `path` names nothing
+    /// or another file; see [`Self::proves_header_device`] for the errors.
+    async fn guest_mount_id_of<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        stat: &libc::stat,
+    ) -> Result<Option<u64>, Error> {
+        let statx_offset = (path.len() + 1).next_multiple_of(8);
+        let len =
+            (statx_offset + std::mem::size_of::<libc::statx>()).next_multiple_of(host_page_size());
+        let page = map_identity_page(guest, len, "statx", path).await?;
+        // SAFETY: `statx_offset` is within the `len` bytes just mapped.
+        let statxptr = StatxPtr(unsafe { page.add(statx_offset) }.cast::<libc::statx>());
+        let asked = Self::statx_in_page(guest, path, page, statxptr).await;
+        unmap_identity_page(guest, page, len, path).await;
+        let statx = match asked {
+            Ok(Some(statx)) => statx,
+            Ok(None) => return Ok(None),
+            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
+            Err(errno) => return Err(identity_lookup_refused("statx", path, errno)),
+        };
+        if statx.stx_mask & StatxMask::STATX_MNT_ID.bits() == 0 {
+            return Err(identity_lookup_refused(
+                "statx",
+                path,
+                "the kernel reported no mount id (STATX_MNT_ID needs Linux 5.8)",
+            ));
+        }
+        let device = libc::makedev(statx.stx_dev_major, statx.stx_dev_minor);
+        if (device, statx.stx_ino) != (stat.st_dev, stat.st_ino) {
+            trace!(
+                "{:?} names another file than its stat did: {:#x}/{} after {:#x}/{}",
+                String::from_utf8_lossy(path),
+                device,
+                statx.stx_ino,
+                stat.st_dev,
+                stat.st_ino
+            );
+            return Ok(None);
+        }
+        Ok(Some(statx.stx_mnt_id))
+    }
+
+    /// Stage `path` NUL-terminated at `path_address` and inject
+    /// `statx(AT_FDCWD, path, 0, STATX_INO | STATX_MNT_ID, statxptr)`, with the
+    /// answers and errors of [`Self::fstatat_in_scratch`].
+    async fn statx_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        path_address: AddrMut<'_, u8>,
+        statxptr: StatxPtr<'_>,
+    ) -> Result<Option<libc::statx>, Errno> {
+        let mut staged = Vec::with_capacity(path.len() + 1);
+        staged.extend_from_slice(path);
+        staged.push(0);
+        guest.memory().write_exact(path_address, &staged)?;
+        let call = syscalls::Statx::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ))
+            .with_flags(AtFlags::empty())
+            .with_mask(StatxMask::STATX_INO | StatxMask::STATX_MNT_ID)
+            .with_statx(Some(statxptr));
+        match guest.inject_with_retry(call).await {
+            Ok(_) => statxptr.read(&guest.memory()).map(Some),
+            Err(error) if is_path_answer(error) => {
+                trace!(
+                    "guest statx of {:?} failed: {error}",
+                    String::from_utf8_lossy(path)
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                warn!(
+                    "[detcore] guest statx of {:?} could not be asked: {error}",
+                    String::from_utf8_lossy(path)
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Whether the guest's `readlink` of the executable link `link` reads as
+    /// `pathname`, the maps line's: `maps` prints a mapped file's path as the
+    /// link would, with ` (deleted)` once it is unlinked, except that it
+    /// spells a newline `\012`. A file that merely shares the executable's
+    /// inode number -- a non-executable mapping, a file literally named
+    /// `x (deleted)` -- has another pathname, so step 3 of
+    /// [`Self::mapping_stat_identity`] does not borrow the executable's
+    /// identity for it. `Ok(false)` when the guest's filesystem answers that
+    /// the link names nothing; errors as in [`Self::proves_header_device`].
+    async fn link_names_mapping<G: Guest<Self>>(
+        guest: &mut G,
+        link: &[u8],
+        pathname: &str,
+    ) -> Result<bool, Error> {
+        // Twice `PATH_MAX`: `d_path`, which both texts come from, never
+        // writes more than one page, so a full buffer cannot be a whole link.
+        const LINK_CAPACITY: usize = 2 * libc::PATH_MAX as usize;
+        let buffer_offset = (link.len() + 1).next_multiple_of(8);
+        let len = (buffer_offset + LINK_CAPACITY).next_multiple_of(host_page_size());
+        let page = map_identity_page(guest, len, "readlink", link).await?;
+        // SAFETY: `buffer_offset` is within the `len` bytes just mapped.
+        let buffer = unsafe { page.add(buffer_offset) };
+        let asked = Self::readlink_in_page(guest, link, page, buffer, LINK_CAPACITY).await;
+        unmap_identity_page(guest, page, len, link).await;
+        let text = match asked {
+            Ok(Some(text)) => text,
+            Ok(None) => return Ok(false),
+            Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
+            Err(errno) => return Err(identity_lookup_refused("readlink", link, errno)),
+        };
+        if text.len() >= LINK_CAPACITY {
+            return Err(identity_lookup_refused(
+                "readlink",
+                link,
+                format_args!("the link filled all {LINK_CAPACITY} bytes of its buffer"),
+            ));
+        }
+        let mut spelled = Vec::with_capacity(text.len());
+        for &byte in &text {
+            if byte == b'\n' {
+                spelled.extend_from_slice(b"\\012");
+            } else {
+                spelled.push(byte);
+            }
+        }
+        Ok(spelled == pathname.as_bytes())
+    }
+
+    /// Stage `link` NUL-terminated at `path_address` and inject
+    /// `readlinkat(AT_FDCWD, link, buffer, capacity)`; the link's text, or
+    /// `None` when the guest's filesystem answers that `link` names no link.
+    async fn readlink_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        link: &[u8],
+        path_address: AddrMut<'_, u8>,
+        buffer: AddrMut<'_, u8>,
+        capacity: usize,
+    ) -> Result<Option<Vec<u8>>, Errno> {
+        let mut staged = Vec::with_capacity(link.len() + 1);
+        staged.extend_from_slice(link);
+        staged.push(0);
+        guest.memory().write_exact(path_address, &staged)?;
+        let call = syscalls::Readlinkat::new()
+            .with_dirfd(libc::AT_FDCWD)
+            .with_path(PathPtr::from_ptr(
+                path_address.as_raw() as *const libc::c_char
+            ))
+            .with_buf(Some(buffer.cast::<libc::c_char>()))
+            .with_buf_len(capacity);
+        match guest.inject_with_retry(call).await {
+            Ok(read) => {
+                let read = usize::try_from(read).expect("readlinkat returned a negative length");
+                let mut text = vec![0u8; read];
+                guest.memory().read_exact(buffer, &mut text)?;
+                Ok(Some(text))
+            }
+            Err(error) if is_path_answer(error) || error == Errno::EINVAL => {
+                trace!(
+                    "guest readlink of {:?} failed: {error}",
+                    String::from_utf8_lossy(link)
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                warn!(
+                    "[detcore] guest readlink of {:?} could not be asked: {error}",
+                    String::from_utf8_lossy(link)
+                );
+                Err(error)
+            }
+        }
     }
 
     /// `stat(path)` performed BY THE GUEST, through an injected
@@ -8110,6 +8520,14 @@ pub(crate) mod inject_fstat_scratch {
     use crate::ThreadState;
     use crate::types::DetPid;
 
+    thread_local! {
+        /// The `mountinfo` `guest_mountinfo` returns instead of reading the
+        /// guest's, while a test sets one: `ScriptedGuest`'s pid is 1, which
+        /// is not the test process.
+        pub(crate) static SCRIPTED_MOUNTINFO: std::cell::RefCell<Option<Vec<u8>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
     /// Room for one `libc::stat`, 8-byte aligned like a real stack slot.
     const ARENA_WORDS: usize = 32;
 
@@ -8292,6 +8710,13 @@ pub(crate) mod inject_fstat_scratch {
         fstatat_guard_live: Vec<bool>,
         /// Path each injected fstatat named, as the kernel reads it.
         pub(crate) fstatat_paths: Vec<Vec<u8>>,
+        /// Path each injected statx named, as the kernel reads it.
+        pub(crate) statx_paths: Vec<Vec<u8>>,
+        /// Link each injected readlinkat named, as the kernel reads it.
+        pub(crate) readlink_paths: Vec<Vec<u8>>,
+        /// (link, text): an injected readlinkat of `link` reads `text`
+        /// instead of running, for a link the test process cannot make.
+        pub(crate) readlink_answers: Vec<(Vec<u8>, Vec<u8>)>,
         /// Buffer address of each injected fstatat.
         fstatat_buffers: Vec<usize>,
         /// (address, length) of each page the guest mapped.
@@ -8344,6 +8769,9 @@ pub(crate) mod inject_fstat_scratch {
                 fstat_buffers: Vec::new(),
                 fstatat_guard_live: Vec::new(),
                 fstatat_paths: Vec::new(),
+                statx_paths: Vec::new(),
+                readlink_paths: Vec::new(),
+                readlink_answers: Vec::new(),
                 fstatat_buffers: Vec::new(),
                 mapped: Vec::new(),
                 unmapped: Vec::new(),
@@ -8551,6 +8979,62 @@ pub(crate) mod inject_fstat_scratch {
                             buffer,
                             0,
                         )
+                    }
+                }
+                Syscall::Statx(call) => {
+                    assert_eq!(call.dirfd(), libc::AT_FDCWD);
+                    assert_eq!(call.flags(), AtFlags::empty());
+                    let path = call.path().expect("statx without a path");
+                    let buffer = call.statx().expect("statx without a buffer").0.as_raw();
+                    self.statx_paths.push(
+                        path.read(&LocalMemory::new())
+                            .expect("statx names a path it cannot read")
+                            .into_os_string()
+                            .into_vec(),
+                    );
+                    unsafe {
+                        libc::syscall(
+                            libc::SYS_statx,
+                            libc::AT_FDCWD,
+                            Some(path).into_raw(),
+                            0,
+                            call.mask().bits(),
+                            buffer,
+                        )
+                    }
+                }
+                Syscall::Readlinkat(call) => {
+                    assert_eq!(call.dirfd(), libc::AT_FDCWD);
+                    let path = call.path().expect("readlinkat without a path");
+                    let buffer = call.buf().expect("readlinkat without a buffer").as_raw();
+                    let link = path
+                        .read(&LocalMemory::new())
+                        .expect("readlinkat names a path it cannot read")
+                        .into_os_string()
+                        .into_vec();
+                    let scripted = self
+                        .readlink_answers
+                        .iter()
+                        .find(|(scripted, _)| *scripted == link)
+                        .map(|(_, text)| text.clone());
+                    self.readlink_paths.push(link);
+                    match scripted {
+                        Some(text) => {
+                            let len = text.len().min(call.buf_len());
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(text.as_ptr(), buffer as *mut u8, len)
+                            };
+                            i64::try_from(len).unwrap()
+                        }
+                        None => unsafe {
+                            libc::syscall(
+                                libc::SYS_readlinkat,
+                                libc::AT_FDCWD,
+                                Some(path).into_raw(),
+                                buffer,
+                                call.buf_len(),
+                            )
+                        },
                     }
                 }
                 Syscall::Munmap(call) => {
@@ -9676,6 +10160,69 @@ pub(crate) mod inject_fstat_scratch {
     /// record alone is under test.
     const RECORDED_START: usize = 0x7e00_0000_0000;
 
+    /// While alive, `guest_mountinfo` reads this mount table instead of the
+    /// guest's.
+    struct ScriptedMountinfo;
+
+    impl ScriptedMountinfo {
+        fn set(mountinfo: impl Into<Vec<u8>>) -> Self {
+            SCRIPTED_MOUNTINFO.with(|scripted| *scripted.borrow_mut() = Some(mountinfo.into()));
+            Self
+        }
+
+        /// A mount table whose only row is the mount of `path`, as the test
+        /// process's own `statx` reports it, on a superblock with `device`.
+        fn proving(path: &Path, device: u64) -> Self {
+            Self::set(mount_row(mount_id_of(path), device))
+        }
+    }
+
+    impl Drop for ScriptedMountinfo {
+        fn drop(&mut self) {
+            SCRIPTED_MOUNTINFO.with(|scripted| *scripted.borrow_mut() = None);
+        }
+    }
+
+    /// The mount id of `path`, from the test process's own `statx`.
+    fn mount_id_of(path: &Path) -> u64 {
+        let raw_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: a NUL-terminated path and a buffer of the size statx writes.
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                raw_path.as_ptr(),
+                0,
+                StatxMask::STATX_MNT_ID.bits(),
+                statx.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            raw,
+            0,
+            "statx of {path:?} failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: statx succeeded, so it wrote the buffer.
+        let statx = unsafe { statx.assume_init() };
+        assert_ne!(
+            statx.stx_mask & StatxMask::STATX_MNT_ID.bits(),
+            0,
+            "precondition: this kernel reports mount ids"
+        );
+        statx.stx_mnt_id
+    }
+
+    /// A mountinfo row for mount `mount_id` on a superblock with `device`.
+    fn mount_row(mount_id: u64, device: u64) -> String {
+        format!(
+            "{mount_id} 1 {}:{} / /scripted rw,relatime shared:1 - scripted scripted rw\n",
+            libc::major(device),
+            libc::minor(device)
+        )
+    }
+
     /// A live file, its raw identity, and a maps header naming it by path
     /// with its inode and `HEADER_DEVICE`.
     fn mapped_path() -> (
@@ -9704,7 +10251,8 @@ pub(crate) mod inject_fstat_scratch {
     // inode check the record would key the line on that other file.
     #[tokio::test]
     async fn mapping_stat_identity_discards_a_record_with_another_inode() {
-        let (_file, identity, key) = mapped_path();
+        let (file, identity, key) = mapped_path();
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
         let scratch = Pages::map(1, 1);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
         let stale = RawInode::new(RECORD_DEVICE, identity.ino + 1);
@@ -9721,8 +10269,153 @@ pub(crate) mod inject_fstat_scratch {
             stale.ino,
             key.inode
         );
-        assert_eq!(guest.injected, [Sysno::newfstatat]);
+        assert_eq!(
+            guest.injected,
+            [Sysno::newfstatat, Sysno::mmap, Sysno::statx, Sysno::munmap]
+        );
         assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
+        assert_eq!(guest.statx_paths, [key.pathname.as_bytes().to_vec()]);
+    }
+
+    // The split pair of https://github.com/rrnewton/hermit/pull/3255's sixth
+    // review: a path whose `stat` has the header's inode on another device,
+    // as every file on btrfs does. Its identity is the one `fstat` gives the
+    // file only when the mount `statx` names is on the header's superblock;
+    // the same inode number on another filesystem keeps the header's pair,
+    // and so does a mount the guest's mountinfo does not list.
+    #[tokio::test]
+    async fn a_path_with_the_headers_inode_needs_the_headers_superblock() {
+        let (file, identity, key) = mapped_path();
+        let header = RawInode::new(HEADER_DEVICE, key.inode);
+        let scratch = Pages::map(1, 1);
+        for (mountinfo, expected, why) in [
+            (
+                mount_row(mount_id_of(file.path()), RECORD_DEVICE),
+                header,
+                "another superblock: the same inode number names another file",
+            ),
+            (
+                mount_row(u64::MAX - 1, HEADER_DEVICE),
+                header,
+                "a mount the guest's mountinfo does not list proves nothing",
+            ),
+            (
+                mount_row(mount_id_of(file.path()), HEADER_DEVICE),
+                identity,
+                "the header's superblock: the identity fstat gives the file",
+            ),
+        ] {
+            let _mounts = ScriptedMountinfo::set(mountinfo);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            let resolved = tool
+                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .await;
+            assert_eq!(
+                resolved.expect("mapping_stat_identity failed"),
+                expected,
+                "{why}"
+            );
+            assert_eq!(
+                guest.injected,
+                [Sysno::newfstatat, Sysno::mmap, Sysno::statx, Sysno::munmap],
+                "{why}"
+            );
+        }
+    }
+
+    // A device proof that could not be asked refuses, as a stat that could
+    // not be asked does: without it the header's pair would key a file whose
+    // identity is fstat's on a host where the page can be mapped.
+    #[tokio::test]
+    async fn a_device_proof_that_cannot_be_asked_refuses() {
+        let (file, _identity, key) = mapped_path();
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.mmap_fails = true;
+
+        let refused = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .await;
+
+        assert!(
+            matches!(&refused, Err(Error::Tool(error))
+                if error.to_string().contains(&Errno::ENOMEM.to_string())),
+            "a device proof that could not be asked must refuse: {refused:?}"
+        );
+        assert_eq!(guest.injected, [Sysno::newfstatat, Sysno::mmap]);
+    }
+
+    // On the test host's own filesystem, through the kernel's real maps line,
+    // statx and mountinfo: a mapped file's line resolves to the identity
+    // fstat gives it. On btrfs (and overlayfs) the line's device is not
+    // stat's, so this runs the mount proof; elsewhere they agree at once.
+    #[tokio::test]
+    async fn a_real_maps_line_resolves_to_its_files_fstat_identity() {
+        use std::os::fd::AsRawFd;
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        file.as_file()
+            .set_len(u64::try_from(page_size()).unwrap())
+            .unwrap();
+        let metadata = file.as_file().metadata().unwrap();
+        let identity = RawInode::new(metadata.dev(), metadata.ino());
+        // SAFETY: a fresh shared read-only mapping of the whole file.
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                page_size(),
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_file().as_raw_fd(),
+                0,
+            )
+        };
+        assert_ne!(address, libc::MAP_FAILED);
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let prefix = format!("{:x}-", address as usize);
+        let line = maps
+            .lines()
+            .find(|line| line.starts_with(&prefix))
+            .expect("no maps line for the mapping")
+            .to_owned();
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        let (major, minor) = fields[3].split_once(':').unwrap();
+        let header_device = libc::makedev(
+            u32::from_str_radix(major, 16).unwrap(),
+            u32::from_str_radix(minor, 16).unwrap(),
+        );
+        let key = crate::procfs::MappingKey {
+            device: header_device,
+            inode: fields[4].parse().unwrap(),
+            pathname: fields[5..].join(" "),
+        };
+        assert_eq!(key.inode, identity.ino, "{line}");
+        let _mounts = ScriptedMountinfo::set(std::fs::read("/proc/self/mountinfo").unwrap());
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+        let resolved = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .await;
+        // SAFETY: the mapping made above.
+        unsafe { libc::munmap(address, page_size()) };
+
+        eprintln!(
+            "maps device {header_device:#x}, stat device {:#x}; injected {:?}",
+            identity.dev, guest.injected
+        );
+        assert_eq!(
+            resolved.expect("mapping_stat_identity failed"),
+            identity,
+            "{line}: a mapped file's line must take the identity fstat gives it"
+        );
+        let proof: &[Sysno] = if header_device == identity.dev {
+            &[]
+        } else {
+            &[Sysno::mmap, Sysno::statx, Sysno::munmap]
+        };
+        assert_eq!(guest.injected, [&[Sysno::newfstatat][..], proof].concat());
     }
 
     // Control for the test above: a record with the header's inode keys the
@@ -9809,13 +10502,30 @@ pub(crate) mod inject_fstat_scratch {
         };
         let scratch = Pages::map(1, 1);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        // The test binary is not deleted, so its link's text is scripted.
+        guest.readlink_answers.push((
+            b"/proc/self/exe".to_vec(),
+            key.pathname.clone().into_bytes(),
+        ));
+        let _mounts = ScriptedMountinfo::proving(Path::new("/proc/self/exe"), HEADER_DEVICE);
+        let exe_proof = [
+            Sysno::newfstatat,
+            Sysno::mmap,
+            Sysno::readlinkat,
+            Sysno::munmap,
+            Sysno::mmap,
+            Sysno::statx,
+            Sysno::munmap,
+        ];
 
         let own = tool
             .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
             .await;
         assert_eq!(own.expect("mapping_stat_identity failed"), identity);
-        assert_eq!(guest.injected, [Sysno::newfstatat]);
+        assert_eq!(guest.injected, exe_proof);
         assert_eq!(guest.fstatat_paths, [b"/proc/self/exe".to_vec()]);
+        assert_eq!(guest.readlink_paths, [b"/proc/self/exe".to_vec()]);
+        assert_eq!(guest.statx_paths, [b"/proc/self/exe".to_vec()]);
 
         let other = tool
             .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Unknown)
@@ -9825,7 +10535,7 @@ pub(crate) mod inject_fstat_scratch {
             RawInode::new(HEADER_DEVICE, identity.ino),
             "an unknown address space's line must not borrow the reader's executable"
         );
-        assert_eq!(guest.injected, [Sysno::newfstatat], "no second stat");
+        assert_eq!(guest.injected, exe_proof, "no second stat");
     }
 
     // The reader's mapping records describe only its own address space. For a
@@ -9835,11 +10545,13 @@ pub(crate) mod inject_fstat_scratch {
     async fn another_address_spaces_maps_line_ignores_the_readers_record() {
         use crate::procfs::MappingIdentityMinter;
 
-        let (_file, identity, key) = mapped_path();
+        let (file, identity, key) = mapped_path();
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
         let scratch = Pages::map(1, 1);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
         let recorded = RawInode::new(RECORD_DEVICE, identity.ino);
         guest.thread.map_file(RECORDED_START, page_size(), recorded);
+        let path_proof = [Sysno::newfstatat, Sysno::mmap, Sysno::statx, Sysno::munmap];
 
         let own = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Reader)
             .stat_identity(&key, &[RECORDED_START])
@@ -9859,7 +10571,7 @@ pub(crate) mod inject_fstat_scratch {
             identity,
             "another address space's line must be keyed on the path's stat, not the reader's record"
         );
-        assert_eq!(guest.injected, [Sysno::newfstatat]);
+        assert_eq!(guest.injected, path_proof);
         assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
 
         let numbered = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Process(1))
@@ -9870,7 +10582,7 @@ pub(crate) mod inject_fstat_scratch {
             identity,
             "a numbered task's line must be keyed on the path's stat, not the reader's record"
         );
-        assert_eq!(guest.injected, [Sysno::newfstatat, Sysno::newfstatat]);
+        assert_eq!(guest.injected, [path_proof, path_proof].concat());
     }
 
     /// A running process other than the test's, whose executable stands in
@@ -9906,6 +10618,57 @@ pub(crate) mod inject_fstat_scratch {
         }
     }
 
+    /// A running copy of `sleep` whose file was unlinked once it ran, so its
+    /// exe link and its maps line both read `<copy> (deleted)`. The copy sits
+    /// beside the test binary, where executing is allowed.
+    struct DeletedExecutable {
+        process: OtherProcess,
+        directory: tempfile::TempDir,
+    }
+
+    impl DeletedExecutable {
+        fn spawn() -> Self {
+            let beside = std::env::current_exe().unwrap();
+            let directory = tempfile::tempdir_in(beside.parent().unwrap()).unwrap();
+            let copy = directory.path().join("sleep");
+            {
+                let original = OtherProcess::spawn();
+                std::fs::copy(format!("/proc/{}/exe", original.pid()), &copy).unwrap();
+            }
+            // Another test's fork can briefly hold the copy's write
+            // descriptor, and executing a file open for writing is ETXTBSY.
+            let mut attempts = 0;
+            let child = loop {
+                match std::process::Command::new(&copy).arg("600").spawn() {
+                    Ok(child) => break child,
+                    Err(error) if error.raw_os_error() == Some(libc::ETXTBSY) && attempts < 100 => {
+                        attempts += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("cannot run {copy:?}: {error}"),
+                }
+            };
+            // `spawn` returns once the child has executed the copy.
+            std::fs::remove_file(&copy).unwrap();
+            Self {
+                process: OtherProcess(child),
+                directory,
+            }
+        }
+
+        fn link(&self) -> String {
+            format!("/proc/{}/exe", self.process.pid())
+        }
+
+        /// Its maps pathname, which its exe link also reads.
+        fn pathname(&self) -> String {
+            format!(
+                "{}/sleep (deleted)",
+                self.directory.path().to_str().unwrap()
+            )
+        }
+    }
+
     // Step 3 for a task the maps file names by number: its executable after
     // it was unlinked -- ` (deleted)`, so no path candidate -- is keyed on the
     // guest's `stat` of `/proc/<pid>/exe`, not on the header's device. Before
@@ -9913,23 +10676,25 @@ pub(crate) mod inject_fstat_scratch {
     // reached this function, and the header decided.
     #[tokio::test]
     async fn mapping_stat_identity_keys_a_numbered_tasks_deleted_executable_on_its_exe_link() {
-        let other = OtherProcess::spawn();
-        let identity = other.executable();
+        let other = DeletedExecutable::spawn();
+        let identity = other.process.executable();
         assert_ne!(identity.dev, HEADER_DEVICE);
+        let link = other.link();
         let key = crate::procfs::MappingKey {
             device: HEADER_DEVICE,
             inode: identity.ino,
-            pathname: "/usr/bin/replaced-sleep (deleted)".to_owned(),
+            pathname: other.pathname(),
         };
         let scratch = Pages::map(1, 1);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let _mounts = ScriptedMountinfo::proving(Path::new(&link), HEADER_DEVICE);
 
         let numbered = tool
             .mapping_stat_identity(
                 &mut guest,
                 &key,
                 &[RECORDED_START],
-                MappingSubject::Process(other.pid()),
+                MappingSubject::Process(other.process.pid()),
             )
             .await;
         assert_eq!(
@@ -9937,11 +10702,93 @@ pub(crate) mod inject_fstat_scratch {
             identity,
             "another task's deleted executable must be keyed on its /proc/<pid>/exe"
         );
-        assert_eq!(guest.injected, [Sysno::newfstatat]);
         assert_eq!(
-            guest.fstatat_paths,
-            [format!("/proc/{}/exe", other.pid()).into_bytes()]
+            guest.injected,
+            [
+                Sysno::newfstatat,
+                Sysno::mmap,
+                Sysno::readlinkat,
+                Sysno::munmap,
+                Sysno::mmap,
+                Sysno::statx,
+                Sysno::munmap,
+            ]
         );
+        assert_eq!(guest.fstatat_paths, [link.clone().into_bytes()]);
+        assert_eq!(guest.readlink_paths, [link.clone().into_bytes()]);
+        assert_eq!(guest.statx_paths, [link.into_bytes()]);
+    }
+
+    // Step 3 borrows the executable's identity only with proof that the
+    // line's file IS the executable: the link must read as the line's
+    // pathname, and the executable must lie on the header's superblock. An
+    // equal inode number alone -- on another filesystem, in a non-executable
+    // mapping, or for a live file literally named `x (deleted)` -- keeps the
+    // header's pair.
+    #[tokio::test]
+    async fn step_three_needs_the_executables_pathname_and_superblock() {
+        let other = DeletedExecutable::spawn();
+        let identity = other.process.executable();
+        let link = other.link();
+        let header = RawInode::new(HEADER_DEVICE, identity.ino);
+        let literal = tempfile::tempdir().unwrap();
+        let literal_path = literal.path().join("x (deleted)");
+        std::fs::write(&literal_path, b"not the executable").unwrap();
+        let scratch = Pages::map(1, 1);
+        let text_mismatch = [
+            Sysno::newfstatat,
+            Sysno::mmap,
+            Sysno::readlinkat,
+            Sysno::munmap,
+        ];
+        let device_mismatch = [
+            &text_mismatch[..],
+            &[Sysno::mmap, Sysno::statx, Sysno::munmap],
+        ]
+        .concat();
+        for (pathname, superblock, expected_calls, why) in [
+            (
+                other.pathname(),
+                RECORD_DEVICE,
+                &device_mismatch[..],
+                "the executable on another superblock",
+            ),
+            (
+                literal_path.to_str().unwrap().to_owned(),
+                HEADER_DEVICE,
+                &text_mismatch[..],
+                "a live file literally named `x (deleted)`",
+            ),
+            (
+                format!("{}/libgone.so (deleted)", literal.path().to_str().unwrap()),
+                HEADER_DEVICE,
+                &text_mismatch[..],
+                "a non-executable mapping with the executable's inode number",
+            ),
+        ] {
+            let key = crate::procfs::MappingKey {
+                device: HEADER_DEVICE,
+                inode: identity.ino,
+                pathname,
+            };
+            let _mounts = ScriptedMountinfo::proving(Path::new(&link), superblock);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            let resolved = tool
+                .mapping_stat_identity(
+                    &mut guest,
+                    &key,
+                    &[],
+                    MappingSubject::Process(other.process.pid()),
+                )
+                .await;
+            assert_eq!(
+                resolved.expect("mapping_stat_identity failed"),
+                header,
+                "{why} must not borrow the executable's identity"
+            );
+            assert_eq!(guest.injected, expected_calls, "{why}");
+            assert_eq!(guest.fstatat_paths, [link.clone().into_bytes()], "{why}");
+        }
     }
 
     // Through the numeric spelling's classification at open time, with the
@@ -9957,8 +10804,10 @@ pub(crate) mod inject_fstat_scratch {
         let own_tgid = i32::try_from(std::process::id()).unwrap();
         // SAFETY: gettid has no preconditions.
         let own_tid = i32::try_from(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap();
-        let other = OtherProcess::spawn();
+        let deleted = DeletedExecutable::spawn();
+        let other = &deleted.process;
         let other_executable = other.executable();
+        let _mounts = ScriptedMountinfo::proving(Path::new(&deleted.link()), HEADER_DEVICE);
         let scratch = Pages::map(1, 1);
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
         let reader_mm = guest.thread.mm_id;
@@ -10002,7 +10851,7 @@ pub(crate) mod inject_fstat_scratch {
         let other_key = crate::procfs::MappingKey {
             device: HEADER_DEVICE,
             inode: other_executable.ino,
-            pathname: "/usr/bin/replaced-sleep (deleted)".to_owned(),
+            pathname: deleted.pathname(),
         };
         // The reader's record at the same address has the same inode number
         // and must not be used for another task's line.
