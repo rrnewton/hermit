@@ -4272,7 +4272,10 @@ impl RunOpts {
     /// guest tree cannot outlive that process. The one mechanism that makes sure
     /// of it from before the guest exists is a PID namespace whose init is
     /// hermit's container init: the namespace dies with its init, and the init
-    /// dies with the outer process through `container::arm_parent_death_signal`.
+    /// dies with the outer process through `container::arm_parent_death_signal`,
+    /// armed before the init starts the guest. A crossing that lands before that
+    /// arming, when the death signal can no longer come, is caught right after
+    /// it by `tracing::exit_if_log_cap_already_crossed`.
     /// A ptrace tracee with `PTRACE_O_EXITKILL` also dies with its tracer, but
     /// Reverie sets that option only after the guest exists (below), so it
     /// binds the guest for the rest of the run, not for all of it.
@@ -5931,13 +5934,12 @@ impl RunOpts {
         // program, and hermit changing its signal dispositions would alter the
         // behaviour being observed.
         //
-        // SAFETY: prctl and the proc diagnostic use only Linux syscall wrappers
-        // and signal-set operations, without allocation or stdio locks.
+        // SAFETY: the arming (prctl, an atomic read-modify-write and `_exit`)
+        // and the proc diagnostic use only Linux syscall wrappers and
+        // signal-set operations, without allocation or stdio locks.
         unsafe {
             command.pre_exec(|| {
-                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) == -1 {
-                    return Err(Errno::last());
-                }
+                super::container::arm_namespace_only_guest()?;
                 hermit::proc_mount::warn_if_readonly_proc();
                 Ok(())
             });

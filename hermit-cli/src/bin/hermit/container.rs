@@ -606,14 +606,20 @@ pub(super) fn deterministic_container() -> Result<(Container, IdentityGuard), Er
 /// Reverie uses the same idiom for exec'd untraced members in
 /// `safeptrace/src/notifier.rs`.
 ///
-/// One residual gap: if the parent somehow died between the fork and this call,
-/// no death signal will ever arrive. The usual `getppid()` guard for that race
-/// is unavailable here, because inside a new PID namespace the out-of-namespace
-/// parent is not mapped and `getppid()` reports 0 whether or not it is alive.
-/// Closing it completely would mean arming the signal inside
-/// `Container::run` before container setup, which is a Reverie-side change.
-/// The window is a few milliseconds of container setup, and the case this
-/// guards against is a supervisor deadline seconds or minutes later.
+/// One residual gap: if the parent died between the fork and this call, no
+/// death signal will ever arrive. The part of that gap that `--max-log-bytes`
+/// itself opens is closed: a parent that crossed the cap set the shared
+/// crossing bit before it exited 123, and `arm_container_init_guards` checks
+/// that bit right after this call (`exit_if_log_cap_already_crossed`, which
+/// carries the ordering argument). A parent that dies for any other reason in
+/// the window (killed from outside, OOM, a crash) still leaves this process
+/// unsupervised. The usual `getppid()` guard for that race is unavailable here,
+/// because inside a new PID namespace the out-of-namespace parent is not mapped
+/// and `getppid()` reports 0 whether or not it is alive. Closing it completely
+/// would mean arming the signal inside `Container::run` before container
+/// setup, which is a Reverie-side change. The window is a few milliseconds of
+/// container setup, and the case this guards against is a supervisor deadline
+/// seconds or minutes later.
 fn arm_parent_death_signal() -> Result<(), Error> {
     // SAFETY: `PR_SET_PDEATHSIG` only sets the calling thread's parent-death
     // signal attribute. It reads and writes no caller memory, and the remaining
@@ -946,11 +952,37 @@ pub(super) const CONTAINER_INIT_ARMING_STALL: std::time::Duration =
 /// deadline most needs to be able to end.
 ///
 /// The structurally better home for this is reverie's `Container::run`, before
-/// `setup()`, which would also close the fork-to-prctl window. That is a
-/// reverie-side change plus a pin bump; this closes the six sites now.
+/// `setup()`, which would also close the rest of the fork-to-prctl window (the
+/// part `--max-log-bytes` opens is closed here, by the check right after the
+/// `prctl`). That is a reverie-side change plus a pin bump; this closes the six
+/// sites now.
 pub(super) fn arm_container_init_guards() -> Result<(), SerializableError> {
     arm_parent_death_signal().map_err(SerializableError::from)?;
+    // Right after the death signal and before anything can start a guest: a
+    // parent that crossed --max-log-bytes and exited 123 before the `prctl`
+    // above will never send it, so stop here instead.
+    super::tracing::exit_if_log_cap_already_crossed();
     install_container_init_stop_handlers().map_err(SerializableError::from)?;
+    Ok(())
+}
+
+/// The `run --namespace-only` counterpart of [`arm_container_init_guards`], run
+/// from Reverie's `pre_exec` in the forked child that then execs the guest as
+/// PID 1 of its namespace. Only the death signal is armed; see the launch
+/// site in `run.rs` for why the stop handlers are not.
+///
+/// It runs between fork and exec, so it must stay async-signal-safe: `prctl`,
+/// one atomic read-modify-write, `_exit` and the error value only.
+pub(super) fn arm_namespace_only_guest() -> Result<(), reverie::Errno> {
+    // SAFETY: as in `arm_parent_death_signal`: it reads and writes no caller
+    // memory.
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } == -1 {
+        return Err(reverie::Errno::last());
+    }
+    // In this mode the parent is the only hermit process and holds the log
+    // subscriber, so it is the likeliest crosser: see
+    // `exit_if_log_cap_already_crossed`.
+    super::tracing::exit_if_log_cap_already_crossed();
     Ok(())
 }
 
@@ -2153,5 +2185,147 @@ mod tests {
             assert!(allowed.contains(&selected), "selected CPU {selected}");
         }
         assert_eq!(choose_affinity_core(&[]), None);
+    }
+
+    /// How the candidate init in [`arm_after_the_parent_crossed`] ended: its
+    /// raw wait status, and whether it wrote the byte a guest start would
+    /// follow.
+    type ArmOutcome = (i32, bool);
+
+    /// The fork-to-`prctl` window, made deterministic. H (this isolated
+    /// process) is a child subreaper and forks P, which holds the invocation's
+    /// capped budget; P forks C, the candidate init, then crosses the cap
+    /// through the production `CappedWriter` path, which exits 123. C waits
+    /// until its parent is no longer P -- that is, until P has run `exit_notify`
+    /// and C was re-parented to H -- so `arm` deterministically runs after the
+    /// parent that crossed is gone. (EOF on a pipe would not do: P's descriptors
+    /// close before `exit_notify`, so C could arm in time and be killed by the
+    /// death signal with or without the guard, and the test would pass either
+    /// way.) If `arm` returns, C writes the marker byte and exits 0.
+    fn arm_after_the_parent_crossed(arm: fn() -> bool) -> ArmOutcome {
+        use std::io::Read as _;
+
+        in_isolated_process(move || {
+            let budget = crate::tracing::LogBudget::new(100).map_err(|e| e.to_string())?;
+            // Only in this isolated process; the harness registers nothing.
+            crate::tracing::register_invocation_log_budget(Some(budget.clone()));
+            // SAFETY: `prctl` touches no caller memory; this process is a fresh
+            // fork, so the attribute reaches no other test.
+            if unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1) } == -1 {
+                return Err(format!("subreaper: {}", io::Error::last_os_error()));
+            }
+            let mut fds = [0; 2];
+            // SAFETY: `fds` is a correctly sized out-parameter.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } == -1 {
+                return Err(format!("pipe: {}", io::Error::last_os_error()));
+            }
+            let (read_fd, marker_fd) = (fds[0], fds[1]);
+            // SAFETY: this process has one thread. P and C call only the code
+            // under test, write(2), usleep and _exit, and never return.
+            let p = unsafe { libc::fork() };
+            if p == -1 {
+                return Err(format!("fork P: {}", io::Error::last_os_error()));
+            }
+            if p == 0 {
+                unsafe {
+                    libc::close(read_fd);
+                    let parent = libc::getpid();
+                    let c = libc::fork();
+                    if c == -1 {
+                        libc::_exit(70);
+                    }
+                    if c == 0 {
+                        // At most 10 s, so a regression cannot hang the suite.
+                        let mut waits = 0;
+                        while libc::getppid() == parent {
+                            waits += 1;
+                            if waits > 10_000 {
+                                libc::_exit(71);
+                            }
+                            libc::usleep(1000);
+                        }
+                        if !arm() {
+                            libc::_exit(72);
+                        }
+                        libc::write(marker_fd, b"G".as_ptr().cast(), 1);
+                        libc::_exit(0);
+                    }
+                    libc::close(marker_fd);
+                    let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                    let mut writer = crate::tracing::CappedWriter::file(
+                        std::fs::File::from_raw_fd(null),
+                        0,
+                        Some(budget.clone()),
+                    );
+                    let _ = writer.write_all(&[b'a'; 60]);
+                    let _ = writer.write_all(&[b'b'; 60]);
+                    // Not reached: the second write crosses and exits 123.
+                    libc::_exit(73);
+                }
+            }
+            // SAFETY: `marker_fd` came from the pipe above and is not used
+            // again in this process.
+            unsafe { libc::close(marker_fd) };
+            let mut status = 0;
+            // SAFETY: P is our own child, and `status` outlives the call.
+            if unsafe { libc::waitpid(p, &mut status, 0) } != p {
+                return Err(format!("waitpid P: {}", io::Error::last_os_error()));
+            }
+            if !libc::WIFEXITED(status) || libc::WEXITSTATUS(status) != hermit::HERMIT_LOG_CAP_EXIT
+            {
+                return Err(format!(
+                    "P did not cross the cap and exit 123: status {status:#x}"
+                ));
+            }
+            // C was re-parented to this subreaper when P ran `exit_notify`,
+            // which happened before P could be reaped.
+            let mut c_status = 0;
+            // SAFETY: as above; C is now our only child.
+            if unsafe { libc::waitpid(-1, &mut c_status, 0) } <= 0 {
+                return Err(format!("waitpid C: {}", io::Error::last_os_error()));
+            }
+            let mut marker = Vec::new();
+            // SAFETY: `read_fd` came from the pipe above; every write end is
+            // closed now that P and C have exited.
+            unsafe { std::fs::File::from_raw_fd(read_fd) }
+                .read_to_end(&mut marker)
+                .map_err(|e| e.to_string())?;
+            Ok((c_status, !marker.is_empty()))
+        })
+    }
+
+    fn assert_stopped_by_the_crossing(name: &str, (status, marker): ArmOutcome) {
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == hermit::HERMIT_LOG_CAP_EXIT,
+            "{name}: armed after its parent crossed --max-log-bytes and exited 123, so its death \
+             signal can never arrive; it must exit 123 itself, but its wait status was \
+             {status:#x} (exit code {}){}",
+            libc::WEXITSTATUS(status),
+            if marker {
+                ", and it went on to the guest start"
+            } else {
+                ""
+            },
+        );
+        assert!(
+            !marker,
+            "{name}: it exited 123 but wrote the guest-start marker first"
+        );
+    }
+
+    /// A container init whose parent crossed the cap before the init armed its
+    /// death signal must not go on to start a guest.
+    #[test]
+    fn log_cap_crossed_before_the_container_init_arms_stops_the_init() {
+        let outcome = arm_after_the_parent_crossed(|| arm_container_init_guards().is_ok());
+        assert_stopped_by_the_crossing("arm_container_init_guards", outcome);
+    }
+
+    /// The same window on the `run --namespace-only` launch path, whose child
+    /// arms in `pre_exec` and then execs the guest itself.
+    #[test]
+    fn log_cap_crossed_before_the_namespace_only_guest_arms_stops_the_exec() {
+        let outcome = arm_after_the_parent_crossed(|| arm_namespace_only_guest().is_ok());
+        assert_stopped_by_the_crossing("arm_namespace_only_guest", outcome);
     }
 }

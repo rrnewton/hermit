@@ -16,6 +16,7 @@ use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::ptr::NonNull;
 use std::sync::Arc;
+use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
@@ -434,6 +435,72 @@ fn claim_crossing(admission: &AtomicU64) -> bool {
 /// Admitted writes that have not finished.
 fn writes_in_progress(admission: &AtomicU64) -> u64 {
     admission.load(Ordering::Acquire) & !CROSSED
+}
+
+/// Whether some process has already claimed the crossing, read the way
+/// [`exit_if_log_cap_already_crossed`] needs: with a read-modify-write that
+/// changes nothing (`fetch_or(0)`) and has acquire AND release ordering, not
+/// with a load. See that function for why the release half matters.
+fn crossing_already_claimed(admission: &AtomicU64) -> bool {
+    admission.fetch_or(0, Ordering::AcqRel) & CROSSED != 0
+}
+
+/// The invocation's budget, for code that runs in a freshly forked process
+/// and has no `GlobalOpts`: the container init's arming point and the
+/// `run --namespace-only` `pre_exec` callback. `main` registers it once, right
+/// after `GlobalOpts::prepare_log_budget` and before any fork. Nothing else
+/// registers one, so a unit test that prepares a budget leaves none behind.
+static INVOCATION_LOG_BUDGET: OnceLock<LogBudget> = OnceLock::new();
+
+/// Make the invocation's budget reachable from [`exit_if_log_cap_already_crossed`].
+/// The first registration wins; `main` makes the only one.
+pub(crate) fn register_invocation_log_budget(budget: Option<LogBudget>) {
+    if let Some(budget) = budget {
+        let _ = INVOCATION_LOG_BUDGET.set(budget);
+    }
+}
+
+/// Exit 123 at once, writing nothing, if `--max-log-bytes` was already crossed.
+///
+/// Called by a process that is about to start a guest, right after it armed
+/// `PR_SET_PDEATHSIG`: the container init in `arm_container_init_guards`, and
+/// the `run --namespace-only` child in its `pre_exec`. It closes the window
+/// between the fork and that `prctl`: if the parent crossed the cap and exited
+/// 123 inside it, the death signal was armed after the parent was gone, so it
+/// will never arrive, and without this check the guest would start with
+/// nothing left to stop it.
+///
+/// WHY A READ-MODIFY-WRITE, AND WHY IT IS ENOUGH. Every cap-caused exit sets
+/// [`CROSSED`] first, with `fetch_or` in [`claim_crossing`], and every write to
+/// the admission word after it is created is a read-modify-write (the CAS in
+/// [`admit_write`], `fetch_sub` in [`finish_write`], `fetch_or` in
+/// [`claim_crossing`]). So this `fetch_or(0, AcqRel)` heads a release sequence
+/// containing every later change to the word. If it reads CROSSED clear, the
+/// crosser's `fetch_or(CROSSED, AcqRel)` comes later in the word's modification
+/// order, reads a value from that release sequence, and so synchronizes with
+/// this read-modify-write. The caller's `prctl` is sequenced before it, so the
+/// kernel's store of this process's death signal happens before everything
+/// the crosser does next, including its `_exit`. The exit of the parent thread
+/// (the crosser itself, or a sibling the group exit kills under `siglock`) runs
+/// `exit_notify`, which reads each child's death signal under `tasklist_lock`
+/// and sends it, so this process is killed. If it reads CROSSED set, it exits
+/// here, before any guest exists. A plain acquire load would not do: a store
+/// (the death signal) followed by a load here, against the crosser's
+/// read-modify-write followed by its read of the death signal, is the
+/// store-buffering shape, in which both sides can miss each other.
+///
+/// It closes only the part of the fork-to-`prctl` window that the cap opens. A
+/// parent killed for another reason inside that window still leaves the child
+/// unsupervised; see `arm_parent_death_signal`.
+pub(crate) fn exit_if_log_cap_already_crossed() {
+    if let Some(budget) = INVOCATION_LOG_BUDGET.get()
+        && crossing_already_claimed(&budget.cells().admission)
+    {
+        // SAFETY: _exit has no preconditions and is async-signal-safe, so it
+        // is also sound in a `pre_exec` callback. Nothing is written: the
+        // crossing process owns the final message.
+        unsafe { libc::_exit(hermit::HERMIT_LOG_CAP_EXIT) }
+    }
 }
 
 /// Wait until no admitted write is in progress, polling with `nanosleep`, for

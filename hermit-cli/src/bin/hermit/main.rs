@@ -566,8 +566,11 @@ fn main() {
     if global.max_log_bytes.is_some() {
         self::tracing::enable_log_cap_exit_bound();
     }
+    // Registered before any fork, so a container init can check the crossing
+    // bit right after it arms its death signal.
     let result = global
         .prepare_log_budget()
+        .map(|()| self::tracing::register_invocation_log_budget(global.log_budget()))
         .and_then(|()| global.open_log_file())
         .and_then(|()| command.main(&global));
 
