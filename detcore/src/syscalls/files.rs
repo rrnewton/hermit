@@ -1725,6 +1725,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Read,
     ) -> Result<Vec<u8>, Error> {
         const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;
+        const CAPTURE_CHUNK_BYTES: usize = 64 * 1024;
 
         // A backend-owned read may have advanced the kernel cursor without
         // passing through Detcore's logical procfs cursor (KVM does this for
@@ -1758,25 +1759,39 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(err) => return Err(err.into()),
         }
 
-        // The capture reads land in the caller's own buffer, and the caller
-        // later receives only the sanitized bytes. Without a restore, every
-        // host byte past the sanitized length stays in guest memory after the
-        // read returns: all of a host `/proc/modules` chunk behind its empty
-        // sanitized view (https://github.com/rrnewton/hermit/issues/3815).
-        // Save what the capture can overwrite and put it back, so the only
-        // change the guest sees is the sanitized prefix that the read returns.
-        let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
-        let mut saved = vec![0; call.len().min(MAX_SNAPSHOT_BYTES)];
-        let readable = read_guest_prefix(&guest.memory(), remote_buf, &mut saved)?;
-        saved.truncate(readable);
-        let mut clobbered = 0;
+        // Capture into a private mapping, never into the caller's buffer. The
+        // caller receives only the sanitized bytes, so every host byte a
+        // capture read left in its buffer past that length would stay visible
+        // after the read returns: all of a host `/proc/modules` chunk behind
+        // its empty sanitized view
+        // (https://github.com/rrnewton/hermit/issues/3815). Saving and
+        // restoring the caller's buffer cannot cover every destination the
+        // kernel may write, such as a PROT_WRITE-only page that the save
+        // cannot read. The mapping is unmapped before returning, so no host
+        // byte stays in guest memory, and the caller's buffer sees only the
+        // sanitized publication with its native access checks.
+        let mapped = guest
+            .inject_with_retry(Syscall::Mmap(
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(CAPTURE_CHUNK_BYTES)
+                    .with_prot(ProtFlags::PROT_READ | ProtFlags::PROT_WRITE)
+                    .with_flags(MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS)
+                    .with_fd(-1)
+                    .with_offset(0),
+            ))
+            .await?;
+        let mapping = usize::try_from(mapped)
+            .ok()
+            .and_then(AddrMut::<u8>::from_raw)
+            .ok_or(Errno::EFAULT)?;
+        let capture = call.with_buf(Some(mapping)).with_len(CAPTURE_CHUNK_BYTES);
         let mut contents = Vec::new();
         let result = loop {
-            let bytes_read = match self.record_or_replay(guest, call).await {
+            let bytes_read = match self.record_or_replay(guest, capture).await {
                 Ok(bytes_read) => bytes_read as usize,
                 Err(err) => break Err(err.into()),
             };
-            clobbered = clobbered.max(bytes_read);
             if bytes_read == 0 {
                 break Ok(contents);
             }
@@ -1785,18 +1800,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
 
             let mut chunk = vec![0; bytes_read];
-            if let Err(err) = guest.memory().read_exact(remote_buf, &mut chunk) {
+            if let Err(err) = guest.memory().read_exact(mapping, &mut chunk) {
                 break Err(err.into());
             }
             contents.extend_from_slice(&chunk);
         };
-        // The kernel wrote `clobbered` bytes, so they were mapped and readable
-        // when `saved` was taken; `saved` is shorter only past the cap, where
-        // the capture has already failed with EFBIG.
-        let restore = &saved[..clobbered.min(saved.len())];
-        if !restore.is_empty() {
-            guest.memory().write_exact(remote_buf, restore)?;
-        }
+        guest
+            .inject_with_retry(Syscall::Munmap(
+                syscalls::Munmap::new()
+                    .with_addr(Some(Addr::from(mapping).cast()))
+                    .with_len(CAPTURE_CHUNK_BYTES),
+            ))
+            .await?;
         result
     }
 

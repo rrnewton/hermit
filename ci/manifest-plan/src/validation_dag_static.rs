@@ -1165,10 +1165,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The 32 readdir_order tests
     // (https://github.com/rrnewton/hermit/pull/3226) retain all 29 prior
     // identities selected after the node's five named skips (measured 61).
-    // The two procfs_caller_buffer tests
+    // The four procfs_caller_buffer tests
     // (https://github.com/rrnewton/hermit/issues/3815) retain all 61 prior
-    // identities selected after the node's five named skips (measured 63).
-    ("test.detcore_misc", 63),
+    // identities selected after the node's five named skips (measured 65).
+    ("test.detcore_misc", 65),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1498,8 +1498,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 63-test tests_misc selection.
-    ("test.detcore_misc_on_host", 63),
+    // The host node carries the identical 65-test tests_misc selection.
+    ("test.detcore_misc_on_host", 65),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).

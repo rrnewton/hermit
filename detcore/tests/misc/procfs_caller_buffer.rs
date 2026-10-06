@@ -13,7 +13,8 @@
 //! empty file (https://github.com/rrnewton/hermit/issues/3815), so the first
 //! read returns 0, and the host module table the capture wrote into the buffer
 //! must not still be there. Each test uses a fresh descriptor, so its call is
-//! the one that performs the capture.
+//! the one that performs the capture. The write-only cases cover a destination
+//! the kernel may write but a tracer's protection-respecting read cannot see.
 
 use std::fs::File;
 use std::os::fd::AsRawFd;
@@ -65,5 +66,63 @@ fn procfs_pread_leaves_no_host_bytes_in_the_caller_buffer() {
         let n = unsafe { libc::pread(file.as_raw_fd(), buf.as_mut_ptr().cast(), LEN, 0) };
         assert_eq!(n, 0);
         assert_untouched(&buf, "pread");
+    });
+}
+
+/// A short read into a page the guest made PROT_WRITE-only. The kernel's read
+/// may write it, but `process_vm_readv` cannot read it, so a save of the
+/// caller's buffer would come back empty.
+const WRITE_ONLY_COUNT: usize = 8;
+
+fn assert_write_only_destination_untouched(
+    call: &str,
+    read: impl FnOnce(libc::c_int, *mut libc::c_void) -> isize,
+) {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    unsafe { std::ptr::write_bytes(mapping.cast::<u8>(), SENTINEL, page) };
+    assert_eq!(
+        unsafe { libc::mprotect(mapping, page, libc::PROT_WRITE) },
+        0
+    );
+    let file = File::open("/proc/modules").unwrap();
+    let n = read(file.as_raw_fd(), mapping);
+    assert_eq!(
+        unsafe { libc::mprotect(mapping, page, libc::PROT_READ | libc::PROT_WRITE) },
+        0
+    );
+    let buf = unsafe { std::slice::from_raw_parts(mapping.cast::<u8>(), page) };
+    assert_eq!(n, 0);
+    assert_untouched(buf, call);
+    assert_eq!(unsafe { libc::munmap(mapping, page) }, 0);
+}
+
+#[test]
+fn procfs_read_leaves_no_host_bytes_in_a_write_only_buffer() {
+    require_host_modules();
+    super::det_test_fn_without_pmu(|| {
+        assert_write_only_destination_untouched("write-only read", |fd, buf| unsafe {
+            libc::read(fd, buf, WRITE_ONLY_COUNT)
+        });
+    });
+}
+
+#[test]
+fn procfs_pread_leaves_no_host_bytes_in_a_write_only_buffer() {
+    require_host_modules();
+    super::det_test_fn_without_pmu(|| {
+        assert_write_only_destination_untouched("write-only pread", |fd, buf| unsafe {
+            libc::pread(fd, buf, WRITE_ONLY_COUNT, 0)
+        });
     });
 }
