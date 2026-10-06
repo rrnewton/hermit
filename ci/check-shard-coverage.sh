@@ -423,6 +423,45 @@ prepared_nextest_artifact_contract() {
         grep -Fqx '          require -f target/ci/nextest-binaries/current.json' <<<"$body"
 }
 
+# Every node of test-debug and test-release runs inside ci/run-hosted-node.sh's
+# network namespace, where Cargo cannot download anything. lint.clippy compiles
+# against the locked registry crates and git checkouts, and every
+# prepared-Nextest consumer re-hashes each git dependency's Cargo checkout
+# (sources() in ci/manifest-plan/src/nextest_binaries.rs). A rust-cache restore
+# does not supply them: its key hashes the runner's installed toolchains, so it
+# misses whenever a runner image's default stable rustc differs from
+# build-debug's. Run 37469056816 failed three shards that way. Each job must
+# therefore run an unconditional `cargo fetch --locked` step before the step
+# that enters the namespace. strict-compat is not listed because neither of its
+# nodes runs Cargo or verifies the prepared-Nextest record.
+locked_source_jobs=(test-debug test-release)
+locked_sources_fetched_contract() {
+    local workflow_text=$1 job body step fetch_line enter_line
+    for job in "${locked_source_jobs[@]}"; do
+        body=$(workflow_job_body "$job" "$workflow_text") || return 1
+        step=$(workflow_step_body "Fetch locked workspace dependencies" "$body" |
+            grep -Ev '^[[:space:]]*(#|$)') || return 1
+        [[ $step == '        run: cargo fetch --locked' ]] || return 1
+        fetch_line=$(grep -nFx '      - name: Fetch locked workspace dependencies' <<<"$body" | cut -d: -f1)
+        enter_line=$(grep -m1 -nE '^        run: \./ci/run-hosted-node\.sh ' <<<"$body" | cut -d: -f1)
+        [[ $fetch_line =~ ^[0-9]+$ && $enter_line =~ ^[0-9]+$ ]] &&
+            ((fetch_line < enter_line)) || return 1
+    done
+}
+
+# Remove one named step, and the lines that belong to it, from one job only.
+drop_job_step() {
+    local job=$1 step_name=$2 workflow_text=$3 body mutated
+    body=$(workflow_job_body "$job" "$workflow_text") || return 1
+    mutated=$(awk -v marker="      - name: $step_name" '
+        $0 == marker { skip = 1; next }
+        skip && /^      (- |# )/ { skip = 0 }
+        !skip { print }
+    ' <<<"$body")
+    [[ $mutated != "$body" ]] || return 1
+    printf '%s' "${workflow_text/"$body"/"$mutated"}"
+}
+
 # The completed-build job is the literal contraction
 #   build.buck_release_artifact + build.workspace -> build.e2e_artifact
 # with build.workspace supplied by build-debug's tree. It must run both shard
@@ -977,6 +1016,52 @@ do
         fi
     done
 done
+if ! locked_sources_fetched_contract "$workflow_text"; then
+    echo "check-shard-coverage.sh: FAIL — ${locked_source_jobs[*]} must each run an unconditional 'cargo fetch --locked' step before ci/run-hosted-node.sh enters the network namespace (run 37469056816)" >&2
+    status=1
+fi
+# Each mutation must be refused: the fetch step deleted from one job, made
+# conditional, run without --locked, or moved after the namespace entry.
+for job in "${locked_source_jobs[@]}"; do
+    if ! unfetched_job=$(drop_job_step "$job" "Fetch locked workspace dependencies" "$workflow_text") ||
+        [[ $unfetched_job == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — locked-source fetch deletion did not change $job" >&2
+        status=1
+    elif locked_sources_fetched_contract "$unfetched_job"; then
+        echo "check-shard-coverage.sh: FAIL — locked-source guard accepted $job without its fetch step" >&2
+        status=1
+    fi
+done
+fetch_from=(
+    '        run: cargo fetch --locked'
+    '        run: cargo fetch --locked'
+)
+fetch_to=(
+    $'        if: false\n        run: cargo fetch --locked'
+    '        run: cargo fetch'
+)
+for index in "${!fetch_from[@]}"; do
+    if ! weakened_fetch=$(mutate_job_step test-debug "Fetch locked workspace dependencies" \
+        "${fetch_from[index]}" "${fetch_to[index]}" "$workflow_text") ||
+        [[ $weakened_fetch == "$workflow_text" ]]; then
+        echo "check-shard-coverage.sh: FAIL — locked-source fetch mutation $index did not change test-debug" >&2
+        status=1
+    elif locked_sources_fetched_contract "$weakened_fetch"; then
+        echo "check-shard-coverage.sh: FAIL — locked-source guard accepted a weakened test-debug fetch (mutation $index)" >&2
+        status=1
+    fi
+done
+late_run_line='        run: ./ci/run-hosted-node.sh portable "${{ matrix.nodes }}"'
+if ! late_fetch=$(drop_job_step test-release "Fetch locked workspace dependencies" "$workflow_text") ||
+    ! late_fetch=$(mutate_job_step test-release 'Run shard nodes (${{ matrix.slug }})' "$late_run_line" \
+        "$late_run_line"$'\n      - name: Fetch locked workspace dependencies\n        run: cargo fetch --locked' "$late_fetch") ||
+    [[ $late_fetch == "$workflow_text" ]]; then
+    echo "check-shard-coverage.sh: FAIL — locked-source late-fetch mutation did not change test-release" >&2
+    status=1
+elif locked_sources_fetched_contract "$late_fetch"; then
+    echo "check-shard-coverage.sh: FAIL — locked-source guard accepted a test-release fetch after the namespace entry" >&2
+    status=1
+fi
 if ! prepared_nextest_producer_contract "$workflow_text"; then
     echo "check-shard-coverage.sh: FAIL — build-debug must re-assert the prepared Nextest record after its last Cargo build and before packing" >&2
     status=1
