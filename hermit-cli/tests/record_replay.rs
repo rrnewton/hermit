@@ -1620,7 +1620,10 @@ fn record_nested_mkdir_side_effects() {
 
 /// A successful mkdir proves that its parent directories existed at record
 /// time, but a standalone replay starts from an empty chroot that holds none of
-/// them. `git clone <src> <existing>/clone` is the real-world instance.
+/// them. `git clone <src> <existing>/clone` is the real-world instance. This
+/// pins the legacy `mkdir` syscall, which coreutils `mkdir` (without `-p`)
+/// issues on x86_64; the mkdirat test below covers the descriptor-relative
+/// form.
 #[test]
 fn replay_mkdir_beneath_a_directory_that_only_existed_at_record_time() {
     let _guard = hermit_record_lock();
@@ -1647,6 +1650,36 @@ fn replay_mkdir_beneath_a_directory_that_only_existed_at_record_time() {
         host.path().join("absolute").is_dir() && cwd.join("relative-parent/relative").is_dir(),
         "recording did not create the directories on the host"
     );
+}
+
+/// The mkdirat form of the test above: AT_FDCWD-relative after a chdir, and
+/// relative to an opened directory, each followed by a second level through the
+/// directory it created. Replay creates the parents of a mkdirat whose dirfd is
+/// confined to the replay root, so it is injected and must reproduce the
+/// recorded success.
+#[test]
+fn replay_mkdirat_beneath_a_directory_that_only_existed_at_record_time() {
+    let _guard = hermit_record_lock();
+    let host = tempfile::tempdir().expect("failed to create pre-existing host directory");
+    fs::create_dir_all(host.path().join("cwd/relative-parent"))
+        .expect("failed to create AT_FDCWD mkdirat fixture");
+    fs::create_dir(host.path().join("dirfd-parent"))
+        .expect("failed to create dirfd mkdirat fixture");
+
+    record_then_replay_command(
+        "mkdirat-beneath-record-time-directory",
+        &workload("c_record_replay_mkdirat_parent").path,
+        &[host.path().as_os_str()],
+    );
+    for created in [
+        "cwd/relative-parent/at-fdcwd/child",
+        "dirfd-parent/at-dirfd/child",
+    ] {
+        assert!(
+            host.path().join(created).is_dir(),
+            "recording did not create {created} on the host"
+        );
+    }
 }
 
 /// Exercises the replay-only distinction between an EEXIST directory and an

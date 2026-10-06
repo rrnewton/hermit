@@ -1334,6 +1334,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_mkdirat_parent.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_mkdirat_parent.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and replays, standalone, successful AT_FDCWD-relative and descriptor-relative mkdirat calls beneath directories that existed only at record time."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_path_queries.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_path_queries.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks that faccessat/faccessat2, chdir/getcwd and legacy path mutations replay from the recording rather than from the replay chroot."
