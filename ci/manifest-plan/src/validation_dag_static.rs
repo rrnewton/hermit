@@ -790,7 +790,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest-plan's
     // runner::tests::a_diverged_chaos_cell_is_a_determinism_failure_as_in_verify
     // retains all 980: 981.
-    ("test.regular_crates", 981),
+    // detcore-model's config::tests::process_exits_complete_asynchronously_never_enters_the_legacy_form
+    // (the C3.5 pin bump) retains all 981: 982.
+    ("test.regular_crates", 982),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1679,7 +1681,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two shared_dequeue_timers tests listed there retain all 977: 979.
     // The path-included validate_plan test listed there retains all 979: 980.
     // The chaos determinism-failure test listed there retains all 980: 981.
-    ("test.regular_crates_on_host", 981),
+    // The same detcore-model legacy-form test retains all 981: 982.
+    ("test.regular_crates_on_host", 982),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

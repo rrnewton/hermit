@@ -1525,7 +1525,11 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// - every other key supplies the one capability of the same meaning.
 ///
 /// This inverts [`to_legacy_backend_json`] for every capability value the keys
-/// can express, which includes every backend's own constant.
+/// can express, which includes every backend's own constant except for
+/// capabilities added after the legacy form froze: those never enter it, as
+/// `record_host_inputs` does not, and read back as their default. The only one
+/// is `process_exits_complete_asynchronously`, true only for in-guest
+/// LiteInst, which never travels through this DBT-only form.
 ///
 /// `kvm_shared_dequeue_timers` supplies no capability. It was read into a
 /// `Config` field that chose the controlled signal path, and that choice is
@@ -2207,6 +2211,14 @@ mod tests {
         backend
     }
 
+    /// `backend` as the legacy form can carry it: capabilities added after the
+    /// form froze never enter it and read back as their default (see
+    /// [`process_exits_complete_asynchronously_never_enters_the_legacy_form`]).
+    fn legacy_expressible(mut backend: BackendCapabilities) -> BackendCapabilities {
+        backend.process_exits_complete_asynchronously = false;
+        backend
+    }
+
     #[test]
     fn legacy_backend_json_round_trips_every_backend_capabilities_constant() {
         for (name, backend) in [
@@ -2229,15 +2241,19 @@ mod tests {
                 };
                 let json = to_legacy_backend_json(&sent).unwrap();
                 let received = from_legacy_backend_json(&json).unwrap();
-                assert_eq!(received.backend, backend, "{name}");
+                assert_eq!(received.backend, legacy_expressible(backend), "{name}");
                 assert_eq!(
                     received.sequentialize_threads, sequentialize_threads,
                     "{name}"
                 );
                 assert_controlled_key(&json, &backend, sequentialize_threads, name);
+                let expressible = Config {
+                    backend: legacy_expressible(backend),
+                    ..sent.clone()
+                };
                 assert_eq!(
                     serde_json::to_string(&received).unwrap(),
-                    serde_json::to_string(&sent).unwrap(),
+                    serde_json::to_string(&expressible).unwrap(),
                     "{name}"
                 );
                 assert_eq!(to_legacy_backend_json(&received).unwrap(), json, "{name}");
@@ -2278,9 +2294,15 @@ mod tests {
             match from_legacy_backend_json(&edited) {
                 Ok(received) => {
                     assert_eq!(value.unwrap_or(false), controlled, "{case} was accepted");
+                    // Compared with what the legacy form can carry; see
+                    // `legacy_expressible`.
+                    let expressible = Config {
+                        backend: legacy_expressible(sent.backend),
+                        ..sent.clone()
+                    };
                     assert_eq!(
                         serde_json::to_string(&received).unwrap(),
-                        serde_json::to_string(sent).unwrap(),
+                        serde_json::to_string(&expressible).unwrap(),
                         "{case}"
                     );
                 }
@@ -2577,6 +2599,38 @@ mod tests {
         assert!(!from_legacy_backend_json(&array).unwrap().record_host_inputs);
     }
 
+    /// `process_exits_complete_asynchronously`, added after the legacy form
+    /// froze, never enters it, whatever its value, exactly as
+    /// `record_host_inputs` does not: the guest-visible bytes stay the legacy
+    /// bytes, and it reads back as false from the object and the array form.
+    #[test]
+    fn process_exits_complete_asynchronously_never_enters_the_legacy_form() {
+        let on = Config {
+            backend: BackendCapabilities::LITEINST_IN_GUEST,
+            ..Config::default()
+        };
+        assert!(on.backend.process_exits_complete_asynchronously);
+        let off = Config {
+            backend: legacy_expressible(on.backend),
+            ..on.clone()
+        };
+        let json = to_legacy_backend_json(&on).unwrap();
+        assert_eq!(json, to_legacy_backend_json(&off).unwrap());
+        assert!(
+            !json.contains("process_exits_complete_asynchronously"),
+            "{json}"
+        );
+        let decoded = from_legacy_backend_json(&json).unwrap();
+        assert!(!decoded.backend.process_exits_complete_asynchronously);
+        let array = positional(&json);
+        assert!(
+            !from_legacy_backend_json(&array)
+                .unwrap()
+                .backend
+                .process_exits_complete_asynchronously
+        );
+    }
+
     /// Serde reads a derived struct from a JSON array by position, so the
     /// legacy form could be given as one. Each array reads as the object
     /// whose values it lists in order, every backend's capabilities included.
@@ -2607,7 +2661,7 @@ mod tests {
                 let array = positional(&json);
                 assert!(array.starts_with('['), "{array}");
                 let received = from_legacy_backend_json(&array).unwrap();
-                assert_eq!(received.backend, backend, "{name}");
+                assert_eq!(received.backend, legacy_expressible(backend), "{name}");
                 assert_eq!(
                     received.sequentialize_threads, sequentialize_threads,
                     "{name}"

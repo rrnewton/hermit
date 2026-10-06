@@ -5592,7 +5592,10 @@ mod tests {
     /// identity check became the capability it selected:
     /// `discover_live_file_metadata` split into the first four fields, the old
     /// `backend_reports_physical_process_exits` became two, and
-    /// `backend_is_kvm` became the last five.
+    /// `backend_is_kvm` became the last five. One field is newer than that
+    /// transcription: `process_exits_complete_asynchronously` (Reverie
+    /// 056c8cac), true only for in-guest LiteInst, whose process exits complete
+    /// some time after the tool grants them.
     fn golden_backend_capabilities(backend: Backend) -> serde_json::Value {
         let sabre = backend == Backend::Sabre;
         let kvm = backend == Backend::Kvm;
@@ -5608,6 +5611,7 @@ mod tests {
             "virtualizes_syscall_clobbers": sabre,
             "needs_killed_thread_rpc_cancellation": in_guest_liteinst || sabre || dbt || kvm,
             "reports_physical_process_exits": sabre,
+            "process_exits_complete_asynchronously": in_guest_liteinst,
             "signal_interrupts_external_syscalls": sabre,
             "tracks_process_children": !dbt,
             "runs_exit_robust_list": backend == Backend::Ptrace,
