@@ -279,6 +279,16 @@ fn anonymous_proc_fd_identity(target: &[u8]) -> Option<AnonymousProcFdIdentity> 
     None
 }
 
+/// Whether `target` is a complete pipe or socket link target, or one a short
+/// buffer may have cut from such a target: it starts with `pipe:[` or
+/// `socket:[`, or is itself a prefix of one of them. A path, such as the one
+/// a named FIFO's link names, is neither.
+fn may_be_anonymous_proc_fd_target(target: &[u8]) -> bool {
+    [b"pipe:[".as_slice(), b"socket:[".as_slice()]
+        .into_iter()
+        .any(|prefix| target.starts_with(prefix) || prefix.starts_with(target))
+}
+
 impl AnonymousProcFdIdentity {
     /// Whether a `stat` of the link describes the object this link target
     /// names: the same kind of object and the same inode.
@@ -468,6 +478,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// was keyed on devices (<https://github.com/rrnewton/hermit/issues/3307>),
     /// so a truncated read of the guest's own link can still name a different
     /// inode at replay than in the recording.
+    ///
+    /// Only a target that is, or may have been cut short from, `pipe:[N]` or
+    /// `socket:[N]` is considered (`may_be_anonymous_proc_fd_target`). A named
+    /// FIFO is a pipe to `fstat`, but its link names its path, as on Linux,
+    /// and is left as the kernel returned it.
     async fn own_proc_fd_link_identity<G>(
         &self,
         guest: &mut G,
@@ -477,6 +492,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     where
         G: Guest<Self>,
     {
+        if !may_be_anonymous_proc_fd_target(observed_target) {
+            return Ok(None);
+        }
         let virtualize_metadata = guest.config().virtualize_metadata;
         if !virtualize_metadata && let Some(identity) = anonymous_proc_fd_identity(observed_target)
         {
@@ -1349,6 +1367,48 @@ mod tests {
                 *guest.determinized.lock().unwrap(),
                 [RawInode::new(0, inode)]
             );
+        }
+
+        /// A named FIFO is a pipe to `fstat`, but Linux names it by its path
+        /// in `/proc/self/fd/<fd>`. Its own link must be left as the kernel
+        /// returned it, in both metadata modes, without an `fstat`.
+        #[tokio::test]
+        async fn a_named_fifos_own_link_keeps_its_path() {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("fifo");
+            nix::unistd::mkfifo(&path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+            // O_RDWR does not wait for a peer on Linux.
+            let fifo = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap();
+            let target = path.as_os_str().as_bytes().to_vec();
+            for virtualize_metadata in [true, false] {
+                let scratch = Pages::map(1, 1);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.answers_determinize_inode = true;
+                guest.config.virtualize_metadata = virtualize_metadata;
+
+                let own = rewrite_own(&tool, &mut guest, fifo.as_raw_fd(), &target, 256).await;
+
+                assert_eq!(
+                    String::from_utf8_lossy(&own),
+                    String::from_utf8_lossy(&target),
+                    "virtualize_metadata={virtualize_metadata}: a named FIFO's link names its path"
+                );
+                assert_eq!(
+                    guest.injected,
+                    [],
+                    "virtualize_metadata={virtualize_metadata}"
+                );
+                assert_eq!(
+                    *guest.determinized.lock().unwrap(),
+                    [],
+                    "virtualize_metadata={virtualize_metadata}"
+                );
+            }
         }
     }
 }
