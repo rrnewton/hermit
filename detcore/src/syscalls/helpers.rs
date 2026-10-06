@@ -1275,7 +1275,11 @@ impl NonblockableSyscall for reverie::syscalls::RtSigtimedwait {
         Errno::EINTR
     }
 
-    /// Signals in the wait's own set are accepted by it, not interrupting.
+    /// Signals in the wait's own set are accepted by it, not interrupting. A set
+    /// that cannot be read counts as empty, which nothing observes: the wait's
+    /// first probe runs before any pending signal is considered
+    /// (`KernelSignalWait::inject_first_probe`) and fails with `EFAULT`, as Linux
+    /// fails the call when it cannot copy the set.
     fn signals_consumed_by_wait<M: MemoryAccess>(&self, memory: &M) -> KernelSigset {
         self.set()
             .and_then(|set| memory.read_value(set.cast::<KernelSigset>()).ok())
@@ -1681,13 +1685,17 @@ where
 /// `KernelSignalWait::inject_absorbing` cannot absorb safely end the wait with a
 /// restart instead, after which the call runs again from the start.
 ///
-/// The first probe runs under the guest's own mask. If it would block, every
-/// blockable signal is blocked for the rest of the wait, so later probes cannot be
-/// stopped by one and every signal that arrives stays pending in the kernel, where
-/// `/proc` reports it. Each turn classifies the pending set against the guest's
-/// mask and dispositions, and an interrupting signal ends the wait with the call's
-/// restart errno (see `KernelSignalWait::interrupted_with_state`). The guest's mask
-/// is restored before returning, so the signal is delivered as the call returns.
+/// The first probe runs under the guest's own mask, and before the first check
+/// for a pending signal (`KernelSignalWait::inject_first_probe`): Linux reports a
+/// descriptor that is ready when the call begins, a queued event, and an
+/// argument error before it looks at pending signals, so the probe's result
+/// stands whenever the signal arrived. If it would block, every blockable signal
+/// is blocked for the rest of the wait, so later probes cannot be stopped by one
+/// and every signal that arrives stays pending in the kernel, where `/proc`
+/// reports it. Each turn classifies the pending set against the guest's mask and
+/// dispositions, and an interrupting signal ends the wait with the call's restart
+/// errno (see `KernelSignalWait::interrupted_with_state`). The guest's mask is
+/// restored before returning, so the signal is delivered as the call returns.
 async fn retry_blocking_wait_with_kernel_signal_state<T, G, C>(
     guest: &mut G,
     call0: C,
@@ -1707,26 +1715,36 @@ where
     );
     let mut rsrc = rsrc.clone();
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
+    let mut first_turn = true;
 
     let result = loop {
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
         let _ = resource_request(guest, rsrc.clone()).await;
-        let state = match signals.interrupted_with_state(guest).await {
-            Ok((false, state)) => state,
-            Ok((true, _)) => {
-                let errno = call0.kernel_restart_errno();
-                tracing::trace!(
-                    "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
-                    call.display(&guest.memory()),
-                    errno
-                );
-                break Err(errno.into());
-            }
-            Err(error) => break Err(error),
-        };
+        let first = std::mem::take(&mut first_turn);
         // Never `inject_with_retry`: see `KernelSignalWait`.
-        let syscall_result = match signals.inject_absorbing_after(guest, call, state).await {
+        let injected = if first {
+            // The first probe runs before the check, so a source that was ready when
+            // the call began, or an argument error, is reported as Linux reports it
+            // whatever signal is pending (`inject_first_probe`).
+            signals.inject_first_probe(guest, call).await
+        } else {
+            let state = match signals.interrupted_with_state(guest).await {
+                Ok((false, state)) => state,
+                Ok((true, _)) => {
+                    let errno = call0.kernel_restart_errno();
+                    tracing::trace!(
+                        "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
+                        call.display(&guest.memory()),
+                        errno
+                    );
+                    break Err(errno.into());
+                }
+                Err(error) => break Err(error),
+            };
+            signals.inject_absorbing_after(guest, call, state).await
+        };
+        let syscall_result = match injected {
             Ok(result) => result,
             Err(error) => {
                 tracing::trace!(
@@ -1748,6 +1766,22 @@ where
                 res
             );
             break res;
+        }
+        if first {
+            // The first turn's check, after its probe found nothing to report.
+            match signals.interrupted_with_state(guest).await {
+                Ok((false, _)) => {}
+                Ok((true, _)) => {
+                    let errno = call0.kernel_restart_errno();
+                    tracing::trace!(
+                        "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
+                        call.display(&guest.memory()),
+                        errno
+                    );
+                    break Err(errno.into());
+                }
+                Err(error) => break Err(error),
+            }
         }
         if signals.needs_block() {
             // Only one scratch-stack guard may be live, so release the probe's, block
@@ -1989,9 +2023,12 @@ impl KernelSignalWait {
     /// this read, which `inject_absorbing_after` takes as its first read in the same
     /// turn. The guest thread has been stopped inside the call since it was
     /// intercepted, so such a signal arrived while the call was waiting, and Linux
-    /// returns the restart errno for that. Linux would still report sources that
-    /// were ready when the call began, which this check puts behind the signal, as
-    /// the scheduler's `Signaled` path did. In a gated wait (`gates_sigchld`), a
+    /// returns the restart errno for that. Linux reports a source that was ready
+    /// when the call began, or an argument error, before any pending signal, so
+    /// `retry_blocking_wait_with_kernel_signal_state` runs its first probe before
+    /// this check (`inject_first_probe`). A source that becomes ready in a later
+    /// turn in which a signal is also pending is put behind the signal, because
+    /// the turn cannot tell which came first. In a gated wait (`gates_sigchld`), a
     /// `SIGCHLD` counts only once the scheduler made it eligible
     /// (`eligible_pending_signals`); the waits of `select` and `pselect6` do not
     /// ask (`for_select`). A `SIGCHLD` that the backend holds since
@@ -2050,7 +2087,8 @@ impl KernelSignalWait {
     ///   wait with `ERESTARTNOINTR`.
     ///
     /// A pending signal that would end the wait ends it before the injection,
-    /// with the restart errno, so it is never held. The backend has one slot for
+    /// with the restart errno, so it is never held, except by the wait's first
+    /// probe (`inject_first_probe`). The backend has one slot for
     /// a held signal, and a stop replaces what it holds. So while it holds a
     /// `SIGCHLD` or a deferred stop, an injection that another pending signal
     /// would stop is not made, and the wait ends with `ERESTARTNOINTR`; the same
@@ -2071,7 +2109,39 @@ impl KernelSignalWait {
         G: Guest<Detcore<T>>,
         S: SyscallInfo,
     {
-        self.inject_absorbing_from(guest, call, None).await
+        self.inject_absorbing_from(guest, call, None, false).await
+    }
+
+    /// The first probe of a wait, which runs before the turn's
+    /// `interrupted_with_state` check: `inject_absorbing`, except that a signal
+    /// that would end the wait neither ends it before the injection nor when it
+    /// stops the injection.
+    ///
+    /// Linux reports a descriptor that is ready when the call begins, a queued
+    /// event, and an argument error before it looks at pending signals:
+    /// `do_poll` tests `signal_pending` only when no descriptor is ready, `ep_poll`
+    /// sends queued events before it tests it, `do_epoll_wait` rejects a bad
+    /// descriptor or `maxevents` first, and `do_sigtimedwait` copies its set
+    /// first. So the probe runs even when such a signal is pending. A pending
+    /// signal that the guest does not block stops the injection before the probe
+    /// runs, on ptrace and on LiteInst alike; when the stop is identified, the
+    /// signal is held as a precious one (`HeldKind::Precious`) and the probe runs
+    /// again, so its result stands, and the backend delivers the signal as the
+    /// call returns. If the probe would block, the caller's check that follows
+    /// counts the held signal (`interrupted_with_state`) and ends the wait with
+    /// the restart errno. A stop that cannot be identified ends the wait as
+    /// `inject_absorbing` describes.
+    pub(crate) async fn inject_first_probe<T, G, S>(
+        &mut self,
+        guest: &mut G,
+        call: S,
+    ) -> Result<Result<i64, Errno>, Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+        S: SyscallInfo,
+    {
+        self.inject_absorbing_from(guest, call, None, true).await
     }
 
     /// `inject_absorbing` in a turn whose `interrupted_with_state` read `state`
@@ -2115,16 +2185,19 @@ impl KernelSignalWait {
         S: SyscallInfo,
     {
         let first = self.saved_mask.is_some().then_some(state);
-        self.inject_absorbing_from(guest, call, first).await
+        self.inject_absorbing_from(guest, call, first, false).await
     }
 
     /// `inject_absorbing`, taking `first`, if any, as the state read before the
-    /// first injection.
+    /// first injection. For `first_probe`, a signal that would end the wait does
+    /// not end it, and one that stops the injection is held
+    /// (`inject_first_probe`).
     async fn inject_absorbing_from<T, G, S>(
         &mut self,
         guest: &mut G,
         call: S,
         mut first: Option<KernelSignalState>,
+        first_probe: bool,
     ) -> Result<Result<i64, Errno>, Error>
     where
         T: RecordOrReplay,
@@ -2144,7 +2217,7 @@ impl KernelSignalWait {
             if self.gates_sigchld(guest) {
                 ends_wait &= !kernel_sigset_bit(libc::SIGCHLD);
             }
-            if before.pending & ends_wait != 0 {
+            if !first_probe && before.pending & ends_wait != 0 {
                 return Err(self.restart_errno.into());
             }
             let next = before.next_dequeued(before.blocked);
@@ -2184,7 +2257,20 @@ impl KernelSignalWait {
                 );
                 return Err(errno.into());
             };
-            match self.stop_verdict(guest, &before, signal) {
+            let bit = kernel_sigset_bit(signal);
+            let verdict = match self.stop_verdict(guest, &before, signal) {
+                // The first probe holds a signal that would end the wait and runs
+                // again (`inject_first_probe`).
+                StopVerdict::End(_)
+                    if first_probe
+                        && self.consumed & bit == 0
+                        && self.could_interrupt(&before) & bit != 0 =>
+                {
+                    StopVerdict::Absorb(HeldKind::Precious)
+                }
+                verdict => verdict,
+            };
+            match verdict {
                 StopVerdict::Absorb(kind) if absorbed < MAX_ABSORBED_STOPS => {
                     absorbed += 1;
                     let kind = self.held.map_or(kind, |held| held.kind.max(kind));
