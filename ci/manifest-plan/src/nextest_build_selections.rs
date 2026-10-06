@@ -83,6 +83,8 @@ pub(super) fn for_step(tag: &str) -> Option<&'static [&'static str]> {
             "--test",
             "epoll_pwait_zero_timeout_progress",
             "--test",
+            "external_signal_interrupt",
+            "--test",
             "file_nr_determinism",
             "--test",
             "first_seen_mtime",
