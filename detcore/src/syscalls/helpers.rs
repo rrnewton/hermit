@@ -4019,6 +4019,55 @@ mod kernel_signal_wait_failures {
         assert_eq!(kernel.lock().unwrap().requested.len(), 65);
     }
 
+    /// At the same bound, a stop that cannot be identified, after stops by a
+    /// signal whose loss does not matter (an ignored `SIGUSR1` sent again and
+    /// again), used to end a wait without a deadline with `ERESTARTNOINTR`,
+    /// which let the backend deliver the unidentified signal, possibly a
+    /// `SIGCHLD`, at a moment host timing could set. It now ends with a
+    /// `HeldSignalRefusal`; a wait with a deadline, which has no bound, goes on
+    /// (round-10 High 1 on https://github.com/rrnewton/hermit/pull/3361).
+    #[tokio::test]
+    async fn an_unidentified_stop_at_the_stop_bound_is_refused() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        for deadline in [false, true] {
+            let (mut guest, kernel) = stopping_guest(usr1, usr1);
+            {
+                let mut kernel = kernel.lock().unwrap();
+                // 64 identified stops, the bound, then one that `/proc` never
+                // shows.
+                kernel.repost_after_take = 63;
+                kernel.outcomes = VecDeque::from([MaskOutcome::StoppedBefore]);
+            }
+            let _proc = scripted_proc(&kernel);
+            let mut wait = KernelSignalWait::new(&guest, 0, true, Errno::ERESTARTNOHAND)
+                .with_deadline(deadline);
+
+            let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+            if deadline {
+                assert!(matches!(result, Ok(Ok(0))), "{result:?}");
+                assert_eq!(kernel.lock().unwrap().requested.len(), 66);
+                assert!(wait.held_unidentified);
+            } else {
+                assert_eq!(
+                    refusal(result),
+                    HeldSignalRefusal {
+                        wait: None,
+                        held: None,
+                        replacing: None,
+                        loss: HeldSignalLoss::StopBound,
+                    }
+                );
+                assert_eq!(kernel.lock().unwrap().requested.len(), 65);
+            }
+            assert_eq!(
+                kernel.lock().unwrap().taken.len(),
+                64,
+                "deadline={deadline}"
+            );
+        }
+    }
+
     /// A stop that cannot be identified while the backend holds a `SIGCHLD`
     /// replaced the `SIGCHLD` in the backend's one slot. The wait used to go on
     /// and lose it; it now ends with a `HeldSignalRefusal`, with or without a
