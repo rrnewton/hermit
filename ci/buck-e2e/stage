@@ -69,19 +69,62 @@ sha=$(git -C "$root" rev-parse HEAD)
 [[ -z $(git -C "$root" status --porcelain --untracked-files=no) ]] ||
     { echo "ci/buck-e2e/stage: commit first; cells record SOURCE_SHA=$sha" >&2; exit 2; }
 tmp=$(mktemp -d)
-trap 'rm -rf "${tmp:?}"' EXIT
+release_build= hermit_build=
+# Each background build runs in a process group of its own (setsid), and stopping it
+# signals the whole group: cargo does not pass SIGTERM on, so killing cargo alone would
+# leave its rustc, build-script and cmake processes writing into target/.
+stop_background_builds() {
+    local pid tries
+    for pid in $release_build $hermit_build; do
+        kill -TERM -- "-$pid" 2>/dev/null || true
+        wait "$pid" 2>/dev/null || true
+        for ((tries = 0; tries < 50; tries++)); do
+            kill -0 -- "-$pid" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL -- "-$pid" 2>/dev/null || true
+    done
+}
+trap 'stop_background_builds; rm -rf "${tmp:?}"' EXIT
 
 # 1. Binaries: the release harness, the validate-profile hermit and its install bundle.
-cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins --target-dir "$target_dir"
+# Cargo locks each profile directory (target/release, target/validate), so builds that
+# share one run one at a time. Three run at once instead: the release harness in
+# target/release; the validate-profile hermit, the longest build, in a target directory
+# of its own (its dependencies are built a second time there); and detcore-dbt then the
+# install bundle in target/validate, as before. The two background builds' output is
+# shown once each finishes, so the logs do not interleave. Each command is main's
+# except for the hermit build's --target-dir, so no feature set changes; the hermit
+# binary differs from a target/validate build only in the build-time DynamoRIO paths
+# reverie-dbt bakes in as a fallback (hermit finds its runtime through install_pkg).
+hermit_target_dir=$target_dir/stage-hermit
+setsid -w cargo build --manifest-path "$root/Cargo.toml" --locked --release -p hermit-manifest-plan --bins \
+    --target-dir "$target_dir" >"$tmp/release-build.log" 2>&1 &
+release_build=$!
+setsid -w cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
+    --features hermit/third-party-backends --target-dir "$hermit_target_dir" >"$tmp/hermit-build.log" 2>&1 &
+hermit_build=$!
 cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p detcore-dbt --target-dir "$target_dir"
-cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit --bin hermit \
-    --features hermit/third-party-backends --target-dir "$target_dir"
 # hermit-install's build script stages install_pkg/ next to the profile directories and
-# links libdetcore_sabre.so and libdetcore_liteinst.so into it (`--bin hermit` above
-# filters these packages out). The links resolve only when this invocation also builds
-# both cdylibs; publish-hermit-e2e-artifact.sh requires every one of them.
+# links libdetcore_sabre.so and libdetcore_liteinst.so into it. The links resolve only
+# when this invocation also builds both cdylibs; publish-hermit-e2e-artifact.sh requires
+# every one of them. Its hermit link, to ../validate/hermit, resolves once the hermit
+# build is copied there below.
 cargo build --manifest-path "$root/Cargo.toml" --locked --profile validate -p hermit-install -p detcore-sabre \
     -p detcore-liteinst --target-dir "$target_dir"
+finish_build() { # finish_build WHAT PID-VARIABLE LOG
+    local status=0
+    wait "${!2}" || status=$?
+    printf -v "$2" ''
+    cat "$3" >&2
+    if [[ $status -ne 0 ]]; then
+        echo "ci/buck-e2e/stage: the $1 failed (exit $status)" >&2
+        exit "$status"
+    fi
+}
+finish_build "release build of hermit-manifest-plan" release_build "$tmp/release-build.log"
+finish_build "validate-profile build of hermit" hermit_build "$tmp/hermit-build.log"
+install -m 755 "$hermit_target_dir/validate/hermit" "$target_dir/validate/hermit"
 mkdir -p "$staged/bin"
 for b in test-harness hermit-manifest-plan; do
     strip --strip-debug -o "$staged/bin/$b" "$target_dir/release/$b"

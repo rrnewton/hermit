@@ -1578,6 +1578,10 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     cells.timeout = 3600;
     cells.cpu_timeout = 14400;
     cells.hint.est_duration_s = 450.0;
+    // The baseline cloned from build.buck_release_artifact (8.39 GiB) is below
+    // what ci/buck-e2e/stage peaks at with its builds running side by side:
+    // cgroup memory.peak 8.69 and 9.27 GiB cold at 32 jobs, 9.47 GiB at 96.
+    cells.hint.rss_baseline_bytes = Some(10 << 30);
     cells.fail_fast_family = Some(BUCK_CELLS_TAG.into());
     added.push(cells);
 

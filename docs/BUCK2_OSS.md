@@ -423,9 +423,12 @@ validation, but the Buck cells no longer wait on them, so a failure among them
 no longer stops the cells early.
 
 The cells therefore test the Cargo-built validate-profile
-`target/validate/hermit`, which `ci/buck-e2e/stage --from-cargo` builds on the
-host in the checkout's `target/`, with the same debug assertions and overflow
-checks as a Cargo-runner run. The ledger row records `release_builder: cargo`,
+`target/validate/hermit`: `ci/buck-e2e/stage --from-cargo` builds it on the
+host in the checkout's `target/stage-hermit/`, beside its other Cargo builds,
+and copies the binary to `target/validate/hermit`. It has the same features,
+debug assertions and overflow checks as a Cargo-runner build; it differs only
+in the DynamoRIO build paths `reverie-dbt` records as a fallback, since Hermit
+finds that runtime through `install_pkg`. The ledger row records `release_builder: cargo`,
 the Cargo `e2e_payload` identity unchanged, and `e2e_runner` (`cargo`,
 `buck-local` or `buck-hybrid`). A Buck-runner request is never answered from the
 tree cache, and a Buck-runner row never answers a cargo request: the cache reads
