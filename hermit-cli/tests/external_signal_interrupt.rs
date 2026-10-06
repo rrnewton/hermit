@@ -147,17 +147,15 @@ const SIGNAL_DELAY_MS: u64 = 100;
 /// waits return at 100-101 ms (measured 2026-09-29). A wait the signal did not
 /// end returns at its 300 ms timeout or later, far outside this window.
 const WAKE_SLACK_MS: u64 = 100;
-/// Lower bound on a child-exit wake. The `exit` child starts its 100 ms sleep
-/// at `fork()`, before the parent prints `READY`, arms its wait and takes its
-/// start stamp. Under Hermit each of those syscalls advances virtual time, so
-/// the wake reads about 1 ms short of `SIGNAL_DELAY_MS` (99 ms measured on
-/// 2026-09-29 for `epoll` on both backends). 90 ms still separates a wake by the
-/// exit from an immediate return, and the upper bound is unchanged. The `tstp`
-/// cells use the same floor: their test runs in a forked child, and there the
-/// sibling sender starts its 100 ms sleep before the main thread prints `READY`,
-/// creates and arms its epoll set and takes its start stamp (99 ms measured on
-/// 2026-10-03 for `epoll` on both backends).
-const EXIT_WAKE_FLOOR_MS: u64 = 90;
+/// Lower bound on a wake by a child's exit (`exit`), by the `tstp` cells'
+/// sender, and by the `thread` and `process` senders of the patched-site and
+/// restart cells. The guest takes its start stamp before it starts any sender,
+/// so each sender's 100 ms sleep begins after the stamp. Until round 7 of
+/// https://github.com/rrnewton/hermit/pull/3361 the stamp came after the forks,
+/// the thread creation, `READY` and the epoll setup, these wakes read about
+/// 1 ms short of 100 ms (99 ms measured on 2026-09-29 and 2026-10-03), and this
+/// floor was 90 ms.
+const EXIT_WAKE_FLOOR_MS: u64 = 100;
 /// Strict-verified repetitions of each child-exit SIGCHLD cell. The kernel also
 /// posts its own SIGCHLD for the exit at a host-timed moment, so a single
 /// matched pair of runs is weak evidence that the result ignores it.
@@ -1696,9 +1694,9 @@ fn liteinst_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend() {
 /// kernel-internal errno 512 or 514 reached the guest, and glibc's
 /// `sem_timedwait` aborted on it.
 ///
-/// The lower bound is `EXIT_WAKE_FLOOR_MS` because the `thread` and `process`
-/// senders, like the `exit` child, start their 100 ms sleep before the wait
-/// takes its start stamp: these waits read 99-100 ms (measured 2026-09-29).
+/// The lower bound is `EXIT_WAKE_FLOOR_MS`, 100 ms: the `thread` and `process`
+/// senders, like the `exit` child, start their 100 ms sleep after the guest's
+/// start stamp.
 fn assert_patched_site_waits_are_interrupted(mode: FutexMode, cells: &[(&[&str], &str)]) {
     for &(args, expected) in cells {
         let run = run_cell("liteinst", mode, args, false);
