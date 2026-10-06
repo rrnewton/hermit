@@ -220,10 +220,16 @@ Each node's tag is `group.job` (e.g. `build.workspace`, `lint.clippy`).
 Since 2026-09-30 a full or portable validation compiles Hermit once, in the
 pinned root, in the `validate` Cargo profile (`Cargo.toml`: release
 optimisation with debug assertions and overflow checks kept on).
-`build.workspace_in_pinned_root` builds every workspace target, the DBT, SaBRe,
-e9patch and LiteInst resources (staged into `target/install_pkg` by
-`hermit-install`'s build script) and every prepared nextest selection in that
-profile; `build.e2e_artifact_in_pinned_root` publishes the one binary at
+`build.workspace_compile_in_pinned_root` builds every workspace target and the
+DBT, SaBRe, e9patch and LiteInst resources (staged into `target/install_pkg` by
+`hermit-install`'s build script) in that profile, and
+`build.workspace_in_pinned_root` then runs `./ci/nextest-binaries.rs prepare
+full`, which lists and records every prepared nextest selection from that
+build. Only the second node needs the prebuilt rust-script tools, so only it
+waits for `build.rust_scripts_in_pinned_root`; the Cargo build runs beside the
+rust-script build. Consumers depend on `build.workspace_in_pinned_root`, never
+on the compile node, so none starts before preparation has finished.
+`build.e2e_artifact_in_pinned_root` publishes the one binary at
 `target/ci/hermit` and as the E2E bundle. Consumers name `target/ci/hermit`
 or the bundle, never a per-profile path. The host keeps only tooling builds
 (`build.rust_scripts`, `setup.manifest_plan`, `build.manifest_guests`) for

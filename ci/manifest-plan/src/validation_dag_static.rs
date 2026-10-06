@@ -750,7 +750,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // detcore-sabre's
     // tests::detlog_forwarding_follows_the_coordinators_per_target_policy
     // retains all 967 prior identities: 967 + 1 = 968.
-    ("test.regular_crates", 968),
+    // manifest-plan's validation_dag::tests::
+    // pinned_workspace_compile_does_not_wait_for_the_rust_script_tools retains
+    // all 968: 969 (a full validation executed 969 against the 968 pin).
+    ("test.regular_crates", 969),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1226,7 +1229,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // liteinst_backend_stats_report_the_guests_own_dispatch_paths retargeted to
     // in-guest LiteInst: 144 = 120 + 23 + 1 (`cargo nextest list --profile ci`
     // with this node's skips lists 144 non-ignored matches). They load the
-    // libdetcore_liteinst.so that build.workspace_in_pinned_root's
+    // libdetcore_liteinst.so that build.workspace_compile_in_pinned_root's
     // `cargo build --profile validate --workspace --all-targets` writes beside
     // target/validate/hermit, the CARGO_BIN_EXE_hermit they run.
     // run_liteinst_finds_the_runtime_staged_as_an_installed_resource, which
@@ -1475,7 +1478,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The delegated write-back test listed there retains all 965: 966.
     // The legacy-form host-input test listed there retains all 966: 967.
     // The same detcore-sabre forwarding-policy test retains all 967: 968.
-    ("test.regular_crates_on_host", 968),
+    // The same pinned-workspace-compile ordering test retains all 968: 969.
+    ("test.regular_crates_on_host", 969),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -1805,7 +1809,7 @@ pub(super) fn config() -> DagConfig {
     }
 }
 
-const RUST_SCRIPT_ENVIRONMENT: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; "########;
+pub(super) const RUST_SCRIPT_ENVIRONMENT: &str = r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; "########;
 
 /// The measured budget of one `selftest.<name>` node. Every other field is the
 /// ordinary manifest gate's: the same labels, admitted two-worker width carried

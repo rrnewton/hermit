@@ -483,12 +483,19 @@ pub(super) fn assert_command_selection(step: &dagrun::model::Step) -> Result<(),
 /// build -- different features, or a second `-p hermit --bin hermit` link --
 /// makes preparation re-resolve features, recompile, and relink the unhashed
 /// executable the tests run. That build also links the Hermit the E2E cells
-/// run, so its features must keep every third-party backend.
+/// run, so its features must keep every third-party backend. The pinned-root
+/// producer runs its build in `validation_dag::PINNED_WORKSPACE_COMPILE_TAG`
+/// and its `prepare` in `PINNED_WORKSPACE_PREPARE_TAG`; the pair is judged as
+/// the one payload it rejoins to.
 pub(super) fn assert_producers_build_the_unified_selection(
     cfg: &dagrun::model::DagConfig,
 ) -> Result<(), String> {
     for step in &cfg.steps {
-        let command = execution_command(step)?;
+        let command = if step.tag() == crate::validation_dag::PINNED_WORKSPACE_PREPARE_TAG {
+            crate::validation_dag::pinned_workspace_producer_payload(cfg)?
+        } else {
+            execution_command(step)?
+        };
         let Some((_, profile)) = command.split_once("./ci/nextest-binaries.rs prepare ") else {
             continue;
         };
@@ -684,10 +691,11 @@ mod tests {
         assert_producers_build_the_unified_selection(&graph).unwrap();
         let mutated = |edit: &dyn Fn(&str) -> String| {
             let mut changed = graph.clone();
+            // The Cargo text lives in the compile half of the pinned producer.
             let producer = changed
                 .steps
                 .iter_mut()
-                .find(|step| step.tag() == "build.workspace_in_pinned_root")
+                .find(|step| step.tag() == crate::validation_dag::PINNED_WORKSPACE_COMPILE_TAG)
                 .unwrap();
             producer.cmd = edit(&producer.cmd);
             assert_ne!(
@@ -695,7 +703,7 @@ mod tests {
                 graph
                     .steps
                     .iter()
-                    .find(|s| s.tag() == "build.workspace_in_pinned_root")
+                    .find(|s| s.tag() == crate::validation_dag::PINNED_WORKSPACE_COMPILE_TAG)
                     .unwrap()
                     .cmd
             );
@@ -764,8 +772,22 @@ mod tests {
             let after =
                 crate::nextest_binaries::unified_prebuild_command(&stripped, profile).unwrap();
             assert!(!after.contains("third-party-backends"), "{after}");
+            // The pinned compile half carries only the Cargo build, the text
+            // of the union before its `prepare` tail, so it follows that part.
+            let cargo_half = |union: &str| {
+                union
+                    .split_once(" && ./ci/nextest-binaries.rs prepare ")
+                    .unwrap()
+                    .0
+                    .to_owned()
+            };
+            let (before_cargo, after_cargo) = (cargo_half(&before), cargo_half(&after));
             for step in &mut stripped.steps {
-                step.cmd = step.cmd.replace(&before, &after);
+                step.cmd = if step.cmd.contains(&before) {
+                    step.cmd.replace(&before, &after)
+                } else {
+                    step.cmd.replace(&before_cargo, &after_cargo)
+                };
             }
         }
         let error = assert_producers_build_the_unified_selection(&stripped).unwrap_err();
@@ -793,7 +815,9 @@ mod tests {
             .iter()
             .find(|step| step.tag() == "build.workspace_in_pinned_root")
             .unwrap();
-        let payload = execution_command(image).unwrap();
+        // The pinned producer's payload is split across its compile and
+        // preparation nodes; rejoined, it is the hosted command.
+        let payload = crate::validation_dag::pinned_workspace_producer_payload(&graph).unwrap();
         let unified = |profile| crate::nextest_binaries::unified_prebuild_command(&graph, profile);
         assert_eq!(
             payload,
@@ -803,7 +827,11 @@ mod tests {
             )
         );
         for (consumer, producer, wrong_command) in [
-            ("test.regular_crates", image.tag(), payload.clone()),
+            (
+                "test.regular_crates",
+                image.tag(),
+                execution_command(image).unwrap(),
+            ),
             (
                 "test.regular_crates_on_host",
                 hosted.tag(),

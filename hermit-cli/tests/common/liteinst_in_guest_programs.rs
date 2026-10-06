@@ -33,7 +33,7 @@
 //!
 //! The runtime library is the `libdetcore_liteinst.so` beside the Hermit this
 //! binary was built with. The validation builds put it there:
-//! `build.workspace_in_pinned_root` and `build.workspace_on_host` run
+//! `build.workspace_compile_in_pinned_root` and `build.workspace_on_host` run
 //! `cargo build --profile validate --workspace --all-targets`, which builds the
 //! `detcore-liteinst` cdylib next to `target/validate/hermit`. A plain
 //! `cargo nextest run -p hermit --test cli` does not build it; run

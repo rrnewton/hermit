@@ -442,7 +442,22 @@ fn release_artifact_plan_bracket(cfg: &DagConfig) -> Result<(), String> {
             }
             return Err(format!("release-artifact bracket: missing {tag}"));
         };
-        let source = guarded_command_source(&producer.tag(), &producer.cmd)?;
+        let mut source = guarded_command_source(&producer.tag(), &producer.cmd)?;
+        let mut tag = tag.to_owned();
+        if producer.tag() == hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_PREPARE_TAG {
+            // The pinned producer compiles in one node and prepares in the
+            // next; judge the payload the pair rejoins to, and name both.
+            let compile_tag = hermit_manifest_plan::validation_dag::PINNED_WORKSPACE_COMPILE_TAG;
+            tag = format!("{tag} (compiled by {compile_tag})");
+            let compile = cfg
+                .steps
+                .iter()
+                .find(|step| step.tag() == compile_tag)
+                .ok_or_else(|| format!("release-artifact bracket: missing {compile_tag}"))?;
+            guarded_command_source(compile_tag, &compile.cmd)?;
+            source = hermit_manifest_plan::validation_dag::pinned_workspace_producer_payload(cfg)
+                .map_err(|error| format!("release-artifact bracket: {tag}: {error}"))?;
+        }
         // The unified workspace build links the one Hermit binary; a second
         // `-p hermit --bin hermit` build would relink it with other features.
         let unified =
@@ -618,9 +633,15 @@ mod artifact_plan_tests {
                 "publish-hermit-e2e-artifact.sh target/validate/hermit ",
             ),
             (
-                "build.workspace_in_pinned_root",
+                // The pinned producer's Cargo half runs in its compile node.
+                "build.workspace_compile_in_pinned_root",
                 "cargo build --locked --profile validate --workspace",
                 "cargo build --locked --workspace",
+            ),
+            (
+                "build.workspace_in_pinned_root",
+                "./ci/nextest-binaries.rs prepare full",
+                "./ci/nextest-binaries.rs prepare portable",
             ),
             (
                 "test.sabre_examples",
@@ -4957,18 +4978,25 @@ cleared-caps refusal names {} starved step(s)",
                 full.compat
             ));
         }
+        // The pinned producer compiles in build.workspace_compile_in_pinned_root
+        // and prepares in build.workspace_in_pinned_root; the pair rejoins to
+        // the one workspace payload.
         let workspace_build = full
             .cfg
             .steps
             .iter()
             .find(|s| s.tag() == "build.workspace_in_pinned_root")
             .ok_or("full-plan bracket: workspace fat build disappeared")?;
+        let workspace_payload =
+            hermit_manifest_plan::validation_dag::pinned_workspace_producer_payload(&full.cfg)
+                .map_err(|error| {
+                    format!("full-plan bracket: workspace fat build disappeared: {error}")
+                })?;
         // The unified workspace build is the validate-profile Hermit producer:
         // it links target/validate/hermit once, and preparation relinks nothing.
-        if !workspace_build
-            .cmd
+        if !workspace_payload
             .contains("cargo build --locked --profile validate --workspace --all-targets")
-            || workspace_build.cmd.contains("--bin hermit")
+            || workspace_payload.contains("--bin hermit")
         {
             return Err(
                 "full-plan bracket: fat build does not finish the validate-profile Hermit producer"

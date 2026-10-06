@@ -69,6 +69,30 @@ const CANONICAL_ADAPTER_ACCEPT_TAG: &str = "check.canonical_adapter_accept";
 const CANONICAL_ADAPTER_ACCEPT_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; python3 ./scripts/test_validate_stop_paths.py --canonical-adapter-accept-arm-only"#;
 const PINNED_ROOT_TWIN_SUFFIX: &str = "_in_pinned_root";
 
+/// The pinned-root workspace producer is two nodes. The compile node runs the
+/// Cargo half of `build.workspace` and needs no rust-script tool, so it starts
+/// beside `build.rust_scripts_in_pinned_root` instead of after it. The prepare
+/// node keeps the producer's tag, so every consumer still names it, and runs
+/// only `./ci/nextest-binaries.rs prepare`, the one part that needs the
+/// prebuilt rust-script tools.
+pub const PINNED_WORKSPACE_COMPILE_TAG: &str = "build.workspace_compile_in_pinned_root";
+pub const PINNED_WORKSPACE_PREPARE_TAG: &str = "build.workspace_in_pinned_root";
+const PINNED_WORKSPACE_COMPILE_JOB: &str = "workspace_compile_in_pinned_root";
+const PINNED_RUST_SCRIPTS_TAG: &str = "build.rust_scripts_in_pinned_root";
+/// The exact text at which the workspace payload is cut: everything before it
+/// is Cargo, everything after the ` && ` is preparation.
+const WORKSPACE_PREPARATION_BOUNDARY: &str = " && ./ci/nextest-binaries.rs prepare ";
+const PINNED_WORKSPACE_COMPILE_DESC: &str = "Build every workspace target, the backend plugins and the one Hermit binary in the validate profile, beside the rust-script build";
+const PINNED_WORKSPACE_COMPILE_DESCRIPTION: &str = "The Cargo half of the pinned-root workspace build and the one Cargo compilation of Hermit in the full and portable validations, in the [profile.validate] profile: release optimisation with debug assertions and overflow checks on, so cells run an optimised Hermit with detcore's debug_assert invariants and the determinism-log hash lines --verify compares. It first cleans and builds detcore-dbt alone, so reverie-dbt's DynamoRIO cache exists before hermit-install stages the DBT client, DynamoRIO, SaBRe, e9patch and the LiteInst runtime into target/install_pkg, then builds the whole workspace, all targets, with the union of the features every prepared Nextest selection names. Nothing in it runs a rust-script (run-with-reverie-dbt-budget.sh compiles its pin checks with rustc, and no build script calls one), so it does not wait for build.rust_scripts_in_pinned_root and the two compile side by side in the same pinned root, writing different target directories; it keeps the rust-script environment, with HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1, so a rust-script added here later fails at once instead of compiling or running unprepared. Its only consumer is build.workspace_in_pinned_root, which lists the executables this build produced. Until 2026-10-06 the two halves were one node that waited for the rust-script tools, about 183 seconds, before this 175-to-182-second Cargo phase began. preferred_inner_jobs=32 is kept from the cold measurement at hermit@846baeca.";
+const PINNED_WORKSPACE_PREPARE_DESC: &str = "List every prepared Nextest executable from the one validate-profile build and record each selection's subset";
+const PINNED_WORKSPACE_PREPARE_DESCRIPTION: &str = "The preparation half of the pinned-root workspace build. Once build.workspace_compile_in_pinned_root has built every workspace target and build.rust_scripts_in_pinned_root has published the prebuilt rust-script tools, `nextest-binaries.rs prepare full` runs in the same pinned root, target directory and Cargo home: one `cargo nextest list` over the unified validate-profile build, the hermit_modes guests and record workloads from that build, and a dev-profile build of the nextest-cpu-wrapper. It hashes every listed executable and publishes all selections in one record, so no selection recompiles anything or relinks target/validate/hermit. Every consumer of the workspace build names this node, so none starts before that record exists. The budget is measured: in eight full validations on 2026-10-06 the unsplit node took 235 to 241 seconds, of which Cargo reported 45 to 46 for detcore-dbt and 130 to 136 for the workspace, leaving 58 to 60 seconds for container start and preparation. The CPU-wrapper build is the largest part, 27 to 28 seconds at 32 workers in those runs; a cold 16-worker build of it outside the root took 28 seconds, 135 CPU-seconds and a 2.4 GB memory peak. The 32-worker preference is the width preparation ran at inside the unsplit node.";
+/// Measured preparation budget; see PINNED_WORKSPACE_PREPARE_DESCRIPTION.
+const PINNED_WORKSPACE_PREPARE_EST_SECONDS: f64 = 60.0;
+const PINNED_WORKSPACE_PREPARE_WALL_SECONDS: i64 = 600;
+const PINNED_WORKSPACE_PREPARE_CPU_SECONDS: i64 = 1200;
+const PINNED_WORKSPACE_PREPARE_RSS_BASELINE_BYTES: i64 = 4 * 1024 * 1024 * 1024;
+const PINNED_WORKSPACE_PREPARE_HARD_MEM_MAX_BYTES: i64 = 8 * 1024 * 1024 * 1024;
+
 /// The group of every tool self-test node: `selftest.<name>`.
 pub const TOOL_SELF_TEST_GROUP: &str = "selftest";
 const TOOL_SELF_TEST_GROUP_PREFIX: &str = "selftest.";
@@ -445,16 +469,19 @@ const PROFILES: [Profile; 12] = [
     // super.liteinst_python3_verify_diagnostics when the LiteInst host hybrid
     // was retired (https://github.com/rrnewton/hermit/issues/3520): 88/89,
     // 74/75, 68/68 and 56/57 before. full and portable each gained
-    // test.record_replay afterwards: 87/88 and 73/74 before.
+    // test.record_replay afterwards: 87/88 and 73/74 before. full and
+    // portable then each gained build.workspace_compile_in_pinned_root, the
+    // Cargo half of build.workspace_in_pinned_root, which carries the same two
+    // labels: 88/89 and 74/75 before.
     Profile {
         label: "full",
-        direct_steps: 88,
-        selected_steps: 89,
+        direct_steps: 89,
+        selected_steps: 90,
     },
     Profile {
         label: "portable",
-        direct_steps: 74,
-        selected_steps: 75,
+        direct_steps: 75,
+        selected_steps: 76,
     },
     Profile {
         label: "quick",
@@ -497,22 +524,25 @@ const PROFILES: [Profile; 12] = [
     },
     // The SaBRe run type: its fixtures and bucket, plus the validation's one
     // Hermit build (the pinned-root producers and the host link) they need.
+    // 2/14 since that build's pinned-root producer became two nodes,
+    // build.workspace_compile_in_pinned_root and build.workspace_in_pinned_root:
+    // 2/13 before. The strict and rr run types gained the same ancestor.
     Profile {
         label: "sabre-compat-only",
         direct_steps: 2,
-        selected_steps: 13,
+        selected_steps: 14,
     },
     // The strict run type: the same shape as the SaBRe run type.
     Profile {
         label: "strict-compat-only",
         direct_steps: 2,
-        selected_steps: 13,
+        selected_steps: 14,
     },
     // The rr run type: the same shape again.
     Profile {
         label: "rr-compat-only",
         direct_steps: 2,
-        selected_steps: 13,
+        selected_steps: 14,
     },
 ];
 
@@ -1589,6 +1619,138 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     Ok(())
 }
 
+/// Cut the workspace producer's payload into its Cargo half and its
+/// preparation half. Both halves keep the leading rust-script environment, so
+/// `join_workspace_payloads` restores the original bytes exactly. Refuses
+/// unless the payload starts with that environment and contains the
+/// preparation boundary exactly once.
+pub(crate) fn split_workspace_payload(payload: &str) -> Result<(String, String), String> {
+    let environment = crate::validation_dag_static::RUST_SCRIPT_ENVIRONMENT;
+    if payload.matches(WORKSPACE_PREPARATION_BOUNDARY).count() != 1 {
+        return Err(format!(
+            "workspace producer lost its exact Nextest preparation boundary `{WORKSPACE_PREPARATION_BOUNDARY}`"
+        ));
+    }
+    if !payload.starts_with(environment) {
+        return Err("workspace producer lost its leading rust-script environment".into());
+    }
+    let (compile, profile) = payload
+        .split_once(WORKSPACE_PREPARATION_BOUNDARY)
+        .expect("boundary counted above");
+    let preparation = &WORKSPACE_PREPARATION_BOUNDARY[" && ".len()..];
+    let prepare = format!("{environment}{preparation}{profile}");
+    if join_workspace_payloads(compile, &prepare)? != payload {
+        return Err("workspace producer payload does not split losslessly".into());
+    }
+    Ok((compile.to_string(), prepare))
+}
+
+/// Rejoin the two halves into the payload the unsplit producer ran: the Cargo
+/// half, ` && `, then the preparation half without its repeated environment.
+pub fn join_workspace_payloads(compile: &str, prepare: &str) -> Result<String, String> {
+    let environment = crate::validation_dag_static::RUST_SCRIPT_ENVIRONMENT;
+    let preparation = &WORKSPACE_PREPARATION_BOUNDARY[" && ".len()..];
+    let Some(prepare_tail) = prepare.strip_prefix(environment) else {
+        return Err(format!(
+            "{PINNED_WORKSPACE_PREPARE_TAG} lost its leading rust-script environment"
+        ));
+    };
+    if !prepare_tail.starts_with(preparation) {
+        return Err(format!(
+            "{PINNED_WORKSPACE_PREPARE_TAG} runs something before `{preparation}`"
+        ));
+    }
+    if !compile.starts_with(environment) {
+        return Err(format!(
+            "{PINNED_WORKSPACE_COMPILE_TAG} lost its leading rust-script environment"
+        ));
+    }
+    if compile.contains(preparation.trim_end()) {
+        return Err(format!(
+            "{PINNED_WORKSPACE_COMPILE_TAG} runs Nextest preparation itself"
+        ));
+    }
+    Ok(format!("{compile} && {prepare_tail}"))
+}
+
+/// The complete payload of the pinned-root workspace producer, rejoined from
+/// its two nodes. Refuses unless both nodes exist, run under byte-identical
+/// pinned-root wrappers (the same --src, --out, --cargo-home, forwarded
+/// environment and guard), and the prepare node depends directly on the
+/// compile node. Checks written for the unsplit producer apply unchanged to
+/// the returned bytes.
+pub fn pinned_workspace_producer_payload(cfg: &DagConfig) -> Result<String, String> {
+    let find = |tag: &str| {
+        cfg.steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .ok_or_else(|| format!("validation DAG lost {tag}"))
+    };
+    let compile = find(PINNED_WORKSPACE_COMPILE_TAG)?;
+    let prepare = find(PINNED_WORKSPACE_PREPARE_TAG)?;
+    if !prepare
+        .deps
+        .iter()
+        .any(|dependency| dependency == PINNED_WORKSPACE_COMPILE_TAG)
+    {
+        return Err(format!(
+            "{PINNED_WORKSPACE_PREPARE_TAG} can prepare before {PINNED_WORKSPACE_COMPILE_TAG} has built"
+        ));
+    }
+    let wrapper = |step: &Step| -> Result<Vec<String>, String> {
+        if !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ") {
+            return Err(format!("{} does not run in the pinned root", step.tag()));
+        }
+        let mut argv =
+            shell_words::split(&step.cmd).map_err(|error| format!("{}: {error}", step.tag()))?;
+        argv.pop();
+        Ok(argv)
+    };
+    if wrapper(compile)? != wrapper(prepare)? {
+        return Err(format!(
+            "{PINNED_WORKSPACE_COMPILE_TAG} and {PINNED_WORKSPACE_PREPARE_TAG} run under different pinned-root wrappers"
+        ));
+    }
+    join_workspace_payloads(
+        &crate::nextest_build_selections::execution_command(compile)?,
+        &crate::nextest_build_selections::execution_command(prepare)?,
+    )
+}
+
+/// Turn the pinned-root workspace twin into its compile and prepare nodes.
+/// `twin` arrives with its pinned-root dependencies and environment set and
+/// its payload not yet wrapped.
+fn split_pinned_workspace_twin(twin: Step) -> Result<[Step; 2], String> {
+    let (compile_payload, prepare_payload) = split_workspace_payload(&twin.cmd)?;
+    let mut compile = twin.clone();
+    compile.job = PINNED_WORKSPACE_COMPILE_JOB.into();
+    compile.desc = PINNED_WORKSPACE_COMPILE_DESC.into();
+    compile.description = PINNED_WORKSPACE_COMPILE_DESCRIPTION.into();
+    compile.cmd = compile_payload;
+    compile
+        .deps
+        .retain(|dependency| dependency != PINNED_RUST_SCRIPTS_TAG);
+    compile.fail_fast_family = None;
+    compile.cmd = pinned_root_command(&compile);
+
+    let mut prepare = twin;
+    prepare.desc = PINNED_WORKSPACE_PREPARE_DESC.into();
+    prepare.description = PINNED_WORKSPACE_PREPARE_DESCRIPTION.into();
+    prepare.cmd = prepare_payload;
+    // The twin's own dependencies, build.rust_scripts_in_pinned_root among
+    // them, stay on the prepare node.
+    prepare.deps.push(PINNED_WORKSPACE_COMPILE_TAG.into());
+    prepare.deps.sort();
+    prepare.deps.dedup();
+    prepare.hint.est_duration_s = PINNED_WORKSPACE_PREPARE_EST_SECONDS;
+    prepare.hint.rss_baseline_bytes = Some(PINNED_WORKSPACE_PREPARE_RSS_BASELINE_BYTES);
+    prepare.hint.hard_mem_max_bytes = Some(PINNED_WORKSPACE_PREPARE_HARD_MEM_MAX_BYTES);
+    prepare.timeout = PINNED_WORKSPACE_PREPARE_WALL_SECONDS;
+    prepare.cpu_timeout = PINNED_WORKSPACE_PREPARE_CPU_SECONDS;
+    prepare.cmd = pinned_root_command(&prepare);
+    Ok([compile, prepare])
+}
+
 fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
     cfg.steps.retain(|step| {
         step.tag() != PINNED_ROOT_FETCH_TAG && !step.job.ends_with(PINNED_ROOT_TWIN_SUFFIX)
@@ -1716,6 +1878,12 @@ fn materialize_pinned_root(cfg: &mut DagConfig) -> Result<(), String> {
         twin.deps.dedup();
         twin.env
             .insert("HERMIT_E2E_EMPTY_WORKDIR".into(), "/test".into());
+        // Only the trailing `nextest-binaries.rs prepare` needs the prebuilt
+        // rust-script tools, so the Cargo half starts without them.
+        if producer.tag() == "build.workspace" {
+            twins.extend(split_pinned_workspace_twin(twin)?);
+            continue;
+        }
         twin.cmd = pinned_root_command(&twin);
         twins.push(twin);
     }
@@ -2596,6 +2764,88 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
     Ok(())
 }
 
+/// The pinned-root workspace producer's two nodes. The Cargo half has no path
+/// to the rust-script producer, the preparation half depends directly on both,
+/// nothing but the preparation half consumes the Cargo half (so no consumer
+/// can read target/validate before its executables are listed and hashed),
+/// and the two payloads rejoin to exactly the unsplit producer's payload.
+fn assert_pinned_workspace_split(cfg: &DagConfig) -> Result<(), String> {
+    let by_tag = cfg
+        .steps
+        .iter()
+        .map(|step| (step.tag(), step))
+        .collect::<BTreeMap<_, _>>();
+    let find = |tag: &str| {
+        by_tag
+            .get(tag)
+            .copied()
+            .ok_or_else(|| format!("validation DAG lost {tag}"))
+    };
+    let compile = find(PINNED_WORKSPACE_COMPILE_TAG)?;
+    let prepare = find(PINNED_WORKSPACE_PREPARE_TAG)?;
+    let mut pending = compile.deps.clone();
+    let mut seen = BTreeSet::new();
+    while let Some(dependency) = pending.pop() {
+        if dependency == PINNED_RUST_SCRIPTS_TAG {
+            return Err(format!(
+                "{PINNED_WORKSPACE_COMPILE_TAG} waits for {PINNED_RUST_SCRIPTS_TAG}; only the preparation half needs the rust-script tools"
+            ));
+        }
+        if seen.insert(dependency.clone()) {
+            pending.extend(find(&dependency)?.deps.iter().cloned());
+        }
+    }
+    for required in [PINNED_WORKSPACE_COMPILE_TAG, PINNED_RUST_SCRIPTS_TAG] {
+        if !prepare.deps.iter().any(|dependency| dependency == required) {
+            return Err(format!(
+                "{PINNED_WORKSPACE_PREPARE_TAG} must depend directly on {required}"
+            ));
+        }
+    }
+    if let Some(consumer) = cfg.steps.iter().find(|step| {
+        step.tag() != PINNED_WORKSPACE_PREPARE_TAG
+            && step
+                .deps
+                .iter()
+                .any(|dependency| dependency == PINNED_WORKSPACE_COMPILE_TAG)
+    }) {
+        return Err(format!(
+            "{} consumes {PINNED_WORKSPACE_COMPILE_TAG} directly; only {PINNED_WORKSPACE_PREPARE_TAG} may, so no consumer runs before preparation",
+            consumer.tag()
+        ));
+    }
+    if compile.labels != prepare.labels {
+        return Err(format!(
+            "{PINNED_WORKSPACE_COMPILE_TAG} labels {:?} differ from {PINNED_WORKSPACE_PREPARE_TAG} labels {:?}",
+            compile.labels, prepare.labels
+        ));
+    }
+    let payload = pinned_workspace_producer_payload(cfg)?;
+    let (compile_payload, prepare_payload) = split_workspace_payload(&payload)?;
+    if compile_payload != crate::nextest_build_selections::execution_command(compile)?
+        || prepare_payload != crate::nextest_build_selections::execution_command(prepare)?
+    {
+        return Err(format!(
+            "{PINNED_WORKSPACE_COMPILE_TAG} and {PINNED_WORKSPACE_PREPARE_TAG} are not the exact halves of one workspace payload"
+        ));
+    }
+    // The Cargo half carries the unsplit producer's heavy budget, which the
+    // hosted producer still runs whole.
+    if let Some(hosted) = by_tag.get("build.workspace_on_host") {
+        if compile.timeout != hosted.timeout
+            || compile.cpu_timeout != hosted.cpu_timeout
+            || compile.hint.rss_baseline_bytes != hosted.hint.rss_baseline_bytes
+            || compile.hint.hard_mem_max_bytes != hosted.hint.hard_mem_max_bytes
+            || compile.hint.classification != hosted.hint.classification
+        {
+            return Err(format!(
+                "{PINNED_WORKSPACE_COMPILE_TAG} lost the workspace build's budget"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn assert_rust_script_producer_contract(cfg: &DagConfig) -> Result<(), String> {
     type ProducerContract<'a> = (&'a str, &'a [&'a str], &'a [&'a str], i64, f64);
     let expected: &[ProducerContract<'_>] = &[
@@ -3029,6 +3279,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     assert_tool_self_test_nodes(cfg)?;
     assert_fail_closed_manifest_selectors(cfg)?;
     assert_rust_script_producer_contract(cfg)?;
+    assert_pinned_workspace_split(cfg)?;
     assert_buck_e2e_selection(cfg, cells)?;
     // 1606 until test.dbt_parity and test.dbt_parity_on_host were retired
     // (slice S13 of https://github.com/rrnewton/hermit/issues/3301); 1605
@@ -3072,9 +3323,12 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // test.liteinst_strict_on_host, liteinst.strict, liteinst.hermit_release,
     // liteinst.runtime and super.liteinst_python3_verify_diagnostics (436 - 6).
     // 431 with test.record_replay (430 + 1).
-    if cfg.steps.len() != 431 {
+    // 432 since build.workspace_in_pinned_root's Cargo half became
+    // build.workspace_compile_in_pinned_root, which does not wait for the
+    // rust-script tools (431 + 1).
+    if cfg.steps.len() != 432 {
         return Err(format!(
-            "superset has {} steps, expected 431",
+            "superset has {} steps, expected 432",
             cfg.steps.len()
         ));
     }
@@ -3097,7 +3351,14 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
             .find(|step| step.tag() == tag)
             .ok_or_else(|| format!("committed DAG lost {tag}"))
     };
-    for tag in ["build.workspace_in_pinned_root", "build.workspace_on_host"] {
+    // The pinned-root Cargo build moved into its compile node; the prepare
+    // node keeps the same width because its CPU-wrapper build and every
+    // `cargo nextest list` read CARGO_BUILD_JOBS too.
+    for tag in [
+        PINNED_WORKSPACE_COMPILE_TAG,
+        PINNED_WORKSPACE_PREPARE_TAG,
+        "build.workspace_on_host",
+    ] {
         let producer = step(tag)?;
         if producer.hint.preferred_inner_jobs != Some(32)
             || producer.jobs_env.as_deref() != Some("CARGO_BUILD_JOBS")
@@ -5299,13 +5560,15 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         assert_buck_e2e_selection(&committed, &cells).unwrap();
-        // 89 full nodes (88 before test.record_replay joined full, 89 before
+        // 90 full nodes (89 before build.workspace_compile_in_pinned_root
+        // split the Cargo half out of build.workspace_in_pinned_root, 88
+        // before test.record_replay joined full, 89 before
         // test.liteinst_strict was retired with the LiteInst host hybrid,
         // https://github.com/rrnewton/hermit/issues/3520; 87 before
         // test.detcore_time joined full, 88 before
         // privileged-test.pmu_detcore_time_cases did) - 22 replaced + 18
         // full-buck-e2e nodes.
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 85);
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 86);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps
@@ -6029,5 +6292,162 @@ sys.exit(37)
             assert_eq!(before_structured, after_structured, "{}", step.tag());
         }
         assert_structured_result_producers(&reattached).unwrap();
+    }
+
+    #[test]
+    fn pinned_workspace_compile_does_not_wait_for_the_rust_script_tools() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let find = |cfg: &DagConfig, tag: &str| {
+            cfg.steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap()
+                .clone()
+        };
+        let full = select_steps_by_labels(&committed, &["full".to_string()]).unwrap();
+        let compile = find(&full, PINNED_WORKSPACE_COMPILE_TAG);
+        let prepare = find(&full, PINNED_WORKSPACE_PREPARE_TAG);
+        assert_eq!(compile.job, PINNED_WORKSPACE_COMPILE_JOB);
+        // The chain-B edge is gone from the Cargo half, directly and
+        // transitively, and the preparation half carries it and the compile
+        // edge.
+        assert!(
+            !compile
+                .deps
+                .iter()
+                .any(|dep| dep == PINNED_RUST_SCRIPTS_TAG)
+        );
+        assert_eq!(compile.deps, ["pre.reverie_pin", "setup.pinned_root_fetch"]);
+        for required in [PINNED_RUST_SCRIPTS_TAG, PINNED_WORKSPACE_COMPILE_TAG] {
+            assert!(prepare.deps.iter().any(|dep| dep == required), "{required}");
+        }
+        assert_pinned_workspace_split(&committed).unwrap();
+
+        // The two payloads concatenate to exactly the unsplit producer's
+        // payload, under one wrapper argv (env names, --out, --cargo-home and
+        // the pinned-root guard).
+        let canonical = crate::validation_dag_static::config();
+        let producer = find(&canonical, "build.workspace");
+        let joined = pinned_workspace_producer_payload(&committed).unwrap();
+        assert_eq!(joined, producer.cmd);
+        let compile_payload = crate::nextest_build_selections::execution_command(&compile).unwrap();
+        let prepare_payload = crate::nextest_build_selections::execution_command(&prepare).unwrap();
+        assert!(prepare_payload.ends_with("./ci/nextest-binaries.rs prepare full"));
+        assert!(!compile_payload.contains("nextest-binaries.rs"));
+        assert_eq!(
+            split_workspace_payload(&producer.cmd).unwrap(),
+            (compile_payload.clone(), prepare_payload.clone())
+        );
+        assert_eq!(
+            join_workspace_payloads(&compile_payload, &prepare_payload).unwrap(),
+            producer.cmd
+        );
+        let wrapper = |step: &Step| {
+            let mut argv = shell_words::split(&step.cmd).unwrap();
+            argv.pop();
+            argv
+        };
+        assert_eq!(wrapper(&compile), wrapper(&prepare));
+        for needle in [
+            "--out",
+            "ignored/hermetic/split",
+            "--cargo-home",
+            "ignored/hermetic/split/cargo",
+            PINNED_ROOT_COMMAND_GUARD,
+        ] {
+            assert!(
+                wrapper(&compile).iter().any(|arg| arg == needle),
+                "{needle}"
+            );
+        }
+
+        // The cut refuses a payload without the boundary and one with two.
+        let missing = producer.cmd.replacen(
+            WORKSPACE_PREPARATION_BOUNDARY,
+            " ; ./ci/nextest-binaries.rs prepare ",
+            1,
+        );
+        assert!(
+            split_workspace_payload(&missing)
+                .unwrap_err()
+                .contains("exact Nextest preparation boundary")
+        );
+        let duplicated = format!("{} && ./ci/nextest-binaries.rs prepare full", producer.cmd);
+        assert!(
+            split_workspace_payload(&duplicated)
+                .unwrap_err()
+                .contains("exact Nextest preparation boundary")
+        );
+        // The twin splitter, which receives the unwrapped payload, refuses too.
+        let mut twin = find(&committed, PINNED_WORKSPACE_PREPARE_TAG);
+        twin.cmd = duplicated;
+        assert!(split_pinned_workspace_twin(twin.clone()).is_err());
+        twin.cmd = missing;
+        assert!(split_pinned_workspace_twin(twin).is_err());
+
+        // The graph assertion refuses each way of undoing the split's contract.
+        let mutated = |tag: &str, edit: &dyn Fn(&mut Step)| {
+            let mut changed = committed.clone();
+            edit(
+                changed
+                    .steps
+                    .iter_mut()
+                    .find(|step| step.tag() == tag)
+                    .unwrap(),
+            );
+            assert_pinned_workspace_split(&changed).unwrap_err()
+        };
+        let waits = mutated(PINNED_WORKSPACE_COMPILE_TAG, &|step| {
+            step.deps.push(PINNED_RUST_SCRIPTS_TAG.into())
+        });
+        assert!(waits.contains("waits for"), "{waits}");
+        // Through an intermediate pinned-root producer that itself waits for
+        // the rust-script tools.
+        let waits_transitively = mutated(PINNED_WORKSPACE_COMPILE_TAG, &|step| {
+            step.deps.push("setup.manifest_plan_in_pinned_root".into())
+        });
+        assert!(
+            waits_transitively.contains("waits for"),
+            "{waits_transitively}"
+        );
+        let unordered = mutated(PINNED_WORKSPACE_PREPARE_TAG, &|step| {
+            step.deps.retain(|dep| dep != PINNED_WORKSPACE_COMPILE_TAG)
+        });
+        assert!(unordered.contains("must depend directly"), "{unordered}");
+        let unscripted = mutated(PINNED_WORKSPACE_PREPARE_TAG, &|step| {
+            step.deps.retain(|dep| dep != PINNED_RUST_SCRIPTS_TAG)
+        });
+        assert!(unscripted.contains("must depend directly"), "{unscripted}");
+        let bypass = mutated("build.e2e_artifact_in_pinned_root", &|step| {
+            step.deps.push(PINNED_WORKSPACE_COMPILE_TAG.into())
+        });
+        assert!(bypass.contains("no consumer runs before"), "{bypass}");
+        let rerooted = mutated(PINNED_WORKSPACE_COMPILE_TAG, &|step| {
+            step.cmd = step.cmd.replacen(
+                "ignored/hermetic/split/cargo",
+                "ignored/hermetic/other/cargo",
+                1,
+            )
+        });
+        assert!(
+            rerooted.contains("different pinned-root wrappers"),
+            "{rerooted}"
+        );
+        let relabeled = mutated(PINNED_WORKSPACE_COMPILE_TAG, &|step| {
+            step.labels.pop();
+        });
+        assert!(relabeled.contains("labels"), "{relabeled}");
+        // The assertion is wired into the generator's invariant set.
+        let mut changed = committed.clone();
+        changed
+            .steps
+            .iter_mut()
+            .find(|step| step.tag() == PINNED_WORKSPACE_COMPILE_TAG)
+            .unwrap()
+            .deps
+            .push(PINNED_RUST_SCRIPTS_TAG.into());
+        let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
+        let error = assert_invariants(&changed, &cells).unwrap_err();
+        assert!(error.contains("waits for"), "{error}");
     }
 }
