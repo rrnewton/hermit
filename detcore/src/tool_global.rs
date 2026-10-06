@@ -819,14 +819,15 @@ impl GlobalState {
             .path
             .as_ref()
             .expect("network trace recording requires a trace path");
+        // Encode before opening the output, so a trace that cannot be encoded
+        // leaves the file as it was instead of truncated.
         let result = engine
             .finish()
             .map_err(|error| error.to_string())
-            .and_then(|trace| {
+            .and_then(|trace| trace.encode_framed().map_err(|error| error.to_string()))
+            .and_then(|bytes| {
                 let mut file = File::create(path).map_err(|error| error.to_string())?;
-                trace
-                    .write_framed(&mut file)
-                    .map_err(|error| error.to_string())
+                file.write_all(&bytes).map_err(|error| error.to_string())
             });
         if let Err(error) = result {
             panic!("cannot write network trace {}: {error}", path.display());

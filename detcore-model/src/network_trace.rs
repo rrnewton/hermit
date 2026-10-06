@@ -39,8 +39,6 @@ use crate::time::LogicalTime;
 pub const NETWORK_TRACE_MAGIC: [u8; 16] = *b"HERMIT-NET-TRACE";
 /// The first network trace format; still accepted and upgraded on read.
 pub const NETWORK_TRACE_VERSION_V1: u32 = 1;
-/// Refuse hostile or corrupt length headers before allocating memory.
-pub const MAX_NETWORK_TRACE_PAYLOAD_BYTES: u64 = 64 * 1024 * 1024;
 
 const FRAME_HEADER_LEN: usize = NETWORK_TRACE_MAGIC.len() + 4 + 8;
 
@@ -509,12 +507,16 @@ fn read_frame<R: Read>(mut reader: R) -> Result<(u32, Vec<u8>), NetworkTraceCode
             .try_into()
             .expect("fixed-size length field"),
     );
-    if payload_len > MAX_NETWORK_TRACE_PAYLOAD_BYTES {
-        return Err(NetworkTraceCodecError::TooLarge);
+    // Grow the payload only as its bytes arrive, so a corrupt or hostile
+    // length header cannot make the reader allocate more than the input holds.
+    let mut payload = Vec::new();
+    let read = reader
+        .by_ref()
+        .take(payload_len)
+        .read_to_end(&mut payload)?;
+    if u64::try_from(read).map_err(|_| NetworkTraceCodecError::TooLarge)? != payload_len {
+        return Err(NetworkTraceCodecError::Truncated);
     }
-    let payload_len = usize::try_from(payload_len).map_err(|_| NetworkTraceCodecError::TooLarge)?;
-    let mut payload = vec![0; payload_len];
-    read_exact_or_truncated(&mut reader, &mut payload)?;
     let mut trailing = [0u8; 1];
     if reader.read(&mut trailing)? != 0 {
         return Err(NetworkTraceCodecError::TrailingData);
@@ -534,21 +536,26 @@ fn decode_payload<T: serde::de::DeserializeOwned>(
     Ok(value)
 }
 
+/// Encode one complete frame: the header, then the payload, in one buffer.
+fn encode_frame<T: Serialize>(version: u32, value: &T) -> Result<Vec<u8>, NetworkTraceCodecError> {
+    let mut frame = Vec::with_capacity(FRAME_HEADER_LEN);
+    frame.extend_from_slice(&NETWORK_TRACE_MAGIC);
+    frame.extend_from_slice(&version.to_le_bytes());
+    frame.extend_from_slice(&[0; 8]);
+    bincode::serde::encode_into_std_write(value, &mut frame, bincode::config::standard())
+        .map_err(NetworkTraceCodecError::Encode)?;
+    let payload_len = u64::try_from(frame.len() - FRAME_HEADER_LEN)
+        .map_err(|_| NetworkTraceCodecError::TooLarge)?;
+    frame[FRAME_HEADER_LEN - 8..FRAME_HEADER_LEN].copy_from_slice(&payload_len.to_le_bytes());
+    Ok(frame)
+}
+
 fn write_frame<W: Write, T: Serialize>(
     mut writer: W,
     version: u32,
     value: &T,
 ) -> Result<(), NetworkTraceCodecError> {
-    let payload = bincode::serde::encode_to_vec(value, bincode::config::standard())
-        .map_err(NetworkTraceCodecError::Encode)?;
-    let payload_len = u64::try_from(payload.len()).map_err(|_| NetworkTraceCodecError::TooLarge)?;
-    if payload_len > MAX_NETWORK_TRACE_PAYLOAD_BYTES {
-        return Err(NetworkTraceCodecError::TooLarge);
-    }
-    writer.write_all(&NETWORK_TRACE_MAGIC)?;
-    writer.write_all(&version.to_le_bytes())?;
-    writer.write_all(&payload_len.to_le_bytes())?;
-    writer.write_all(&payload)?;
+    writer.write_all(&encode_frame(version, value)?)?;
     Ok(())
 }
 
@@ -760,10 +767,17 @@ impl NetworkTraceV2 {
 
     /// Write one complete, length-delimited trace: v4 when it records a send
     /// wait, otherwise v3 when it records a refused send, otherwise v2.
-    pub fn write_framed<W: Write>(&self, writer: W) -> Result<(), NetworkTraceCodecError> {
+    pub fn write_framed<W: Write>(&self, mut writer: W) -> Result<(), NetworkTraceCodecError> {
+        writer.write_all(&self.encode_framed()?)?;
+        Ok(())
+    }
+
+    /// The bytes [`Self::write_framed`] writes, encoded without touching any
+    /// output, so a caller can refuse an invalid trace before it truncates a file.
+    pub fn encode_framed(&self) -> Result<Vec<u8>, NetworkTraceCodecError> {
         self.validate()?;
         if self.records_send_waits() {
-            return write_frame(writer, NETWORK_TRACE_VERSION_V4, self);
+            return encode_frame(NETWORK_TRACE_VERSION_V4, self);
         }
         let version = if self.records_refused_sends() {
             NETWORK_TRACE_VERSION_V3
@@ -784,7 +798,7 @@ impl NetworkTraceV2 {
                 })
                 .collect(),
         };
-        write_frame(writer, version, &wire)
+        encode_frame(version, &wire)
     }
 
     /// Read exactly one complete v1, v2, v3 or v4 trace. A v1 trace is
@@ -1220,14 +1234,16 @@ mod tests {
     }
 
     #[test]
-    fn oversized_length_is_rejected_before_allocation() {
+    fn hostile_length_is_truncation_without_allocating_it() {
+        // Allocating the claimed length before reading it panics here.
         let mut bytes = Vec::new();
         bytes.extend_from_slice(&NETWORK_TRACE_MAGIC);
         bytes.extend_from_slice(&NETWORK_TRACE_VERSION_V1.to_le_bytes());
-        bytes.extend_from_slice(&(MAX_NETWORK_TRACE_PAYLOAD_BYTES + 1).to_le_bytes());
+        bytes.extend_from_slice(&u64::MAX.to_le_bytes());
+        bytes.extend_from_slice(b"short");
         assert!(matches!(
             NetworkTraceV1::read_framed(Cursor::new(bytes)),
-            Err(NetworkTraceCodecError::TooLarge)
+            Err(NetworkTraceCodecError::Truncated)
         ));
     }
 
@@ -1579,6 +1595,25 @@ mod tests {
             NetworkTraceV2::read_framed(Cursor::new(bytes)).unwrap(),
             trace
         );
+    }
+
+    #[test]
+    fn network_trace_above_64_mib_round_trips() {
+        // 64 MiB was the old limit on a whole trace; a download of that size
+        // recorded completely and then lost its trace at exit.
+        let mut trace = valid_trace_v2();
+        let len = 64 * 1024 * 1024 + 1;
+        trace.inputs[1].event = NetworkInputKindV1::InboundBytes {
+            stream_offset: 0,
+            bytes: vec![0xa5; len],
+        };
+        trace.inputs[2].event = NetworkInputKindV1::PeerWriteClosed {
+            stream_offset: len as u64,
+        };
+        let mut framed = Vec::new();
+        trace.write_framed(&mut framed).unwrap();
+        assert!(framed.len() > len);
+        assert!(NetworkTraceV2::read_framed(Cursor::new(framed)).unwrap() == trace);
     }
 
     #[test]
