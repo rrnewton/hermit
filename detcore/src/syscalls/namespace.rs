@@ -396,10 +396,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// process probed before launch, or failing that from the devices probed
     /// when the tool was constructed (`anonymous_object_devices`). Only when
     /// there are neither -- no configured devices and a failed construction
-    /// probe, which a run launched through hermit-cli reaches only on DBT or
-    /// when the Hermit process's own probe failed -- does the readlink fail
-    /// with a tool error (`anonymous_object_device`) rather than key the link
-    /// on a device no `fstat` reports.
+    /// probe -- does the readlink fail with a tool error
+    /// (`anonymous_object_device`) rather than key the link on a device no
+    /// `fstat` reports. A run launched through hermit-cli lacks configured
+    /// devices when its own probe failed, and on DBT always: hermit-cli
+    /// leaves them out of DBT's `HERMIT_DBT_DETCONFIG`, which the guest can
+    /// read and which must stay byte-identical, so every DBT run keys an
+    /// unconfirmed link on the devices probed in the guest when the tool was
+    /// constructed. A DBT guest that execs with `HERMIT_DBT_DETCONFIG` removed
+    /// from its environment is in the same position: the re-injected runtime
+    /// builds its default Config, which carries no devices, and probes in the
+    /// guest.
     ///
     /// Without `virtualize_metadata` -- `hermit record` and `hermit replay`
     /// -- neither is consulted, and the object is keyed on its inode alone,
