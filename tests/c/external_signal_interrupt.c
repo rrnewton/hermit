@@ -344,14 +344,24 @@ static void fork_sibling(void) {
 }
 
 /* The spin role: after a 50 ms sleep, user code only, with no system calls,
- * until some thread's handler ran. */
+ * until some thread's handler ran.
+ *
+ * The PAUSE makes each iteration slower without adding a conditional branch.
+ * Hermit preempts this thread by counting retired conditional branches, and
+ * the counter's interrupt arrives some branches late (skid): the denser the
+ * branches, the later it lands. Without the PAUSE, Hermit refused about 1 run
+ * in 100 for a skid overshoot (https://github.com/rrnewton/hermit/issues/1845).
+ * The branches per iteration, and so the schedule and the output, are
+ * unchanged. */
 static void *spin_sibling(void *arg) {
   (void)arg;
   /* Let the main thread park in its wait before spinning. */
   sleep_ms(50);
   unsigned long x = 1;
-  for (unsigned long i = 0; handled == 0 && i < SPIN_ITERATIONS; i++)
+  for (unsigned long i = 0; handled == 0 && i < SPIN_ITERATIONS; i++) {
+    __builtin_ia32_pause();
     x = x * 6364136223846793005UL + 1442695040888963407UL;
+  }
   spin_sink = x;
   if (!flip_timed) wake_waiter();
   return NULL;
