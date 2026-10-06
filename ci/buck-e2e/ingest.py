@@ -333,17 +333,18 @@ def main():
             (os.listdir(failed_root) and not os.path.isfile(os.path.join(failed_root, FAILED_LOGS_INDEX)))):
         sys.exit(f"ingest: --failed-verify-logs {failed_root} is not absent, empty, or a previous ingest's "
                  f"(no {FAILED_LOGS_INDEX}); refusing to replace it")
-    if failed_root is not None:
-        def nested(a_path, b_path):
-            a_path, b_path = os.path.realpath(a_path), os.path.realpath(b_path)
-            return os.path.commonpath([a_path, b_path]) in (a_path, b_path)
-        for flag, other in (("--out", a.out), ("--work", a.work), ("--local-artifacts", a.local_artifacts)):
-            if other is not None and nested(failed_root, other):
-                sys.exit(f"ingest: --failed-verify-logs {failed_root} overlaps {flag} {other}; replacing it would "
-                         f"delete that directory's files")
     plan = json.load(open(a.plan))
     want = {"{}/{}@{}".format(c["test"], c["mode"], c["backend"]): c for c in plan["cells"]}
     work = a.work or tempfile.mkdtemp(prefix="buck-e2e-ingest-")
+    if failed_root is not None:
+        # Against the work directory in effect, including a default one below TMPDIR.
+        def nested(a_path, b_path):
+            a_path, b_path = os.path.realpath(a_path), os.path.realpath(b_path)
+            return os.path.commonpath([a_path, b_path]) in (a_path, b_path)
+        for flag, other in (("--out", a.out), ("--work", work), ("--local-artifacts", a.local_artifacts)):
+            if other is not None and nested(failed_root, other):
+                sys.exit(f"ingest: --failed-verify-logs {failed_root} overlaps {flag} {other}; replacing it would "
+                         f"delete that directory's files")
     os.makedirs(work, exist_ok=True)  # testx needs the parent of --output-dir to exist
     executions = []  # (cell, end, test id, test run id, marker run id, result)
     for rid in a.run_ids:
@@ -453,15 +454,26 @@ def main():
 
     # Kept before the coverage check below, which refuses a run with a cell that wrote no row:
     # the logs of the executions that died are the evidence that refusal needs.
-    failed_entries = []
+    # Like every log kept here, the directory is evidence, not input: failing to write it is
+    # reported in the summary line and never fails the ingest.
+    failed_entries, failed_logs_error = [], None
     if failed_root is not None:
-        shutil.rmtree(failed_root, ignore_errors=True)
-        os.makedirs(failed_root)  # fails if a previous ingest's logs could not all be removed
-        with cf.ThreadPoolExecutor(a.j) as ex:
-            failed_entries = list(ex.map(lambda s: keep_failed_logs(failed_root, *s, a.failed_log_max_bytes), failed_sources))
-        with open(os.path.join(failed_root, FAILED_LOGS_INDEX), "w") as f:
-            for entry in sorted(failed_entries, key=lambda e: (e["cell"], str(e["run_id"]))):
-                f.write(json.dumps(entry, sort_keys=True) + "\n")
+        try:
+            shutil.rmtree(failed_root, ignore_errors=True)
+            os.makedirs(failed_root)  # fails if a previous ingest's logs could not all be removed
+        except OSError as error:
+            failed_logs_error = f"cannot create {failed_root}: {error}"
+        if failed_logs_error is None:
+            with cf.ThreadPoolExecutor(a.j) as ex:
+                failed_entries = list(ex.map(lambda s: keep_failed_logs(failed_root, *s, a.failed_log_max_bytes), failed_sources))
+            try:
+                with open(os.path.join(failed_root, FAILED_LOGS_INDEX), "w") as f:
+                    for entry in sorted(failed_entries, key=lambda e: (e["cell"], str(e["run_id"]))):
+                        f.write(json.dumps(entry, sort_keys=True) + "\n")
+            except OSError as error:
+                failed_logs_error = f"cannot write {FAILED_LOGS_INDEX} in {failed_root}: {error}"
+        if failed_logs_error is not None:
+            print(f"ingest: the failed cells' verify logs were not kept: {failed_logs_error}", file=sys.stderr)
     failed_logs = [one for entry in failed_entries for one in entry["logs"]]
 
     def covered(cell):
@@ -539,7 +551,7 @@ def main():
                       "evidence_complete_executions": sum(len(v) for v in evidence_complete.values()),
                       "verify_logs_restored": len(index) - len(unrestored), "verify_logs_unrestored": len(unrestored),
                       "verify_logs_unrestored_examples": unrestored[:5],
-                      "failed_executions": len(failed_entries),
+                      "failed_executions": len(failed_entries), "failed_verify_logs_error": failed_logs_error,
                       "failed_verify_logs_kept": sum(one["log"] is not None for one in failed_logs),
                       "failed_verify_logs_not_kept": sum(one["log"] is None for one in failed_logs),
                       "failed_executions_without_logs": sum(entry["reason"] is not None for entry in failed_entries)}))

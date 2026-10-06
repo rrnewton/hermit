@@ -582,6 +582,38 @@ class IngestTest(unittest.TestCase):
                 self.assertIn("overlaps", process.stderr)
                 self.assertFalse((work / out).exists(), "ingest wrote before refusing")
 
+    def test_a_directory_that_cannot_be_written_never_fails_the_ingest(self):
+        diverged = with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS)
+        locked = self.root / "locked"
+        locked.mkdir()
+        locked.chmod(0o555)
+        self.addCleanup(locked.chmod, 0o755)
+        work, process = self.ingest({"RUN": [execution(X, 100, "PASS", "rx1"), diverged]},
+                                    extra=["--failed-verify-logs", str(locked / "kept")])
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("the failed cells' verify logs were not kept: cannot create", process.stderr)
+        self.assertIn("cannot create", json.loads(process.stdout)["failed_verify_logs_error"])
+        self.assertTrue((work / "out" / "portable" / "manifest_cat" / "results.jsonl").is_file())
+
+    def test_a_default_work_directory_inside_it_is_refused(self):
+        # Without --work, ingest downloads below TMPDIR; replacing a directory that holds
+        # TMPDIR would delete those downloads.
+        diverged = with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS)
+        work = Path(tempfile.mkdtemp(dir=self.root))
+        fake = work / "fake"
+        write_test_runs(fake, {"RUN": [execution(X, 100, "PASS", "rx1"), diverged]})
+        target = work / "kept"
+        (target / "tmp").mkdir(parents=True)
+        (target / "index.jsonl").write_text("")
+        process = subprocess.run(
+            [sys.executable, str(INGEST), "--plan", str(self.root / "plan.json"), "--out", str(work / "out"),
+             "--failed-verify-logs", str(target), "RUN"],
+            capture_output=True, text=True,
+            env=dict(os.environ, TESTX=str(self.testx), FAKE_TESTX_DIR=str(fake), TMPDIR=str(target / "tmp")))
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        self.assertIn("overlaps --work", process.stderr)
+        self.assertFalse((work / "out").exists(), "ingest wrote before refusing")
+
 
 if __name__ == "__main__":
     unittest.main()
