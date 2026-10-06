@@ -1406,11 +1406,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // reverie_private_page_is_the_range_hermit_guards retain all 203 (207).
     // https://github.com/rrnewton/hermit/pull/3361
     // (https://github.com/rrnewton/hermit/issues/3146): the new
-    // external_signal_interrupt binary adds all 66 of its tests (its LiteInst
+    // external_signal_interrupt binary adds all 68 of its tests (its LiteInst
     // cells are restoration targets of
     // https://github.com/rrnewton/hermit/issues/3745), and all 207 prior
-    // identities are retained (273, measured with cargo nextest list).
-    ("test.hermit_integration", 273),
+    // identities are retained (275, measured with cargo nextest list).
+    ("test.hermit_integration", 275),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1833,9 +1833,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two --passthru-opt host-input verify tests and the
     // private-page rebinding test (203).
     // And the four private-page guard tests (207).
-    // The host twin also selects the 66 external_signal_interrupt tests
-    // (https://github.com/rrnewton/hermit/pull/3361) (273, measured).
-    ("test.hermit_integration_on_host", 273),
+    // The host twin also selects the 68 external_signal_interrupt tests
+    // (https://github.com/rrnewton/hermit/pull/3361) (275, measured).
+    ("test.hermit_integration_on_host", 275),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
