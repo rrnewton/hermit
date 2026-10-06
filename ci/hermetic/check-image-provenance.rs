@@ -36,12 +36,12 @@ use sha2::Sha256;
 const PROVENANCE: &str = "ci/hermetic/image.provenance.json";
 const PIN: &str = "ci/hermetic/image.digest";
 const METHOD: &str = "two-clean-isolated-nix-stores-v1";
-const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:d809dc6e74ce56238e1110e0c323ba617bea759198ef72bc23f56ea966c1c90a";
+const SUPERSEDED_REFERENCE: &str = "localhost/hermit-hermetic-validate@sha256:d4e585cb6baebf51ef3e52a3488f8fa6c1401379f2c0aa5e5e5a17121092ec95";
 const SUPERSEDED_ARCHIVE_SHA256: &str =
-    "717144d1e2d19c5efa7296c7db00bdf0d95a6478323d79e8ebcc07e150c05470";
-/// The replaced d809 root lacked liblzma on LIBRARY_PATH; the rationale must
-/// name the library whose absence this repin repairs.
-const RATIONALE_MARKER: &str = "liblzma";
+    "085b605dd6d17c59795ccc92b5cbd761424810ab156520a10474dc9e4a3c57d0";
+/// The replaced d4e5 root lacked the curl executable; the rationale must name
+/// the executable whose absence this repin repairs.
+const RATIONALE_MARKER: &str = "curl";
 /// Both isolated builds recorded `nix --version` before building.
 const RECORDED_NIX_VERSION: &str = "nix (Nix) 2.35.2";
 const INPUT_PATHS: [&str; 4] = [
@@ -50,11 +50,12 @@ const INPUT_PATHS: [&str; 4] = [
     "ci/hermetic/flake.nix",
     "ci/hermetic/guest-paths.txt",
 ];
-const EVIDENCE_LIMITATIONS: [&str; 5] = [
-    "Each service ran with the systemd user manager's environment plus PATH, HOME, NIX_SSL_CERT_FILE and CURL_CA_BUNDLE; only those variable names were recorded, not their values.",
-    "Both builds fetched the locked flake inputs and binary substitutes from cache.nixos.org through the host forward proxy; substituted paths are trusted by Nix signature and NAR hash, not rebuilt.",
+const EVIDENCE_LIMITATIONS: [&str; 6] = [
+    "Each service ran with the systemd user manager's environment plus PATH and HOME; only those variable names were recorded, not their values.",
+    "Neither build used the network. Each new store could substitute only from the build host's default Nix store, and only paths signed with the cache.nixos.org key, the one key trusted, or content-addressed (derivation files and fixed-output sources, which Nix checks by hash); substituted paths are trusted by Nix signature or content hash and NAR hash, not rebuilt. Every unsigned path in the closure, including rust-script, cargo-nextest and coreutils, was rebuilt in each store.",
+    "Both builds ran in the Nix build sandbox with /bin/sh bound to the static busybox at /nix/store/yysvxw5iwwijaci7ggrnms4mavwcjnpk-busybox-1.37.0 (NAR hash sha256-Qlx+BoVIaa3RubvM7Lr733QAcJpy4XZPFDX0d5XN9WA=), because the build host's /bin/sh links to a dynamically linked bash; that shell is unsigned and is not in the image.",
     "Build logs, unit records and Nix path-info records were retained only on the build host; this receipt does not authenticate them.",
-    "The superseded d809 archive was not rebuilt for this receipt; its 717144 SHA-256 is carried from the d809 receipt.",
+    "The superseded d4e5 archive was not rebuilt for this receipt; its 085b60 SHA-256 is carried from the d4e5 receipt.",
     "The recorded build-source commit and tree are historical review evidence. Rebases can rewrite their ancestry; live verification establishes equivalence only for the four enumerated image input files, not the complete source tree or archive.",
 ];
 
@@ -69,20 +70,20 @@ struct ExpectedRun {
 
 const EXPECTED_RUNS: [ExpectedRun; 2] = [
     ExpectedRun {
-        run_id: "hermetic-ad99-a-lzma.service",
-        source_snapshot_identity: "source-a.git-archive.tar@50:1247760177",
-        nix_store_identity: "build-a/nix-root/nix@50:1247977273",
+        run_id: "hermetic-b898-a-curl.service",
+        source_snapshot_identity: "source-a.git-archive.tar@47:1981730721",
+        nix_store_identity: "build-a/nix-root/nix@47:1981733241",
         podman_store_identity: "build-a/podman-data",
-        memory_peak_bytes: 7_086_940_160,
-        cpu_nanoseconds: 1_351_620_598_000,
+        memory_peak_bytes: 7_528_996_864,
+        cpu_nanoseconds: 1_180_895_998_000,
     },
     ExpectedRun {
-        run_id: "hermetic-ad99-b-lzma.service",
-        source_snapshot_identity: "source-b.git-archive.tar@50:1247764715",
-        nix_store_identity: "build-b/nix-root/nix@50:1247977542",
+        run_id: "hermetic-b898-b-curl.service",
+        source_snapshot_identity: "source-b.git-archive.tar@47:1981733239",
+        nix_store_identity: "build-b/nix-root/nix@47:1981735766",
         podman_store_identity: "build-b/podman-data",
-        memory_peak_bytes: 7_098_404_864,
-        cpu_nanoseconds: 1_343_578_125_000,
+        memory_peak_bytes: 7_536_754_688,
+        cpu_nanoseconds: 1_179_648_165_000,
     },
 ];
 
@@ -506,18 +507,18 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
     let new = string(repin, "replacement_reference", "repin")?;
     if old != SUPERSEDED_REFERENCE {
         return Err(format!(
-            "repin.superseded_reference must retain the replaced d809 reference {SUPERSEDED_REFERENCE:?}"
+            "repin.superseded_reference must retain the replaced d4e5 reference {SUPERSEDED_REFERENCE:?}"
         ));
     }
     let old_archive = string(repin, "superseded_archive_sha256", "repin")?;
     if old_archive != SUPERSEDED_ARCHIVE_SHA256 {
         return Err(format!(
-            "repin.superseded_archive_sha256 must retain the d809 receipt's 717144 archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
+            "repin.superseded_archive_sha256 must retain the d4e5 receipt's 085b60 archive SHA-256 {SUPERSEDED_ARCHIVE_SHA256:?}"
         ));
     }
     if old == new || !string(repin, "rationale", "repin")?.contains(RATIONALE_MARKER) {
         return Err(format!(
-            "repin must explain the real change: its rationale must name {RATIONALE_MARKER}, the library the d809 root left off LIBRARY_PATH"
+            "repin must explain the real change: its rationale must name {RATIONALE_MARKER}, the executable the d4e5 root lacked"
         ));
     }
     for (reference, context) in [
@@ -695,7 +696,7 @@ fn validate_semantics(root: &Value) -> Result<(), String> {
             ],
             &format!("{context}.resource_bound"),
         )?;
-        if unsigned(bound, "wall_seconds", "resource_bound")? != 1200
+        if unsigned(bound, "wall_seconds", "resource_bound")? != 2400
             || unsigned(bound, "cpu_quota_cores", "resource_bound")? != 2
             || unsigned(bound, "memory_max_bytes", "resource_bound")? != 8_589_934_592
             || unsigned(bound, "swap_max_bytes", "resource_bound")? != 0
@@ -954,7 +955,7 @@ mod tests {
         assert!(
             validate_semantics(&reference)
                 .unwrap_err()
-                .contains("must retain the replaced d809 reference")
+                .contains("must retain the replaced d4e5 reference")
         );
 
         let mut archive = record();
@@ -962,7 +963,7 @@ mod tests {
         assert!(
             validate_semantics(&archive)
                 .unwrap_err()
-                .contains("must retain the d809 receipt's 717144 archive SHA-256")
+                .contains("must retain the d4e5 receipt's 085b60 archive SHA-256")
         );
     }
 
@@ -1009,7 +1010,7 @@ mod tests {
         assert!(
             validate_semantics(&rationale)
                 .unwrap_err()
-                .contains("rationale must name liblzma")
+                .contains("rationale must name curl")
         );
     }
 

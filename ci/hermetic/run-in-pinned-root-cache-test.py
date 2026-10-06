@@ -1546,6 +1546,9 @@ class PinnedGuestPathContract(unittest.TestCase):
         self.assertIn(
             "/usr/bin/printf", paths, "DBT ptrace argument-forwarding reference"
         )
+        # test.record_replay's curl_recording_replays_offline_with_identical_logs
+        # finds curl on PATH (https://github.com/rrnewton/hermit/issues/3786).
+        self.assertIn("/usr/bin/curl", paths, "record_replay curl guest")
 
 
 if __name__ == "__main__":

@@ -58,33 +58,37 @@ checker is read-only and does not build, load, inspect, or silently repair an
 image. Both `-h` and `--help` describe this interface; its unit tests run with
 `rust-script --test ci/hermetic/check-image-provenance.rs`.
 
-The current d4e5 pin supersedes d809, whose root put only libunwind,
-elfutils, zlib and openssl on `LIBRARY_PATH`. Reverie `b8ef6a829634`
-(https://github.com/rrnewton/reverie/pull/942) made reverie-ptrace's build
-script request libunwind-ptrace's `--static` pkg-config closure, and Nixpkgs'
-`libunwind.pc` names `-llzma` in `Libs.private`, so
-`build.workspace_in_pinned_root` failed with `rust-lld: error: unable to find
-library -llzma` although liblzma was already in the image closure. The
-replacement adds xz to `nativeLibs`. Two builds from commit
-`ad99c6fa21f7332ee399dfe0ce47149a78d29c34` used independent source snapshots,
-physical Nix stores that did not exist before the build, and Podman stores;
-both produced archive
-`085b605dd6d17c59795ccc92b5cbd761424810ab156520a10474dc9e4a3c57d0`
-and loaded the same d4e5 image. d809
-(https://github.com/rrnewton/hermit/pull/3171) itself replaced c607
+The current 29a8 pin supersedes d4e5, whose root had no `curl` executable, so
+`test.record_replay` skipped
+`network_trace::curl_recording_replays_offline_with_identical_logs`, the only
+pinned-root test that runs curl
+(https://github.com/rrnewton/hermit/issues/3786). The replacement adds
+`curl.bin` to `guestTools` and `/usr/bin/curl` to `guest-paths.txt`. Two builds
+from commit `b8981f6ac8da871ab68b4cb75a9736dd810b0af0` used independent source
+snapshots, physical Nix stores that did not exist before the build, and Podman
+stores; both produced archive
+`7aeffce338a79d601c7352c80acd1ceca67547efcc02fd44e169ac465be6cd39`
+and loaded the same 29a8 image. d4e5 itself replaced d809, whose root lacked
+liblzma, which libunwind's static pkg-config closure names after Reverie
+https://github.com/rrnewton/reverie/pull/942; d809
+(https://github.com/rrnewton/hermit/pull/3171) replaced c607
 (https://github.com/rrnewton/hermit/pull/3172), an image built from a reused,
 mixed Nix store.
 
 This proves same-host reproducibility for the recorded method only; it makes no
 cross-host reproducibility claim. Each build ran as a systemd user service
-bounded to 2 CPUs (`CPUQuota=200%`), 8 GiB of memory with no swap and 1200
-seconds of wall time, running `nix --store <build-root>/nix-root build .#image`.
-The receipt records the build-time Nix version; its evidence limitations name
-what it does not preserve: the service environment's values, the build logs
-and path-info records, and the superseded d809 archive bytes. `build-image.sh`
-remains useful for a local one-off build, but one such build is not sufficient
-evidence for another reviewed repin. A future repin must replace the digest and
-provenance together with two new agreeing isolated builds.
+bounded to 2 CPUs (`CPUQuota=200%`), 8 GiB of memory with no swap and 2400
+seconds of wall time, running `nix --store <build-root>/nix-root build .#image`
+without network access: the new store could substitute only from the build
+host's default store, only signed or content-addressed paths, and every
+unsigned path was rebuilt. The Nix build sandbox's `/bin/sh` was a static
+busybox recorded in the receipt. The receipt records the build-time Nix
+version; its evidence limitations name what it does not preserve: the service
+environment's values, the build logs and path-info records, and the superseded
+d4e5 archive bytes. `build-image.sh` remains useful for a local one-off build,
+but one such build is not sufficient evidence for another reviewed repin. A
+future repin must replace the digest and provenance together with two new
+agreeing isolated builds.
 
 `setup.pinned_root_fetch` fetches Cargo dependencies; it does not prepare the OCI
 image. Prepare that image explicitly with `build-image.sh` when needed. Each
