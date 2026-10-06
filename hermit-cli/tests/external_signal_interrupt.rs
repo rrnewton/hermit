@@ -181,7 +181,7 @@ const HANDLED_BEFORE_EXIT_MS: u64 = SIGNAL_DELAY_MS + SIGNAL_DELAY_MS / 2;
 /// Trials in the guest's `sigsuspend creator` mode (`CREATOR_TRIALS` in the
 /// guest).
 const CREATOR_TRIALS: usize = 6;
-/// Trials in the guest's `poll pdeathchld` and `poll pdeathusr1` modes
+/// Trials in the guest's `poll pdeathchld`, `poll pdeathusr1` and `poll exitusr1` modes
 /// (`PDEATH_TRIALS` in the guest).
 const PDEATH_TRIALS: usize = 3;
 /// Unverified strict runs of a parent-death cell; each must match.
@@ -1728,6 +1728,36 @@ fn ptrace_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline() {
 #[test]
 fn ptrace_parent_death_usr1_keeps_a_poll_to_its_deadline() {
     assert_parent_death_signal_keeps_a_poll_to_its_deadline("ptrace", "pdeathusr1");
+}
+
+/// A child's exit signal other than SIGCHLD (the guest's `poll exitusr1`
+/// mode). A process catches SIGUSR1, creates a child with the raw clone system
+/// call and SIGUSR1 as its exit signal, and polls; the child exits 50 ms later.
+/// Linux returns EINTR when the child exits. Under Hermit the kernel posts that
+/// SIGUSR1 at the child's physical exit, an instant set by the host, so the
+/// clone call records SIGUSR1 as host-timed for the creating process, in its
+/// turn and before the child exists, and no gated wait of that process ends for
+/// it afterwards: in each trial the poll returns 0 after its full timeout and
+/// the handler runs once afterwards. Before that record, the poll returned EINTR
+/// at 53 ms in every measured trial, at the first turn after the host posted the
+/// signal (https://github.com/rrnewton/hermit/issues/3146).
+/// Unlike the parent-death cells, no guest kills a parked process here, so the
+/// cell runs once under strict verification and must show bitwise parity.
+#[test]
+fn ptrace_child_exit_usr1_keeps_a_poll_to_its_deadline() {
+    let backend = "ptrace";
+    let args = ["poll", "exitusr1"];
+    let expected =
+        format!("RESULT call=poll role=exitusr1 trials={PDEATH_TRIALS} matched={PDEATH_TRIALS}");
+    let run = run_cell(backend, FutexMode::Precise, &args, false);
+    assert!(
+        run.status.success()
+            && run.result_line() == Some(expected.as_str())
+            && run.stdout.lines().any(|line| line == "DONE"),
+        "{backend} {args:?}: expected `{expected}`\n{}",
+        run.describe()
+    );
+    assert_verified(backend, FutexMode::Precise, &args, &run);
 }
 
 /// `wait4` and `waitid` restart under SA_RESTART, as Linux restarts them: the

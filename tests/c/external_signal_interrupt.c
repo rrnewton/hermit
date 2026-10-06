@@ -15,7 +15,7 @@
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
  *             extchld|extchldreaped|extchldlive|chldflood] [held]
  *        external_signal_interrupt sigsuspend creator
- *        external_signal_interrupt poll <pdeathchld|pdeathusr1>
+ *        external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1>
  *        external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
@@ -640,13 +640,9 @@ static void on_pdeath(int sig) {
   pdeath_handled += 1;
 }
 
-static void pdeath_child(pid_t parent, int sig, int ready_fd, int out_fd) {
-  set_handler(sig, on_pdeath);
-  if (prctl(PR_SET_PDEATHSIG, sig) != 0) _exit(80);
-  /* P was not killed before the signal was armed. */
-  if (getppid() != parent) _exit(81);
-  if (write(ready_fd, "R", 1) != 1) _exit(82);
-  close(ready_fd);
+/* Polls no descriptors for PDEATH_POLL_MS, waits boundedly for the handler,
+ * writes the trial's fields to `out_fd` and exits. */
+static void report_poll_to_deadline(int out_fd) {
   struct timespec start, end;
   clock_gettime(CLOCK_MONOTONIC, &start);
   errno = 0;
@@ -664,6 +660,35 @@ static void pdeath_child(pid_t parent, int sig, int ready_fd, int out_fd) {
                    ret < 0 ? errno_name(err) : "none", elapsed, handled_count, ok);
   if (n <= 0 || write(out_fd, line, (size_t)n) != n) _exit(83);
   _exit(0);
+}
+
+static void pdeath_child(pid_t parent, int sig, int ready_fd, int out_fd) {
+  set_handler(sig, on_pdeath);
+  if (prctl(PR_SET_PDEATHSIG, sig) != 0) _exit(80);
+  /* P was not killed before the signal was armed. */
+  if (getppid() != parent) _exit(81);
+  if (write(ready_fd, "R", 1) != 1) _exit(82);
+  close(ready_fd);
+  report_poll_to_deadline(out_fd);
+}
+
+/* Reads one trial's report from `out_fd` to end of file, closes it, prints the
+ * TRIAL line, and returns 1 when the trial matched, 0 when it did not, or -1
+ * when the read failed. */
+static int collect_trial(int trial, int out_fd) {
+  char line[160];
+  size_t len = 0;
+  for (;;) {
+    ssize_t n = read(out_fd, line + len, sizeof line - 1 - len);
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0) return -1;
+    if (n == 0 || (len += (size_t)n) == sizeof line - 1) break;
+  }
+  line[len] = 0;
+  close(out_fd);
+  printf("TRIAL %d %s", trial, len > 0 ? line : "no report\n");
+  fflush(stdout);
+  return strstr(line, " ok=1\n") != NULL;
 }
 
 static int pdeath_main(const char *call, int sig, const char *role) {
@@ -694,21 +719,56 @@ static int pdeath_main(const char *call, int sig, const char *role) {
     sleep_ms(PDEATH_KILL_DELAY_MS);
     if (kill(parent, SIGKILL) != 0) return 88;
     reap(parent);
-    char line[160];
-    size_t len = 0;
-    for (;;) {
-      ssize_t n = read(out[0], line + len, sizeof line - 1 - len);
-      if (n < 0 && errno == EINTR) continue;
-      if (n < 0) return 89;
-      if (n == 0 || (len += (size_t)n) == sizeof line - 1) break;
-    }
-    line[len] = 0;
-    close(out[0]);
-    printf("TRIAL %d %s", i, len > 0 ? line : "no report\n");
-    fflush(stdout);
-    if (strstr(line, " ok=1\n") != NULL) matched += 1;
+    int trial = collect_trial(i, out[0]);
+    if (trial < 0) return 89;
+    matched += trial;
   }
   printf("RESULT call=poll role=%s trials=%d matched=%d\n", role, PDEATH_TRIALS, matched);
+  printf("DONE\n");
+  fflush(stdout);
+  return 0;
+}
+
+/* The `poll exitusr1` mode. Each of PDEATH_TRIALS trials forks a parent P. P
+ * catches SIGUSR1, creates a child C with the raw clone system call and
+ * SIGUSR1 as C's exit signal, and polls no descriptors for PDEATH_POLL_MS. C
+ * sleeps EXIT_SIGNAL_DELAY_MS and exits. Linux sends P SIGUSR1 when C exits, so
+ * on Linux the poll returns EINTR near EXIT_SIGNAL_DELAY_MS. Under Hermit the
+ * instant C exits physically, and so the instant the signal is posted, is the
+ * host's. So the poll must keep its deadline: it returns 0 after its full
+ * timeout and the handler runs once afterwards. P reports as in the
+ * parent-death modes and does not reap C; the main process reaps P. Prints one
+ * TRIAL line per trial, then `RESULT call=poll role=exitusr1 trials=<n>
+ * matched=<m>`. */
+#define EXIT_SIGNAL_DELAY_MS 50
+
+static int exit_signal_main(const char *call) {
+  if (strcmp(call, "poll")) return 2;
+  int matched = 0;
+  for (int i = 0; i < PDEATH_TRIALS; i++) {
+    int out[2];
+    if (pipe(out) != 0) return 84;
+    pid_t parent = fork();
+    if (parent < 0) return 85;
+    if (parent == 0) {
+      close(out[0]);
+      set_handler(SIGUSR1, on_pdeath);
+      long child = syscall(SYS_clone, (unsigned long)SIGUSR1, NULL, NULL, NULL, NULL);
+      if (child < 0) _exit(90);
+      if (child == 0) {
+        close(out[1]);
+        sleep_ms(EXIT_SIGNAL_DELAY_MS);
+        _exit(0);
+      }
+      report_poll_to_deadline(out[1]);
+    }
+    close(out[1]);
+    int trial = collect_trial(i, out[0]);
+    reap(parent);
+    if (trial < 0) return 89;
+    matched += trial;
+  }
+  printf("RESULT call=poll role=exitusr1 trials=%d matched=%d\n", PDEATH_TRIALS, matched);
   printf("DONE\n");
   fflush(stdout);
   return 0;
@@ -858,7 +918,7 @@ int main(int argc, char **argv) {
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
         "spinthrexit|usr2|extchld|extchldreaped|extchldlive|chldflood]\n"
         "       external_signal_interrupt sigsuspend creator\n"
-        "       external_signal_interrupt poll <pdeathchld|pdeathusr1>\n"
+        "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1>\n"
         "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing\n");
     return 2;
   }
@@ -869,6 +929,7 @@ int main(int argc, char **argv) {
   if (!strcmp(call, "sigsuspend")) return creator_main(sender);
   if (!strcmp(sender, "pdeathchld")) return pdeath_main(call, SIGCHLD, "pdeathchld");
   if (!strcmp(sender, "pdeathusr1")) return pdeath_main(call, SIGUSR1, "pdeathusr1");
+  if (!strcmp(sender, "exitusr1")) return exit_signal_main(call);
   if (!strcmp(sender, "racing")) return racing_main(call);
   int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
   int chldflood = 0;

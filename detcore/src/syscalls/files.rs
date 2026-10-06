@@ -61,8 +61,10 @@ use crate::resources::HOST_TIMED_INTERNAL_PIPE_IO_FYI;
 use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
+use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::runqueue::LAST_PRIORITY;
 use crate::stat::*;
+use crate::syscalls::threads::kernel_sigset_bit;
 use crate::tool_global::*;
 use crate::tool_local::CapturedDetFdInstallError;
 use crate::tool_local::Detcore;
@@ -371,6 +373,38 @@ pub(crate) const DETERMINISTIC_PIPE_CAPACITY_BYTES: i32 = 8 * 1024;
 /// was told.
 pub(crate) fn pipe_capacity_request_exceeds_ceiling(requested: i32) -> bool {
     requested > DETERMINISTIC_PIPE_CAPACITY_BYTES
+}
+
+/// SIGIO and SIGURG, the signals Linux sends to a descriptor's owner when
+/// data, out-of-band data, a lease break, or a directory change arrives.
+fn async_io_signals() -> u64 {
+    kernel_sigset_bit(libc::SIGIO) | kernel_sigset_bit(libc::SIGURG)
+}
+
+/// The signals an `fcntl` command lets Linux send at a moment set by host
+/// timing, as a kernel sigset; 0 for every other command. `F_SETOWN` and
+/// `F_SETOWN_EX` name the owner, `F_SETLEASE` and `F_NOTIFY` make the caller
+/// the owner, `O_ASYNC` enables SIGIO, and `F_SETSIG` replaces SIGIO with
+/// another signal.
+fn fcntl_host_timed_signals(cmd: syscalls::FcntlCmd<'_>) -> u64 {
+    match cmd {
+        F_SETFL(flags) if flags & libc::O_ASYNC != 0 => async_io_signals(),
+        F_SETOWN | F_SETOWN_EX(_) | F_SETLEASE(_) | F_NOTIFY(_) => async_io_signals(),
+        F_SETSIG(signal) => async_io_signals() | kernel_sigset_bit(signal),
+        _ => 0,
+    }
+}
+
+/// The signals an `ioctl` request lets Linux send at a moment set by host
+/// timing, as a kernel sigset; 0 for every other request. `FIOASYNC` enables
+/// SIGIO, and `FIOSETOWN` and `SIOCSPGRP` name the owner.
+fn ioctl_host_timed_signals(request: syscalls::ioctl::Request<'_>) -> u64 {
+    match request {
+        syscalls::ioctl::Request::FIOASYNC(_)
+        | syscalls::ioctl::Request::FIOSETOWN(_)
+        | syscalls::ioctl::Request::SIOCSPGRP(_) => async_io_signals(),
+        _ => 0,
+    }
 }
 
 /// Why the pin failed, and which descriptors Linux had already created when it did.
@@ -3800,6 +3834,19 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Fcntl,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        // The owner of an asynchronous-I/O descriptor may be any process or
+        // process group, and Linux signals it when data arrives, at a moment
+        // set by host timing. Record the signals in this turn, before the call
+        // reaches the kernel, for every process of the container, and never
+        // forget them (`Scheduler::record_host_timed_signals`).
+        let signals = fcntl_host_timed_signals(call.cmd());
+        if signals != 0
+            && guest
+                .config()
+                .backend_supports_blocked_wait_signal_interruption
+        {
+            record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
+        }
         let o_cloexec = match call.cmd() {
             F_DUPFD_CLOEXEC(_) => OFlag::O_CLOEXEC,
             _ => OFlag::empty(),
@@ -3905,6 +3952,16 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Ioctl,
     ) -> Result<i64, Error> {
         let fd = call.fd();
+        // As in `handle_fcntl`: an asynchronous-I/O owner is signalled at a
+        // moment set by host timing, so hold its signals in every process.
+        let signals = ioctl_host_timed_signals(call.request());
+        if signals != 0
+            && guest
+                .config()
+                .backend_supports_blocked_wait_signal_interruption
+        {
+            record_host_timed_signals(guest, HostTimedSignalScope::Container, signals).await;
+        }
         let (cloexec, nonblocking) = match call.request() {
             // AUTONOMOUS-BOT-IMPLEMENTED
             // TODO-HUMAN-REVIEW(PR-1142): Review deterministic SIOCETHTOOL rejection.
@@ -6480,9 +6537,52 @@ mod test {
     use reverie::syscalls::Whence;
 
     use super::DETERMINISTIC_PIPE_CAPACITY_BYTES;
+    use super::fcntl_host_timed_signals;
+    use super::ioctl_host_timed_signals;
     use super::pipe_capacity_request_exceeds_ceiling;
     use crate::test_pages::PAGE;
     use crate::test_pages::Pages;
+
+    /// Every `fcntl` and `ioctl` that can make Linux signal a descriptor's
+    /// owner at a moment set by host timing names SIGIO and SIGURG, plus the
+    /// signal `F_SETSIG` chooses; every other command names nothing
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn async_io_arming_calls_name_their_host_timed_signals() {
+        use reverie::syscalls::FcntlCmd;
+        use reverie::syscalls::ioctl::Request;
+        let bit = |signal: i32| 1_u64 << (signal - 1);
+        let async_io = bit(libc::SIGIO) | bit(libc::SIGURG);
+        for (cmd, expected) in [
+            (
+                FcntlCmd::F_SETFL(libc::O_ASYNC | libc::O_NONBLOCK),
+                async_io,
+            ),
+            (FcntlCmd::F_SETFL(libc::O_NONBLOCK), 0),
+            (FcntlCmd::F_SETOWN, async_io),
+            (FcntlCmd::F_SETOWN_EX(None), async_io),
+            (FcntlCmd::F_SETLEASE(libc::F_RDLCK), async_io),
+            // DN_MODIFY, which the libc crate does not export.
+            (FcntlCmd::F_NOTIFY(0x2), async_io),
+            (
+                FcntlCmd::F_SETSIG(libc::SIGUSR1),
+                async_io | bit(libc::SIGUSR1),
+            ),
+            (FcntlCmd::F_SETSIG(0), async_io),
+            (FcntlCmd::F_GETFL, 0),
+            (FcntlCmd::F_SETFD(libc::FD_CLOEXEC), 0),
+        ] {
+            assert_eq!(fcntl_host_timed_signals(cmd), expected, "{cmd:?}");
+        }
+        for (request, expected) in [
+            (Request::FIOASYNC(None), async_io),
+            (Request::FIOSETOWN(None), async_io),
+            (Request::SIOCSPGRP(None), async_io),
+            (Request::FIOCLEX, 0),
+        ] {
+            assert_eq!(ioctl_host_timed_signals(request), expected, "{request:?}");
+        }
+    }
     /// The ceiling is inclusive. A guest that reads the advertised
     /// `pipe-max-size` and asks for exactly that must be allowed to have it;
     /// refusing at the boundary would advertise a size that cannot be set.
