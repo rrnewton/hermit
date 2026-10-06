@@ -910,6 +910,17 @@ fn restore_pre_exclusion_ownership(cfg: &mut DagConfig, generated: &DagConfig) {
     }
 }
 
+/// The generated validation DAG, read from the committed ci/dag/validate.json
+/// compiled into this test binary. validation_dag::tests::
+/// full_generator_refuses_static_artifact_mutations asserts that
+/// `validation_dag::generate` emits exactly these bytes, so these tests read
+/// them rather than regenerating. Regenerating runs scripts/validate.rs, which
+/// outside validate (where it is prebuilt) rust-script compiles first: 88 s wall
+/// in a cold cache at load ~250 on 2026-10-06, against nextest's 57 s limit.
+fn generated_validation_dag() -> DagConfig {
+    dag_from_json(include_str!("../../../../dag/validate.json")).unwrap()
+}
+
 // Use the real generated graph and label selection, including the pinned-root
 // wrapper additions. The small report fixture above intentionally remains a
 // synthetic single-cell input; it does not cover generated command bytes.
@@ -921,11 +932,7 @@ fn restore_pre_exclusion_ownership(cfg: &mut DagConfig, generated: &DagConfig) {
 // pre-fold generator emitted.
 fn generated_plan_populations_preserve_command_policy() {
     let root = crate::git_environment::checkout_root();
-    let generated = crate::validation_dag::generate(&root).unwrap();
-    assert_eq!(
-        crate::validation_dag::canonical_text(&generated),
-        std::fs::read_to_string(root.join("ci/dag/validate.json")).unwrap()
-    );
+    let generated = generated_validation_dag();
     let expected_json = std::fs::read_to_string(root.join("ci/expected-e2e-plan.json")).unwrap();
     let raw_expected = crate::validation_dag::expected_cells_from_json(&expected_json)
         .unwrap()
@@ -1712,8 +1719,7 @@ fn exact_legacy_artifacts_remain_authenticated_without_inferred_bindings() {
 /// export.
 #[test]
 fn plans_retained_before_issue_3301_still_verify_their_parity_relations() {
-    let root = crate::git_environment::checkout_root();
-    let generated = crate::validation_dag::generate(&root).unwrap();
+    let generated = generated_validation_dag();
     // Slice S6 of https://github.com/rrnewton/hermit/issues/3301 then folded
     // the two parity selectors into the c-programs pair, which selects no
     // parity relation.
