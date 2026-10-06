@@ -1882,7 +1882,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )));
                 }
             }
-            let snapshot = MountInfoSnapshot::new(
+            let mut snapshot = MountInfoSnapshot::new(
                 rows,
                 if guest.config().mountinfo_mount_ids_captured {
                     &guest.config().mountinfo_mount_ids
@@ -1898,9 +1898,26 @@ impl<T: RecordOrReplay> Detcore<T> {
                     "mountinfo snapshot failed strict identity validation"
                 ))
             })?;
-            if !validate_mountinfo_identity_order(guest, snapshot.raw_mount_id_order()).await {
+            // Number this view's mount IDs through the same run-global pool
+            // as fdinfo. IDs the run has already shown keep their numbers;
+            // the rest are numbered in the order this view presents them
+            // (rows, then parent-only IDs). The canonical order, which may
+            // follow the captured namespace, only validates the view.
+            let observation_order = snapshot.raw_mount_id_observation_order();
+            let Some(virtual_ids) = resolve_mountinfo_identities(
+                guest,
+                snapshot.raw_mount_id_order(),
+                observation_order.clone(),
+            )
+            .await
+            else {
                 return Err(Error::Tool(anyhow::anyhow!(
                     "mountinfo mount-ID order changed after the run-global identity snapshot"
+                )));
+            };
+            if !snapshot.use_run_mount_ids(&observation_order, &virtual_ids) {
+                return Err(Error::Tool(anyhow::anyhow!(
+                    "run-global mount identities do not cover this mountinfo snapshot"
                 )));
             }
             Some(snapshot)

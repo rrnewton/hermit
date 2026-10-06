@@ -516,18 +516,7 @@ impl MountInfoSnapshot {
             .iter()
             .flat_map(|row| [row.raw_mount_id, row.raw_parent_id])
             .collect::<std::collections::BTreeSet<_>>();
-        let mut derived_order = Vec::with_capacity(expected_mount_ids.len());
-        let mut seen = std::collections::BTreeSet::new();
-        for row in &rows {
-            if seen.insert(row.raw_mount_id) {
-                derived_order.push(row.raw_mount_id);
-            }
-        }
-        for row in &rows {
-            if seen.insert(row.raw_parent_id) {
-                derived_order.push(row.raw_parent_id);
-            }
-        }
+        let derived_order = mountinfo_observation_order(&rows);
         let mount_ids = if mount_id_order.is_empty() {
             derived_order
                 .into_iter()
@@ -601,7 +590,50 @@ impl MountInfoSnapshot {
         self.mount_ids.get(&raw_mount_id).copied()
     }
 
+    /// Replace this snapshot's positional mount IDs with run-global ones.
+    ///
+    /// `virtual_ids[i]` is the run-global ID of `raw_order[i]`, and `raw_order`
+    /// must name exactly this snapshot's raw IDs. The positional numbering from
+    /// [`Self::new`] only orders the entries for that request. Rendering uses
+    /// the run-global numbers so mountinfo agrees with fdinfo and neither
+    /// depends on rows the guest never observed. Returns false, leaving the
+    /// snapshot unchanged, on a length, membership, or distinctness mismatch.
+    pub(crate) fn use_run_mount_ids(&mut self, raw_order: &[u64], virtual_ids: &[u64]) -> bool {
+        let mut distinct_raw = std::collections::BTreeSet::new();
+        let mut distinct_virtual = std::collections::BTreeSet::new();
+        if raw_order.len() != virtual_ids.len()
+            || raw_order.len() != self.mount_ids.len()
+            || !raw_order
+                .iter()
+                .all(|raw| self.mount_ids.contains_key(raw) && distinct_raw.insert(*raw))
+            || !virtual_ids.iter().all(|id| distinct_virtual.insert(*id))
+        {
+            return false;
+        }
+        self.mount_ids = raw_order
+            .iter()
+            .copied()
+            .zip(virtual_ids.iter().copied())
+            .collect();
+        true
+    }
+
+    /// Raw mount IDs in the order this view presents them to the guest: row
+    /// IDs in row order, then parent-only IDs in row order.
+    ///
+    /// Unlike [`Self::raw_mount_id_order`], this never depends on the
+    /// producer-captured namespace order, which can place a view's parent
+    /// before or after its rows depending on mounts the guest cannot see. The
+    /// run-global pool numbers unseen IDs in this order.
+    pub(crate) fn raw_mount_id_observation_order(&self) -> Vec<u64> {
+        mountinfo_observation_order(&self.rows)
+    }
+
     /// Raw mount IDs in the canonical order assigned by this snapshot.
+    ///
+    /// When a captured order was supplied, this is that order restricted to
+    /// the view, so it is used only to validate the view against the run's
+    /// captured namespace, never to number it.
     pub(crate) fn raw_mount_id_order(&self) -> Vec<u64> {
         let mut ordered = self
             .mount_ids
@@ -611,6 +643,24 @@ impl MountInfoSnapshot {
         ordered.sort_unstable();
         ordered.into_iter().map(|(_, raw)| raw).collect()
     }
+}
+
+/// Row mount IDs in row order, then parent-only mount IDs in row order, each
+/// raw ID once.
+fn mountinfo_observation_order(rows: &[MountInfoRow]) -> Vec<u64> {
+    let mut order = Vec::with_capacity(rows.len().saturating_mul(2));
+    let mut seen = std::collections::BTreeSet::new();
+    for row in rows {
+        if seen.insert(row.raw_mount_id) {
+            order.push(row.raw_mount_id);
+        }
+    }
+    for row in rows {
+        if seen.insert(row.raw_parent_id) {
+            order.push(row.raw_parent_id);
+        }
+    }
+    order
 }
 
 /// Guest-visible values used to normalize one procfs snapshot.
@@ -4826,6 +4876,88 @@ Rss:                   4 kB\n" as &[u8];
         let rendered = sanitize_mountinfo(&filtered, &snapshot);
         assert!(rendered.windows(6).any(|w| w == b"/child"));
         assert!(!rendered.windows(7).any(|w| w == b"xarfuse"));
+    }
+
+    /// Mountinfo renders the run-global numbers, not the snapshot's
+    /// positional ones, and a mismatched assignment leaves it unchanged.
+    #[test]
+    fn run_mount_ids_replace_positional_ids_only_when_they_cover_the_snapshot() {
+        let contents =
+            b"20 10 8:1 / /a rw - ext4 /dev/a rw\n30 20 8:2 / /a/b rw - ext4 /dev/b rw\n";
+        let snapshot = || {
+            let rows = parse_mountinfo(contents).unwrap();
+            MountInfoSnapshot::new(rows, &[], false, BTreeMap::new(), BTreeMap::new()).unwrap()
+        };
+        let positional = snapshot();
+        let raw_order = positional.raw_mount_id_order();
+        assert_eq!(raw_order, [20, 30, 10]);
+
+        for (raw, virtual_ids) in [
+            (vec![20, 30], vec![5, 6]),
+            (vec![20, 30, 10, 40], vec![5, 6, 7, 8]),
+            (vec![20, 30, 99], vec![5, 6, 7]),
+            (vec![20, 20, 10], vec![5, 6, 7]),
+            (vec![20, 30, 10], vec![5, 5, 7]),
+            (vec![20, 30, 10], vec![5, 6]),
+        ] {
+            let mut refused = snapshot();
+            assert!(
+                !refused.use_run_mount_ids(&raw, &virtual_ids),
+                "{raw:?} -> {virtual_ids:?} must be refused"
+            );
+            assert_eq!(
+                sanitize_mountinfo(contents, &refused),
+                sanitize_mountinfo(contents, &positional)
+            );
+        }
+
+        let mut run_global = snapshot();
+        assert!(run_global.use_run_mount_ids(&raw_order, &[7, 3, 9]));
+        assert_eq!(run_global.canonical_mount_id(20), Some(7));
+        assert_eq!(run_global.canonical_mount_id(30), Some(3));
+        assert_eq!(run_global.canonical_mount_id(10), Some(9));
+        assert_eq!(
+            sanitize_mountinfo(contents, &run_global),
+            b"7 9 8:1 / /a rw - ext4 /dev/a rw\n3 7 8:2 / /a/b rw - ext4 /dev/b rw\n"
+        );
+    }
+
+    /// The same chroot view (row 20 under parent 10, which is outside the
+    /// view) can sit in a captured namespace that lists 10 before 20 or after
+    /// it. The canonical order follows the capture and may differ; the
+    /// observation order, which numbers the view, must not.
+    #[test]
+    fn observation_order_follows_the_view_not_the_captured_namespace() {
+        let contents = b"20 10 8:1 / /proc rw - proc proc rw\n";
+        let snapshot = |captured: &[u64]| {
+            MountInfoSnapshot::new(
+                parse_mountinfo(contents).unwrap(),
+                captured,
+                false,
+                BTreeMap::new(),
+                BTreeMap::new(),
+            )
+            .unwrap()
+        };
+        let parent_first = snapshot(&[10, 20, 9]);
+        let parent_last = snapshot(&[20, 10]);
+        let uncaptured = snapshot(&[]);
+        assert_eq!(parent_first.raw_mount_id_order(), [10, 20]);
+        assert_eq!(parent_last.raw_mount_id_order(), [20, 10]);
+        for view in [&parent_first, &parent_last, &uncaptured] {
+            assert_eq!(view.raw_mount_id_observation_order(), [20, 10]);
+        }
+
+        // Numbering in observation order renders identical text either way.
+        let render = |mut view: MountInfoSnapshot| {
+            let order = view.raw_mount_id_observation_order();
+            assert!(view.use_run_mount_ids(&order, &[1, 2]));
+            sanitize_mountinfo(contents, &view)
+        };
+        let expected = b"1 2 8:1 / /proc rw - proc proc rw\n".to_vec();
+        assert_eq!(render(parent_first), expected);
+        assert_eq!(render(parent_last), expected);
+        assert_eq!(render(uncaptured), expected);
     }
 
     #[test]

@@ -190,10 +190,11 @@ pub struct Config {
 
     /// Recording/container namespace mount IDs in canonical row order.
     ///
-    /// Detcore uses this same mapping for `/proc/*/mountinfo` and
-    /// `/proc/*/fdinfo/*`. It is runtime provenance rather than a user option;
-    /// replay retains recording-time raw IDs because its read events contain
-    /// recording-time kernel bytes.
+    /// Detcore validates every `/proc/*/mountinfo` view against this order.
+    /// It does not number mount IDs by position in it; see
+    /// `mount_id_assignment_order`. It is runtime provenance rather than a
+    /// user option; replay retains recording-time raw IDs because its read
+    /// events contain recording-time kernel bytes.
     #[serde(default)]
     #[clap(skip)]
     pub mountinfo_mount_ids: Vec<u64>,
@@ -207,13 +208,17 @@ pub struct Config {
     #[clap(skip)]
     pub mountinfo_mount_ids_captured: bool,
 
-    /// Raw fdinfo mount IDs absent from mountinfo, in first-observation order.
+    /// Raw mount IDs in the order Detcore numbered them for the guest.
     ///
-    /// Recording persists this producer-observed order so replay does not
-    /// derive identities from its fresh namespace or launch descriptor shape.
+    /// Detcore numbers a raw mount ID when the guest first observes it through
+    /// `/proc/*/mountinfo` or `/proc/*/fdinfo/*`; `mountinfo_mount_ids` only
+    /// validates mountinfo views. A live run starts empty. Recording persists
+    /// the completed order so replay gives every raw ID its recorded number
+    /// rather than deriving one from its fresh namespace or launch descriptor
+    /// shape.
     #[serde(default)]
     #[clap(skip)]
-    pub fdinfo_unlisted_mount_ids: Vec<u64>,
+    pub mount_id_assignment_order: Vec<u64>,
 
     /// Sequentialize thread execution deterministically.
     #[clap(long)]
@@ -2608,13 +2613,13 @@ mod tests {
         value
             .as_object_mut()
             .unwrap()
-            .remove("fdinfo_unlisted_mount_ids");
+            .remove("mount_id_assignment_order");
         let restored: Config = serde_json::from_value(value).unwrap();
         assert!(restored.mountinfo_root_rewrites.is_empty());
         assert!(restored.mountinfo_device_rewrites.is_empty());
         assert!(restored.mountinfo_mount_ids.is_empty());
         assert!(!restored.mountinfo_mount_ids_captured);
-        assert!(restored.fdinfo_unlisted_mount_ids.is_empty());
+        assert!(restored.mount_id_assignment_order.is_empty());
     }
 
     #[test]

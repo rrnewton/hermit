@@ -93,7 +93,7 @@ impl Replay {
         config.mountinfo_root_rewrites = metadata.mountinfo_root_rewrites.clone();
         config.mountinfo_mount_ids = metadata.mountinfo_mount_ids.clone();
         config.mountinfo_mount_ids_captured = metadata.mountinfo_mount_ids_captured;
-        config.fdinfo_unlisted_mount_ids = metadata.fdinfo_unlisted_mount_ids.clone();
+        config.mount_id_assignment_order = metadata.mount_id_assignment_order.clone();
         let sequentialize_threads = config.sequentialize_threads;
 
         let (chroot, bootstrap_program, materialization_scope, replay_mounts) =
