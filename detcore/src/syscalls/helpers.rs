@@ -1659,8 +1659,8 @@ where
 /// stopped by one and every signal that arrives stays pending in the kernel, where
 /// `/proc` reports it. Each turn classifies the pending set against the guest's
 /// mask and dispositions, and an interrupting signal ends the wait with the call's
-/// restart errno (see `KernelSignalWait::interrupted`). The guest's mask is
-/// restored before returning, so the signal is delivered as the call returns.
+/// restart errno (see `KernelSignalWait::interrupted_with_state`). The guest's mask
+/// is restored before returning, so the signal is delivered as the call returns.
 async fn retry_blocking_wait_with_kernel_signal_state<T, G, C>(
     guest: &mut G,
     call0: C,
@@ -1779,10 +1779,10 @@ where
 /// The first probe runs under the guest's own mask. If it would block, `block`
 /// blocks every blockable signal for the rest of the wait, so later probes cannot
 /// be stopped by one and every signal that arrives stays pending in the kernel,
-/// where `/proc` reports it. `interrupted` classifies the pending set against the
-/// guest's mask and dispositions each turn, and `restore` puts the guest's mask
-/// back before the call returns, so a pending interrupting signal is delivered as
-/// the call returns its restart errno.
+/// where `/proc` reports it. `interrupted_with_state` classifies the pending set
+/// against the guest's mask and dispositions each turn, and `restore` puts the
+/// guest's mask back before the call returns, so a pending interrupting signal
+/// is delivered as the call returns its restart errno.
 ///
 /// Probes and the mask change go through `inject_absorbing`, never
 /// `inject_with_retry`. A signal that stops the guest around an injection is
@@ -1791,12 +1791,12 @@ where
 /// from `/proc` which signal the backend holds and injects again only when that
 /// signal would not end the wait natively. Before the mask is set, a signal
 /// pending at the turn's `/proc` read that would end the wait is reported by
-/// `interrupted`, and any other unblocked one stops the next injection and is
-/// absorbed; a signal that arrives after the read can stop an injection in a way
-/// that cannot be identified, which ends the wait. Afterwards only a signal that
-/// cannot be blocked can stop an injection. A stop after a probe ran replaces its
-/// result, so a probe that consumed something (an edge-triggered event, a
-/// dequeued signal) loses it; that remains a known gap.
+/// `interrupted_with_state`, and any other unblocked one stops the next
+/// injection and is absorbed; a signal that arrives after the read can stop an
+/// injection in a way that cannot be identified, which ends the wait.
+/// Afterwards only a signal that cannot be blocked can stop an injection. A stop
+/// after a probe ran replaces its result, so a probe that consumed something (an
+/// edge-triggered event, a dequeued signal) loses it; that remains a known gap.
 ///
 /// No failure of this machinery reaches the guest as an errno the wait call
 /// cannot return. A `/proc` read that fails for a thread that still exists, or a
@@ -1909,16 +1909,8 @@ impl KernelSignalWait {
         sigchld_eligibility_is_tracked(guest)
     }
 
-    /// Whether a signal that would end the wait natively is pending, in which case
-    /// the caller returns the call's restart errno. The guest thread has been
-    /// stopped inside the call since it was intercepted, so such a signal arrived
-    /// while the call was waiting, and Linux returns the restart errno for that.
-    /// Linux would still report sources that were ready when the call began, which
-    /// this check puts behind the signal, as the scheduler's `Signaled` path did.
-    /// A `SIGCHLD` counts only once the scheduler made it eligible
-    /// (`eligible_pending_signals`), and a `SIGCHLD` that the backend holds since
-    /// `inject_absorbing` absorbed it counts as pending. A failed read is never
-    /// returned as the call's errno (`read_wait_signal_state`).
+    /// `interrupted_with_state` without the state, for the tests.
+    #[cfg(test)]
     pub(crate) async fn interrupted<T, G>(&self, guest: &mut G) -> Result<bool, Error>
     where
         T: RecordOrReplay,
@@ -1927,8 +1919,17 @@ impl KernelSignalWait {
         Ok(self.interrupted_with_state(guest).await?.0)
     }
 
-    /// `interrupted`, also returning the kernel's state that it read, which
-    /// `inject_absorbing_after` takes as its first read in the same turn.
+    /// Whether a signal that would end the wait natively is pending, in which case
+    /// the caller returns the call's restart errno, with the kernel's state that
+    /// this read, which `inject_absorbing_after` takes as its first read in the same
+    /// turn. The guest thread has been stopped inside the call since it was
+    /// intercepted, so such a signal arrived while the call was waiting, and Linux
+    /// returns the restart errno for that. Linux would still report sources that
+    /// were ready when the call began, which this check puts behind the signal, as
+    /// the scheduler's `Signaled` path did. A `SIGCHLD` counts only once the
+    /// scheduler made it eligible (`eligible_pending_signals`), and a `SIGCHLD` that
+    /// the backend holds since `inject_absorbing` absorbed it counts as pending. A
+    /// failed read is never returned as the call's errno (`read_wait_signal_state`).
     pub(crate) async fn interrupted_with_state<T, G>(
         &self,
         guest: &mut G,
@@ -1969,7 +1970,7 @@ impl KernelSignalWait {
     ///   it is delivered rather than consumed, and the call runs again.
     /// - A signal that would end the wait natively ends it with the restart
     ///   errno, except a `SIGCHLD` the scheduler has not made eligible, which is
-    ///   held and counts in `interrupted` once it is.
+    ///   held and counts in `interrupted_with_state` once it is.
     /// - Any other `SIGCHLD`, and a default job-control stop that the wait
     ///   defers, are held, and so are an ignored signal and a default-ignored
     ///   one. The injection runs again.
@@ -2006,18 +2007,26 @@ impl KernelSignalWait {
     ///
     /// Once `block` has blocked every blockable signal (`saved_mask`), `state`
     /// serves as the first read before the injection, so a polling turn reads
-    /// `/proc` once, as it did before injections absorbed stops. Between the two
-    /// reads the guest thread stays stopped and only it can change its own mask,
-    /// and with threads sequentialized no other guest thread runs in its turn, so
-    /// a signal that arrives meanwhile arrives at a host-timed moment: sent from
-    /// outside the guest, or posted by the kernel. Under the full mask a
-    /// blockable one stays pending, cannot stop the injection, and is classified
-    /// at the next turn's read, as one that arrives just after a fresh read is.
-    /// One that cannot be blocked and stops the injection is not named by
-    /// `state`, so the stop is not identified and ends the wait with the restart
-    /// errno, as a stop by a signal that arrives just after a fresh read does.
-    /// `interrupted` found no signal in `state` that ends the wait, so the check
-    /// before the injection does not end it either.
+    /// `/proc` once, as it did before injections absorbed stops. The caller must
+    /// run nothing between the two that resumes the guest thread or changes its
+    /// signal state. `retry_blocking_wait_with_kernel_signal_state`, which serves
+    /// poll, epoll_wait, futex, wait4, rt_sigtimedwait and pipe and socket IO,
+    /// runs nothing there; the `select` and `pselect6` waits write the probe's
+    /// timeout and descriptor sets into guest memory, which Detcore in a tracer
+    /// (ptrace, LiteInst's default runtime) does without resuming the thread. So
+    /// between the two reads the guest thread stays stopped and only it can
+    /// change its own mask, and with threads sequentialized no other guest thread
+    /// runs in its turn, so a signal that arrives meanwhile arrives at a
+    /// host-timed moment: sent from outside the guest, or posted by the kernel.
+    /// A signal that the full mask blocks stays pending, cannot stop the
+    /// injection, and is classified at the next turn's read, as one that arrives
+    /// just after a fresh read is. One that the full mask leaves unblocked
+    /// (`SIGKILL`, `SIGSTOP`, glibc's two reserved signals, `PERF_EVENT_SIGNAL`)
+    /// and that stops the injection is not named by `state`, so the stop is not
+    /// identified and ends the wait with the restart errno, as a stop by a signal
+    /// that arrives just after a fresh read does. `interrupted_with_state` found
+    /// no signal in `state` that ends the wait, so the check before the injection
+    /// does not end it either.
     ///
     /// Before `block` takes effect, or when it cannot, the probe runs under the
     /// guest's own mask and a fresh read is taken, so a signal that arrived
@@ -2168,9 +2177,9 @@ impl KernelSignalWait {
     /// If the mask cannot be changed for another reason, the guest's mask is
     /// unchanged and no wait call can return that error, so the wait continues
     /// with every probe under the guest's own mask, as the first probe runs, and
-    /// `block` is not tried again (`needs_block`). `interrupted` reads that mask
-    /// from the kernel each turn. The scratch-stack commit fails this way on a
-    /// guest stack with no room below its stack pointer
+    /// `block` is not tried again (`needs_block`). `interrupted_with_state` reads
+    /// that mask from the kernel each turn. The scratch-stack commit fails this
+    /// way on a guest stack with no room below its stack pointer
     /// (https://github.com/rrnewton/hermit/issues/3328); poll and epoll_wait
     /// probes need no scratch of their own, so for them this is the first need.
     pub(crate) async fn block<'a, T, G>(
