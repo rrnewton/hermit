@@ -701,7 +701,8 @@ fn classify_failure(error: &Error) -> String {
         return "HERMIT_RUN_TIMEOUT class=run-timeout".to_string();
     }
     // NOT HERMIT_INTERNAL_FAILURE either: the requested log cap fired and the
-    // writer that crossed it printed the bound before tearing the run down.
+    // writer that crossed it tore the run down. Its message with the bound is
+    // best effort and may be missing.
     if error.downcast_ref::<LogCapExceeded>().is_some() {
         return "HERMIT_LOG_CAP class=log-cap".to_string();
     }

@@ -1011,8 +1011,10 @@ pub(crate) fn enable_log_cap_exit_bound() {
 /// Two ways around that timer are closed here. If the thread cannot be
 /// created, nothing would bound the diagnostics that follow, so the process
 /// exits 123 at once. And from here on a panic exits 123 instead of
-/// unwinding to the panic status 101: `eprintln!` panics when stderr's reader
-/// has gone, and `analyze` still `expect`s its trials' results.
+/// unwinding to the panic status 101, because the run's class is already
+/// decided: `eprintln!`, for one, panics when stderr's reader has gone. A
+/// failed `analyze` or `bisect` trial does not panic; it returns its error to
+/// `main`, which reports a cap crossing by its class.
 pub(crate) fn bound_log_cap_exit() {
     bound_log_cap_exit_with(|timer| {
         std::thread::Builder::new()

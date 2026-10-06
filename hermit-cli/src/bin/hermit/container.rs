@@ -1212,9 +1212,10 @@ impl std::error::Error for RunTimeoutMarker {}
 
 /// The container child exited [`hermit::HERMIT_LOG_CAP_EXIT`]: hermit's own
 /// log output crossed `--max-log-bytes` and the writer that crossed it ended
-/// the run. The child printed the bound and byte count to stderr before
-/// exiting; this carries no number for the same reason [`RunTimeoutMarker`]
-/// does not.
+/// the run. Before exiting, the child attempted one message with the bound and
+/// byte count, without waiting for its sink. That message is best effort and
+/// can be missing (see `CappedWriter` in `tracing.rs`). This carries no number
+/// for the same reason [`RunTimeoutMarker`] does not.
 #[derive(Debug)]
 pub struct LogCapExceeded;
 
