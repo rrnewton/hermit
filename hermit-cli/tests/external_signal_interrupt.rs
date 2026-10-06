@@ -39,8 +39,11 @@
 //!
 //! LiteInst runs a call site's first execution through a ptrace stop, where the
 //! kernel turns a restart errno into `EINTR` or a restart, and later executions
-//! through the patched site, where Hermit must do the same. The `warm` cells run
-//! the wait through the patched site.
+//! through the patched site. There Reverie rewinds an interrupted call to the
+//! LiteInst runtime's trap instruction, and the kernel's signal delivery makes
+//! the same decision at a landing in the runtime's private page. The `warm`
+//! cells run the wait through the patched site and expect what the call returns
+//! at a ptrace stop.
 //!
 //! Every cell with only Hermit-internal senders, on both backends, runs under
 //! `--verify --verify-strict` and requires a matched strict report.
@@ -144,6 +147,16 @@ const STEAL_WAKE_MS: u64 = 2 * SIGNAL_DELAY_MS;
 /// until its timeslice ends, and the wait ended at 450-652 ms on 2026-09-29 on
 /// both backends. A wait the SIGCHLD did not end runs to its 10 s timeout.
 const SPIN_WAKE_BOUND_MS: u64 = 1_000;
+/// When a wait that the signal interrupted near 100 ms and that Linux then
+/// restarted ends: 100 ms after the signal, when the `thread` sender wakes the
+/// futex or the `process` sender's child exits. A wait that returned at the
+/// signal instead reads near 100 ms, below this window.
+const RESTARTED_WAKE_MS: std::ops::Range<u64> =
+    SIGNAL_DELAY_MS + EXIT_WAKE_FLOOR_MS..2 * SIGNAL_DELAY_MS + WAKE_SLACK_MS;
+/// Upper bound on when the handler of a signal that interrupted a child wait
+/// first ran: midway between the child's signal near 100 ms and its exit near
+/// 200 ms. A handler that ran only after the wait returned reads near 200 ms.
+const HANDLED_BEFORE_EXIT_MS: u64 = SIGNAL_DELAY_MS + SIGNAL_DELAY_MS / 2;
 
 static GUEST: OnceLock<PathBuf> = OnceLock::new();
 
@@ -192,6 +205,15 @@ impl GuestRun {
         self.line("SIBLING ")
             .and_then(|line| line.rsplit_once(" ms="))
             .and_then(|(_, value)| value.parse().ok())
+    }
+
+    /// The `HANDLED_AT ms=` value a `restart` child-wait cell prints: when the
+    /// handler first ran, after the wait began, or -1 if it never ran.
+    fn handled_at_ms(&self) -> Option<i64> {
+        self.stdout
+            .lines()
+            .find_map(|line| line.strip_prefix("HANDLED_AT ms="))
+            .and_then(|value| value.parse().ok())
     }
 }
 
@@ -268,6 +290,21 @@ enum StderrEvent {
 /// Run one cell. With `external`, send `SIGUSR1` to the guest process from
 /// this host process `EXTERNAL_SIGNAL_DELAY` after it prints `READY`.
 fn run_cell(backend: &str, mode: FutexMode, args: &[&str], external: bool) -> GuestRun {
+    let signals: &[libc::c_int] = if external { &[libc::SIGUSR1] } else { &[] };
+    run_cell_with_external_signals(backend, mode, args, signals)
+}
+
+/// Run one cell, sending each of `external_signals`, in order and back to back,
+/// to the guest process from this host process `EXTERNAL_SIGNAL_DELAY` after it
+/// prints `READY`. A cell with no external signal runs under strict
+/// verification instead.
+fn run_cell_with_external_signals(
+    backend: &str,
+    mode: FutexMode,
+    args: &[&str],
+    external_signals: &[libc::c_int],
+) -> GuestRun {
+    let external = !external_signals.is_empty();
     // Compiling the guest also creates the directory that holds every trial.
     let guest = guest();
     let trial = tempfile::Builder::new()
@@ -347,12 +384,15 @@ fn run_cell(backend: &str, mode: FutexMode, args: &[&str], external: bool) -> Gu
             if !signalled && ready.elapsed() >= EXTERNAL_SIGNAL_DELAY {
                 let pids = pids_with_argv0(&program);
                 if let [pid] = pids[..] {
-                    // SAFETY: plain kill(2) on a pid read from /proc.
-                    if unsafe { libc::kill(pid, libc::SIGUSR1) } != 0 {
-                        failure = Some(format!(
-                            "kill({pid}, SIGUSR1) failed: {}",
-                            std::io::Error::last_os_error()
-                        ));
+                    for &signal in external_signals {
+                        // SAFETY: plain kill(2) on a pid read from /proc.
+                        if unsafe { libc::kill(pid, signal) } != 0 {
+                            failure = Some(format!(
+                                "kill({pid}, {signal}) failed: {}",
+                                std::io::Error::last_os_error()
+                            ));
+                            break;
+                        }
                     }
                 } else {
                     failure = Some(format!(
@@ -1148,19 +1188,21 @@ fn liteinst_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
 }
 
 /// A wait at a LiteInst call site that has already run once goes through the
-/// patched site, which the kernel's syscall-return path does not see. Hermit
-/// must then turn the handler's restart errno into what Linux returns: EINTR for
-/// a timed futex wait, a raw `select`, glibc's `sem_timedwait`, and an untimed
-/// futex wait without SA_RESTART. An untimed futex wait under SA_RESTART cannot
-/// be restarted, because the patched site resumes after the system-call
-/// instruction; it returns 0, a wakeup futex(2) permits and every caller
-/// re-checks. Each call returns near the signal, strict-verified. Before
-/// https://github.com/rrnewton/hermit/pull/3361 was fixed the kernel-internal
-/// errno 512 or 514 reached the guest, and glibc's `sem_timedwait` aborted on it.
+/// patched site. When Hermit ends such a wait with a restart errno, Reverie
+/// rewinds the guest to the LiteInst runtime's trap instruction and lets the
+/// kernel's signal delivery decide, at a landing in the runtime's private page,
+/// whether the call returns EINTR or runs again, as the kernel decides at a
+/// ptrace stop (https://github.com/rrnewton/reverie/commit/6c920de24642ffe921c507704748012001f23c0a).
+/// Each call here returns EINTR near the signal, strict-verified, as on Linux: a
+/// timed futex wait, even under SA_RESTART; an untimed futex wait, `wait4` and
+/// `waitid` without SA_RESTART; a raw `select`, even under SA_RESTART; and
+/// glibc's `sem_timedwait`. With a Reverie that predates that commit, the
+/// kernel-internal errno 512 or 514 reached the guest, and glibc's
+/// `sem_timedwait` aborted on it.
 ///
-/// The lower bound is `EXIT_WAKE_FLOOR_MS` because the `thread` sender, like the
-/// `exit` child, starts its 100 ms sleep before the wait takes its start stamp:
-/// these waits read 99-100 ms (measured 2026-09-29).
+/// The lower bound is `EXIT_WAKE_FLOOR_MS` because the `thread` and `process`
+/// senders, like the `exit` child, start their 100 ms sleep before the wait
+/// takes its start stamp: these waits read 99-100 ms (measured 2026-09-29).
 fn assert_patched_site_waits_are_interrupted(mode: FutexMode, cells: &[(&[&str], &str)]) {
     for &(args, expected) in cells {
         let run = run_cell("liteinst", mode, args, false);
@@ -1185,22 +1227,15 @@ fn assert_patched_site_waits_are_interrupted(mode: FutexMode, cells: &[(&[&str],
 }
 
 /// Futex waits at a patched call site, split from the other calls so that each
-/// test stays within two thirds of the per-test CPU budget.
-const PATCHED_SITE_FUTEX_CELLS: [(&[&str], &str); 6] = [
+/// test stays within two thirds of the per-test CPU budget. The untimed wait
+/// under SA_RESTART, which Linux restarts, has its own test:
+/// `liteinst_untimed_futex_wait_at_a_patched_call_site_restarts_under_sa_restart`.
+const PATCHED_SITE_FUTEX_CELLS: [(&[&str], &str); 5] = [
     (&["futex", "thread", "warm"], EINTR_FUTEX),
     (&["futex", "thread", "timed", "warm"], EINTR_FUTEX),
     (
         &["futex", "thread", "restart", "timed", "warm"],
         EINTR_FUTEX,
-    ),
-    // A known deviation, pinned so that a change is seen. Linux restarts this
-    // wait under `SA_RESTART` and the sibling's FUTEX_WAKE ends it near 200 ms.
-    // A patched site cannot re-run the call, so the wait returns 0 as soon as
-    // the handler has run, near 100 ms
-    // (https://github.com/rrnewton/hermit/issues/3403).
-    (
-        &["futex", "thread", "restart", "warm"],
-        "RESULT call=futex ret=0 errno=none handler=1",
     ),
     (&["futex", "exit", "warm"], EINTR_FUTEX),
     (&["futex", "exit", "timed", "warm"], EINTR_FUTEX),
@@ -1222,6 +1257,19 @@ const PATCHED_SITE_OTHER_CELLS: [(&[&str], &str); 3] = [
     ),
 ];
 
+/// `wait4` and `waitid` at a patched call site, without SA_RESTART. The waited
+/// child sends the signal and stays alive.
+const PATCHED_SITE_CHILD_WAIT_CELLS: [(&[&str], &str); 2] = [
+    (
+        &["wait4", "process", "warm"],
+        "RESULT call=wait4 ret=-1 errno=EINTR handler=1",
+    ),
+    (
+        &["waitid", "process", "warm"],
+        "RESULT call=waitid ret=-1 errno=EINTR handler=1",
+    ),
+];
+
 #[test]
 fn liteinst_precise_futex_waits_at_a_patched_call_site_are_interrupted_as_on_linux() {
     assert_patched_site_waits_are_interrupted(FutexMode::Precise, &PATCHED_SITE_FUTEX_CELLS);
@@ -1240,4 +1288,197 @@ fn liteinst_precise_sem_and_select_at_a_patched_call_site_are_interrupted_as_on_
 #[test]
 fn liteinst_polling_sem_and_select_at_a_patched_call_site_are_interrupted_as_on_linux() {
     assert_patched_site_waits_are_interrupted(FutexMode::Polling, &PATCHED_SITE_OTHER_CELLS);
+}
+
+#[test]
+fn liteinst_child_waits_at_a_patched_call_site_are_interrupted_as_on_linux() {
+    assert_patched_site_waits_are_interrupted(FutexMode::Precise, &PATCHED_SITE_CHILD_WAIT_CELLS);
+}
+
+/// An untimed futex wait at a patched call site restarts under SA_RESTART, as
+/// it does at a ptrace stop (`untimed_futex_wait_restarts_under_sa_restart`)
+/// and natively: the handler runs near 100 ms, the call does not report EINTR,
+/// and the restarted wait ends at the sibling's FUTEX_WAKE 100 ms after the
+/// handler ran, near 200 ms. Precise mode reports that wake as 0 and polling
+/// mode as EAGAIN, as at a ptrace stop. Strict-verified. Before
+/// https://github.com/rrnewton/hermit/pull/3361 left patched-site restarts to
+/// Reverie, Hermit could not re-run the call there and the wait returned 0 as
+/// soon as the handler had run, near 100 ms
+/// (https://github.com/rrnewton/hermit/issues/3403).
+#[test]
+fn liteinst_untimed_futex_wait_at_a_patched_call_site_restarts_under_sa_restart() {
+    let args = ["futex", "thread", "restart", "warm"];
+    for (mode, expected) in [
+        (
+            FutexMode::Precise,
+            "RESULT call=futex ret=0 errno=none handler=1",
+        ),
+        (
+            FutexMode::Polling,
+            "RESULT call=futex ret=-1 errno=EAGAIN handler=1",
+        ),
+    ] {
+        let run = run_cell("liteinst", mode, &args, false);
+        assert!(
+            run.status.success()
+                && run.result_line() == Some(expected)
+                && run.stdout.lines().any(|line| line == "DONE"),
+            "liteinst {mode:?} {args:?}: expected `{expected}`\n{}",
+            run.describe()
+        );
+        let elapsed = run.elapsed_ms();
+        assert!(
+            elapsed.is_some_and(|ms| RESTARTED_WAKE_MS.contains(&ms)),
+            "liteinst {mode:?} {args:?}: the wait took {elapsed:?} ms, outside \
+             {RESTARTED_WAKE_MS:?}: it was not restarted\n{}",
+            run.describe()
+        );
+        assert_verified("liteinst", mode, &args, &run);
+    }
+}
+
+/// `wait4` and `waitid` restart under SA_RESTART, as Linux restarts them: the
+/// waited child signals the parent near 100 ms and exits 100 ms later. The
+/// handler runs near 100 ms, before `HANDLED_BEFORE_EXIT_MS`, the call does not
+/// report EINTR, and the restarted wait returns the child near 200 ms.
+/// Strict-verified. `warms` says whether each call runs from a cold call site,
+/// a warm one, or both; on LiteInst a warm site is the patched site. Before
+/// https://github.com/rrnewton/hermit/pull/3361 left patched-site restarts to
+/// Reverie, LiteInst returned EINTR from a warm site instead
+/// (https://github.com/rrnewton/hermit/issues/3403).
+fn assert_child_waits_restart_under_sa_restart(backend: &str, warms: &[bool]) {
+    for (call, expected) in [
+        ("wait4", "RESULT call=wait4 ret=child errno=none handler=1"),
+        ("waitid", "RESULT call=waitid ret=0 errno=none handler=1"),
+    ] {
+        for &warm in warms {
+            let mut args = vec![call, "process", "restart"];
+            if warm {
+                args.push("warm");
+            }
+            let run = run_cell(backend, FutexMode::Precise, &args, false);
+            assert!(
+                run.status.success()
+                    && run.result_line() == Some(expected)
+                    && run.stdout.lines().any(|line| line == "DONE"),
+                "{backend} {args:?}: expected `{expected}`\n{}",
+                run.describe()
+            );
+            let elapsed = run.elapsed_ms();
+            assert!(
+                elapsed.is_some_and(|ms| RESTARTED_WAKE_MS.contains(&ms)),
+                "{backend} {args:?}: the wait took {elapsed:?} ms, outside \
+                 {RESTARTED_WAKE_MS:?}\n{}",
+                run.describe()
+            );
+            let handled_at = run.handled_at_ms();
+            assert!(
+                handled_at.is_some_and(|ms| {
+                    (EXIT_WAKE_FLOOR_MS as i64..HANDLED_BEFORE_EXIT_MS as i64).contains(&ms)
+                }),
+                "{backend} {args:?}: the handler first ran at {handled_at:?} ms, not near the \
+                 child's signal at {SIGNAL_DELAY_MS} ms: the signal did not interrupt the wait\n{}",
+                run.describe()
+            );
+            assert_verified(backend, FutexMode::Precise, &args, &run);
+        }
+    }
+}
+
+#[test]
+fn ptrace_child_waits_restart_under_sa_restart() {
+    assert_child_waits_restart_under_sa_restart("ptrace", &[false]);
+}
+
+#[test]
+fn liteinst_child_waits_restart_under_sa_restart_at_a_ptrace_stop_and_at_a_patched_call_site() {
+    assert_child_waits_restart_under_sa_restart("liteinst", &[false, true]);
+}
+
+/// A caught signal and a default-ignored SIGCHLD pending together end a futex
+/// wait with EINTR near the signal, timed or not, and the handler runs, as on
+/// Linux. The sibling reaps a child, whose SIGCHLD stays pending where only the
+/// waiter can take it, and then sends SIGUSR1. Under ptrace the kernel queues
+/// even a default-ignored signal and stops the guest for it, so both signals
+/// reach the backend, and the backend holds one signal per thread. Each wait
+/// runs from a cold call site and, where `warms` says so, from a warm one: on
+/// LiteInst the patched site. Strict-verified. Before
+/// https://github.com/rrnewton/hermit/pull/3361 left patched-site restarts to
+/// Reverie, Hermit resumed the guest at a patched site to read the handler's
+/// SA_RESTART flag, both signals could stop it in turn, and the SIGCHLD could
+/// replace the held SIGUSR1.
+fn assert_caught_signal_with_a_pending_sigchld_ends_futex_wait(backend: &str, warms: &[bool]) {
+    for mode in [FutexMode::Precise, FutexMode::Polling] {
+        for &warm in warms {
+            for timed in [false, true] {
+                let mut args = vec!["futex", "thread", "chldpend"];
+                if timed {
+                    args.push("timed");
+                }
+                if warm {
+                    args.push("warm");
+                    assert_patched_site_waits_are_interrupted(
+                        mode,
+                        &[(args.as_slice(), EINTR_FUTEX)],
+                    );
+                } else {
+                    assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn ptrace_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld() {
+    assert_caught_signal_with_a_pending_sigchld_ends_futex_wait("ptrace", &[false]);
+}
+
+#[test]
+fn liteinst_futex_wait_is_ended_by_a_caught_signal_pending_with_a_default_ignored_sigchld() {
+    assert_caught_signal_with_a_pending_sigchld_ends_futex_wait("liteinst", &[false, true]);
+}
+
+/// Two caught signals sent together end a polling futex wait with EINTR, and
+/// both handlers run, as on Linux: the harness sends SIGUSR1 and SIGUSR2 back to
+/// back from outside Hermit, and the guest reports both handlers on its
+/// `HANDLED` line. The backend holds one signal per thread, so a second signal
+/// that stops the guest must not replace the first. Before
+/// https://github.com/rrnewton/hermit/pull/3361 left patched-site restarts to
+/// Reverie, Hermit resumed the guest at a LiteInst patched site to read a
+/// handler's SA_RESTART flag, which let the second signal replace the first.
+/// External signals arrive at host-timed moments, so each backend runs
+/// `EXTERNAL_TRIALS` trials.
+fn assert_two_external_signals_are_both_delivered(backend: &str, warm: bool) {
+    let mut args = vec!["futex", "external", "usr2"];
+    if warm {
+        args.push("warm");
+    }
+    for trial in 0..EXTERNAL_TRIALS {
+        let run = run_cell_with_external_signals(
+            backend,
+            FutexMode::Polling,
+            &args,
+            &[libc::SIGUSR1, libc::SIGUSR2],
+        );
+        assert!(
+            run.status.success()
+                && run.result_line() == Some(EINTR_FUTEX)
+                && run.line("HANDLED ") == Some("HANDLED usr1=1 usr2=1")
+                && run.stdout.lines().any(|line| line == "DONE"),
+            "{backend} {args:?} trial {trial}/{EXTERNAL_TRIALS}: expected `{EINTR_FUTEX}` and \
+             `HANDLED usr1=1 usr2=1`\n{}",
+            run.describe()
+        );
+    }
+}
+
+#[test]
+fn ptrace_polling_futex_wait_delivers_both_of_two_external_signals() {
+    assert_two_external_signals_are_both_delivered("ptrace", false);
+}
+
+#[test]
+fn liteinst_polling_futex_wait_at_a_patched_call_site_delivers_both_of_two_external_signals() {
+    assert_two_external_signals_are_both_delivered("liteinst", true);
 }

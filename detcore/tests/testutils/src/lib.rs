@@ -91,7 +91,6 @@ pub static BOTTOM_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     // These test configs run detcore under the ptrace backend.
     backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
     backend_supports_blocked_wait_signal_interruption: false,
-    backend_may_skip_kernel_syscall_restart: false,
     virtualize_time: false,
     virtualize_metadata: false,
     mountinfo_root_rewrites: Vec::new(),
@@ -170,7 +169,6 @@ pub static MIDDLE_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     // These test configs run detcore under the ptrace backend.
     backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
     backend_supports_blocked_wait_signal_interruption: false,
-    backend_may_skip_kernel_syscall_restart: false,
     virtualize_time: true, // stat* could depends on this
     virtualize_metadata: true,
     mountinfo_root_rewrites: Vec::new(),
@@ -249,7 +247,6 @@ pub static TOP_CFG: LazyLock<Config> = LazyLock::new(|| Config {
     // These test configs run detcore under the ptrace backend.
     backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
     backend_supports_blocked_wait_signal_interruption: false,
-    backend_may_skip_kernel_syscall_restart: false,
     virtualize_time: true,
     virtualize_metadata: true,
     mountinfo_root_rewrites: Vec::new(),

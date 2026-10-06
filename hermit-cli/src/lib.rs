@@ -3272,17 +3272,17 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // control from then on.
     // Only ptrace and LiteInst have been measured to report a thread's signal state
     // in /proc (https://github.com/rrnewton/hermit/issues/3146). Every other backend
-    // keeps the previous blocking-wait behavior. Ptrace resumes a restart errno
-    // through the kernel's signal delivery and syscall-restart path. LiteInst does so
-    // only for a call site's first execution, which stops in ptrace. Once it has
-    // patched the site, reverie writes the Tool's result straight into the guest's
-    // registers and no kernel syscall-return path runs, so detcore applies Linux's
-    // restart rules itself (`backend_may_skip_kernel_syscall_restart`).
-    // `reverie::BackendCapabilities` has no field for either fact yet, so both are
-    // set here from the backend's name.
+    // keeps the previous blocking-wait behavior. Both hand a restart errno to the
+    // kernel's signal delivery, which turns it into `EINTR` or a restart as Linux
+    // does. Ptrace does so at the syscall stop. LiteInst does so at a call site's
+    // first execution, which stops in ptrace, and at a site it has patched, where
+    // reverie rewinds the guest to the runtime's trap instruction and lets the
+    // kernel decide at a landing in the runtime's private page
+    // (https://github.com/rrnewton/reverie/commit/6c920de24642ffe921c507704748012001f23c0a).
+    // `reverie::BackendCapabilities` has no field for this fact yet, so it is set
+    // here from the backend's name.
     config.backend_supports_blocked_wait_signal_interruption =
         matches!(backend, Backend::Ptrace | Backend::Liteinst);
-    config.backend_may_skip_kernel_syscall_restart = backend == Backend::Liteinst;
     config
 }
 
@@ -6080,24 +6080,6 @@ mod tests {
             assert_eq!(
                 config.backend_supports_blocked_wait_signal_interruption, supports_interruption,
                 "unexpected blocked-wait signal support for {backend:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn backend_skipped_syscall_restart_contract_is_explicit() {
-        for (backend, may_skip) in [
-            (Backend::Ptrace, false),
-            (Backend::Dbt, false),
-            (Backend::Kvm, false),
-            (Backend::Sabre, false),
-            (Backend::Liteinst, true),
-            (Backend::E9patch, false),
-        ] {
-            let config = prepare_backend_config(super::DetConfig::default(), backend);
-            assert_eq!(
-                config.backend_may_skip_kernel_syscall_restart, may_skip,
-                "unexpected skipped-syscall-restart contract for {backend:?}"
             );
         }
     }
