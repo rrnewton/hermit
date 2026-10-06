@@ -716,7 +716,7 @@ pub struct Scheduler {
     /// keyed by that process: no gated wait of the process ends for them
     /// (`host_timed_signals`). An entry is added in the turn of the call that
     /// arms the source and is never removed
-    /// (https://github.com/rrnewton/hermit/issues/3146).
+    /// (<https://github.com/rrnewton/hermit/issues/3146>).
     host_timed_signals: BTreeMap<DetPid, u64>,
 
     /// Signals that a host-timed source armed by a guest can post to any process
@@ -4059,7 +4059,7 @@ impl Scheduler {
     /// posted by the source from one a guest sends with `kill`, and a source
     /// that fired once may stay armed. Holding a signal too long keeps the
     /// behaviour gated waits had before signal interruption
-    /// (https://github.com/rrnewton/hermit/issues/3146); ending a wait for a
+    /// (<https://github.com/rrnewton/hermit/issues/3146>); ending a wait for a
     /// host-timed copy makes the run depend on host timing.
     ///
     /// The entry is keyed by the caller's process, so every thread of it is
