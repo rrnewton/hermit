@@ -22,8 +22,8 @@ chrono = { version = "0.4.45", features = ["clock", "serde", "std"], default-fea
 clap = { version = "4.6.2", features = ["derive", "env", "string", "unicode", "wrap_help"] }
 libc = "0.2.186"
 nix = { version = "0.30.1", features = ["dir", "event", "hostname", "inotify", "ioctl", "mman", "mount", "net", "poll", "ptrace", "reboot", "resource", "sched", "signal", "term", "time", "user", "zerocopy"] }
-reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "d2257c061c5bc6523cd9dc9b3a75dd898fd62d34" }
-reverie-syscalls = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "d2257c061c5bc6523cd9dc9b3a75dd898fd62d34" }
+reverie = { package = "reverie-core", version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7e0f57e9e1318d930f304f05fa9a9cfb257261d3" }
+reverie-syscalls = { version = "0.4.1", git = "https://github.com/rrnewton/reverie.git", rev = "7e0f57e9e1318d930f304f05fa9a9cfb257261d3" }
 serde = { version = "1.0.219", features = ["derive", "rc"] }
 serde_json = { version = "1.0.140", features = ["alloc", "float_roundtrip", "raw_value", "unbounded_depth"] }
 shell-words = "1.1.1"

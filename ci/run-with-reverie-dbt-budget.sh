@@ -933,7 +933,22 @@ fi
 # recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
 # second budget are unchanged. Carry, not recalibration: no new timing sample
 # or >=5-sample replacement claim is made.
-expected_pin=d2257c061c5bc6523cd9dc9b3a75dd898fd62d34
+# CARRY TO 7e0f57e9e1318d930f304f05fa9a9cfb257261d3 (2026-10-06): from
+# d2257c061c5bc6523cd9dc9b3a75dd898fd62d34. The four inputs the budget governs, the DynamoRIO content-key miss
+# hashed over reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, $CMAKE and
+# $CMAKE_GENERATOR, are unchanged: vendor/dynamorio and build.rs have the same
+# git object ids at both revisions, as do reverie-dbt/Cargo.toml,
+# reverie-dbt/native/CMakeLists.txt, third-party, rust-toolchain.toml and the
+# root Cargo.toml. The seven-commit range (1ef1f2a0, f7ec2823, 0f3d0b4d,
+# bc7cd3b8, cffe8539, f7d8b07e, 7e0f57e9) moves LiteInst's trap path (runtime
+# support, instruction control and fault handler, signal rules, descriptor
+# protection, SIGSYS dispatcher) into reverie-inguest and makes trap-only mode
+# emulate in-arena CPUID/RDTSC; it does not touch reverie-dbt.
+# The available-CPU cap and f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
+# second budget are unchanged. Carry, not recalibration: no new timing sample
+# or >=5-sample replacement claim is made.
+expected_pin=7e0f57e9e1318d930f304f05fa9a9cfb257261d3
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
