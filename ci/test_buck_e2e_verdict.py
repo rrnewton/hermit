@@ -226,7 +226,7 @@ class VerdictTest(unittest.TestCase):
             expected = ["run", "--repo-root", str(self.root / "repo"), "--lane", lane, "--category", category,
                         "--ci-only", "--prebuilt"]
             # Only the diagnostic buckets' nodes declare --diagnostic-results.
-            expected += ["--diagnostic-results"] if category == "compat" else []
+            expected += ["--diagnostic-results"] if category in ("compat", "compat-pinned") else []
             expected += ["--results", str(directory / "results.jsonl"), "--junit", str(directory / "junit.xml")]
             self.assertEqual(call["argv"], expected)
             # One counts file cannot hold three runs' counts, so none is passed on.
@@ -273,6 +273,27 @@ class VerdictTest(unittest.TestCase):
                       "does not fail the run: exit status 3", process.stderr)
         self.assertNotIn("did not pass", process.stderr)
         self.assertEqual(json.loads(process.stdout)["diagnostic_failures"], 1)
+
+    def test_the_compat_pinned_bucket_may_hold_a_diagnostic_cell(self):
+        # tests/e2e/manifests/compat-pinned.yaml, the corpus run from the pinned root,
+        # declares diagnostic rows, and its node e2e.manifest_compat_pinned runs with
+        # --diagnostic-results like the host compat node
+        # (https://github.com/rrnewton/hermit/issues/3712).
+        pinned = "compat-pinned/e/verify/ptrace"
+        cells = dict(CELLS)
+        cells[pinned] = ("portable", "compat-pinned", "diagnostic")
+        self.write_plan(plan(cells))
+        excused = {"rc": 0, "summary": summary(1, failed=1, diagnostic=[(pinned, "exit status 3")]),
+                   "junit": [[pinned, "failure", "exit status 3"]]}
+        process, calls = self.verdict({"portable/compat-pinned": excused})
+        self.assertEqual(process.returncode, 0, process.stderr)
+        judged = {c["argv"][c["argv"].index("--category") + 1]: c["argv"] for c in calls}
+        self.assertEqual(sorted(judged), ["c-programs", "compat", "compat-pinned", "system-utils"])
+        self.assertIn("--diagnostic-results", judged["compat-pinned"])
+        self.assertIn(f"verdict: DIAGNOSTIC portable/compat-pinned {pinned}: a diagnostic cell's product "
+                      "failure does not fail the run: exit status 3", process.stderr)
+        self.assertNotIn("did not pass", process.stderr)
+        self.assertEqual(json.loads(process.stdout)["failed_buckets"], [])
 
     def test_a_failure_the_harness_did_not_excuse_fails_even_when_it_exits_zero(self):
         lying = {"rc": 0, "summary": summary(2, failed=2, diagnostic=[(E, "exit status 3")]),
@@ -381,7 +402,7 @@ class VerdictTest(unittest.TestCase):
         process, calls = self.failed(
             {},
             f"verdict: portable/c-programs did not pass: the plan puts the diagnostic cells {B} in it, "
-            "but only a compat bucket may hold one",
+            "but only a compat or compat-pinned bucket may hold one",
         )
         self.assertEqual(json.loads(process.stdout)["failed_buckets"], ["portable/c-programs"])
         # Its node refuses to select the cell, so the bucket is not judged; the flag follows

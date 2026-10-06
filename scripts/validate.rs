@@ -154,6 +154,7 @@ use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
 use dagrun::scheduler::monotonic_now_ns;
 use dagrun::scheduler::run_dag_boxed_deadline;
 use dagrun::scheduler::steps_violating_run_timeout;
+use hermit_manifest_plan::compat_guest_root::ImagePaths;
 use hermit_manifest_plan::host_capability::CapabilityVerdict;
 use hermit_manifest_plan::invocation_cgroup::ALLOW_PROCESS_GROUP_CPU_SCAN_ENV;
 use hermit_manifest_plan::invocation_cgroup::process_group_scan_allowed;
@@ -654,9 +655,15 @@ mod artifact_plan_tests {
                 "HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit-strict ",
             ),
             (
-                // The host-run strict compatibility bucket must reach the
+                // The host-portability compatibility bucket must reach the
                 // published artifact, never a per-profile binary.
                 "e2e.manifest_compat",
+                "./ci/run-with-hermit-e2e-artifact.sh --require-install",
+                "HERMIT_BIN=$PWD/target/release/hermit ./ci/run-with-hermit-e2e-artifact.sh --require-install",
+            ),
+            (
+                // So must the gating compatibility bucket in the pinned root.
+                "e2e.manifest_compat_pinned",
                 "./ci/run-with-hermit-e2e-artifact.sh --require-install",
                 "HERMIT_BIN=$PWD/target/release/hermit ./ci/run-with-hermit-e2e-artifact.sh --require-install",
             ),
@@ -6636,9 +6643,12 @@ mod e2e_runner_tests {
         let (cargo_tags, buck_tags) = (tags(&cargo), tags(&buck));
         let added = buck_tags.difference(&cargo_tags).cloned().collect::<BTreeSet<_>>();
         let dropped = cargo_tags.difference(&buck_tags).cloned().collect::<BTreeSet<_>>();
-        // The two runner nodes (e2e.buck_stage, e2e.buck_cells) plus 17
-        // `_buck` import twins.
-        assert_eq!(added.len(), 19, "{added:?}");
+        // The two runner nodes (e2e.buck_stage, e2e.buck_cells) plus 18
+        // `_buck` import twins. 20 added and 24 dropped since
+        // e2e.manifest_compat_pinned gained its import twin, whose Buck stage
+        // also replaces compatpinnedprep.fixtures
+        // (https://github.com/rrnewton/hermit/issues/3712); 19 and 22 before.
+        assert_eq!(added.len(), 20, "{added:?}");
         assert!(added.contains("e2e.buck_stage"));
         assert!(added.contains("e2e.buck_cells"));
         assert!(added.contains("full-scorecard.compatibility_buck"));
@@ -6648,8 +6658,9 @@ mod e2e_runner_tests {
                 assert!(dropped.contains(cargo_tag), "{tag} replaces nothing");
             }
         }
-        assert_eq!(dropped.len(), 22, "{dropped:?}");
-        assert_eq!(buck_tags.len(), cargo_tags.len() - 22 + 19);
+        assert_eq!(dropped.len(), 24, "{dropped:?}");
+        assert!(dropped.contains("compatpinnedprep.fixtures"), "{dropped:?}");
+        assert_eq!(buck_tags.len(), cargo_tags.len() - 24 + 20);
         assert_eq!(buck.profile, "full");
         assert_eq!(buck.selection_mode, "full");
         assert!(buck.suite_complete);
@@ -7761,9 +7772,10 @@ fn normal_raw_result_path(step: &Step, run_id: &str) -> Result<PathBuf, String> 
         .as_ref()
         .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
     {
-        // The strict compatibility corpus runs its rows eight at a time, the
-        // same width transport as c-programs.
-        Some(("portable", "c-programs" | "compat")) => Some("--jobs"),
+        // The compatibility corpus, in the pinned root and its host-portability
+        // copy, runs its rows eight at a time, the same width transport as
+        // c-programs.
+        Some(("portable", "c-programs" | "compat" | "compat-pinned")) => Some("--jobs"),
         Some(("portable" | "privileged", "system-utils")) => Some(""),
         _ => None,
     };
@@ -12276,10 +12288,12 @@ fn retain_focused_manifest_producers(cfg: &DagConfig, tags: &mut BTreeSet<String
                 | "build.rust_scripts"
                 | "build.rust_scripts_in_pinned_root"
                 | "setup.pinned_root_fetch"
-                // The strict compatibility corpus reads fixtures this node
-                // writes under the run's own state directory, so a focused
-                // run of e2e.manifest_compat must produce them itself.
+                // The compatibility corpora read fixtures these nodes write
+                // under the run's own state directory, so a focused run of
+                // e2e.manifest_compat_pinned (in the pinned root) or of the
+                // host-portability e2e.manifest_compat must produce them itself.
                 | "compatprep.fixtures"
+                | "compatpinnedprep.fixtures"
         )
     };
     loop {
@@ -12592,10 +12606,12 @@ fn generated_focused_compat_partition(
     namespace: &str,
     label: &str,
 ) -> Result<Vec<Step>, String> {
-    // The portable focused lane runs the compat.yaml bucket, whose rows read
-    // their fixtures under $VALIDATE_RUN_STATE/strict-compat.
+    // The portable focused lane runs the compat-pinned.yaml bucket in the
+    // pinned root, whose rows read their fixtures under
+    // $VALIDATE_RUN_STATE/compat-pinned (until 2026-10-05, compat.yaml on the
+    // host, under $VALIDATE_RUN_STATE/strict-compat).
     let run_root = if mode == CompatMode::PortableStrict {
-        tmp.join("strict-compat")
+        tmp.join("compat-pinned")
     } else {
         tmp.join(namespace)
     };
@@ -12615,7 +12631,7 @@ fn generated_focused_compat_partition(
     if mode == CompatMode::PortableStrict {
         prep.desc = "Prepare the fixture files the corpus-only lane's compat bucket reads".into();
         prep.description = format!(
-            "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, after the lane's pinned-root release build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of portablecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the lane before the bucket runs.",
+            "Runs tests/compat/prepare_real_compat_fixtures.sh into {} inside the pinned root, with the image's compilers and toolchain, after the lane's pinned-root release build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat-pinned.yaml rows of portablecompat.manifest_compat read. Beside them it writes real-compat-fixtures.receipt: the image, its gcc, the SHA-256 of the script and its sources, and every fixture file and link, without which test-harness refuses the bucket's cells (verify_fixture_receipt in ci/manifest-plan/src/compat_guest_root.rs). A fixture that fails to build or a tool missing from the image stops the lane before the bucket runs. Until 2026-10-05 (https://github.com/rrnewton/hermit/issues/3712) it ran on the host, for compat.yaml.",
             fixtures.display()
         );
     } else if mode == CompatMode::E9patch {
@@ -12662,8 +12678,8 @@ fn generated_focused_compat_partition(
     }
     steps.push(prep);
     if mode == CompatMode::PortableStrict {
-        // The rows themselves are tests/e2e/manifests/compat.yaml, run by the
-        // static bucket node portablecompat.manifest_compat.
+        // The rows themselves are tests/e2e/manifests/compat-pinned.yaml, run
+        // by the static bucket node portablecompat.manifest_compat.
         return Ok(steps);
     }
     let mut probes = validate_plan::compat_nodes(
@@ -12736,19 +12752,7 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     let portable_root = tmp.join("strict-compat");
     let portable_fixtures = portable_root.join("real-compat-fixtures");
     let mut portable_prep = prepare_fixtures_node("compatprep.fixtures", &portable_fixtures);
-    portable_prep.deps = [
-        "build.e2e_artifact",
-        "doc.doctests",
-        "doc.rustdoc",
-        "lint.clippy",
-        "test.detcore_unit",
-        "test.hermit_unit",
-        "test.regular_crates",
-        "test.rr_suite_contract",
-    ]
-    .into_iter()
-    .map(str::to_string)
-    .collect();
+    portable_prep.deps = portable_prep_barrier();
     portable_prep.desc =
         "Prepare the fixture files the portable strict compatibility corpus reads".into();
     portable_prep.description = format!(
@@ -12761,55 +12765,74 @@ fn build_generated_validation_plan(root: &Path, tmp: &Path) -> Result<Plan, Stri
     portable_prep.labels = vec!["full".into(), "portable".into()];
     steps.push(portable_prep);
 
-    // The SaBRe run type's rows are the compat.yaml cells labelled
-    // sabre-compat-only, run by the static node sabrecompat.manifest_compat
-    // against the validation's one Hermit build; this node prepares the files
-    // those rows read, at the path the rows name.
-    let mut sabre_prep = prepare_fixtures_node_dep(
-        "sabrecompatprep.fixtures",
-        &portable_fixtures,
-        "build.host_hermit_link",
+    // The gating copy of the corpus is the manifest bucket
+    // e2e.manifest_compat_pinned (tests/e2e/manifests/compat-pinned.yaml),
+    // which runs in the pinned root; this node prepares the files its rows
+    // read, in that root, with the same barrier as compatprep.fixtures.
+    let pinned_root = tmp.join("compat-pinned");
+    let pinned_fixtures = pinned_root.join("real-compat-fixtures");
+    let mut pinned_prep = prepare_fixtures_node("compatpinnedprep.fixtures", &pinned_fixtures);
+    pinned_prep.group = "compatpinnedprep".into();
+    pinned_prep.deps = portable_prep_barrier();
+    pinned_prep.desc =
+        "Prepare the fixture files the pinned-root strict compatibility corpus reads".into();
+    pinned_prep.description = format!(
+        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} inside the pinned root, with \
+         the image's compilers and toolchain: {REAL_COMPAT_FIXTURE_CONTENTS}, so the rows of \
+         e2e.manifest_compat_pinned read run-owned files built in the root they run in. It \
+         starts after the same non-guest Cargo nodes as compatprep.fixtures, so the corpus's \
+         shell-build row cannot observe a concurrent target or cache mutation. Beside them it \
+         writes real-compat-fixtures.receipt: the image, its gcc, the SHA-256 of the script and \
+         its sources, and every fixture file and link, without which test-harness refuses the \
+         bucket's cells (verify_fixture_receipt in ci/manifest-plan/src/compat_guest_root.rs). \
+         Added on \
+         2026-10-05 (https://github.com/rrnewton/hermit/issues/3712), when the gating corpus \
+         moved from the host into the pinned root.",
+        pinned_fixtures.display()
     );
-    sabre_prep.group = "sabrecompatprep".into();
-    sabre_prep.desc = "Prepare the fixture files the SaBRe run type's compat cells read".into();
-    sabre_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of sabrecompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
-        portable_fixtures.display()
-    );
-    sabre_prep.labels = vec!["sabre-compat-only".into()];
-    steps.push(sabre_prep);
+    pinned_prep.labels = vec!["full".into(), "portable".into()];
+    steps.push(pinned_prep);
 
-    // The strict run type's rows are the compat.yaml cells labelled
-    // strict-compat-only, run the same way by strictcompat.manifest_compat.
-    let mut strict_prep = prepare_fixtures_node_dep(
-        "strictcompatprep.fixtures",
-        &portable_fixtures,
-        "build.host_hermit_link",
-    );
-    strict_prep.group = "strictcompatprep".into();
-    strict_prep.desc = "Prepare the fixture files the strict run type's compat cells read".into();
-    strict_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of strictcompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
-        portable_fixtures.display()
-    );
-    strict_prep.labels = vec!["strict-compat-only".into()];
-    steps.push(strict_prep);
-
-    // The rr run type's rows are the compat.yaml replay cells labelled
-    // rr-compat-only, run the same way by rrcompat.manifest_compat.
-    let mut rr_prep = prepare_fixtures_node_dep(
-        "rrcompatprep.fixtures",
-        &portable_fixtures,
-        "build.host_hermit_link",
-    );
-    rr_prep.group = "rrcompatprep".into();
-    rr_prep.desc = "Prepare the fixture files the rr run type's compat cells read".into();
-    rr_prep.description = format!(
-        "Runs tests/compat/prepare_real_compat_fixtures.sh into {} on the host, once build.host_hermit_link has linked the validation's one Hermit build: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat.yaml rows of rrcompat.manifest_compat read. A fixture that fails to build or a missing host tool stops the run type before the bucket runs.",
-        portable_fixtures.display()
-    );
-    rr_prep.labels = vec!["rr-compat-only".into()];
-    steps.push(rr_prep);
+    // The SaBRe, strict and rr run types run the compat-pinned.yaml cells
+    // their labels select, through the static nodes sabrecompat, strictcompat
+    // and rrcompat.manifest_compat, in the pinned root against the
+    // validation's one Hermit build. Each node below prepares, in that root,
+    // the files those rows read, at the path the rows name. The fixtures need
+    // no Hermit, so they wait only for the manifest gate. Until 2026-10-05
+    // (https://github.com/rrnewton/hermit/issues/3712) they ran on the host
+    // after build.host_hermit_link, for compat.yaml.
+    for (group, run_type, desc) in [
+        (
+            "sabrecompatprep",
+            "sabre-compat-only",
+            "Prepare the fixture files the SaBRe run type's compat cells read",
+        ),
+        (
+            "strictcompatprep",
+            "strict-compat-only",
+            "Prepare the fixture files the strict run type's compat cells read",
+        ),
+        (
+            "rrcompatprep",
+            "rr-compat-only",
+            "Prepare the fixture files the rr run type's compat cells read",
+        ),
+    ] {
+        let node = group.trim_end_matches("prep");
+        let mut prep = prepare_fixtures_node_dep(
+            &format!("{group}.fixtures"),
+            &pinned_fixtures,
+            "gate.manifest",
+        );
+        prep.group = group.into();
+        prep.desc = desc.into();
+        prep.description = format!(
+            "Runs tests/compat/prepare_real_compat_fixtures.sh into {} inside the pinned root, with the image's compilers and toolchain, after gate.manifest: {REAL_COMPAT_FIXTURE_CONTENTS}, the run-owned files the compat-pinned.yaml rows of {node}.manifest_compat read. Beside them it writes real-compat-fixtures.receipt: the image, its gcc, the SHA-256 of the script and its sources, and every fixture file and link, without which test-harness refuses the bucket's cells (verify_fixture_receipt in ci/manifest-plan/src/compat_guest_root.rs). A fixture that fails to build or a tool missing from the image stops the run type before the bucket runs. Until 2026-10-05 (https://github.com/rrnewton/hermit/issues/3712) it ran on the host after build.host_hermit_link, for compat.yaml.",
+            pinned_fixtures.display()
+        );
+        prep.labels = vec![run_type.into()];
+        steps.push(prep);
+    }
 
     for (mode, namespace, label) in [
         (
@@ -13045,6 +13068,25 @@ fn build_release_hermit_node(gate: &str, bin: &str) -> dagrun::model::Step {
     step
 }
 
+/// The nodes compatprep.fixtures and compatpinnedprep.fixtures wait for: the
+/// Hermit artifact and every non-guest Cargo node, so the corpus's shell-build
+/// row cannot observe a concurrent target or cache mutation.
+fn portable_prep_barrier() -> Vec<String> {
+    [
+        "build.e2e_artifact",
+        "doc.doctests",
+        "doc.rustdoc",
+        "lint.clippy",
+        "test.detcore_unit",
+        "test.hermit_unit",
+        "test.regular_crates",
+        "test.rr_suite_contract",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
 /// What tests/compat/prepare_real_compat_fixtures.sh writes, for the paragraphs
 /// of the nodes that run it.
 const REAL_COMPAT_FIXTURE_CONTENTS: &str = "a copy of README.md, compiled binutils, gprof, gcov and lsof inputs, a loopback HTTP server, df's mount fixture, and cargo/rustc links into the active toolchain";
@@ -13059,20 +13101,145 @@ struct CompatManifestRow {
     argv: Vec<std::ffi::OsString>,
     timeout_seconds: u64,
     diagnostic: bool,
+    /// Whether the default run type requires the cell (`ci: true`).
+    required: bool,
 }
 
-/// Each row of the strict compatibility corpus (tests/e2e/manifests/compat.yaml),
+/// The gating copy of the strict compatibility corpus: the manifest bucket
+/// tests/e2e/manifests/compat-pinned.yaml, which runs in the pinned root
+/// (https://github.com/rrnewton/hermit/issues/3712). Its host-portability copy,
+/// compat.yaml, holds the same rows argv for argv with the run state under
+/// strict-compat (the manifest-plan test
+/// the_host_portability_copy_runs_every_pinned_row_and_gates_nothing binds the
+/// two), and every one of its verify cells is diagnostic.
+const GATING_COMPAT_BUCKET: &str = "compat-pinned";
+
+/// Where the corpus names a host program path the pinned image lacks, the
+/// gating bucket's row names the image's own copy of that program instead
+/// (https://github.com/rrnewton/hermit/issues/3712): `/usr/bin/<name>` becomes
+/// `/bin/<name>` and `/usr/sbin/<name>` becomes `/sbin/<name>` when
+/// ci/hermetic/image-paths.txt lists the latter and not the former. (The
+/// image's /bin and /sbin are its Nix profile; its /usr/bin holds only the
+/// curated links of ci/hermetic/guest-paths.txt.)
+const PINNED_IMAGE_PROGRAM_DIRS: [(&str, &str); 2] =
+    [("/usr/bin/", "/bin/"), ("/usr/sbin/", "/sbin/")];
+
+/// The rows whose pinned-root argv also adapts the command to the image's
+/// version of the program, each as the one substring of the path-rewritten
+/// corpus argv (its words joined by NUL) it replaces: the image's util-linux
+/// logger needs --socket-errors=off without a syslog socket; its coreutils
+/// uptime has no -p; and basename and dirname take a path string the image
+/// has instead of the host's /usr/local/bin/hermit, which the guest-root lint
+/// refuses.
+const PINNED_IMAGE_ARGV_REWRITES: [(&str, &str, &str); 4] = [
+    ("logger", "--no-act -t", "--no-act --socket-errors=off -t"),
+    ("uptime", "/bin/uptime\0-p", "/bin/uptime"),
+    (
+        "basename",
+        "/usr/local/bin/hermit",
+        "/opt/hermit/bin/hermit",
+    ),
+    ("dirname", "/usr/local/bin/hermit", "/opt/hermit/bin/hermit"),
+];
+
+/// One argv word with PINNED_IMAGE_PROGRAM_DIRS applied. A program path must
+/// start the word or follow a byte that cannot continue a word, a path or a
+/// shell expansion, so `$WORK_DIR/usr/bin/x` is left alone.
+fn pinned_image_word(image: &ImagePaths, word: &str) -> String {
+    let bytes = word.as_bytes();
+    let name_byte = |byte: u8| byte.is_ascii_alphanumeric() || b"_.+-[".contains(&byte);
+    let mut out = String::with_capacity(word.len());
+    let (mut copied, mut index) = (0, 0);
+    while index < bytes.len() {
+        let at_word_start = index == 0 || {
+            let before = bytes[index - 1];
+            !(before.is_ascii_alphanumeric() || b"_.+-/$}".contains(&before))
+        };
+        let rewrite = PINNED_IMAGE_PROGRAM_DIRS
+            .iter()
+            .filter(|(host, _)| at_word_start && bytes[index..].starts_with(host.as_bytes()))
+            .find_map(|(host, pinned)| {
+                let start = index + host.len();
+                let end = bytes[start..]
+                    .iter()
+                    .position(|byte| !name_byte(*byte))
+                    .map_or(bytes.len(), |offset| start + offset);
+                let name = &word[start..end];
+                (!name.is_empty()
+                    && !image.contains(&format!("{host}{name}"))
+                    && image.contains(&format!("{pinned}{name}")))
+                .then(|| (end, format!("{pinned}{name}")))
+            });
+        if let Some((end, replacement)) = rewrite {
+            out.push_str(&word[copied..index]);
+            out.push_str(&replacement);
+            copied = end;
+            index = end;
+        } else {
+            index += 1;
+        }
+    }
+    out.push_str(&word[copied..]);
+    out
+}
+
+/// The corpus generator's argv for `label` as the gating bucket must run it:
+/// with PINNED_IMAGE_PROGRAM_DIRS applied to every word, then the row's one
+/// PINNED_IMAGE_ARGV_REWRITES entry, if it has one, which must apply.
+fn pinned_image_corpus_argv(
+    image: &ImagePaths,
+    label: &str,
+    argv: &[std::ffi::OsString],
+) -> Result<Vec<std::ffi::OsString>, String> {
+    let words = argv
+        .iter()
+        .map(|word| pinned_image_word(image, &word.to_string_lossy()))
+        .collect::<Vec<_>>();
+    let Some((_, from, to)) = PINNED_IMAGE_ARGV_REWRITES
+        .iter()
+        .find(|(row, _, _)| *row == label)
+    else {
+        return Ok(words.into_iter().map(Into::into).collect());
+    };
+    let joined = words.join("\0");
+    if joined.matches(from).count() != 1 {
+        return Err(format!(
+            "{label}: the corpus argv no longer contains its pinned-image rewrite source {from:?} exactly once: {words:?}"
+        ));
+    }
+    Ok(joined
+        .replace(from, to)
+        .split('\0')
+        .map(std::ffi::OsString::from)
+        .collect())
+}
+
+/// Each enabled default-run-type row of a strict compatibility corpus bucket,
 /// keyed by its corpus label (the last backquoted word of the description the
-/// expansion writes; `g++` has the test id `compat/gxx`).
+/// expansion writes; `g++` has the test id `<bucket>/gxx`). Enabled, not
+/// required: the gating bucket keeps the rows whose program the pinned image
+/// lacks enabled with ci: false, and they must still equal the corpus.
 fn compat_manifest_rows(
     root: &Path,
+    bucket: &str,
     run_state: &Path,
 ) -> Result<BTreeMap<String, CompatManifestRow>, String> {
-    let cells = ManifestSet::load(root)?.select(&hermit_manifest_plan::runner::Selection {
-        category: Some("compat".into()),
-        population: Some(hermit_manifest_plan::runner::Population::Required),
+    let set = ManifestSet::load(root)?;
+    let selection = |population| hermit_manifest_plan::runner::Selection {
+        category: Some(bucket.into()),
+        population: Some(population),
         ..Default::default()
-    })?;
+    };
+    let required = set
+        .select(&selection(
+            hermit_manifest_plan::runner::Population::Required,
+        ))?
+        .into_iter()
+        .map(|cell| cell.test.id)
+        .collect::<BTreeSet<_>>();
+    let cells = set.select(&selection(
+        hermit_manifest_plan::runner::Population::Enabled,
+    ))?;
     let mut rows = BTreeMap::new();
     for cell in cells {
         let Some(hermit_manifest_plan::runner::DirectCommand::Argv(argv)) = &cell.test.direct
@@ -13101,6 +13268,7 @@ fn compat_manifest_rows(
             argv: argv.into_iter().map(Into::into).collect(),
             timeout_seconds: cell.timeout_seconds,
             diagnostic,
+            required: required.contains(&cell.test.id),
         };
         if rows.insert(label, row).is_some() {
             return Err(format!("{} repeats a corpus label", cell.test.id));
@@ -13109,24 +13277,29 @@ fn compat_manifest_rows(
     Ok(rows)
 }
 
-/// The guest argv of each compat.yaml row, keyed by its corpus label.
+/// The guest argv of each gating compat-pinned.yaml row, keyed by its corpus
+/// label.
 fn compat_manifest_argv(
     root: &Path,
     run_state: &Path,
 ) -> Result<BTreeMap<String, Vec<std::ffi::OsString>>, String> {
-    Ok(compat_manifest_rows(root, run_state)?
+    Ok(compat_manifest_rows(root, GATING_COMPAT_BUCKET, run_state)?
         .into_iter()
         .map(|(label, row)| (label, row.argv))
         .collect())
 }
 
-/// tests/e2e/manifests/compat.yaml and ci/compat/corpus-strict.json both hold
-/// the portable strict corpus until the focused compatibility lanes and the
-/// super rows move too. Bind the copies: the generator's expansion of every
-/// portable corpus row must equal the compat.yaml row's argv, wall budget and
-/// diagnostic status, and neither may hold a row the other lacks. (The
-/// diagnostic reasons are not compared: compat.yaml spells the tracking
-/// issues as full links.)
+/// tests/e2e/manifests/compat-pinned.yaml and ci/compat/corpus-strict.json both
+/// hold the portable strict corpus until the focused compatibility lanes and
+/// the super rows move too. Bind the copies: the generator's expansion of every
+/// portable corpus row, with the run state under compat-pinned and the
+/// declared pinned-image rewrites (PINNED_IMAGE_ARGV_REWRITES), must equal the
+/// compat-pinned.yaml row's argv, wall budget and diagnostic status, and
+/// neither may hold a row the other lacks. (The diagnostic reasons are not
+/// compared: the manifest spells the tracking issues as full links. Nor is
+/// `ci`: the rows whose program the image lacks stay enabled with ci: false.)
+/// compat.yaml, the host-portability copy, is bound to compat-pinned.yaml by
+/// the manifest-plan tests.
 fn compat_corpus_binding_bracket(root: &Path) -> Result<String, String> {
     let fixture = tempfile::Builder::new()
         .prefix("validate-compat-binding-")
@@ -13135,7 +13308,7 @@ fn compat_corpus_binding_bracket(root: &Path) -> Result<String, String> {
     // Like the generator's production input, $VALIDATE_RUN_STATE, the state
     // path has no space: some corpus commands interpolate it unquoted.
     let run_state = fixture.path().join("run-state");
-    let compat = run_state.join("strict-compat");
+    let compat = run_state.join(GATING_COMPAT_BUCKET);
     let fixtures = compat.join("real-compat-fixtures");
     let shell_build = compat.join("shell-build");
     let root_text = root.to_string_lossy();
@@ -13156,15 +13329,20 @@ fn compat_corpus_binding_bracket(root: &Path) -> Result<String, String> {
         &paths,
         None,
     )?;
-    let mut manifest = compat_manifest_rows(root, &run_state)?;
+    let mut manifest = compat_manifest_rows(root, GATING_COMPAT_BUCKET, &run_state)?;
+    let image = ImagePaths::load(root)?;
     let diagnostic_labels = validate_corpus::portable_diagnostic();
-    let check = |node: &Step, row: &CompatManifestRow| -> Result<(), String> {
+    // Ok(true) when the gating row differs from the corpus's own argv only by
+    // the declared pinned-image rewrites.
+    let check = |node: &Step, row: &CompatManifestRow| -> Result<bool, String> {
         let label = node.job.as_str();
-        let argv = expand_constructed_guest(node, &run_state)
+        let corpus = expand_constructed_guest(node, &run_state)
+            .map_err(|error| format!("compat corpus binding: {error}"))?;
+        let argv = pinned_image_corpus_argv(&image, label, &corpus)
             .map_err(|error| format!("compat corpus binding: {error}"))?;
         if argv != row.argv {
             return Err(format!(
-                "compat corpus binding: {label} argv differs: corpus {argv:?}, compat.yaml {:?}",
+                "compat corpus binding: {label} argv differs: corpus {argv:?}, compat-pinned.yaml {:?}",
                 row.argv
             ));
         }
@@ -13173,19 +13351,22 @@ fn compat_corpus_binding_bracket(root: &Path) -> Result<String, String> {
         let diagnostic = diagnostic_labels.contains_key(label);
         if row.timeout_seconds != timeout || row.diagnostic != diagnostic {
             return Err(format!(
-                "compat corpus binding: {label} budget or diagnostic status differs: corpus {timeout} s diagnostic={diagnostic}, compat.yaml {} s diagnostic={}",
+                "compat corpus binding: {label} budget or diagnostic status differs: corpus {timeout} s diagnostic={diagnostic}, compat-pinned.yaml {} s diagnostic={}",
                 row.timeout_seconds, row.diagnostic
             ));
         }
-        Ok(())
+        Ok(argv != corpus)
     };
     let mut compared = 0;
+    let mut required = 0;
+    let mut rewritten = 0;
     for (index, node) in constructed.iter().enumerate() {
         let label = node.job.as_str();
         let row = manifest.remove(label).ok_or_else(|| {
-            format!("compat corpus binding: compat.yaml lacks corpus row {label}")
+            format!("compat corpus binding: compat-pinned.yaml lacks corpus row {label}")
         })?;
-        check(node, &row)?;
+        required += usize::from(row.required);
+        rewritten += usize::from(check(node, &row)?);
         if index == 0 {
             // Planted drift on the first row must be refused.
             let mut argv = row.argv.clone();
@@ -13195,6 +13376,7 @@ fn compat_corpus_binding_bracket(root: &Path) -> Result<String, String> {
                 argv: changed_argv.argv[..changed_argv.argv.len() - 1].to_vec(),
                 timeout_seconds: changed_argv.timeout_seconds,
                 diagnostic: !changed_argv.diagnostic,
+                required: changed_argv.required,
             };
             if check(node, &changed_argv).is_ok() || check(node, &flipped).is_ok() {
                 return Err(format!(
@@ -13206,11 +13388,41 @@ fn compat_corpus_binding_bracket(root: &Path) -> Result<String, String> {
     }
     if let Some(label) = manifest.keys().next() {
         return Err(format!(
-            "compat corpus binding: compat.yaml row {label} is not a portable corpus row"
+            "compat corpus binding: compat-pinned.yaml row {label} is not a portable corpus row"
         ));
     }
+    // The path rule rewrites only a program the image lacks at the host path
+    // and has at the image's; a row rewrite whose source the corpus lost is
+    // refused rather than passing the row through unchanged.
+    for (word, want) in [
+        ("/usr/bin/true", "/bin/true"),
+        ("/usr/bin/[", "/bin/["),
+        ("/usr/sbin/lsmod", "/sbin/lsmod"),
+        ("x=$(/usr/bin/true)", "x=$(/bin/true)"),
+        ("/usr/bin/wc", "/usr/bin/wc"),
+        (
+            "/usr/bin/hermit-absent-program",
+            "/usr/bin/hermit-absent-program",
+        ),
+        ("$PREFIX/usr/bin/true", "$PREFIX/usr/bin/true"),
+    ] {
+        let got = pinned_image_word(&image, word);
+        if got != want {
+            return Err(format!(
+                "compat corpus binding: the pinned-image path rule rewrote {word:?} to {got:?}, expected {want:?}"
+            ));
+        }
+    }
+    for (label, _, _) in PINNED_IMAGE_ARGV_REWRITES {
+        if pinned_image_corpus_argv(&image, label, &["/usr/bin/true".into()]).is_ok() {
+            return Err(format!(
+                "compat corpus binding: the pinned-image rewrite of {label} is not enforced"
+            ));
+        }
+    }
     Ok(format!(
-        "compat corpus binding: {compared} compat.yaml rows equal the corpus generator's argv, wall budget and diagnostic status"
+        "compat corpus binding: {compared} compat-pinned.yaml rows ({required} required) equal the corpus generator's argv under compat-pinned, wall budget and diagnostic status; {rewritten} differ only by the image's program path or one of the {} declared command adaptations",
+        PINNED_IMAGE_ARGV_REWRITES.len()
     ))
 }
 
@@ -13250,14 +13462,16 @@ fn expand_constructed_guest(
 /// is an argv/environment bracket, not a substitute for the real strict-verify
 /// comparator. "constructed" is the generator that still builds the focused
 /// compatibility lanes from ci/compat/corpus-strict.json; "committed" is the
-/// compat.yaml row e2e.manifest_compat runs.
+/// compat-pinned.yaml row e2e.manifest_compat_pinned runs.
 fn compat_fixture_operand_bracket(root: &Path) -> Result<String, String> {
     let fixture = tempfile::Builder::new()
         .prefix("validate-compat-operand-")
         .tempdir()
         .map_err(|error| format!("compat fixture operand: cannot create fixture: {error}"))?;
     let run_state = fixture.path().join("run state ' \" \\ $missing `false`");
-    let fixtures = run_state.join("strict-compat/real-compat-fixtures");
+    let fixtures = run_state
+        .join(GATING_COMPAT_BUCKET)
+        .join("real-compat-fixtures");
     let guest_tmp = fixture.path().join("guest-tmp");
     for path in [&fixtures, &guest_tmp] {
         std::fs::create_dir_all(path)
@@ -13382,7 +13596,7 @@ fn compat_fixture_operand_bracket(root: &Path) -> Result<String, String> {
 
 /// A digest of empty input is a successful hash operation, not proof that its
 /// compressor succeeded. Run the actual guest argv, both the generator's and the
-/// compat.yaml row's, under Minimal's cleared environment and compare against
+/// compat-pinned.yaml row's, under Minimal's cleared environment and compare against
 /// independently compressed real input.
 fn compat_compression_fixture_bracket(root: &Path) -> Result<String, String> {
     use std::os::unix::process::CommandExt;
@@ -13392,7 +13606,9 @@ fn compat_compression_fixture_bracket(root: &Path) -> Result<String, String> {
         .tempdir()
         .map_err(|error| format!("compression fixture: create tempdir: {error}"))?;
     let run_state = fixture.path().join("run state ' \" \\ $missing `false`");
-    let fixtures = run_state.join("strict-compat/real-compat-fixtures");
+    let fixtures = run_state
+        .join(GATING_COMPAT_BUCKET)
+        .join("real-compat-fixtures");
     let failed_producers = fixture.path().join("failed-producers");
     for path in [&fixtures, &failed_producers] {
         std::fs::create_dir_all(path)
@@ -13623,34 +13839,54 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
                 .into(),
         );
     }
-    let bucket = first
-        .steps
-        .iter()
-        .find(|step| step.tag() == "e2e.manifest_compat")
-        .cloned()
-        .ok_or("strict-compat bucket: e2e.manifest_compat is absent")?;
-    let prep = first
-        .steps
-        .iter()
-        .find(|step| step.tag() == "compatprep.fixtures")
-        .ok_or("strict-compat bucket: fixture-preparation node is absent")?;
-    let selector = format!(
-        "target/debug/test-harness run --lane portable --category compat {}",
-        hermit_manifest_plan::validation_dag::manifest_selector_flags("compat")
-    );
-    if bucket.cmd.matches(selector.as_str()).count() != 1
-        || bucket.cmd.contains("run-in-pinned-root.sh")
-        || bucket
-            .env
-            .get("HERMIT_E2E_EMPTY_WORKDIR")
-            .map(String::as_str)
-            != Some("/test")
-        || !bucket.deps.iter().any(|dep| dep == "compatprep.fixtures")
-    {
-        return Err(format!(
-            "strict-compat bucket: e2e.manifest_compat must run `{selector}` once on the host, in the isolated /test working directory, after compatprep.fixtures: env={:?} deps={:?} cmd={}",
-            bucket.env, bucket.deps, bucket.cmd
-        ));
+    // The gating bucket, e2e.manifest_compat_pinned, runs compat-pinned.yaml
+    // inside the pinned root, so each program and its libc come from the
+    // pinned image; its host-portability copy, e2e.manifest_compat, runs
+    // compat.yaml on the host, where every verify cell is diagnostic
+    // (https://github.com/rrnewton/hermit/issues/3712). Each runs its own
+    // bucket once, in the isolated /test working directory, after the node
+    // that prepares its fixtures in the root it runs in.
+    let find = |tag: &str| {
+        first
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .cloned()
+            .ok_or_else(|| format!("strict-compat bucket: {tag} is absent"))
+    };
+    let bucket = find("e2e.manifest_compat_pinned")?;
+    let prep = find("compatpinnedprep.fixtures")?;
+    let host_bucket = find("e2e.manifest_compat")?;
+    let host_prep = find("compatprep.fixtures")?;
+    for (node, category, fixtures, pinned) in [
+        (&bucket, GATING_COMPAT_BUCKET, &prep, true),
+        (&host_bucket, "compat", &host_prep, false),
+    ] {
+        let selector = format!(
+            "target/debug/test-harness run --lane portable --category {category} {}",
+            hermit_manifest_plan::validation_dag::manifest_selector_flags(category)
+        );
+        if node.cmd.matches(selector.as_str()).count() != 1
+            || node.cmd.contains("run-in-pinned-root.sh") != pinned
+            || fixtures.cmd.contains("run-in-pinned-root.sh") != pinned
+            || node.env.get("HERMIT_E2E_EMPTY_WORKDIR").map(String::as_str) != Some("/test")
+            || !node.deps.iter().any(|dep| *dep == fixtures.tag())
+        {
+            return Err(format!(
+                "strict-compat bucket: {} must run `{selector}` once {}, in the isolated /test working directory, after {}, which prepares its fixtures there: env={:?} deps={:?} cmd={} fixtures={}",
+                node.tag(),
+                if pinned {
+                    "inside the pinned root"
+                } else {
+                    "on the host"
+                },
+                fixtures.tag(),
+                node.env,
+                node.deps,
+                node.cmd,
+                fixtures.cmd,
+            ));
+        }
     }
 
     // Its rows, resolved the way the runner resolves them for a run whose
@@ -13661,7 +13897,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         validate_corpus::STRICT_COMPAT_TOTAL - validate_corpus::portable_super_only().len();
     if rows.len() != expected {
         return Err(format!(
-            "strict-compat bucket: compat.yaml has {} CI rows; the corpus has {expected} portable rows",
+            "strict-compat bucket: compat-pinned.yaml has {} enabled rows; the corpus has {expected} portable rows",
             rows.len()
         ));
     }
@@ -13672,7 +13908,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     println!("  {}", compat_corpus_binding_bracket(root)?);
     println!("  {}", compat_fixture_operand_bracket(root)?);
     println!("  {}", compat_compression_fixture_bracket(root)?);
-    let fixture_readme = "/run-state/strict-compat/real-compat-fixtures/README.md";
+    let fixture_readme = "/run-state/compat-pinned/real-compat-fixtures/README.md";
     let readme_labels = rows
         .iter()
         .filter(|(_, argv)| contains(argv, "README.md"))
@@ -13724,7 +13960,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
             .ok_or_else(|| format!("strict-compat bucket: fixture-backed row {label} is absent"))?;
         let want: [&OsStr; 5] = [
             "env".as_ref(),
-            "REAL_COMPAT_FIXTURES=/run-state/strict-compat/real-compat-fixtures".as_ref(),
+            "REAL_COMPAT_FIXTURES=/run-state/compat-pinned/real-compat-fixtures".as_ref(),
             "bash".as_ref(),
             workload.as_os_str(),
             label.as_ref(),
@@ -13736,9 +13972,9 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         }
     }
     for (label, path) in [
-        ("seq", "/run-state/strict-compat/real-compat-fixtures"),
-        ("shell-build", "/run-state/strict-compat/shell-build"),
-        ("top", "/run-state/strict-compat/top-home"),
+        ("seq", "/run-state/compat-pinned/real-compat-fixtures"),
+        ("shell-build", "/run-state/compat-pinned/shell-build"),
+        ("top", "/run-state/compat-pinned/top-home"),
     ] {
         let argv = rows
             .get(label)
@@ -13809,7 +14045,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
         let peer = barrier.join(format!("{}.active", 1 - index));
         let observed = barrier.join(format!("{index}.observed"));
         step.deps = vec![
-            "compatprep.fixtures".into(),
+            "compatpinnedprep.fixtures".into(),
             PIN_GATE_TAG.into(),
             "gate.manifest".into(),
         ];
@@ -13873,7 +14109,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     let expected_observed = tags.iter().map(String::as_str).collect::<BTreeSet<_>>();
     let expected_outcomes = fixture_preflight
         .into_iter()
-        .chain(std::iter::once("compatprep.fixtures"))
+        .chain(std::iter::once("compatpinnedprep.fixtures"))
         .chain(expected_observed.iter().copied())
         .collect::<BTreeSet<_>>();
     if !result.ok
@@ -13893,7 +14129,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
             != expected_observed
     {
         return Err(format!(
-            "strict-compat bucket: one outer scheduler did not execute e2e.manifest_compat and an ordinary Hermit node concurrently: ok={} complete={} outcomes={:?} skipped={:?} observed={observed:?}",
+            "strict-compat bucket: one outer scheduler did not execute e2e.manifest_compat_pinned and an ordinary Hermit node concurrently: ok={} complete={} outcomes={:?} skipped={:?} observed={observed:?}",
             result.ok,
             result.complete,
             result
@@ -13906,7 +14142,7 @@ fn committed_validation_execution_bracket(root: &Path) -> Result<String, String>
     }
 
     Ok(format!(
-        "portable strict compatibility: one bucket of {expected} rows without hermit_guest exclusion, run-unique fixture/shell/top paths, one scheduler execution"
+        "portable strict compatibility: one pinned-root gating bucket of {expected} rows and its host-portability copy, without hermit_guest exclusion, run-unique fixture/shell/top paths, one scheduler execution"
     ))
 }
 
@@ -17725,7 +17961,18 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
     let mut seen = BTreeSet::new();
     let mut index = 2;
     while let Some(option) = argv.get(index) {
-        if !seen.insert(option.as_str()) {
+        // test-harness accepts --exclude-category once per category: the quick
+        // verify smoke omits both the gating compat-pinned corpus and the
+        // host-portability compat copy. A repeated category is still refused.
+        let repeat_key = if option == "--exclude-category" {
+            format!(
+                "{option} {}",
+                argv.get(index + 1).map_or("", String::as_str)
+            )
+        } else {
+            option.clone()
+        };
+        if !seen.insert(repeat_key) {
             return Err(format!(
                 "retry bounds: {tag} supplies {option} more than once"
             ));
@@ -17754,8 +18001,8 @@ fn manifest_command_policy(tag: &str, command: &str) -> Result<(Selection, bool)
                     // cells the node actually runs; the repeated-option guard
                     // above still refuses a second exclusion.
                     "--exclude-backend" => selection.exclude_backends.push(value.clone()),
-                    // The quick verify smoke omits the host-bound strict
-                    // compatibility corpus; model it like the backend omission.
+                    // The quick verify smoke omits the compatibility corpora;
+                    // model it like the backend omission.
                     "--exclude-category" => selection.exclude_categories.push(value.clone()),
                     // A focused run type's bucket selects its labelled cells.
                     "--label" => selection.labels.push(value.clone()),
@@ -18377,8 +18624,11 @@ printf 'FORWARDED_CPU=%s\nFORWARDED_WALL=%s\n' "$cpu_value" "$wall_value"
         // full-buck-e2e import twins (<bucket>_buck), which only
         // scripts/validate.rs --e2e-runner buck-local|buck-hybrid selects,
         // each publish the cells of their bucket from the rows
-        // e2e.buck_cells wrote.
-        assert_eq!(steps.len(), 56);
+        // e2e.buck_cells wrote. 58 since the gating compatibility corpus moved
+        // into the pinned root as e2e.manifest_compat_pinned and its import
+        // twin e2e.manifest_compat_pinned_buck, beside the host-portability
+        // e2e.manifest_compat (https://github.com/rrnewton/hermit/issues/3712).
+        assert_eq!(steps.len(), 58);
         for step in steps {
             let (selection, prebuilt) = manifest_step_policy(step).unwrap();
             assert_eq!(prebuilt, step.tag() != "quick.e2e_verify", "{}", step.tag());
@@ -30211,6 +30461,47 @@ mod committed_selection_preservation_tests {
         );
     }
 
+    #[test]
+    fn focused_compat_buckets_produce_their_own_run_owned_fixtures() {
+        // Each compatibility bucket reads the fixtures its prep node writes
+        // under the run's state directory: the gating bucket in the pinned
+        // root, the host-portability copy on the host. A focused run of either
+        // must add its own producer and not the other's
+        // (https://github.com/rrnewton/hermit/issues/3712).
+        let root = Path::new(file!()).parent().and_then(Path::parent).unwrap();
+        for (bucket, own, other) in [
+            (
+                "e2e.manifest_compat_pinned",
+                "compatpinnedprep.fixtures",
+                "compatprep.fixtures",
+            ),
+            (
+                "e2e.manifest_compat",
+                "compatprep.fixtures",
+                "compatpinnedprep.fixtures",
+            ),
+        ] {
+            let args = parse_argv(&[
+                "--only".into(),
+                "portable".into(),
+                bucket.into(),
+                ALLOW_LOCAL_OFF_THE_RECORD_RUN_OPTION.into(),
+            ])
+            .unwrap();
+            let temp = tempfile::tempdir().unwrap();
+            let plan = build_plan(root, &args, temp.path()).unwrap();
+            let tags = plan
+                .cfg
+                .steps
+                .iter()
+                .map(Step::tag)
+                .collect::<BTreeSet<_>>();
+            assert!(tags.contains(bucket), "{bucket}: {tags:?}");
+            assert!(tags.contains(own), "{bucket} lacks {own}: {tags:?}");
+            assert!(!tags.contains(other), "{bucket} added {other}: {tags:?}");
+        }
+    }
+
     fn inert_step(source: &Step, command: String) -> Step {
         let mut step = step_with_caps(
             &source.group,
@@ -33032,8 +33323,11 @@ mod raw_census_publication_tests {
         // full-buck-e2e import twins (<bucket>_buck), which only
         // scripts/validate.rs --e2e-runner buck-local|buck-hybrid selects,
         // each publish the cells of their bucket from the rows
-        // e2e.buck_cells wrote.
-        assert_eq!(publishers.len(), 56);
+        // e2e.buck_cells wrote. 58 since the gating compatibility corpus moved
+        // into the pinned root as e2e.manifest_compat_pinned and its import
+        // twin e2e.manifest_compat_pinned_buck, beside the host-portability
+        // e2e.manifest_compat (https://github.com/rrnewton/hermit/issues/3712).
+        assert_eq!(publishers.len(), 58);
         for step in publishers {
             let path = normal_raw_result_path(step, "fixture-run").unwrap();
             // Only the full-buck-e2e label admits the import launcher.
@@ -33077,7 +33371,7 @@ mod raw_census_publication_tests {
                 .as_ref()
                 .map(|manifest| (manifest.lane.as_str(), manifest.category.as_str()))
             {
-                Some(("portable", "c-programs" | "compat")) => Some("--jobs"),
+                Some(("portable", "c-programs" | "compat" | "compat-pinned")) => Some("--jobs"),
                 Some(("portable" | "privileged", "system-utils")) => Some(""),
                 _ => None,
             };
@@ -33157,10 +33451,13 @@ mod raw_census_publication_tests {
             .iter()
             .find(|step| step.tag() == "portablecompat.manifest_compat")
             .unwrap();
+        // The node runs inside the pinned root, so the host path of the same
+        // build (its HERMIT_BIN until 2026-10-05) is now a wrong binary.
         let mut wrong_bin = focused.clone();
-        wrong_bin
-            .env
-            .insert("HERMIT_BIN".into(), "target/release/hermit".into());
+        wrong_bin.env.insert(
+            "HERMIT_BIN".into(),
+            "ignored/hermetic/split/target/release/hermit".into(),
+        );
         assert!(normal_raw_result_path(&wrong_bin, "fixture-run").is_err());
         let mut no_bin = focused.clone();
         no_bin.env.remove("HERMIT_BIN");

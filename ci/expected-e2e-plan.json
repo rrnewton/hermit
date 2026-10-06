@@ -13505,7 +13505,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13521,7 +13521,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13537,7 +13537,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13553,7 +13553,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13569,7 +13569,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13585,7 +13585,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13601,7 +13601,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13617,7 +13617,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13633,7 +13633,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13649,7 +13649,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13665,7 +13665,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13681,7 +13681,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13697,7 +13697,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13713,7 +13713,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13729,7 +13729,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13745,7 +13745,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13761,7 +13761,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13777,7 +13777,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13793,7 +13793,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13809,7 +13809,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13825,7 +13825,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13841,7 +13841,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13857,7 +13857,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13873,7 +13873,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13889,7 +13889,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13905,7 +13905,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13921,7 +13921,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13937,7 +13937,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13953,7 +13953,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13969,7 +13969,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -13985,7 +13985,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14001,7 +14001,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14017,7 +14017,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14033,7 +14033,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14049,7 +14049,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14065,7 +14065,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14081,7 +14081,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14113,7 +14113,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14129,7 +14129,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14145,7 +14145,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14161,7 +14161,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14177,7 +14177,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14193,7 +14193,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14209,7 +14209,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14225,7 +14225,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14241,7 +14241,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14257,7 +14257,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14273,7 +14273,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14289,7 +14289,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14305,7 +14305,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14321,7 +14321,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14337,7 +14337,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14353,7 +14353,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14369,7 +14369,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14385,7 +14385,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14401,7 +14401,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14417,7 +14417,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14433,7 +14433,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14449,7 +14449,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14465,7 +14465,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14481,7 +14481,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14497,7 +14497,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14513,7 +14513,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14529,7 +14529,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14545,7 +14545,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14561,7 +14561,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14577,7 +14577,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14593,7 +14593,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14609,7 +14609,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14625,7 +14625,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14641,7 +14641,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14657,7 +14657,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14673,7 +14673,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14689,7 +14689,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14705,7 +14705,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14721,7 +14721,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14737,7 +14737,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14753,7 +14753,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14769,7 +14769,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14785,7 +14785,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14801,7 +14801,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14817,7 +14817,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14833,7 +14833,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14849,7 +14849,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14865,7 +14865,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14881,7 +14881,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14897,7 +14897,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14913,7 +14913,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14929,7 +14929,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14945,7 +14945,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14961,7 +14961,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14977,7 +14977,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -14993,7 +14993,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15009,7 +15009,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15025,7 +15025,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15041,7 +15041,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15057,7 +15057,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15073,7 +15073,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15089,7 +15089,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15105,7 +15105,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15121,7 +15121,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15137,7 +15137,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15153,7 +15153,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15169,7 +15169,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15185,7 +15185,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15201,7 +15201,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15217,7 +15217,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15233,7 +15233,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15249,7 +15249,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15265,7 +15265,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15281,7 +15281,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15297,7 +15297,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15313,7 +15313,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15329,7 +15329,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15345,7 +15345,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15361,7 +15361,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15377,7 +15377,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15393,7 +15393,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15409,7 +15409,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15425,7 +15425,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15441,7 +15441,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15457,7 +15457,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15473,7 +15473,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15489,7 +15489,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15521,7 +15521,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15537,7 +15537,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15553,7 +15553,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15569,7 +15569,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15585,7 +15585,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15601,7 +15601,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15617,7 +15617,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15633,7 +15633,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15649,7 +15649,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15665,7 +15665,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15681,7 +15681,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15697,7 +15697,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15713,7 +15713,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15729,7 +15729,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15745,7 +15745,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15761,7 +15761,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15777,7 +15777,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15793,7 +15793,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15809,7 +15809,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15825,7 +15825,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15841,7 +15841,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15857,7 +15857,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15873,7 +15873,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15889,7 +15889,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15905,7 +15905,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15921,7 +15921,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15937,7 +15937,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15953,7 +15953,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15969,7 +15969,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -15985,7 +15985,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16001,7 +16001,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16017,7 +16017,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16033,7 +16033,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16049,7 +16049,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16065,7 +16065,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16081,7 +16081,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16097,7 +16097,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16129,7 +16129,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16145,7 +16145,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16161,7 +16161,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16177,7 +16177,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16193,7 +16193,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16209,7 +16209,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16225,7 +16225,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16241,7 +16241,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16257,7 +16257,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16273,7 +16273,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16289,7 +16289,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16305,7 +16305,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16321,7 +16321,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16337,7 +16337,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16353,7 +16353,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16369,7 +16369,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16385,7 +16385,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16401,7 +16401,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16417,7 +16417,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16433,7 +16433,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16449,7 +16449,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16465,7 +16465,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16481,7 +16481,7 @@
     {
       "backend": "ptrace",
       "category": "compat",
-      "classification": "required",
+      "classification": "diagnostic",
       "cpu_timeout_seconds": 59,
       "lane": "portable",
       "mode": "verify",
@@ -16524,6 +16524,3362 @@
         "ptrace"
       ],
       "test": "compat/zstd-roundtrip",
+      "timeout_seconds": 20
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/basenc",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/col",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/colrm",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/crc32",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/cscope",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/df-direct",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/diff3",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/dos2unix",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/envsubst",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/fallocate",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/flex",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/getconf",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/lua-direct",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/mountpoint",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/msgfmt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/msgunfmt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/namei",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/node",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/pathchk",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/perl-direct",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/rustc",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/setfacl",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/setfattr",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/shred",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/sync",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/truncate",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 59,
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat/uuidgen",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/addr2line",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ar",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/arch",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/as",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/awk",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/b2sum",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/base32",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/base64",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/basename",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/bash",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/bracket",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/bzip2",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/bzip2-roundtrip",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cal",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cargo",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cat",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/chmod",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/chown",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/chrt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cksum",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cmake",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cmp",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/column",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/comm",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cp",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cpp",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/csplit",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cut",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/cxxfilt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/date",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/dd",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 19,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/df",
+      "timeout_seconds": 20
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/diff",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/dirname",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/du",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/echo",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/egrep",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/elfedit",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/env",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/expand",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/expr",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/factor",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/fgrep",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/find",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/findmnt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/flock",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/fmt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/fold",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/free",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/gcc",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/getopt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/git",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/gprof",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/grep",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/groups",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/gxx",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/gzip",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/gzip-roundtrip",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/head",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/hexdump",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/hostname",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/iconv",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/id",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/install",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ionice",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/iostat",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/join",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/jq",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/kill",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ld",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ln",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/logger",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/logname",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ls",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/lscpu",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/lsirq",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/lsmod",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/lua",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/m4",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/make",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/md5sum",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/mkdir",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/mkfifo",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/mktemp",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/mpstat-softirqs",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/mv",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/netlink-route",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/netlink-sock-diag",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/nice",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/nl",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/nm",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/nohup",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/nproc",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/numactl-hardware",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/numastat",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/numfmt",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/objcopy",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/objdump",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/od",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/openssl",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/paste",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/perl",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/pgrep",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/pidstat-disk",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/pinky",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/pkg-config",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/pkill",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/pr",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/printenv",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/printf",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ps",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ptx",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/pwd",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/python3",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 19,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ranlib",
+      "timeout_seconds": 20
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/readelf",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/readlink",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/realpath",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/rev",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/rm",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/rmdir",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ruby",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sed",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/seq",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sha1sum",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sha224sum",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sha256sum",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sha384sum",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sha512sum",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/shell-build",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/shuf",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/size",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sleep",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sort",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/split",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sqlite3",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/ss",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/stat",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/stdbuf",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/strings",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/strip",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sum",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/sysctl-random-uuid",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/tac",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/tar",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/tar-roundtrip",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/taskset",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/tcl",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/tee",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/test",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 19,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/top",
+      "timeout_seconds": 20
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/touch",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/tr",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/true",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/tsort",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/tty",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/uname",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/unexpand",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/uniq",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/users",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/vmstat",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/vmstat-disk",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/wc",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/wc-lines",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/whoami",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/xargs",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/xxd",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/xz",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/xz-roundtrip",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/yes",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 19,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/zstd",
+      "timeout_seconds": 20
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "diagnostic",
+      "cpu_timeout_seconds": 19,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/zstd-roundtrip",
       "timeout_seconds": 20
     },
     {
@@ -19287,6 +22643,40 @@
       ],
       "test": "c-programs/sched-getaffinity-identity",
       "timeout_seconds": 57
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/curl",
+      "timeout_seconds": 60
+    },
+    {
+      "backend": "ptrace",
+      "category": "compat-pinned",
+      "classification": "required",
+      "cpu_timeout_seconds": 59,
+      "guest_root": "pinned",
+      "lane": "portable",
+      "mode": "verify",
+      "requires": [
+        "linux",
+        "x86_64",
+        "userns",
+        "ptrace"
+      ],
+      "test": "compat-pinned/curl-localhost",
+      "timeout_seconds": 60
     }
   ],
   "schema": 1

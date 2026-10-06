@@ -14,9 +14,10 @@ bucket's e2e node uses in the cargo flow:
         --junit DIR/LANE/manifest_CATEGORY/junit.xml
 
 and keeps its output in DIR/LANE/manifest_CATEGORY/harness.log. Only a bucket listed in
-DIAGNOSTIC_MANIFEST_BUCKETS (ci/manifest-plan/src/validation_dag.rs: compat) gets
---diagnostic-results, as only its node does; a plan that puts a diagnostic cell in any
-other bucket fails that bucket, because its node refuses to select one.
+DIAGNOSTIC_MANIFEST_BUCKETS (ci/manifest-plan/src/validation_dag.rs: compat and
+compat-pinned) gets --diagnostic-results, as only its node does; a plan that puts a
+diagnostic cell in any other bucket fails that bucket, because its node refuses to
+select one.
 The harness decides every cell's verdict as it does for the rows of an executed run:
 which retries this run would have made (no compat cell is retried, so a second Tpx
 execution of one is dropped), staleness, evidence, host inapplicability on this machine,
@@ -45,7 +46,7 @@ import xml.etree.ElementTree as ET
 COUNTS = ("cells", "passed", "failed", "errors", "diagnostic_failures", "host_inapplicable")
 IMPORTED = ("missing_cells", "dropped_retries")
 # DIAGNOSTIC_MANIFEST_BUCKETS in ci/manifest-plan/src/validation_dag.rs; a test pins the copy.
-DIAGNOSTIC_BUCKETS = ("compat",)
+DIAGNOSTIC_BUCKETS = ("compat", "compat-pinned")
 
 def refuse(message):
     print(f"verdict: {message}", file=sys.stderr)

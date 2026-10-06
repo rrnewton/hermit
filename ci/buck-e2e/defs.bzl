@@ -7,7 +7,8 @@ pass --no-retry to the harness, so `buck2 test ... -- --retry 1` retries a faile
 and the ingester keeps "passed only on rerun" red.
 
 Routing (per cell, first match wins; see _route):
-  local: kvm backend, privileged lane, a host-capability requirement, a `requires` tool
+  local: kvm backend, privileged lane, a pinned guest root (guest_root "pinned": the
+         compat-pinned bucket), a host-capability requirement, a `requires` tool
          RE workers lack, the LOCAL_TESTS deny-list, a test measured to fail only on RE
          (re_exclusions.json), a PMU-armed cell under -c hermit_e2e.pmu_on_re=false, or
          the ptrace verify cell of a test with a kvm verify cell (its parity reference).
@@ -16,9 +17,10 @@ Routing (per cell, first match wins; see _route):
   re:    everything else.
 `-c hermit_e2e.routing=local` runs every cell locally (the buck-local test mode).
 
-Container (per local cell; see _container): a privileged-lane cell and a pinned-root-only
-cell run inside ci/hermetic/run-in-pinned-root.sh, the privileged podman
-container the cargo flow runs every e2e node in. Other local cells run on the host.
+Container (per local cell; see _container): a privileged-lane cell, a pinned-guest-root
+cell and a pinned-root-only cell run inside ci/hermetic/run-in-pinned-root.sh, the
+privileged podman container the cargo flow runs every e2e node in. Other local cells run
+on the host.
 
 RE-routed cells support Buck's test execution caching: when the bundle (hermit, harness,
 fixtures, sources) and the cell are unchanged, Buck answers from the RE action cache
@@ -52,6 +54,18 @@ PINNED_ROOT_ONLY = {
     "c-programs/environment-and-workdir/verify": "asserts a fresh tmpfs workdir at /test, which cell.sh gives only pinned-root cells (elsewhere the workdir is the bound /tmp/test)",
 }
 
+# A cell whose plan entry has guest_root "pinned" (the compat-pinned bucket, from
+# tests/e2e/manifests/compat-pinned.yaml) names programs and fixtures that resolve, with
+# their libc, only inside the pinned image: its verdict must not depend on the host's
+# glibc (https://github.com/rrnewton/hermit/issues/3712). A buck-local host or an RE
+# worker (CentOS Stream 9, its own /usr/bin) is not that image, so these cells run
+# locally inside the pinned-root container, as the cargo flow's
+# e2e.manifest_compat_pinned node runs them.
+PINNED_GUEST_ROOT_REASON = "pinned guest root: its guests resolve their programs and libc inside the pinned image, which neither RE workers nor the host provide"
+
+def pinned_guest_root(cell):
+    return cell.get("guest_root") == "pinned"
+
 # ptrace/liteinst cells that run with --max-timeslice=disabled and so never arm the PMU.
 PMU_FREE_CELLS = [
     "c-programs/io-uring-fallback/custom@ptrace",
@@ -67,7 +81,7 @@ def cell_slug(cell):
     return "{}-{}-{}".format(cell["test"].replace("/", "-"), cell["mode"], cell["backend"])
 
 def pmu_armed(cell):
-    return cell["backend"] in ["ptrace", "liteinst"] and cell["category"] != "compat" and cell_id(cell) not in PMU_FREE_CELLS
+    return cell["backend"] in ["ptrace", "liteinst"] and cell["category"] not in ["compat", "compat-pinned"] and cell_id(cell) not in PMU_FREE_CELLS
 
 def _route(cell, pmu_on_re, re_exclusions, kvm_verify_tests):
     """Returns (where, reason): where is "local" or "re"."""
@@ -75,6 +89,8 @@ def _route(cell, pmu_on_re, re_exclusions, kvm_verify_tests):
         return ("local", "kvm backend: RE workers have no /dev/kvm")
     if cell["lane"] == "privileged":
         return ("local", "privileged lane")
+    if pinned_guest_root(cell):
+        return ("local", PINNED_GUEST_ROOT_REASON)
     if cell.get("requires_host_capabilities"):
         return ("local", "needs host capability " + ",".join(cell["requires_host_capabilities"]))
     missing = [t for t in cell.get("requires", []) if t in RE_MISSING_TOOLS]
@@ -102,6 +118,8 @@ def _container(cell, where):
         return ("", "")
     if cell["lane"] == "privileged":
         return ("pinned-root", "privileged lane: the cargo flow runs it in the privileged pinned-root container")
+    if pinned_guest_root(cell):
+        return ("pinned-root", PINNED_GUEST_ROOT_REASON)
     pinned = PINNED_ROOT_ONLY.get("{}/{}".format(cell["test"], cell["mode"]))
     if pinned:
         return ("pinned-root", "pinned-root-only: " + pinned)

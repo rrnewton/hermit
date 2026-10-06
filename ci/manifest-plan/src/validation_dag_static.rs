@@ -181,6 +181,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "e2e.manifest_c_programs_buck",
     "e2e.manifest_chaos_c_buck",
     "e2e.manifest_compat_buck",
+    "e2e.manifest_compat_pinned_buck",
     "e2e.manifest_data_handling_buck",
     "e2e.manifest_debugger_c_buck",
     "e2e.manifest_determinism_stress_buck",
@@ -196,6 +197,7 @@ pub(super) const TEST_HARNESS_RESULT_PRODUCERS: &[&str] = &[
     "e2e.manifest_applications_on_host",
     "e2e.manifest_compat",
     "e2e.manifest_compat_on_host",
+    "e2e.manifest_compat_pinned",
     "e2e.manifest_bin_c",
     "e2e.manifest_bin_c_on_host",
     "e2e.manifest_c_programs",
@@ -787,7 +789,75 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // nextest list --profile ci --workspace --exclude hermit-detcore
     // --exclude hermit --exclude hermetic_infra_hermit_flaky-tests
     // (detcore-model 156).
-    ("test.regular_crates", 978),
+    // The 28 pinned-guest-root tests of
+    // https://github.com/rrnewton/hermit/issues/3712 phase 2 retain all 978
+    // prior identities: 23 compat_guest_root::tests
+    // (shipped_compat_manifests_satisfy_the_pinned_guest_contract,
+    // every_declared_data_path_is_still_needed,
+    // every_unavailable_row_names_a_program_the_image_lacks,
+    // a_gating_compat_cell_without_the_pinned_guest_root_is_refused,
+    // a_gating_argv_naming_a_host_program_outside_the_image_is_refused,
+    // a_gating_bare_program_the_image_lacks_is_refused,
+    // diagnostic_and_unselected_cells_do_not_gate,
+    // buckets_outside_the_compat_family_are_not_checked,
+    // a_workload_arm_naming_a_host_program_is_refused,
+    // a_declared_host_only_probe_must_still_guard_an_image_fallback,
+    // a_host_path_in_any_directory_is_refused_wherever_the_argv_names_it,
+    // runtime_paths_are_permitted_and_other_host_files_are_not,
+    // a_declared_data_path_covers_only_its_consumer,
+    // a_program_the_checkout_builds_is_refused,
+    // a_repository_script_needs_an_image_interpreter_and_image_paths,
+    // placeholders_and_relative_programs_are_refused_outside_their_rules,
+    // a_parent_component_is_refused_before_any_prefix_exemption,
+    // the_workload_code_an_arm_runs_is_checked_and_other_code_is_not,
+    // absolute_paths_are_found_in_any_directory_but_not_after_expansions,
+    // the_listing_must_describe_the_pinned_image,
+    // the_shipped_listing_records_store_targets_and_the_libc_bytes,
+    // the_identity_changes_with_any_recorded_entry and
+    // verify_root_compares_targets_and_bytes_on_the_filesystem),
+    // manifest_corpus::tests::
+    // the_host_portability_copy_runs_every_pinned_row_and_gates_nothing,
+    // runner::tests::the_pinned_guest_root_needs_the_marker_and_the_image_content,
+    // validation_dag::tests::
+    // hosted_portable_omits_exactly_the_pinned_guest_root_categories, and
+    // test-harness's tests::a_pinned_guest_root_bucket_is_refused_outside_the_pinned_root
+    // and tests::import_mode_requires_each_row_of_a_pinned_bucket_to_record_the_pinned_root.
+    // 978 + 28 = 1006, measured with cargo nextest list --profile ci
+    // --workspace --exclude hermit-detcore --exclude hermit
+    // --exclude hermetic_infra_hermit_flaky-tests (hermit-manifest-plan 747).
+    // The tree-digest and fixture-receipt tests of the same phase,
+    // compat_guest_root::tests::the_tree_digest_covers_bytes_execute_bits_links_and_entries,
+    // compat_guest_root::tests::a_fixture_receipt_vouches_only_for_the_pinned_build_of_this_checkout
+    // and test-harness's
+    // tests::pinned_cells_that_read_the_fixtures_require_their_pinned_receipt,
+    // retain all 1006 prior identities: 1006 + 3 = 1009, measured with the
+    // same cargo nextest list (hermit-manifest-plan 750).
+    // The guest-PATH and loader-preload listing test of the same phase,
+    // compat_guest_root::tests::the_shipped_listing_covers_the_guest_path_and_the_loader_preload_files,
+    // retains all 1009 prior identities: 1009 + 1 = 1010, measured with the
+    // same cargo nextest list (hermit-manifest-plan 751).
+    // The gating-recipe test of the same phase,
+    // compat_guest_root::tests::a_gating_recipe_cannot_change_what_its_argv_runs,
+    // retains all 1010 prior identities: 1010 + 1 = 1011, measured with the
+    // same cargo nextest list (hermit-manifest-plan 752).
+    // The environment, env-option and runtime-alias tests of the same phase,
+    // compat_guest_root::tests::a_gating_cell_sets_only_admitted_variables_with_values_of_their_kind,
+    // compat_guest_root::tests::a_gating_argv_env_uses_only_options_this_check_reads,
+    // compat_guest_root::tests::a_runtime_path_that_reaches_another_tree_is_refused
+    // and test-harness's
+    // tests::parity_compare_refuses_a_row_outside_its_buckets_guest_root,
+    // retain all 1011 prior identities: 1011 + 4 = 1015, measured with the
+    // same cargo nextest list (hermit-manifest-plan 756).
+    // The shebang, script-text and run-state fixture tests and the read-only
+    // image test of the same phase,
+    // compat_guest_root::tests::a_shebang_line_is_read_whole_and_must_run_a_shell,
+    // compat_guest_root::tests::a_parent_component_in_script_text_is_refused,
+    // compat_guest_root::tests::only_the_receipt_verified_fixture_tree_may_run_from_run_state
+    // and
+    // compat_guest_root::tests::verify_read_only_refuses_an_image_directory_on_a_writable_filesystem,
+    // retain all 1015 prior identities: 1015 + 4 = 1019, measured with the
+    // same cargo nextest list (hermit-manifest-plan 760).
+    ("test.regular_crates", 1019),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1651,7 +1721,17 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The row-recording exact-branch-counter test listed there retains all 974: 975.
     // The report exact-branch-counter test listed there retains all 975: 976.
     // The two /proc/mounts seed-class tests listed there retain all 976: 978.
-    ("test.regular_crates_on_host", 978),
+    // The 28 pinned-guest-root tests listed there retain all 978: 1006.
+    // The three tree-digest and fixture-receipt tests listed there retain all
+    // 1006: 1009.
+    // The guest-PATH and loader-preload listing test listed there retains all
+    // 1009: 1010.
+    // The gating-recipe test listed there retains all 1010: 1011.
+    // The four environment, env-option, runtime-alias and parity-admission
+    // tests listed there retain all 1011: 1015.
+    // The four shebang, script-text, run-state fixture and read-only image
+    // tests listed there retain all 1015: 1019.
+    ("test.regular_crates_on_host", 1019),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
@@ -2902,7 +2982,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"build"########,
         job: r########"host_hermit_link"########,
         desc: r########"Link the host target/ci/hermit and artifact pointer to the one Hermit the pinned root published"########,
-        description: r########"The strict compatibility corpus (e2e.manifest_compat) exercises programs installed on the host, which the pinned image does not carry, so it and its fixtures run on the host. It runs the one validate-profile Hermit that build.e2e_artifact_in_pinned_root published, not a second, host-built copy. This node points the host's target/ci/hermit at those exact bytes (ignored/hermetic/split/target is the pinned root's /src/target) and proves the binary runs here. It does because the binary's loader and libraries are the host nix store paths that ci/hermetic/build-image.sh built the image from; if nix garbage collection has removed them, the node fails and names the missing store paths. It also writes the host artifact pointer target/ci/hermit-e2e-artifact.path, naming the same content-addressed bundle by its host path, and verifies it with ci/verify-hermit-e2e-artifact.sh, so the corpus bucket reaches the binary and its resources through the same verified wrapper as every other manifest bucket."########,
+        description: r########"The host-portability check of the strict compatibility corpus (e2e.manifest_compat) exercises the programs installed on the host rather than the pinned image's, so it and its fixtures run on the host; its cells are non-blocking diagnostics, and e2e.manifest_compat_pinned gates the same rows inside the pinned root. It runs the one validate-profile Hermit that build.e2e_artifact_in_pinned_root published, not a second, host-built copy. This node points the host's target/ci/hermit at those exact bytes (ignored/hermetic/split/target is the pinned root's /src/target) and proves the binary runs here. It does because the binary's loader and libraries are the host nix store paths that ci/hermetic/build-image.sh built the image from; if nix garbage collection has removed them, the node fails and names the missing store paths. It also writes the host artifact pointer target/ci/hermit-e2e-artifact.path, naming the same content-addressed bundle by its host path, and verifies it with ci/verify-hermit-e2e-artifact.sh, so the corpus bucket reaches the binary and its resources through the same verified wrapper as every other manifest bucket."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; hermit=ignored/hermetic/split/target/ci/hermit && test -f "$hermit" && test -x "$hermit" && mkdir -p target/ci && ln -sfnT "../../$hermit" target/ci/hermit && if ! target/ci/hermit --version; then echo "build.host_hermit_link: $hermit does not run on this host. Its loader and libraries are the host nix store paths the pinned image was built from: $(readelf -l "$hermit" | grep -o '/nix/store/[^]]*'). Rebuild the image with ci/hermetic/build-image.sh to restore that closure." >&2; exit 1; fi && pointer=ignored/hermetic/split/target/ci/hermit-e2e-artifact.path && bundle=$(cat "$pointer") && case "$bundle" in /src/target/*) ;; *) echo "build.host_hermit_link: $pointer names $bundle, which is not under the pinned root's /src/target" >&2; exit 1;; esac && printf '%s\n' "$PWD/ignored/hermetic/split/target/${bundle#/src/target/}" > target/ci/hermit-e2e-artifact.path && ./ci/verify-hermit-e2e-artifact.sh target/ci/hermit-e2e-artifact.path >/dev/null"########,
         cmdtype: CmdType::Unknown,
@@ -3177,8 +3257,8 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
     StaticStepSpec {
         group: r########"e2e"########,
         job: r########"manifest_compat"########,
-        desc: r########"Portable manifest bucket: compat, the strict compatibility corpus on the host"########,
-        description: r########"The portable strict compatibility corpus (tests/e2e/manifests/compat.yaml): 189 programs installed on the validation host, each one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's stripped --verify comparison, which is below L2 and never counted as bitwise parity. It runs on the host, not in the pinned root, because 31 of the programs are not in the pinned image; the Hermit is the pinned root's validate-profile binary, verified through the host artifact pointer build.host_hermit_link publishes. compatprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/strict-compat. Five rows (df, ranlib, top, zstd, zstd-roundtrip) are diagnostics with a 20-second budget: a measured failure of one is reported and counted but does not fail the node. Until 2026-10-01 these programs were 189 separate compat.<program> nodes; in the validation of Hermit 76980bac they took 92.8 s of wall and 60.3 CPU seconds in total, the slowest 3.0 s."########,
+        desc: r########"Portable manifest bucket: compat, the host-portability check of the strict compatibility corpus"########,
+        description: r########"The host-portability check of the portable strict compatibility corpus (tests/e2e/manifests/compat.yaml): the 216 selected rows of compat-pinned.yaml, argv for argv, each one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's stripped --verify comparison, which is below L2 and never counted as bitwise parity, with the program, its libc and its loader taken from the validation host instead of the pinned image. Every cell is a non-blocking diagnostic (the corpus's host_portability setting): a measured failure is reported and counted through dagrun schema 4 but fails nothing, because e2e.manifest_compat_pinned gates the same programs from the pinned root (https://github.com/rrnewton/hermit/issues/3712). It keeps the 26 rows whose program the pinned image lacks, so each of those still has a measured verdict here. The Hermit is the pinned root's validate-profile binary, verified through the host artifact pointer build.host_hermit_link publishes, and compatprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/strict-compat. Until 2026-10-05 this node gated 189 of these cells, so its verdicts depended on the host's glibc; until 2026-10-01 those programs were 189 separate compat.<program> nodes, which in the validation of Hermit 76980bac took 92.8 s of wall and 60.3 CPU seconds in total, the slowest 3.0 s. On 2026-10-05 the 216 host cells took 14 s of wall at 8 jobs and 108.5 s of summed cell time on devbig014."########,
         labels: &[r########"full"########, r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
         cmdtype: CmdType::Unknown,
@@ -3219,16 +3299,61 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         jobs_env: None,
     },
     StaticStepSpec {
-        group: r########"portablecompat"########,
-        job: r########"manifest_compat"########,
-        desc: r########"The strict compatibility corpus against this lane's release Hermit"########,
-        description: r########"The portable-strict-compat-only run type: the same compat.yaml bucket and selector as e2e.manifest_compat, run on the host against the release Hermit that compatprep.hermit_release_in_pinned_root builds, which the pinned root writes under ignored/hermetic/split/target (HERMIT_BIN=ignored/hermetic/split/target/release/hermit, resolved under the checkout; the harness probes the binary before any cell, so one that cannot run on the host fails every cell rather than passing) and the fixtures portablecompatprep.fixtures writes under $VALIDATE_RUN_STATE/strict-compat, so a corpus-only check needs one release build instead of the full profile's workspace build and test barrier. Each row is one ptrace verify cell under the corpus's portable flags and stripped comparison, and the bucket's diagnostic rows report through dagrun schema 4. A program that diverges or fails under the release Hermit turns it red; until 2026-10-01 these rows were 189 separate portablecompat.<program> nodes."########,
-        labels: &[r########"portable-strict-compat-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --category compat --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
+        group: r########"e2e"########,
+        job: r########"manifest_compat_pinned"########,
+        desc: r########"Portable manifest bucket: compat-pinned, the strict compatibility corpus from the pinned image"########,
+        description: r########"The gating portable strict compatibility corpus (tests/e2e/manifests/compat-pinned.yaml), run inside the pinned root (ci/hermetic/image.digest, glibc 2.42), so every program, its libc and its loader come from the pinned image and a verdict does not depend on the validation host's glibc (https://github.com/rrnewton/hermit/issues/3712). Each selected row is one verify cell on ptrace under the corpus's portable flags (--no-virtualize-cpuid, --max-timeslice=disabled, TMPDIR=/tmp, an empty tmpfs /test workdir) and Hermit's stripped --verify comparison, which is below L2 and never counted as bitwise parity. The bucket declares guest_root: pinned, so test-harness refuses to run its cells unless HERMIT_PINNED_ROOT_IMAGE, which ci/hermetic/run-in-pinned-root.sh exports, equals image.digest and /bin/sh resolves into the image's /nix/store, and every result row records guest_root=pinned. The Hermit is the validate-profile binary build.e2e_artifact_in_pinned_root publishes, and compatpinnedprep.fixtures prepares the files the rows read under $VALIDATE_RUN_STATE/compat-pinned inside the same root. Five rows (df, ranlib, top, zstd, zstd-roundtrip) are diagnostics with a 20-second budget: a measured failure of one is reported and counted but does not fail the node. The 26 rows whose program the image lacks (bc, clang, cpio-roundtrip, crc32, cscope, dc, dos2unix, envsubst, file, flex, gcov, ip, java, javac, lsof, msgfmt, msgunfmt, patch, rustc, sar-resource-tables, setfacl, setfattr, time, wget-localhost, xmllint, zip-unzip) stay enabled with ci: false and name the missing program until a repin adds it (phase 3 of the issue), and uptime is unselected because Detcore answers CLOCK_BOOTTIME with the virtual wall clock, so the image's coreutils 9.11 uptime computes a boot time at the epoch and exits 1. e2e.manifest_compat runs every row from the host as a non-blocking host-portability check. Until 2026-10-05 that host bucket gated 189 cells; this node gates 174, 169 required and 5 diagnostic. On 2026-10-06 the 174 cells all passed in 11 s of wall at 8 jobs, 70.7 s of summed cell time, on devbig014."########,
+        labels: &[r########"full"########, r########"portable"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat-pinned --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
-            category: r########"compat"########,
+            category: r########"compat-pinned"########,
+            test: None,
+            mode: None,
+            backend: None,
+            label: None,
+        }),
+        integration_test_binaries: None,
+        deps: &[
+            r########"build.e2e_artifact"########,
+            r########"build.rust_scripts"########,
+            r########"compatpinnedprep.fixtures"########,
+            r########"gate.manifest"########,
+            r########"setup.manifest_plan"########,
+        ],
+        env: &[(
+            r########"HERMIT_E2E_EMPTY_WORKDIR"########,
+            r########"/test"########,
+        )],
+        hint: HintSpec {
+            resources: &[(r########"manifest_guest"########, 8)],
+            est_duration_s: 120.0,
+            rss_baseline_bytes: Some(4294967296),
+            hard_mem_max_bytes: Some(6442450944),
+            classification: StepClass::LatencyBound,
+            preferred_inner_jobs: Some(8),
+            measured_effective_cores: None,
+            measured_cpu_utilization: None,
+        },
+        networkonly: false,
+        engine_only: false,
+        timeout: 600,
+        cpu_timeout: 1800,
+        jobs_flag: Some(r########"--jobs"########),
+        jobs_env: None,
+    },
+    StaticStepSpec {
+        group: r########"portablecompat"########,
+        job: r########"manifest_compat"########,
+        desc: r########"The strict compatibility corpus against this lane's release Hermit"########,
+        description: r########"The portable-strict-compat-only run type: the same compat-pinned.yaml bucket and selector as e2e.manifest_compat_pinned, run inside the pinned root against the release Hermit that compatprep.hermit_release_in_pinned_root builds there (HERMIT_BIN=target/release/hermit, which the pinned root's /src/target makes ignored/hermetic/split/target/release/hermit; the harness probes the binary before any cell, so one that cannot run fails every cell rather than passing) and the fixtures portablecompatprep.fixtures writes under $VALIDATE_RUN_STATE/compat-pinned in the same root, so a corpus-only check needs one release build instead of the full profile's workspace build and test barrier. Each row is one ptrace verify cell under the corpus's portable flags and stripped comparison; the bucket's guest_root: pinned makes test-harness refuse to run it anywhere but the pinned root, and its diagnostic rows report through dagrun schema 4. A program that diverges or fails under the release Hermit turns it red. Until 2026-10-05 it ran compat.yaml's 189 cells on the host, with the host's own programs and glibc (https://github.com/rrnewton/hermit/issues/3712); until 2026-10-01 these rows were 189 separate portablecompat.<program> nodes."########,
+        labels: &[r########"portable-strict-compat-only"########],
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --category compat-pinned --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/junit.xml""########,
+        cmdtype: CmdType::Unknown,
+        manifest: Some(ManifestSpec {
+            lane: r########"portable"########,
+            category: r########"compat-pinned"########,
             test: None,
             mode: None,
             backend: None,
@@ -3237,13 +3362,15 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         integration_test_binaries: None,
         deps: &[
             r########"build.rust_scripts"########,
+            r########"compatprep.hermit_release"########,
             r########"gate.manifest"########,
             r########"portablecompatprep.fixtures"########,
+            r########"setup.manifest_plan"########,
         ],
         env: &[
             (
                 r########"HERMIT_BIN"########,
-                r########"ignored/hermetic/split/target/release/hermit"########,
+                r########"target/release/hermit"########,
             ),
             (
                 r########"HERMIT_E2E_EMPTY_WORKDIR"########,
@@ -3271,13 +3398,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"rrcompat"########,
         job: r########"manifest_compat"########,
         desc: r########"The compatibility corpus recorded and replayed under strict Hermit"########,
-        description: r########"The rr-compat-only run type: `test-harness run --label rr-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are the replay cells of the rows' own tests compat/<row>, from the corpus's `replay` section: one ptrace replay cell for each of the 139 programs the retired rr lane listed as passing (ci/compat/corpus-rr.json and RR_PASSING_LABELS until 2026-10-02), each running `hermit record start --strict --verify` under the stricter --verify-strict comparison, which records the program, replays the recording and compares the two, with the old lane's 60-second wall bound per program. It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, against the fixtures rrcompatprep.fixtures writes. The old lane ran `record start --verify --verify-strict`; the harness adds what every manifest replay cell has: --strict, --log info, --base-env=minimal, and a tmpfs /test working directory. Only 51 of the 139 pass, on the old lane's own command too (measured on 97ae0ccef with its release Hermit), so the old lane could not have been green: the other 88 stop recording with exit status 122 because record mode refuses every clock read (https://github.com/rrnewton/hermit/issues/3519), and the corpus lists them as `unselected` under that issue, so the node gates the 51 and any of them that diverges, crashes or exceeds its budget turns it red. Until 2026-10-02 these rows were 139 separate rrcompat.<program> nodes running a separately built release Hermit, and until 2026-10-04 139 separate compat/rr-<row> tests duplicating the rows' own tests. Like the old lane's command, each replay cell runs without the corpus's verify settings: no added Hermit flags or comparator, no TMPDIR=/tmp, and one attempt. The node's 600-second wall bound is the 200 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of the largest cell, 60 seconds scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (90 + 10)), plus 400 seconds for the rest of the bucket; the 51 cells took 2.6 seconds of wall time and 15 CPU seconds at 16 jobs on 2026-10-02 (21 seconds of summed cell time), against 56.7 seconds for the same 51 programs run one after another through the old command. The two attempts are that conservative model only; the harness never retries a replay cell, so a recording that fails to replay fails its one attempt, as it did on the old lane."########,
+        description: r########"The rr-compat-only run type: `test-harness run --label rr-compat-only` over tests/e2e/manifests/compat-pinned.yaml inside the pinned root, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are the replay cells of the rows' own tests compat/<row>, from the corpus's `replay` section: one ptrace replay cell for each of the 139 programs the retired rr lane listed as passing (ci/compat/corpus-rr.json and RR_PASSING_LABELS until 2026-10-02), each running `hermit record start --strict --verify` under the stricter --verify-strict comparison, which records the program, replays the recording and compares the two, with the old lane's 60-second wall bound per program. It runs inside the pinned root, so each program, its libc and its loader come from the pinned image (the bucket's guest_root: pinned makes test-harness refuse any other root; https://github.com/rrnewton/hermit/issues/3712), with the validation's one Hermit build, the e2e artifact build.e2e_artifact_in_pinned_root publishes, against the fixtures rrcompatprep.fixtures writes under $VALIDATE_RUN_STATE/compat-pinned in the same root. Until 2026-10-05 it ran on the host, against the host's own programs and glibc. The old lane ran `record start --verify --verify-strict`; the harness adds what every manifest replay cell has: --strict, --log info, --base-env=minimal, and a tmpfs /test working directory. Only 51 of the 139 pass, on the old lane's own command too (measured on 97ae0ccef with its release Hermit), so the old lane could not have been green: the other 88 stop recording with exit status 122 because record mode refuses every clock read (https://github.com/rrnewton/hermit/issues/3519), and the corpus lists them as `unselected` under that issue, so the node gates the 51 and any of them that diverges, crashes or exceeds its budget turns it red. Until 2026-10-02 these rows were 139 separate rrcompat.<program> nodes running a separately built release Hermit, and until 2026-10-04 139 separate compat/rr-<row> tests duplicating the rows' own tests. Like the old lane's command, each replay cell runs without the corpus's verify settings: no added Hermit flags or comparator, no TMPDIR=/tmp, and one attempt. The node's 600-second wall bound is the 200 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of the largest cell, 60 seconds scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (90 + 10)), plus 400 seconds for the rest of the bucket; the 51 cells took 2.6 seconds of wall time and 15 CPU seconds at 16 jobs on 2026-10-02 (21 seconds of summed cell time), against 56.7 seconds for the same 51 programs run one after another through the old command; in the pinned root on 2026-10-05 the same 51 cells passed in 3 s of wall at 8 jobs, 22.9 s of summed cell time. The two attempts are that conservative model only; the harness never retries a replay cell, so a recording that fails to replay fails its one attempt, as it did on the old lane."########,
         labels: &[r########"rr-compat-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --label rr-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat-pinned --label rr-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
-            category: r########"compat"########,
+            category: r########"compat-pinned"########,
             test: None,
             mode: None,
             backend: None,
@@ -3285,7 +3412,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         }),
         integration_test_binaries: None,
         deps: &[
-            r########"build.host_hermit_link"########,
+            r########"build.e2e_artifact"########,
             r########"build.rust_scripts"########,
             r########"gate.manifest"########,
             r########"pre.reverie_pin"########,
@@ -3317,13 +3444,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"sabrecompat"########,
         job: r########"manifest_compat"########,
         desc: r########"The compatibility corpus on SaBRe"########,
-        description: r########"The sabre-compat-only run type: `test-harness run --label sabre-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are each corpus row's SaBRe verify cell (the `focused` section: every row but lsof, netlink-route, netlink-sock-diag and shell-build) and both cells of the 30 rows only this run type has (23 programs the SaBRe corpus had and the strict corpus lacks; lua-direct, perl-direct and df-direct, which keep that corpus's single-image argv for programs whose strict rows run under a bash wrapper; and rustc, javac, java and node, whose ptrace cells get 600 seconds). It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, whose install tree carries the SaBRe loader and libdetcore_sabre.so, against the fixtures sabrecompatprep.fixtures writes; each cell runs Hermit's stripped --verify once and must also pass the harness's SaBRe execution-path contract (an RPC from the in-guest tool, zero ptrace-fallback and zero trusted shared-object system-call sites). A cell measured red stays enabled with `ci: false` and its failure class's issue (https://github.com/rrnewton/hermit/issues/3486 and the issues it names), so `--ci-only` selects only the cells that pass. The guest's own dynamic loader loads libdetcore_sabre.so against the guest's libc, so the artifact's publication and verification refuse a plugin that records a library search path, needs a library outside glibc, or requires a glibc symbol version newer than 2.34 (https://github.com/rrnewton/hermit/issues/3652). A program that diverges, crashes or leaves SaBRe's measured path turns it red. Until 2026-10-01 these rows were 212 separate sabrecompat.<program> nodes that checked only Hermit's exit status, so a program whose children ran outside SaBRe passed, and on a fresh checkout their release Hermit had no SaBRe loader at all. The node's 2120-second wall bound is the 1820 seconds `scripts/validate.rs --self-test` requires of it as outer headroom, plus 300 seconds for the rest of the bucket, so a hung heavy cell is reported as that cell's timeout rather than ending the node. The self-test models every manifest cell as two attempts with 10 seconds of termination grace each, and its representative 1.5x wall multiplier turns the largest selected cells (rustc and node on ptrace, 600 seconds each) into 900-second windows: 2 x (900 + 10). The two attempts are that conservative model only; compat cells carry the manifest's no_retry_reason, so the harness never retries them."########,
+        description: r########"The sabre-compat-only run type: `test-harness run --label sabre-compat-only` over tests/e2e/manifests/compat-pinned.yaml inside the pinned root, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are each corpus row's SaBRe verify cell (the `focused` section: every row but lsof, netlink-route, netlink-sock-diag and shell-build) and both cells of the 30 rows only this run type has (23 programs the SaBRe corpus had and the strict corpus lacks; lua-direct, perl-direct and df-direct, which keep that corpus's single-image argv for programs whose strict rows run under a bash wrapper; and rustc, javac, java and node, whose ptrace cells get 600 seconds). It runs inside the pinned root, so each program, its libc and its loader come from the pinned image (the bucket's guest_root: pinned makes test-harness refuse any other root; https://github.com/rrnewton/hermit/issues/3712), with the validation's one Hermit build, the e2e artifact build.e2e_artifact_in_pinned_root publishes, whose install tree carries the SaBRe loader built in that root and libdetcore_sabre.so, against the fixtures sabrecompatprep.fixtures writes under $VALIDATE_RUN_STATE/compat-pinned in the same root; the rows whose program the image lacks (rustc, javac and java among them) stay enabled with ci: false until a repin adds them; each cell runs Hermit's stripped --verify once and must also pass the harness's SaBRe execution-path contract (an RPC from the in-guest tool, zero ptrace-fallback and zero trusted shared-object system-call sites). A cell measured red stays enabled with `ci: false` and its failure class's issue (https://github.com/rrnewton/hermit/issues/3486 and the issues it names), so `--ci-only` selects only the cells that pass. The guest's own dynamic loader loads libdetcore_sabre.so against the guest's libc, so the artifact's publication and verification refuse a plugin that records a library search path, needs a library outside glibc, or requires a glibc symbol version newer than 2.34 (https://github.com/rrnewton/hermit/issues/3652). A program that diverges, crashes or leaves SaBRe's measured path turns it red. Until 2026-10-01 these rows were 212 separate sabrecompat.<program> nodes that checked only Hermit's exit status, so a program whose children ran outside SaBRe passed, and on a fresh checkout their release Hermit had no SaBRe loader at all. Until 2026-10-05 the node ran on the host and selected 92 cells; in the pinned root on 2026-10-06 its 80 selected cells (63 on SaBRe, 17 on ptrace) all passed in 11 s of wall at 8 jobs, 39.4 s of summed cell time. The node's 2120-second wall bound is the 1820 seconds `scripts/validate.rs --self-test` requires of it as outer headroom, plus 300 seconds for the rest of the bucket, so a hung heavy cell is reported as that cell's timeout rather than ending the node. The self-test models every manifest cell as two attempts with 10 seconds of termination grace each, and its representative 1.5x wall multiplier turns the largest selected cells (rustc and node on ptrace, 600 seconds each) into 900-second windows: 2 x (900 + 10). The two attempts are that conservative model only; compat cells carry the manifest's no_retry_reason, so the harness never retries them."########,
         labels: &[r########"sabre-compat-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --label sabre-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat-pinned --label sabre-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
-            category: r########"compat"########,
+            category: r########"compat-pinned"########,
             test: None,
             mode: None,
             backend: None,
@@ -3331,7 +3458,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         }),
         integration_test_binaries: None,
         deps: &[
-            r########"build.host_hermit_link"########,
+            r########"build.e2e_artifact"########,
             r########"build.rust_scripts"########,
             r########"gate.manifest"########,
             r########"pre.reverie_pin"########,
@@ -3363,13 +3490,13 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"strictcompat"########,
         job: r########"manifest_compat"########,
         desc: r########"The compatibility corpus under strict Hermit without relaxations"########,
-        description: r########"The strict-compat-only run type: `test-harness run --label strict-compat-only` over tests/e2e/manifests/compat.yaml, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are the corpus's `variants` cells compat/strict-<row>: one ptrace verify cell for each of the 193 rows of ci/compat/corpus-strict.json, with that file's guest argv (112 byte-identical; the other 81 name the same prepare_real_compat_fixtures.sh output, or for shell-build and top their scratch directory, under $VALIDATE_RUN_STATE/strict-compat instead of strictcompat), under --strict and Hermit's stripped --verify with none of the corpus's relaxations, so CPUID virtualization and the preemption timeslice stay on, and the old lane's 60-second wall bound per program. It runs the validation's one Hermit build, the e2e artifact build.host_hermit_link links on the host, against the fixtures strictcompatprep.fixtures writes. The harness adds what every manifest verify cell has and the old lane did not: --log info, --base-env=minimal, and a tmpfs /test working directory. A cell measured red stays enabled with `ci: false` and its failure class's issue (java and javac, https://github.com/rrnewton/hermit/issues/3495), so `--ci-only` selects only the cells that pass; any other program that diverges, crashes or exceeds its budget turns the node red. Until 2026-10-02 these rows were 193 separate strictcompat.<program> nodes running a separately built release Hermit. The node's 600-second wall bound is the 200 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of the largest cell, 60 seconds scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (90 + 10)), plus 400 seconds for the rest of the bucket; the 193 cells measured 123 seconds of summed wall time and 84 CPU seconds on 2026-10-02. The two attempts are that conservative model only; compat cells carry the manifest's no_retry_reason, so the harness never retries them."########,
+        description: r########"The strict-compat-only run type: `test-harness run --label strict-compat-only` over tests/e2e/manifests/compat-pinned.yaml inside the pinned root, so it runs exactly the cells labelled with that run type and nothing the full validation runs. Those are the corpus's `variants` cells compat/strict-<row>: one ptrace verify cell for each of the 193 rows of ci/compat/corpus-strict.json, with that file's guest argv (84 rows byte-identical; 81 name the same prepare_real_compat_fixtures.sh output, or for shell-build and top their scratch directory, under $VALIDATE_RUN_STATE/compat-pinned instead of strictcompat; 25, top among them, name the pinned image's /bin or /sbin copy of a program the image has no /usr/bin or /usr/sbin copy of; and 4 adapt the command to the image's version of the program: logger adds --socket-errors=off, uptime drops -p, and basename and dirname take /opt/hermit/bin/hermit instead of the host path /usr/local/bin/hermit; scripts/validate.rs --self-test checks the 189 rows the default run type enables against exactly these rewrites), under --strict and Hermit's stripped --verify with none of the corpus's relaxations, so CPUID virtualization and the preemption timeslice stay on, and the old lane's 60-second wall bound per program. It runs inside the pinned root, so each program, its libc and its loader come from the pinned image (the bucket's guest_root: pinned makes test-harness refuse any other root; https://github.com/rrnewton/hermit/issues/3712), with the validation's one Hermit build, the e2e artifact build.e2e_artifact_in_pinned_root publishes, against the fixtures strictcompatprep.fixtures writes under $VALIDATE_RUN_STATE/compat-pinned in the same root. The rows whose program the image lacks stay enabled with ci: false until a repin adds them, and strict-uptime is unselected (CLOCK_BOOTTIME, as in e2e.manifest_compat_pinned). The harness adds what every manifest verify cell has and the old lane did not: --log info, --base-env=minimal, and a tmpfs /test working directory. A cell measured red stays enabled with `ci: false` and its failure class's issue (java and javac, https://github.com/rrnewton/hermit/issues/3495), so `--ci-only` selects only the cells that pass; any other program that diverges, crashes or exceeds its budget turns the node red. Until 2026-10-02 these rows were 193 separate strictcompat.<program> nodes running a separately built release Hermit. The node's 600-second wall bound is the 200 seconds `scripts/validate.rs --self-test` requires of it as outer headroom (two modelled attempts of the largest cell, 60 seconds scaled by the representative 1.5x multiplier, each with 10 seconds of termination grace: 2 x (90 + 10)), plus 400 seconds for the rest of the bucket; the 193 cells measured 123 seconds of summed wall time and 84 CPU seconds on 2026-10-02. Until 2026-10-05 the node ran on the host and selected 191 cells; in the pinned root on 2026-10-06 its 175 selected cells all passed in 12 s of wall at 8 jobs, 81.5 s of summed cell time. The two attempts are that conservative model only; compat cells carry the manifest's no_retry_reason, so the harness never retries them."########,
         labels: &[r########"strict-compat-only"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --label strict-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat-pinned --label strict-compat-only --ci-only --prebuilt --diagnostic-results --results "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat_pinned/junit.xml""########,
         cmdtype: CmdType::Unknown,
         manifest: Some(ManifestSpec {
             lane: r########"portable"########,
-            category: r########"compat"########,
+            category: r########"compat-pinned"########,
             test: None,
             mode: None,
             backend: None,
@@ -3377,7 +3504,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         }),
         integration_test_binaries: None,
         deps: &[
-            r########"build.host_hermit_link"########,
+            r########"build.e2e_artifact"########,
             r########"build.rust_scripts"########,
             r########"gate.manifest"########,
             r########"pre.reverie_pin"########,
@@ -5067,6 +5194,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"e2e.manifest_c_programs"########,
             r########"e2e.manifest_chaos_c"########,
             r########"e2e.manifest_compat"########,
+            r########"e2e.manifest_compat_pinned"########,
             r########"e2e.manifest_data_handling"########,
             r########"e2e.manifest_debugger_c"########,
             r########"e2e.manifest_determinism_stress"########,
@@ -5101,7 +5229,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"scorecard"########,
         job: r########"compatibility"########,
         desc: r########"Verify fresh per-cell results and print the compatibility table"########,
-        description: r########"After the thirteen portable e2e.manifest_* buckets finish, `ci/compat-envelope/scorecard.rs verify-results --lanes portable` requires one fresh row at git HEAD, from a clean tree, for every portable-lane regression cell ci/expected-e2e-plan.json selects. Each must be a PASS, except a cell the manifest declares diagnostic, whose FAIL is listed without failing the check; declared stripped-comparator passes are counted apart as below L2. All rows must come from one Hermit binary, and each cell's rows from one run. A cell no bucket wrote, a row from another commit, or rows from two Hermit builds fail it with "fresh result set refused: N missing, M non-passing" even when every bucket node passed; on success it prints the compatibility table. It is the portable-profile copy of full-scorecard.compatibility, which checks both lanes."########,
+        description: r########"After the fourteen portable e2e.manifest_* buckets finish, `ci/compat-envelope/scorecard.rs verify-results --lanes portable` requires one fresh row at git HEAD, from a clean tree, for every portable-lane regression cell ci/expected-e2e-plan.json selects. Each must be a PASS, except a cell the manifest declares diagnostic, whose FAIL is listed without failing the check; declared stripped-comparator passes are counted apart as below L2. All rows must come from one Hermit binary, and each cell's rows from one run. A cell no bucket wrote, a row from another commit, or rows from two Hermit builds fail it with "fresh result set refused: N missing, M non-passing" even when every bucket node passed; on success it prints the compatibility table. It is the portable-profile copy of full-scorecard.compatibility, which checks both lanes."########,
         labels: &[r########"portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/compat-envelope/scorecard.rs verify-results --results "$E2E_RESULT_ROOT" --lanes portable"########,
         cmdtype: CmdType::Unknown,
@@ -5113,6 +5241,7 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
             r########"e2e.manifest_c_programs"########,
             r########"e2e.manifest_chaos_c"########,
             r########"e2e.manifest_compat"########,
+            r########"e2e.manifest_compat_pinned"########,
             r########"e2e.manifest_data_handling"########,
             r########"e2e.manifest_debugger_c"########,
             r########"e2e.manifest_determinism_stress"########,
@@ -5205,9 +5334,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"quick"########,
         job: r########"e2e_verify"########,
         desc: r########"Portable ptrace E2E verification"########,
-        description: r########"In the pinned root, with the shared /proc-locks runtime directory mounted, runs `target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only --exclude-category compat`: every CI-selected portable-lane E2E cell, on the ptrace backend, in verify mode, except the compat category (359 result manifests in ci/dag/validate.json, across applications, C programs, system utilities and the other portable categories). It is the quick profile's end-to-end determinism coverage, run once from quick.build's tree before a full validation. A guest whose two runs differ in output or scheduler log, or that exits nonzero, records a failing row for that cell and turns the node red. The compat category is left to portablecompat.manifest_compat."########,
+        description: r########"In the pinned root, with the shared /proc-locks runtime directory mounted, runs `target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only --exclude-category compat --exclude-category compat-pinned`: every CI-selected portable-lane E2E cell, on the ptrace backend, in verify mode, except the compat and compat-pinned categories (359 result manifests in ci/dag/validate.json, across applications, C programs, system utilities and the other portable categories). It is the quick profile's end-to-end determinism coverage, run once from quick.build's tree before a full validation. A guest whose two runs differ in output or scheduler log, or that exits nonzero, records a failing row for that cell and turns the node red. The compat-pinned corpus is left to portablecompat.manifest_compat and e2e.manifest_compat_pinned, and the host-portability compat corpus to the diagnostic e2e.manifest_compat."########,
         labels: &[r########"quick"########],
-        cmd: r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only --exclude-category compat'"########,
+        cmd: r########"./ci/hermetic/run-in-pinned-root.sh --src . --out ignored/hermetic/split --src-rw --cargo-home ignored/hermetic/split/cargo --env CARGO_BUILD_JOBS --env DAGRUN_STEP_STARTED_MONOTONIC_NS --env DAGRUN_TEST_COUNTS_PATH --env E2E_BUILD_ROOT --env E2E_KERNEL_VERSION --env E2E_MACHINE_SHORTNAME --env E2E_RESULT_ROOT --env E2E_RUN_ID --env HERMIT_E2E_EMPTY_WORKDIR --env HERMIT_VALIDATE_HOST_CAPABILITY_PRESENT --env L4_REPS --env PR_NUMBER --env SUPER_REPETITIONS --env THIRD_PARTY_BUILD_JOBS --env VALIDATE_VERBOSITY -- bash -c '/src/ci/hermetic/assert-no-network.sh && /src/ci/hermetic/assert-build-dependencies.sh && exec bash -c "$1"' bash 'export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; target/debug/test-harness run --lane portable --mode verify --backend ptrace --ci-only --exclude-category compat --exclude-category compat-pinned'"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,
@@ -7269,7 +7398,7 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         group: r########"e2e"########,
         job: r########"manifest_compat_on_host"########,
         desc: r########"Portable manifest bucket: compat, the strict compatibility corpus on the host"########,
-        description: r########"The hosted-portable twin of e2e.manifest_compat: the same 189 cells on the hosted runner, with that runner's own Hermit (build.e2e_artifact_on_host) and the fixtures compatprep.fixtures_on_host prepares. Like every hosted bucket it excludes KVM cells; the corpus has none."########,
+        description: r########"The hosted-portable twin of e2e.manifest_compat: the same 216 host-portability cells on the hosted runner, with that runner's own Hermit (build.e2e_artifact_on_host), its own installed programs and the fixtures compatprep.fixtures_on_host prepares. Every cell is a non-blocking diagnostic, as on the validation host: the gating verdicts come from e2e.manifest_compat_pinned, which runs the programs from the pinned image (https://github.com/rrnewton/hermit/issues/3712). Until 2026-10-05 it gated 189 of these cells. Like every hosted bucket it excludes KVM cells; the corpus has none."########,
         labels: &[r########"hosted-portable"########],
         cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/run-with-hermit-e2e-artifact.sh --require-install target/debug/test-harness run --lane portable --category compat --ci-only --prebuilt --diagnostic-results --exclude-backend kvm --results "$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl" --junit "$E2E_RESULT_ROOT/portable/manifest_compat/junit.xml""########,
         cmdtype: CmdType::Unknown,
@@ -7631,9 +7760,9 @@ HERMIT_ANALYZE_SKID_MARGIN=$margin ./ci/run-nextest-counted.sh -p hermit --featu
         group: r########"scorecard"########,
         job: r########"compatibility_on_host"########,
         desc: r########"Verify fresh per-cell results and print the compatibility table"########,
-        description: r########"The GitHub-hosted copy of scorecard.compatibility: the same `scorecard.rs verify-results --lanes portable` check, run on the host after the thirteen e2e.manifest_*_on_host buckets, with `--exclude-backend kvm` added. Hosted runners expose /dev/kvm through nested virtualization but have no PMU, so KVM guests fail when their clock opens the retired-branch counter; the profile drops those cells, and the scorecard prints them on an "Omitted by --exclude-backend" line instead of counting them. Every other selected portable cell still needs one fresh PASS at HEAD from one Hermit binary and one run per cell. A bucket that wrote no row for a cell fails it as missing; if the plan ever selects no KVM cell, `--exclude-backend kvm matches no selected cell in the named lanes` turns it red rather than silently excluding nothing."########,
+        description: r########"The GitHub-hosted copy of scorecard.compatibility: the same `scorecard.rs verify-results --lanes portable` check, run on the host after the thirteen e2e.manifest_*_on_host buckets, with `--exclude-backend kvm` added. Hosted runners expose /dev/kvm through nested virtualization but have no PMU, so KVM guests fail when their clock opens the retired-branch counter; the profile drops those cells, and the scorecard prints them on an "Omitted by --exclude-backend" line instead of counting them. Every other selected portable cell still needs one fresh PASS at HEAD from one Hermit binary and one run per cell. A bucket that wrote no row for a cell fails it as missing; if the plan ever selects no KVM cell, `--exclude-backend kvm matches no selected cell in the named lanes` turns it red rather than silently excluding nothing. `--exclude-category compat-pinned` omits the gating compat corpus the same way, on its own "Omitted by --exclude-category" line: its manifest declares `guest_root: pinned`, so only a step inside the pinned root can produce those rows and no hosted step runs them (https://github.com/rrnewton/hermit/issues/3712); the local scorecard.compatibility still requires every one. An exclusion that matches no selected cell fails the same way."########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/compat-envelope/scorecard.rs verify-results --results "$E2E_RESULT_ROOT" --lanes portable --exclude-backend kvm"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/compat-envelope/scorecard.rs verify-results --results "$E2E_RESULT_ROOT" --lanes portable --exclude-category compat-pinned --exclude-backend kvm"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: None,

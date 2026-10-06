@@ -60,7 +60,37 @@ struct Corpus {
     /// validation does not select them.
     #[serde(default)]
     variants: Vec<CorpusVariant>,
+    /// Makes this corpus a host-portability check: every row's corpus-backend
+    /// verify cell becomes a non-blocking diagnostic with this reason (a row
+    /// with its own `diagnostic` entry keeps that entry and its budget). Such
+    /// a corpus runs each program from the host it starts on, so its verdicts
+    /// say whether Hermit copes with that host's binaries and libc and gate
+    /// nothing. It has no focused, replay or variant cells, which belong to
+    /// the gating corpus, and its document may not require a guest root.
+    #[serde(default)]
+    host_portability: Option<String>,
+    /// Rows whose program the document's guest root does not contain. Every
+    /// cell of such a row (corpus backend, focused, replay and variant) stays
+    /// enabled with `ci: false` and an `unavailable` `ci_disabled_reason`
+    /// naming the program, so no run type requires a verdict the guest root
+    /// cannot produce. Only a `guest_root: pinned` document may declare it.
+    #[serde(default)]
+    unavailable: Option<CorpusUnavailable>,
     rows: Vec<CorpusRow>,
+}
+
+/// The rows whose program a pinned guest root lacks, with the evidence and
+/// reason every one of their cells carries.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusUnavailable {
+    /// Where the absence and its follow-up are recorded (an issue).
+    evidence: String,
+    /// What would make the program available, appended to the absence.
+    reason: String,
+    /// Row label to the program the guest root lacks, which is not always
+    /// the row's own (rustc links with clang).
+    rows: BTreeMap<String, String>,
 }
 
 /// One focused run type's replay cell (`hermit record start --verify`) on the
@@ -239,9 +269,18 @@ pub fn expand_corpus(mut document: Value) -> Result<Value, String> {
         .and_then(Value::as_str)
         .ok_or("a manifest with a corpus section needs a string bucket")?
         .to_string();
+    let guest_root = match table.get(string("guest_root")) {
+        None => None,
+        Some(value) => Some(
+            value
+                .as_str()
+                .ok_or_else(|| format!("{bucket}: guest_root must be a string"))?
+                .to_string(),
+        ),
+    };
     let corpus: Corpus = serde_yaml::from_value(section)
         .map_err(|error| format!("{bucket}: invalid corpus section: {error}"))?;
-    let tests = expand(&bucket, &corpus)?;
+    let tests = expand(&bucket, &corpus, guest_root.as_deref())?;
     let entry = table
         .entry(string("test"))
         .or_insert_with(|| Value::Sequence(Vec::new()));
@@ -324,7 +363,7 @@ fn check_row_groups<'a>(
     Ok(excepted)
 }
 
-fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
+fn expand(bucket: &str, corpus: &Corpus, guest_root: Option<&str>) -> Result<Vec<Value>, String> {
     if !BACKENDS.contains(&corpus.backend.as_str()) {
         return Err(format!(
             "{bucket}: corpus backend `{}` is not one of {BACKENDS:?}",
@@ -496,6 +535,96 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             variant_ids.insert(id);
         }
     }
+    if let Some(reason) = &corpus.host_portability {
+        nonempty(bucket, "host_portability", reason)?;
+        if guest_root.is_some() {
+            return Err(format!(
+                "{bucket}: a host_portability corpus runs on the host it starts on, so its document may not require guest_root"
+            ));
+        }
+        if !corpus.focused.is_empty() || corpus.replay.is_some() || !corpus.variants.is_empty() {
+            return Err(format!(
+                "{bucket}: a host_portability corpus has no focused, replay or variant cells; those belong to the gating corpus"
+            ));
+        }
+        if corpus.unavailable.is_some() {
+            return Err(format!(
+                "{bucket}: a host_portability corpus keeps every row a diagnostic; it declares no unavailable rows"
+            ));
+        }
+    }
+    let mut unavailable_rows = BTreeMap::<&str, Value>::new();
+    if let Some(unavailable) = &corpus.unavailable {
+        if guest_root != Some("pinned") {
+            return Err(format!(
+                "{bucket}: corpus unavailable rows describe a pinned guest root, so the document needs guest_root: pinned"
+            ));
+        }
+        nonempty(bucket, "unavailable evidence", &unavailable.evidence)?;
+        nonempty(bucket, "unavailable reason", &unavailable.reason)?;
+        if unavailable.rows.is_empty() {
+            return Err(format!("{bucket}: corpus unavailable names no rows"));
+        }
+        let unselected_anywhere = |label: &str| {
+            corpus
+                .unselected
+                .iter()
+                .any(|class| class.rows.iter().any(|row| row == label))
+                || corpus
+                    .replay
+                    .iter()
+                    .flat_map(|replay| &replay.unselected)
+                    .chain(
+                        corpus
+                            .variants
+                            .iter()
+                            .flat_map(|variant| &variant.unselected),
+                    )
+                    .any(|class| class.rows.iter().any(|row| row == label))
+        };
+        for (label, program) in &unavailable.rows {
+            if !labels.contains(label.as_str()) {
+                return Err(format!(
+                    "{bucket}: corpus unavailable names `{label}`, which is no row"
+                ));
+            }
+            nonempty(
+                bucket,
+                &format!("unavailable program for `{label}`"),
+                program,
+            )?;
+            if program.split_whitespace().count() != 1 || program.contains('/') {
+                return Err(format!(
+                    "{bucket}: corpus unavailable program for `{label}` must be one program name, got `{program}`"
+                ));
+            }
+            if corpus
+                .diagnostic
+                .as_ref()
+                .is_some_and(|diagnostic| diagnostic.rows.contains_key(label))
+            {
+                return Err(format!(
+                    "{bucket}: corpus row `{label}` is both unavailable and diagnostic"
+                ));
+            }
+            if unselected_anywhere(label) {
+                return Err(format!(
+                    "{bucket}: corpus row `{label}` is unavailable, so no unselected class may also name it"
+                ));
+            }
+            unavailable_rows.insert(
+                label.as_str(),
+                ci_disabled_reason(
+                    crate::ci_selection::CiDisabledResult::Unavailable,
+                    &unavailable.evidence,
+                    &format!(
+                        "The program `{program}` is not in the pinned image; {}",
+                        unavailable.reason
+                    ),
+                ),
+            );
+        }
+    }
     let off_reason = format!(
         "A {bucket} corpus row runs only its lane's verify cell on {}",
         corpus.backend
@@ -611,7 +740,10 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                     .map(|class| (*backend, *class))
             })
             .collect::<Vec<_>>();
-        let ci = if unselected.is_empty() {
+        let absent = unavailable_rows.get(row.label.as_str());
+        let ci = if absent.is_some() {
+            mapping(enabled.iter().map(|backend| (*backend, Value::Bool(false))))
+        } else if unselected.is_empty() {
             Value::Bool(true)
         } else {
             mapping(enabled.iter().map(|backend| {
@@ -638,7 +770,12 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             ),
             ("slow_reason", per_cell(&|_, _, slow| string(slow))),
         ];
-        if !unselected.is_empty() {
+        if let Some(absent) = absent {
+            verify.push((
+                "ci_disabled_reason",
+                mapping(enabled.iter().map(|backend| (*backend, absent.clone()))),
+            ));
+        } else if !unselected.is_empty() {
             verify.push((
                 "ci_disabled_reason",
                 mapping(unselected.iter().map(|(backend, class)| {
@@ -680,7 +817,10 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
         if let Some(reason) = &corpus.verify.no_retry_reason {
             verify.push(("no_retry_reason", string(reason)));
         }
-        if let Some((_, reason)) = diagnostic {
+        if let Some(reason) = diagnostic
+            .map(|(_, reason)| reason)
+            .or(corpus.host_portability.as_ref())
+        {
             verify.push((
                 "diagnostic",
                 mapping([(corpus.backend.as_str(), string(reason))]),
@@ -694,7 +834,11 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             let mut recipe = vec![
                 (
                     "ci",
-                    class.map_or(Value::Bool(true), |_| per_cell(Value::Bool(false))),
+                    if absent.is_some() || class.is_some() {
+                        per_cell(Value::Bool(false))
+                    } else {
+                        Value::Bool(true)
+                    },
                 ),
                 ("backends_enabled", strings(&[backend.to_string()])),
                 (
@@ -716,7 +860,9 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                 ),
                 ("slow_reason", per_cell(string(&replay.slow_reason))),
             ];
-            if let Some(class) = class {
+            if let Some(absent) = absent {
+                recipe.push(("ci_disabled_reason", per_cell(absent.clone())));
+            } else if let Some(class) = class {
                 recipe.push((
                     "ci_disabled_reason",
                     per_cell(ci_disabled_reason(
@@ -769,10 +915,15 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
             .filter(|row| !excepted.contains(row.label.as_str()))
         {
             let class = unselected.get(row.label.as_str());
+            let absent = unavailable_rows.get(row.label.as_str());
             let mut recipe = vec![
                 (
                     "ci",
-                    class.map_or(Value::Bool(true), |_| per_cell(Value::Bool(false))),
+                    if absent.is_some() || class.is_some() {
+                        per_cell(Value::Bool(false))
+                    } else {
+                        Value::Bool(true)
+                    },
                 ),
                 ("backends_enabled", strings(&[backend.to_string()])),
                 (
@@ -794,7 +945,9 @@ fn expand(bucket: &str, corpus: &Corpus) -> Result<Vec<Value>, String> {
                 ),
                 ("slow_reason", per_cell(string(&variant.slow_reason))),
             ];
-            if let Some(class) = class {
+            if let Some(absent) = absent {
+                recipe.push(("ci_disabled_reason", per_cell(absent.clone())));
+            } else if let Some(class) = class {
                 recipe.push((
                     "ci_disabled_reason",
                     per_cell(ci_disabled_reason(
@@ -1064,14 +1217,20 @@ mod tests {
     /// file, because scripts/manifest-to-commands.rs compiles this module
     /// under rust-script, where CARGO_MANIFEST_DIR is not ci/manifest-plan.
     const COMPAT_YAML: &str = include_str!("../../../tests/e2e/manifests/compat.yaml");
+    /// The gating copy of the same corpus, run from the pinned image
+    /// (https://github.com/rrnewton/hermit/issues/3712): it carries the
+    /// SaBRe, strict and rr run types that compat.yaml's host-portability
+    /// copy does not.
+    const COMPAT_PINNED_YAML: &str =
+        include_str!("../../../tests/e2e/manifests/compat-pinned.yaml");
 
-    /// compat.yaml's strict variant runs exactly the programs of
+    /// compat-pinned.yaml's strict variant runs exactly the programs of
     /// ci/compat/corpus-strict.json, the corpus STRICT_COMPAT_TOTAL counts and
     /// the super suite still reads: a row added to either file without the
     /// other fails here instead of silently changing the strict run type.
     #[test]
     fn the_strict_variant_runs_exactly_the_strict_corpus_programs() {
-        let document: Value = serde_yaml::from_str(COMPAT_YAML).unwrap();
+        let document: Value = serde_yaml::from_str(COMPAT_PINNED_YAML).unwrap();
         let label_of = document["corpus"]["rows"]
             .as_sequence()
             .unwrap()
@@ -1095,7 +1254,7 @@ mod tests {
             })
             .map(|test| {
                 let id = test["id"].as_str().unwrap();
-                let row = id.strip_prefix("compat/strict-").unwrap_or_else(|| {
+                let row = id.strip_prefix("compat-pinned/strict-").unwrap_or_else(|| {
                     panic!("{id}: a strict-compat-only test outside the strict variant")
                 });
                 label_of[row].clone()
@@ -1116,18 +1275,19 @@ mod tests {
         );
     }
 
-    /// compat.yaml's replay cells keep the retired rr lane's 139 programs (the
+    /// compat-pinned.yaml's replay cells keep the retired rr lane's 139 programs (the
     /// count its RR_COMPAT_EXPECTED guard held before ci/compat/corpus-rr.json
     /// was retired), each the replay cell of its row's own test, carrying the
     /// rr run type alone and none of the verify cell's settings, and select
     /// only the 51 that record and replay: each of the other 88 stays enabled
-    /// with `ci: false` and the issue of the clock-read refusal that stops its
-    /// recording. A row moved into or out of the run type, a second test for a
+    /// with `ci: false` and either the issue of the clock-read refusal that
+    /// stops its recording or, for a program the pinned image lacks, its
+    /// `unavailable` reason. A row moved into or out of the run type, a second test for a
     /// program, the rr run type reaching a verify cell, or an unselected cell
     /// quietly reselected, fails here.
     #[test]
     fn the_replay_cells_keep_the_rr_lane_programs_and_gate_only_those_that_replay() {
-        let expanded = expand_corpus(serde_yaml::from_str(COMPAT_YAML).unwrap()).unwrap();
+        let expanded = expand_corpus(serde_yaml::from_str(COMPAT_PINNED_YAML).unwrap()).unwrap();
         let rr_label = Value::from("rr-compat-only");
         let seq = |text: &str| serde_yaml::from_str::<Value>(text).unwrap();
         let carries_rr = |labels: &Value| {
@@ -1135,10 +1295,10 @@ mod tests {
                 .as_sequence()
                 .is_some_and(|labels| labels.contains(&rr_label))
         };
-        let (mut gated, mut refused) = (0, 0);
+        let (mut gated, mut refused, mut absent) = (0, 0, Vec::new());
         for test in tests_of(&expanded) {
             let id = test["id"].as_str().unwrap();
-            assert!(!id.starts_with("compat/rr-"), "{id}");
+            assert!(!id.starts_with("compat-pinned/rr-"), "{id}");
             assert!(!carries_rr(&test["labels"]), "{id}");
             if let Some(labels) = test["modes"]["verify"]["labels"].as_mapping() {
                 assert!(!labels.values().any(carries_rr), "{id}");
@@ -1160,6 +1320,14 @@ mod tests {
                 ci => {
                     assert_eq!(ci["ptrace"], Value::Bool(false), "{id}");
                     let reason = &replay["ci_disabled_reason"]["ptrace"];
+                    if reason["result"] == "unavailable" {
+                        assert_eq!(
+                            reason["evidence"], "https://github.com/rrnewton/hermit/issues/3712",
+                            "{id}"
+                        );
+                        absent.push(id.to_owned());
+                        continue;
+                    }
                     assert_eq!(reason["result"], "replay-failure", "{id}");
                     assert_eq!(
                         reason["evidence"], "https://github.com/rrnewton/hermit/issues/3519",
@@ -1169,7 +1337,90 @@ mod tests {
                 }
             }
         }
-        assert_eq!((gated, refused), (51, 88));
+        // The 88 the clock-read refusal stopped are 84 of that class plus the
+        // four whose program the pinned image lacks (bc, dc, file and java),
+        // which compat-pinned.yaml lists as unavailable instead.
+        assert_eq!(
+            (gated, refused, absent),
+            (
+                51,
+                84,
+                ["bc", "dc", "file", "java"]
+                    .map(|row| format!("compat-pinned/{row}"))
+                    .to_vec()
+            )
+        );
+    }
+
+    /// compat.yaml is the host-portability copy of compat-pinned.yaml: the
+    /// same rows in the same order, argv for argv except that each one's
+    /// per-run state lives under strict-compat instead of compat-pinned, and
+    /// none of the pinned copy's run-type labels. Every one of its cells is a
+    /// non-blocking diagnostic, so no host verdict can gate, and every row the
+    /// pinned image lacks still has a host cell. A row edited in one copy and
+    /// not the other, or a host cell that gates, fails here.
+    #[test]
+    fn the_host_portability_copy_runs_every_pinned_row_and_gates_nothing() {
+        let rows_of = |text: &str| {
+            let document: Value = serde_yaml::from_str(text).unwrap();
+            document["corpus"]["rows"]
+                .as_sequence()
+                .unwrap()
+                .iter()
+                .map(|row| {
+                    let mut row = row.as_mapping().unwrap().clone();
+                    row.remove("labels");
+                    serde_yaml::to_string(&row).unwrap()
+                })
+                .collect::<Vec<_>>()
+        };
+        let host = rows_of(COMPAT_YAML);
+        let pinned = rows_of(COMPAT_PINNED_YAML)
+            .into_iter()
+            .map(|row| {
+                row.replace(
+                    "{{VALIDATE_RUN_STATE}}/compat-pinned/",
+                    "{{VALIDATE_RUN_STATE}}/strict-compat/",
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(host.len(), 219);
+        assert_eq!(host, pinned);
+        let host_document: Value = serde_yaml::from_str(COMPAT_YAML).unwrap();
+        assert!(host_document.get("guest_root").is_none());
+        let expanded = expand_corpus(host_document).unwrap();
+        let mut selected = 0;
+        for test in tests_of(&expanded) {
+            let id = test["id"].as_str().unwrap();
+            for (mode, recipe) in test["modes"].as_mapping().unwrap() {
+                if mode != "verify" {
+                    assert_eq!(
+                        recipe["backends_enabled"],
+                        Value::Sequence(Vec::new()),
+                        "{id}: a host-portability test runs only its verify cell, not {mode:?}"
+                    );
+                }
+            }
+            let verify = &test["modes"]["verify"];
+            assert_eq!(
+                verify["backends_enabled"],
+                Value::from(vec!["ptrace"]),
+                "{id}"
+            );
+            assert!(
+                verify["diagnostic"]["ptrace"]
+                    .as_str()
+                    .is_some_and(|reason| !reason.is_empty()),
+                "{id}: a host-portability cell must be a diagnostic"
+            );
+            if verify["ci"] == Value::Bool(true) {
+                selected += 1;
+            }
+        }
+        assert_eq!(tests_of(&expanded).len(), 219);
+        // The ptrace cells measured red stay unselected, as in compat-pinned;
+        // the other 216 run and report without gating.
+        assert_eq!(selected, 216);
     }
 
     #[test]

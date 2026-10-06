@@ -269,11 +269,46 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result",
     "run_liteinst_finds_the_runtime_staged_as_an_installed_resource",
 ];
+/// E2E categories the GitHub-hosted portable profile omits: exactly the
+/// buckets whose manifest declares `guest_root: pinned`.
+///
+/// Such a bucket's guests must resolve their programs and libc inside the
+/// pinned root, and `test-harness` refuses to run it anywhere else. GitHub-
+/// hosted runners run validation steps on the runner's own Ubuntu userland,
+/// not in the pinned image, so no hosted step can run these cells; the local
+/// `full` and `portable` profiles still require them. The hosted expected
+/// population and result ownership omit them, so an omitted cell is never
+/// reported as a pass, and the same three shell consumers listed for
+/// [`HOSTED_PORTABLE_EXCLUDED_BACKENDS`] apply the same filter; a test keeps
+/// this list equal to the set of `guest_root: pinned` buckets. The hosted
+/// lane still runs the host-portability copy of the corpus (`compat`),
+/// diagnostic, through e2e.manifest_compat_on_host
+/// (<https://github.com/rrnewton/hermit/issues/3712>).
+pub const HOSTED_PORTABLE_EXCLUDED_CATEGORIES: &[&str] = &["compat-pinned"];
 
 fn hosted_portable_excludes(cell: &DagManifest) -> bool {
-    cell.backend
-        .as_deref()
-        .is_some_and(|backend| HOSTED_PORTABLE_EXCLUDED_BACKENDS.contains(&backend))
+    HOSTED_PORTABLE_EXCLUDED_CATEGORIES.contains(&cell.category.as_str())
+        || cell
+            .backend
+            .as_deref()
+            .is_some_and(|backend| HOSTED_PORTABLE_EXCLUDED_BACKENDS.contains(&backend))
+}
+
+/// The jq `select` the shell consumers of `ci/expected-e2e-plan.json` apply to
+/// count the hosted-portable E2E population.
+#[cfg(test)]
+fn hosted_portable_jq_filter() -> String {
+    format!(
+        "select(.lane == \"portable\"{}{})",
+        HOSTED_PORTABLE_EXCLUDED_BACKENDS
+            .iter()
+            .map(|backend| format!(" and .backend != \"{backend}\""))
+            .collect::<String>(),
+        HOSTED_PORTABLE_EXCLUDED_CATEGORIES
+            .iter()
+            .map(|category| format!(" and .category != \"{category}\""))
+            .collect::<String>()
+    )
 }
 
 /// Whether constructed `step` omits `backend`'s cells under the hosted-portable
@@ -312,6 +347,46 @@ fn hosted_portable_exclusion_flags() -> String {
         .iter()
         .map(|backend| format!(" --exclude-backend {backend}"))
         .collect()
+}
+
+/// The `scorecard.rs verify-results` flags that omit
+/// [`HOSTED_PORTABLE_EXCLUDED_CATEGORIES`], each with a leading space.
+fn hosted_portable_category_exclusion_flags() -> String {
+    HOSTED_PORTABLE_EXCLUDED_CATEGORIES
+        .iter()
+        .map(|category| format!(" --exclude-category {category}"))
+        .collect()
+}
+
+/// The `--lanes` selector of the hosted scorecard, followed by its category
+/// exclusions. The backend exclusions come directly after it and end the
+/// command.
+fn hosted_scorecard_selector() -> String {
+    format!(
+        "--lanes portable{}",
+        hosted_portable_category_exclusion_flags()
+    )
+}
+
+/// Whether the hosted scorecard command carries the category exclusions
+/// exactly once, directly after `--lanes portable`, and no other
+/// `--exclude-category` word: `scorecard.rs` refuses a repeated exclusion.
+fn hosted_scorecard_carries_category_exclusion_once(cmd: &str) -> bool {
+    let selector = hosted_scorecard_selector();
+    cmd.match_indices(&selector)
+        .filter(|(at, _)| {
+            cmd[at + selector.len()..]
+                .chars()
+                .next()
+                .is_none_or(char::is_whitespace)
+        })
+        .count()
+        == 1
+        && cmd
+            .split_whitespace()
+            .filter(|word| *word == "--exclude-category")
+            .count()
+            == HOSTED_PORTABLE_EXCLUDED_CATEGORIES.len()
 }
 const HOSTED_RESOURCE_TUPLES: [(&str, &str, i64, i64); 13] = [
     ("e2e.manifest_applications", "manifest_guest", 1, 8),
@@ -381,6 +456,16 @@ const PINNED_ROOT_EXECUTION_STEPS: &[&str] = &[
     "privileged-only-pmu.preemption",
     "privileged-only-test.pmu_buck_chaos_cases",
     "privileged-only-test.cli_kvm",
+    // The fixture preparation of the strict compatibility corpus's pinned-root
+    // copy, tests/e2e/manifests/compat-pinned.yaml, and of its four run types.
+    // Until 2026-10-05 (https://github.com/rrnewton/hermit/issues/3712) these
+    // ran on the host with the host's toolchain, and their buckets ran the
+    // host's programs and libc.
+    "compatpinnedprep.fixtures",
+    "portablecompatprep.fixtures",
+    "sabrecompatprep.fixtures",
+    "strictcompatprep.fixtures",
+    "rrcompatprep.fixtures",
 ];
 
 const PINNED_ROOT_FORWARDED_ENV: &[&str] = &[
@@ -464,6 +549,13 @@ struct Profile {
 // full-buck-e2e is only the Buck E2E nodes; a Buck full run selects it with a
 // pruned full (buck_e2e_selection), which assert_buck_e2e_selection counts.
 // It gained e2e.buck_stage when the staging left e2e.buck_cells: 18/23 before.
+// full and portable then gained e2e.manifest_compat_pinned and
+// compatpinnedprep.fixtures, and full-buck-e2e gained
+// e2e.manifest_compat_pinned_buck, when the gating compat corpus moved into
+// the pinned root (https://github.com/rrnewton/hermit/issues/3712): 89/90,
+// 75/76 and 19/24 before. hosted-portable is unchanged: its
+// e2e.manifest_compat_on_host twin stays, now diagnostic, and the pinned-root
+// bucket has no hosted twin.
 const PROFILES: [Profile; 12] = [
     // full and portable each lost test.liteinst_strict, hosted-portable lost
     // its twin test.liteinst_strict_on_host, and super lost
@@ -476,13 +568,13 @@ const PROFILES: [Profile; 12] = [
     // labels: 88/89 and 74/75 before.
     Profile {
         label: "full",
-        direct_steps: 89,
-        selected_steps: 90,
+        direct_steps: 91,
+        selected_steps: 92,
     },
     Profile {
         label: "portable",
-        direct_steps: 75,
-        selected_steps: 76,
+        direct_steps: 77,
+        selected_steps: 78,
     },
     Profile {
         label: "quick",
@@ -515,13 +607,13 @@ const PROFILES: [Profile; 12] = [
     // the gate and producers they need.
     Profile {
         label: FULL_BUCK_E2E_LABEL,
-        direct_steps: 19,
-        selected_steps: 24,
+        direct_steps: 20,
+        selected_steps: 25,
     },
     Profile {
         label: "portable-strict-compat-only",
         direct_steps: 3,
-        selected_steps: 10,
+        selected_steps: 11,
     },
     // The SaBRe run type: its fixtures and bucket, plus the validation's one
     // Hermit build (the pinned-root producers and the host link) they need.
@@ -578,6 +670,11 @@ struct ExpectedCell {
     #[serde(default)]
     #[allow(dead_code)]
     classification: Option<String>,
+    /// The guest root the cell's bucket requires (`pinned`), for the Buck cell
+    /// generator, which runs such a cell locally in the pinned-root container.
+    #[serde(default)]
+    #[allow(dead_code)]
+    guest_root: Option<String>,
 }
 
 impl From<ExpectedCell> for DagManifest {
@@ -901,15 +998,16 @@ fn is_pinned_root_producer(step: &Step) -> bool {
 }
 
 /// Manifest bucket nodes that run on the validation host rather than in the
-/// pinned root: the compatibility corpus exercises programs installed on the
-/// host, 31 of which the pinned image does not carry.
-pub const HOST_MANIFEST_RUNS: &[&str] = &[
-    "e2e.manifest_compat",
-    "portablecompat.manifest_compat",
-    "sabrecompat.manifest_compat",
-    "strictcompat.manifest_compat",
-    "rrcompat.manifest_compat",
-];
+/// pinned root. e2e.manifest_compat is the host-portability check of the strict
+/// compatibility corpus (tests/e2e/manifests/compat.yaml): it runs the same rows
+/// against the host's programs and libc, and every one of its cells is a
+/// non-blocking diagnostic. The gating copy, e2e.manifest_compat_pinned, and
+/// the four compatibility run types run tests/e2e/manifests/compat-pinned.yaml
+/// in the pinned root. Until 2026-10-05
+/// (<https://github.com/rrnewton/hermit/issues/3712>) portablecompat, sabrecompat,
+/// strictcompat and rrcompat also ran on the host, and the gating verdicts of
+/// all five depended on the host's glibc.
+pub const HOST_MANIFEST_RUNS: &[&str] = &["e2e.manifest_compat"];
 
 /// The run type a manifest bucket node selects with `test-harness run
 /// --label`, from the node's static source; `None` for the default run type.
@@ -917,9 +1015,11 @@ pub fn manifest_run_type(tag: &str) -> Option<&'static str> {
     crate::validation_dag_static::manifest_run_type(tag)
 }
 
-/// The release Hermit compatprep.hermit_release_in_pinned_root builds, as the
-/// host sees it: the pinned root's /src/target is ignored/hermetic/split/target.
-pub const PORTABLE_FOCUSED_HERMIT_BIN: &str = "ignored/hermetic/split/target/release/hermit";
+/// The release Hermit compatprep.hermit_release_in_pinned_root builds, as
+/// portablecompat.manifest_compat sees it inside the pinned root, whose working
+/// directory is /src. Until 2026-10-05 that node ran on the host and named the
+/// same file by its host path, ignored/hermetic/split/target/release/hermit.
+pub const PORTABLE_FOCUSED_HERMIT_BIN: &str = "target/release/hermit";
 
 fn runs_in_pinned_root(step: &Step) -> bool {
     !is_hosted_variant(step)
@@ -935,13 +1035,17 @@ pub(crate) const HOST_HERMIT_LINK_TAG: &str = "build.host_hermit_link";
 /// Route the local host consumers of the Hermit producers to the pinned-root
 /// build.
 ///
-/// The strict compatibility rows exercise host-installed programs that the
-/// pinned image does not carry, so they, and the fixtures they read, still run
-/// on the host. They reach the one Hermit through build.host_hermit_link, which
-/// links the host's target/ci/hermit to the pinned root's published binary; that
-/// binary runs on the host because its loader and libraries are the host nix
-/// store paths the image was built from. No local host step may depend on the
-/// workspace build itself.
+/// The host-portability check of the strict compatibility corpus,
+/// e2e.manifest_compat, runs the corpus against the host's programs and libc,
+/// so it, and compatprep.fixtures, still run on the host. They reach the one
+/// Hermit through build.host_hermit_link, which links the host's
+/// target/ci/hermit to the pinned root's published binary; that binary runs on
+/// the host because its loader and libraries are the host nix store paths the
+/// image was built from. No local host step may depend on the workspace build
+/// itself. Until 2026-10-05 the four compatibility run types also ran on the
+/// host, and the corpus-only lane's dependency on compatprep.hermit_release was
+/// rerouted here to its pinned-root twin; they now run in the pinned root,
+/// where [`materialize_pinned_root`] maps their producers.
 fn route_host_consumers_to_pinned_build(cfg: &mut DagConfig) -> Result<(), String> {
     for step in &mut cfg.steps {
         if is_hosted_variant(step)
@@ -961,13 +1065,6 @@ fn route_host_consumers_to_pinned_build(cfg: &mut DagConfig) -> Result<(), Strin
                 return Err(format!(
                     "local host step {tag} depends on build.workspace; only the pinned root builds Hermit"
                 ));
-            }
-            // The corpus-only lane builds its release Hermit in the pinned
-            // root; the host producer drops that lane's label.
-            if dependency == "compatprep.hermit_release"
-                && step.labels == ["portable-strict-compat-only"]
-            {
-                *dependency = pinned_root_twin_tag("compatprep.hermit_release");
             }
             if dependency == "build.e2e_artifact" {
                 *dependency = if tag == HOST_HERMIT_LINK_TAG {
@@ -1070,6 +1167,23 @@ fn needs_proc_locks_runtime(tag: &str) -> bool {
     )
 }
 
+/// Whether `command` selects a `guest_root: pinned` bucket
+/// ([`HOSTED_PORTABLE_EXCLUDED_CATEGORIES`]) with `--category`. Such a run
+/// needs the wrapper's `--read-only-root`: test-harness verifies the pinned
+/// image's files once, when it starts, and refuses these buckets unless the
+/// root is mounted read-only, so no guest can change those files for a later
+/// cell (<https://github.com/rrnewton/hermit/issues/3712>).
+fn needs_read_only_root(command: &str) -> bool {
+    command
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(2)
+        .any(|pair| {
+            pair[0] == "--category"
+                && HOSTED_PORTABLE_EXCLUDED_CATEGORIES.contains(&pair[1].trim_matches(['\'', '"']))
+        })
+}
+
 fn pinned_root_command(step: &Step) -> String {
     let mut env_names = PINNED_ROOT_FORWARDED_ENV
         .iter()
@@ -1099,6 +1213,9 @@ fn pinned_root_command(step: &Step) -> String {
     // the native host lease inode, not one file per container or validation.
     if needs_proc_locks_runtime(&step.tag()) {
         argv.push("--proc-locks-runtime".into());
+    }
+    if needs_read_only_root(&step.cmd) {
+        argv.push("--read-only-root".into());
     }
     if step.tag() == "test.regular_crates" {
         argv.push("--nextest-calibration".into());
@@ -1142,6 +1259,18 @@ pub(crate) fn refresh_pinned_root_environment(tag: &str, command: &str) -> Resul
         }
         (true, 1) | (false, 0) => {}
         _ => return Err(format!("{tag} has an unexpected proc-locks runtime option")),
+    }
+    let read_only_options = words
+        .iter()
+        .filter(|word| **word == "--read-only-root")
+        .count();
+    match (needs_read_only_root(payload), read_only_options) {
+        (true, 0) => {
+            let position = refreshed.find(" --env ").unwrap_or(refreshed.len());
+            refreshed.insert_str(position, " --read-only-root");
+        }
+        (true, 1) | (false, 0) => {}
+        _ => return Err(format!("{tag} has an unexpected read-only root option")),
     }
     for name in PINNED_ROOT_FORWARDED_ENV {
         let count = words
@@ -1404,6 +1533,7 @@ const FULL_SCORECARD_TAG: &str = "full-scorecard.compatibility";
 pub const BUCK_REPLACED_PRODUCERS: &[&str] = &[
     "build.host_hermit_link",
     "build.manifest_guests_in_pinned_root",
+    "compatpinnedprep.fixtures",
     "compatprep.fixtures",
     "privileged-build.manifest_guests_in_pinned_root",
     "setup.manifest_plan_in_pinned_root",
@@ -1507,9 +1637,12 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
         })
         .cloned()
         .collect::<Vec<_>>();
-    if buckets.len() != 16 {
+    // 16 until e2e.manifest_compat_pinned, the gating pinned-root copy of the
+    // strict compatibility corpus, was added on 2026-10-05
+    // (https://github.com/rrnewton/hermit/issues/3712).
+    if buckets.len() != 17 {
         return Err(format!(
-            "the full profile has {} E2E buckets, expected 16",
+            "the full profile has {} E2E buckets, expected 17",
             buckets.len()
         ));
     }
@@ -2181,6 +2314,7 @@ fn materialize_regular_calibration_launch(cfg: &mut DagConfig) -> Result<(), Str
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum GeneratedPartition {
     PortableCompat,
+    PinnedCompat,
     PortableFocusedCompat,
     StrictCompat,
     SabreCompat,
@@ -2192,6 +2326,9 @@ enum GeneratedPartition {
 
 fn generated_partition(step: &Step) -> Option<GeneratedPartition> {
     match step.group.as_str() {
+        // The gating copy of the strict corpus is the static bucket node
+        // e2e.manifest_compat_pinned; only its fixtures are generated.
+        "compatpinnedprep" => return Some(GeneratedPartition::PinnedCompat),
         // The focused lane's corpus is the static bucket node
         // portablecompat.manifest_compat; only its fixtures are generated.
         "portablecompatprep" => {
@@ -2256,6 +2393,9 @@ fn refresh_generated_partitions(
         // 1 since the portable strict corpus became the manifest bucket
         // e2e.manifest_compat on 2026-10-01: only compatprep.fixtures remains.
         (GeneratedPartition::PortableCompat, 1usize),
+        // 1 since 2026-10-05 (https://github.com/rrnewton/hermit/issues/3712):
+        // compatpinnedprep.fixtures, for e2e.manifest_compat_pinned.
+        (GeneratedPartition::PinnedCompat, 1usize),
         // 1 since the focused portable lane runs the same bucket through the
         // static node portablecompat.manifest_compat: only its fixtures remain.
         (GeneratedPartition::PortableFocusedCompat, 1usize),
@@ -2307,6 +2447,7 @@ fn refresh_generated_partitions(
     // test fixture.
     for partition in [
         GeneratedPartition::PortableCompat,
+        GeneratedPartition::PinnedCompat,
         GeneratedPartition::PortableFocusedCompat,
         GeneratedPartition::StrictCompat,
         GeneratedPartition::SabreCompat,
@@ -2323,9 +2464,10 @@ fn refresh_generated_partitions(
             );
         }
     }
-    if inserted.len() != 8 {
+    // 8 until 2026-10-05, when PinnedCompat was added.
+    if inserted.len() != 9 {
         return Err(format!(
-            "committed DAG has anchors for {} of 8 generated partitions",
+            "committed DAG has anchors for {} of 9 generated partitions",
             inserted.len()
         ));
     }
@@ -2388,10 +2530,13 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // twin, liteinst.strict and super.liteinst_python3_verify_diagnostics
     // were retired with the LiteInst host hybrid
     // (https://github.com/rrnewton/hermit/issues/3520). 134 since
-    // test.record_replay joined the Nextest producers.
-    if expected.len() != 134 {
+    // test.record_replay joined the Nextest producers. 136 since
+    // e2e.manifest_compat_pinned and its Buck import twin joined the
+    // test-harness producers: the gating compat corpus runs from the pinned
+    // root (https://github.com/rrnewton/hermit/issues/3712).
+    if expected.len() != 136 {
         return Err(format!(
-            "structured result producer registry has {} entries, expected 134",
+            "structured result producer registry has {} entries, expected 136",
             expected.len()
         ));
     }
@@ -2543,8 +2688,10 @@ fn assert_structured_result_producers(cfg: &DagConfig) -> Result<(), String> {
     // hosted twin, liteinst.strict and super.liteinst_python3_verify_diagnostics
     // were retired with the LiteInst host hybrid
     // (https://github.com/rrnewton/hermit/issues/3520), and 69 with
-    // test.record_replay.
-    if actual_group_counts != [69, 56, 7, 2] {
+    // test.record_replay. TestHarness 58 with e2e.manifest_compat_pinned and
+    // its Buck import twin, when the gating compat corpus moved into the
+    // pinned root (https://github.com/rrnewton/hermit/issues/3712).
+    if actual_group_counts != [69, 58, 7, 2] {
         return Err(format!(
             "structured result producer group counts changed: {actual_group_counts:?}"
         ));
@@ -2676,12 +2823,14 @@ impl<'a> ResultOwnerIndex<'a> {
 }
 
 /// Manifest categories the quick profile's pinned-root verify smoke
-/// (quick.e2e_verify) omits: the compatibility corpus runs programs installed
-/// on the validation host and reads fixtures compatprep.fixtures prepares,
-/// neither of which the quick profile has. quick.e2e_verify passes
+/// (quick.e2e_verify) omits: both copies of the strict compatibility corpus
+/// read fixtures that compatprep.fixtures or compatpinnedprep.fixtures
+/// prepares, which the quick profile does not, and the host copy (compat) runs
+/// programs installed on the validation host. quick.e2e_verify passes
 /// `--exclude-category` for each, and neither its expected cells nor its
-/// owned results include them.
-pub const QUICK_EXCLUDED_CATEGORIES: &[&str] = &["compat"];
+/// owned results include them. compat-pinned was added on 2026-10-05
+/// (<https://github.com/rrnewton/hermit/issues/3712>).
+pub const QUICK_EXCLUDED_CATEGORIES: &[&str] = &["compat", "compat-pinned"];
 
 /// The exact harness command quick.e2e_verify runs, with one
 /// `--exclude-category` per [`QUICK_EXCLUDED_CATEGORIES`] entry. The generator
@@ -2715,8 +2864,11 @@ fn expected_for_label<'a>(label: &str, cells: &'a [DagManifest]) -> Vec<&'a DagM
             HOSTED_PRIVILEGED_LABEL => cell.lane == "privileged",
             "privileged" => cell.lane == "privileged",
             "quick" => quick_verify_cell(cell),
-            // The corpus-only run type runs exactly the strict compatibility bucket.
-            "portable-strict-compat-only" => cell.lane == "portable" && cell.category == "compat",
+            // The corpus-only run type runs exactly the strict compatibility
+            // bucket's pinned-root copy (compat until 2026-10-05).
+            "portable-strict-compat-only" => {
+                cell.lane == "portable" && cell.category == "compat-pinned"
+            }
             "super" => false,
             // The import twins own every cell, as the cargo buckets do in full.
             FULL_BUCK_E2E_LABEL => true,
@@ -2740,6 +2892,7 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
         "c_programs",
         "chaos_c",
         "compat",
+        "compat_pinned",
         "data_handling",
         "debugger_c",
         "determinism_stress",
@@ -2769,9 +2922,9 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
     // The selection is the full profile minus the replaced nodes plus exactly
-    // the full-buck-e2e nodes (on the committed DAG: 90 - 22 + 19 = 87, pinned
-    // by committed_buck_e2e_selection_replaces_22_nodes_with_18, named before
-    // e2e.buck_stage made the added nodes 19).
+    // the full-buck-e2e nodes (on the committed DAG: 92 - 24 + 20 = 88, pinned
+    // by committed_buck_e2e_selection_replaces_22_nodes_with_18, whose name
+    // keeps the counts it was added with).
     let added = selected_tags
         .difference(&full_tags)
         .cloned()
@@ -3143,7 +3296,9 @@ fn assert_dagrun_preparation_placement(cfg: &DagConfig) -> Result<(), String> {
 /// that large must not be able to report green on an empty selection. The
 /// generator, the manifest DAG audit in `test-harness validate`, and the
 /// validation driver's raw-publisher check all read this one list.
-pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs", "compat"];
+/// compat-pinned, the gating pinned-root copy of compat, joined on 2026-10-05
+/// (<https://github.com/rrnewton/hermit/issues/3712>).
+pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs", "compat", "compat-pinned"];
 
 /// The selector flags a manifest node for `category` passes after
 /// `--lane <lane> --category <category>`.
@@ -3151,9 +3306,11 @@ pub const FAIL_CLOSED_MANIFEST_BUCKETS: &[&str] = &["c-programs", "compat"];
 /// harness with `--diagnostic-results` and declare dagrun structured-result
 /// schema 4, so a diagnostic cell's failure is reported without failing the
 /// node; every other bucket writes and declares schema 2, and the harness
-/// refuses to run a diagnostic cell without the flag. Empty until a bucket
-/// with diagnostic cells exists.
-pub const DIAGNOSTIC_MANIFEST_BUCKETS: &[&str] = &["compat"];
+/// refuses to run a diagnostic cell without the flag. Since 2026-10-05
+/// (<https://github.com/rrnewton/hermit/issues/3712>) every compat cell is a
+/// diagnostic (the host-portability check) and compat-pinned carries the
+/// corpus's own diagnostic rows.
+pub const DIAGNOSTIC_MANIFEST_BUCKETS: &[&str] = &["compat", "compat-pinned"];
 
 /// The harness selection a manifest bucket node `tag` passes after
 /// `test-harness run`: its lane, its category, the `--label` of the run type
@@ -3452,9 +3609,13 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // rust-script tools (431 + 1).
     // 433 since e2e.buck_stage took the staging out of e2e.buck_cells, so it
     // waits only for the pinned Reverie (432 + 1).
-    if cfg.steps.len() != 433 {
+    // 436 when the gating compat corpus moved into the pinned root
+    // (https://github.com/rrnewton/hermit/issues/3712): e2e.manifest_compat_pinned,
+    // its Buck import twin e2e.manifest_compat_pinned_buck and the fixture
+    // preparation compatpinnedprep.fixtures (433 + 3).
+    if cfg.steps.len() != 436 {
         return Err(format!(
-            "superset has {} steps, expected 433",
+            "superset has {} steps, expected 436",
             cfg.steps.len()
         ));
     }
@@ -3662,6 +3823,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         ));
     }
     for group in [
+        "compatpinnedprep",
         "portablecompatprep",
         "strictcompatprep",
         "sabrecompatprep",
@@ -3670,21 +3832,27 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     ] {
         let prep = step(&format!("{group}.fixtures"))?;
         // The SaBRe, strict and rr run types take the validation's one build,
-        // linked on the host by build.host_hermit_link, instead of a dedicated
-        // release build.
+        // build.e2e_artifact_in_pinned_root, through their bucket nodes; their
+        // fixtures need no Hermit and wait only for the manifest gate. Until
+        // 2026-10-05 (https://github.com/rrnewton/hermit/issues/3712) they ran
+        // on the host after build.host_hermit_link. compatpinnedprep keeps the
+        // barrier compatprep.fixtures has, so the corpus's shell-build row
+        // cannot observe a concurrent Cargo mutation.
         let producer = match group {
+            "compatpinnedprep" => "build.e2e_artifact_in_pinned_root",
             "portablecompatprep" => "compatprep.hermit_release_in_pinned_root",
-            "sabrecompatprep" | "strictcompatprep" | "rrcompatprep" => HOST_HERMIT_LINK_TAG,
+            "sabrecompatprep" | "strictcompatprep" | "rrcompatprep" => "gate.manifest",
             _ => "compatprep.hermit_release",
         };
+        let pinned = group != "e9patchcompatprep";
         if !prep.deps.iter().any(|dependency| dependency == producer)
-            || prep
-                .deps
-                .iter()
-                .any(|dependency| dependency == "build.runtime_release")
+            || prep.deps.iter().any(|dependency| {
+                dependency == "build.runtime_release" || dependency == HOST_HERMIT_LINK_TAG
+            })
+            || pinned != prep.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
         {
             return Err(format!(
-                "{group}.fixtures does not use the dedicated focused release producer"
+                "{group}.fixtures does not use the dedicated focused release producer, or runs outside its root (pinned root: {pinned})"
             ));
         }
     }
@@ -3778,22 +3946,30 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
         })
         .map(Step::tag)
         .collect::<Vec<_>>();
-    // The corpus-only bucket runs the release Hermit its own lane builds in the
-    // pinned root, which writes under ignored/hermetic/split/target; a host
-    // target/ path would run whatever stale binary the checkout holds.
+    // The corpus-only bucket runs, inside the pinned root, the release Hermit
+    // its own lane builds there (target/release/hermit under /src, which the
+    // host sees as ignored/hermetic/split/target/release/hermit).
     if let Some(step) = cfg
         .steps
         .iter()
         .find(|step| step.tag() == "portablecompat.manifest_compat")
     {
         if step.env.get("HERMIT_BIN").map(String::as_str) != Some(PORTABLE_FOCUSED_HERMIT_BIN)
+            || !step.cmd.starts_with("./ci/hermetic/run-in-pinned-root.sh ")
             || !step
                 .deps
                 .iter()
                 .any(|dep| dep == "portablecompatprep.fixtures")
+            || !step
+                .deps
+                .iter()
+                .any(|dep| dep == "compatprep.hermit_release_in_pinned_root")
         {
             return Err(format!(
-                "portablecompat.manifest_compat must run HERMIT_BIN={PORTABLE_FOCUSED_HERMIT_BIN}, the pinned-root release build, after portablecompatprep.fixtures"
+                "portablecompat.manifest_compat must run HERMIT_BIN={PORTABLE_FOCUSED_HERMIT_BIN} inside the pinned root, after compatprep.hermit_release_in_pinned_root and portablecompatprep.fixtures; it has HERMIT_BIN={:?}, deps {:?}, and a command starting {:?}",
+                step.env.get("HERMIT_BIN"),
+                step.deps,
+                step.cmd.chars().take(60).collect::<String>()
             ));
         }
     }
@@ -4001,6 +4177,25 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                     pinned.join(", ")
                 ));
             }
+            // No hosted step produces the excluded categories' cells, so the
+            // hosted scorecard must omit them from the population it
+            // requires, or it would demand rows nothing wrote.
+            let unexcluded_categories = selected
+                .steps
+                .iter()
+                .filter(|step| {
+                    step.tag() == "scorecard.compatibility_on_host"
+                        && !hosted_scorecard_carries_category_exclusion_once(&step.cmd)
+                })
+                .map(Step::tag)
+                .collect::<Vec<_>>();
+            if !unexcluded_categories.is_empty() {
+                return Err(format!(
+                    "{HOSTED_PORTABLE_LABEL} step(s) do not carry the category exclusion `{}` exactly once after `--lanes portable`: {}",
+                    hosted_portable_category_exclusion_flags().trim(),
+                    unexcluded_categories.join(", ")
+                ));
+            }
             // The owned results above omit the excluded backends, so each
             // command that produces or verifies them must omit the same ones,
             // exactly once: `test-harness` refuses a repeated exclusion.
@@ -4017,7 +4212,7 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
                             " ",
                         )
                     } else if step.tag() == "scorecard.compatibility_on_host" {
-                        !carries_hosted_exclusion_once(&step.cmd, "--lanes portable", "")
+                        !carries_hosted_exclusion_once(&step.cmd, &hosted_scorecard_selector(), "")
                     } else {
                         false
                     }
@@ -4644,6 +4839,66 @@ sys.exit(37)
             )
             .is_err()
         );
+        // Exactly the steps that select a `guest_root: pinned` bucket mount
+        // the image root read-only, because test-harness refuses those
+        // buckets on a writable root; a refresh adds a missing flag and
+        // refuses a duplicate or one on another step.
+        let read_only = steps
+            .iter()
+            .filter(|step| pinned_root_command(step).contains(" --read-only-root "))
+            .map(|step| step.tag())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            read_only,
+            BTreeSet::from(
+                [
+                    "e2e.manifest_compat_pinned",
+                    "portablecompat.manifest_compat",
+                    "rrcompat.manifest_compat",
+                    "sabrecompat.manifest_compat",
+                    "strictcompat.manifest_compat",
+                ]
+                .map(String::from)
+            )
+        );
+        assert!(!needs_read_only_root(
+            "test-harness run --exclude-category compat --exclude-category compat-pinned"
+        ));
+        assert!(!needs_read_only_root("test-harness run --category compat"));
+        for tag in &read_only {
+            let step = steps.iter().find(|step| step.tag() == *tag).unwrap();
+            let command = pinned_root_command(step);
+            assert_eq!(
+                refresh_pinned_root_environment(tag, &command).unwrap(),
+                command
+            );
+            assert_eq!(
+                refresh_pinned_root_environment(tag, &command.replace(" --read-only-root", ""))
+                    .unwrap(),
+                command
+            );
+            assert!(
+                refresh_pinned_root_environment(
+                    tag,
+                    &command.replace(" --read-only-root", " --read-only-root --read-only-root")
+                )
+                .is_err()
+            );
+        }
+        let unpinned = steps
+            .iter()
+            .find(|step| step.tag() == "e2e.manifest_c_programs")
+            .unwrap();
+        assert!(
+            refresh_pinned_root_environment(
+                "e2e.manifest_c_programs",
+                &pinned_root_command(unpinned).replace(
+                    " --proc-locks-runtime",
+                    " --proc-locks-runtime --read-only-root"
+                )
+            )
+            .is_err()
+        );
         // The wrapper's own cache and run-state behaviour is exercised by
         // ci/hermetic/run-in-pinned-root-cache-test.py, which runs the actual
         // wrapper against the recorded Podman fixture. That suite runs in the
@@ -4956,13 +5211,18 @@ sys.exit(37)
 
     #[test]
     fn steps_sharing_a_result_file_never_run_in_one_run_type() {
-        // e2e.manifest_compat, portablecompat.manifest_compat,
+        // e2e.manifest_compat_pinned, portablecompat.manifest_compat,
         // sabrecompat.manifest_compat, strictcompat.manifest_compat,
-        // rrcompat.manifest_compat, e2e.manifest_compat_on_host and the
-        // full-buck-e2e import twin e2e.manifest_compat_buck all write
+        // rrcompat.manifest_compat and the full-buck-e2e import twin
+        // e2e.manifest_compat_pinned_buck all write
+        // $E2E_RESULT_ROOT/portable/manifest_compat_pinned/results.jsonl, and
+        // the host-portability copy e2e.manifest_compat, its hosted twin
+        // e2e.manifest_compat_on_host and its import twin
+        // e2e.manifest_compat_buck write
         // $E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl. That is safe
-        // only while no run type selects two of them: a run selects one label,
-        // so their label sets must be non-empty and pairwise disjoint.
+        // only while no run type selects two writers of one file: a run selects
+        // one label, so their label sets must be non-empty and pairwise
+        // disjoint.
         let dag = generated_dag();
         let mut writers: BTreeMap<String, Vec<&Step>> = BTreeMap::new();
         for step in &dag.steps {
@@ -4973,12 +5233,19 @@ sys.exit(37)
                 }
             }
         }
-        let shared = writers
-            .get("$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl")
-            .map_or(0, Vec::len);
+        let shared = |path: &str| writers.get(path).map_or(0, Vec::len);
+        // 7 in one file until 2026-10-05, when the gating corpus moved to the
+        // pinned-root bucket compat-pinned
+        // (https://github.com/rrnewton/hermit/issues/3712).
         assert_eq!(
-            shared, 7,
-            "the six manifest_compat buckets and the Buck import twin share one result file"
+            shared("$E2E_RESULT_ROOT/portable/manifest_compat_pinned/results.jsonl"),
+            6,
+            "the five compat-pinned buckets and their Buck import twin share one result file"
+        );
+        assert_eq!(
+            shared("$E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl"),
+            3,
+            "the host-portability bucket, its hosted twin and its Buck import twin share one result file"
         );
         for (path, steps) in &writers {
             for (index, first) in steps.iter().enumerate() {
@@ -5080,17 +5347,34 @@ sys.exit(37)
 
     /// GitHub-hosted runners have no PMU, so the hosted-portable profile omits
     /// KVM cells from every command, owned result, and expected population,
-    /// while the local profiles keep requiring them.
+    /// while the local profiles keep requiring them. They cannot run the
+    /// pinned image either, so the profile also omits the categories whose
+    /// manifest requires it (https://github.com/rrnewton/hermit/issues/3712);
+    /// those have no hosted step at all.
     #[test]
     fn hosted_portable_omits_the_excluded_backends_everywhere_and_locally_keeps_them() {
         assert_eq!(HOSTED_PORTABLE_EXCLUDED_BACKENDS, ["kvm"]);
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         let excluded = |cell: &DagManifest| hosted_portable_excludes(cell);
+        let excluded_category = |cell: &DagManifest| {
+            HOSTED_PORTABLE_EXCLUDED_CATEGORIES.contains(&cell.category.as_str())
+        };
         let portable = expected_for_label("portable", &cells);
         let hosted = expected_for_label(HOSTED_PORTABLE_LABEL, &cells);
         let omitted = portable.iter().filter(|cell| excluded(cell)).count();
-        assert!(omitted > 0, "the corpus has no portable KVM cell to omit");
+        let omitted_by_category = portable
+            .iter()
+            .filter(|cell| excluded_category(cell))
+            .count();
+        assert!(
+            omitted > omitted_by_category,
+            "the corpus has no portable KVM cell to omit"
+        );
+        assert!(
+            omitted_by_category > 0,
+            "the corpus has no portable pinned-root cell to omit"
+        );
         assert_eq!(hosted.len() + omitted, portable.len());
         assert!(hosted.iter().all(|cell| !excluded(cell)));
         assert!(
@@ -5114,6 +5398,11 @@ sys.exit(37)
             .filter(|step| step.manifest.is_some() && step.labels == [HOSTED_PORTABLE_LABEL])
         {
             let category = &step.manifest.as_ref().unwrap().category;
+            assert!(
+                !HOSTED_PORTABLE_EXCLUDED_CATEGORIES.contains(&category.as_str()),
+                "{}: a hosted step for a category the hosted runner cannot run",
+                step.tag()
+            );
             assert!(
                 step.cmd.contains(&format!(
                     "{} --exclude-backend kvm ",
@@ -5162,7 +5451,9 @@ sys.exit(37)
             local_omitted += local_cells.len() - hosted_cells.len();
         }
         assert_eq!(hosted_owned, hosted.len());
-        assert_eq!(local_omitted, omitted);
+        // A local twin's omitted cells are its KVM cells; the pinned-root
+        // categories' cells belong to local steps that have no hosted twin.
+        assert_eq!(local_omitted, omitted - omitted_by_category);
         let scorecard = |tag: &str| {
             committed
                 .steps
@@ -5172,10 +5463,60 @@ sys.exit(37)
                 .cmd
                 .clone()
         };
+        // The hosted scorecard requires exactly the population the hosted
+        // producers write: the portable cells minus the excluded categories
+        // and backends (https://github.com/rrnewton/hermit/issues/3712).
         assert!(scorecard("scorecard.compatibility_on_host").ends_with(
-            "verify-results --results \"$E2E_RESULT_ROOT\" --lanes portable --exclude-backend kvm"
+            "verify-results --results \"$E2E_RESULT_ROOT\" --lanes portable --exclude-category compat-pinned --exclude-backend kvm"
         ));
         assert!(scorecard("scorecard.compatibility").ends_with("--lanes portable"));
+        assert!(!scorecard("scorecard.compatibility").contains("--exclude-category"));
+        let hosted_scorecard_population = portable
+            .iter()
+            .filter(|cell| !excluded_category(cell))
+            .filter(|cell| {
+                !cell
+                    .backend
+                    .as_deref()
+                    .is_some_and(|backend| HOSTED_PORTABLE_EXCLUDED_BACKENDS.contains(&backend))
+            })
+            .count();
+        assert_eq!(hosted_scorecard_population, hosted.len());
+        assert_eq!(hosted_scorecard_population, hosted_owned);
+
+        // Dropping the category exclusion would make the hosted scorecard
+        // demand compat-pinned rows that no hosted step writes; repeating it
+        // makes scorecard.rs refuse the command.
+        let mutations: [fn(&str) -> String; 3] = [
+            |cmd: &str| cmd.replace(" --exclude-category compat-pinned", ""),
+            |cmd: &str| {
+                cmd.replace(
+                    "--exclude-category compat-pinned",
+                    "--exclude-category compat-pinned --exclude-category compat-pinned",
+                )
+            },
+            |cmd: &str| {
+                cmd.replace(
+                    "--lanes portable --exclude-category compat-pinned",
+                    "--exclude-category compat-pinned --lanes portable",
+                )
+            },
+        ];
+        for planted_cmd in mutations {
+            let mut planted = committed.clone();
+            let step = planted
+                .steps
+                .iter_mut()
+                .find(|step| step.tag() == "scorecard.compatibility_on_host")
+                .unwrap();
+            let before = step.cmd.clone();
+            step.cmd = planted_cmd(&step.cmd);
+            assert_ne!(step.cmd, before);
+            assert_eq!(
+                assert_invariants(&planted, &cells).unwrap_err(),
+                "hosted-portable step(s) do not carry the category exclusion `--exclude-category compat-pinned` exactly once after `--lanes portable`: scorecard.compatibility_on_host"
+            );
+        }
 
         let mut planted = committed.clone();
         let step = planted
@@ -5210,7 +5551,7 @@ sys.exit(37)
             ),
             (
                 "scorecard.compatibility_on_host",
-                "--lanes portable --exclude-backend kvm",
+                "--exclude-category compat-pinned --exclude-backend kvm",
             ),
         ] {
             let mut planted = committed.clone();
@@ -5236,13 +5577,12 @@ sys.exit(37)
             );
         }
 
-        // The shell consumers of ci/expected-e2e-plan.json apply the same list.
-        let filter = format!(
-            "select(.lane == \"portable\"{})",
-            HOSTED_PORTABLE_EXCLUDED_BACKENDS
-                .iter()
-                .map(|backend| format!(" and .backend != \"{backend}\""))
-                .collect::<String>()
+        // The shell consumers of ci/expected-e2e-plan.json apply the same
+        // lists.
+        let filter = hosted_portable_jq_filter();
+        assert_eq!(
+            filter,
+            "select(.lane == \"portable\" and .backend != \"kvm\" and .category != \"compat-pinned\")"
         );
         for (path, text) in [
             (
@@ -5267,6 +5607,37 @@ sys.exit(37)
                 !text.contains("[.cells[] | select(.lane == \"portable\")]")
                     && !text.contains("[.cells[] | select(.lane == \"portable\")\n"),
                 "{path} still counts the unfiltered portable population"
+            );
+        }
+    }
+
+    /// The hosted-portable profile omits exactly the categories whose bucket
+    /// requires the pinned guest root, and the local profiles keep requiring
+    /// their cells (https://github.com/rrnewton/hermit/issues/3712).
+    #[test]
+    fn hosted_portable_omits_exactly_the_pinned_guest_root_categories() {
+        let root = crate::git_environment::checkout_root();
+        let manifests = crate::runner::ManifestSet::load(&root).unwrap();
+        let cells = expected_cells(&root).unwrap();
+        let categories = cells
+            .iter()
+            .map(|cell| cell.category.as_str())
+            .collect::<BTreeSet<_>>();
+        let pinned = categories
+            .iter()
+            .copied()
+            .filter(|category| {
+                manifests.required_guest_root(category) == Some(crate::runner::GuestRoot::Pinned)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pinned, HOSTED_PORTABLE_EXCLUDED_CATEGORIES);
+        let hosted = expected_for_label(HOSTED_PORTABLE_LABEL, &cells);
+        let portable = expected_for_label("portable", &cells);
+        for category in HOSTED_PORTABLE_EXCLUDED_CATEGORIES {
+            assert!(hosted.iter().all(|cell| cell.category != *category));
+            assert!(
+                portable.iter().any(|cell| cell.category == *category),
+                "the local portable profile must still require {category}"
             );
         }
     }
@@ -5482,7 +5853,13 @@ sys.exit(37)
             .find(|step| step.tag() == "portablecompat.manifest_compat")
             .unwrap()
             .env
-            .insert("HERMIT_BIN".into(), "target/release/hermit".into());
+            // The host path this node named before it moved into the pinned
+            // root (2026-10-05); inside the root the release build is
+            // target/release/hermit under /src.
+            .insert(
+                "HERMIT_BIN".into(),
+                "ignored/hermetic/split/target/release/hermit".into(),
+            );
         let error = assert_invariants(&planted_stale_release, &cells).unwrap_err();
         assert!(
             error.starts_with("portablecompat.manifest_compat must run HERMIT_BIN="),
@@ -5696,7 +6073,13 @@ sys.exit(37)
         // test.detcore_time joined full, 88 before
         // privileged-test.pmu_detcore_time_cases did) - 22 replaced + 19
         // full-buck-e2e nodes (18, and 86 in all, before e2e.buck_stage).
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 87);
+        // 88 since the gating compat corpus runs from the pinned image
+        // (https://github.com/rrnewton/hermit/issues/3712): full gained
+        // e2e.manifest_compat_pinned and compatpinnedprep.fixtures (92 nodes),
+        // both replaced (24), and full-buck-e2e gained
+        // e2e.manifest_compat_pinned_buck (20): 92 - 24 + 20. The test keeps
+        // its name, which the NEXTEST_EXPECTED_COUNTS history cites.
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 88);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

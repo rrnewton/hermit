@@ -16,7 +16,7 @@
 #
 #   usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA]
 #                                [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--env NAME]... -- CMD...
-#                                [--nextest-calibration]
+#                                [--nextest-calibration] [--read-only-root]
 #          run-in-pinned-root.sh --check-image [--digest NAME@SHA]
 #
 # --check-image only reads the exact local image reference. It shares the late
@@ -27,6 +27,16 @@
 # ignored/e2e/build), exactly as a GitHub shard job writes into its checkout.
 # Read-only is the right default for a one-shot command; it is not a property
 # the test phase can satisfy.
+#
+# --read-only-root mounts the image's own root filesystem read-only (podman
+# --read-only, which keeps /dev, /dev/shm, /run, /tmp and /var/tmp as tmpfs).
+# test-harness verifies the image's files once, when it starts, before it runs
+# a `guest_root: pinned` manifest; it then requires this flag, because on a
+# writable root a guest of one cell could replace /usr/bin/env, a store file or
+# a loader preload file and every later cell would run that instead of the
+# image (https://github.com/rrnewton/hermit/issues/3712). The source, target,
+# home and cache mounts keep their own modes. --privileged still lets a guest
+# remount the root deliberately; the flag stops accidental and ordinary writes.
 #
 # --cargo-home mounts the registry and git caches from an already-populated
 # CARGO_HOME. The test phase has no network BY DESIGN, so cargo must find those
@@ -40,6 +50,12 @@
 # --env, its parent directory is mounted at /dagrun-test-counts and the child is
 # given the translated path. This lets an in-container test producer atomically
 # publish the same evidence file the host scheduler will read after podman exits.
+#
+# HERMIT_PINNED_ROOT_IMAGE is always set inside the container to the exact
+# image reference that runs, and only this script sets it: --env refuses the
+# name, so a caller cannot claim a pinned root it did not get. test-harness
+# compares it with ci/hermetic/image.digest before it runs a manifest that
+# declares `guest_root: pinned` (https://github.com/rrnewton/hermit/issues/3712).
 
 set -euo pipefail
 
@@ -48,15 +64,17 @@ DIGEST_FILE="$HERE/image.digest"
 
 src=""; out=""; digest=""; src_mode="ro=true"; cargo_home=""
 proc_locks_runtime=false
+read_only_root=false
 check_image=false
 nextest_calibration=false
 pass_env=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --help|-h)
-            printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--env NAME]... -- CMD...' \
+            printf '%s\n' 'usage: run-in-pinned-root.sh --src DIR --out DIR [--digest NAME@SHA] [--src-rw] [--cargo-home DIR] [--proc-locks-runtime] [--nextest-calibration] [--read-only-root] [--env NAME]... -- CMD...' \
                 '       run-in-pinned-root.sh --check-image [--digest NAME@SHA]' \
-                '--nextest-calibration captures the actual host envelope for the regular Nextest consumer using an existing prepared helper. Missing capture capability stays unqualified; bootstrap calls do not capture or compile.'
+                '--nextest-calibration captures the actual host envelope for the regular Nextest consumer using an existing prepared helper. Missing capture capability stays unqualified; bootstrap calls do not capture or compile.' \
+                '--read-only-root mounts the image root filesystem read-only, so files verified when a run starts stay as verified; test-harness requires it for guest_root: pinned manifests.'
             exit 0 ;;
         --src) src=$2; shift 2 ;;
         --out) out=$2; shift 2 ;;
@@ -66,6 +84,7 @@ while [[ $# -gt 0 ]]; do
         --cargo-home) cargo_home=$2; shift 2 ;;
         --proc-locks-runtime) proc_locks_runtime=true; shift ;;
         --nextest-calibration) nextest_calibration=true; shift ;;
+        --read-only-root) read_only_root=true; shift ;;
         --env) pass_env+=("$2"); shift 2 ;;
         --) shift; break ;;
         *) echo "run-in-pinned-root: unexpected argument '$1'" >&2; exit 2 ;;
@@ -110,7 +129,7 @@ check_pinned_image() {
 }
 
 if "$check_image"; then
-    [[ -z "$src" && -z "$out" && -z "$cargo_home" && "$src_mode" == ro=true && "$proc_locks_runtime" == false && "$nextest_calibration" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
+    [[ -z "$src" && -z "$out" && -z "$cargo_home" && "$src_mode" == ro=true && "$proc_locks_runtime" == false && "$read_only_root" == false && "$nextest_calibration" == false && ${#pass_env[@]} == 0 && $# == 0 ]] || {
         echo "run-in-pinned-root: --check-image accepts only optional --digest." >&2
         exit 2
     }
@@ -345,6 +364,10 @@ for name in "${pass_env[@]}"; do
         echo "run-in-pinned-root: invalid environment name '$name'." >&2
         exit 2
     }
+    if [[ $name == HERMIT_PINNED_ROOT_IMAGE ]]; then
+        echo "run-in-pinned-root: --env HERMIT_PINNED_ROOT_IMAGE is refused; the script sets it to the image that runs." >&2
+        exit 2
+    fi
     [[ -v $name ]] || continue
     case "$name" in
         E2E_RESULT_ROOT)
@@ -437,12 +460,18 @@ PY
     env_args+=(-e "HERMIT_PROC_LOCKS_LEASE_ID=$proc_locks_identity")
 fi
 
+root_args=()
+if "$read_only_root"; then
+    root_args+=(--read-only)
+fi
+
 # `--network=none` is the point, not a precaution: if the run can reach the
 # network it can pick up something the lock does not describe, and the rebuild
 # guarantee is void. CARGO_NET_OFFLINE in the image makes that fail loudly.
 exec podman run --rm \
     --cgroups=disabled \
     --privileged \
+    "${root_args[@]}" \
     --hostname=hermetic-container.local \
     "${device_args[@]}" \
     --network=none \
@@ -462,6 +491,7 @@ exec podman run --rm \
     -e HOME=/build \
     -e CARGO_HOME="$cargo_home_in" \
     -e CARGO_TARGET_DIR=/src/target \
+    -e HERMIT_PINNED_ROOT_IMAGE="$digest" \
     -w /src \
     "$digest" \
     "$@"

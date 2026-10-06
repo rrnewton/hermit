@@ -75,7 +75,9 @@ deadline=${CELL_DEADLINE_S:-$((tpx_timeout - 30))}
 # RE, so a local cell must see the same workdir or the two guests' inputs differ (a local
 # /test tmpfs made every kvm comparison inputs-not-equalized). The pinned-root container
 # keeps its fresh tmpfs at /test, and a guest that asserts /test
-# (c-programs/environment-and-workdir) runs there for it (defs.bzl PINNED_ROOT_ONLY).
+# (c-programs/environment-and-workdir) runs there for it (defs.bzl PINNED_ROOT_ONLY). So
+# does every pinned-guest-root cell (compat-pinned), which the cargo flow's pinned-root
+# e2e.manifest_compat_pinned node runs with the same /test workdir.
 container=${HERMIT_E2E_CONTAINER:-}
 workdir=
 [[ $container == pinned-root ]] && workdir=HERMIT_E2E_EMPTY_WORKDIR=/test
@@ -93,8 +95,18 @@ else
     cpu_scan_env=(-u HERMIT_E2E_ALLOW_PROCESS_GROUP_CPU_SCAN)
 fi
 extra=()
-# The compat bucket node runs with --diagnostic-results; so does its Buck cell.
-[[ $TEST == compat/* ]] && extra+=(--diagnostic-results)
+# The compat and compat-pinned bucket nodes run with --diagnostic-results
+# (DIAGNOSTIC_MANIFEST_BUCKETS in ci/manifest-plan/src/validation_dag.rs); so do their
+# Buck cells.
+[[ $TEST == compat/* || $TEST == compat-pinned/* ]] && extra+=(--diagnostic-results)
+# A pinned-guest-root cell (compat-pinned) runs with the image's own root mounted
+# read-only (run-in-pinned-root.sh --read-only-root), as the cargo flow's
+# e2e.manifest_compat_pinned node does: test-harness verifies the image's files once,
+# before the first cell, and refuses a guest_root: pinned bucket whose image directories
+# are writable, because a guest could otherwise change them after they were verified.
+# Cells of other buckets in the pinned root keep a writable root.
+root_args=()
+[[ $TEST == compat-pinned/* ]] && root_args+=(--read-only-root)
 
 # A local KVM cell runs only while it holds one of HERMIT_E2E_KVM_SLOTS (default 8) slots
 # shared by every cell on the host. reverie-kvm makes about seven ioctls per guest exit,
@@ -232,7 +244,7 @@ exec "$@"'
         E2E_RESULT_ROOT="$W/results" E2E_RUN_ID="$run_id" \
         E2E_KEEP_VERIFY_LOGS=1 E2E_PARITY_POST_PASS=0 \
         timeout --kill-after=10 "$outer" \
-        "$wrapper" --src "$R" --out "$W/pinned" --src-rw \
+        "$wrapper" --src "$R" --out "$W/pinned" --src-rw "${root_args[@]}" \
         --env HERMIT_E2E_EMPTY_WORKDIR --env VALIDATE_RUN_STATE --env E2E_RESULT_ROOT \
         --env E2E_RUN_ID --env E2E_KEEP_VERIFY_LOGS --env E2E_PARITY_POST_PASS \
         --env HERMIT_EPOCH -- \

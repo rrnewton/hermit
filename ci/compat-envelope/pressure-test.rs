@@ -74,6 +74,7 @@ use hermit_manifest_plan::runner::CellResult;
 use hermit_manifest_plan::runner::E2E_RUN_INDEX_ENV;
 use hermit_manifest_plan::runner::ExpectedGuestExit;
 use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::GuestRoot;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
 use hermit_manifest_plan::runner::ObservedResult;
@@ -675,6 +676,23 @@ struct PressureCells {
     population_cells: usize,
     /// The cells excluded from a sample's draw ([`UnsampleableCell`]).
     unsampleable: Vec<UnsampleableCell>,
+    /// The population's cells whose bucket declares `guest_root: pinned`,
+    /// omitted because the pressure graph runs host variants only
+    /// ([`pinned_root_refusal`]).
+    pinned_root: Vec<TrackedCell>,
+}
+
+/// Why the pressure graph cannot run `id`: its bucket declares
+/// `guest_root: pinned`, so `test-harness` runs it only inside the pinned
+/// root (ci/hermetic/run-in-pinned-root.sh), and this graph runs the host
+/// variants of the canonical producers and refuses that launcher. An exact or
+/// cells-file request for such a cell is refused with this reason; a batch
+/// omits the cells and counts them (`pinned_root_cells` in run.json).
+fn pinned_root_refusal(id: &CellId) -> String {
+    format!(
+        "{} runs in the pinned root: its manifest bucket declares `guest_root: pinned`, and the pressure graph runs host variants only (<https://github.com/rrnewton/hermit/issues/3712>)",
+        display_id(id)
+    )
 }
 
 /// A cell a seeded sample does not draw, because its own declared critical
@@ -1938,6 +1956,11 @@ struct RunMetadata {
     seed: Option<u64>,
     #[serde(default)]
     unavailable_cells: usize,
+    /// The selected population's cells omitted because their bucket declares
+    /// `guest_root: pinned` ([`pinned_root_refusal`]). Absent when none was
+    /// omitted, and for runs planned before the pinned-root buckets.
+    #[serde(default, skip_serializing_if = "is_zero_count")]
+    pinned_root_cells: usize,
     #[serde(default)]
     repetitions: Option<usize>,
     #[serde(default)]
@@ -3334,12 +3357,22 @@ fn print_manifest_guest_memory(metadata: &RunMetadata) {
     );
 }
 
+fn is_zero_count(count: &usize) -> bool {
+    *count == 0
+}
+
 fn print_unavailable(metadata: &RunMetadata) {
+    let population = population_label(metadata.green, metadata.probe_disabled);
     if metadata.unavailable_cells > 0 {
-        let population = population_label(metadata.green, metadata.probe_disabled);
         println!(
             "Unavailable {population} cells omitted: {} (their manifests declare no executable attempts)",
             metadata.unavailable_cells
+        );
+    }
+    if metadata.pinned_root_cells > 0 {
+        println!(
+            "Pinned-root {population} cells omitted: {} (their manifest bucket declares guest_root: pinned; the pressure graph runs host variants only, https://github.com/rrnewton/hermit/issues/3712)",
+            metadata.pinned_root_cells
         );
     }
 }
@@ -4150,6 +4183,18 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     let budgets = load_budgets(root)?;
     let tracked = load_tracked_cells(root)?;
+    let manifests = ManifestSet::load(root)?;
+    // Buckets that run only inside the pinned root: this graph runs host
+    // variants, so their cells are refused or omitted ([`pinned_root_refusal`]).
+    let pinned_categories: BTreeSet<String> = tracked
+        .cells
+        .iter()
+        .map(|cell| cell.id.category.as_str())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|category| manifests.required_guest_root(category) == Some(GuestRoot::Pinned))
+        .map(str::to_string)
+        .collect();
     let (requested_cells, cells_file_sha256) = if let Some(path) = &selection.cells_file {
         let (cells, digest) = load_cells_file(path)?;
         (Some(cells), Some(digest))
@@ -4183,6 +4228,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     let mut seen = BTreeSet::new();
     let mut selected_cells = Vec::new();
     let mut unavailable = Vec::new();
+    let mut pinned_root = Vec::new();
     let mut applicable_by_test = BTreeMap::new();
     let tracked_by_id: BTreeMap<CellId, TrackedCell> = tracked
         .cells
@@ -4221,6 +4267,23 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                     && selection.mode.is_none()
                     && !matches!(cell.id.mode.as_str(), "verify" | "replay" | "chaos"))
         };
+        if selected && pinned_categories.contains(&cell.id.category) {
+            if requested_ids.is_some() || selection.is_exact() {
+                return Err(pinned_root_refusal(&cell.id));
+            }
+            // Counted only when the cell is in the selected population, the
+            // same conditions under which the status match below takes it.
+            let in_population = match cell.status.as_str() {
+                "red" => !selection.selects_green_population() && !selection.probe_disabled,
+                "green" => selection.selects_green_population(),
+                "not-applicable" => selection.probe_disabled,
+                other => return Err(format!("unknown cell status `{other}`")),
+            };
+            if in_population {
+                pinned_root.push(cell);
+            }
+            continue;
+        }
         if selected && requested_ids.is_some() && selection.probe_disabled && cell.is_applicable() {
             return Err(format!(
                 "--cells-file identity {} is not in the not-applicable pressure population (status={})",
@@ -4370,6 +4433,12 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
                 unavailable.len()
             ));
         }
+        if !pinned_root.is_empty() {
+            return Err(format!(
+                "the selected {population} population has no host cells; its {} cell(s) run in the pinned root: their manifest bucket declares `guest_root: pinned`, and the pressure graph runs host variants only (<https://github.com/rrnewton/hermit/issues/3712>)",
+                pinned_root.len()
+            ));
+        }
         return Err(
             if let (Some(test), Some(mode), Some(backend)) = (
                 selection.test.as_deref(),
@@ -4408,7 +4477,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
     }
     // The harness selects a cell only through its run types and its enabled
     // state, so every generated command takes them from the manifest.
-    let all_facts = manifest_cell_facts(&ManifestSet::load(root)?)?;
+    let all_facts = manifest_cell_facts(&manifests)?;
     // A sample draws only from cells whose own declared path fits the run's
     // limit, so the draw can never produce a plan the limit must refuse. The
     // excluded cells are named, and the draw stays reproducible from the seed
@@ -4446,25 +4515,9 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
             run_timeout_seconds: limit,
             fixture_seconds: compat_fixture_seconds(&canonical)?,
         };
-        let mut drawable = Vec::with_capacity(selected_cells.len());
-        for cell in selected_cells {
-            // The fixture node is on every path of a sample that reads the
-            // fixtures, and the draw cannot know whether it will, so it is
-            // counted for every cell.
-            let (seconds, composition) = declared.path(&cell.id, true)?;
-            if declared.fits(seconds) {
-                drawable.push(cell);
-            } else {
-                unsampleable.push(UnsampleableCell {
-                    reason: format!(
-                        "not sampleable under the {limit} s limit: its declared critical path after the shared builds is {seconds}s ({composition}), counting the fixture node any sample may need"
-                    ),
-                    cell: cell.id,
-                    seconds,
-                });
-            }
-        }
+        let (drawable, excluded) = partition_sample_population(selected_cells, &declared)?;
         selected_cells = drawable;
+        unsampleable = excluded;
     }
     let eligible_cells = selected_cells.len();
     if let Some(count) = selection.sample {
@@ -4565,6 +4618,7 @@ fn pressure_cells(root: &Path, selection: &CellSelection) -> Result<PressureCell
         parity_pairs,
         population_cells,
         unsampleable,
+        pinned_root,
     })
 }
 
@@ -4598,7 +4652,41 @@ static REUSE_BUDGETS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 static LOADED_BUDGETS: std::sync::Mutex<BTreeMap<PathBuf, Budgets>> =
     std::sync::Mutex::new(BTreeMap::new());
 
+/// Declared budgets planted by a self-test for an alias of the checkout (see
+/// [`plant_budgets`]). Only self-tests insert, each under a new scratch path,
+/// so a root that is not such an alias always reads its manifests.
+static PLANTED_BUDGETS: std::sync::Mutex<BTreeMap<PathBuf, Budgets>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Make `alias`, a new path, a symbolic link to the checkout `root` whose
+/// declared budgets are `budgets` instead of its manifests'. A plan made at
+/// the alias reads every other input (scorecard, manifests, validation graph,
+/// Git state) from the checkout itself. Self-tests use it to plan, end to
+/// end, a shape the host manifests do not declare today: since
+/// <https://github.com/rrnewton/hermit/issues/3712> moved the long compat
+/// rows (600 s ptrace cells) into the compat-pinned bucket, which the
+/// pressure graph omits, no host cell declares a path longer than the shared
+/// builds, nor a parity reference much longer than its candidate.
+fn plant_budgets(root: &Path, alias: &Path, budgets: Budgets) -> Result<(), String> {
+    std::os::unix::fs::symlink(root, alias)
+        .map_err(|e| format!("cannot link {} to {}: {e}", alias.display(), root.display()))?;
+    let mut planted = PLANTED_BUDGETS
+        .lock()
+        .map_err(|_| "a thread panicked while planting execution budgets")?;
+    if planted.insert(alias.to_path_buf(), budgets).is_some() {
+        return Err(format!("{} already has planted budgets", alias.display()));
+    }
+    Ok(())
+}
+
 fn load_budgets(root: &Path) -> Result<Budgets, String> {
+    if let Some(budgets) = PLANTED_BUDGETS
+        .lock()
+        .map_err(|_| "a thread panicked while planting execution budgets")?
+        .get(root)
+    {
+        return Ok(budgets.clone());
+    }
     if !REUSE_BUDGETS.load(std::sync::atomic::Ordering::Relaxed) {
         return run_manifest_plan_for_budgets(root);
     }
@@ -5427,6 +5515,35 @@ fn compat_fixture_seconds(canonical: &DagConfig) -> Result<i64, String> {
         .ok_or_else(|| format!("{PORTABLE_DAG} has no {VALIDATE_FIXTURE_STEP}"))
 }
 
+/// Split a sample's population into the cells its draw may pick and the
+/// cells it excludes ([`UnsampleableCell`]), each by its own declared path
+/// against `declared`'s run bound. The fixture node is on every path of a
+/// sample that reads the fixtures, and the draw cannot know whether it will,
+/// so it is counted for every cell.
+fn partition_sample_population(
+    population: Vec<TrackedCell>,
+    declared: &DeclaredChain<'_>,
+) -> Result<(Vec<TrackedCell>, Vec<UnsampleableCell>), String> {
+    let limit = declared.run_timeout_seconds;
+    let mut drawable = Vec::with_capacity(population.len());
+    let mut unsampleable = Vec::new();
+    for cell in population {
+        let (seconds, composition) = declared.path(&cell.id, true)?;
+        if declared.fits(seconds) {
+            drawable.push(cell);
+        } else {
+            unsampleable.push(UnsampleableCell {
+                reason: format!(
+                    "not sampleable under the {limit} s limit: its declared critical path after the shared builds is {seconds}s ({composition}), counting the fixture node any sample may need"
+                ),
+                cell: cell.id,
+                seconds,
+            });
+        }
+    }
+    Ok((drawable, unsampleable))
+}
+
 /// The declared wall budgets of a plan's post-build critical paths. Each cell
 /// run's path is the fixture node when the graph has one, then its test's
 /// shared preparation when there is one, then the cell, then the summary
@@ -5779,6 +5896,7 @@ fn write_plan_after_scorecard_check(
         parity_pairs,
         population_cells,
         unsampleable,
+        pinned_root,
     } = pressure_cells(root, &drawn_selection)?;
     let preparation_by_test = if selection.uses_shared_preparation() {
         all_preparations
@@ -6383,6 +6501,7 @@ fn write_plan_after_scorecard_check(
         sample: selection.sample,
         seed: selection.seed,
         unavailable_cells: unavailable.len(),
+        pinned_root_cells: pinned_root.len(),
         repetitions: selection.repetitions,
         run_id_prefix: selection.run_id_prefix.clone(),
         green: selection.green,
@@ -6713,6 +6832,14 @@ fn validate_run_contract(
             "run metadata records {} unavailable {population} cell(s), current manifest selection has {}",
             metadata.unavailable_cells,
             pressure_cells.unavailable.len()
+        ));
+    }
+    if metadata.pinned_root_cells != pressure_cells.pinned_root.len() {
+        let population = population_label(metadata.green, metadata.probe_disabled);
+        return Err(format!(
+            "run metadata records {} pinned-root {population} cell(s) omitted, current manifest selection has {}",
+            metadata.pinned_root_cells,
+            pressure_cells.pinned_root.len()
         ));
     }
     // A sample's excluded cells and population count follow from its seed,
@@ -12775,40 +12902,35 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
     Ok(())
 }
 
-/// Red cells the default run type does not select: a test-level label
-/// (compat/strict-du), a row label on the verify cells (compat/java on
-/// ptrace, compat/comm on SaBRe), and the rr-compat replay cell of a row's
-/// own test (compat/awk, whose verify cell on ptrace is of the default run
-/// type). [`focused_red_cells`] puts an [`ordinary_red_cell`] beside them.
-const FOCUSED_LABELLED_RED_CELLS: [(&str, &str, &str); 4] = [
-    ("compat/awk", "replay", "ptrace"),
-    ("compat/comm", "verify", "sabre"),
-    ("compat/java", "verify", "ptrace"),
-    ("compat/strict-du", "verify", "ptrace"),
-];
-
 /// A cell as the self-tests name one: (test, mode, backend).
 type NamedCell = (String, String, String);
 
 /// The first red cell of the tracked scorecard, in its order, that is
 /// portable, enabled in its manifest, has executable attempts in its budget,
-/// and that `wanted` accepts. The self-tests that need a red cell of some shape
-/// derive it here instead of naming one, so switching a named cell on cannot
-/// break them: 6d5ae40c switched on the dbt c-programs/prctl-identity verify
-/// cell that four of them named, and each refused it as green. They refuse
-/// only when no red cell of that shape is left, which names the shape.
+/// is in a bucket the host pressure graph runs (not one that declares
+/// `guest_root: pinned`, whose cells it refuses: [`pinned_root_refusal`]),
+/// and that `wanted` accepts. The self-tests that need a red cell of some
+/// shape derive it here instead of naming one, so switching a named cell on
+/// cannot break them: 6d5ae40c switched on the dbt c-programs/prctl-identity
+/// verify cell that four of them named, and each refused it as green. They
+/// refuse only when no red cell of that shape is left, which names the shape.
 fn red_cell_where(
     root: &Path,
     shape: &str,
     wanted: impl Fn(&CellId, &ManifestCellFacts) -> bool,
 ) -> Result<NamedCell, String> {
     let tracked = load_tracked_cells(root)?;
-    let facts = manifest_cell_facts(&ManifestSet::load(root)?)?;
+    let manifests = ManifestSet::load(root)?;
+    let facts = manifest_cell_facts(&manifests)?;
     let budgets = load_budgets(root)?;
     tracked
         .cells
         .iter()
-        .filter(|cell| cell.status == "red" && cell.id.lane == "portable")
+        .filter(|cell| {
+            cell.status == "red"
+                && cell.id.lane == "portable"
+                && manifests.required_guest_root(&cell.id.category) != Some(GuestRoot::Pinned)
+        })
         .find_map(|cell| {
             let key = (
                 cell.id.test.clone(),
@@ -12823,7 +12945,9 @@ fn red_cell_where(
                 && wanted(&cell.id, fact))
             .then_some(key)
         })
-        .ok_or_else(|| format!("the tracked scorecard has no red portable cell that is {shape}"))
+        .ok_or_else(|| {
+            format!("the tracked scorecard has no red portable host cell that is {shape}")
+        })
 }
 
 /// A red c-programs verify cell of the default run type that neither reads
@@ -12845,14 +12969,6 @@ fn ordinary_red_cell(root: &Path) -> Result<NamedCell, String> {
     )
 }
 
-/// A red cell whose argv writes below VALIDATE_RUN_STATE outside the fixture
-/// root ([`run_state_resource`]).
-fn run_state_writer_red_cell(root: &Path) -> Result<NamedCell, String> {
-    red_cell_where(root, "a run-state writer", |_, facts| {
-        facts.writes_run_state
-    })
-}
-
 /// A red cell that reads the real-compat fixtures and writes no run state.
 fn compat_fixture_reader_red_cell(root: &Path) -> Result<NamedCell, String> {
     red_cell_where(root, "a compat-fixture reader", |_, facts| {
@@ -12860,15 +12976,30 @@ fn compat_fixture_reader_red_cell(root: &Path) -> Result<NamedCell, String> {
     })
 }
 
-/// [`FOCUSED_LABELLED_RED_CELLS`] beside an [`ordinary_red_cell`].
+/// A red row of the host compat bucket (the host-portability copy of the
+/// corpus) that neither reads the real-compat fixtures nor writes run state.
+fn host_compat_red_cell(root: &Path) -> Result<NamedCell, String> {
+    red_cell_where(
+        root,
+        "a host compat row that reads no fixtures",
+        |id, facts| {
+            id.category == "compat" && !facts.reads_compat_fixtures && !facts.writes_run_state
+        },
+    )
+}
+
+/// Red cells the host pressure graph runs, all of the default run type: an
+/// [`ordinary_red_cell`], a [`compat_fixture_reader_red_cell`] and a
+/// [`host_compat_red_cell`]. The other run types (sabre-compat-only,
+/// rr-compat-only, strict-compat-only) belong to compat-pinned alone, whose
+/// cells run only in the pinned root ([`pinned_root_refusal`]), and
+/// [`run_types_belong_to_pinned_buckets`] fails when a host bucket gains one.
 fn focused_red_cells(root: &Path) -> Result<Vec<NamedCell>, String> {
-    let mut cells = vec![ordinary_red_cell(root)?];
-    cells.extend(
-        FOCUSED_LABELLED_RED_CELLS
-            .iter()
-            .map(|(test, mode, backend)| (test.to_string(), mode.to_string(), backend.to_string())),
-    );
-    Ok(cells)
+    Ok(vec![
+        ordinary_red_cell(root)?,
+        compat_fixture_reader_red_cell(root)?,
+        host_compat_red_cell(root)?,
+    ])
 }
 
 /// `cells` borrowed in the form the plan checks take.
@@ -12878,11 +13009,183 @@ fn named_cells(cells: &[NamedCell]) -> Vec<(&str, &str, &str)> {
         .map(|(test, mode, backend)| (test.as_str(), mode.as_str(), backend.as_str()))
         .collect()
 }
-/// Disabled SaBRe cells: one of a labelled test, one of a default-run-type test.
+/// Disabled SaBRe cells the host pressure graph probes, of two buckets.
 const FOCUSED_DISABLED_SABRE_CELLS: [(&str, &str, &str); 2] = [
-    ("compat/comm", "replay", "sabre"),
-    ("compat/strict-du", "verify", "sabre"),
+    ("c-programs/clone", "verify", "sabre"),
+    ("system-utils/auxv-loader-dump", "verify", "sabre"),
 ];
+/// Cells of each run type the default one does not select, all in
+/// compat-pinned: a test-level label (strict-du), a row label on the verify
+/// cells (java on ptrace, comm on SaBRe), and the rr-compat replay cell of a
+/// row's own test (awk). The host pressure graph refuses each by name and
+/// omits them from a batch.
+const PINNED_RUN_TYPE_CELLS: [(&str, &str, &str); 4] = [
+    ("compat-pinned/awk", "replay", "ptrace"),
+    ("compat-pinned/comm", "verify", "sabre"),
+    ("compat-pinned/java", "verify", "ptrace"),
+    ("compat-pinned/strict-du", "verify", "ptrace"),
+];
+
+fn portable_cell_id((test, mode, backend): (&str, &str, &str)) -> CellId {
+    CellId {
+        lane: "portable".into(),
+        category: test
+            .split_once('/')
+            .map_or("", |(category, _)| category)
+            .into(),
+        test: test.into(),
+        mode: mode.into(),
+        backend: backend.into(),
+    }
+}
+
+/// Every run type but the default belongs to a bucket that declares
+/// `guest_root: pinned`, so no command of the host pressure graph needs a
+/// `--label` filter, and each [`PINNED_RUN_TYPE_CELLS`] cell is of a run type
+/// the default does not select. A host bucket that gains a run type fails
+/// here: give [`focused_red_cells`] or [`FOCUSED_DISABLED_SABRE_CELLS`] one
+/// of its cells and narrow this check.
+fn run_types_belong_to_pinned_buckets(root: &Path) -> Result<(), String> {
+    let manifests = ManifestSet::load(root)?;
+    let facts = manifest_cell_facts(&manifests)?;
+    let tracked = load_tracked_cells(root)?;
+    let key = |id: &CellId| (id.test.clone(), id.mode.clone(), id.backend.clone());
+    let default = hermit_manifest_plan::runner::DEFAULT_RUN_TYPE;
+    let mut host_cells = 0;
+    for cell in &tracked.cells {
+        if manifests.required_guest_root(&cell.id.category) == Some(GuestRoot::Pinned) {
+            continue;
+        }
+        let Some(fact) = facts.get(&key(&cell.id)) else {
+            continue;
+        };
+        host_cells += 1;
+        if !fact.run_types.contains(default) {
+            return Err(format!(
+                "host cell {} is of run types {:?}; the focused pressure fixtures assume only pinned-root buckets have a run type other than {default}",
+                display_id(&cell.id),
+                fact.run_types
+            ));
+        }
+    }
+    if host_cells == 0 {
+        return Err("no tracked host cell has a manifest recipe".into());
+    }
+    for cell in PINNED_RUN_TYPE_CELLS.map(portable_cell_id) {
+        if manifests.required_guest_root(&cell.category) != Some(GuestRoot::Pinned) {
+            return Err(format!(
+                "{} is not in a pinned-root bucket",
+                display_id(&cell)
+            ));
+        }
+        let fact = facts
+            .get(&key(&cell))
+            .ok_or_else(|| format!("{} has no manifest recipe", display_id(&cell)))?;
+        if fact.run_types.contains(default) {
+            return Err(format!(
+                "{} is of the default run type; it no longer exercises a focused run type",
+                display_id(&cell)
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The host pressure graph refuses a cell of a pinned-root bucket by name,
+/// requested exactly or through a cells file, and a batch omits every such
+/// cell of its population and counts it, selecting none of them.
+fn pinned_root_cells_are_refused_or_omitted(root: &Path, scratch: &Path) -> Result<(), String> {
+    for (index, cell) in PINNED_RUN_TYPE_CELLS
+        .map(portable_cell_id)
+        .into_iter()
+        .enumerate()
+    {
+        let expected = pinned_root_refusal(&cell);
+        let cells_file = scratch.join(format!("pinned-root-{index}.jsonl"));
+        fs::write(
+            &cells_file,
+            canonical_cells_jsonl(std::slice::from_ref(&cell))?,
+        )
+        .map_err(|error| format!("cannot write {}: {error}", cells_file.display()))?;
+        let requests = [
+            (
+                "a cells-file",
+                CellSelection {
+                    cells_file: Some(cells_file),
+                    repetitions: Some(1),
+                    ..CellSelection::default()
+                },
+            ),
+            (
+                "an exact",
+                CellSelection {
+                    test: Some(cell.test.clone()),
+                    mode: Some(cell.mode.clone()),
+                    backend: Some(cell.backend.clone()),
+                    ..CellSelection::default()
+                },
+            ),
+        ];
+        for (shape, selection) in requests {
+            match pressure_cells(root, &selection) {
+                Err(error) if error == expected => {}
+                other => {
+                    return Err(format!(
+                        "{shape} request for {} was not refused as a pinned-root cell: {:?}",
+                        display_id(&cell),
+                        other.map(|cells| cells.selected.len())
+                    ));
+                }
+            }
+        }
+    }
+    let manifests = ManifestSet::load(root)?;
+    let tracked = load_tracked_cells(root)?;
+    let pinned =
+        |id: &CellId| manifests.required_guest_root(&id.category) == Some(GuestRoot::Pinned);
+    for (population, status, selection) in [
+        ("red", "red", CellSelection::default()),
+        (
+            "green",
+            "green",
+            CellSelection {
+                green: true,
+                repetitions: Some(1),
+                ..CellSelection::default()
+            },
+        ),
+    ] {
+        let expected: BTreeSet<CellId> = tracked
+            .cells
+            .iter()
+            .filter(|cell| pinned(&cell.id) && cell.status == status)
+            .map(|cell| cell.id.clone())
+            .collect();
+        let cells = pressure_cells(root, &selection)?;
+        let omitted: BTreeSet<CellId> = cells
+            .pinned_root
+            .iter()
+            .map(|cell| cell.id.clone())
+            .collect();
+        if expected.is_empty()
+            || omitted != expected
+            || omitted.len() != cells.pinned_root.len()
+            || cells.selected.iter().any(|cell| pinned(&cell.id))
+        {
+            return Err(format!(
+                "the {population} batch omitted {} pinned-root cell(s) and selected {}; expected it to omit the {} tracked {status} pinned-root cells and select none",
+                cells.pinned_root.len(),
+                cells
+                    .selected
+                    .iter()
+                    .filter(|cell| pinned(&cell.id))
+                    .count(),
+                expected.len()
+            ));
+        }
+    }
+    Ok(())
+}
 
 /// The `test-harness` subcommand of a generated command and the selection it
 /// applies, parsed as `test-harness` parses them: `--include-manual` selects
@@ -13032,9 +13335,12 @@ fn focused_run_type_plan_selects_each_cell(
     Ok(())
 }
 
-/// Cells of a non-default run type, red and disabled, are prepared and run by
-/// commands that the harness's own selection resolves to exactly them.
+/// Red and disabled host cells are prepared and run by commands that the
+/// harness's own selection resolves to exactly them; the run types other
+/// than the default belong to pinned-root buckets, whose cells the host graph
+/// refuses by name and omits from a batch.
 fn focused_run_type_selection_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
+    run_types_belong_to_pinned_buckets(root)?;
     let red = focused_red_cells(root)?;
     focused_run_type_plan_selects_each_cell(root, scratch, "red", &named_cells(&red), None)?;
     focused_run_type_plan_selects_each_cell(
@@ -13043,7 +13349,8 @@ fn focused_run_type_selection_self_test(root: &Path, scratch: &Path) -> Result<(
         "disabled",
         &FOCUSED_DISABLED_SABRE_CELLS,
         Some("sabre"),
-    )
+    )?;
+    pinned_root_cells_are_refused_or_omitted(root, scratch)
 }
 
 /// The validation node that fills `$VALIDATE_RUN_STATE/strict-compat/real-compat-fixtures`.
@@ -13254,9 +13561,48 @@ fn compat_fixture_step_refusal_self_test(root: &Path) -> Result<(), String> {
     }
 }
 
-/// The recurring scheduler's whole-run bound, at which some red cells'
-/// declared paths cannot fit.
-const UNSAMPLEABLE_FIXTURE_RUN_TIMEOUT_SECONDS: i64 = 2700;
+/// The inputs a seeded sample's draw ([`partition_sample_population`]) and a
+/// sample's reference partition ([`partition_references`]) measure declared
+/// paths with, loaded as [`pressure_cells`] and [`write_plan`] load them:
+/// every manifest budget resolved by the current timeout policy, the manifest
+/// facts, the shared preparation of each test of `cells`, and validation's
+/// fixture node.
+struct DeclaredInputs {
+    budgets: BTreeMap<(String, String, String), CellBudget>,
+    manifest_facts: BTreeMap<(String, String, String), ManifestCellFacts>,
+    preparation_by_test: BTreeMap<String, CellId>,
+    fixture_seconds: i64,
+}
+
+impl DeclaredInputs {
+    fn load(root: &Path, cells: &PressureCells) -> Result<Self, String> {
+        let budgets = load_budgets(root)?;
+        let keys = budgets.keys().cloned().collect();
+        let budgets = resolve_budgets(budgets, PressureTimeoutPolicy::from_env()?, &keys)?;
+        let manifest_facts = manifest_cell_facts(&ManifestSet::load(root)?)?;
+        let canonical_text = fs::read_to_string(root.join(PORTABLE_DAG))
+            .map_err(|e| format!("cannot read {PORTABLE_DAG}: {e}"))?;
+        let canonical =
+            dag_from_json(&canonical_text).map_err(|e| format!("invalid {PORTABLE_DAG}: {e}"))?;
+        Ok(Self {
+            budgets,
+            manifest_facts,
+            preparation_by_test: cells.preparation_by_test.clone(),
+            fixture_seconds: compat_fixture_seconds(&canonical)?,
+        })
+    }
+
+    fn chain(&self, run_timeout_seconds: i64) -> DeclaredChain<'_> {
+        DeclaredChain {
+            budgets: &self.budgets,
+            manifest_facts: &self.manifest_facts,
+            preparation_by_test: &self.preparation_by_test,
+            cell_timeout_seconds: None,
+            run_timeout_seconds,
+            fixture_seconds: self.fixture_seconds,
+        }
+    }
+}
 
 /// A seeded sample draws only from cells whose own declared path fits the
 /// run's limit, so a draw can never produce a plan the limit must refuse.
@@ -13264,20 +13610,34 @@ const UNSAMPLEABLE_FIXTURE_RUN_TIMEOUT_SECONDS: i64 = 2700;
 /// what they count (red population, not sampleable, eligible for the draw),
 /// a seed whose unrestricted draw would hit an excluded cell draws from the
 /// remaining cells by the same seeded order, a re-summary refuses an altered
-/// excluded set or count, and an exact request for an excluded cell is still
-/// refused when it is planned.
+/// excluded set or count (or the count of omitted pinned-root cells), and an
+/// exact request for an excluded cell is still checked against its own path
+/// when it is planned.
+///
+/// A valid run bound must exceed every step of the plan, the shared builds
+/// included, and no host cell declares a draw-time path above the longest
+/// shared step: the long cells (the 600 s ptrace rows of rustc, javac, java
+/// and node) are compat-pinned only, and the pressure graph omits them
+/// (<https://github.com/rrnewton/hermit/issues/3712>). So the test plants
+/// longer declared budgets for two red cells, one that reads the compat
+/// fixtures and one that does not, at an alias of the checkout
+/// ([`plant_budgets`]), until each one's draw-time path reaches the limit:
+/// one second above the longest shared step. Every plan, and the re-summary,
+/// is made at the alias, which reads everything else from the checkout.
+///
+/// An excluded cell's draw-time path counts the fixture node, since the draw
+/// cannot know whether the sample will read the fixtures. An exact request
+/// carries that node only when the cell reads the fixtures, so an excluded
+/// fixture reader is refused at the sample's limit, while an excluded cell
+/// that reads none is planned there and refused at its own fixture-free path.
 fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
     const SAMPLE: usize = 10;
-    let limit = UNSAMPLEABLE_FIXTURE_RUN_TIMEOUT_SECONDS;
-    let checked = CheckedScorecard {
-        root,
-        enforce_host_capabilities: false,
-        memory_budget_override: Some(i64::MAX),
-    };
-    let population: Vec<CellId> = pressure_cells(root, &CellSelection::default())?
+    let policy = PressureTimeoutPolicy::from_env()?;
+    let red = pressure_cells(root, &CellSelection::default())?;
+    let population: Vec<CellId> = red
         .selected
-        .into_iter()
-        .map(|cell| cell.id)
+        .iter()
+        .map(|cell| cell.id.clone())
         .filter(|cell| matches!(cell.mode.as_str(), "verify" | "replay" | "chaos"))
         .collect();
     let draw = |cells: &[CellId], seed: u64| -> BTreeSet<CellId> {
@@ -13292,19 +13652,70 @@ fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             .map(|(_, cell)| cell.clone())
             .collect()
     };
-    let plan = |label: &str, selection: CellSelection| {
+    let plan_at = |at: &Path, label: &str, selection: CellSelection| {
+        let checked = CheckedScorecard {
+            root: at,
+            enforce_host_capabilities: false,
+            memory_budget_override: Some(i64::MAX),
+        };
         let results = scratch.join(format!("unsampleable-{label}"));
         write_plan_after_scorecard_check(&checked, &results, &results.join("dag.json"), &selection)
             .map(|planned| (planned, results))
     };
-    let sample = |seed: u64| CellSelection {
+    let sample = |seed: u64, run_timeout: i64| CellSelection {
         sample: Some(SAMPLE),
         seed: Some(seed),
-        run_timeout_seconds: Some(limit),
+        run_timeout_seconds: Some(run_timeout),
         ..CellSelection::default()
     };
+    // The limit must exceed every step outside the cells, or no plan at it
+    // is valid whatever the draw.
+    let ((_, wide_dag), _) = plan_at(root, "wide", sample(0, 1_000_000))?;
+    let longest_shared = wide_dag
+        .steps
+        .iter()
+        .filter(|step| step.group != "cell")
+        .map(|step| step.timeout)
+        .max()
+        .ok_or("a sample plan has no step outside its cells")?;
+    let limit = longest_shared + 1;
+    // Plant a longer budget for one red fixture reader and one red cell that
+    // reads none, until each one's draw-time path reaches the limit.
+    let mut raw = load_budgets(root)?;
+    let mut inputs = DeclaredInputs::load(root, &red)?;
+    let mut planted = Vec::new();
+    for reads in [true, false] {
+        let mut chosen = None;
+        for cell in &population {
+            if inputs.chain(limit).reads_fixtures(cell)? == reads {
+                chosen = Some(cell.clone());
+                break;
+            }
+        }
+        let cell = chosen.ok_or_else(|| {
+            format!("no red sample-eligible cell has reads_compat_fixtures {reads}")
+        })?;
+        let key = (cell.test.clone(), cell.mode.clone(), cell.backend.clone());
+        while inputs.chain(limit).path(&cell, true)?.0 < limit {
+            let budget = raw
+                .get_mut(&key)
+                .ok_or_else(|| format!("no manifest budget for {}", display_id(&cell)))?;
+            budget.timeout_seconds += 1;
+            budget.cpu_timeout_seconds += 1;
+            let resolved = resolve_budgets(
+                BTreeMap::from([(key.clone(), budget.clone())]),
+                policy,
+                &BTreeSet::from([key.clone()]),
+            )?;
+            inputs.budgets.extend(resolved);
+        }
+        planted.push(cell);
+    }
+    let alias = scratch.join("unsampleable-planted-root");
+    plant_budgets(root, &alias, raw)?;
+    let declared = inputs.chain(limit);
     // Any seed names the excluded set; read it from the first plan.
-    let ((first, _), _) = plan("seed-0", sample(0))?;
+    let ((first, _), _) = plan_at(&alias, "seed-0", sample(0, limit))?;
     let first_json = serde_json::to_value(&first).map_err(|e| e.to_string())?;
     let excluded: Vec<CellId> = serde_json::from_value(
         first_json
@@ -13317,9 +13728,17 @@ fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             .unwrap_or_else(|| json!([])),
     )
     .map_err(|e| format!("run.json unsampleable_cells: {e}"))?;
-    if excluded.is_empty() {
+    let mut expected_excluded = BTreeSet::new();
+    for cell in &population {
+        if !declared.fits(declared.path(cell, true)?.0) {
+            expected_excluded.insert(cell.clone());
+        }
+    }
+    let excluded_set: BTreeSet<CellId> = excluded.iter().cloned().collect();
+    if planted.iter().any(|cell| !excluded_set.contains(cell)) || excluded_set != expected_excluded
+    {
         return Err(format!(
-            "a {SAMPLE}-cell sample under the {limit}s limit names no cell as not sampleable"
+            "a {SAMPLE}-cell sample under the {limit}s limit names {excluded:?} as not sampleable; expected the cells whose planted or declared path reaches it: {expected_excluded:?}"
         ));
     }
     for entry in first_json["unsampleable_cells"]
@@ -13332,7 +13751,6 @@ fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             return Err(format!("unsampleable entry without its reason: {entry}"));
         }
     }
-    let excluded_set: BTreeSet<CellId> = excluded.iter().cloned().collect();
     let drawable: Vec<CellId> = population
         .iter()
         .filter(|cell| !excluded_set.contains(cell))
@@ -13360,7 +13778,7 @@ fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
                 .any(|cell| excluded_set.contains(cell))
         })
         .ok_or("no seed's unrestricted draw reaches a cell that is not sampleable")?;
-    let ((metadata, _), results) = plan("hit", sample(seed))?;
+    let ((metadata, _), results) = plan_at(&alias, "hit", sample(seed, limit))?;
     let drawn: BTreeSet<CellId> = metadata.cells.iter().cloned().collect();
     if drawn != draw(&drawable, seed) || drawn.iter().any(|cell| excluded_set.contains(cell)) {
         return Err(format!(
@@ -13371,7 +13789,7 @@ fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
     // A re-summary re-derives the excluded set and the counts.
     let mut retained = metadata.clone();
     retained.source_tree_dirty = false;
-    validate_run_contract(root, &results, &retained, false)
+    validate_run_contract(&alias, &results, &retained, false)
         .map_err(|e| format!("the retained sample was refused: {e}"))?;
     let mut value = serde_json::to_value(&retained).map_err(|e| e.to_string())?;
     let forged_set = {
@@ -13381,34 +13799,77 @@ fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
         }
         forged
     };
+    if retained.pinned_root_cells == 0 {
+        return Err("the sample's run.json records no omitted pinned-root cell".into());
+    }
+    let mut forged_pinned = value.clone();
+    forged_pinned["pinned_root_cells"] = json!(retained.pinned_root_cells + 1);
     value["population_cells"] = json!(population.len() + 1);
-    for (label, forged) in [("excluded set", forged_set), ("population count", value)] {
+    for (label, forged) in [
+        ("excluded set", forged_set),
+        ("population count", value),
+        ("pinned-root omission count", forged_pinned),
+    ] {
         let forged: RunMetadata =
             serde_json::from_value(forged).map_err(|e| format!("{label}: {e}"))?;
-        if validate_run_contract(root, &results, &forged, false).is_ok() {
+        if validate_run_contract(&alias, &results, &forged, false).is_ok() {
             return Err(format!("a re-summary accepted an altered {label}"));
         }
     }
-    // An exact request for an excluded cell is still refused when planned.
-    let cell = &excluded[0];
-    match plan(
-        "exact",
-        CellSelection {
-            test: Some(cell.test.clone()),
-            mode: Some(cell.mode.clone()),
-            backend: Some(cell.backend.clone()),
-            repetitions: Some(1),
-            run_timeout_seconds: Some(limit),
-            ..CellSelection::default()
-        },
-    ) {
-        Err(error) if error.contains("cannot fit") => Ok(()),
-        other => Err(format!(
-            "an exact request for {} under the {limit}s limit was not refused: {:?}",
-            display_id(cell),
-            other.map(|_| ())
-        )),
+    // An exact request for an excluded cell is checked against its own path.
+    let exact = |label: &str, cell: &CellId, run_timeout: i64| {
+        plan_at(
+            &alias,
+            label,
+            CellSelection {
+                test: Some(cell.test.clone()),
+                mode: Some(cell.mode.clone()),
+                backend: Some(cell.backend.clone()),
+                repetitions: Some(1),
+                run_timeout_seconds: Some(run_timeout),
+                ..CellSelection::default()
+            },
+        )
+    };
+    for (index, cell) in excluded.iter().enumerate() {
+        let reads = declared.reads_fixtures(cell)?;
+        let own = declared.path(cell, reads)?.0;
+        // A cell whose own path fits is planned at the limit and refused at
+        // its own path; any other is refused at the limit and at its own path.
+        let bounds = if declared.fits(own) {
+            exact(&format!("exact-planned-{index}"), cell, limit).map_err(|e| {
+                format!(
+                    "an exact request for {}, whose own {own}s path fits, was refused under the {limit}s limit: {e}",
+                    display_id(cell)
+                )
+            })?;
+            BTreeSet::from([own])
+        } else {
+            BTreeSet::from([limit, own])
+        };
+        for bound in bounds {
+            match exact(&format!("exact-refused-{index}-{bound}"), cell, bound) {
+                Err(error) if error.contains("cannot fit") => {}
+                other => {
+                    return Err(format!(
+                        "an exact request for {} under a {bound}s bound, not above its own {own}s path, was not refused: {:?}",
+                        display_id(cell),
+                        other.map(|_| ())
+                    ));
+                }
+            }
+        }
     }
+    let readers = excluded
+        .iter()
+        .filter(|cell| declared.reads_fixtures(cell).unwrap_or(false))
+        .count();
+    if readers == 0 || readers == excluded.len() {
+        return Err(format!(
+            "the excluded cells {excluded:?} do not include both a fixture reader and a cell that reads none"
+        ));
+    }
+    Ok(())
 }
 
 /// Two runs of one test whose argv writes below VALIDATE_RUN_STATE outside
@@ -13417,37 +13878,83 @@ fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 /// workload removes and rebuilds its directory. Each such cell run holds the
 /// one unit of its test's `run_state:` resource, the same per-test exclusive
 /// scheduling that keeps two DBT cells of one test apart; a cell that only
-/// reads the fixtures holds none.
+/// reads the fixtures holds none. The writer is green, so it is planned by an
+/// exact green request; a red fixture reader
+/// ([`compat_fixture_reader_red_cell`]) and an [`ordinary_red_cell`] of another
+/// bucket are planned through a cells file.
 fn run_state_exclusive_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
     const PREFIX: &str = "run_state:";
-    let named = [
-        run_state_writer_red_cell(root)?,
-        compat_fixture_reader_red_cell(root)?,
-        ordinary_red_cell(root)?,
-    ];
-    let writer = (
-        named[0].0.as_str(),
-        named[0].1.as_str(),
-        named[0].2.as_str(),
-    );
-    let ids: Vec<CellId> = named_cells(&named)
-        .iter()
-        .map(|(test, mode, backend)| CellId {
-            lane: "portable".into(),
-            category: test
-                .split_once('/')
-                .map_or("", |(category, _)| category)
-                .into(),
-            test: (*test).into(),
-            mode: (*mode).into(),
-            backend: (*backend).into(),
-        })
-        .collect();
+    let writer = ("compat/shell-build", "verify", "ptrace");
+    let reader = compat_fixture_reader_red_cell(root)?;
+    let other = ordinary_red_cell(root)?;
     let checked = CheckedScorecard {
         root,
         enforce_host_capabilities: false,
         memory_budget_override: Some(i64::MAX),
     };
+    let held_run_state = |step: &Step| -> Vec<(String, i64)> {
+        step.hint
+            .resources
+            .iter()
+            .filter(|(name, _)| name.starts_with(PREFIX))
+            .map(|(name, units)| (name.clone(), *units))
+            .collect()
+    };
+
+    let writer_plan = scratch.join("run-state-exclusive-writer-plan");
+    let (_, dag) = write_plan_after_scorecard_check(
+        &checked,
+        &writer_plan,
+        &writer_plan.join("dag.json"),
+        &CellSelection {
+            test: Some(writer.0.into()),
+            mode: Some(writer.1.into()),
+            backend: Some(writer.2.into()),
+            green: true,
+            repetitions: Some(2),
+            run_timeout_seconds: Some(1_000_000),
+            ..CellSelection::default()
+        },
+    )?;
+    let expected = format!("{PREFIX}{}", writer.0);
+    if dag.resource_caps.get(&expected) != Some(&1) {
+        return Err(format!(
+            "the plan does not grant exactly one unit of {expected}: {:?}",
+            dag.resource_caps
+        ));
+    }
+    let mut writer_runs = 0;
+    for step in dag.steps.iter().filter(|step| step.group == "cell") {
+        let held = held_run_state(step);
+        if !step
+            .cmd
+            .contains(&format!(" --test {} ", shell_quote(writer.0)))
+        {
+            return Err(format!(
+                "the exact green plan for {} runs another cell: {}",
+                writer.0,
+                step.tag()
+            ));
+        }
+        writer_runs += 1;
+        if held != [(expected.clone(), 1)] {
+            return Err(format!(
+                "{} holds {held:?} of the run-state resources",
+                step.tag()
+            ));
+        }
+    }
+    if writer_runs != 2 {
+        return Err(format!(
+            "the plan runs {writer_runs} repetitions of {}, expected 2",
+            writer.0
+        ));
+    }
+
+    let ids: Vec<CellId> = named_cells(&[reader, other])
+        .into_iter()
+        .map(portable_cell_id)
+        .collect();
     let cells_file = scratch.join("run-state-exclusive.jsonl");
     fs::write(&cells_file, canonical_cells_jsonl(&ids)?)
         .map_err(|error| format!("cannot write {}: {error}", cells_file.display()))?;
@@ -13463,41 +13970,20 @@ fn run_state_exclusive_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
             ..CellSelection::default()
         },
     )?;
-    let expected = format!("{PREFIX}{}", writer.0);
-    if dag.resource_caps.get(&expected) != Some(&1) {
-        return Err(format!(
-            "the plan does not grant exactly one unit of {expected}: {:?}",
-            dag.resource_caps
-        ));
-    }
-    let mut writer_runs = 0;
+    let mut cell_runs = 0;
     for step in dag.steps.iter().filter(|step| step.group == "cell") {
-        let held: Vec<(&String, &i64)> = step
-            .hint
-            .resources
-            .iter()
-            .filter(|(name, _)| name.starts_with(PREFIX))
-            .collect();
-        let is_writer = step
-            .cmd
-            .contains(&format!(" --test {} ", shell_quote(writer.0)));
-        let ok = if is_writer {
-            writer_runs += 1;
-            held == [(&expected, &1)]
-        } else {
-            held.is_empty()
-        };
-        if !ok {
+        cell_runs += 1;
+        let held = held_run_state(step);
+        if !held.is_empty() {
             return Err(format!(
                 "{} holds {held:?} of the run-state resources",
                 step.tag()
             ));
         }
     }
-    if writer_runs != 2 {
+    if cell_runs != 4 {
         return Err(format!(
-            "the plan runs {writer_runs} repetitions of {}, expected 2",
-            writer.0
+            "the plan runs {cell_runs} cell steps for 2 cells at 2 repetitions, expected 4"
         ));
     }
     Ok(())
@@ -16534,19 +17020,33 @@ fn self_test(root: &Path) -> Result<(), String> {
         run_timeout_seconds: Some(1_000_000),
         ..CellSelection::default()
     };
-    let expected_green_ids: BTreeSet<_> = tracked
+    // Every applicable green cell is either selected or, when its bucket runs
+    // only inside the pinned root, omitted and counted in `pinned_root`.
+    let green_manifests = ManifestSet::load(root)?;
+    let (expected_pinned_green_ids, expected_green_ids): (BTreeSet<_>, BTreeSet<_>) = tracked
         .cells
         .iter()
         .filter(|tracked| tracked.is_applicable() && tracked.status == "green")
         .map(|tracked| tracked.id.clone())
-        .collect();
+        .partition(|id| {
+            green_manifests.required_guest_root(&id.category) == Some(GuestRoot::Pinned)
+        });
     let selected_green_batch = pressure_cells(root, &green_batch_selection)?;
     let selected_green_ids: BTreeSet<_> = selected_green_batch
         .selected
         .iter()
         .map(|tracked| tracked.id.clone())
         .collect();
-    if selected_green_ids != expected_green_ids || !selected_green_batch.unavailable.is_empty() {
+    let omitted_green_ids: BTreeSet<_> = selected_green_batch
+        .pinned_root
+        .iter()
+        .map(|tracked| tracked.id.clone())
+        .collect();
+    if selected_green_ids != expected_green_ids
+        || omitted_green_ids != expected_pinned_green_ids
+        || omitted_green_ids.len() != selected_green_batch.pinned_root.len()
+        || !selected_green_batch.unavailable.is_empty()
+    {
         return Err("--green did not select the complete population selected by full".into());
     }
     let green_sample_selection = CellSelection {
@@ -16634,6 +17134,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         green: true,
         repetitions: Some(2),
         unavailable_cells: 0,
+        pinned_root_cells: 0,
         eligible_cells: 1,
         cells_file: None,
         cells_file_sha256: None,
@@ -17550,6 +18051,7 @@ fn self_test(root: &Path) -> Result<(), String> {
         sample: None,
         seed: None,
         unavailable_cells: 0,
+        pinned_root_cells: 0,
         repetitions: None,
         run_id_prefix: None,
         green: false,
@@ -17679,6 +18181,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         kernel_version: "7.1.3-fixture".into(),
         host_capabilities: fixture_host_capabilities(),
         exact_branch_counter: None,
+        guest_root: None,
+        guest_root_identity: None,
         hermit_sha: sample_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         binary_sha256: None,
@@ -20879,6 +21383,8 @@ fn self_test(root: &Path) -> Result<(), String> {
         kernel_version: "7.1.3-fixture".into(),
         host_capabilities: fixture_host_capabilities(),
         exact_branch_counter: None,
+        guest_root: None,
+        guest_root_identity: None,
         hermit_sha: repeated_metadata.hermit_sha.clone(),
         source_tree_dirty: false,
         binary_sha256: None,
@@ -25992,49 +26498,108 @@ mod pressure_sample_tests {
     /// bound, the reference is not run and its pair is recorded
     /// `reference-missing` with that reason; where it fits, it runs; and a
     /// sample whose own cells cannot fit is refused when it is planned.
+    ///
+    /// A valid run bound exceeds every step outside the cells, and no host
+    /// pair declares a reference chain that long: the 600 s ptrace rows of
+    /// the 60 s SaBRe cells are compat-pinned only, and the pressure graph
+    /// omits them (<https://github.com/rrnewton/hermit/issues/3712>). So a
+    /// real sampled pair is planned at an alias of the checkout whose
+    /// reference declares a longer cell ([`plant_budgets`]), until its chain
+    /// passes the longest step outside the cells.
     #[test]
     fn a_reference_that_cannot_fit_the_run_bound_is_skipped_and_counted() {
         let root = checkout_root();
-        let checked = CheckedScorecard {
-            root: &root,
-            enforce_host_capabilities: false,
-            memory_budget_override: Some(i64::MAX),
-        };
         let pairs = snapshot_parity_pairs(&root).unwrap();
-        let budgets = load_budgets(&root).unwrap();
-        let wall = |test: &str, backend: &str| {
-            budgets
-                .get(&(test.to_string(), "verify".to_string(), backend.to_string()))
-                .map(|budget| budget.timeout_seconds)
-        };
-        // A comparable candidate whose reference declares a much longer cell.
+        // A comparable candidate with a pair.
         let (seed, candidate) = one_cell_sample_seed(&root, |cell| {
             cell.mode == parity::PARITY_MODE
                 && parity::ParityBackend::parse(&cell.backend).is_ok()
                 && pairs.contains(&(cell.test.clone(), cell.backend.clone()))
-                && wall(&cell.test, "ptrace").is_some_and(|reference| {
-                    wall(&cell.test, &cell.backend).is_some_and(|own| reference >= own + 300)
-                })
         });
         let reference = reference_of(&candidate);
-        let plan = |label: &str, run_timeout: i64| {
+        let selection = |run_timeout: i64| CellSelection {
+            sample: Some(1),
+            seed: Some(seed),
+            run_timeout_seconds: Some(run_timeout),
+            ..CellSelection::default()
+        };
+        let plan = |at: &Path, label: &str, run_timeout: i64| {
+            let checked = CheckedScorecard {
+                root: at,
+                enforce_host_capabilities: false,
+                memory_budget_override: Some(i64::MAX),
+            };
             let (results, cleanup) = parity_self_test_results(label);
             let planned = write_plan_after_scorecard_check(
                 &checked,
                 &results,
                 &results.join("dag.json"),
-                &CellSelection {
-                    sample: Some(1),
-                    seed: Some(seed),
-                    run_timeout_seconds: Some(run_timeout),
-                    ..CellSelection::default()
-                },
+                &selection(run_timeout),
             );
             (planned, results, cleanup)
         };
-        let (wide, wide_results, wide_cleanup) = plan("fit-wide", 1_000_000);
-        let (_, wide_dag) = wide.unwrap();
-        let finish = post_build_finish(&wide_dag);
+        let (wide, _, wide_cleanup) = plan(&root, "fit-wide", 1_000_000);
+        let (wide, wide_dag) = wide.unwrap();
+        assert_eq!(wide.cells, vec![candidate.clone()]);
+        assert_eq!(wide.reference_cells, vec![reference.clone()]);
+        let longest_shared = wide_dag
+            .steps
+            .iter()
+            .filter(|step| step.group != "cell")
+            .map(|step| step.timeout)
+            .max()
+            .unwrap();
+        let fixtures = wide_dag
+            .steps
+            .iter()
+            .any(|step| step.tag() == VALIDATE_FIXTURE_STEP);
+        wide_cleanup.remove().unwrap();
+
+        // Plant a longer reference until its chain passes the longest step
+        // outside the cells, so a bound at that chain is a valid run bound.
+        let policy = PressureTimeoutPolicy::from_env().unwrap();
+        let sample = pressure_cells(
+            &root,
+            &CellSelection {
+                timeout_policy: Some(policy),
+                ..selection(1_000_000)
+            },
+        )
+        .unwrap();
+        let mut inputs = DeclaredInputs::load(&root, &sample).unwrap();
+        let mut raw = load_budgets(&root).unwrap();
+        let key = (
+            reference.test.clone(),
+            reference.mode.clone(),
+            reference.backend.clone(),
+        );
+        while inputs
+            .chain(1_000_000)
+            .path(&reference, fixtures)
+            .unwrap()
+            .0
+            <= longest_shared
+        {
+            let budget = raw.get_mut(&key).unwrap();
+            budget.timeout_seconds += 1;
+            budget.cpu_timeout_seconds += 1;
+            inputs.budgets.extend(
+                resolve_budgets(
+                    BTreeMap::from([(key.clone(), budget.clone())]),
+                    policy,
+                    &BTreeSet::from([key.clone()]),
+                )
+                .unwrap(),
+            );
+        }
+        let (alias_parent, alias_cleanup) = parity_self_test_results("fit-alias");
+        let alias = alias_parent.join("root");
+        plant_budgets(&root, &alias, raw).unwrap();
+
+        // The planted pair's chains, from the graph planned at the alias.
+        let (planted, _, planted_cleanup) = plan(&alias, "fit-planted", 1_000_000);
+        let (_, planted_dag) = planted.unwrap();
+        let finish = post_build_finish(&planted_dag);
         let summary = finish["pressure.summarize"]
             - finish
                 .iter()
@@ -26045,15 +26610,22 @@ mod pressure_sample_tests {
         let chain =
             |cell: &CellId| finish[&format!("cell.{}", cell_run_slug(cell, None))] + summary;
         let (sampled_chain, reference_chain) = (chain(&candidate), chain(&reference));
-        assert!(
-            reference_chain > sampled_chain && reference_chain > 1300,
-            "fixture chains {sampled_chain}s and {reference_chain}s"
+        assert_eq!(
+            reference_chain,
+            inputs
+                .chain(1_000_000)
+                .path(&reference, fixtures)
+                .unwrap()
+                .0
         );
-        wide_cleanup.remove().unwrap();
-        drop(wide_results);
+        assert!(
+            reference_chain > sampled_chain && reference_chain > longest_shared,
+            "fixture chains {sampled_chain}s and {reference_chain}s, longest shared step {longest_shared}s"
+        );
+        planted_cleanup.remove().unwrap();
 
         // It fits: the reference runs.
-        let (fits, _, fits_cleanup) = plan("fit-fits", reference_chain + 1);
+        let (fits, _, fits_cleanup) = plan(&alias, "fit-fits", reference_chain + 1);
         let (fits, fits_dag) = fits.unwrap();
         assert_eq!(fits.reference_cells, vec![reference.clone()]);
         assert!(
@@ -26066,7 +26638,8 @@ mod pressure_sample_tests {
 
         // It does not fit: no reference node, the pair stays, and the skip is
         // recorded with its reason.
-        let (skipped, skipped_results, skipped_cleanup) = plan("fit-skipped", reference_chain);
+        let (skipped, skipped_results, skipped_cleanup) =
+            plan(&alias, "fit-skipped", reference_chain);
         let (mut skipped, skipped_dag) = skipped.unwrap();
         let retained = serde_json::to_value(&skipped).unwrap();
         assert_eq!(
@@ -26112,7 +26685,7 @@ mod pressure_sample_tests {
                 ..RunnerEvidence::default()
             },
         )]);
-        summarize(&root, &skipped_results, false, Some(&evidence), true).unwrap();
+        summarize(&alias, &skipped_results, false, Some(&evidence), true).unwrap();
         let cell = parity::ParityCellId {
             test_id: candidate.test.clone(),
             backend: parity::ParityBackend::parse(&candidate.backend).unwrap(),
@@ -26141,7 +26714,11 @@ mod pressure_sample_tests {
         // the same shared preparation as the sample, is refused when planned.
         let (results, refused_cleanup) = parity_self_test_results("fit-refused");
         let refused = write_plan_after_scorecard_check(
-            &checked,
+            &CheckedScorecard {
+                root: &alias,
+                enforce_host_capabilities: false,
+                memory_budget_override: Some(i64::MAX),
+            },
             &results,
             &results.join("dag.json"),
             &CellSelection {
@@ -26158,39 +26735,79 @@ mod pressure_sample_tests {
             .expect("an exact cell that cannot fit was planned");
         assert!(error.contains("cannot fit"), "{error}");
         refused_cleanup.remove().unwrap();
+        alias_cleanup.remove().unwrap();
     }
 
     /// A cell's draw-time path assumes the fixture node, which lands on every
     /// path as soon as any sampled cell reads the fixtures. A cell that does
     /// not read them and fits only without that node is excluded and named,
     /// with the fixture node counted in its declared seconds.
+    ///
+    /// The fixture node alone declares 420 s, more than the fixture-free path
+    /// of any red host cell that reads no fixtures, so at a limit just above
+    /// such a path every cell would be excluded and the draw would be empty.
+    /// So the cell is planned at an alias of the checkout that declares it a
+    /// longer budget ([`plant_budgets`]), until its fixture-free path passes
+    /// every other red cell's draw-time path, which leaves those drawable.
     #[test]
     fn a_cell_that_fits_only_without_the_fixture_node_is_not_sampleable() {
         let root = checkout_root();
-        let checked = CheckedScorecard {
-            root: &root,
-            enforce_host_capabilities: false,
-            memory_budget_override: Some(i64::MAX),
-        };
         let facts = manifest_cell_facts(&ManifestSet::load(&root).unwrap()).unwrap();
         let budgets = load_budgets(&root).unwrap();
         let key = |cell: &CellId| (cell.test.clone(), cell.mode.clone(), cell.backend.clone());
-        // The red sample-eligible cell that does not read the fixtures and
-        // declares the longest wall, so most other cells stay drawable.
-        let cell = pressure_cells(&root, &CellSelection::default())
-            .unwrap()
+        let red = pressure_cells(&root, &CellSelection::default()).unwrap();
+        let population: Vec<CellId> = red
             .selected
-            .into_iter()
-            .map(|cell| cell.id)
+            .iter()
+            .map(|cell| cell.id.clone())
             .filter(|cell| matches!(cell.mode.as_str(), "verify" | "replay" | "chaos"))
+            .collect();
+        // The red sample-eligible cell that does not read the fixtures and
+        // declares the longest wall.
+        let cell = population
+            .iter()
             .filter(|cell| !facts[&key(cell)].reads_compat_fixtures)
-            .max_by_key(|cell| (budgets[&key(cell)].timeout_seconds, cell.clone()))
+            .max_by_key(|cell| (budgets[&key(cell)].timeout_seconds, (*cell).clone()))
+            .cloned()
             .unwrap();
+        // Plant a longer budget for it until its fixture-free path passes
+        // every other cell's draw-time path.
+        let policy = PressureTimeoutPolicy::from_env().unwrap();
+        let mut inputs = DeclaredInputs::load(&root, &red).unwrap();
+        let mut raw = budgets.clone();
+        let longest_other = |inputs: &DeclaredInputs| {
+            population
+                .iter()
+                .filter(|other| **other != cell)
+                .map(|other| inputs.chain(i64::MAX).path(other, true).unwrap().0)
+                .max()
+                .unwrap()
+        };
+        while inputs.chain(i64::MAX).path(&cell, false).unwrap().0 <= longest_other(&inputs) {
+            let budget = raw.get_mut(&key(&cell)).unwrap();
+            budget.timeout_seconds += 1;
+            budget.cpu_timeout_seconds += 1;
+            inputs.budgets.extend(
+                resolve_budgets(
+                    BTreeMap::from([(key(&cell), budget.clone())]),
+                    policy,
+                    &BTreeSet::from([key(&cell)]),
+                )
+                .unwrap(),
+            );
+        }
+        let (alias_parent, alias_cleanup) = parity_self_test_results("fixture-assumed-alias");
+        let alias = alias_parent.join("root");
+        plant_budgets(&root, &alias, raw).unwrap();
         // Its path in a graph without the fixture node: an exact cell with the
         // shared preparation a sample gives it.
         let (results, cleanup) = parity_self_test_results("fixture-assumed");
         let (_, dag) = write_plan_after_scorecard_check(
-            &checked,
+            &CheckedScorecard {
+                root: &alias,
+                enforce_host_capabilities: false,
+                memory_budget_override: Some(i64::MAX),
+            },
             &results,
             &results.join("dag.json"),
             &CellSelection {
@@ -26216,40 +26833,42 @@ mod pressure_sample_tests {
                 + PRESSURE_SUMMARY_TIMEOUT_SECONDS,
         );
         cleanup.remove().unwrap();
+        assert_eq!(
+            without_fixture,
+            inputs.chain(i64::MAX).path(&cell, false).unwrap().0
+        );
         let canonical =
             dag_from_json(&fs::read_to_string(root.join(PORTABLE_DAG)).unwrap()).unwrap();
         let fixture = compat_fixture_seconds(&canonical).unwrap();
         // A limit it fits only without the fixture node.
         let limit = without_fixture + 1;
         let drawn = pressure_cells(
-            &root,
+            &alias,
             &CellSelection {
                 sample: Some(1),
                 seed: Some(0),
                 run_timeout_seconds: Some(limit),
-                timeout_policy: Some(PressureTimeoutPolicy::from_env().unwrap()),
+                timeout_policy: Some(policy),
                 ..CellSelection::default()
             },
         )
         .unwrap();
-        let named = drawn
-            .unsampleable
-            .iter()
-            .find(|entry| entry.cell == cell)
-            .unwrap_or_else(|| {
-                panic!(
-                    "{} fits the {limit}s limit only without the fixture node and was not excluded",
-                    display_id(&cell)
-                )
-            });
-        assert_eq!(named.seconds, without_fixture + fixture, "{named:?}");
+        let named: Vec<&UnsampleableCell> = drawn.unsampleable.iter().collect();
+        assert_eq!(
+            named.iter().map(|entry| &entry.cell).collect::<Vec<_>>(),
+            vec![&cell],
+            "{} fits the {limit}s limit only without the fixture node and must be the one cell excluded",
+            display_id(&cell)
+        );
+        assert_eq!(named[0].seconds, without_fixture + fixture, "{named:?}");
         assert!(
-            named
+            named[0]
                 .reason
                 .contains(&format!("not sampleable under the {limit} s limit")),
             "{named:?}"
         );
         assert!(!drawn.selected.iter().any(|tracked| tracked.id == cell));
+        alias_cleanup.remove().unwrap();
     }
 
     /// A reference never costs the sample its run through the occupancy
@@ -27661,10 +28280,8 @@ mod harness_selection_tests {
             .to_path_buf()
     }
 
-    /// Red cells whose run type is not the default one (a test-level label, a
-    /// per-backend label, and an rr-compat replay cell), beside a red cell of
-    /// the default run type. compat/java prepares through its ptrace cell,
-    /// whose verify-cell label also excludes it from the default selection.
+    /// Red host cells of the default run type ([`focused_red_cells`]), one
+    /// reading the fixtures.
     #[test]
     fn red_cells_of_focused_run_types_select_their_cells() {
         let (path, cleanup) = scratch("red");
@@ -27680,8 +28297,7 @@ mod harness_selection_tests {
         cleanup.remove().unwrap();
     }
 
-    /// A disabled-backend probe of a labelled test, beside one of a test of
-    /// the default run type.
+    /// Disabled-backend probes of two buckets.
     #[test]
     fn disabled_probes_of_focused_run_types_select_their_cells() {
         let (path, cleanup) = scratch("disabled");
@@ -27696,12 +28312,36 @@ mod harness_selection_tests {
         cleanup.remove().unwrap();
     }
 
+    /// Only pinned-root buckets have run types other than the default, and
+    /// the host graph refuses each of their focused cells by name and omits
+    /// them from a batch.
+    #[test]
+    fn focused_run_types_are_pinned_root_cells_the_host_graph_refuses() {
+        let (path, cleanup) = scratch("pinned-root");
+        run_types_belong_to_pinned_buckets(&checkout_root()).unwrap();
+        pinned_root_cells_are_refused_or_omitted(&checkout_root(), &path).unwrap();
+        cleanup.remove().unwrap();
+    }
+
+    /// A focused run type's filter, as the planner writes it.
+    #[test]
+    fn a_focused_run_type_gets_its_label_filter_and_the_default_none() {
+        let default = BTreeSet::from([hermit_manifest_plan::runner::DEFAULT_RUN_TYPE.to_string()]);
+        assert_eq!(run_type_filter(&default).unwrap(), "");
+        let focused = BTreeSet::from(["sabre-compat-only".to_string()]);
+        assert_eq!(
+            run_type_filter(&focused).unwrap(),
+            format!(" --label {}", shell_quote("sabre-compat-only"))
+        );
+        assert!(run_type_filter(&BTreeSet::new()).is_err());
+    }
+
     /// The check itself refuses a command whose run-type filter is lost.
     #[test]
     fn a_command_without_its_run_type_filter_selects_nothing() {
         let manifests = ManifestSet::load(&checkout_root()).unwrap();
         let labelled = "env X=1 target/debug/test-harness run --include-manual \
-             --include-occasional --prebuilt --test 'compat/java' --mode 'verify' \
+             --include-occasional --prebuilt --test 'compat-pinned/java' --mode 'verify' \
              --backend 'ptrace' --label 'sabre-compat-only' --results 'r' --junit 'j' || status=$?";
         let (command, selection) = harness_command_selection(labelled).unwrap();
         assert_eq!(command, "run");

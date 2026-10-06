@@ -149,7 +149,10 @@ pub const DBT_MATRIX_2026_09_29_ENABLED_CI_FALSE_TESTS: [&str; 1] =
 /// keep those nodes' wall bounds (60 s, and 20 s for the five diagnostic rows)
 /// rather than the ordinary 22/57 bounds. The nodes' 120 s CPU cap cannot be
 /// stated because a cell's CPU budget must stay below its wall bound, so the
-/// CPU budgets are 59 s and 19 s; the slowest program used 2.9 s.
+/// CPU budgets are 59 s and 19 s; the slowest program used 2.9 s. Since
+/// <https://github.com/rrnewton/hermit/issues/3712> these cells live in
+/// `tests/e2e/manifests/compat-pinned.yaml` and run from the pinned image;
+/// `compat.yaml` keeps the same rows as a non-gating host-portability check.
 pub const STRICT_COMPAT_FOLD_2026_10_01_EVIDENCE_SHA: &str =
     "76980bac89901c3ecefbefc816ed47bcf099eda6";
 pub const STRICT_COMPAT_FOLD_2026_10_01_SELECTED_CI_CELL_COUNT: usize = 189;

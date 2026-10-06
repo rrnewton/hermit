@@ -459,11 +459,15 @@ sudo dnf install -y libunwind-devel xz-devel cmake patchelf binutils podman
 | `cmake` | `stage` | the host Cargo build of `reverie-dbt`, which builds DynamoRIO (remote actions use the pinned cmake wheel `stage-re-inputs` stages instead) |
 | `patchelf` | `stage` | the `DT_RPATH` through which the staged `hermit` finds the libunwind closure beside it |
 | `binutils` | `stage` | `strip` for the staged harness, and `readelf`, with which `ci/publish-hermit-e2e-artifact.sh` checks the staged `hermit`'s runtime closure |
-| `podman` | `ci/buck-e2e/cell.sh` | privileged-lane, pinned-root-only and local DBT cells, which run inside `ci/hermetic/run-in-pinned-root.sh` exactly as the Cargo flow runs them |
+| `podman` | `ci/buck-e2e/cell.sh`, `stage` | privileged-lane, pinned-root-only, `guest_root: pinned` (the gating `compat-pinned` corpus) and local DBT cells, which run inside `ci/hermetic/run-in-pinned-root.sh` exactly as the Cargo flow runs them; and the `compat-pinned` fixtures, which `stage` compiles inside the same root |
 
 Those cells also need the pinned root image: build it once with
 `ci/hermetic/build-image.sh`. Without it they fail with `pinned-root image
-unavailable`; they never fall back to running on the host. A missing package
+unavailable`; they never fall back to running on the host, and
+`stage --from-cargo` refuses before building anything. The `guest_root:
+pinned` cells always take the local route, in `buck-hybrid` too: a remote
+worker's own `/usr/bin` and glibc are exactly the unpinned guest those cells
+exist to avoid (https://github.com/rrnewton/hermit/issues/3712). A missing package
 stops `stage-re-inputs` or `stage` before anything is built, with a message
 naming the package; nothing downloads a substitute. `stage-re-inputs`
 downloads its pinned cmake wheel from `files.pythonhosted.org`, so on a Meta

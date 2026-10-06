@@ -29,11 +29,17 @@ Seven buckets currently contain calibrated blocking workloads:
 - `language-runtimes.yaml`
 - `applications.yaml`
 - `c-programs.yaml` (eight calibrated Buck-derived C probes)
-- `compat.yaml` (the 189-program strict compatibility corpus, written as a
-  `corpus` section; five of its rows are diagnostics; it also holds the
-  `sabre-compat-only` run type's SaBRe cells and its 27 extra rows, the
+- `compat-pinned.yaml` (the strict compatibility corpus, written as a
+  `corpus` section and run from the pinned image under `guest_root: pinned`,
+  https://github.com/rrnewton/hermit/issues/3712; 174 of its rows run in
+  blocking CI and five of those are diagnostics; it also holds the
+  `sabre-compat-only` run type's 215 SaBRe cells and its extra rows, the
   `rr-compat-only` run type's 139 replay cells, and the
   `strict-compat-only` run type's 193 strict variant tests)
+
+`compat.yaml` holds the same corpus's 219 rows, without the strict variants,
+run on the host and on ptrace only. It is a host-portability check: its 216
+CI cells are all diagnostic, so none of them gates.
 
 Eight additional `*-c.yaml`/`c-programs.yaml` buckets make 180 more C guests
 centrally discoverable. Eight `c-programs.yaml` entries have calibrated

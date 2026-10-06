@@ -58,7 +58,7 @@ EOF
 
 function build_assembly_object {
     write_assembly_fixture
-    /usr/bin/as --64 "$WORK_DIR/add.s" -o "$WORK_DIR/add.o"
+    /bin/as --64 "$WORK_DIR/add.s" -o "$WORK_DIR/add.o"
 }
 
 # AUTONOMOUS-BOT-IMPLEMENTED
@@ -341,6 +341,23 @@ $(diff "$root/$name.before" "$root/$name.after" || true)"
     )
 }
 
+# The localhost clients. Each arm passes its own, so the arm's code names only
+# the program it runs (ci/manifest-plan/src/compat_guest_root.rs checks every
+# path an arm's code names against the pinned image).
+function fetch_with_wget {
+    /usr/bin/wget --quiet \
+        --output-document="$WORK_DIR/output/payload.txt" \
+        "http://127.0.0.1:$1/payload.txt"
+}
+
+function fetch_with_curl {
+    /usr/bin/curl --fail --silent --show-error \
+        --output "$WORK_DIR/output/payload.txt" \
+        "http://127.0.0.1:$1/payload.txt"
+}
+
+# Serve the archive fixture's payload on a loopback port and fetch it with
+# the client function $1, which takes the port.
 function fetch_localhost_payload {
     (
         local client=$1
@@ -387,15 +404,7 @@ function fetch_localhost_payload {
             cat "$WORK_DIR/server.log" >&2
             return 1
         fi
-        if [[ $client == wget ]]; then
-            /usr/bin/wget --quiet \
-                --output-document="$WORK_DIR/output/payload.txt" \
-                http://127.0.0.1:$server_port/payload.txt || status=$?
-        else
-            /usr/bin/curl --fail --silent --show-error \
-                --output "$WORK_DIR/output/payload.txt" \
-                http://127.0.0.1:$server_port/payload.txt || status=$?
-        fi
+        "$client" "$server_port" || status=$?
 
         if ((status != 0)); then
             kill "$server_pid" 2>/dev/null || true
@@ -469,10 +478,10 @@ case "$PROGRAM" in
         verify_archive_roundtrip "$WORK_DIR/archive.cpio"
         ;;
     wget-localhost)
-        fetch_localhost_payload wget
+        fetch_localhost_payload fetch_with_wget
         ;;
     curl-localhost)
-        fetch_localhost_payload curl
+        fetch_localhost_payload fetch_with_curl
         ;;
     cargo)
         mkdir -p "$WORK_DIR/src"
@@ -726,7 +735,7 @@ if(NOT product EQUAL 42)
 endif()
 file(WRITE "${OUTPUT_PATH}" "cmake=${product}\n")
 EOF
-        /usr/bin/cmake -DOUTPUT_PATH="$WORK_DIR/result.txt" \
+        /bin/cmake -DOUTPUT_PATH="$WORK_DIR/result.txt" \
             -P "$WORK_DIR/workload.cmake"
         grep -Fxq 'cmake=42' "$WORK_DIR/result.txt"
         printf 'cmake:script-product-42\n'
@@ -746,13 +755,18 @@ Libs: -L${libdir} -lhermit_compat
 Cflags: -I${includedir} -DHERMIT_COMPAT=42
 EOF
         export PKG_CONFIG_PATH="$WORK_DIR/pkgconfig"
-        version=$(/usr/bin/pkg-config --modversion hermit-compat)
-        flags=$(/usr/bin/pkg-config --cflags --libs hermit-compat)
+        version=$(/bin/pkg-config --modversion hermit-compat)
+        flags=$(/bin/pkg-config --cflags --libs hermit-compat)
+        # pkgconf prints the Cflags in file order and freedesktop pkg-config
+        # 0.29 (the pinned root's) puts -D before -I, so compare the flags as
+        # a sorted set rather than one host's ordering.
+        # shellcheck disable=SC2086 # split the flags into one per line
+        flags=$(printf '%s\n' $flags | sort | tr '\n' ' ')
         flags=${flags% }
         test "$version" = '1.2.3'
         test "$flags" = \
-            '-I/opt/hermit-compat/include -DHERMIT_COMPAT=42 -L/opt/hermit-compat/lib -lhermit_compat'
-        /usr/bin/pkg-config --atleast-version=1.2 hermit-compat
+            '-DHERMIT_COMPAT=42 -I/opt/hermit-compat/include -L/opt/hermit-compat/lib -lhermit_compat'
+        /bin/pkg-config --atleast-version=1.2 hermit-compat
         printf 'pkg-config:%s:%s\n' "$version" "$flags"
         ;;
     m4)
@@ -760,7 +774,7 @@ EOF
 define(`PRODUCT', `eval($1 * $2)')dnl
 product=PRODUCT(6, 7)
 EOF
-        /usr/bin/m4 "$WORK_DIR/input.m4" >"$WORK_DIR/output.txt"
+        /bin/m4 "$WORK_DIR/input.m4" >"$WORK_DIR/output.txt"
         grep -Fxq 'product=42' "$WORK_DIR/output.txt"
         printf 'm4:product-42\n'
         ;;
@@ -824,8 +838,8 @@ EOF
         printf 'ip:loopback-ipv4-ok\n'
         ;;
     ss)
-        if [[ -x /usr/sbin/ss ]]; then
-            readonly SS=/usr/sbin/ss
+        if [[ -x /sbin/ss ]]; then
+            readonly SS=/sbin/ss
         else
             readonly SS=/usr/bin/ss
         fi
@@ -1147,7 +1161,7 @@ EOF
         printf '0\n' >"$root/sys/devices/system/cpu/cpu0/topology/core_id"
         printf '0\n' \
             >"$root/sys/devices/system/cpu/cpu0/topology/physical_package_id"
-        output=$(/usr/bin/lscpu --sysroot "$root" -p=CPU,ONLINE)
+        output=$(/bin/lscpu --sysroot "$root" -p=CPU,ONLINE)
         [[ $output == *"# CPU,Online"* ]]
         [[ $output == *"0,Y"* ]]
         printf 'lscpu:cpu0-online\n'
@@ -1208,14 +1222,14 @@ EOF
     ar)
         archive=$(gcc -print-file-name=libgcc.a)
         test -r "$archive"
-        /usr/bin/ar t "$archive" | grep -qx '_muldi3.o'
-        bytes=$(/usr/bin/ar p "$archive" _muldi3.o | wc -c)
+        /bin/ar t "$archive" | grep -qx '_muldi3.o'
+        bytes=$(/bin/ar p "$archive" _muldi3.o | wc -c)
         test "$bytes" -gt 0
         printf 'ar:_muldi3.o:%s-bytes\n' "$bytes"
         ;;
     as)
         build_assembly_object
-        /usr/bin/readelf -sW "$WORK_DIR/add.o" | grep -Eq 'FUNC.*GLOBAL.*compat_add'
+        /bin/readelf -sW "$WORK_DIR/add.o" | grep -Eq 'FUNC.*GLOBAL.*compat_add'
         printf 'as:compat_add\n'
         ;;
     ld)
@@ -1229,10 +1243,10 @@ compat_add:
     .size compat_add, .-compat_add
     .section .note.GNU-stack,"",@progbits
 EOF
-        /usr/bin/as --64 "$WORK_DIR/compat.s" -o "$WORK_DIR/compat.o"
-        /usr/bin/ld -shared --build-id=none \
+        /bin/as --64 "$WORK_DIR/compat.s" -o "$WORK_DIR/compat.o"
+        /bin/ld -shared --build-id=none \
             -o "$WORK_DIR/libcompat.so" "$WORK_DIR/compat.o"
-        /usr/bin/readelf -h "$WORK_DIR/libcompat.so" \
+        /bin/readelf -h "$WORK_DIR/libcompat.so" \
             | grep -q 'DYN (Shared object file)'
         /usr/bin/python3 -I -B - "$WORK_DIR/libcompat.so" <<'PY'
 import ctypes
@@ -1249,35 +1263,35 @@ PY
         ;;
     nm)
         build_assembly_object
-        /usr/bin/nm --defined-only "$WORK_DIR/add.o" | grep -E ' [Tt] compat_add$'
+        /bin/nm --defined-only "$WORK_DIR/add.o" | grep -E ' [Tt] compat_add$'
         ;;
     objcopy)
         build_assembly_object
         printf 'compat-section\n' >"$WORK_DIR/section.txt"
-        /usr/bin/objcopy --add-section .compat="$WORK_DIR/section.txt" \
+        /bin/objcopy --add-section .compat="$WORK_DIR/section.txt" \
             --set-section-flags .compat=readonly,data \
             "$WORK_DIR/add.o" "$WORK_DIR/with-section.o"
-        /usr/bin/readelf -SW "$WORK_DIR/with-section.o" | grep -q '\.compat'
+        /bin/readelf -SW "$WORK_DIR/with-section.o" | grep -q '\.compat'
         printf 'objcopy:.compat\n'
         ;;
     objdump)
         build_assembly_object
-        /usr/bin/objdump -d "$WORK_DIR/add.o" >"$WORK_DIR/disassembly"
+        /bin/objdump -d "$WORK_DIR/add.o" >"$WORK_DIR/disassembly"
         grep -q '<compat_add>:' "$WORK_DIR/disassembly"
         grep -Eq '[[:space:]]ret[q]?[[:space:]]*$' "$WORK_DIR/disassembly"
         printf 'objdump:compat_add:ret\n'
         ;;
     ranlib)
         cp "$FIXTURE_ROOT/binutils/with-symbols.o" "$WORK_DIR/compat.o"
-        /usr/bin/ar crDS "$WORK_DIR/libcompat.a" "$WORK_DIR/compat.o"
-        /usr/bin/ranlib -D "$WORK_DIR/libcompat.a"
-        /usr/bin/nm -s "$WORK_DIR/libcompat.a" >"$WORK_DIR/archive-index.txt"
+        /bin/ar crDS "$WORK_DIR/libcompat.a" "$WORK_DIR/compat.o"
+        /bin/ranlib -D "$WORK_DIR/libcompat.a"
+        /bin/nm -s "$WORK_DIR/libcompat.a" >"$WORK_DIR/archive-index.txt"
         grep -qx 'compat_line in compat.o' "$WORK_DIR/archive-index.txt"
         printf 'ranlib:indexed-fixture-archive\n'
         ;;
     readelf)
         build_assembly_object
-        /usr/bin/readelf -hSWs "$WORK_DIR/add.o" >"$WORK_DIR/readelf.out"
+        /bin/readelf -hSWs "$WORK_DIR/add.o" >"$WORK_DIR/readelf.out"
         grep -q 'ELF64' "$WORK_DIR/readelf.out"
         grep -q '\.text' "$WORK_DIR/readelf.out"
         grep -q 'compat_add' "$WORK_DIR/readelf.out"
@@ -1285,44 +1299,44 @@ PY
         ;;
     size)
         test -s "$FIXTURE_ROOT/binutils/with-symbols.o"
-        /usr/bin/size -A "$FIXTURE_ROOT/binutils/with-symbols.o" >"$WORK_DIR/size.out"
+        /bin/size -A "$FIXTURE_ROOT/binutils/with-symbols.o" >"$WORK_DIR/size.out"
         awk '$1 == ".text" && $2 > 0 { found = 1 } END { exit !found }' "$WORK_DIR/size.out"
         awk '$1 == ".text" { print "size:.text:" $2 }' "$WORK_DIR/size.out"
         ;;
     strip)
         test -s "$FIXTURE_ROOT/binutils/with-symbols.o"
         cp -p "$FIXTURE_ROOT/binutils/with-symbols.o" "$WORK_DIR/with-symbols.o"
-        /usr/bin/strip --strip-all "$WORK_DIR/with-symbols.o" \
+        /bin/strip --strip-all "$WORK_DIR/with-symbols.o" \
             -o "$WORK_DIR/stripped.o"
-        ! /usr/bin/readelf -SW "$WORK_DIR/stripped.o" | grep -q '\.symtab'
+        ! /bin/readelf -SW "$WORK_DIR/stripped.o" | grep -q '\.symtab'
         printf 'strip:relocatable-object:no-symtab\n'
         ;;
     addr2line)
         test -s "$FIXTURE_ROOT/binutils/with-symbols.o"
-        address=$(/usr/bin/nm "$FIXTURE_ROOT/binutils/with-symbols.o" | \
+        address=$(/bin/nm "$FIXTURE_ROOT/binutils/with-symbols.o" | \
             awk '$3 == "compat_line" { print $1 }')
-        /usr/bin/addr2line -f -e "$FIXTURE_ROOT/binutils/with-symbols.o" \
+        /bin/addr2line -f -e "$FIXTURE_ROOT/binutils/with-symbols.o" \
             "$address" >"$WORK_DIR/location"
         grep -Fxq 'compat_line' "$WORK_DIR/location"
         tail -n 1 "$WORK_DIR/location" | grep -Eq 'fixture.c:[0-9]+$'
         printf 'addr2line:%s\n' "$(tail -n 1 "$WORK_DIR/location" | sed 's|.*/||')"
         ;;
     c++filt)
-        demangled=$(printf '_ZN6hermit6compatEi\n' | /usr/bin/c++filt)
+        demangled=$(printf '_ZN6hermit6compatEi\n' | /bin/c++filt)
         test "$demangled" = 'hermit::compat(int)'
         printf 'c++filt:%s\n' "$demangled"
         ;;
     elfedit)
         build_assembly_object
         cp "$WORK_DIR/add.o" "$WORK_DIR/edited.o"
-        /usr/bin/elfedit --output-osabi GNU "$WORK_DIR/edited.o"
-        /usr/bin/readelf -h "$WORK_DIR/edited.o" | grep -q 'UNIX - GNU'
+        /bin/elfedit --output-osabi GNU "$WORK_DIR/edited.o"
+        /bin/readelf -h "$WORK_DIR/edited.o" | grep -q 'UNIX - GNU'
         printf 'elfedit:GNU\n'
         ;;
     gprof)
         test -x "$FIXTURE_ROOT/gprof/program"
         test -s "$FIXTURE_ROOT/gprof/gmon.out"
-        /usr/bin/gprof -b "$FIXTURE_ROOT/gprof/program" \
+        /bin/gprof -b "$FIXTURE_ROOT/gprof/program" \
             "$FIXTURE_ROOT/gprof/gmon.out" >"$WORK_DIR/profile.out"
         grep -q 'compat_root' "$WORK_DIR/profile.out"
         grep -q 'compat_leaf' "$WORK_DIR/profile.out"
@@ -1336,7 +1350,7 @@ EOF
 #include "compat.h"
 int value = PRODUCT(6, 7);
 EOF
-        /usr/bin/cpp -P -I"$WORK_DIR" "$WORK_DIR/input.c" >"$WORK_DIR/output.c"
+        /bin/cpp -P -I"$WORK_DIR" "$WORK_DIR/input.c" >"$WORK_DIR/output.c"
         grep -Eq '^int value = .*6.*7.*;$' "$WORK_DIR/output.c"
         printf 'cpp:'
         tr -d ' ' <"$WORK_DIR/output.c"
@@ -1370,7 +1384,7 @@ EOF
         printf 'find:recursive-filter-ok\n'
         ;;
     env)
-        output=$(/usr/bin/env -i ALPHA=6 BETA=7 /usr/bin/printenv ALPHA BETA)
+        output=$(/usr/bin/env -i ALPHA=6 BETA=7 /bin/printenv ALPHA BETA)
         test "$output" = $'6\n7'
         printf 'env:clean-two-vars-ok\n'
         ;;
@@ -1380,7 +1394,7 @@ EOF
         printf 'factor:composite-and-prime-ok\n'
         ;;
     xargs)
-        output=$(printf '6\n7\n' | /usr/bin/xargs -n1 /usr/bin/expr 6 '*')
+        output=$(printf '6\n7\n' | /bin/xargs -n1 /usr/bin/expr 6 '*')
         test "$output" = $'36\n42'
         printf 'xargs:two-products-ok\n'
         ;;
@@ -1395,7 +1409,7 @@ EOF
         ;;
     shuf)
         output=$(printf 'alpha\nbeta\ngamma\ndelta\n' |
-            /usr/bin/shuf | /usr/bin/sort)
+            /bin/shuf | /usr/bin/sort)
         test "$output" = $'alpha\nbeta\ndelta\ngamma'
         printf 'shuf:permutation-ok\n'
         ;;
