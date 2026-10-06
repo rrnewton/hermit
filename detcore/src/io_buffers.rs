@@ -539,6 +539,15 @@ fn read_extent<M: MemoryAccess>(
     let Err(error) = memory.read_values(Addr::from(start), buf.as_mut_slice()) else {
         return Ok((buf, 0));
     };
+    // The read above may be wider than the extent: on ptrace, up to eight bytes
+    // are one eight-byte `PTRACE_PEEKDATA`, which fails for a buffer that ends
+    // less than eight bytes before an unmapped page. Read exactly the moved
+    // bytes before treating the extent as unreadable. The wide read stays
+    // first because it can read a write-only page, which `process_vm_readv`
+    // cannot.
+    if crate::syscalls::read_guest_exact(memory, start, buf.as_mut_slice()).is_ok() {
+        return Ok((buf, 0));
+    }
     if !records {
         return Err(error.into());
     }

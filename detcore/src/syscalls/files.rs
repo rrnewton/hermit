@@ -318,10 +318,31 @@ fn save_procfs_scratch<M: MemoryAccess>(
     scratch: AddrMut<'_, u8>,
     original: &mut [u8],
 ) -> bool {
-    memory.read_exact(scratch, original).is_ok()
+    read_guest_exact(memory, scratch, original).is_ok()
         && memory
             .write_with_user_access(scratch, original)
             .is_ok_and(|written| written == original.len())
+}
+
+/// Read exactly `buf.len()` bytes at `addr`, in one `read_vectored` of that
+/// length, or fail `EFAULT` if not all of them can be read. `read` and
+/// `read_exact` may widen a short read (ptrace turns up to eight bytes into one
+/// eight-byte `PTRACE_PEEKDATA`), which fails when a valid extent ends less
+/// than eight bytes before an unmapped page.
+pub(crate) fn read_guest_exact<M: MemoryAccess>(
+    memory: &M,
+    addr: AddrMut<'_, u8>,
+    buf: &mut [u8],
+) -> Result<(), Errno> {
+    let len = buf.len();
+    let remote = unsafe { AddrSlice::from_raw_parts(addr.into(), len) };
+    let remote = [unsafe { remote.as_ioslice() }];
+    let mut local = [std::io::IoSliceMut::new(buf)];
+    match memory.read_vectored(&remote, &mut local) {
+        Ok(copied) if copied == len => Ok(()),
+        Ok(_) => Err(Errno::EFAULT),
+        Err(errno) => Err(errno),
+    }
 }
 
 /// Capacity used for pipes that Detcore makes physically nonblocking.
@@ -1968,7 +1989,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             let start = contents.len();
             contents.resize(start + bytes_read, 0);
-            guest.memory().read_exact(scratch, &mut contents[start..])?;
+            read_guest_exact(&guest.memory(), scratch, &mut contents[start..])?;
         }
     }
 

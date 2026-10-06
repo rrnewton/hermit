@@ -553,6 +553,51 @@ fn procfs_self_maps_first_read_on_a_tight_stack_checks_the_destination() {
     });
 }
 
+/// With no stack scratch, a valid destination of 1 or 4 bytes that ends right
+/// before an unmapped page gets those bytes, as natively. Neither the capture,
+/// which saves and reads back those bytes, nor the digest of the moved bytes
+/// in the log may fail on the unmapped page, as an eight-byte
+/// `PTRACE_PEEKDATA` there does. Eight bytes is the control.
+#[test]
+fn procfs_self_maps_short_read_on_a_tight_stack_before_an_unmapped_page() {
+    use super::tight_stack_openat::BelowStack;
+    super::det_test_fn_sequential_without_pmu(|| {
+        let mut expected = [0_u8; 8];
+        let file = File::open("/proc/self/maps").unwrap();
+        assert_eq!(
+            unsafe { libc::read(file.as_raw_fd(), expected.as_mut_ptr().cast(), 8) },
+            8
+        );
+        for count in [1, 4, 8] {
+            for positioned in [false, true] {
+                let (stack, stack_mapping, stack_len) =
+                    super::tight_stack_openat::tight_stack(BelowStack::GuardPage, 0);
+                let (mapping, page) = sentinel_pages(2);
+                let second_page = unsafe { mapping.add(page) };
+                assert_eq!(unsafe { libc::munmap(second_page.cast(), page) }, 0);
+                let destination = unsafe { second_page.sub(count) };
+                let file = File::open("/proc/self/maps").unwrap();
+                let n = unsafe {
+                    raw_read_on_stack(stack, file.as_raw_fd(), destination, count, positioned)
+                };
+                let case = format!(
+                    "{} of {count} bytes",
+                    if positioned { "pread" } else { "read" }
+                );
+                assert_eq!(n, count as i64, "{case}");
+                let got = unsafe { std::slice::from_raw_parts(destination, count) };
+                assert_eq!(got, &expected[..count], "{case}");
+                let before = unsafe { std::slice::from_raw_parts(mapping, page - count) };
+                assert!(before.iter().all(|&byte| byte == SENTINEL), "{case}");
+                let offset = unsafe { libc::lseek(file.as_raw_fd(), 0, libc::SEEK_CUR) };
+                assert_eq!(offset, if positioned { 0 } else { count as i64 }, "{case}");
+                assert_eq!(unsafe { libc::munmap(mapping.cast(), page) }, 0);
+                assert_eq!(unsafe { libc::munmap(stack_mapping, stack_len) }, 0);
+            }
+        }
+    });
+}
+
 /// Linux checks the whole requested range against the user address limit
 /// before reading, so a range beyond it is `EFAULT` even at EOF. A range
 /// within the limit gets 0 at EOF whether or not its pages are mapped.
