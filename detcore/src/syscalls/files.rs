@@ -1195,7 +1195,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     }
 
     /// The fast path of [`Self::inject_fstat`]: the buffer lives in the guest
-    /// stack scratch. Returns `EFAULT` when that scratch is not writable.
+    /// stack scratch. Returns `EFAULT` when that scratch cannot be read,
+    /// committed or written.
+    ///
+    /// On ptrace and KVM the buffer is the guest's own memory below its red
+    /// zone, which the commit and the kernel's `fstat` overwrite. A guest that
+    /// issues raw system calls may keep live data there, and Linux never
+    /// writes there for it, so the 144 bytes under the buffer are read before
+    /// the scratch is committed and written back afterwards: on success, on a
+    /// failed `fstat` and after a fault alike, before the scratch guard drops.
+    /// A scratch whose bytes cannot be read is not used. This is the same
+    /// save and restore [`Self::stat_guest_path`] performs; an error other
+    /// than `EFAULT` from any step wins over an `EFAULT` from another.
     async fn inject_fstat_on_stack<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1203,17 +1214,29 @@ impl<T: RecordOrReplay> Detcore<T> {
     ) -> Result<libc::stat, Errno> {
         let mut stack = guest.stack().await;
         let statptr: StatPtr = StatPtr(stack.reserve());
-        // Keep the guard until the buffer is no longer used. Backends whose
-        // scratch is a Tool-owned arena (DBT, SaBRe, LiteInst, e9patch) free
-        // it when the guard drops, so dropping it before the injected fstat
-        // would let the kernel write into freed memory.
-        let _stack_guard = stack.commit()?;
-        let copied = Self::inject_fstat_into(guest, raw_fd, statptr).await?;
-        // clear stack memory used for fstat allocation
-        guest
-            .memory()
-            .write_exact(statptr.0.cast(), &[0; std::mem::size_of::<libc::stat>()])?;
-        Ok(copied)
+        let mut saved = [0u8; std::mem::size_of::<libc::stat>()];
+        // `EFAULT` here sends the fstat to a transient page before anything
+        // is written.
+        guest.memory().read_exact(statptr.0.cast(), &mut saved)?;
+        // Keep the guard until the buffer is written back. DBT and SaBRe free
+        // their Tool-owned arena when the guard drops; LiteInst and e9patch
+        // move it to a list of committed arenas that is cleared when the
+        // current dispatch ends. Either way, an injected fstat after the drop
+        // could write into memory the scratch no longer owns. A failed commit
+        // is written back too: the ptrace commit writes page by page, so it
+        // can fail after writing a lower writable page.
+        let committed = stack.commit();
+        let copied = match &committed {
+            Ok(_) => Self::inject_fstat_into(guest, raw_fd, statptr).await,
+            Err(errno) => Err(*errno),
+        };
+        let restored = guest.memory().write_exact(statptr.0.cast(), &saved);
+        drop(committed);
+        match (copied, restored) {
+            (Ok(copied), Ok(())) => Ok(copied),
+            (Err(errno), Ok(())) | (Ok(_), Err(errno)) => Err(errno),
+            (Err(Errno::EFAULT), Err(errno)) | (Err(errno), Err(_)) => Err(errno),
+        }
     }
 
     /// The fallback of [`Self::inject_fstat`]: the buffer lives in a private
@@ -1422,8 +1445,9 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    never writes there for it. So the bytes under both buffers are read
     ///    before the scratch is committed and written back afterwards, on
     ///    success, on a failed stat and after a fault alike, before the
-    ///    scratch guard drops (backends whose scratch is a Tool-owned arena
-    ///    free it then). A scratch whose bytes cannot be read is not used.
+    ///    scratch guard drops (DBT and SaBRe free their Tool-owned arena
+    ///    then; LiteInst and e9patch keep it only until the current dispatch
+    ///    ends). A scratch whose bytes cannot be read is not used.
     ///    That memory need not be writable either, for the reasons
     ///    `inject_fstat` gives. The fault belongs to Detcore's bookkeeping,
     ///    not to the guest (<https://github.com/rrnewton/hermit/issues/3328>),
@@ -1512,9 +1536,10 @@ impl<T: RecordOrReplay> Detcore<T> {
             }
             Err(errno) => return Err(errno),
         }
-        // Keep the guard until both buffers are written back: backends whose
-        // scratch is a Tool-owned arena (DBT, SaBRe, LiteInst, e9patch) free
-        // it when the guard drops. A failed commit is written back too: the
+        // Keep the guard until both buffers are written back: DBT and SaBRe
+        // free their Tool-owned arena when the guard drops, and LiteInst and
+        // e9patch move it to a list of committed arenas that is cleared when
+        // the current dispatch ends. A failed commit is written back too: the
         // ptrace commit writes page by page, so it can fail after writing a
         // lower writable page.
         let committed = stack.commit();
@@ -8439,12 +8464,203 @@ pub(crate) mod inject_fstat_scratch {
             [guest.arena.as_ptr() as usize],
             "fstat must write into the stack scratch"
         );
-        let used_words = std::mem::size_of::<libc::stat>().div_ceil(8);
         assert!(
-            guest.arena[..used_words].iter().all(|word| *word == 0),
-            "the stat must not be left in the guest's stack scratch"
+            guest.arena.iter().all(|word| *word == u64::MAX),
+            "the guest's bytes under the stat buffer must be put back, and the \
+             stat must not be left in the guest's stack scratch"
         );
         assert_eq!(recorded_inode(&guest, fd), Some(inode));
+    }
+
+    /// `inject_fstat`'s result, printable without `libc::stat: Debug`.
+    fn fstat_outcome(result: &Result<libc::stat, Errno>) -> String {
+        match result {
+            Ok(stat) => format!("Ok(stat of inode {})", stat.st_ino),
+            Err(errno) => format!("Err({errno:?})"),
+        }
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_restores_the_guest_bytes_under_its_buffer() {
+        let (fd, inode) = open_file();
+        // A commit that writes zeros over the scratch, as on ptrace, and one
+        // that writes nothing, as on the arena backends.
+        for commit_writes in [true, false] {
+            let scratch = Pages::sentinel(1, 1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.commit_writes = commit_writes;
+
+            let result = tool.inject_fstat(&mut guest, fd).await;
+
+            let stat = result.unwrap_or_else(|errno| panic!("inject_fstat failed: {errno}"));
+            assert_eq!(stat.st_ino, inode);
+            assert_eq!(guest.injected, [Sysno::fstat]);
+            assert_eq!(
+                guest.fstat_buffers,
+                [scratch.address],
+                "fstat must write into the stack scratch"
+            );
+            assert_eq!(
+                guest.fstat_guard_live,
+                [true],
+                "the stack guard must outlive the injected fstat"
+            );
+            assert_eq!(
+                guest.unguarded_scratch_writes(),
+                0,
+                "the buffer must be written back before the stack guard drops"
+            );
+            assert!(
+                scratch.holds_sentinel(0, scratch.len),
+                "the guest's bytes under the fstat buffer must be put back \
+                 (commit_writes: {commit_writes})"
+            );
+        }
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_restores_its_scratch_when_the_fstat_fails() {
+        // A descriptor number far above any open one: the guest's fstat
+        // fails with EBADF, which is the guest's answer.
+        let closed: RawFd = 1 << 20;
+        let scratch = Pages::sentinel(1, 1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.commit_writes = true;
+
+        let result = tool.inject_fstat(&mut guest, closed).await;
+
+        assert!(
+            matches!(result, Err(Errno::EBADF)),
+            "a failed fstat is the guest's answer: {}",
+            fstat_outcome(&result)
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::fstat],
+            "a failed fstat is not a reason to retry"
+        );
+        assert_eq!(guest.fstat_guard_live, [true]);
+        assert_eq!(guest.unguarded_scratch_writes(), 0);
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the guest's bytes must be put back after a failed fstat"
+        );
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_restores_what_a_failed_commit_wrote() {
+        // As on ptrace, the commit writes the whole scratch in one write from
+        // its start: here its first 64 bytes, on a writable page, before it
+        // faults on the read-only page after them.
+        let (fd, inode) = open_file();
+        let written = 64;
+        let scratch = Pages::sentinel(2, 1, 2);
+        let start = page_size() - written;
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address + start, scratch.len - start, None);
+        guest.commit_writes = true;
+
+        let result = tool.inject_fstat(&mut guest, fd).await;
+
+        let stat = result.unwrap_or_else(|errno| {
+            panic!("a scratch the guest cannot hold must not fail the caller: {errno}")
+        });
+        assert_eq!(stat.st_ino, inode);
+        assert_eq!(guest.commits.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap, Sysno::fstat, Sysno::munmap],
+            "no fstat may be injected into a scratch whose commit failed"
+        );
+        let [(page, _)] = guest.mapped[..] else {
+            panic!("expected one transient page, got {:?}", guest.mapped);
+        };
+        assert_eq!(guest.fstat_buffers, [page]);
+        assert!(
+            scratch.holds_sentinel(0, scratch.len),
+            "the bytes the failed commit wrote must be put back"
+        );
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_does_not_use_a_scratch_it_cannot_save() {
+        // The buffer starts 64 bytes before the end of a writable page, and
+        // the page after it cannot be accessed, so the guest's bytes under the
+        // buffer cannot be read and could not be put back.
+        let (fd, inode) = open_file();
+        let readable = 64;
+        let scratch = Pages::sentinel(2, 1, 1);
+        let start = page_size() - readable;
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address + start, scratch.len - start, None);
+        guest.commit_writes = true;
+
+        let result = tool.inject_fstat(&mut guest, fd).await;
+
+        let stat = result.unwrap_or_else(|errno| {
+            panic!("a scratch that cannot be saved must not fail the caller: {errno}")
+        });
+        assert_eq!(stat.st_ino, inode);
+        assert_eq!(
+            guest.commits.load(Ordering::SeqCst),
+            0,
+            "a scratch whose bytes cannot be saved must not be committed"
+        );
+        assert_eq!(guest.injected, [Sysno::mmap, Sysno::fstat, Sysno::munmap]);
+        assert!(
+            scratch.holds_sentinel(start, readable),
+            "no byte of a scratch that cannot be saved may be written"
+        );
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_retries_in_a_transient_page_when_the_kernel_cannot_write_its_buffer() {
+        // The scratch can be read, so its bytes can be saved, and the commit
+        // writes nothing, as on the arena backends; but no byte of it can be
+        // written, so the kernel's fstat faults.
+        let (fd, inode) = open_file();
+        let scratch = Pages::sentinel(1, 0, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+        let result = tool.inject_fstat(&mut guest, fd).await;
+
+        let stat = result.unwrap_or_else(|errno| {
+            panic!("a buffer the kernel cannot write must not fail the caller: {errno}")
+        });
+        assert_eq!(stat.st_ino, inode);
+        assert_eq!(
+            guest.injected,
+            [Sysno::fstat, Sysno::mmap, Sysno::fstat, Sysno::munmap]
+        );
+        assert_eq!(
+            guest.fstat_guard_live,
+            [true, false],
+            "the stack guard must outlive the first fstat and be gone by the retry"
+        );
+        assert!(scratch.holds_sentinel(0, scratch.len));
+        assert_eq!(unsafe { libc::close(fd) }, 0);
+    }
+
+    #[tokio::test]
+    async fn inject_fstat_propagates_a_commit_error_other_than_efault() {
+        let (fd, _) = open_file();
+        let scratch = Pages::sentinel(1, 1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::ESRCH));
+
+        let result = tool.inject_fstat(&mut guest, fd).await;
+
+        assert!(
+            matches!(result, Err(Errno::ESRCH)),
+            "only EFAULT sends the fstat to a transient page: {}",
+            fstat_outcome(&result)
+        );
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+        assert!(scratch.holds_sentinel(0, scratch.len));
+        assert_eq!(unsafe { libc::close(fd) }, 0);
     }
 
     #[tokio::test]
