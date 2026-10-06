@@ -1041,6 +1041,7 @@ impl std::error::Error for LiteinstInGuestRefusal {}
 ///   `set_timer` as fatal (`.expect("Failed to set timer")`), so the guest
 ///   would panic at its first scheduling point. The CLI refuses
 ///   `--max-timeslice` earlier; this covers library callers.
+/// - A kernel older than Linux 6.5 ([`in_guest_liteinst_kernel_gap`]).
 /// - A guest program that would run code before, or without, the runtime's
 ///   constructor ([`in_guest_liteinst_program_gap`]).
 ///
@@ -1057,12 +1058,57 @@ fn refuse_in_guest_liteinst_run(command: &mut Command, config: &DetConfig) -> Re
              --max-timeslice=disabled"
                 .to_owned(),
         )
+    } else if let Some(gap) = in_guest_liteinst_kernel_gap(&running_kernel_release()) {
+        Some(gap)
     } else {
         in_guest_liteinst_program_gap(command)?
     };
     match reason {
         Some(reason) => Err(Error::new(LiteinstInGuestRefusal::new(reason))),
         None => Ok(()),
+    }
+}
+
+/// The oldest kernel in-guest LiteInst runs on, as (major, minor). Linux 6.5
+/// added `SO_PEERPIDFD`: the coordinator admits each guest process through the
+/// pidfd of the socket's peer and watches that pidfd for the process's exit
+/// (`in_guest_exits`). On an older kernel every admission would fail.
+#[cfg(feature = "liteinst")]
+const IN_GUEST_LITEINST_KERNEL_FLOOR: (u32, u32) = (6, 5);
+
+/// The running kernel's release string (`uname -r`), or empty if unreadable.
+#[cfg(feature = "liteinst")]
+fn running_kernel_release() -> String {
+    let mut name: libc::utsname = unsafe { std::mem::zeroed() };
+    // SAFETY: uname fills the struct it is given.
+    if unsafe { libc::uname(&mut name) } != 0 {
+        return String::new();
+    }
+    // SAFETY: uname NUL-terminates each field.
+    unsafe { std::ffi::CStr::from_ptr(name.release.as_ptr()) }
+        .to_string_lossy()
+        .into_owned()
+}
+
+/// Why kernel `release` cannot run in-guest LiteInst, or `None` when it is at
+/// least [`IN_GUEST_LITEINST_KERNEL_FLOOR`]. A release whose version cannot be
+/// read is refused.
+#[cfg(feature = "liteinst")]
+fn in_guest_liteinst_kernel_gap(release: &str) -> Option<String> {
+    let mut numbers = release
+        .split(|c: char| !c.is_ascii_digit())
+        .map(|part| part.parse::<u32>().ok());
+    let (floor_major, floor_minor) = IN_GUEST_LITEINST_KERNEL_FLOOR;
+    match (numbers.next().flatten(), numbers.next().flatten()) {
+        (Some(major), Some(minor)) if (major, minor) >= IN_GUEST_LITEINST_KERNEL_FLOOR => None,
+        (Some(_), Some(_)) => Some(format!(
+            "it needs Linux {floor_major}.{floor_minor} or later (SO_PEERPIDFD, which it uses to \
+             admit each guest process and observe its exit); this kernel is {release}"
+        )),
+        _ => Some(format!(
+            "it needs Linux {floor_major}.{floor_minor} or later (SO_PEERPIDFD), and the kernel \
+             release {release:?} does not say which version this is"
+        )),
     }
 }
 
@@ -4618,6 +4664,37 @@ mod tests {
                 "{name}: {gap}"
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "liteinst")]
+    fn in_guest_liteinst_refuses_a_kernel_older_than_6_5() {
+        for release in [
+            "6.5.0",
+            "6.5",
+            "6.10.3-200.fc40.x86_64",
+            "7.1.3-0_fbk0_rc18",
+            "10.0",
+        ] {
+            assert_eq!(in_guest_liteinst_kernel_gap(release), None, "{release}");
+        }
+        for release in ["6.4.16", "5.15.0-91-generic", "4.19"] {
+            let gap = in_guest_liteinst_kernel_gap(release)
+                .unwrap_or_else(|| panic!("{release} was not refused"));
+            assert!(gap.contains("Linux 6.5 or later"), "{gap}");
+            assert!(gap.contains(release), "{gap}");
+        }
+        for release in ["", "unknown", "6"] {
+            assert!(
+                in_guest_liteinst_kernel_gap(release).is_some(),
+                "{release:?}"
+            );
+        }
+        // This host runs the tests, so it is at the floor.
+        assert_eq!(
+            in_guest_liteinst_kernel_gap(&running_kernel_release()),
+            None
+        );
     }
 
     #[test]

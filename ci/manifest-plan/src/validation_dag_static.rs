@@ -1023,7 +1023,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The shared physical-exit watcher's four runtime-mode tests and the three
     // in_guest_exits admission tests retain all 902 prior IDs: 909.
     // The exit watchdog's six tests (in_guest_exits) retain all 909: 915.
-    ("test.hermit_unit", 915),
+    // The two verification-latch tests and the in-guest kernel-floor test retain all 915: 918.
+    ("test.hermit_unit", 918),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1615,7 +1616,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 862 + 40 = 902.
     // The host twin selects the same seven watcher and admission tests: 909.
     // The host twin selects the same six watchdog tests: 915.
-    ("test.hermit_unit_on_host", 915),
+    // The host twin selects the same three latch and kernel-floor tests: 918.
+    ("test.hermit_unit_on_host", 918),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

@@ -254,6 +254,12 @@ naming the process, when an exit sleeps in the kernel's exit path for over
 guests; such a run never verifies. A soft mount whose retries give up in
 under a second can still complete unnoticed.
 
+In-guest LiteInst needs Linux 6.5 or later (`SO_PEERPIDFD`) and refuses to
+start on an older kernel. `--verify` refuses to compare a run that recorded a
+determinism loss (an in-guest process died at a moment the host chose,
+without finishing its exit, or a DETLOG record was lost) or whose log failed
+a write, even if later writes succeeded.
+
 The default namespace, mount, and network setup is shared with Hermit's other
 backends; `--no-namespace` remains available for trusted guests. The in-guest
 runtime reserves `SIGSYS` for itself. This experimental path is not a security

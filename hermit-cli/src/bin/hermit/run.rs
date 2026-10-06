@@ -570,12 +570,42 @@ const FORWARDING_REFUSED_MARKER: &str = "HERMIT_DETLOG_FORWARDING_REFUSED";
 /// Each write takes the one lock for the whole buffer, so a record and a
 /// tracing event never interleave within a line, and both are counted against
 /// `--max-log-bytes` and go through the log's byte bound.
+///
+/// Neither writer can act on a failed write: the forwarded-record sink has no
+/// caller to return it to, and the tracing subscriber drops it. So the log
+/// keeps the first write or flush error ([`SharedLog::failure`]), and
+/// verification refuses the run ([`RunLatches`]) even when later writes
+/// recover and the log reads complete.
 #[derive(Clone)]
-struct SharedLog(std::sync::Arc<std::sync::Mutex<CappedWriter<BoundedWriter<fs::File>>>>);
+struct SharedLog {
+    writer: std::sync::Arc<std::sync::Mutex<Box<dyn Write + Send>>>,
+    failure: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+}
 
 impl SharedLog {
-    fn new(writer: CappedWriter<BoundedWriter<fs::File>>) -> Self {
-        Self(std::sync::Arc::new(std::sync::Mutex::new(writer)))
+    fn new(writer: impl Write + Send + 'static) -> Self {
+        Self {
+            writer: std::sync::Arc::new(std::sync::Mutex::new(Box::new(writer))),
+            failure: Default::default(),
+        }
+    }
+
+    /// Runs `op` on the writer under its lock, keeping its error if it is the
+    /// first.
+    fn with<R>(&self, op: impl FnOnce(&mut dyn Write) -> std::io::Result<R>) -> std::io::Result<R> {
+        let result = op(&mut **self.writer.lock().unwrap());
+        if let Err(error) = &result {
+            self.failure
+                .lock()
+                .unwrap()
+                .get_or_insert_with(|| error.to_string());
+        }
+        result
+    }
+
+    /// The log's first write or flush error, if any.
+    fn failure(&self) -> Option<String> {
+        self.failure.lock().unwrap().clone()
     }
 
     /// Writes each forwarded record as the line `extract_forwarded_detlogs`
@@ -596,8 +626,9 @@ impl SharedLog {
                 line.extend_from_slice(&payload[..payload.len().min(200)]);
             }
             line.push(b'\n');
-            // A failed write is the log's own failure; the bound announces it.
-            let _ = log.0.lock().unwrap().write_all(&line);
+            // The sink cannot return an error; a failed write is kept in the
+            // log's failure latch, which verification checks.
+            let _ = log.with(|writer| writer.write_all(&line));
         })
     }
 }
@@ -619,15 +650,41 @@ fn verification_log(
 
 impl Write for SharedLog {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().write(bytes)
+        self.with(|writer| writer.write(bytes))
     }
 
     fn write_all(&mut self, bytes: &[u8]) -> std::io::Result<()> {
-        self.0.lock().unwrap().write_all(bytes)
+        self.with(|writer| writer.write_all(bytes))
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.0.lock().unwrap().flush()
+        self.with(|writer| writer.flush())
+    }
+}
+
+/// What one verification run recorded that makes its records untrustworthy,
+/// carried out of the run's container process. Verification checks it before
+/// any comparison, independently of what reached the log: a lost or failed
+/// write can leave a log that reads complete.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct RunLatches {
+    /// Detcore's determinism-loss latch (`detcore::detlog::determinism_loss`):
+    /// a record was lost, or an event happened at a moment the host chose.
+    determinism_loss: Option<String>,
+    /// The first write or flush error of the run's log ([`SharedLog::failure`]).
+    log_sink_failure: Option<String>,
+}
+
+impl RunLatches {
+    /// Refuses to compare `run` when either latch is set.
+    fn refuse_comparison(&self, run: &str) -> Result<(), Error> {
+        if let Some(reason) = &self.determinism_loss {
+            anyhow::bail!("{run}: determinism loss recorded: {reason}");
+        }
+        if let Some(error) = &self.log_sink_failure {
+            anyhow::bail!("{run}: log sink failure: {error}");
+        }
+        Ok(())
     }
 }
 
@@ -6030,7 +6087,7 @@ impl RunOpts {
 
         eprintln!(":: {}", "Run1...".yellow().bold());
 
-        let (out1, skid_overshoots_run1) = match run_verification_execution(
+        let (out1, skid_overshoots_run1, latches1) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run1,
             || run1_options.run_verify(log1_file, forwarded1_for_run, global),
@@ -6073,6 +6130,12 @@ impl RunOpts {
                     return Err(error);
                 }
             };
+        if let Err(error) = latches1.refuse_comparison("run 1") {
+            if self.keep_logs {
+                retain_verification_logs([("run 1", log1_path)])?;
+            }
+            return Err(error);
+        }
 
         // With --verify the first run's `--log` output was diverted to a
         // temporary file for later comparison rather than shown to the user.
@@ -6194,7 +6257,7 @@ impl RunOpts {
         restore_standard_fd_status_flags(fd_flags_before_run1);
 
         eprintln!(":: {}", "Run2...".yellow().bold());
-        let (out2, skid_overshoots_run2) = match run_verification_execution(
+        let (out2, skid_overshoots_run2, latches2) = match run_verification_execution(
             self.verify_json.as_deref(),
             VerificationRun::Run2,
             || run2_options.run_verify(log2_file, forwarded2_for_run, global),
@@ -6259,6 +6322,12 @@ impl RunOpts {
             eprintln!(
                 ":: {backend} syscall DETLOG records included: run1={forwarded_syscalls1}, run2={forwarded_syscalls2}"
             );
+        }
+        if let Err(error) = latches2.refuse_comparison("run 2") {
+            if self.keep_logs {
+                retain_verification_logs([("run 1", log1_path), ("run 2", log2_path)])?;
+            }
+            return Err(error);
         }
 
         // Say what was actually established. Buffer hashing is ON BY DEFAULT, so
@@ -6560,12 +6629,12 @@ impl RunOpts {
         Ok((container, identity_sources))
     }
 
-    pub fn run_verify(
+    fn run_verify(
         &self,
         log_file: fs::File,
         forwarded_detlogs: Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
         global: &GlobalOpts,
-    ) -> Result<(Output, u64), Error> {
+    ) -> Result<(Output, u64, RunLatches), Error> {
         let mut options = self.clone();
         let network_trace = options.open_network_trace()?;
         let global = global.clone();
@@ -6970,7 +7039,7 @@ impl RunOpts {
         forwarded_detlogs: &mut Option<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)>,
         global: &GlobalOpts,
         identity_sources: Option<&IdentityGuard>,
-    ) -> Result<(Output, u64), Error> {
+    ) -> Result<(Output, u64, RunLatches), Error> {
         hermit::proc_mount::warn_if_readonly_proc();
 
         // HACK: Use interior mutability to workaround not being able to pass
@@ -7033,9 +7102,15 @@ impl RunOpts {
             // Records sent after the guest's last request, then close the socket.
             detcore::detlog::clear_forwarded_source();
         }
-        let result = result?;
+        let (output, skid_overshoots) = result?;
         self.relabel_e9patch_dispatch_stats(&self.summary_json)?;
-        Ok(result)
+        // A flush error counts too.
+        let _ = log.clone().flush();
+        let latches = RunLatches {
+            determinism_loss: detcore::detlog::determinism_loss(),
+            log_sink_failure: log.failure(),
+        };
+        Ok((output, skid_overshoots, latches))
     }
 }
 
@@ -7064,6 +7139,79 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    /// Fails its first write and accepts every later one.
+    struct FailsOnce {
+        failed: bool,
+        written: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    impl Write for FailsOnce {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if !self.failed {
+                self.failed = true;
+                return Err(std::io::Error::other("injected write failure"));
+            }
+            self.written.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// The design's fault injection: the loss notice's write fails once and
+    /// later writes recover, so the log reads complete apart from the notice.
+    /// Verification must still refuse, from the latch.
+    #[test]
+    fn a_failed_log_write_refuses_comparison_after_later_writes_recover() {
+        let written = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = SharedLog::new(FailsOnce {
+            failed: false,
+            written: written.clone(),
+        });
+        let mut sink = log.record_sink();
+        sink(
+            format!(
+                "{} 0 0 lost under test\n",
+                detcore::detlog::FORWARDING_LOSS_NOTICE
+            )
+            .as_bytes(),
+        );
+        sink(b"INFO detcore DETLOG [syscall] write(1, 0x1000, 5) = 5\n");
+        let mut tracing_writer = log.clone();
+        tracing_writer
+            .write_all(b"a later tracing event\n")
+            .unwrap();
+        // The notice is gone from the log, and the later writes are there.
+        let text = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        assert!(!text.contains("lost under test"), "{text}");
+        assert!(text.contains("DETLOG [syscall]"), "{text}");
+        let latches = RunLatches {
+            determinism_loss: None,
+            log_sink_failure: log.failure(),
+        };
+        let refusal = latches.refuse_comparison("run 1").unwrap_err().to_string();
+        assert!(
+            refusal.contains("log sink failure: injected write failure"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn a_recorded_determinism_loss_refuses_comparison() {
+        assert!(RunLatches::default().refuse_comparison("run 1").is_ok());
+        let latches = RunLatches {
+            determinism_loss: Some("in-guest process 7 exited without deregistering".to_string()),
+            log_sink_failure: None,
+        };
+        let refusal = latches.refuse_comparison("run 2").unwrap_err().to_string();
+        assert_eq!(
+            refusal,
+            "run 2: determinism loss recorded: in-guest process 7 exited without deregistering"
+        );
+    }
 
     /// https://github.com/rrnewton/hermit/pull/3686, restacked onto a main
     /// whose verification log is one writer shared by the tracing subscriber
