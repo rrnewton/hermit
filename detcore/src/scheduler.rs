@@ -3864,11 +3864,11 @@ impl Scheduler {
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
         let await_external_continuation =
             self.backend.signal_interrupts_external_syscalls && has_external_blocker;
-        // On a traced backend (the same condition as `sigchld_eligibility`:
-        // ptrace and LiteInst's host-hybrid runtime), such a thread awaits its
-        // own continuation too. Its request was consumed when it was
-        // backgrounded, so nothing may be counterfeited for it; the scheduler
-        // orders the continuation the signal provokes instead.
+        // On a traced backend (the same condition as `sigchld_eligibility`,
+        // which only ptrace meets), such a thread awaits its own continuation
+        // too. Its request was consumed when it was backgrounded, so nothing
+        // may be counterfeited for it; the scheduler orders the continuation
+        // the signal provokes instead.
         if self.sigchld_eligibility && has_external_blocker && !await_external_continuation {
             self.arm_signaled_background(dettid, signal);
             return;
@@ -4231,12 +4231,11 @@ impl Scheduler {
     //     host-timed moment like any external signal, and is observed at the
     //     same boundary as every other: the reader's gated read in its turn.
     //
-    // The argument needs the guest to be traced, and it is on every backend that
-    // turns this on: `backend_supports_blocked_wait_signal_interruption` is set
-    // only for ptrace and LiteInst (`hermit-cli/src/lib.rs`), and Hermit runs
-    // LiteInst guests as tracees of the same `reverie-ptrace` tracer. Two
-    // kernel facts it leans on hold only for a traced task, so a backend that
-    // enables the gate without tracing must revisit this section:
+    // The argument needs the guest to be traced, and it is on the only backend
+    // that turns this on: `backend_supports_blocked_wait_signal_interruption`
+    // is set only for ptrace (`hermit-cli/src/lib.rs`). Two kernel facts it
+    // leans on hold only for a traced task, so a backend that enables the gate
+    // without tracing must revisit this section:
     //   * Linux discards a signal at generation when the target has it
     //     ignored, explicitly or by default, and unblocked, unless the target is
     //     traced (`sig_ignored`). A traced task therefore stops for every
@@ -5604,11 +5603,11 @@ impl Scheduler {
                 // `thread_signal_mask`) and `arm_signaled_background`, run only
                 // under that flag, and the flag needs
                 // `backend_supports_blocked_wait_signal_interruption`, which is
-                // set only for ptrace and LiteInst (`hermit-cli/src/lib.rs`).
-                // Those are the backends whose `DetTid`s are the host thread IDs
-                // that `/proc` names. On any other backend, KVM among them, whose
-                // IDs are guest-virtual, a `/proc` read of `dettid` would name an
-                // unrelated host thread or none at all.
+                // set only for ptrace (`hermit-cli/src/lib.rs`), a backend whose
+                // `DetTid`s are the host thread IDs that `/proc` names. On a
+                // backend whose IDs are guest-virtual, KVM among them, a `/proc`
+                // read of `dettid` would name an unrelated host thread or none at
+                // all.
                 let sleeping_mask = self
                     .sigchld_eligibility
                     .then(|| blocked_signal_mask.or_else(|| self.read_thread_blocked_mask(dettid)));
@@ -10193,10 +10192,10 @@ mod test {
 
     /// A scheduler without `sigchld_eligibility` neither reads a committed
     /// thread's sleeping mask from `/proc` nor records one. Nothing on such a
-    /// scheduler consumes the record, and on a backend other than ptrace and
-    /// LiteInst, KVM among them, a `DetTid` is not a host thread ID, so the read
-    /// would name an unrelated host thread or none. The gated scheduler, for
-    /// contrast, records the call's own mask, or else reads the thread's
+    /// scheduler consumes the record, and on a backend whose `DetTid` is not a
+    /// host thread ID, KVM among them, the read would name an unrelated host
+    /// thread or none. The gated scheduler, for contrast, records the call's
+    /// own mask, or else reads the thread's
     /// (https://github.com/rrnewton/hermit/issues/3146).
     #[test]
     fn a_scheduler_without_sigchld_eligibility_reads_and_records_no_sleeping_mask() {

@@ -352,7 +352,7 @@
       "disposition": "guest-fixture",
       "path": "tests/c/external_signal_interrupt.c",
       "runner": "hermit-cli/tests/external_signal_interrupt.rs",
-      "why": "tests/c/external_signal_interrupt.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The dedicated integration suite compiles this guest and signals it from outside Hermit, from a live sibling process or thread, and from ITIMER_REAL while it blocks in FUTEX_WAIT, select, wait4 or waitid, asserting the one RESULT line under both futex modes and both the ptrace and LiteInst backends (https://github.com/rrnewton/hermit/issues/3146). External delivery needs a host-side sender that finds the guest by argv[0], which a manifest cannot express."
+      "why": "tests/c/external_signal_interrupt.c is owned by hermit-cli/tests/external_signal_interrupt.rs: The dedicated integration suite compiles this guest and signals it from outside Hermit, from a live sibling process or thread, and from ITIMER_REAL while it blocks in FUTEX_WAIT, select, wait4 or waitid, asserting the one RESULT line under both futex modes on the ptrace backend (https://github.com/rrnewton/hermit/issues/3146); its LiteInst cells are restoration targets (https://github.com/rrnewton/hermit/issues/3745). External delivery needs a host-side sender that finds the guest by argv[0], which a manifest cannot express."
     },
     {
       "disposition": "manifest-test",
