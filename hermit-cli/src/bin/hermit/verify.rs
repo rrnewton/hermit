@@ -2302,8 +2302,8 @@ mod tests {
         }
     }
 
-    /// How a forked child that reported its kept verification log ended; see
-    /// [`retention_report_in_child`].
+    /// How the child of [`retention_report_in_child`], which reported its kept
+    /// verification log, ended.
     #[derive(Debug, PartialEq, Eq)]
     enum RetentionChild {
         /// The report returned, the error kept its exit class and the log
@@ -2324,17 +2324,57 @@ mod tests {
     /// would show nothing more.
     const RETENTION_CHILD_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
+    /// Set in the re-executed child of [`retention_report_in_child`]: the
+    /// primary error, "log cap" or "timeout".
+    const RETENTION_CHILD_PRIMARY: &str = "HERMIT_TEST_RETENTION_CHILD_PRIMARY";
+
+    /// Set with [`RETENTION_CHILD_PRIMARY`]: the directory for the child's log.
+    const RETENTION_CHILD_DIR: &str = "HERMIT_TEST_RETENTION_CHILD_DIR";
+
+    /// The child's exit code when the report returned, the error kept its
+    /// exit class and the log was kept. It is not 0, which is what the test
+    /// binary exits with when its name filter matched no test.
+    const RETENTION_CHILD_RETURNED: libc::c_int = 10;
+
     /// The child's exit code when an `eprint!` did not reach its descriptor
-    /// 2. That happens when libtest captures output (`cargo test` without
-    /// `--nocapture`; nextest always passes `--nocapture`). A blocking or
-    /// panicking `eprintln!` could not be seen then, so the test fails
-    /// rather than pass without testing anything.
+    /// 2, so that a blocking or panicking `eprintln!` could not be seen. The
+    /// child runs with `--nocapture`, so this would mean libtest captured
+    /// its output anyway; the test then fails rather than pass without
+    /// testing anything.
     const RETENTION_CHILD_OUTPUT_CAPTURED: libc::c_int = 5;
 
-    /// Fork a child whose descriptor 2 is `stderr`, the write end of a pipe,
-    /// and have it call `retain_logs_after_verification_error(primary(), ..)`
-    /// for one log it creates in `dir`. Wait for it for at most
+    /// The first statement of each test that runs [`retention_report_in_child`].
+    /// In that child, the variables above are set: report, then exit with
+    /// the result instead of returning into the test harness. Elsewhere,
+    /// return.
+    fn retention_child_entry() {
+        let (Ok(primary), Some(dir)) = (
+            std::env::var(RETENTION_CHILD_PRIMARY),
+            std::env::var_os(RETENTION_CHILD_DIR),
+        ) else {
+            return;
+        };
+        let primary = match primary.as_str() {
+            "log cap" => log_cap_error,
+            "timeout" => timeout_error,
+            other => panic!("unknown primary error {other:?}"),
+        };
+        let code = retention_report_child_body(primary, Path::new(&dir));
+        // SAFETY: _exit has no preconditions.
+        unsafe { libc::_exit(code) }
+    }
+
+    /// Run the test named `test` in a new process of this test binary, with
+    /// descriptor 2 a copy of `stderr`, the write end of a pipe. That test
+    /// starts with [`retention_child_entry`], so the child calls
+    /// `retain_logs_after_verification_error` with the `primary` error for
+    /// one log it creates in `dir`. Wait for it for at most
     /// [`RETENTION_CHILD_BOUND`].
+    ///
+    /// The child runs with `--nocapture`. A forked child would inherit
+    /// libtest's output capture when this test runs under `cargo test`
+    /// without `--nocapture`, and its `eprint!` would then never reach its
+    /// descriptor 2.
     ///
     /// The child keeps SIGPIPE ignored, as hermit's outer process does: the
     /// Rust runtime ignores it at startup and hermit never restores it. A
@@ -2344,70 +2384,60 @@ mod tests {
     /// (`tracing::bound_log_cap_exit`), so what this observes is the report
     /// itself, not that bound covering for it.
     fn retention_report_in_child(
-        primary: fn() -> Error,
+        test: &str,
+        primary: &str,
         stderr: &std::os::fd::OwnedFd,
         dir: &Path,
     ) -> RetentionChild {
-        let stderr = stderr.as_raw_fd();
-        // SAFETY: the child calls only `retention_report_child_body`, then
-        // _exits without returning into the test harness.
-        let child = unsafe { libc::fork() };
-        assert!(child >= 0, "fork failed: {}", io::Error::last_os_error());
-        if child == 0 {
-            let code = retention_report_child_body(primary, stderr, dir);
-            // SAFETY: _exit has no preconditions.
-            unsafe { libc::_exit(code) }
-        }
+        use std::os::unix::process::ExitStatusExt as _;
+        // The Command, and with it this process's copy of `stderr`, is
+        // dropped at the end of this statement.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([test, "--exact", "--nocapture", "--test-threads=1"])
+            .env(RETENTION_CHILD_PRIMARY, primary)
+            .env(RETENTION_CHILD_DIR, dir)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(stderr.try_clone().unwrap())
+            .spawn()
+            .unwrap();
         let start = std::time::Instant::now();
-        loop {
-            let mut status = 0;
-            // SAFETY: waitpid writes only `status`.
-            let reaped = unsafe { libc::waitpid(child, &mut status, libc::WNOHANG) };
-            assert!(
-                reaped >= 0,
-                "waitpid failed: {}",
-                io::Error::last_os_error()
-            );
-            if reaped == child {
-                assert!(
-                    !(libc::WIFEXITED(status)
-                        && libc::WEXITSTATUS(status) == RETENTION_CHILD_OUTPUT_CAPTURED),
-                    "eprint! in the child did not reach its descriptor 2, so libtest is \
-                     capturing output; run this test under nextest or with --nocapture"
-                );
-                return match status {
-                    status if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0 => {
-                        RetentionChild::Returned
-                    }
-                    status if libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 101 => {
-                        RetentionChild::Panicked
-                    }
-                    status => RetentionChild::Other(status),
-                };
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
             }
             if start.elapsed() >= RETENTION_CHILD_BOUND {
-                // SAFETY: `child` is this test's unreaped child.
-                unsafe { libc::kill(child, libc::SIGKILL) };
-                assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+                child.kill().unwrap();
+                child.wait().unwrap();
                 return RetentionChild::StillRunning;
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        assert_ne!(
+            status.code(),
+            Some(RETENTION_CHILD_OUTPUT_CAPTURED),
+            "eprint! in the child did not reach its descriptor 2"
+        );
+        match status.code() {
+            Some(RETENTION_CHILD_RETURNED) => RetentionChild::Returned,
+            Some(101) => RetentionChild::Panicked,
+            _ => RetentionChild::Other(status.into_raw()),
         }
     }
 
-    /// The forked child of [`retention_report_in_child`]; returns its exit
-    /// code.
-    fn retention_report_child_body(
-        primary: fn() -> Error,
-        stderr: std::os::fd::RawFd,
-        dir: &Path,
-    ) -> i32 {
-        // SAFETY: the calls below only change this single-threaded child's
-        // signal disposition and descriptors, and read into a local buffer.
+    /// The body of the child of [`retention_report_in_child`]; returns its
+    /// exit code.
+    fn retention_report_child_body(primary: fn() -> Error, dir: &Path) -> i32 {
+        // SAFETY: the calls below only change this process's SIGPIPE
+        // disposition and descriptors, and read into a local buffer. The
+        // test harness's other thread is waiting for this test and writes
+        // nothing to descriptor 2 meanwhile.
         unsafe {
             libc::signal(libc::SIGPIPE, libc::SIG_IGN);
+            let stderr = libc::fcntl(libc::STDERR_FILENO, libc::F_DUPFD_CLOEXEC, 3);
             let mut probe = [0; 2];
-            if libc::pipe2(probe.as_mut_ptr(), libc::O_NONBLOCK) != 0
+            if stderr < 0
+                || libc::pipe2(probe.as_mut_ptr(), libc::O_NONBLOCK | libc::O_CLOEXEC) != 0
                 || libc::dup2(probe[1], libc::STDERR_FILENO) < 0
             {
                 return 6;
@@ -2436,7 +2466,7 @@ mod tests {
             Ok(error) if super::super::failure_exit_code(&error) != class => 3,
             // A TempPath that was not kept deletes its file when dropped.
             Ok(_) if !path.exists() => 4,
-            Ok(_) => 0,
+            Ok(_) => RETENTION_CHILD_RETURNED,
         }
     }
 
@@ -2465,6 +2495,10 @@ mod tests {
         Error::new(super::super::container::LogCapExceeded)
     }
 
+    fn timeout_error() -> Error {
+        Error::new(super::super::container::RunTimeoutMarker)
+    }
+
     /// Round-3 review of https://github.com/rrnewton/hermit/pull/3686, finding
     /// 4: after the log cap ends run 1 or run 2, `--verify --keep-logs`
     /// reports the logs it kept. Through `eprintln!`, that report panicked
@@ -2473,11 +2507,17 @@ mod tests {
     /// omitted when it cannot be delivered; the log is still kept.
     #[test]
     fn log_cap_retention_report_survives_a_stderr_without_a_reader() {
+        retention_child_entry();
         let dir = tempfile::tempdir().unwrap();
         let (reader, writer) = retention_stderr_pipe();
         drop(reader);
         assert_eq!(
-            retention_report_in_child(log_cap_error, &writer, dir.path()),
+            retention_report_in_child(
+                "verify::tests::log_cap_retention_report_survives_a_stderr_without_a_reader",
+                "log cap",
+                &writer,
+                dir.path()
+            ),
             RetentionChild::Returned
         );
         assert_eq!(files_in(dir.path()).len(), 1, "the log was not kept");
@@ -2487,6 +2527,7 @@ mod tests {
     /// drains: the `eprintln!` report waited for it forever.
     #[test]
     fn log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe() {
+        retention_child_entry();
         let dir = tempfile::tempdir().unwrap();
         let (reader, writer) = retention_stderr_pipe();
         // Fill the pipe in non-blocking mode, then make the write end
@@ -2508,7 +2549,12 @@ mod tests {
             assert_eq!(libc::fcntl(writer.as_raw_fd(), libc::F_SETFL, 0), 0);
         }
         assert_eq!(
-            retention_report_in_child(log_cap_error, &writer, dir.path()),
+            retention_report_in_child(
+                "verify::tests::log_cap_retention_report_does_not_wait_on_a_full_stderr_pipe",
+                "log cap",
+                &writer,
+                dir.path()
+            ),
             RetentionChild::Returned
         );
         drop(reader);
@@ -2521,17 +2567,17 @@ mod tests {
     #[test]
     fn retention_report_reads_as_before_when_stderr_has_room() {
         use std::io::Read as _;
-        fn timeout_error() -> Error {
-            Error::new(super::super::container::RunTimeoutMarker)
-        }
-        for (primary, class) in [
-            (log_cap_error as fn() -> Error, "log cap"),
-            (timeout_error, "timeout"),
-        ] {
+        retention_child_entry();
+        for class in ["log cap", "timeout"] {
             let dir = tempfile::tempdir().unwrap();
             let (reader, writer) = retention_stderr_pipe();
             assert_eq!(
-                retention_report_in_child(primary, &writer, dir.path()),
+                retention_report_in_child(
+                    "verify::tests::retention_report_reads_as_before_when_stderr_has_room",
+                    class,
+                    &writer,
+                    dir.path()
+                ),
                 RetentionChild::Returned,
                 "{class}"
             );
