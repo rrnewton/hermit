@@ -31,11 +31,8 @@ use crate::random::getrandom_request_len;
 use crate::random::validate_getrandom_flags;
 use crate::random::write_random_chunk;
 use crate::record_or_replay::RecordOrReplay;
-use crate::syscalls::threads::sigchld_eligibility_is_tracked;
-use crate::tool_global::SigchldEligibilityRequest;
 use crate::tool_global::create_session;
 use crate::tool_global::set_process_group;
-use crate::tool_global::sigchld_eligibility;
 use crate::tool_local::Detcore;
 use crate::types::DetPid;
 
@@ -394,28 +391,6 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Ok(0)
             }
             libc::PR_GET_TIMERSLACK => Ok(guest.thread_state().timer_slack_ns as i64),
-            // The kernel sends a parent-death signal itself, when the thread
-            // that forked the caller exits, at the host instant of that exit.
-            // The scheduler must not count such a `SIGCHLD` as one sent from
-            // outside the container, so it is told which processes armed one
-            // (`Scheduler::note_parent_death_sigchld`; round-8 High 3 on
-            // https://github.com/rrnewton/hermit/pull/3361).
-            libc::PR_SET_PDEATHSIG => {
-                let signal = call.arg2();
-                let result = self.passthrough(guest, call.into()).await;
-                if result.is_ok()
-                    && signal == libc::SIGCHLD as u64
-                    && sigchld_eligibility_is_tracked(guest)
-                {
-                    let thread = guest.thread_state().dettid;
-                    sigchld_eligibility(
-                        guest,
-                        SigchldEligibilityRequest::ParentDeathSignal { thread },
-                    )
-                    .await;
-                }
-                result
-            }
             option
                 if guest.config().backend.virtualizes_capability_prctls
                     && is_backend_virtualized_capability_prctl(option) =>

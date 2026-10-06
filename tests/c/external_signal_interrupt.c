@@ -13,7 +13,7 @@
  *            [ignored|blocked|winch|tstp|ign2caught|caught2ign|chldlate|chldign|
  *             chldkill|chldthrexit|chldpend|stealgrp|stealkill|stealthrexit|
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
- *             extchld|extchldreaped|extchldlive|chldflood]
+ *             extchld|extchldreaped|extchldlive|chldflood] [held]
  *        external_signal_interrupt sigsuspend creator
  *        external_signal_interrupt poll pdeathchld
  *        external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing
@@ -123,6 +123,18 @@
  *            waiting, so it takes the SIGCHLD and its wait ends with EINTR.
  *            For an untimed wait the sibling then wakes the futex, so a wait
  *            that lost the signal to the sibling returns 0 instead of hanging.
+ *
+ * `held` states the expectation of a Hermit whose gated waits hold a caught
+ * SIGCHLD until the call returns, as Hermit's main branch does: the SIGCHLD
+ * cannot end the wait, so the wait needs another way to end. It goes with
+ * the `exit` sender and futex, poll or epoll (a `spin*` role included), or
+ * with chldlate, chldkill and chldthrexit. With `exit`, the call gets the
+ * 300 ms timeout of a must-not-wake option, timed or not. With a SIGCHLD
+ * flip, the sibling does not wait for the handler: as for chldign, a `timed`
+ * wait returns at its 300 ms deadline, and the sibling wakes an untimed one
+ * 200 ms after the signal. Either way the handler runs once the call has
+ * returned, so the RESULT line reports it. Linux instead ends the wait with
+ * EINTR when the SIGCHLD arrives, so these cells hold only under Hermit.
  *
  * `warm` issues the waiting call's own system-call instruction once before the
  * wait, so a backend that patches a call site on its first execution (LiteInst)
@@ -237,6 +249,8 @@ static int quiet = 0;
 enum flip { FLIP_NONE, IGN2CAUGHT, CAUGHT2IGN, CHLDLATE, CHLDIGN, CHLDKILL, CHLDTHREXIT, CHLDPEND };
 static enum flip flip = FLIP_NONE;
 static int flip_timed = 0;
+/* The `held` option (see the usage comment). */
+static int held = 0;
 /* A sibling that does not block SIGCHLD (see the usage comment). */
 enum role { ROLE_NONE, ROLE_STEAL, ROLE_FORK, ROLE_SPIN };
 static enum role role = ROLE_NONE;
@@ -370,7 +384,7 @@ static void flip_sender(void) {
     case FLIP_NONE:
       _exit(97);
   }
-  if (flip_catches()) {
+  if (flip_catches() && !held) {
     /* Wake only after the handler ran, so a wait the signal did not end is
      * not rescued by this wake. */
     wait_for_handler();
@@ -902,6 +916,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "extchldreaped")) extchld = EXTCHLD_REAPED;
     else if (!strcmp(argv[i], "extchldlive")) extchld = EXTCHLD_LIVE;
     else if (!strcmp(argv[i], "chldflood")) chldflood = 1;
+    else if (!strcmp(argv[i], "held")) held = 1;
     else return 2;
   }
   if (ignored + blocked + (sent_signal == SIGWINCH) + tstp + (flip != FLIP_NONE) + options + usr2 +
@@ -940,6 +955,9 @@ int main(int argc, char **argv) {
                                   (!is_rawselect && strcmp(call, "select"))))
     return 2;
   if (chldflood && (strcmp(sender, "external") || restart || warm || !(is_poll || (is_futex && timed))))
+    return 2;
+  if (held && !((from_exit && (is_futex || is_poll || is_epoll)) || flip == CHLDLATE ||
+                flip == CHLDKILL || flip == CHLDTHREXIT))
     return 2;
   int report_elapsed = quiet || flip != FLIP_NONE || from_exit || role != ROLE_NONE || warm ||
                        (is_wait && restart) || chldflood;
@@ -1107,13 +1125,14 @@ int main(int argc, char **argv) {
   errno = 0;
   /* A must-not-wake wait, or a timed disposition-change wait, has the short
    * timeout; a readiness wait is otherwise unbounded. */
-  int bounded = quiet || (flip != FLIP_NONE && timed) || chldflood;
+  int bounded = quiet || (flip != FLIP_NONE && timed) || chldflood || (held && from_exit);
   if (is_futex) {
     struct timespec timeout = {10, 0};
-    if (quiet || flip != FLIP_NONE || role == ROLE_STEAL || role == ROLE_FORK || chldflood)
+    if (quiet || flip != FLIP_NONE || role == ROLE_STEAL || role == ROLE_FORK || chldflood ||
+        held)
       timeout = (struct timespec){0, QUIET_TIMEOUT_MS * 1000000L};
     ret = syscall(SYS_futex, &futex_word, FUTEX_WAIT_PRIVATE, 0,
-                  timed || quiet ? &timeout : NULL, NULL, 0);
+                  timed || quiet || (held && from_exit) ? &timeout : NULL, NULL, 0);
   } else if (is_sem) {
     struct timespec deadline;
     clock_gettime(CLOCK_REALTIME, &deadline);

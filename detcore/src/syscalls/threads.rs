@@ -49,7 +49,6 @@ use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::robust_list;
 use crate::tool_global::FutexAction;
 use crate::tool_global::ResumeStatus;
-use crate::tool_global::SigchldEligibilityRequest;
 use crate::tool_global::await_exact_child_physical_exit;
 use crate::tool_global::cancel_exec;
 use crate::tool_global::child_tid_clear_address;
@@ -61,7 +60,6 @@ use crate::tool_global::process_group;
 use crate::tool_global::ready_child_wait;
 use crate::tool_global::resource_request;
 use crate::tool_global::set_child_tid_address;
-use crate::tool_global::sigchld_eligibility;
 use crate::tool_global::thread_is_live;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::wait_for_child_lifecycle;
@@ -1034,79 +1032,6 @@ pub(crate) mod signal_state_read_seam {
     }
 }
 
-/// Whether the scheduler tracks which pending `SIGCHLD`s a gated wait may count.
-/// This must match the scheduler's own condition (`Scheduler::sigchld_eligibility`).
-pub(crate) fn sigchld_eligibility_is_tracked<T, G>(guest: &G) -> bool
-where
-    T: RecordOrReplay,
-    G: Guest<Detcore<T>>,
-{
-    let config = guest.config();
-    config.sequentialize_threads && config.backend_supports_blocked_wait_signal_interruption
-}
-
-/// The part of a gated wait's `pending` set that may interrupt it, given the
-/// signals that could (`interrupting`): `pending` without a `SIGCHLD` that the
-/// scheduler has not made eligible
-/// (https://github.com/rrnewton/hermit/issues/3146).
-///
-/// The kernel posts `SIGCHLD` to a parent when a child exits, at a moment set by
-/// host timing, so `/proc` can report one that the schedule has not reached yet.
-/// The scheduler makes a `SIGCHLD` eligible at its own ordering points: a guest
-/// send in the sender's turn, its own `ChildExit` send at a granted
-/// `exit_group`'s time, and the logical death of a child that had no
-/// `ChildExit` send. Those count here, and so does every `SIGCHLD` pending for a
-/// process that never had a child, which no child can have sent; that is how a
-/// `SIGCHLD` sent from outside the container interrupts such a process's wait
-/// (`Scheduler::sigchld_eligible`). Any other pending `SIGCHLD` does not end the
-/// wait: it stays pending in the kernel, or is held by the backend if it stopped
-/// an injection before `KernelSignalWait::block` took effect, and it counts at a
-/// later turn once the scheduler makes it eligible. If the wait ends first, it
-/// is delivered after the call returns, once the guest's mask is put back. A
-/// `SIGCHLD` sent from outside the container to a process that has had a child
-/// is not made eligible by its arrival, so it ends a gated wait only together
-/// with one that the scheduler makes eligible. The waits of `select` and
-/// `pselect6` are not gated and do not call this: any pending `SIGCHLD` that
-/// could interrupt them does, as on Linux (`KernelSignalWait::for_select`).
-///
-/// The scheduler is asked whenever `SIGCHLD` could interrupt the wait, pending or
-/// not, so whether the question is asked depends only on the guest's mask and
-/// dispositions, never on when the host posted the signal. See the `SIGCHLD`
-/// eligibility section of `Scheduler` for why the answer is deterministic.
-pub(crate) async fn eligible_pending_signals<G, T>(
-    guest: &mut G,
-    pending: KernelSigset,
-    interrupting: KernelSigset,
-) -> KernelSigset
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let sigchld = kernel_sigset_bit(libc::SIGCHLD);
-    if interrupting & sigchld == 0 || !sigchld_eligibility_is_tracked(guest) {
-        return pending;
-    }
-    let thread = guest.thread_state().dettid;
-    let request = SigchldEligibilityRequest::Take {
-        thread,
-        pending: pending & sigchld != 0,
-    };
-    if sigchld_eligibility(guest, request).await {
-        // The thread's next handler retires the reservation this answer may
-        // have used (`Detcore::pre_handler_hook`).
-        guest.thread_state_mut().sigchld_answered = true;
-        pending
-    } else {
-        if pending & sigchld != 0 {
-            trace!(
-                "[detcore, dtid {}] a pending SIGCHLD is not eligible yet; it does not interrupt the wait",
-                thread
-            );
-        }
-        pending & !sigchld
-    }
-}
-
 pub(super) fn blocked_signal_mask() -> KernelSigset {
     // Preserve libc's definition of the blockable set (notably its reserved
     // NPTL signals) while converting the result to the kernel's one-word ABI.
@@ -1836,9 +1761,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // a blocked, ignored, or default-ignored signal leaves the wait
                         // parked until its wakeup or its original deadline. As in
                         // Linux, one already pending when the value matches ends the
-                        // wait at once with the futex's restart errno; a `SIGCHLD`
-                        // counts only once the scheduler made it eligible
-                        // (`eligible_pending_signals`).
+                        // wait at once with the futex's restart errno. A `SIGCHLD`
+                        // never ends it: it stays pending until the call returns,
+                        // because the kernel also posts one for a child event at a
+                        // moment set by host timing
+                        // (https://github.com/rrnewton/hermit/issues/3146).
                         //
                         // The same check decides a wait the scheduler woke for a
                         // signal. The scheduler commits such a wake without this
@@ -1870,14 +1797,9 @@ impl<T: RecordOrReplay> Detcore<T> {
                             // A timed `FUTEX_WAIT` lets a default job-control stop
                             // wait for its deadline (`KernelSignalState::interrupting_wait`).
                             let defers_default_stops = call.restart_rearms_timeout();
-                            let interrupting =
-                                state.interrupting_wait(state.blocked, defers_default_stops);
-                            let pending = eligible_pending_signals(
-                                guest,
-                                state.pending_interrupting(state.blocked, defers_default_stops),
-                                interrupting,
-                            )
-                            .await;
+                            let pending = state
+                                .pending_interrupting(state.blocked, defers_default_stops)
+                                & !kernel_sigset_bit(libc::SIGCHLD);
                             if pending != 0 {
                                 let errno = call.kernel_restart_errno();
                                 trace!(

@@ -30,10 +30,18 @@
 //! one while a waiter is parked. The disposition that counts is the one in
 //! force when the signal arrives, not the one when the wait began: a signal
 //! caught after the wait parked ends it near the 100 ms send, and one ignored
-//! after the wait parked leaves it running to its original deadline. A
-//! SIGCHLD from an exiting child ends a wait whose handler is installed,
-//! including a child that dies by SIGKILL or by its only thread calling `exit`,
-//! whose SIGCHLD comes from the kernel alone.
+//! after the wait parked leaves it running to its original deadline.
+//!
+//! A SIGCHLD never ends a gated wait (a futex wait, `poll` or `epoll_wait`),
+//! whoever sends it: Hermit holds a caught SIGCHLD until the call returns, and
+//! the handler runs then, as on Hermit's main branch. Linux instead returns
+//! EINTR when the SIGCHLD arrives. This gives up the SIGCHLD part of
+//! https://github.com/rrnewton/hermit/issues/3146 until Reverie reports every
+//! delivery it holds. The `held` cells assert it: a child's exit, including a
+//! child that dies by SIGKILL or by its only thread calling `exit`, leaves the
+//! wait running to its 300 ms deadline or its wakeup, and the handler has run
+//! by the `RESULT` line. `select` and the `select` system call are not gated,
+//! so a caught SIGCHLD still ends them with EINTR, as on Linux.
 //!
 //! A child's SIGCHLD is queued on its parent process and taken by one thread
 //! that does not block it; Linux offers it first to the thread that forked the
@@ -41,8 +49,9 @@
 //! and check both the waiter's result and which thread's handler ran. A
 //! runnable sibling that forks the child takes the signal, and the waiter keeps
 //! waiting to its original deadline or its wakeup. A sibling that forks the
-//! child and then parks in a wait of its own takes it there. A waiting main
-//! thread that forks the child takes it although a sibling is running.
+//! child and then parks in a wait of its own holds it until that wait returns.
+//! A waiting main thread that forks the child while a sibling spins does not
+//! take it: the sibling does, and the sibling's wake ends the wait.
 //!
 //! Every cell with only Hermit-internal senders runs under strict verification
 //! (`--verify --verify-strict`) and requires a matched strict report.
@@ -65,16 +74,10 @@
 //!   Hermit's deadlock detector ends the run before the signal can arrive.
 //! - External signals to blocked `wait4`/`waitid`. Those still do not observe
 //!   a host-queued signal; that is a separate defect in the same issue.
-//! - A host-timed kernel SIGCHLD that the scheduler has not made eligible yet.
-//!   The detcore unit tests cover that filter; every cell here also passes
-//!   without it.
-//! - A caught SIGCHLD sent from outside Hermit to a `poll`, `epoll_wait`,
-//!   `ppoll`, futex, or `rt_sigtimedwait` waiter whose process has had a child.
-//!   Those waits keep the filter above, which cannot tell such a SIGCHLD from
-//!   the kernel's report of a child event, so it does not end them until the
-//!   scheduler makes a SIGCHLD eligible, where Linux returns EINTR at once.
-//!   Hermit main did not end `poll` or `epoll_wait` for it either; only the
-//!   select waits are asserted above.
+//! - A caught SIGCHLD sent from outside Hermit to a gated wait. It is held until
+//!   the call returns, like every SIGCHLD (above), where Linux returns EINTR at
+//!   once; Hermit main did not end `poll` or `epoll_wait` for it either. Only
+//!   the select waits, which are not gated, are asserted above.
 //! - The `spin` role in polling mode. Between probes a polling waiter blocks
 //!   every signal, so the running sibling takes the SIGCHLD that Linux gives the
 //!   waiting thread that forked the child.
@@ -153,16 +156,17 @@ const EXIT_WAKE_FLOOR_MS: u64 = 100;
 const SIGCHLD_TRIALS: usize = 3;
 /// A role cell's SIGCHLD handler ran once, on the sibling.
 const HANDLED_BY_SIBLING: &str = "HANDLER main=0 sibling=1";
-/// A role cell's SIGCHLD handler ran once, on the main thread.
-const HANDLED_BY_MAIN: &str = "HANDLER main=1 sibling=0";
 /// When the steal role's untimed wait ends: the sibling forks at 100 ms and
 /// wakes the futex 100 ms after the handler ran. Measured at 202-205 ms on
 /// 2026-09-29, on both backends and in both futex modes.
 const STEAL_WAKE_MS: u64 = 2 * SIGNAL_DELAY_MS;
 /// Upper bound on the spin role's wake. Natively the wait ends at the child's
-/// death, about 100 ms in. Under Hermit the spinning sibling keeps the run slot
-/// until its timeslice ends, and the wait ended at 450-652 ms on 2026-09-29 on
-/// both backends. A wait the SIGCHLD did not end runs to its 10 s timeout.
+/// death, about 100 ms in. Under Hermit the spinning sibling takes the SIGCHLD
+/// and then wakes the futex: the wait ended at 456-457 ms for the `spin` and
+/// `spinthrexit` deaths and at 254 ms for `spinkill` on 2026-10-05. Before
+/// round 9 of https://github.com/rrnewton/hermit/pull/3361, when the SIGCHLD
+/// ended the main thread's wait with EINTR, it ended at 450-652 ms on
+/// 2026-09-29 and at 454-656 ms on 2026-10-05.
 const SPIN_WAKE_BOUND_MS: u64 = 1_000;
 /// When a wait that the signal interrupted near 100 ms and that Linux then
 /// restarted ends: 100 ms after the signal, when the `thread` sender wakes the
@@ -715,8 +719,10 @@ fn assert_cell(backend: &str, mode: FutexMode, args: &[&str], external: bool, ex
     assert_verified(backend, mode, args, &run);
 }
 
-/// A signal that must not end the wait: the call returns its timeout result, the
-/// handler never ran, and the call took its full 300 ms timeout.
+/// A signal that must not end the wait: the call returns `expected`, its timeout
+/// result or the result of a wakeup the guest schedules at 300 ms, and it took
+/// those 300 ms. A must-not-wake cell expects `handler=0`; a `held` cell expects
+/// `handler=1`, from the handler that ran once the call returned.
 fn assert_quiet_cell(backend: &str, mode: FutexMode, args: &[&str], expected: &str) {
     let run = run_cell(backend, mode, args, false);
     assert!(
@@ -1285,19 +1291,18 @@ fn child_waits_are_interrupted_by_a_live_sibling_process_signal() {
 
 /// A signal whose disposition a sibling changes to caught while the waiter is
 /// parked ends the wait with EINTR near the send, timed or not, as Linux does:
-/// SIGUSR1 turned from SIG_IGN to a handler, and SIGCHLD turned from its
-/// default to a handler before a child exits. Before
+/// SIGUSR1 turned from SIG_IGN to a handler. Before
 /// https://github.com/rrnewton/hermit/pull/3361 stopped filtering on the
 /// disposition read when the wait began, the precise wait ran to its timeout
-/// and the untimed one never ended.
+/// and the untimed one never ended. The SIGCHLD half of this cell (`chldlate`)
+/// moved to `assert_caught_sigchld_is_held_by_futex_wait`: a SIGCHLD no longer
+/// ends a gated wait.
 fn assert_caught_after_parking_ends_futex_wait(backend: &str) {
     for mode in [FutexMode::Precise, FutexMode::Polling] {
-        for flip in ["ign2caught", "chldlate"] {
-            for timed in [None, Some("timed")] {
-                let mut args = vec!["futex", "thread", flip];
-                args.extend(timed);
-                assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
-            }
+        for timed in [None, Some("timed")] {
+            let mut args = vec!["futex", "thread", "ign2caught"];
+            args.extend(timed);
+            assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
         }
     }
 }
@@ -1307,27 +1312,43 @@ fn ptrace_futex_wait_is_ended_by_a_signal_caught_after_it_parked() {
     assert_caught_after_parking_ends_futex_wait("ptrace");
 }
 
-/// As `chldlate`, but the child dies without `exit_group`: by SIGKILL, or by its
-/// only thread calling `exit`. Hermit's scheduler then sends no child-exit
-/// SIGCHLD of its own, so the only SIGCHLD is the kernel's, and the scheduler
-/// makes it eligible at the child's logical death. The wait must still end with
-/// EINTR near the death, timed or not, under strict verification, as it does on
-/// Linux.
-fn assert_child_death_without_exit_group_ends_futex_wait(backend: &str) {
-    for mode in [FutexMode::Precise, FutexMode::Polling] {
-        for flip in ["chldkill", "chldthrexit"] {
-            for timed in [None, Some("timed")] {
-                let mut args = vec!["futex", "thread", flip];
-                args.extend(timed);
-                assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
-            }
-        }
+/// A SIGCHLD whose disposition a sibling changes to caught while the waiter is
+/// parked, from a child that then dies by `exit_group` (`chldlate`), by SIGKILL
+/// (`chldkill`), or by its only thread calling `exit` (`chldthrexit`), does not
+/// end the futex wait: Hermit holds it until the call returns (the guest's
+/// `held` option). A timed wait returns ETIMEDOUT at its 300 ms deadline, and
+/// an untimed one is ended by the sibling's FUTEX_WAKE 200 ms after the signal,
+/// which precise mode reports as 0 and polling mode as EAGAIN, as in
+/// `assert_ignored_after_parking_leaves_futex_wait`. The handler has run by
+/// the `RESULT` line, and each cell is strict-verified. Linux instead ends the
+/// wait with EINTR near the child's death; Hermit main holds the SIGCHLD too.
+/// Until round 9 of https://github.com/rrnewton/hermit/pull/3361 these cells
+/// asserted that EINTR. Each futex mode is its own test, to stay inside the
+/// per-test wall and CPU bounds.
+fn assert_caught_sigchld_is_held_by_futex_wait(backend: &str, mode: FutexMode) {
+    for flip in ["chldlate", "chldkill", "chldthrexit"] {
+        assert_quiet_cell(
+            backend,
+            mode,
+            &["futex", "thread", flip, "held", "timed"],
+            "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=1",
+        );
+        let untimed = match mode {
+            FutexMode::Precise => "RESULT call=futex ret=0 errno=none handler=1",
+            FutexMode::Polling => "RESULT call=futex ret=-1 errno=EAGAIN handler=1",
+        };
+        assert_quiet_cell(backend, mode, &["futex", "thread", flip, "held"], untimed);
     }
 }
 
 #[test]
-fn ptrace_futex_wait_is_ended_by_the_sigchld_of_a_child_that_dies_without_exit_group() {
-    assert_child_death_without_exit_group_ends_futex_wait("ptrace");
+fn ptrace_precise_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns() {
+    assert_caught_sigchld_is_held_by_futex_wait("ptrace", FutexMode::Precise);
+}
+
+#[test]
+fn ptrace_polling_futex_wait_holds_a_sigchld_caught_after_it_parked_until_it_returns() {
+    assert_caught_sigchld_is_held_by_futex_wait("ptrace", FutexMode::Polling);
 }
 
 /// A signal whose disposition a sibling changes to ignored while the waiter is
@@ -1360,37 +1381,68 @@ fn ptrace_futex_wait_is_not_ended_by_a_signal_ignored_after_it_parked() {
     assert_ignored_after_parking_leaves_futex_wait("ptrace");
 }
 
-/// A caught SIGCHLD from a child that exits during the wait ends a timed or
-/// untimed futex wait with EINTR near the exit. Hermit's scheduler delivers the
-/// child-exit SIGCHLD at a deterministic point; the kernel's own SIGCHLD for
-/// the same exit arrives at a host-timed moment and must not decide the result,
-/// so each cell is strict-verified `SIGCHLD_TRIALS` times. Each futex mode is
-/// its own test, to stay inside the per-test wall and CPU bounds.
-fn assert_child_exit_ends_futex_wait(backend: &str, mode: FutexMode) {
+/// A caught SIGCHLD from a child that exits during the wait does not end a
+/// futex wait: Hermit holds it until the call returns. With the guest's `held`
+/// option the wait has a 300 ms timeout, so it returns ETIMEDOUT at that
+/// deadline, and the handler has run by the `RESULT` line. Linux instead ends
+/// the wait with EINTR near the exit; Hermit main holds the SIGCHLD too. The
+/// kernel posts its own SIGCHLD for the exit at a host-timed moment, which must
+/// not decide the result, so each cell is strict-verified `SIGCHLD_TRIALS`
+/// times. Until round 9 of https://github.com/rrnewton/hermit/pull/3361 these
+/// cells asserted EINTR near the exit, for a timed and an untimed wait; with
+/// `held` both waits have the same 300 ms timeout, so one cell covers them.
+/// Each futex mode is its own test, to stay inside the per-test wall and CPU
+/// bounds.
+fn assert_child_exit_sigchld_is_held_by_futex_wait(backend: &str, mode: FutexMode) {
     for _ in 0..SIGCHLD_TRIALS {
-        for timed in [None, Some("timed")] {
-            let mut args = vec!["futex", "exit"];
-            args.extend(timed);
-            assert_woken_cell(backend, mode, &args, EINTR_FUTEX);
+        assert_quiet_cell(
+            backend,
+            mode,
+            &["futex", "exit", "held"],
+            "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=1",
+        );
+    }
+}
+
+#[test]
+fn ptrace_precise_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns() {
+    assert_child_exit_sigchld_is_held_by_futex_wait("ptrace", FutexMode::Precise);
+}
+
+#[test]
+fn ptrace_polling_futex_wait_holds_the_sigchld_of_an_exiting_child_until_it_returns() {
+    assert_child_exit_sigchld_is_held_by_futex_wait("ptrace", FutexMode::Polling);
+}
+
+/// The same child-exit SIGCHLD does not end `poll` or `epoll_wait` either:
+/// with `held` each returns 0 at its 300 ms timeout, and the handler has run by
+/// the `RESULT` line, each strict-verified `SIGCHLD_TRIALS` times. Until round
+/// 9 of https://github.com/rrnewton/hermit/pull/3361 these cells asserted EINTR
+/// near the exit, as Linux returns.
+fn assert_child_exit_sigchld_is_held_by_readiness_waits(backend: &str) {
+    for _ in 0..SIGCHLD_TRIALS {
+        for call in ["poll", "epoll"] {
+            assert_quiet_cell(
+                backend,
+                FutexMode::Precise,
+                &[call, "exit", "held"],
+                &format!("RESULT call={call} ret=0 errno=none handler=1"),
+            );
         }
     }
 }
 
 #[test]
-fn ptrace_precise_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
-    assert_child_exit_ends_futex_wait("ptrace", FutexMode::Precise);
+fn ptrace_poll_and_epoll_hold_the_sigchld_of_an_exiting_child_until_they_return() {
+    assert_child_exit_sigchld_is_held_by_readiness_waits("ptrace");
 }
 
-#[test]
-fn ptrace_polling_futex_wait_is_ended_by_a_caught_sigchld_from_an_exiting_child() {
-    assert_child_exit_ends_futex_wait("ptrace", FutexMode::Polling);
-}
-
-/// The same child-exit SIGCHLD ends `poll`, `epoll_wait`, and both `select`s
-/// with EINTR near the exit, each strict-verified `SIGCHLD_TRIALS` times.
-fn assert_child_exit_ends_readiness_waits(backend: &str, calls: [&str; 2]) {
+/// The same child-exit SIGCHLD ends both `select`s with EINTR near the exit,
+/// as on Linux, each strict-verified `SIGCHLD_TRIALS` times: select and
+/// pselect6 are not gated.
+fn assert_child_exit_ends_selects(backend: &str) {
     for _ in 0..SIGCHLD_TRIALS {
-        for call in calls {
+        for call in ["select", "rawselect"] {
             assert_woken_cell(
                 backend,
                 FutexMode::Precise,
@@ -1402,13 +1454,8 @@ fn assert_child_exit_ends_readiness_waits(backend: &str, calls: [&str; 2]) {
 }
 
 #[test]
-fn ptrace_poll_and_epoll_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
-    assert_child_exit_ends_readiness_waits("ptrace", ["poll", "epoll"]);
-}
-
-#[test]
 fn ptrace_selects_are_ended_by_a_caught_sigchld_from_an_exiting_child() {
-    assert_child_exit_ends_readiness_waits("ptrace", ["select", "rawselect"]);
+    assert_child_exit_ends_selects("ptrace");
 }
 
 /// A child's SIGCHLD goes to the thread that forked it when that thread does
@@ -1490,13 +1537,16 @@ fn ptrace_polling_untimed_futex_wait_keeps_waiting_when_a_runnable_sibling_takes
 }
 
 /// As above, but the sibling that forks the child, which dies 100 ms later,
-/// then parks in a 300 ms FUTEX_WAIT of its own. The SIGCHLD ends the sibling's
-/// wait with EINTR near 100 ms, and the main thread's timed wait runs to
-/// ETIMEDOUT at its 300 ms deadline. Before
-/// https://github.com/rrnewton/hermit/pull/3361 was fixed, a child that called
-/// `exit_group` had its SIGCHLD sent to the main thread instead, ending the
-/// main thread's wait at 100 ms and leaving the sibling's to time out.
-fn assert_parked_forker_takes_the_sigchld(backend: &str) {
+/// then parks in a 300 ms FUTEX_WAIT of its own. The SIGCHLD does not end the
+/// sibling's wait: Hermit holds it until that call returns, so the sibling's
+/// wait returns ETIMEDOUT at its 300 ms deadline and its handler runs then.
+/// The main thread's timed wait also runs to ETIMEDOUT at its 300 ms deadline.
+/// Linux instead ends the sibling's wait with EINTR near 100 ms, and until
+/// round 9 of https://github.com/rrnewton/hermit/pull/3361 this cell asserted
+/// that. Before https://github.com/rrnewton/hermit/pull/3361 was fixed, a child
+/// that called `exit_group` had its SIGCHLD sent to the main thread instead,
+/// ending the main thread's wait at 100 ms.
+fn assert_parked_forker_holds_the_sigchld(backend: &str) {
     for mode in [FutexMode::Precise, FutexMode::Polling] {
         for death in ["forkgrp", "forkkill", "forkthrexit"] {
             let args = ["futex", "thread", "timed", death];
@@ -1511,12 +1561,12 @@ fn assert_parked_forker_takes_the_sigchld(backend: &str) {
             let ms = run.sibling_ms();
             assert!(
                 run.line("SIBLING ")
-                    .is_some_and(|line| line.starts_with("SIBLING ret=-1 errno=EINTR ms="))
+                    .is_some_and(|line| line.starts_with("SIBLING ret=-1 errno=ETIMEDOUT ms="))
                     && ms.is_some_and(|ms| {
-                        (SIGNAL_DELAY_MS..SIGNAL_DELAY_MS + WAKE_SLACK_MS).contains(&ms)
+                        (QUIET_TIMEOUT_MS..QUIET_TIMEOUT_MS + QUIET_OVERSHOOT_MS).contains(&ms)
                     }),
-                "{backend} {mode:?} {args:?}: expected the sibling's wait to end with EINTR \
-                 near {SIGNAL_DELAY_MS} ms, not after {ms:?} ms\n{}",
+                "{backend} {mode:?} {args:?}: expected the sibling's wait to run to \
+                 ETIMEDOUT at its {QUIET_TIMEOUT_MS} ms deadline, not end after {ms:?} ms\n{}",
                 run.describe()
             );
         }
@@ -1524,46 +1574,44 @@ fn assert_parked_forker_takes_the_sigchld(backend: &str) {
 }
 
 #[test]
-fn ptrace_futex_wait_of_the_thread_that_forked_the_child_takes_its_sigchld() {
-    assert_parked_forker_takes_the_sigchld("ptrace");
+fn ptrace_futex_wait_of_the_thread_that_forked_the_child_holds_its_sigchld_until_it_returns() {
+    assert_parked_forker_holds_the_sigchld("ptrace");
 }
 
-/// The thread that forked the child takes its SIGCHLD while waiting, although
-/// a sibling that does not block SIGCHLD is running. Here the main thread forks
-/// a child that dies after 100 ms and waits, while a sibling spins in user code,
-/// with no system calls, until the handler has run and then, for an untimed
-/// wait, wakes the futex. The main thread's wait ends with EINTR, timed or not,
-/// within `SPIN_WAKE_BOUND_MS`. Before
-/// https://github.com/rrnewton/hermit/pull/3361 was fixed the spinning sibling
-/// took the SIGCHLD: an untimed wait was ended only by the sibling's wake, and a
-/// timed one ran to its 10 s timeout. Precise mode only; see the module
-/// documentation for polling mode. The untimed and the timed (`timed`) cells
-/// are separate tests, so that each stays inside the per-test CPU bound with
-/// room to spare.
-fn assert_waiting_forker_takes_the_sigchld(backend: &str, timed: Option<&str>) {
+/// The thread that forked the child does not take its SIGCHLD while it waits,
+/// although Linux offers the signal to that thread first. Here the main thread
+/// forks a child that dies after 100 ms and waits with no timeout, while a
+/// sibling that does not block SIGCHLD spins in user code, with no system
+/// calls, until a handler has run, and then wakes the futex. The handler runs
+/// once, on the sibling, and the sibling's wake ends the main thread's wait,
+/// which returns 0 within `SPIN_WAKE_BOUND_MS` for every death: at 456-457 ms
+/// when the child calls `exit_group` or its only thread calls `exit`, and at
+/// 254 ms when it sends itself SIGKILL (measured on 2026-10-05). Linux instead
+/// ends the main thread's wait with EINTR near the child's death and runs the
+/// handler there. Until round 9 of https://github.com/rrnewton/hermit/pull/3361
+/// this cell asserted that EINTR and the main thread's handler, for an untimed
+/// and a timed (10 s) wait, in two tests. The sibling does not wake a timed
+/// wait, which now runs to its 10 s timeout (ETIMEDOUT at 10003 ms, measured
+/// on 2026-10-05), so only the untimed wait is tested. Hermit's main branch
+/// behaved the same way before https://github.com/rrnewton/hermit/pull/3361:
+/// the spinning sibling took the SIGCHLD there too. Precise mode only; see the
+/// module documentation for polling mode.
+fn assert_waiting_forker_leaves_the_sigchld_to_the_sibling(backend: &str) {
     for death in ["spin", "spinkill", "spinthrexit"] {
-        let mut args = vec!["futex", "exit"];
-        args.extend(timed);
-        args.push(death);
         assert_role_cell(
             backend,
             FutexMode::Precise,
-            &args,
-            EINTR_FUTEX,
-            HANDLED_BY_MAIN,
+            &["futex", "exit", death],
+            "RESULT call=futex ret=0 errno=none handler=1",
+            HANDLED_BY_SIBLING,
             EXIT_WAKE_FLOOR_MS..SPIN_WAKE_BOUND_MS,
         );
     }
 }
 
 #[test]
-fn ptrace_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
-    assert_waiting_forker_takes_the_sigchld("ptrace", None);
-}
-
-#[test]
-fn ptrace_precise_timed_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
-    assert_waiting_forker_takes_the_sigchld("ptrace", Some("timed"));
+fn ptrace_precise_futex_wait_leaves_its_childs_sigchld_to_a_running_sibling() {
+    assert_waiting_forker_leaves_the_sigchld_to_the_sibling("ptrace");
 }
 
 /// A thread other than the thread-group leader forks a child and waits for it in
@@ -1624,7 +1672,8 @@ fn ptrace_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend() {
 /// (the guest's 300 ms and 50 ms overshoot match `QUIET_TIMEOUT_MS` and
 /// `QUIET_OVERSHOOT_MS`) and the handler runs once afterwards. Round 7 of
 /// https://github.com/rrnewton/hermit/pull/3361 counted that SIGCHLD under its
-/// childless-process exception (round-8 High 3) and returned EINTR.
+/// childless-process exception (round-8 High 3) and returned EINTR. Round 9
+/// removed that exception: no SIGCHLD ends a gated wait.
 ///
 /// The cell runs `PDEATH_RUNS` times under `--strict` without `--verify`, and
 /// every trial of every run must keep its deadline. It is not strict-verified:

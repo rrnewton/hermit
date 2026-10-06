@@ -666,12 +666,14 @@ impl Scheduler {
                 self.blocked.sigchld_ready.insert(deferred);
                 self.run_queue.push_eager_io_repoll(deferred);
             } else {
-                // Where gated waits model interruption, send to the thread the
-                // kernel gives this shared-queue `SIGCHLD`: the child's creator
-                // (`tid`) if it does not block the signal, otherwise the next
-                // thread that does not. Only if that thread is a parked waiter
-                // is a wait woken (https://github.com/rrnewton/hermit/issues/3146).
-                let target = if self.sigchld_eligibility {
+                // Where the scheduler models signal targets, send to the thread
+                // the kernel gives this shared-queue `SIGCHLD`: the child's
+                // creator (`tid`) if it does not block the signal, otherwise the
+                // next thread that does not. Only if that thread sleeps outside
+                // the schedule is it woken (`arm_signaled_background`); a gated
+                // wait holds `SIGCHLD` until its call returns
+                // (https://github.com/rrnewton/hermit/issues/3146).
+                let target = if self.models_signal_targets {
                     self.kernel_sigchld_target(parent, tid).unwrap_or(tid)
                 } else {
                     tid
@@ -685,12 +687,13 @@ impl Scheduler {
 
     /// The thread of `process` whose deferred `SIGCHLD` delivery
     /// (`blocked.sigchld_deferred`) a child-exit timer of `process` commits.
-    /// Where gated waits model interruption, any thread of the process may have
-    /// dequeued the shared-queue signal: the child's creator (`creator`) first,
-    /// as the kernel prefers it, then the others in thread-ID order. Otherwise
-    /// the timer targets the leader, so only the leader is looked up, as before.
+    /// Where the scheduler models signal targets, any thread of the process may
+    /// have dequeued the shared-queue signal: the child's creator (`creator`)
+    /// first, as the kernel prefers it, then the others in thread-ID order.
+    /// Otherwise the timer targets the leader, so only the leader is looked up,
+    /// as before.
     fn deferred_child_exit_sigchld(&self, process: DetPid, creator: DetTid) -> Option<DetTid> {
-        if !self.sigchld_eligibility {
+        if !self.models_signal_targets {
             return self
                 .blocked
                 .sigchld_deferred

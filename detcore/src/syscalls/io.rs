@@ -656,9 +656,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // cell lets the wait block signals under the one scratch-stack guard
         // (https://github.com/rrnewton/hermit/issues/3146). A restart resumes from
         // the remaining time written back below, so a default stop ends the wait
-        // as on Linux. A pending caught `SIGCHLD` ends it without waiting for the
-        // scheduler to make it eligible, as Linux ends it for one sent from
-        // outside the container (`KernelSignalWait::for_select`).
+        // as on Linux. Unlike the other waits, it holds no signal until the call
+        // returns, so a pending caught `SIGCHLD` ends it as on Linux, whoever
+        // sent it, at a turn that host timing can choose: a known gap that this
+        // wait had before (`KernelSignalWait::for_select`).
         let mut signals = (sigmask.is_none()
             && self.cfg.backend_supports_blocked_wait_signal_interruption)
             .then(|| KernelSignalWait::for_select(guest));
@@ -701,7 +702,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // A scheduler `Signaled` answer is only a hint here; the kernel's
                         // state decides. pselect6 returns ERESTARTNOHAND: EINTR after a
                         // handler, a restart with the remaining timeout after a stop.
-                        match signals.interrupted_with_state(guest).await {
+                        match signals.interrupted_with_state() {
                             Ok((false, state)) => turn_state = Some(state),
                             Ok((true, _)) => {
                                 self.write_pselect6_remaining(guest, call, deadline).await?;
@@ -928,9 +929,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // signals under the one scratch-stack guard
         // (https://github.com/rrnewton/hermit/issues/3146). A restart resumes from
         // the remaining time written back below, so a default stop ends the wait
-        // as on Linux. A pending caught `SIGCHLD` ends it without waiting for the
-        // scheduler to make it eligible, as Linux ends it for one sent from
-        // outside the container (`KernelSignalWait::for_select`).
+        // as on Linux. Unlike the other waits, it holds no signal until the call
+        // returns, so a pending caught `SIGCHLD` ends it as on Linux, whoever
+        // sent it, at a turn that host timing can choose: a known gap that this
+        // wait had before (`KernelSignalWait::for_select`).
         let mut signals = self
             .cfg
             .backend_supports_blocked_wait_signal_interruption
@@ -973,7 +975,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // A scheduler `Signaled` answer is only a hint here; the kernel's
                         // state decides. select returns ERESTARTNOHAND: EINTR after a
                         // handler, a restart with the remaining timeout after a stop.
-                        match signals.interrupted_with_state(guest).await {
+                        match signals.interrupted_with_state() {
                             Ok((false, state)) => turn_state = Some(state),
                             Ok((true, _)) => {
                                 self.write_select_remaining(guest, call, deadline).await?;

@@ -2038,30 +2038,6 @@ impl GlobalTool for GlobalState {
             GlobalRequest::ThreadIsLive(dtid) => {
                 R::ThreadIsLive(self.lock_rpc_scheduler(false).await.thread_is_live(dtid))
             }
-            GlobalRequest::SigchldEligibility(request) => {
-                let mut sched = self.lock_rpc_scheduler(false).await;
-                R::SigchldEligibility(match request {
-                    SigchldEligibilityRequest::Mark { thread, process } => {
-                        sched.mark_sigchld_eligible(thread, process);
-                        false
-                    }
-                    SigchldEligibilityRequest::Take { thread, pending } => {
-                        sched.sigchld_eligible(thread, pending)
-                    }
-                    SigchldEligibilityRequest::Flush { thread } => {
-                        sched.flush_sigchld_eligibility(thread);
-                        false
-                    }
-                    SigchldEligibilityRequest::Retire { thread } => {
-                        sched.retire_answered_sigchld(thread);
-                        false
-                    }
-                    SigchldEligibilityRequest::ParentDeathSignal { thread } => {
-                        sched.note_parent_death_sigchld(thread);
-                        false
-                    }
-                })
-            }
             GlobalRequest::ExactChildWaitState(parent, child) => R::ExactChildWaitState(
                 self.lock_rpc_scheduler(false)
                     .await
@@ -3554,10 +3530,6 @@ pub enum GlobalRequest {
     RecordHostMutation {
         path: String,
     },
-    /// Record or query `SIGCHLD` eligibility for gated waits; see
-    /// [`SigchldEligibilityRequest`]. Appended after `RecordHostMutation`, so
-    /// that adding it left every earlier variant's encoded tag unchanged.
-    SigchldEligibility(SigchldEligibilityRequest),
 }
 
 /// Responses from the global object
@@ -3640,9 +3612,6 @@ pub enum GlobalResponse {
     /// Appended at the end, so that adding it left every earlier variant's
     /// tag unchanged.
     RecordHostMutation(()),
-    /// Appended after `RecordHostMutation`, so that adding it left every
-    /// earlier variant's tag unchanged.
-    SigchldEligibility(bool),
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -4177,33 +4146,6 @@ where
     }
 }
 
-/// What a guest turn tells or asks the scheduler about a `SIGCHLD` that a gated
-/// wait may count (<https://github.com/rrnewton/hermit/issues/3146>). See the
-/// `SIGCHLD` eligibility section of `Scheduler` for why only a deterministic send
-/// makes one eligible.
-#[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
-pub enum SigchldEligibilityRequest {
-    /// A send in this turn succeeded: on `process`'s shared queue, or on
-    /// `thread`'s private queue when `process` is `None`.
-    Mark {
-        thread: DetTid,
-        process: Option<DetPid>,
-    },
-    /// A gated wait of `thread` can be interrupted by `SIGCHLD`; `pending` says
-    /// whether the kernel reports one pending. Answers whether it counts.
-    Take { thread: DetTid, pending: bool },
-    /// `thread` set `SIGCHLD` to `SIG_IGN` or `SIG_DFL` in this turn, which
-    /// discards every pending `SIGCHLD` of its process.
-    Flush { thread: DetTid },
-    /// `thread`, whose gated wait an earlier `Take` answered `true`, entered its
-    /// next handler for anything but a `SIGCHLD` delivery, so the signal that
-    /// answer named has been dequeued (`Scheduler::retire_answered_sigchld`).
-    Retire { thread: DetTid },
-    /// `thread` armed `SIGCHLD` as its parent-death signal
-    /// (`Scheduler::note_parent_death_sigchld`).
-    ParentDeathSignal { thread: DetTid },
-}
-
 /// Which actions we can take before/after a futex system call.
 #[derive(PartialEq, Debug, Eq, Clone, Copy, Serialize, Deserialize)]
 pub enum FutexAction {
@@ -4671,21 +4613,6 @@ where
     let response = send_and_update_time(guest, GlobalRequest::ThreadIsLive(dettid)).await;
     match response.1 {
         GlobalResponse::ThreadIsLive(live) => live,
-        _ => unreachable!(),
-    }
-}
-
-/// Record or query `SIGCHLD` eligibility for gated waits
-/// (<https://github.com/rrnewton/hermit/issues/3146>). Only a `Take` answer is
-/// meaningful; every other request answers `false`.
-pub async fn sigchld_eligibility<G, T>(guest: &mut G, request: SigchldEligibilityRequest) -> bool
-where
-    G: Guest<Detcore<T>>,
-    T: RecordOrReplay,
-{
-    let response = send_and_update_time(guest, GlobalRequest::SigchldEligibility(request)).await;
-    match response.1 {
-        GlobalResponse::SigchldEligibility(eligible) => eligible,
         _ => unreachable!(),
     }
 }
