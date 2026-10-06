@@ -1072,10 +1072,10 @@ impl NonblockableSyscall for reverie::syscalls::Poll {
     /// Known deviation: Linux's code is `ERESTART_RESTARTBLOCK`, and its restart
     /// (`do_restart_poll`) keeps the original deadline. Hermit cannot install the
     /// kernel's restart block for a wait it emulates, so it returns `ERESTARTNOHAND`.
-    /// The kernel then re-runs `poll` with its original arguments, at a ptrace stop
-    /// and, through Reverie's restart, at a LiteInst patched site, so a restart after
-    /// `SIGSTOP` or a caught-and-restarted stop starts the relative timeout again. A
-    /// default `SIGTSTP`, `SIGTTIN`, or `SIGTTOU` does not end the wait at all
+    /// The kernel then re-runs `poll` with its original arguments at the ptrace stop,
+    /// so a restart after `SIGSTOP` or a caught-and-restarted stop starts the
+    /// relative timeout again. A default `SIGTSTP`, `SIGTTIN`, or `SIGTTOU` does not
+    /// end the wait at all
     /// ([`restart_rearms_timeout`](NonblockableSyscall::restart_rearms_timeout)), so
     /// the deadline holds when Linux discards that stop. A timed futex wait has the
     /// same deviation (https://github.com/rrnewton/hermit/issues/3358).
@@ -2154,10 +2154,10 @@ impl KernelSignalWait {
     /// descriptor or `maxevents` first, and `do_sigtimedwait` copies its set
     /// first. So the probe runs even when such a signal is pending. A pending
     /// signal that the guest does not block stops the injection before the probe
-    /// runs, on ptrace and on LiteInst alike; when the stop is identified, the
-    /// signal is held as a precious one (`HeldKind::Precious`) and the probe runs
-    /// again, so its result stands, and the backend delivers the signal as the
-    /// call returns. If the probe would block, the caller's check that follows
+    /// runs; when the stop is identified, the signal is held as a precious one
+    /// (`HeldKind::Precious`) and the probe runs again, so its result stands, and
+    /// the backend delivers the signal as the call returns. If the probe would
+    /// block, the caller's check that follows
     /// counts the held signal (`interrupted_with_state`) and ends the wait with
     /// the restart errno. A stop that cannot be identified is held, as
     /// `inject_absorbing` describes.
@@ -2184,11 +2184,11 @@ impl KernelSignalWait {
     /// signal state. `retry_blocking_wait_with_kernel_signal_state`, which serves
     /// ppoll, poll, epoll_pwait, epoll_wait, rt_sigtimedwait and polling futex
     /// waits, runs nothing there; the `select` and `pselect6` waits write the
-    /// probe's timeout and descriptor sets into guest memory, which Detcore in a
-    /// tracer (ptrace, LiteInst's default runtime) does without resuming the
-    /// thread. So between the two reads the guest thread stays stopped and only
-    /// it can change its own mask, and with threads sequentialized no other guest
-    /// thread runs in its turn, so a signal that arrives meanwhile arrives at a
+    /// probe's timeout and descriptor sets into guest memory, which Detcore in the
+    /// ptrace tracer does without resuming the thread. So between the two reads
+    /// the guest thread stays stopped and only it can change its own mask, and
+    /// with threads sequentialized no other guest thread runs in its turn, so a
+    /// signal that arrives meanwhile arrives at a
     /// host-timed moment: sent from outside the guest, or posted by the kernel.
     /// A signal that the full mask blocks stays pending, cannot stop the
     /// injection, and is classified at the next turn's read, as one that arrives
