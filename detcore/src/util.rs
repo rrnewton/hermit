@@ -330,14 +330,55 @@ impl std::io::Write for RetryingStderr {
             return Ok(0);
         }
         loop {
-            // SAFETY: `write(2)` on fd 2 reads `buf.len()` bytes from `buf`,
-            // which is valid for that length, and writes no memory.
-            let n = unsafe { libc::write(libc::STDERR_FILENO, buf.as_ptr().cast(), buf.len()) };
-            if n >= 0 {
-                return Ok(n as usize);
-            }
-            let err = std::io::Error::last_os_error();
+            // ⚠️ UNDER --max-log-bytes A BLOCKING DESCRIPTOR MUST NOT WAIT INSIDE
+            // write(2). The bounded wait below starts only at `EAGAIN`, which a
+            // blocking pipe never returns: its write simply waits for a reader,
+            // forever when the reader has stopped, and the run never reaches the
+            // cap. While `--max-log-bytes` is in force (review of
+            // https://github.com/rrnewton/hermit/pull/3686) each attempt is one
+            // that cannot wait for a reader, so a full pipe answers `EAGAIN` and
+            // takes the same bounded path as a guest-set `O_NONBLOCK`. Without the
+            // cap this is the plain `write(2)` it always was.
+            let must_not_wait = crate::nonwaiting_write::diagnostics_must_not_wait();
+            let attempt = if must_not_wait {
+                crate::nonwaiting_write::write_without_waiting_for_a_reader(
+                    libc::STDERR_FILENO,
+                    buf,
+                )
+            } else {
+                // SAFETY: `write(2)` on fd 2 reads `buf.len()` bytes from `buf`,
+                // which is valid for that length, and writes no memory.
+                let n = unsafe { libc::write(libc::STDERR_FILENO, buf.as_ptr().cast(), buf.len()) };
+                if n >= 0 {
+                    Ok(n as usize)
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            };
+            let err = match attempt {
+                Ok(n) => return Ok(n),
+                Err(err) => err,
+            };
             match err.kind() {
+                // ⚠️ UNDER --max-log-bytes AN INTERRUPTED ATTEMPT IS RETRIED ONLY
+                // WITHIN THE SAME DEADLINE, AND GIVEN UP AS `TimedOut`. A seccomp
+                // policy can answer any call in the attempt with `EINTR` every
+                // time: answering `statx` and the file-type probes on fd 2 that
+                // way leaves the writer no type, and it returns `statx`'s
+                // `EINTR`. An unbounded retry then never returned to
+                // `DroppingStderr`, so the log was never charged and the cap
+                // never crossed. `Interrupted` itself must not escape either:
+                // `write_all`, behind `writeln!`, retries it forever. Without the
+                // cap an interrupted write is retried as it always was.
+                std::io::ErrorKind::Interrupted if must_not_wait => {
+                    if STDERR_DIAGNOSTIC_DEADLINE
+                        .checked_sub(stderr_blocked_for())
+                        .is_none()
+                    {
+                        return Err(std::io::ErrorKind::TimedOut.into());
+                    }
+                    continue;
+                }
                 std::io::ErrorKind::Interrupted => continue,
                 std::io::ErrorKind::WouldBlock => {
                     // ⚠️ BOUNDED, AND THE CLOCK IS PROCESS-WIDE. Waiting for a slow
@@ -384,6 +425,53 @@ impl std::io::Write for RetryingStderr {
         Ok(())
     }
 }
+
+/// [`RetryingStderr`] for output whose loss must not change how a capped run
+/// ends: hermit's own log when it goes to stderr, and the stack traces that
+/// `--stacktrace-event` and `--preemption-stacktrace` print there.
+///
+/// While `--max-log-bytes` is in force
+/// ([`crate::nonwaiting_write::diagnostics_must_not_wait`]), bytes that
+/// [`RetryingStderr`] gives up on -- its bounded deadline for a reader that is
+/// not draining is spent, or the reader is gone -- are reported as written.
+/// So a log line that stderr could not take still counts against the cap,
+/// as `BoundedWriter` counts the bytes it truncates, and a run whose stderr
+/// reader stopped still reaches the cap and exits 123 instead of running on
+/// uncounted; and a caller that unwraps the write does not panic.
+/// Without the cap this is exactly [`RetryingStderr`], errors included.
+pub struct DroppingStderr;
+
+impl std::io::Write for DroppingStderr {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match RetryingStderr.write(buf) {
+            Err(_) if crate::nonwaiting_write::diagnostics_must_not_wait() => Ok(buf.len()),
+            result => result,
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// `eprintln!` for detcore output that a capped run can print before the cap
+/// crosses: under `--max-log-bytes` the line goes through [`DroppingStderr`]
+/// and never waits beyond [`RetryingStderr`]'s deadline; otherwise this is the
+/// `eprintln!` it replaces, with the same arguments, so uncapped output is
+/// unchanged.
+macro_rules! capped_eprintln {
+    ($($arg:tt)*) => {
+        if crate::nonwaiting_write::diagnostics_must_not_wait() {
+            // One buffer, so the line is not split across several writes.
+            let mut line = format!($($arg)*);
+            line.push('\n');
+            let _ = std::io::Write::write_all(&mut crate::util::DroppingStderr, line.as_bytes());
+        } else {
+            eprintln!($($arg)*);
+        }
+    };
+}
+pub(crate) use capped_eprintln;
 
 #[cfg(test)]
 mod shared_stderr_origin_tests {

@@ -34,6 +34,9 @@ mod interp;
 pub mod liteinst_bootstrap;
 pub mod liteinst_record;
 mod metadata;
+/// Diagnostic writes that never wait for a reader; they live in detcore, whose
+/// own stderr writer reads the same flag.
+pub use detcore::nonwaiting_write;
 pub mod physical_exit_watch;
 pub mod proc_mount;
 mod ptrace_completion;
@@ -598,11 +601,19 @@ pub fn reserve_output_stdin_snapshot(stdin: Option<fs::File>) -> io::Result<()> 
                     // delivers, and nothing can separate "slow" from "never" except
                     // by waiting. This changes no control flow: every input that
                     // worked before still works, byte for byte, on stdout.
-                    eprintln!(
-                        "hermit: --verify is buffering stdin from a non-seekable stream so both \
+                    const BUFFERING_NOTE: &str = "hermit: --verify is buffering stdin from a non-seekable stream so both \
                          runs receive identical input. If this appears to hang, stdin has not \
-                         reached end-of-file; pass `< /dev/null` when the guest needs no input."
-                    );
+                         reached end-of-file; pass `< /dev/null` when the guest needs no input.";
+                    if nonwaiting_write::diagnostics_must_not_wait() {
+                        // Under --max-log-bytes, termination must not depend
+                        // on this write; see `nonwaiting_write`.
+                        nonwaiting_write::write_without_waiting(
+                            libc::STDERR_FILENO,
+                            format!("{BUFFERING_NOTE}\n").as_bytes(),
+                        );
+                    } else {
+                        eprintln!("{BUFFERING_NOTE}");
+                    }
                     let mut buffered = tempfile::tempfile()?;
                     io::copy(&mut file, &mut buffered)?;
                     buffered.seek(SeekFrom::Start(0))?;
