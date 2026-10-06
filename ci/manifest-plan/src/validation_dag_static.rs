@@ -1231,9 +1231,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // Both 999 counts above, re-listed together: 1000.
     // With the two inode tests above, the descriptor-alias test retains all 1001: 1002.
     // https://github.com/rrnewton/hermit/pull/3361
-    // (https://github.com/rrnewton/hermit/issues/3146): 65 blocked-wait and
+    // (https://github.com/rrnewton/hermit/issues/3146): 66 blocked-wait and
     // host-timed signal tests, with none removed, retain all 975 prior
-    // identities (1040, measured with cargo nextest list --profile ci):
+    // identities (1041, measured with cargo nextest list --profile ci):
     // scheduler::test, 26 tests:
     //   a_child_exit_sigchld_goes_to_the_first_thread_that_does_not_block_it,
     //   a_child_exit_timer_commits_a_deferred_creator_delivery_without_sending,
@@ -1261,7 +1261,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     //   signaled_background_threads_are_released_together_in_thread_id_order,
     //   the_signaled_background_barrier_runs_before_any_timer_pop,
     //   unreported_signal_state_keeps_futex_waiter_parked_for_cross_task_signals;
-    // syscalls::files::test, three tests:
+    // syscalls::files::test, four tests:
+    //   a_hangup_after_the_open_does_not_hide_the_acquired_terminal,
     //   an_open_acquires_a_controlling_terminal_only_as_a_session_leader,
     //   async_io_arming_calls_name_their_host_timed_signals,
     //   terminal_control_calls_name_the_terminal_signals;
@@ -1304,7 +1305,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     //   a_rearming_wait_is_not_ended_by_a_default_job_control_stop,
     //   kernel_signal_state_parses_proc_status,
     //   only_unblocked_caught_or_fatal_signals_interrupt_a_wait;
-    ("test.detcore_unit", 1067),
+    ("test.detcore_unit", 1068),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1813,9 +1814,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same test: 999.
     // The host twin selects both tests: 1000.
     // And the descriptor-alias interning test (1002).
-    // And the same 65 https://github.com/rrnewton/hermit/pull/3361 signal tests
-    // listed for test.detcore_unit (1040, measured).
-    ("test.detcore_unit_on_host", 1067),
+    // And the same 66 https://github.com/rrnewton/hermit/pull/3361 signal tests
+    // listed for test.detcore_unit (1041, measured).
+    ("test.detcore_unit_on_host", 1068),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
