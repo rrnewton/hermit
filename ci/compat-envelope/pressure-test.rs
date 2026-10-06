@@ -12779,14 +12779,105 @@ fn disabled_cells_file_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 /// (compat/strict-du), a row label on the verify cells (compat/java on
 /// ptrace, compat/comm on SaBRe), and the rr-compat replay cell of a row's
 /// own test (compat/awk, whose verify cell on ptrace is of the default run
-/// type), beside a red default-run-type cell.
-const FOCUSED_RED_CELLS: [(&str, &str, &str); 5] = [
-    ("c-programs/prctl-identity", "verify", "dbt"),
+/// type). [`focused_red_cells`] puts an [`ordinary_red_cell`] beside them.
+const FOCUSED_LABELLED_RED_CELLS: [(&str, &str, &str); 4] = [
     ("compat/awk", "replay", "ptrace"),
     ("compat/comm", "verify", "sabre"),
     ("compat/java", "verify", "ptrace"),
     ("compat/strict-du", "verify", "ptrace"),
 ];
+
+/// A cell as the self-tests name one: (test, mode, backend).
+type NamedCell = (String, String, String);
+
+/// The first red cell of the tracked scorecard, in its order, that is
+/// portable, enabled in its manifest, has executable attempts in its budget,
+/// and that `wanted` accepts. The self-tests that need a red cell of some shape
+/// derive it here instead of naming one, so switching a named cell on cannot
+/// break them: 6d5ae40c switched on the dbt c-programs/prctl-identity verify
+/// cell that four of them named, and each refused it as green. They refuse
+/// only when no red cell of that shape is left, which names the shape.
+fn red_cell_where(
+    root: &Path,
+    shape: &str,
+    wanted: impl Fn(&CellId, &ManifestCellFacts) -> bool,
+) -> Result<NamedCell, String> {
+    let tracked = load_tracked_cells(root)?;
+    let facts = manifest_cell_facts(&ManifestSet::load(root)?)?;
+    let budgets = load_budgets(root)?;
+    tracked
+        .cells
+        .iter()
+        .filter(|cell| cell.status == "red" && cell.id.lane == "portable")
+        .find_map(|cell| {
+            let key = (
+                cell.id.test.clone(),
+                cell.id.mode.clone(),
+                cell.id.backend.clone(),
+            );
+            let fact = facts.get(&key)?;
+            (fact.enabled
+                && budgets
+                    .get(&key)
+                    .is_some_and(|budget| budget.attempts.is_some())
+                && wanted(&cell.id, fact))
+            .then_some(key)
+        })
+        .ok_or_else(|| format!("the tracked scorecard has no red portable cell that is {shape}"))
+}
+
+/// A red c-programs verify cell of the default run type that neither reads
+/// the real-compat fixtures nor writes run state: the ordinary red cell the
+/// self-tests put beside cells chosen for a particular shape.
+fn ordinary_red_cell(root: &Path) -> Result<NamedCell, String> {
+    red_cell_where(
+        root,
+        "an ordinary c-programs verify cell of the default run type",
+        |id, facts| {
+            id.category == "c-programs"
+                && id.mode == "verify"
+                && facts
+                    .run_types
+                    .contains(hermit_manifest_plan::runner::DEFAULT_RUN_TYPE)
+                && !facts.reads_compat_fixtures
+                && !facts.writes_run_state
+        },
+    )
+}
+
+/// A red cell whose argv writes below VALIDATE_RUN_STATE outside the fixture
+/// root ([`run_state_resource`]).
+fn run_state_writer_red_cell(root: &Path) -> Result<NamedCell, String> {
+    red_cell_where(root, "a run-state writer", |_, facts| {
+        facts.writes_run_state
+    })
+}
+
+/// A red cell that reads the real-compat fixtures and writes no run state.
+fn compat_fixture_reader_red_cell(root: &Path) -> Result<NamedCell, String> {
+    red_cell_where(root, "a compat-fixture reader", |_, facts| {
+        facts.reads_compat_fixtures && !facts.writes_run_state
+    })
+}
+
+/// [`FOCUSED_LABELLED_RED_CELLS`] beside an [`ordinary_red_cell`].
+fn focused_red_cells(root: &Path) -> Result<Vec<NamedCell>, String> {
+    let mut cells = vec![ordinary_red_cell(root)?];
+    cells.extend(
+        FOCUSED_LABELLED_RED_CELLS
+            .iter()
+            .map(|(test, mode, backend)| (test.to_string(), mode.to_string(), backend.to_string())),
+    );
+    Ok(cells)
+}
+
+/// `cells` borrowed in the form the plan checks take.
+fn named_cells(cells: &[NamedCell]) -> Vec<(&str, &str, &str)> {
+    cells
+        .iter()
+        .map(|(test, mode, backend)| (test.as_str(), mode.as_str(), backend.as_str()))
+        .collect()
+}
 /// Disabled SaBRe cells: one of a labelled test, one of a default-run-type test.
 const FOCUSED_DISABLED_SABRE_CELLS: [(&str, &str, &str); 2] = [
     ("compat/comm", "replay", "sabre"),
@@ -12944,7 +13035,8 @@ fn focused_run_type_plan_selects_each_cell(
 /// Cells of a non-default run type, red and disabled, are prepared and run by
 /// commands that the harness's own selection resolves to exactly them.
 fn focused_run_type_selection_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
-    focused_run_type_plan_selects_each_cell(root, scratch, "red", &FOCUSED_RED_CELLS, None)?;
+    let red = focused_red_cells(root)?;
+    focused_run_type_plan_selects_each_cell(root, scratch, "red", &named_cells(&red), None)?;
     focused_run_type_plan_selects_each_cell(
         root,
         scratch,
@@ -13089,21 +13181,20 @@ fn validate_run_state_plan_check(
 /// whose cells read the real-compat fixtures prepares them first, as
 /// validation does.
 fn validate_run_state_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
+    let ordinary = ordinary_red_cell(root)?;
+    let reader = compat_fixture_reader_red_cell(root)?;
     validate_run_state_plan_check(
         root,
         scratch,
         "fixtures",
-        &[
-            ("c-programs/prctl-identity", "verify", "dbt"),
-            ("compat/shuf", "verify", "sabre"),
-        ],
+        &named_cells(&[ordinary.clone(), reader]),
         true,
     )?;
     validate_run_state_plan_check(
         root,
         scratch,
         "no-fixtures",
-        &[("c-programs/prctl-identity", "verify", "dbt")],
+        &named_cells(&[ordinary]),
         false,
     )?;
     compat_fixture_step_refusal_self_test(root)
@@ -13329,10 +13420,17 @@ fn unsampleable_sample_self_test(root: &Path, scratch: &Path) -> Result<(), Stri
 /// reads the fixtures holds none.
 fn run_state_exclusive_self_test(root: &Path, scratch: &Path) -> Result<(), String> {
     const PREFIX: &str = "run_state:";
-    let writer = ("compat/strict-shell-build", "verify", "ptrace");
-    let reader = ("compat/shuf", "verify", "sabre");
-    let other = ("c-programs/prctl-identity", "verify", "dbt");
-    let ids: Vec<CellId> = [writer, reader, other]
+    let named = [
+        run_state_writer_red_cell(root)?,
+        compat_fixture_reader_red_cell(root)?,
+        ordinary_red_cell(root)?,
+    ];
+    let writer = (
+        named[0].0.as_str(),
+        named[0].1.as_str(),
+        named[0].2.as_str(),
+    );
+    let ids: Vec<CellId> = named_cells(&named)
         .iter()
         .map(|(test, mode, backend)| CellId {
             lane: "portable".into(),
@@ -27568,11 +27666,12 @@ mod harness_selection_tests {
     #[test]
     fn red_cells_of_focused_run_types_select_their_cells() {
         let (path, cleanup) = scratch("red");
+        let red = focused_red_cells(&checkout_root()).unwrap();
         focused_run_type_plan_selects_each_cell(
             &checkout_root(),
             &path,
             "red",
-            &FOCUSED_RED_CELLS,
+            &named_cells(&red),
             None,
         )
         .unwrap();
@@ -27645,17 +27744,13 @@ mod validate_run_state_tests {
     #[test]
     fn a_cell_reading_the_fixtures_gets_validations_fixture_preparation() {
         let (path, cleanup) = scratch("fixtures");
-        validate_run_state_plan_check(
-            &checkout_root(),
-            &path,
-            "fixtures",
-            &[
-                ("c-programs/prctl-identity", "verify", "dbt"),
-                ("compat/shuf", "verify", "sabre"),
-            ],
-            true,
-        )
-        .unwrap();
+        let root = checkout_root();
+        let cells = [
+            ordinary_red_cell(&root).unwrap(),
+            compat_fixture_reader_red_cell(&root).unwrap(),
+        ];
+        validate_run_state_plan_check(&root, &path, "fixtures", &named_cells(&cells), true)
+            .unwrap();
         cleanup.remove().unwrap();
     }
 
@@ -27667,14 +27762,10 @@ mod validate_run_state_tests {
     #[test]
     fn a_plan_without_fixture_readers_still_names_its_run_state() {
         let (path, cleanup) = scratch("no-fixtures");
-        validate_run_state_plan_check(
-            &checkout_root(),
-            &path,
-            "no-fixtures",
-            &[("c-programs/prctl-identity", "verify", "dbt")],
-            false,
-        )
-        .unwrap();
+        let root = checkout_root();
+        let cells = [ordinary_red_cell(&root).unwrap()];
+        validate_run_state_plan_check(&root, &path, "no-fixtures", &named_cells(&cells), false)
+            .unwrap();
         cleanup.remove().unwrap();
     }
 }
