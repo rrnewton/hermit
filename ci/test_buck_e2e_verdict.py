@@ -710,23 +710,92 @@ class ValidateNodeTest(unittest.TestCase):
         (checkout / "ci" / "buck-e2e").mkdir(parents=True)
         self.node = checkout / "ci" / "buck-e2e" / "validate-node"
         shutil.copy2(BUCK_E2E / "validate-node", self.node)
-        for step in ("bootstrap/regenerate-rust-deps", "ci/buck-e2e/stage", "ci/buck-e2e/run"):
+        self.checkout = checkout
+        for step in ("bootstrap/regenerate-rust-deps", "shim/modes/stage-re-inputs", "ci/buck-e2e/stage",
+                     "ci/buck-e2e/run"):
             write_executable(checkout / step, FAKE_STEP)
         # with-proxy, when installed, prefixes the network steps; this one only runs them.
         write_executable(self.root / "bin" / "with-proxy", '#!/bin/sh\nexec "$@"\n')
         self.buck2 = write_executable(self.root / "bin" / "buck2", "#!/bin/sh\nexit 0\n")
         self.calls = self.root / "calls.jsonl"
 
-    def validate_node(self, e2e_result_root, cwd=None):
-        """Run validate-node from CWD with E2E_RESULT_ROOT (None: unset)."""
+    def validate_node(self, e2e_result_root, cwd=None, args=(), runner="buck-local"):
+        """Run validate-node ARGS from CWD with E2E_RESULT_ROOT (None: unset)."""
         environment = {k: v for k, v in os.environ.items() if k != "E2E_RESULT_ROOT"}
         environment.update(PATH=f"{self.root / 'bin'}:{os.environ['PATH']}",
-                           HERMIT_VALIDATE_E2E_RUNNER="buck-local", HERMIT_VALIDATE_BUCK2=str(self.buck2),
+                           HERMIT_VALIDATE_E2E_RUNNER=runner, HERMIT_VALIDATE_BUCK2=str(self.buck2),
                            VALIDATE_RUN_STATE=str(self.root / "state"), HERMIT_EPOCH="2026-10-05T00:00:00+00:00",
                            FAKE_STEP_CALLS=str(self.calls))
         if e2e_result_root is not None:
             environment["E2E_RESULT_ROOT"] = e2e_result_root
-        return subprocess.run([str(self.node)], capture_output=True, text=True, env=environment, cwd=cwd)
+        return subprocess.run([str(self.node), *args], capture_output=True, text=True, env=environment, cwd=cwd)
+
+    def commit_checkout(self):
+        """Make the scratch checkout a git repository with one commit; return its HEAD."""
+        environment = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        git = ["git", "-C", str(self.checkout), "-c", "user.name=test", "-c", "user.email=test@example.invalid",
+               "-c", "commit.gpgsign=false"]
+        for command in (["init", "-q"], ["add", "-A"], ["commit", "-q", "-m", "scratch"]):
+            subprocess.run(git + command, check=True, env=environment, capture_output=True)
+        return subprocess.run(git + ["rev-parse", "HEAD"], check=True, env=environment, capture_output=True,
+                              text=True).stdout.strip()
+
+    def write_staged_source_sha(self, sha):
+        staged = self.checkout / "ci" / "buck-e2e" / "staged"
+        staged.mkdir(parents=True, exist_ok=True)
+        (staged / "SOURCE_SHA").write_text(sha + "\n")
+
+    def test_without_an_argument_the_node_regenerates_stages_and_runs_in_order(self):
+        process = self.validate_node(str(self.root / "e2e-results"))
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        calls = calls_in(self.calls)
+        self.assertEqual([call[0] for call in calls], ["regenerate-rust-deps", "stage", "run"])
+        self.assertEqual(calls[1], ["stage", "--from-cargo"])
+
+    def test_stage_only_stages_and_needs_no_runner_environment(self):
+        environment = {k: v for k, v in os.environ.items()
+                       if k not in ("HERMIT_VALIDATE_E2E_RUNNER", "HERMIT_VALIDATE_BUCK2", "VALIDATE_RUN_STATE",
+                                    "E2E_RESULT_ROOT")}
+        environment.update(PATH=f"{self.root / 'bin'}:{os.environ['PATH']}", FAKE_STEP_CALLS=str(self.calls))
+        process = subprocess.run([str(self.node), "--stage-only"], capture_output=True, text=True,
+                                 env=environment)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(calls_in(self.calls), [["stage", "--from-cargo"]])
+
+    def test_cells_only_runs_the_cells_against_inputs_staged_for_head(self):
+        self.write_staged_source_sha(self.commit_checkout())
+        process = self.validate_node(str(self.root / "e2e-results"), args=["--cells-only"])
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual([call[0] for call in calls_in(self.calls)], ["regenerate-rust-deps", "run"])
+
+    def test_cells_only_under_buck_hybrid_stages_the_re_link_inputs_but_not_the_cargo_inputs(self):
+        self.write_staged_source_sha(self.commit_checkout())
+        process = self.validate_node(str(self.root / "e2e-results"), args=["--cells-only"], runner="buck-hybrid")
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual([call[0] for call in calls_in(self.calls)],
+                         ["regenerate-rust-deps", "stage-re-inputs", "run"])
+
+    def test_cells_only_without_staged_inputs_is_refused_before_any_step(self):
+        self.commit_checkout()
+        process = self.validate_node(str(self.root / "e2e-results"), args=["--cells-only"])
+        self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+        self.assertIn("SOURCE_SHA is missing", process.stderr)
+        self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
+
+    def test_cells_only_with_inputs_staged_for_another_commit_is_refused_before_any_step(self):
+        head = self.commit_checkout()
+        other = "0" * 40
+        self.write_staged_source_sha(other)
+        process = self.validate_node(str(self.root / "e2e-results"), args=["--cells-only"])
+        self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+        self.assertIn(f"staged for {other}, but HEAD is {head}", process.stderr)
+        self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
+
+    def test_two_phase_arguments_are_refused(self):
+        process = self.validate_node(str(self.root / "e2e-results"), args=["--stage-only", "--cells-only"])
+        self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+        self.assertIn("unexpected argument: --cells-only", process.stderr)
+        self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
 
     def test_the_logs_of_cells_that_did_not_pass_go_below_the_e2e_result_root(self):
         results = self.root / "e2e-results"

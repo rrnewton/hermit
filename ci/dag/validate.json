@@ -43319,16 +43319,49 @@
     },
     {
       "group": "e2e",
-      "job": "buck_cells",
-      "desc": "Run every E2E cell under Buck/Tpx",
-      "description": "Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which passes the runner in HERMIT_VALIDATE_E2E_RUNNER and the internal buck2 in HERMIT_VALIDATE_BUCK2. On the host it regenerates the Buck third-party rules, stages the inputs Buck does not build (ci/buck-e2e/stage --from-cargo, a host cargo build in its own target directory), and runs every cell of ci/expected-e2e-plan.json under Buck (ci/buck-e2e/run --no-verdict), locally or with RE-routed cells on Meta RE. It judges nothing: the rows go to $VALIDATE_RUN_STATE/buck-e2e/results for the import twins, which own the verdicts. The verify logs (run1_log_*, run2_log_*) of every cell execution that did not pass, which for an RE cell exist only as its Tpx artifacts, go to $E2E_RESULT_ROOT/buck-failed-verify-logs with an index.jsonl, each log bounded at 1 GiB + 1 MiB (hermit's own 1 GiB log bound plus its truncation marker). Any other runner value exits 2; nothing falls back to cargo.",
+      "job": "buck_stage",
+      "desc": "Stage the inputs Buck does not build for the E2E cells",
+      "description": "Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, with e2e.buck_cells. On the host it runs ci/buck-e2e/stage --from-cargo (ci/buck-e2e/validate-node --stage-only): a Cargo build in the checkout's target/ of the release test-harness and hermit-manifest-plan (target/release), the validate-profile hermit (target/stage-hermit, copied to target/validate/hermit) and detcore-dbt then the install bundle (target/validate), published with ci/publish-hermit-e2e-artifact.sh; then git archive HEAD and the CI-selected fixtures built from it. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. It needs no buck2 and no runner, only the pinned Reverie (pre.reverie_pin): it builds nothing in target/ci or target/debug, so it runs beside build.rust_scripts (target/ci/rust-script-build) and setup.manifest_plan (target/debug), and Cargo's per-profile-directory locks keep the three from waiting on each other. Until 2026-10-05 the stage ran inside e2e.buck_cells, after those two and gate.manifest: in the full validation of hermit f53e746779 on a 284-core host they took 202, 34 and 3 seconds before the 422.74-second e2e.buck_cells began.",
       "labels": [
         "full-buck-e2e"
       ],
-      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/buck-e2e/validate-node",
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/buck-e2e/validate-node --stage-only",
+      "result_manifests": [],
+      "deps": [
+        "pre.reverie_pin"
+      ],
+      "env": {},
+      "networkonly": false,
+      "engine_only": false,
+      "timeout": 1800,
+      "cpu_timeout": 3600,
+      "jobs_flag": "",
+      "jobs_env": "CARGO_BUILD_JOBS",
+      "hint": {
+        "resources": {},
+        "est_duration_s": 145.0,
+        "rss_baseline_bytes": 10737418240,
+        "hard_mem_max_bytes": 68719476736,
+        "classification": "cpu-bound",
+        "preferred_inner_jobs": 32,
+        "measured_effective_cores": null,
+        "measured_cpu_utilization": null
+      },
+      "fail_fast_family": "e2e.buck_stage"
+    },
+    {
+      "group": "e2e",
+      "job": "buck_cells",
+      "desc": "Run every E2E cell under Buck/Tpx",
+      "description": "Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which passes the runner in HERMIT_VALIDATE_E2E_RUNNER and the internal buck2 in HERMIT_VALIDATE_BUCK2. On the host (ci/buck-e2e/validate-node --cells-only) it refuses with exit 2 unless e2e.buck_stage staged the inputs Buck does not build for HEAD (ci/buck-e2e/staged/SOURCE_SHA), regenerates the Buck third-party rules, stages the RE link inputs for buck-hybrid, and runs every cell of ci/expected-e2e-plan.json under Buck (ci/buck-e2e/run --no-verdict), locally or with RE-routed cells on Meta RE. It judges nothing: the rows go to $VALIDATE_RUN_STATE/buck-e2e/results for the import twins, which own the verdicts. The verify logs (run1_log_*, run2_log_*) of every cell execution that did not pass, which for an RE cell exist only as its Tpx artifacts, go to $E2E_RESULT_ROOT/buck-failed-verify-logs with an index.jsonl, each log bounded at 1 GiB + 1 MiB (hermit's own 1 GiB log bound plus its truncation marker). Any other runner value exits 2; nothing falls back to cargo.",
+      "labels": [
+        "full-buck-e2e"
+      ],
+      "cmd": "export PATH=\"$PWD/ci/rust-script-bin:$PATH\"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT=\"$PWD/target/ci/rust-scripts\"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/buck-e2e/validate-node --cells-only",
       "result_manifests": [],
       "deps": [
         "build.rust_scripts",
+        "e2e.buck_stage",
         "gate.manifest",
         "pre.reverie_pin",
         "setup.manifest_plan"
@@ -43342,7 +43375,7 @@
       "jobs_env": "CARGO_BUILD_JOBS",
       "hint": {
         "resources": {},
-        "est_duration_s": 450.0,
+        "est_duration_s": 165.0,
         "rss_baseline_bytes": 10737418240,
         "hard_mem_max_bytes": 68719476736,
         "classification": "cpu-bound",

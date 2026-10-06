@@ -38,7 +38,8 @@ set -uo pipefail
 # Cargo-only and must not let an inherited environment select another producer.
 unset HERMIT_VALIDATE_RELEASE_BUILD_MODE
 unset HERMIT_VALIDATE_BUCK_DOTSLASH
-# Likewise the E2E runner (--e2e-runner/--buck2): e2e.buck_cells refuses without it.
+# Likewise the E2E runner (--e2e-runner/--buck2): e2e.buck_cells refuses without it
+# (e2e.buck_stage does not read it).
 unset HERMIT_VALIDATE_E2E_RUNNER
 unset HERMIT_VALIDATE_BUCK2
 

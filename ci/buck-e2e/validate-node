@@ -1,12 +1,25 @@
 #!/bin/bash
-# The validation DAG's e2e.buck_cells node: run every e2e manifest cell under Buck and
-# leave the rows, unjudged, where the import twins (<bucket>_buck) read them.
+# The validation DAG's two Buck runner nodes. e2e.buck_stage (--stage-only) stages the
+# inputs Buck does not build; e2e.buck_cells (--cells-only) runs every e2e manifest cell
+# under Buck against them and leaves the rows, unjudged, where the import twins
+# (<bucket>_buck) read them. With no argument it does both, in order, as one process.
 #
-# usage: ci/buck-e2e/validate-node
+# usage: ci/buck-e2e/validate-node [--stage-only | --cells-only]
 #        ci/buck-e2e/validate-node -h|--help
 #
-# scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH selects this node and
-# passes, through the environment:
+#   --stage-only  only ci/buck-e2e/stage --from-cargo: a cargo build in the checkout's
+#                 target/ and a fresh ci/buck-e2e/staged/ for HEAD, whose SOURCE_SHA is
+#                 written last. It needs none of the environment below, no buck2 and no
+#                 runner; what it checks is what the stage checks: its host prerequisites,
+#                 a clean tree of tracked files, and that every build and fixture step
+#                 succeeds.
+#   --cells-only  everything but the staging: regenerate the third-party rules, stage the
+#                 RE link inputs for buck-hybrid, run the cells. It refuses with exit 2,
+#                 before any step runs, unless ci/buck-e2e/staged/SOURCE_SHA exists and
+#                 names HEAD, so it never runs cells against another commit's staging.
+#
+# scripts/validate.rs --e2e-runner buck-local|buck-hybrid --buck2 PATH selects both nodes
+# and passes, through the environment (the cells, and the no-argument form, need it):
 #   HERMIT_VALIDATE_E2E_RUNNER  buck-local (every cell locally) or buck-hybrid (RE-routed
 #                               cells on Meta RE, the rest locally). Anything else,
 #                               including cargo or unset, exits 2: nothing falls back.
@@ -30,23 +43,65 @@
 # build in the checkout's target/ (ci/buck-e2e/stage --from-cargo), then
 # ci/buck-e2e/run --no-verdict with -c hermit_e2e.hermit=staged, so the cells test that
 # cargo-built validate-profile target/validate/hermit, the payload a Cargo-runner run
-# certifies. Nothing else in the full plan builds in the host target/ beside it: the
-# other Cargo nodes build in the pinned root, and setup.manifest_plan finishes first. The buck2 daemon is killed on every exit.
+# certifies. The stage builds in target/release, target/stage-hermit and target/validate.
+# In the full plan it runs beside build.rust_scripts, which builds in
+# target/ci/rust-script-build, and setup.manifest_plan, which builds in target/debug;
+# Cargo locks each profile directory separately, so none of them waits on another. The
+# other Cargo nodes build in the pinned root's own target. Whenever the cells run (the
+# --cells-only and no-argument forms), the buck2 daemon is killed on every exit.
 # Network steps run through with-proxy when it is installed.
 #
-# Exit status: 0 once the rows are written, whatever the cells' verdicts (the twins judge
-# them); 2 for a usage error or a missing input; otherwise the failing step's status.
+# Exit status: 0 once the rows are written (or, for --stage-only, once the inputs are
+# staged), whatever the cells' verdicts (the twins judge them); 2 for a usage error or a
+# missing input; otherwise the failing step's status.
 set -euo pipefail
 
 usage() { sed -n '2,/^set -euo pipefail$/{/^set /d;s/^# \{0,1\}//;p}' "${BASH_SOURCE[0]}"; }
+phase=all
 case ${1:-} in
     -h|--help) usage; exit 0 ;;
     '') ;;
+    --stage-only) phase=stage ;;
+    --cells-only) phase=cells ;;
     *) echo "validate-node: unexpected argument: $1 (see --help)" >&2; exit 2 ;;
 esac
+if [[ $# -gt 1 ]]; then
+    echo "validate-node: unexpected argument: $2 (see --help)" >&2
+    exit 2
+fi
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
+proxy=()
+if command -v with-proxy >/dev/null 2>&1; then proxy=(with-proxy); fi
+step() { echo "validate-node: $*" >&2; }
+stage_inputs() {
+    step "staging the inputs Buck does not build (cargo, target/)"
+    "${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
+}
+
+if [[ $phase == stage ]]; then
+    cd "$root"
+    stage_inputs
+    exit 0
+fi
+if [[ $phase == cells ]]; then
+    staged_sha_file=$here/staged/SOURCE_SHA
+    if ! head_sha=$(git -C "$root" rev-parse HEAD 2>/dev/null); then
+        echo "validate-node: --cells-only cannot read HEAD in $root to check the staged inputs against it" >&2
+        exit 2
+    fi
+    if [[ ! -s $staged_sha_file ]]; then
+        echo "validate-node: --cells-only needs staged inputs, and $staged_sha_file is missing: the stage (e2e.buck_stage, ci/buck-e2e/validate-node --stage-only) did not finish" >&2
+        exit 2
+    fi
+    staged_sha=$(<"$staged_sha_file")
+    if [[ $staged_sha != "$head_sha" ]]; then
+        echo "validate-node: --cells-only refuses: the inputs were staged for $staged_sha, but HEAD is $head_sha; stage again (ci/buck-e2e/validate-node --stage-only)" >&2
+        exit 2
+    fi
+fi
+
 runner=${HERMIT_VALIDATE_E2E_RUNNER:-}
 case $runner in
     buck-local) mode=local; buck_args=() ;;
@@ -70,12 +125,9 @@ if [[ -z ${E2E_RESULT_ROOT:-} ]]; then
 fi
 state=$VALIDATE_RUN_STATE/buck-e2e
 failed_logs=$(realpath -m -- "$E2E_RESULT_ROOT")/buck-failed-verify-logs
-proxy=()
-if command -v with-proxy >/dev/null 2>&1; then proxy=(with-proxy); fi
 
 cd "$root"
 trap '"$buck2" kill >/dev/null 2>&1 || true' EXIT
-step() { echo "validate-node: $*" >&2; }
 
 step "regenerating the Buck third-party rules"
 "${proxy[@]}" ./bootstrap/regenerate-rust-deps
@@ -83,8 +135,9 @@ if [[ $mode == hybrid ]]; then
     step "staging the RE link inputs"
     "${proxy[@]}" ./shim/modes/stage-re-inputs
 fi
-step "staging the inputs Buck does not build (cargo, target/)"
-"${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
+if [[ $phase == all ]]; then
+    stage_inputs
+fi
 rm -rf -- "${state:?}/results"
 # The failed cells' logs are evidence, not input: an earlier attempt's copy that cannot be
 # removed costs this run its copy, never the run.

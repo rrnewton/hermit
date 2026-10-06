@@ -404,14 +404,20 @@ Nothing is inferred from ambient environment, and nothing falls back to Cargo.
 The plan is the committed `full` plan with the `full-buck-e2e` label swapped
 in (`buck_e2e_selection` in `ci/manifest-plan/src/validation_dag.rs`): the 16
 Cargo E2E bucket nodes, the compatibility scorecard and the five nodes that
-only fed them leave the plan, and `e2e.buck_cells` plus one `<bucket>_buck`
-import twin per bucket and `full-scorecard.compatibility_buck` take their
-place. `e2e.buck_cells` (`ci/buck-e2e/validate-node`) regenerates the
-third-party rules, stages the remote-execution inputs for `buck-hybrid`,
+only fed them leave the plan, and `e2e.buck_stage`, `e2e.buck_cells`, one
+`<bucket>_buck` import twin per bucket and `full-scorecard.compatibility_buck`
+take their place. `e2e.buck_stage` (`ci/buck-e2e/validate-node --stage-only`)
 builds the inputs Buck does not build yet with Cargo
-(`ci/buck-e2e/stage --from-cargo`), and runs every cell with
-`-c hermit_e2e.hermit=staged`. Each twin then judges its bucket's rows with the
-same `test-harness run` verdict as the Cargo bucket, reading them through
+(`ci/buck-e2e/stage --from-cargo`). It depends only on `pre.reverie_pin`, so it
+runs beside `build.rust_scripts` and `setup.manifest_plan` instead of after
+them; each uses its own Cargo profile directory. `e2e.buck_cells`
+(`ci/buck-e2e/validate-node --cells-only`) waits for it, refuses before any
+step unless `ci/buck-e2e/staged/SOURCE_SHA` names the checkout's `HEAD`,
+regenerates the third-party rules, stages the remote-execution inputs for
+`buck-hybrid`, and runs every cell with `-c hermit_e2e.hermit=staged`. Run
+without an argument, `ci/buck-e2e/validate-node` does both in one process, as
+before. Each twin then judges its bucket's rows with the same
+`test-harness run` verdict as the Cargo bucket, reading them through
 `E2E_IMPORT_RESULTS`.
 
 One ordering difference follows. In the Cargo plan, eight nodes run before the

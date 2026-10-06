@@ -463,6 +463,7 @@ struct Profile {
 // twin.
 // full-buck-e2e is only the Buck E2E nodes; a Buck full run selects it with a
 // pruned full (buck_e2e_selection), which assert_buck_e2e_selection counts.
+// It gained e2e.buck_stage when the staging left e2e.buck_cells: 18/23 before.
 const PROFILES: [Profile; 12] = [
     // full and portable each lost test.liteinst_strict, hosted-portable lost
     // its twin test.liteinst_strict_on_host, and super lost
@@ -514,8 +515,8 @@ const PROFILES: [Profile; 12] = [
     // the gate and producers they need.
     Profile {
         label: FULL_BUCK_E2E_LABEL,
-        direct_steps: 18,
-        selected_steps: 23,
+        direct_steps: 19,
+        selected_steps: 24,
     },
     Profile {
         label: "portable-strict-compat-only",
@@ -1364,12 +1365,24 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
 pub const FULL_BUCK_E2E_LABEL: &str = "full-buck-e2e";
 /// The host node that runs every E2E cell under Buck/Tpx.
 pub const BUCK_CELLS_TAG: &str = "e2e.buck_cells";
+/// The host node that stages the inputs Buck does not build for
+/// [`BUCK_CELLS_TAG`]. It needs only the pinned Reverie, so it runs beside the
+/// rust-script build and the manifest-plan build that the cells wait for.
+pub const BUCK_STAGE_TAG: &str = "e2e.buck_stage";
 const BUCK_TWIN_SUFFIX: &str = "_buck";
 /// The assignment that puts a twin's `target/debug/test-harness run` in import mode,
 /// naming where e2e.buck_cells leaves the Buck rows.
 pub const BUCK_IMPORT_ASSIGNMENT: &str =
     "E2E_IMPORT_RESULTS=\"$VALIDATE_RUN_STATE/buck-e2e/results\" ";
-const BUCK_CELLS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/buck-e2e/validate-node"#;
+const BUCK_CELLS_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/buck-e2e/validate-node --cells-only"#;
+/// The stage keeps the rust-script environment although it runs no rust-script
+/// (its cargo builds, ci/publish-hermit-e2e-artifact.sh, `test-harness build` and
+/// tests/compat/prepare_real_compat_fixtures.sh call none), so one added later
+/// fails loudly instead of compiling unprepared. It no longer waits for
+/// build.rust_scripts, so whether such a call finds the prepared binaries would
+/// depend on timing: it would fail or run the prepared binary, never run
+/// something unprepared.
+const BUCK_STAGE_COMMAND: &str = r#"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; ./ci/buck-e2e/validate-node --stage-only"#;
 /// The scorecard that judges the cargo buckets' result files, and its twin.
 const FULL_SCORECARD_TAG: &str = "full-scorecard.compatibility";
 /// The `full` nodes that exist only to build inputs for, or to run, the cargo
@@ -1382,6 +1395,12 @@ pub const BUCK_REPLACED_PRODUCERS: &[&str] = &[
     "setup.manifest_plan_in_pinned_root",
 ];
 
+/// The two `full-buck-e2e` nodes that run the Buck runner itself rather than
+/// replace a cargo node: the stage and the cells.
+fn is_buck_runner_node(step: &Step) -> bool {
+    matches!(step.tag().as_str(), BUCK_CELLS_TAG | BUCK_STAGE_TAG)
+}
+
 fn is_buck_import_twin(step: &Step) -> bool {
     step.job.ends_with(BUCK_TWIN_SUFFIX)
         && step.manifest.is_some()
@@ -1390,8 +1409,8 @@ fn is_buck_import_twin(step: &Step) -> bool {
 
 /// The `full` selection of a Buck E2E run: every `full` node except the cargo
 /// E2E buckets, their scorecard and [`BUCK_REPLACED_PRODUCERS`], plus the
-/// `full-buck-e2e` nodes: e2e.buck_cells, one import twin per bucket and the
-/// twin scorecard. Each twin owns its bucket's cells and writes its bucket's
+/// `full-buck-e2e` nodes: e2e.buck_stage, e2e.buck_cells, one import twin per
+/// bucket and the twin scorecard. Each twin owns its bucket's cells and writes its bucket's
 /// result files, so the selection reports the same cells at the same paths.
 ///
 /// Refuses a `full` node that still depends on a replaced node, since the
@@ -1432,7 +1451,7 @@ fn buck_replaced_tags(cfg: &DagConfig) -> Result<BTreeSet<String>, String> {
     let tags = cfg.steps.iter().map(Step::tag).collect::<BTreeSet<_>>();
     let mut replaced = BTreeSet::new();
     for step in &cfg.steps {
-        if step.labels != [FULL_BUCK_E2E_LABEL] || step.tag() == BUCK_CELLS_TAG {
+        if step.labels != [FULL_BUCK_E2E_LABEL] || is_buck_runner_node(step) {
             continue;
         }
         let cargo = step
@@ -1454,9 +1473,10 @@ fn buck_replaced_tags(cfg: &DagConfig) -> Result<BTreeSet<String>, String> {
     Ok(replaced)
 }
 
-/// Add the `full-buck-e2e` nodes: e2e.buck_cells, which stages the inputs and
-/// runs every cell under Buck/Tpx, one host import twin per `full` E2E bucket,
-/// and a twin of the full scorecard that waits for the twins.
+/// Add the `full-buck-e2e` nodes: e2e.buck_stage, which stages the inputs Buck
+/// does not build; e2e.buck_cells, which runs every cell under Buck/Tpx against
+/// them; one host import twin per `full` E2E bucket; and a twin of the full
+/// scorecard that waits for the twins.
 ///
 /// A twin keeps its bucket's manifest selector and test-harness arguments, so
 /// it owns the same cells and writes the same result files. It only adds
@@ -1592,25 +1612,72 @@ fn materialize_buck_e2e(cfg: &mut DagConfig) -> Result<(), String> {
     scorecard_twin.fail_fast_family = Some(scorecard_twin.tag());
     added.push(scorecard_twin);
 
-    let mut cells = cfg
+    let release_artifact = cfg
         .steps
         .iter()
         .find(|step| step.tag() == "build.buck_release_artifact")
         .ok_or("build.buck_release_artifact is absent")?
         .clone();
-    cells.group = "e2e".into();
-    cells.job = "buck_cells".into();
-    cells.desc = "Run every E2E cell under Buck/Tpx".into();
-    cells.description = "Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which passes the runner in HERMIT_VALIDATE_E2E_RUNNER and the internal buck2 in HERMIT_VALIDATE_BUCK2. On the host it regenerates the Buck third-party rules, stages the inputs Buck does not build (ci/buck-e2e/stage --from-cargo, a host cargo build in its own target directory), and runs every cell of ci/expected-e2e-plan.json under Buck (ci/buck-e2e/run --no-verdict), locally or with RE-routed cells on Meta RE. It judges nothing: the rows go to $VALIDATE_RUN_STATE/buck-e2e/results for the import twins, which own the verdicts. The verify logs (run1_log_*, run2_log_*) of every cell execution that did not pass, which for an RE cell exist only as its Tpx artifacts, go to $E2E_RESULT_ROOT/buck-failed-verify-logs with an index.jsonl, each log bounded at 1 GiB + 1 MiB (hermit's own 1 GiB log bound plus its truncation marker). Any other runner value exits 2; nothing falls back to cargo.".into();
-    cells.labels = vec![FULL_BUCK_E2E_LABEL.into()];
-    cells.cmd = BUCK_CELLS_COMMAND.into();
-    cells.deps = deps[1..].iter().map(|dep| (*dep).to_string()).collect();
-    cells.timeout = 3600;
-    cells.cpu_timeout = 14400;
-    cells.hint.est_duration_s = 450.0;
+
+    // The stage is three Cargo builds and the fixtures, in target/release,
+    // target/stage-hermit and target/validate, so it keeps the release
+    // artifact's 64-GiB hard cap, CPU-bound class and 32-wide CARGO_BUILD_JOBS.
+    let mut stage = release_artifact.clone();
+    stage.group = "e2e".into();
+    stage.job = "buck_stage".into();
+    stage.desc = "Stage the inputs Buck does not build for the E2E cells".into();
+    stage.description = "Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, with e2e.buck_cells. On the host it runs ci/buck-e2e/stage --from-cargo (ci/buck-e2e/validate-node --stage-only): a Cargo build in the checkout's target/ of the release test-harness and hermit-manifest-plan (target/release), the validate-profile hermit (target/stage-hermit, copied to target/validate/hermit) and detcore-dbt then the install bundle (target/validate), published with ci/publish-hermit-e2e-artifact.sh; then git archive HEAD and the CI-selected fixtures built from it. It writes ci/buck-e2e/staged/ for HEAD, SOURCE_SHA last, and refuses a tree with uncommitted changes to tracked files. It needs no buck2 and no runner, only the pinned Reverie (pre.reverie_pin): it builds nothing in target/ci or target/debug, so it runs beside build.rust_scripts (target/ci/rust-script-build) and setup.manifest_plan (target/debug), and Cargo's per-profile-directory locks keep the three from waiting on each other. Until 2026-10-05 the stage ran inside e2e.buck_cells, after those two and gate.manifest: in the full validation of hermit f53e746779 on a 284-core host they took 202, 34 and 3 seconds before the 422.74-second e2e.buck_cells began.".into();
+    stage.labels = vec![FULL_BUCK_E2E_LABEL.into()];
+    stage.cmd = BUCK_STAGE_COMMAND.into();
+    stage.deps = vec!["pre.reverie_pin".into()];
+    // ci/buck-e2e/stage with its builds side by side (02eba338ab), cold:
+    // 143.3 to 144.2 s wall at 32 jobs and 128.6 s at 96, 2276 to 2312 CPU-s.
+    // The CPU bound is the next 300-s bucket above 1.5 x 2312 (3468). The wall
+    // bound keeps build.buck_release_artifact's 1800 s for the same builds:
+    // over 12 times the measurement, room for the rust-script and
+    // manifest-plan builds it now shares the host with.
+    stage.timeout = 1800;
+    stage.cpu_timeout = 3600;
+    stage.hint.est_duration_s = 145.0;
     // The baseline cloned from build.buck_release_artifact (8.39 GiB) is below
     // what ci/buck-e2e/stage peaks at with its builds running side by side:
     // cgroup memory.peak 8.69 and 9.27 GiB cold at 32 jobs, 9.47 GiB at 96.
+    stage.hint.rss_baseline_bytes = Some(10 << 30);
+    stage.fail_fast_family = Some(BUCK_STAGE_TAG.into());
+    added.push(stage);
+
+    let mut cells = release_artifact;
+    cells.group = "e2e".into();
+    cells.job = "buck_cells".into();
+    cells.desc = "Run every E2E cell under Buck/Tpx".into();
+    cells.description = "Selected only by scripts/validate.rs --e2e-runner buck-local|buck-hybrid, which passes the runner in HERMIT_VALIDATE_E2E_RUNNER and the internal buck2 in HERMIT_VALIDATE_BUCK2. On the host (ci/buck-e2e/validate-node --cells-only) it refuses with exit 2 unless e2e.buck_stage staged the inputs Buck does not build for HEAD (ci/buck-e2e/staged/SOURCE_SHA), regenerates the Buck third-party rules, stages the RE link inputs for buck-hybrid, and runs every cell of ci/expected-e2e-plan.json under Buck (ci/buck-e2e/run --no-verdict), locally or with RE-routed cells on Meta RE. It judges nothing: the rows go to $VALIDATE_RUN_STATE/buck-e2e/results for the import twins, which own the verdicts. The verify logs (run1_log_*, run2_log_*) of every cell execution that did not pass, which for an RE cell exist only as its Tpx artifacts, go to $E2E_RESULT_ROOT/buck-failed-verify-logs with an index.jsonl, each log bounded at 1 GiB + 1 MiB (hermit's own 1 GiB log bound plus its truncation marker). Any other runner value exits 2; nothing falls back to cargo.".into();
+    cells.labels = vec![FULL_BUCK_E2E_LABEL.into()];
+    cells.cmd = BUCK_CELLS_COMMAND.into();
+    // The rust-script tools (bootstrap/regenerate-rust-deps runs two) and the
+    // debug test-harness the import twins share come from the producers that
+    // the stage no longer waits for.
+    let mut cells_deps = deps[1..]
+        .iter()
+        .map(|dep| (*dep).to_string())
+        .collect::<Vec<_>>();
+    cells_deps.push(BUCK_STAGE_TAG.into());
+    cells_deps.sort();
+    cells.deps = cells_deps;
+    // Kept from the node that also staged: the stage's share of the 2066 CPU-s
+    // e2e.buck_cells used in the validation of hermit f53e746779 is not
+    // recorded, so nothing here measures the cells alone, and running the
+    // cells is strictly less work than the node that also staged.
+    cells.timeout = 3600;
+    cells.cpu_timeout = 14400;
+    // 422.74 s for the node that also staged (hermit f53e746779, before
+    // 02eba338ab overlapped the stage's builds), minus the 258.9 s its step
+    // log shows those then-serial Cargo builds took (46.10, 46.60, 120 and
+    // 46.20 s): at most 163.8 s for the rest, of which the archive and the
+    // fixtures also moved to e2e.buck_stage.
+    cells.hint.est_duration_s = 165.0;
+    // Not lowered with the stage gone: the 10-GiB baseline covered the stage's
+    // measured peak, and the peak of the Buck run alone (its daemon and up to
+    // 32 cells at once) has not been measured.
     cells.hint.rss_baseline_bytes = Some(10 << 30);
     cells.fail_fast_family = Some(BUCK_CELLS_TAG.into());
     added.push(cells);
@@ -2688,8 +2755,9 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
         .map(Step::tag)
         .collect::<BTreeSet<_>>();
     // The selection is the full profile minus the replaced nodes plus exactly
-    // the full-buck-e2e nodes (on the committed DAG: 87 - 22 + 18 = 83, pinned
-    // by committed_buck_e2e_selection_has_83_steps).
+    // the full-buck-e2e nodes (on the committed DAG: 90 - 22 + 19 = 87, pinned
+    // by committed_buck_e2e_selection_replaces_22_nodes_with_18, named before
+    // e2e.buck_stage made the added nodes 19).
     let added = selected_tags
         .difference(&full_tags)
         .cloned()
@@ -2714,9 +2782,38 @@ fn assert_buck_e2e_selection(cfg: &DagConfig, cells: &[DagManifest]) -> Result<(
             "the Buck E2E selection drops {dropped:?}, but replaces {replaced:?}"
         ));
     }
+    // The stage needs only the pinned Reverie, so it overlaps the producers
+    // the cells wait for; the cells refuse inputs staged for another commit,
+    // so they must wait for it.
+    let runner_node = |tag: &str, flag: &str| {
+        selected
+            .steps
+            .iter()
+            .find(|step| step.tag() == tag)
+            .filter(|step| {
+                step.cmd
+                    .ends_with(&format!("./ci/buck-e2e/validate-node {flag}"))
+            })
+            .ok_or_else(|| {
+                format!("the Buck E2E selection has no {tag} running validate-node {flag}")
+            })
+    };
+    let stage = runner_node(BUCK_STAGE_TAG, "--stage-only")?;
+    if stage.deps != ["pre.reverie_pin"] {
+        return Err(format!(
+            "{BUCK_STAGE_TAG} depends on {:?}, expected only pre.reverie_pin",
+            stage.deps
+        ));
+    }
+    let cells_node = runner_node(BUCK_CELLS_TAG, "--cells-only")?;
+    if !cells_node.deps.iter().any(|dep| dep == BUCK_STAGE_TAG) {
+        return Err(format!(
+            "{BUCK_CELLS_TAG} does not wait for {BUCK_STAGE_TAG}"
+        ));
+    }
     for step in &selected.steps {
         if step.labels == [FULL_BUCK_E2E_LABEL]
-            && step.tag() != BUCK_CELLS_TAG
+            && !is_buck_runner_node(step)
             && !step
                 .deps
                 .iter()
@@ -3326,9 +3423,11 @@ fn assert_invariants(cfg: &DagConfig, cells: &Populations) -> Result<(), String>
     // 432 since build.workspace_in_pinned_root's Cargo half became
     // build.workspace_compile_in_pinned_root, which does not wait for the
     // rust-script tools (431 + 1).
-    if cfg.steps.len() != 432 {
+    // 433 since e2e.buck_stage took the staging out of e2e.buck_cells, so it
+    // waits only for the pinned Reverie (432 + 1).
+    if cfg.steps.len() != 433 {
         return Err(format!(
-            "superset has {} steps, expected 432",
+            "superset has {} steps, expected 433",
             cfg.steps.len()
         ));
     }
@@ -5560,15 +5659,17 @@ sys.exit(37)
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let cells = expected_cells(&crate::git_environment::checkout_root()).unwrap();
         assert_buck_e2e_selection(&committed, &cells).unwrap();
+        // The name predates e2e.buck_stage: 19 full-buck-e2e nodes since
+        // the stage left e2e.buck_cells, 18 before.
         // 90 full nodes (89 before build.workspace_compile_in_pinned_root
         // split the Cargo half out of build.workspace_in_pinned_root, 88
         // before test.record_replay joined full, 89 before
         // test.liteinst_strict was retired with the LiteInst host hybrid,
         // https://github.com/rrnewton/hermit/issues/3520; 87 before
         // test.detcore_time joined full, 88 before
-        // privileged-test.pmu_detcore_time_cases did) - 22 replaced + 18
-        // full-buck-e2e nodes.
-        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 86);
+        // privileged-test.pmu_detcore_time_cases did) - 22 replaced + 19
+        // full-buck-e2e nodes (18, and 86 in all, before e2e.buck_stage).
+        assert_eq!(buck_e2e_selection(&committed).unwrap().steps.len(), 87);
 
         fn twin(cfg: &mut DagConfig) -> &mut Step {
             cfg.steps

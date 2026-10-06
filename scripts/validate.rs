@@ -1273,7 +1273,8 @@ fn usage() -> &'static str {
      \x20                  mode refuses unsupported plans and never falls back.\n\
      \x20 --e2e-runner cargo|buck-local|buck-hybrid\n\
      \x20                  Who runs the full level's E2E cells (default cargo). A Buck\n\
-     \x20                  runner swaps the manifest buckets for e2e.buck_cells (every\n\
+     \x20                  runner swaps the manifest buckets for e2e.buck_stage (the\n\
+     \x20                  Cargo inputs Buck does not build), e2e.buck_cells (every\n\
      \x20                  cell under Buck: buck-local all on this host, buck-hybrid the\n\
      \x20                  RE-routed cells on Meta RE) and the <bucket>_buck import nodes,\n\
      \x20                  which own the same cells and result files. Full level only.\n\
@@ -6635,17 +6636,20 @@ mod e2e_runner_tests {
         let (cargo_tags, buck_tags) = (tags(&cargo), tags(&buck));
         let added = buck_tags.difference(&cargo_tags).cloned().collect::<BTreeSet<_>>();
         let dropped = cargo_tags.difference(&buck_tags).cloned().collect::<BTreeSet<_>>();
-        assert_eq!(added.len(), 18, "{added:?}");
+        // The two runner nodes (e2e.buck_stage, e2e.buck_cells) plus 17
+        // `_buck` import twins.
+        assert_eq!(added.len(), 19, "{added:?}");
+        assert!(added.contains("e2e.buck_stage"));
         assert!(added.contains("e2e.buck_cells"));
         assert!(added.contains("full-scorecard.compatibility_buck"));
         for tag in &added {
-            if tag != "e2e.buck_cells" {
+            if tag != "e2e.buck_cells" && tag != "e2e.buck_stage" {
                 let cargo_tag = tag.strip_suffix("_buck").unwrap();
                 assert!(dropped.contains(cargo_tag), "{tag} replaces nothing");
             }
         }
         assert_eq!(dropped.len(), 22, "{dropped:?}");
-        assert_eq!(buck_tags.len(), cargo_tags.len() - 22 + 18);
+        assert_eq!(buck_tags.len(), cargo_tags.len() - 22 + 19);
         assert_eq!(buck.profile, "full");
         assert_eq!(buck.selection_mode, "full");
         assert!(buck.suite_complete);
@@ -6667,7 +6671,7 @@ mod e2e_runner_tests {
         assert!(stage.contains("install -m 755 \"$target_dir/validate/hermit\""));
         let node =
             std::fs::read_to_string(test_source_root().join("ci/buck-e2e/validate-node")).unwrap();
-        assert!(node.contains("\n\"${proxy[@]}\" ./ci/buck-e2e/stage --from-cargo\n"));
+        assert!(node.contains("\n    \"${proxy[@]}\" ./ci/buck-e2e/stage --from-cargo\n"));
         assert!(!node.contains("--target-dir"));
         assert!(node.contains("-c hermit_e2e.hermit=staged"));
     }
