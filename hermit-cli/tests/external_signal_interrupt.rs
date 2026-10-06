@@ -97,6 +97,7 @@
 #[path = "common/hermit_binary.rs"]
 mod hermit_binary;
 
+use std::cell::Cell;
 use std::fs;
 use std::io::BufRead;
 use std::io::BufReader;
@@ -112,7 +113,19 @@ use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+/// Wall-clock bound on one whole cell, from starting Hermit to its exit.
 const WATCHDOG_BACKSTOP: Duration = Duration::from_secs(90);
+/// Wall-clock bound from starting Hermit to the guest's `READY` line: 20 s, the
+/// same margin as `RESULT_BOUND`. Every cell measured on 2026-10-05, startup,
+/// both strict-verification runs and exit included, took under 3 s; the slowest
+/// test, of eight cells, took 8.1 s.
+const STARTUP_BOUND: Duration = Duration::from_secs(20);
+/// The per-test wall kill in `.config/nextest.toml` (57 s), before the runner
+/// scales it by `HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER`.
+const NEXTEST_WALL_KILL: Duration = Duration::from_secs(57);
+/// Wall time kept free below that kill for this harness to stop Hermit, reap
+/// it, and report which cell and phase ran out of time.
+const REPORT_MARGIN: Duration = Duration::from_secs(5);
 /// Wall-clock bound from the guest's `READY` line to its `RESULT` line: 20 s,
 /// unchanged since this file was added. It catches a lost interruption, which
 /// hangs; it is not a timing assertion, which the `ELAPSED` windows below make
@@ -362,6 +375,99 @@ enum StderrEvent {
     Eof,
 }
 
+/// The runner's wall-clock timeout multiplier, which also scales its per-test
+/// wall kill, read the way `ci/manifest-plan/src/timeouts.rs` reads it: unset is
+/// 1, and anything else must be a finite number greater than zero.
+fn wall_timeout_multiplier() -> f64 {
+    const NAME: &str = "HERMIT_TEST_WALL_TIMEOUT_MULTIPLIER";
+    match std::env::var(NAME) {
+        Err(std::env::VarError::NotPresent) => 1.0,
+        Ok(text) => match text.parse::<f64>() {
+            Ok(value) if value.is_finite() && value > 0.0 => value,
+            _ => panic!("{NAME} must be a finite number greater than zero, got {text:?}"),
+        },
+        Err(std::env::VarError::NotUnicode(_)) => panic!("{NAME} must be valid UTF-8"),
+    }
+}
+
+/// One test's wall budget for all of its cells: the runner's scaled per-test
+/// wall kill, less `REPORT_MARGIN`. A test that runs out of it fails with this
+/// harness's own report instead of being killed by the runner without one.
+fn test_wall_budget() -> Duration {
+    NEXTEST_WALL_KILL
+        .mul_f64(wall_timeout_multiplier())
+        .saturating_sub(REPORT_MARGIN)
+}
+
+thread_local! {
+    /// When this test's first cell started, and how many cells it has started.
+    /// Every test runs its cells on its own thread, under Cargo's harness and
+    /// under nextest alike.
+    static TEST_CELLS: Cell<Option<(Instant, usize)>> = const { Cell::new(None) };
+}
+
+/// Count a new cell of the running test and print a progress line for it, so
+/// that a test the runner stops still names the cell it was in. Returns the
+/// cell's 1-based number and the test's wall deadline.
+fn begin_cell(describe: &str) -> (usize, Instant) {
+    let budget = test_wall_budget();
+    let (started, index) = TEST_CELLS.with(|cells| {
+        let (started, count) = cells.get().unwrap_or((Instant::now(), 0));
+        cells.set(Some((started, count + 1)));
+        (started, count + 1)
+    });
+    eprintln!(
+        "[esi] cell {index}: {describe}; {:.1}s of the test's {:.1}s wall budget used",
+        started.elapsed().as_secs_f64(),
+        budget.as_secs_f64(),
+    );
+    (index, started + budget)
+}
+
+/// The deadline of one phase of a cell that began at `start`: `bound` later,
+/// but never past `test_deadline`. Also says which of the two applies.
+fn phase_deadline(
+    start: Instant,
+    bound: Duration,
+    test_deadline: Instant,
+) -> (Instant, &'static str) {
+    let own = start + bound;
+    if own <= test_deadline {
+        (own, "its phase bound")
+    } else {
+        (test_deadline, "the test's wall budget")
+    }
+}
+
+/// Each phase of a cell ends by the test's wall deadline, startup included, and
+/// that deadline comes before the runner's scaled per-test wall kill, so a hung
+/// cell fails with this harness's report rather than the runner's kill.
+#[test]
+fn every_cell_phase_ends_by_the_tests_wall_deadline() {
+    let start = Instant::now();
+    let soon = start + Duration::from_secs(5);
+    for bound in [STARTUP_BOUND, RESULT_BOUND, WATCHDOG_BACKSTOP] {
+        assert_eq!(
+            phase_deadline(start, bound, soon),
+            (soon, "the test's wall budget"),
+            "a {bound:?} phase must end at a test deadline 5 s away"
+        );
+        let late = start + bound + Duration::from_secs(1);
+        assert_eq!(
+            phase_deadline(start, bound, late),
+            (start + bound, "its phase bound"),
+            "a {bound:?} phase must keep its own bound when the test has time left"
+        );
+    }
+    let budget = test_wall_budget();
+    assert!(budget < NEXTEST_WALL_KILL.mul_f64(wall_timeout_multiplier()));
+    assert!(
+        STARTUP_BOUND < budget && RESULT_BOUND < budget,
+        "startup ({STARTUP_BOUND:?}) and the READY-to-RESULT phase ({RESULT_BOUND:?}) must \
+         each fit in one test's {budget:?} wall budget"
+    );
+}
+
 /// Run one cell. With `external`, send `SIGUSR1` to the guest process from
 /// this host process `EXTERNAL_SIGNAL_DELAY` after it prints `READY`.
 fn run_cell(backend: &str, mode: FutexMode, args: &[&str], external: bool) -> GuestRun {
@@ -432,6 +538,9 @@ fn run_cell_observed(
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::piped());
 
+    let (cell, test_deadline) = begin_cell(&format!(
+        "{backend} {mode:?} {args:?} external_signals={external_signals:?} observe={observe:?}"
+    ));
     let mut child = command
         .spawn()
         .unwrap_or_else(|error| panic!("failed to spawn hermit: {error}"));
@@ -455,6 +564,8 @@ fn run_cell_observed(
     });
 
     let started = Instant::now();
+    let (startup_deadline, startup_limit) = phase_deadline(started, STARTUP_BOUND, test_deadline);
+    let (cell_deadline, cell_limit) = phase_deadline(started, WATCHDOG_BACKSTOP, test_deadline);
     let mut lines = Vec::new();
     let mut truncated = false;
     let mut stderr_eof = false;
@@ -472,6 +583,13 @@ fn run_cell_observed(
             ready_at = Some(Instant::now());
         }
         let has_result = stdout.lines().any(|line| line.starts_with("RESULT "));
+        let now = Instant::now();
+        if failure.is_none() && ready_at.is_none() && status.is_none() && now >= startup_deadline {
+            failure = Some(format!(
+                "cell {cell}: no READY line {:.1}s after starting Hermit, at {startup_limit}",
+                (now - started).as_secs_f64()
+            ));
+        }
         if let Some(ready) = ready_at {
             if !signalled && ready.elapsed() >= EXTERNAL_SIGNAL_DELAY {
                 let pids = pids_with_argv0(&program);
@@ -494,18 +612,21 @@ fn run_cell_observed(
                 }
                 signalled = true;
             }
-            if failure.is_none() && !has_result && ready.elapsed() >= RESULT_BOUND {
+            let (result_deadline, result_limit) =
+                phase_deadline(ready, RESULT_BOUND, test_deadline);
+            if failure.is_none() && !has_result && now >= result_deadline {
                 failure = Some(format!(
-                    "no RESULT line within {}s of READY (external={external}): the blocked call \
-                     was not interrupted",
-                    RESULT_BOUND.as_secs()
+                    "cell {cell}: no RESULT line {:.1}s after READY, at {result_limit} \
+                     (external={external}): the blocked call was not interrupted",
+                    (now - ready).as_secs_f64()
                 ));
             }
         }
-        if failure.is_none() && started.elapsed() >= WATCHDOG_BACKSTOP {
+        if failure.is_none() && now >= cell_deadline {
             failure = Some(format!(
-                "watchdog deadline of {}s exceeded; process_exited={}, ready={}",
-                WATCHDOG_BACKSTOP.as_secs(),
+                "cell {cell}: watchdog deadline {:.1}s after starting Hermit, at {cell_limit}; \
+                 process_exited={}, ready={}",
+                (now - started).as_secs_f64(),
                 status.is_some(),
                 ready_at.is_some(),
             ));
