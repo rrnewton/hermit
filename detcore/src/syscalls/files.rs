@@ -64,6 +64,7 @@ use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::runqueue::LAST_PRIORITY;
+use crate::scheduler::terminal_signals;
 use crate::stat::*;
 use crate::syscalls::threads::kernel_sigset_bit;
 use crate::tool_global::*;
@@ -396,30 +397,28 @@ fn fcntl_host_timed_signals(cmd: syscalls::FcntlCmd<'_>) -> u64 {
     }
 }
 
-/// SIGHUP and SIGCONT, the signals Linux sends when a session's controlling
-/// terminal hangs up: when its other end closes, or when the session leader
-/// exits (`disassociate_ctty`, `tty_vhangup_session`). Either event happens at
-/// a moment set by host timing, so once a guest process has a controlling
-/// terminal, either signal can reach a gated wait at a turn the host chose
-/// (https://github.com/rrnewton/hermit/issues/3146).
-fn terminal_hangup_signals() -> u64 {
-    kernel_sigset_bit(libc::SIGHUP) | kernel_sigset_bit(libc::SIGCONT)
-}
-
 /// The signals an `ioctl` request lets Linux send at a moment set by host
 /// timing, as a kernel sigset; 0 for every other request. `FIOASYNC` enables
 /// SIGIO, and `FIOSETOWN` and `SIOCSPGRP` name the owner. `TIOCSCTTY` makes
-/// the terminal the caller's controlling terminal and `TIOCSPGRP` names that
-/// terminal's foreground process group, so a hangup can then signal the
-/// session (`terminal_hangup_signals`). `TIOCNOTTY` is not one: the signals it
-/// sends, it sends inside the caller's call, in the caller's turn.
+/// the terminal the caller's controlling terminal, `TIOCGPTPEER` without
+/// `O_NOCTTY` opens a pseudoterminal's other end as `open` does and so can
+/// make it one (`open_can_acquire_controlling_terminal`), and `TIOCSPGRP`
+/// names the terminal's foreground process group, so the terminal can then
+/// signal the session and that group (`terminal_signals`). `TIOCNOTTY` and
+/// `TIOCSWINSZ` are not among them: the signals they send, they send inside
+/// the caller's call, in the caller's turn.
 fn ioctl_host_timed_signals(request: syscalls::ioctl::Request<'_>) -> u64 {
     match request {
         syscalls::ioctl::Request::FIOASYNC(_)
         | syscalls::ioctl::Request::FIOSETOWN(_)
         | syscalls::ioctl::Request::SIOCSPGRP(_) => async_io_signals(),
         syscalls::ioctl::Request::TIOCSCTTY(_) | syscalls::ioctl::Request::TIOCSPGRP(_) => {
-            terminal_hangup_signals()
+            terminal_signals()
+        }
+        syscalls::ioctl::Request::TIOCGPTPEER(flags)
+            if open_can_acquire_controlling_terminal(OFlag::from_bits_truncate(flags)) =>
+        {
+            terminal_signals()
         }
         _ => 0,
     }
@@ -449,8 +448,9 @@ fn leads_session_with_terminal(pid: i32, session: i32, tty: (i32, i32), rdev: li
 /// `host_stat` is the descriptor's stat when the caller already read it. A
 /// session leader that reopens the terminal it already controls also answers
 /// true. Every host read that fails answers true as well: a needless record
-/// only holds SIGHUP and SIGCONT to the end of the gated waits that follow,
-/// while a missed one lets a hangup interrupt one at a turn the host chose.
+/// only holds the terminal's signals (`terminal_signals`) to the end of the
+/// gated waits that follow, while a missed one lets the terminal interrupt one
+/// at a turn the host chose.
 fn opened_controlling_terminal(pid: i32, fd: RawFd, host_stat: Option<&libc::stat>) -> bool {
     let rdev = match host_stat {
         Some(stat) if stat.st_mode & libc::S_IFMT == libc::S_IFCHR => stat.st_rdev,
@@ -1549,16 +1549,17 @@ impl<T: RecordOrReplay> Detcore<T> {
                     crate::tool_global::record_host_mutation(guest, String::from("/")).await;
                 }
                 // A session leader with no controlling terminal that opens a
-                // terminal without O_NOCTTY gains it as one, and a later
-                // hangup signals the session at a moment set by host timing
-                // (`terminal_hangup_signals`). Hold those signals in every
-                // process, as `handle_ioctl` does for TIOCSCTTY. Only the
-                // kernel knows whether this open made the terminal
-                // controlling, so the record is made after the call; it is
-                // still this thread's turn, and no other thread's gated wait
-                // reads the record before the turn ends. Skipped under record
-                // and replay: Replayer's descriptor is a placeholder that never
-                // becomes a terminal, so the two runs would not record alike.
+                // terminal without O_NOCTTY gains it as one, and the terminal
+                // can then signal the session and its foreground process group
+                // at moments set by host timing (`terminal_signals`). Hold
+                // those signals in every process, as `handle_ioctl` does for
+                // TIOCSCTTY and TIOCGPTPEER. Only the kernel knows whether this
+                // open made the terminal controlling, so the record is made
+                // after the call; it is still this thread's turn, and no other
+                // thread's gated wait reads the record before the turn ends.
+                // Skipped under record and replay: Replayer's descriptor is a
+                // placeholder that never becomes a terminal, so the two runs
+                // would not record alike.
                 if guest
                     .config()
                     .backend_supports_blocked_wait_signal_interruption
@@ -1569,7 +1570,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     record_host_timed_signals(
                         guest,
                         HostTimedSignalScope::Container,
-                        terminal_hangup_signals(),
+                        terminal_signals(),
                     )
                     .await;
                 }
@@ -6672,24 +6673,49 @@ mod test {
         }
     }
 
-    /// The calls that give a session its controlling terminal (TIOCSCTTY) or
-    /// choose the terminal's foreground process group (TIOCSPGRP) name SIGHUP
-    /// and SIGCONT, which Linux sends to that group and to the session leader
-    /// when the terminal hangs up or the leader exits, at a moment set by host
-    /// timing. Reading the foreground group (TIOCGPGRP) and giving up the
-    /// controlling terminal (TIOCNOTTY) name nothing (round-9 High 2 of
+    /// The calls that give a session its controlling terminal (TIOCSCTTY, and
+    /// TIOCGPTPEER without O_NOCTTY, which opens a pseudoterminal's other end
+    /// as `open` does) or choose the terminal's foreground process group
+    /// (TIOCSPGRP) name every signal Linux sends because of that terminal, at
+    /// a moment set by host timing: SIGHUP and SIGCONT when it hangs up or the
+    /// leader exits, SIGINT, SIGQUIT and SIGTSTP for its interrupt, quit and
+    /// suspend characters, SIGWINCH when its size changes, and SIGTTIN and
+    /// SIGTTOU when a background process group reads or writes it. Reading the
+    /// foreground group (TIOCGPGRP), giving up the controlling terminal
+    /// (TIOCNOTTY), opening the other end with O_NOCTTY, and setting the size
+    /// (TIOCSWINSZ, whose SIGWINCH is sent inside the caller's call) name
+    /// nothing (round-9 High 2 and the round-11 finding "Terminal resize
+    /// remains an admitted host-timed interruption" of
     /// https://github.com/rrnewton/hermit/pull/3361).
     #[test]
-    fn terminal_control_calls_name_sighup_and_sigcont() {
+    fn terminal_control_calls_name_the_terminal_signals() {
         use reverie::syscalls::ioctl::Request;
         let bit = |signal: i32| 1_u64 << (signal - 1);
-        let hangup = bit(libc::SIGHUP) | bit(libc::SIGCONT);
+        let terminal = [
+            libc::SIGHUP,
+            libc::SIGCONT,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTSTP,
+            libc::SIGWINCH,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+        ]
+        .into_iter()
+        .fold(0, |set, signal| set | bit(signal));
         for (request, expected) in [
-            (Request::TIOCSCTTY(0), hangup),
-            (Request::TIOCSCTTY(1), hangup),
-            (Request::TIOCSPGRP(None), hangup),
+            (Request::TIOCSCTTY(0), terminal),
+            (Request::TIOCSCTTY(1), terminal),
+            (Request::TIOCSPGRP(None), terminal),
+            (Request::TIOCGPTPEER(libc::O_RDWR), terminal),
+            (
+                Request::TIOCGPTPEER(libc::O_RDWR | libc::O_CLOEXEC),
+                terminal,
+            ),
+            (Request::TIOCGPTPEER(libc::O_RDWR | libc::O_NOCTTY), 0),
             (Request::TIOCGPGRP(None), 0),
             (Request::TIOCNOTTY, 0),
+            (Request::TIOCSWINSZ(None), 0),
         ] {
             assert_eq!(ioctl_host_timed_signals(request), expected, "{request:?}");
         }

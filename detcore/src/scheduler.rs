@@ -275,19 +275,63 @@ fn kernel_signal_bit(raw_signal: i32) -> u64 {
     }
 }
 
+/// Every signal Linux sends because of a terminal, as a kernel sigset. Once a
+/// guest process may have the terminal as its controlling terminal, or be in
+/// the terminal's foreground process group, each can arrive at a moment set
+/// by host timing:
+///
+/// - SIGHUP and SIGCONT when the terminal hangs up, as when its other end
+///   closes, or when the session leader exits (`tty_vhangup_session`,
+///   `disassociate_ctty`).
+/// - SIGINT, SIGQUIT and SIGTSTP for the interrupt, quit and suspend
+///   characters (`isig`), sent to the foreground process group when the
+///   kernel processes the terminal's input, which it does on a kernel worker
+///   rather than inside the call that supplied the input.
+/// - SIGWINCH when the window size changes (`tty_do_resize`, which
+///   `pty_resize` reaches for a pseudoterminal), sent to the foreground
+///   process group: a terminal emulator outside the container changes the
+///   size when its user resizes the window.
+/// - SIGTTIN and SIGTTOU when a process of a background process group reads
+///   the terminal, or writes it or changes its settings while TOSTOP is set
+///   (`__tty_check_change`, `job_control`), sent to that process's group,
+///   which can hold a process Hermit does not schedule. Linux sends them
+///   inside the caller's call, so for a guest's own read or write the record
+///   holds them longer than needed.
+///
+/// The scheduler records the whole set at launch when the guest may start
+/// with a terminal (`startup_host_timed_signals`), and so does a guest call
+/// that gives a session a controlling terminal or names the terminal's
+/// foreground process group (`syscalls/files.rs`). From then on no gated wait
+/// ends for any of them, whoever sends it: each is held until the call
+/// returns, as before blocked waits decided interruption from the kernel's
+/// signal state (<https://github.com/rrnewton/hermit/issues/3146>, and the
+/// round-11 finding "Terminal resize remains an admitted host-timed
+/// interruption" of <https://github.com/rrnewton/hermit/pull/3361>).
+pub(crate) fn terminal_signals() -> u64 {
+    [
+        libc::SIGHUP,
+        libc::SIGCONT,
+        libc::SIGINT,
+        libc::SIGQUIT,
+        libc::SIGTSTP,
+        libc::SIGWINCH,
+        libc::SIGTTIN,
+        libc::SIGTTOU,
+    ]
+    .into_iter()
+    .fold(0, |set, signal| set | kernel_signal_bit(signal))
+}
+
 /// The signals recorded as host-timed for every process of the container
 /// before the guest's first instruction (`host_timed_signals_everywhere`):
-/// SIGHUP and SIGCONT when the guest may start with a terminal and blocked
-/// waits decide interruption from the kernel's signal state
-/// (`Config::guest_may_inherit_a_terminal`), and nothing otherwise. Linux sends
-/// both when that terminal hangs up, as it does for one a guest makes its
-/// controlling terminal (`terminal_hangup_signals` in `syscalls/files.rs`), at
-/// a moment set by host timing. The guest makes no traced call that arms them,
-/// so no guest turn could record them
-/// (<https://github.com/rrnewton/hermit/issues/3146>).
+/// every signal a terminal sends (`terminal_signals`) when the guest may start
+/// with a terminal and blocked waits decide interruption from the kernel's
+/// signal state (`Config::guest_may_inherit_a_terminal`), and nothing
+/// otherwise. The guest makes no traced call that arms them, so no guest turn
+/// could record them (<https://github.com/rrnewton/hermit/issues/3146>).
 fn startup_host_timed_signals(cfg: &Config) -> u64 {
     if cfg.backend_supports_blocked_wait_signal_interruption && cfg.guest_may_inherit_a_terminal {
-        kernel_signal_bit(libc::SIGHUP) | kernel_signal_bit(libc::SIGCONT)
+        terminal_signals()
     } else {
         0
     }
@@ -9271,16 +9315,33 @@ mod test {
         );
     }
 
-    /// A launch that may pass the guest a terminal records SIGHUP and SIGCONT
-    /// as host-timed for every process before the guest runs, so a parked
-    /// precise-mode futex wait that catches both ends for neither, in the
+    /// A launch that may pass the guest a terminal records every signal a
+    /// terminal sends as host-timed for every process before the guest runs:
+    /// SIGHUP and SIGCONT for a hangup, SIGINT, SIGQUIT and SIGTSTP for the
+    /// interrupt, quit and suspend characters, SIGWINCH for a resize, and
+    /// SIGTTIN and SIGTTOU for a background read or write. So a parked
+    /// precise-mode futex wait that catches all of them ends for none, in the
     /// first process and in a forked child alike. Nothing is recorded without
     /// that terminal, or on a backend whose blocked waits do not read the
     /// kernel's signal state (https://github.com/rrnewton/hermit/issues/3146).
+    /// Round-11 finding "Terminal resize remains an admitted host-timed
+    /// interruption" on https://github.com/rrnewton/hermit/pull/3361: only
+    /// SIGHUP and SIGCONT were recorded, so a resize ended such a wait at a
+    /// turn the host chose.
     #[test]
-    fn a_launch_that_may_pass_a_terminal_holds_sighup_and_sigcont_from_the_start() {
-        let hup = kernel_signal_bit(libc::SIGHUP);
-        let cont = kernel_signal_bit(libc::SIGCONT);
+    fn a_launch_that_may_pass_a_terminal_holds_the_terminal_signals_from_the_start() {
+        let terminal = [
+            libc::SIGHUP,
+            libc::SIGCONT,
+            libc::SIGINT,
+            libc::SIGQUIT,
+            libc::SIGTSTP,
+            libc::SIGWINCH,
+            libc::SIGTTIN,
+            libc::SIGTTOU,
+        ]
+        .into_iter()
+        .fold(0, |set, signal| set | kernel_signal_bit(signal));
         let usr1 = kernel_signal_bit(libc::SIGUSR1);
         let gated = |guest_may_inherit_a_terminal| Config {
             sequentialize_threads: true,
@@ -9288,7 +9349,7 @@ mod test {
             guest_may_inherit_a_terminal,
             ..Config::default()
         };
-        assert_eq!(startup_host_timed_signals(&gated(true)), hup | cont);
+        assert_eq!(startup_host_timed_signals(&gated(true)), terminal);
         assert_eq!(startup_host_timed_signals(&gated(false)), 0);
         assert_eq!(
             startup_host_timed_signals(&Config {
@@ -9309,17 +9370,17 @@ mod test {
             register_known_thread(&mut scheduler, thread);
         }
         for (thread, mm_pid) in [(parent, 100), (child, 200)] {
-            assert_eq!(scheduler.host_timed_signals(thread), hup | cont);
+            assert_eq!(scheduler.host_timed_signals(thread), terminal);
             scheduler.sleep_futex_waiter(
                 &thread,
                 FutexID::private(MmId::initial(DetPid::from_raw(mm_pid)), 0x404110),
                 None,
                 u32::MAX,
-                Some(signal_watch(hup | cont | usr1)),
+                Some(signal_watch(terminal | usr1)),
             );
             scheduler
                 .test_kernel_signal_states
-                .insert(thread, signal_state(hup | cont | usr1, 0));
+                .insert(thread, signal_state(terminal | usr1, 0));
             assert_eq!(
                 scheduler.parked_futex_interrupting_signals(thread),
                 Some(usr1),

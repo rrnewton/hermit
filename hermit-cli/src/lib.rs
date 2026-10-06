@@ -3288,8 +3288,9 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     config
 }
 
-/// Whether the guest may start with a terminal, which Linux can hang up and
-/// send SIGHUP and SIGCONT for at a moment the host sets
+/// Whether the guest may start with a terminal, which can make Linux send the
+/// guest signals at moments the host sets, such as SIGHUP when the terminal
+/// hangs up and SIGWINCH when it is resized
 /// (`Config::guest_may_inherit_a_terminal`): one of this process's standard
 /// descriptors, which the guest inherits, is a terminal, or this process has a
 /// controlling terminal, which the guest inherits with its session because
