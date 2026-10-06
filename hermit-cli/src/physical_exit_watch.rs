@@ -302,6 +302,15 @@ impl PhysicalExitWatch {
         Ok(())
     }
 
+    /// The watcher's terminal failure, if it has stopped observing exits.
+    pub fn failure(&self) -> Option<io::Error> {
+        let state = self.shared.state.lock().unwrap();
+        state
+            .failure
+            .as_ref()
+            .map(|failure| io::Error::new(failure.kind(), failure.to_string()))
+    }
+
     /// Sends `SIGKILL` to every watched process that has not exited yet. Used
     /// when a run has failed, so that no guest outlives it; the exits that
     /// follow are reported as usual. `SIGKILL` also ends a stopped process.

@@ -1022,7 +1022,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // a_failing_jitter_replay_returns_its_error}.
     // The shared physical-exit watcher's four runtime-mode tests and the three
     // in_guest_exits admission tests retain all 902 prior IDs: 909.
-    ("test.hermit_unit", 909),
+    // The exit watchdog's six tests (in_guest_exits) retain all 909: 915.
+    ("test.hermit_unit", 915),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1613,7 +1614,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // https://github.com/rrnewton/hermit/pull/3686 --max-log-bytes tests:
     // 862 + 40 = 902.
     // The host twin selects the same seven watcher and admission tests: 909.
-    ("test.hermit_unit_on_host", 909),
+    // The host twin selects the same six watchdog tests: 915.
+    ("test.hermit_unit_on_host", 915),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.

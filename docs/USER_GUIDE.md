@@ -244,6 +244,16 @@ set-user-ID or non-x86-64 programs, programs with a `DT_PREINIT_ARRAY`, and
 anything other than a regular file. A guest may `fork`, and `vfork` runs as a
 copying fork; creating a thread and `exec` are not supported yet.
 
+A guest process leaves the host some time after Hermit grants its exit, so
+Hermit selects no other guest's turn until the process has physically gone.
+An exit that needs another guest's turn to finish therefore cannot complete.
+A guest that serves a kernel network-filesystem client mounted outside the
+guest set (NFS, CIFS, 9p) is an unsupported topology. Hermit fails the run,
+naming the process, when an exit sleeps in the kernel's exit path for over
+1 s, or when any exit is not complete 60 s after its grant, and kills the
+guests; such a run never verifies. A soft mount whose retries give up in
+under a second can still complete unnoticed.
+
 The default namespace, mount, and network setup is shared with Hermit's other
 backends; `--no-namespace` remains available for trusted guests. The in-guest
 runtime reserves `SIGSYS` for itself. This experimental path is not a security
