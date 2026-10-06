@@ -19,6 +19,7 @@
  *            winchinherit>
  *        external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault|
  *            select|rawselect|selectbadf|rawselectbadf> <racing|racingchld>
+ *        external_signal_interrupt <select|rawselect> <parkready|parkclose>
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
  * select system call itself. `sem` is glibc's sem_timedwait, a FUTEX_WAIT_BITSET
@@ -210,6 +211,22 @@
  * EFAULT, and the handler runs once by the time the thread is joined. Each
  * trial prints a TRIAL line, then one RESULT line counts the trials that
  * matched Linux.
+ *
+ * The `parkready` and `parkclose` senders are a mode of their own, for select
+ * and rawselect on the read end of a new, empty pipe, with a 5 s timeout, so
+ * the call finds nothing ready at first and waits. Four times, the main thread
+ * starts a thread that sleeps 100 ms, then writes a byte to the pipe
+ * (`parkready`) or closes its read end (`parkclose`), yields the trial number
+ * of times, and sends SIGUSR1, caught with SA_RESTART, to the main thread with
+ * tgkill; the main thread makes the call. Linux's do_select polls every
+ * descriptor on each pass and looks at pending signals only when none is
+ * ready, so for `parkready`, wherever the signal lands, the call returns 1
+ * with the pipe set, and the handler runs once. For `parkclose` the trial
+ * expects -1 with EBADF, which is Hermit's result and not Linux's: each probe
+ * Hermit makes is a new select call, which rejects the closed descriptor,
+ * while Linux 7.1.3, measured, returns 1 with the closed descriptor set. Each
+ * trial prints a TRIAL line, then one RESULT line counts the trials that
+ * matched.
  *
  * The `stopcont` and `stopcontusr1` senders are modes of their own, for poll
  * (no descriptors) and a relative FUTEX_WAIT, each with the QUIET_TIMEOUT_MS
@@ -1242,6 +1259,81 @@ static int racing_main(const char *call, int signal, const char *role) {
   return 0;
 }
 
+/* The `parkready` and `parkclose` senders (see the usage comment). */
+#define PARKED_TRIALS 4
+#define PARKED_TIMEOUT_MS 5000
+#define PARKED_DELAY_MS 100
+
+struct parker {
+  pid_t target;
+  int fd;
+  int close_fd;
+  int yields;
+};
+
+static void *parker_thread(void *arg) {
+  const struct parker *parker = arg;
+  sleep_ms(PARKED_DELAY_MS);
+  if (parker->close_fd) {
+    if (close(parker->fd) != 0) _exit(95);
+  } else if (write(parker->fd, "x", 1) != 1) {
+    _exit(95);
+  }
+  for (int i = 0; i < parker->yields; i++) sched_yield();
+  if (syscall(SYS_tgkill, getpid(), parker->target, SIGUSR1) != 0) _exit(95);
+  return NULL;
+}
+
+static int parked_main(const char *call, int close_fd, const char *role) {
+  int raw = !strcmp(call, "rawselect");
+  if (!raw && strcmp(call, "select")) return 2;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = on_usr1;
+  sa.sa_flags = SA_RESTART;
+  sigemptyset(&sa.sa_mask);
+  if (sigaction(SIGUSR1, &sa, NULL) != 0) return 94;
+  pid_t self = (pid_t)syscall(SYS_gettid);
+  say("READY\n");
+  int matched = 0;
+  for (int i = 0; i < PARKED_TRIALS; i++) {
+    handled = 0;
+    int fds[2];
+    if (pipe(fds) != 0) return 97;
+    struct parker parker = {self, close_fd ? fds[0] : fds[1], close_fd, i};
+    pthread_t thread;
+    if (pthread_create(&thread, NULL, parker_thread, &parker) != 0) return 98;
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fds[0], &rfds);
+    struct timeval tv = {PARKED_TIMEOUT_MS / 1000, 0};
+    errno = 0;
+    long ret;
+    if (raw)
+      ret = syscall(SYS_select, fds[0] + 1, &rfds, NULL, NULL, &tv);
+    else
+      ret = select(fds[0] + 1, &rfds, NULL, NULL, &tv);
+    int err = errno;
+    int got = ret > 0 && FD_ISSET(fds[0], &rfds);
+    if (pthread_join(thread, NULL) != 0) return 98;
+    /* The thread sent the signal before it exited, so it is pending at the
+     * latest now; the first system call below delivers it. */
+    wait_for_handler();
+    int handled_count = handled;
+    printf("TRIAL %d ret=%ld errno=%s got=%d handled=%d\n", i, ret,
+           ret < 0 ? errno_name(err) : "none", got, handled_count);
+    fflush(stdout);
+    int ok = close_fd ? ret == -1 && err == EBADF : ret == 1 && got == 1;
+    if (ok && handled_count == 1) matched += 1;
+    if (!close_fd && close(fds[0]) != 0) return 97;
+    if (close(fds[1]) != 0) return 97;
+  }
+  printf("RESULT call=%s role=%s trials=%d matched=%d\n", call, role, PARKED_TRIALS, matched);
+  printf("DONE\n");
+  fflush(stdout);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) {
     say("usage: external_signal_interrupt <futex|sem|select|rawselect|poll|epoll|wait4|waitid> "
@@ -1255,7 +1347,8 @@ int main(int argc, char **argv) {
         "       external_signal_interrupt <poll|futex|bitset> <stopcont|stopcontusr1>\n"
         "       external_signal_interrupt <futex|bitset> restartfirst\n"
         "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault|"
-        "select|rawselect|selectbadf|rawselectbadf> <racing|racingchld>\n");
+        "select|rawselect|selectbadf|rawselectbadf> <racing|racingchld>\n"
+        "       external_signal_interrupt <select|rawselect> <parkready|parkclose>\n");
     return 2;
   }
   /* Before any handler is installed: the handler compares against it. */
@@ -1272,6 +1365,8 @@ int main(int argc, char **argv) {
   if (!strcmp(sender, "winchinherit")) return inherited_terminal_main(call, SIGWINCH, "winchinherit");
   if (!strcmp(sender, "racing")) return racing_main(call, SIGUSR1, "racing");
   if (!strcmp(sender, "racingchld")) return racing_main(call, SIGCHLD, "racingchld");
+  if (!strcmp(sender, "parkready")) return parked_main(call, 0, "parkready");
+  if (!strcmp(sender, "parkclose")) return parked_main(call, 1, "parkclose");
   if (!strcmp(sender, "stopcont")) return stopcont_main(call, 0);
   if (!strcmp(sender, "stopcontusr1")) return stopcont_main(call, 1);
   if (!strcmp(sender, "restartfirst")) return restart_first_main(call);

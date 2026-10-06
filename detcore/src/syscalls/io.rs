@@ -694,37 +694,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             let signals = &mut signals;
             let resources = &mut resources;
             async move {
-                let mut first_turn = true;
                 loop {
                     let signaled = matches!(
                         resource_request(guest, resources.clone()).await,
                         ResumeStatus::Signaled(_)
                     );
-                    let first = std::mem::take(&mut first_turn);
-                    // The kernel's signal state that this turn's check read, which the
-                    // probe's injection below takes as its first read once every
-                    // blockable signal is blocked (`inject_absorbing_after`). The first
-                    // turn reads none before its probe: Linux reports a descriptor that
-                    // is not open, and the count of ready descriptors, before it looks
-                    // at pending signals (`core_sys_select`), so the first probe runs
-                    // before the first check, as in
-                    // `retry_blocking_wait_with_kernel_signal_state`.
-                    let mut turn_state = None;
-                    if let Some(signals) = signals.as_ref() {
-                        // A scheduler `Signaled` answer is only a hint here; the kernel's
-                        // state decides. pselect6 returns ERESTARTNOHAND: EINTR after a
-                        // handler, a restart with the remaining timeout after a stop.
-                        if !first {
-                            match signals.interrupted_with_state() {
-                                Ok((false, state)) => turn_state = Some(state),
-                                Ok((true, _)) => {
-                                    self.write_pselect6_remaining(guest, call, deadline).await?;
-                                    break Err(Errno::ERESTARTNOHAND.into());
-                                }
-                                Err(error) => break Err(error),
-                            }
-                        }
-                    } else if signaled {
+                    // Every turn probes before it looks at pending signals, as Linux
+                    // does: do_select polls every descriptor on each pass and returns
+                    // the count of ready ones before it tests signal_pending, and at
+                    // the start max_select_fd returns EBADF for a descriptor that is
+                    // not open (`core_sys_select`). So a descriptor that becomes ready
+                    // in a later turn in which a signal is also pending is reported
+                    // (round-12 Medium on https://github.com/rrnewton/hermit/pull/3361).
+                    // Each probe is a new select call, so a descriptor closed during
+                    // the wait gets EBADF, where Linux reports it ready. Without the
+                    // kernel's signal state, a scheduler `Signaled` answer still ends
+                    // the call before the probe.
+                    if signals.is_none() && signaled {
                         self.write_pselect6_remaining(guest, call, deadline).await?;
                         return Err(Errno::EINTR.into());
                     }
@@ -741,27 +727,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
                     let raw_result = match signals.as_mut() {
                         // A signal stop that does not end the wait is absorbed (see
-                        // `KernelSignalWait`). Only the guest memory writes above ran
-                        // since the turn's read, and they do not resume the thread.
-                        Some(signals) => {
-                            // Only the first turn has no state. Its probe runs before
-                            // any check (`inject_first_probe`): a signal that would end
-                            // the wait and stops the probe is held, the probe runs
-                            // again, and the signal is delivered as the call returns.
-                            let injected = match turn_state {
-                                Some(state) => {
-                                    signals.inject_absorbing_after(guest, probe, state).await
-                                }
-                                None => signals.inject_first_probe(guest, probe).await,
-                            };
-                            match injected {
-                                Ok(result) => result,
-                                Err(error) => {
-                                    self.write_pselect6_remaining(guest, call, deadline).await?;
-                                    break Err(error);
-                                }
+                        // `KernelSignalWait`). Every probe runs before the turn's check
+                        // (`inject_first_probe`): a signal that would end the wait and
+                        // stops the probe is held, the probe runs again, and the signal
+                        // is delivered as the call returns. Once `block` has blocked
+                        // every blockable signal, a pending one cannot stop the probe.
+                        Some(signals) => match signals.inject_first_probe(guest, probe).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                self.write_pselect6_remaining(guest, call, deadline).await?;
+                                break Err(error);
                             }
-                        }
+                        },
                         None => guest.inject(probe).await,
                     };
                     let result = pselect6_probe_result(raw_result);
@@ -775,9 +752,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         copy_result?;
                         break result.map_err(Into::into);
                     }
-                    // The first turn's check, after its probe found no descriptor ready
-                    // and no error: only then does a pending signal end the call.
-                    if first && let Some(signals) = signals.as_ref() {
+                    // The turn's check, after its probe found no descriptor ready and no
+                    // error: only then does a pending signal end the call. A scheduler
+                    // `Signaled` answer is only a hint here; the kernel's state decides.
+                    // pselect6 returns ERESTARTNOHAND: EINTR after a handler, a restart
+                    // with the remaining timeout after a stop.
+                    if let Some(signals) = signals.as_ref() {
                         match signals.interrupted_with_state() {
                             Ok((false, _)) => {}
                             Ok((true, _)) => {
@@ -993,37 +973,23 @@ impl<T: RecordOrReplay> Detcore<T> {
             let signals = &mut signals;
             let resources = &mut resources;
             async move {
-                let mut first_turn = true;
                 loop {
                     let signaled = matches!(
                         resource_request(guest, resources.clone()).await,
                         ResumeStatus::Signaled(_)
                     );
-                    let first = std::mem::take(&mut first_turn);
-                    // The kernel's signal state that this turn's check read, which the
-                    // probe's injection below takes as its first read once every
-                    // blockable signal is blocked (`inject_absorbing_after`). The first
-                    // turn reads none before its probe: Linux reports a descriptor that
-                    // is not open, and the count of ready descriptors, before it looks
-                    // at pending signals (`core_sys_select`), so the first probe runs
-                    // before the first check, as in
-                    // `retry_blocking_wait_with_kernel_signal_state`.
-                    let mut turn_state = None;
-                    if let Some(signals) = signals.as_ref() {
-                        // A scheduler `Signaled` answer is only a hint here; the kernel's
-                        // state decides. select returns ERESTARTNOHAND: EINTR after a
-                        // handler, a restart with the remaining timeout after a stop.
-                        if !first {
-                            match signals.interrupted_with_state() {
-                                Ok((false, state)) => turn_state = Some(state),
-                                Ok((true, _)) => {
-                                    self.write_select_remaining(guest, call, deadline).await?;
-                                    break Err(Errno::ERESTARTNOHAND.into());
-                                }
-                                Err(error) => break Err(error),
-                            }
-                        }
-                    } else if signaled {
+                    // Every turn probes before it looks at pending signals, as Linux
+                    // does: do_select polls every descriptor on each pass and returns
+                    // the count of ready ones before it tests signal_pending, and at
+                    // the start max_select_fd returns EBADF for a descriptor that is
+                    // not open (`core_sys_select`). So a descriptor that becomes ready
+                    // in a later turn in which a signal is also pending is reported
+                    // (round-12 Medium on https://github.com/rrnewton/hermit/pull/3361).
+                    // Each probe is a new select call, so a descriptor closed during
+                    // the wait gets EBADF, where Linux reports it ready. Without the
+                    // kernel's signal state, a scheduler `Signaled` answer still ends
+                    // the call before the probe.
+                    if signals.is_none() && signaled {
                         self.write_select_remaining(guest, call, deadline).await?;
                         return Err(Errno::EINTR.into());
                     }
@@ -1040,27 +1006,18 @@ impl<T: RecordOrReplay> Detcore<T> {
 
                     let result = match signals.as_mut() {
                         // A signal stop that does not end the wait is absorbed (see
-                        // `KernelSignalWait`). Only the guest memory writes above ran
-                        // since the turn's read, and they do not resume the thread.
-                        Some(signals) => {
-                            // Only the first turn has no state. Its probe runs before
-                            // any check (`inject_first_probe`): a signal that would end
-                            // the wait and stops the probe is held, the probe runs
-                            // again, and the signal is delivered as the call returns.
-                            let injected = match turn_state {
-                                Some(state) => {
-                                    signals.inject_absorbing_after(guest, probe, state).await
-                                }
-                                None => signals.inject_first_probe(guest, probe).await,
-                            };
-                            match injected {
-                                Ok(result) => result,
-                                Err(error) => {
-                                    self.write_select_remaining(guest, call, deadline).await?;
-                                    break Err(error);
-                                }
+                        // `KernelSignalWait`). Every probe runs before the turn's check
+                        // (`inject_first_probe`): a signal that would end the wait and
+                        // stops the probe is held, the probe runs again, and the signal
+                        // is delivered as the call returns. Once `block` has blocked
+                        // every blockable signal, a pending one cannot stop the probe.
+                        Some(signals) => match signals.inject_first_probe(guest, probe).await {
+                            Ok(result) => result,
+                            Err(error) => {
+                                self.write_select_remaining(guest, call, deadline).await?;
+                                break Err(error);
                             }
-                        }
+                        },
                         None => guest.inject(probe).await,
                     };
                     if result != Ok(0) {
@@ -1073,9 +1030,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                         copy_result?;
                         break result.map_err(Into::into);
                     }
-                    // The first turn's check, after its probe found no descriptor ready
-                    // and no error: only then does a pending signal end the call.
-                    if first && let Some(signals) = signals.as_ref() {
+                    // The turn's check, after its probe found no descriptor ready and no
+                    // error: only then does a pending signal end the call. A scheduler
+                    // `Signaled` answer is only a hint here; the kernel's state decides.
+                    // select returns ERESTARTNOHAND: EINTR after a handler, a restart
+                    // with the remaining timeout after a stop.
+                    if let Some(signals) = signals.as_ref() {
                         match signals.interrupted_with_state() {
                             Ok((false, _)) => {}
                             Ok((true, _)) => {
