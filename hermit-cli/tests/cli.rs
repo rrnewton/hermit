@@ -9372,6 +9372,73 @@ fn output_capturing_run2_log(
     (output, captured.then(|| capture.to_owned()))
 }
 
+/// A verification report from a backend whose virtual clock is the
+/// retired-branch counter repeats the binary's own `exact_branch_counter`
+/// verdict (https://github.com/rrnewton/hermit/issues/3794), for `run --verify`
+/// and for `record start --verify`, which ignores `--strict` and so still runs
+/// where the counter is inexact. Those two run without `--strict`, so that a
+/// host with an inexact counter writes a complete report too. A strict run
+/// refused before it starts a guest, here for a missing program, still carries
+/// the verdict in its no-result report: the strict counter refusal and every
+/// later refusal come after the verdict is recorded.
+#[test]
+fn ptrace_verification_reports_carry_the_exact_branch_counter_verdict() {
+    let _guard = hermit_run_guard();
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .expect("failed to create the branch-counter report test directory");
+    let capabilities = Command::new(env!("CARGO_BIN_EXE_hermit"))
+        .args(["host-capabilities", "--json"])
+        .output()
+        .expect("failed to run hermit host-capabilities");
+    assert!(capabilities.status.success(), "{capabilities:?}");
+    let expected = serde_json::from_slice::<serde_json::Value>(&capabilities.stdout)
+        .expect("host-capabilities --json is JSON")["exact_branch_counter"]
+        .clone();
+    assert!(expected.is_object(), "{expected}");
+    for (label, file, prefix, program) in [
+        ("run --verify", "run", &["run", "--verify"][..], "/bin/true"),
+        (
+            "record start --verify",
+            "record",
+            &["record", "start", "--verify"][..],
+            "/bin/true",
+        ),
+        (
+            "refused run --strict --verify",
+            "refused",
+            &["run", "--strict", "--verify"][..],
+            "/nonexistent/hermit-missing-program",
+        ),
+    ] {
+        let verdict_path = root.path().join(format!("{file}.json"));
+        let mut args = prefix.to_vec();
+        args.extend([
+            "--verify-json",
+            verdict_path.to_str().expect("verdict path should be UTF-8"),
+            "--",
+            program,
+        ]);
+        let output = hermit_command(&args)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run {label}: {error}"));
+        let report: serde_json::Value = serde_json::from_slice(
+            &fs::read(&verdict_path)
+                .unwrap_or_else(|error| panic!("{label} wrote no report: {error}")),
+        )
+        .unwrap_or_else(|error| panic!("{label} report is not JSON: {error}"));
+        assert_eq!(
+            report["exact_branch_counter"],
+            expected,
+            "{label}: {report}\n{}",
+            strip_ansi_sgr(&stderr(&output))
+        );
+        if file == "refused" {
+            assert!(!output.status.success(), "{label} was not refused");
+            assert_eq!(report["verdict"], "no_result", "{label}: {report}");
+        }
+    }
+}
+
 /// `--keep-logs` keeps ONLY the first run's log after a matched verification.
 ///
 /// Owner rule, https://github.com/rrnewton/hermit/issues/3301: after the two

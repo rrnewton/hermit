@@ -20446,6 +20446,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                     first_divergent_syscall: None,
                     first_divergent_left_message: None,
                     first_divergent_right_message: None,
+                    exact_branch_counter: None,
                 })
                 .unwrap();
                 serde_json::json!({
@@ -21371,6 +21372,7 @@ fn self_test_tier(include_commands: bool) -> Result<(), String> {
                 first_divergent_syscall: syscall,
                 first_divergent_left_message: None,
                 first_divergent_right_message: None,
+                exact_branch_counter: None,
                 runtime: None,
                 dbt_counted_branches: None,
                 guest_exit_code: Some(0),
@@ -40901,6 +40903,39 @@ mod evidence_identity_tests {
             reason: reason.into(),
         });
         row
+    }
+
+    /// Shared with dev-hermit's ci-hub/series/tests/fixtures/branch-counter-parity-row.json
+    /// (byte-identical): run 1838's backend-parity row with the ptrace reference's
+    /// exact_branch_counter verdict (https://github.com/rrnewton/hermit/issues/3794)
+    /// added as Hermit writes it. The verdict is part of the typed parity witness,
+    /// so this identity and the series writer's (`_cell_result_evidence_sha256`)
+    /// must agree on it, or scorecard reconciliation refuses the row.
+    #[test]
+    fn a_parity_operands_branch_counter_verdict_is_in_the_shared_evidence_identity() {
+        const BRANCH_COUNTER_PARITY_ROW: &str = "763763fee9e6daf7bfe2bd571ce4c6dfce703878665c1fe68c241280896c87c2";
+        let fixture: JsonValue =
+            serde_json::from_str(include_str!("testdata/branch-counter-parity-row.json")).unwrap();
+        assert_eq!(
+            fixture["provenance"]["evidence_sha256"],
+            BRANCH_COUNTER_PARITY_ROW
+        );
+        let mut row: ResultRow = serde_json::from_value(fixture["row"].clone()).unwrap();
+        // As the scorecard reads a row: the pinned-root /src paths become the
+        // recorded /repo root, which the series writer's projection does too.
+        normalise_recorded_root(&mut row);
+        assert_eq!(
+            row.backend_parity
+                .as_ref()
+                .unwrap()
+                .reference
+                .verification
+                .exact_branch_counter
+                .as_ref()
+                .map(|verdict| verdict.present),
+            Some(true)
+        );
+        assert_eq!(row.evidence_identity().unwrap(), BRANCH_COUNTER_PARITY_ROW);
     }
 
     #[test]

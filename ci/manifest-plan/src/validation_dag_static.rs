@@ -776,7 +776,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // manifest-plan's
     // runner::tests::every_row_records_the_binarys_exact_branch_counter_verdict
     // retains all 974 (975, measured with cargo nextest list).
-    ("test.regular_crates", 975),
+    // canonical_verdict::tests::the_exact_branch_counter_verdict_is_optional_and_strictly_typed,
+    // which manifest-plan path-includes, retains all 975 (976, measured with
+    // cargo nextest list).
+    ("test.regular_crates", 976),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -956,7 +959,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 843: 843 + 6 = 849.
     // run::passthru_opt_leaves_guest_syscalls_unobserved_on_every_backend
     // retains all 849 (850, measured with cargo nextest list).
-    ("test.hermit_unit", 859),
+    // canonical_verdict::tests::the_exact_branch_counter_verdict_is_optional_and_strictly_typed
+    // and verify::tests::a_recorded_branch_counter_verdict_is_stamped_on_every_report_once
+    // retain all 859 (861, measured with cargo nextest list).
+    ("test.hermit_unit", 861),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1301,7 +1307,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // dbt_rdtsc_is_answered_by_detcore_as_under_ptrace retains all 152: 153,
     // listed with the build.workspace_on_host features and this node's
     // arguments.
-    ("test.cli", 153),
+    // ptrace_verification_reports_carry_the_exact_branch_counter_verdict
+    // retains all 153 (154, measured with cargo nextest list).
+    ("test.cli", 154),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1378,7 +1386,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // 121 after, and the removed set is exactly those 31.
     // The same DBT rdtsc test as test.cli retains all 121: 122, listed the
     // same way.
-    ("test.cli_on_host", 122),
+    // The same exact-branch-counter report test retains all 122 (123).
+    ("test.cli_on_host", 123),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
@@ -1473,7 +1482,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two LiteInst DETLOG forwarding-policy tests (843).
     // The host twin selects the same six exact-branch-counter tests: 843 + 6 = 849.
     // And the same --passthru-opt coverage test (850).
-    ("test.hermit_unit_on_host", 859),
+    // And the same two exact-branch-counter report tests (861).
+    ("test.hermit_unit_on_host", 861),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -1541,7 +1551,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The three exact-branch-counter tests listed there retain all 969: 972.
     // The two network trace codec tests listed there retain all 972: 974.
     // The row-recording exact-branch-counter test listed there retains all 974: 975.
-    ("test.regular_crates_on_host", 975),
+    // The report exact-branch-counter test listed there retains all 975: 976.
+    ("test.regular_crates_on_host", 976),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

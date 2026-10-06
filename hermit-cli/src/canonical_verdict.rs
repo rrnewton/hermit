@@ -405,6 +405,24 @@ pub struct VerificationReport {
     /// Corresponding first differing compared message from the right execution.
     #[serde(default)]
     pub first_divergent_right_message: Option<String>,
+    /// Whether the retired-branch counter that this run's virtual clock and
+    /// preemption points came from was exact on the producing host: the same
+    /// verdict `hermit host-capabilities` reports as `exact_branch_counter`
+    /// (<https://github.com/rrnewton/hermit/issues/3794>). Present for a run
+    /// on a backend that reads that counter (ptrace, e9patch, and `record
+    /// start`); absent for another backend, and in a report written before
+    /// this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_branch_counter: Option<BranchCounterVerdict>,
+}
+
+/// [`VerificationReport::exact_branch_counter`]: present, and the producer's
+/// evidence (the CPU and, when absent, the kind of validation failure).
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BranchCounterVerdict {
+    pub present: bool,
+    pub evidence: String,
 }
 
 /// Accept `null` but not a MISSING field. serde maps an absent `Option` field to
@@ -442,6 +460,7 @@ impl VerificationReport {
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
+            exact_branch_counter: None,
         }
     }
 
@@ -777,6 +796,41 @@ impl VerificationReport {
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_exact_branch_counter_verdict_is_optional_and_strictly_typed() {
+        // Absent: the key is not written, so a report from another backend has
+        // exactly the bytes it had before the field existed.
+        let report = VerificationReport::no_result();
+        let bytes = serde_json::to_vec(&report).unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(value.get("exact_branch_counter").is_none(), "{value}");
+        assert_eq!(
+            VerificationReport::from_current_json_slice(&bytes)
+                .unwrap()
+                .exact_branch_counter,
+            None
+        );
+        // Present: it round-trips through the current-producer reader.
+        let mut report = VerificationReport::no_result();
+        report.exact_branch_counter = Some(BranchCounterVerdict {
+            present: false,
+            evidence: "fixture CPU: Reverie performance-counter validation failed \
+                       (AmdSpecLockMapShouldBeDisabled)"
+                .into(),
+        });
+        let bytes = serde_json::to_vec(&report).unwrap();
+        assert_eq!(
+            VerificationReport::from_current_json_slice(&bytes)
+                .unwrap()
+                .exact_branch_counter,
+            report.exact_branch_counter
+        );
+        // An unknown key inside the verdict is refused, not dropped.
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        value["exact_branch_counter"]["measured_counts"] = serde_json::json!(91);
+        assert!(VerificationReport::from_json_slice(value.to_string().as_bytes()).is_err());
+    }
+
     fn failed_container_report(
         run: VerificationRun,
         disposition: ContainerDisposition,
@@ -1079,6 +1133,7 @@ mod tests {
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
+            exact_branch_counter: None,
         }
     }
 

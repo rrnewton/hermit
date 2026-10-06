@@ -76,6 +76,7 @@ use super::global_opts::GlobalOpts;
 use super::guest_capture::GuestRunCapturePaths;
 use super::guest_capture::GuestRunCaptureSession;
 use super::host_capabilities::cpu_identity;
+use super::host_capabilities::exact_branch_counter_verdict;
 use super::host_capabilities::host_inexact_branch_counter;
 use super::record_envelope::RecordEnvelope;
 use super::tracing::BoundedWriter;
@@ -344,6 +345,16 @@ fn place_host_input_change(
     };
     let positions = [place(logs[0], "run 1"), place(logs[1], "run 2")];
     Some((difference, positions))
+}
+
+/// `hermit host-capabilities`'s own `exact_branch_counter` verdict, for a
+/// verification report (`VerificationReport::exact_branch_counter`).
+pub(crate) fn branch_counter_verdict() -> hermit::canonical_verdict::BranchCounterVerdict {
+    let verdict = exact_branch_counter_verdict();
+    hermit::canonical_verdict::BranchCounterVerdict {
+        present: verdict.present,
+        evidence: verdict.evidence,
+    }
 }
 
 /// Why a run on `backend`, with `--passthru-opt` when `passthru_opt` is set,
@@ -4220,7 +4231,17 @@ impl RunOpts {
             backend.ensure_available()?;
         }
         self.install_pmu_config()?;
-        // After the PMU configuration: Reverie's validation reads it.
+        // After the PMU configuration, which Reverie's validation reads, and
+        // before every check below that can still refuse the run: the pending
+        // report is rewritten with the verdict, so that a run refused here,
+        // by the strict counter check or a later one, still says which
+        // counter it would have read.
+        if let Some(path) = self.verify_json.as_deref()
+            && self.arms_reverie_ptrace_pmu_timer()
+        {
+            crate::verify::record_exact_branch_counter(branch_counter_verdict());
+            crate::verify::write_pending_verification_json(path)?;
+        }
         self.refuse_strict_with_inexact_branch_counter()?;
         // The KVM backend reaches real reverie-kvm code from its dispatch path
         // and reports an accurate, program-specific error there, so it is not

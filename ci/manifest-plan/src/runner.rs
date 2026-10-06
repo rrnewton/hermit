@@ -16485,6 +16485,7 @@ backends_disabled:
             first_divergent_syscall: None,
             first_divergent_left_message: None,
             first_divergent_right_message: None,
+            exact_branch_counter: None,
         }
     }
 

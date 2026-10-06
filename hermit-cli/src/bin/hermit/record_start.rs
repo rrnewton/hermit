@@ -549,6 +549,12 @@ impl StartOpts {
 
     /// This is called when `--verify` is passed to the command line.
     fn record_verify(&self, global: &GlobalOpts) -> Result<ExitStatus, Error> {
+        // `record start` runs on the ptrace record runtime, whose virtual clock
+        // is the retired-branch counter, and installs no PMU configuration of
+        // its own, so Reverie's validation can run here.
+        if self.verify_json.is_some() {
+            crate::verify::record_exact_branch_counter(crate::run::branch_counter_verdict());
+        }
         // Stamp an explicit no-result BEFORE any fallible work: the record and
         // replay steps below can fail long before a verdict exists, and a reused
         // --verify-json path must never keep showing a previous invocation's

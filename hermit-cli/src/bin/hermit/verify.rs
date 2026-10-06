@@ -25,6 +25,7 @@ use detcore_model::summary::RunSummary;
 use hermit::Context;
 use hermit::Error;
 use hermit::HERMIT_VERIFICATION_DIVERGENCE_EXIT;
+use hermit::canonical_verdict::BranchCounterVerdict;
 use hermit::canonical_verdict::ComparedLogMessages;
 use hermit::canonical_verdict::ComparedLogScope;
 use hermit::canonical_verdict::ComparedOutput;
@@ -708,7 +709,35 @@ pub(crate) fn verification_report(outcome: &VerificationOutcome) -> Verification
         first_divergent_syscall: outcome.first_divergent_syscall,
         first_divergent_left_message: outcome.first_divergent_left_message.clone(),
         first_divergent_right_message: outcome.first_divergent_right_message.clone(),
+        exact_branch_counter: None,
     }
+}
+
+/// The `exact_branch_counter` verdict every verification report this process
+/// writes carries, once [`record_exact_branch_counter`] has run.
+static EXACT_BRANCH_COUNTER: std::sync::OnceLock<BranchCounterVerdict> = std::sync::OnceLock::new();
+
+/// Record, once per process, the `exact_branch_counter` verdict that
+/// `hermit host-capabilities` reports, so that every verification report this
+/// process writes from then on carries it ([`write_report_json`]). Called by a
+/// run on a backend whose virtual clock is the retired-branch counter, after
+/// its PMU configuration is installed: Reverie's validation reads that
+/// configuration and fixes it for the process.
+pub(crate) fn record_exact_branch_counter(verdict: BranchCounterVerdict) {
+    let _ = EXACT_BRANCH_COUNTER.set(verdict);
+}
+
+/// `report` with the recorded `exact_branch_counter` verdict (`recorded`),
+/// unless it already carries one.
+fn with_exact_branch_counter(
+    report: &VerificationReport,
+    recorded: Option<&BranchCounterVerdict>,
+) -> VerificationReport {
+    let mut report = report.clone();
+    if report.exact_branch_counter.is_none() {
+        report.exact_branch_counter = recorded.cloned();
+    }
+    report
 }
 
 /// Write the verification report as a single JSON line to `path`.
@@ -965,7 +994,8 @@ fn staging_directory(path: &Path) -> &Path {
 pub fn write_report_json(path: &Path, report: &VerificationReport) -> Result<(), Error> {
     use std::io::Write as _;
 
-    let json = serde_json::to_string(report)?;
+    let report = with_exact_branch_counter(report, EXACT_BRANCH_COUNTER.get());
+    let json = serde_json::to_string(&report)?;
     // Same directory as the target so the rename below stays within one
     // filesystem and is therefore atomic.
     let mut temp = NamedTempFile::new_in(staging_directory(path))
@@ -1913,6 +1943,31 @@ mod tests {
     use std::fs;
 
     use super::*;
+
+    #[test]
+    fn a_recorded_branch_counter_verdict_is_stamped_on_every_report_once() {
+        let recorded = BranchCounterVerdict {
+            present: true,
+            evidence: "fixture CPU: Reverie performance-counter validation passed".into(),
+        };
+        // Nothing recorded (another backend): the report is written as built.
+        let report = VerificationReport::no_result();
+        assert_eq!(with_exact_branch_counter(&report, None), report);
+        // Recorded: every report gains it, the pending no-result stamp included.
+        let stamped = with_exact_branch_counter(&report, Some(&recorded));
+        assert_eq!(stamped.exact_branch_counter.as_ref(), Some(&recorded));
+        // A report that already carries a verdict keeps its own.
+        let own = BranchCounterVerdict {
+            present: false,
+            evidence: "fixture: own verdict".into(),
+        };
+        let mut carrying = VerificationReport::no_result();
+        carrying.exact_branch_counter = Some(own.clone());
+        assert_eq!(
+            with_exact_branch_counter(&carrying, Some(&recorded)).exact_branch_counter,
+            Some(own)
+        );
+    }
 
     fn classified_container<T: serde::Serialize + serde::de::DeserializeOwned>(
         mut child: impl FnMut() -> Result<T, Error>,
