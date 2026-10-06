@@ -1664,7 +1664,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// deterministic.
     ///
     /// Directory entries have the same overlayfs gap: `getdents` keys `d_ino`
-    /// on the directory's device (`raw_device_of_fd`), but with `xino=off` and
+    /// on the directory's device (`directory_device`), but with `xino=off` and
     /// layers on different filesystems `stat` reports a non-directory's lower
     /// device, so the guest sees a `d_ino` other than that entry's `st_ino`
     /// (natively they are equal). Both values stay deterministic.
@@ -6882,8 +6882,6 @@ impl<T: RecordOrReplay> Detcore<T> {
         Ok(stats)
     }
 
-    /// The raw device of the filesystem an open descriptor refers to.
-    ///
     /// getdents system call.
     pub async fn handle_getdents<G: Guest<Self>>(
         &self,
