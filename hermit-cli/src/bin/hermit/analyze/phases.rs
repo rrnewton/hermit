@@ -38,6 +38,7 @@ use crate::logdiff::LogDiffCLIOpts;
 use crate::run::RunOpts;
 use crate::schedule_search::Config;
 use crate::schedule_search::CriticalSchedule;
+use crate::schedule_search::TrialOutcome;
 use crate::schedule_search::search_for_critical_schedule;
 
 /// Compare only preemptions, not recorded schedules.
@@ -213,7 +214,7 @@ impl AnalyzeOpts {
                         .red()
                         .bold()
                 );
-                Ok(self.do_search())
+                self.do_search()
             } else {
                 bail!("FAILED. The run did not match the target criteria. Try --search.");
             }
@@ -440,16 +441,20 @@ impl AnalyzeOpts {
     ) -> anyhow::Result<CriticalSchedule> {
         let mut i = 0;
 
-        let test_fn = |sched: &[SchedEvent]| {
+        // Each call is one trial. A trial that cannot finish (for example, one
+        // that --max-log-bytes ended) returns its error unchanged, and the
+        // search stops there.
+        let test_fn = |sched: &[SchedEvent]| -> TrialOutcome {
             i += 1;
             let runname = format!("bisect_round_{:0wide$}", i, wide = 3);
-            let mut newrun = RunData::new_baseline(self, runname)
-                .expect("RunData construction to suceed")
+            let mut newrun = RunData::new_baseline(self, runname)?
                 .with_schedule_replay() // Default input path
                 .with_schedule_recording(); // Default output path
             // Prepare the next synthetic schedule on disk:
             let next_sched = PreemptionRecord::from_sched_events(sched.to_owned());
-            next_sched.write_to_disk(newrun.sched_path_in()).unwrap();
+            next_sched
+                .write_to_disk(newrun.sched_path_in())
+                .map_err(Error::msg)?;
 
             if self.verbose {
                 eprintln!(
@@ -461,7 +466,7 @@ impl AnalyzeOpts {
                 );
             }
 
-            newrun.launch().expect("New run to succeed");
+            newrun.launch()?;
             let is_match = newrun.is_a_match();
             if is_match {
                 eprintln!(" => Target condition ({})", self.display_criteria());
@@ -470,7 +475,7 @@ impl AnalyzeOpts {
             }
 
             let sched_out = PreemptionReader::new(newrun.sched_path_out()).load_all();
-            (!is_match, sched_out.into_global())
+            Ok((!is_match, sched_out.into_global()))
         };
 
         let target = target.to_vec(); // TODO: have search_for_critical_schedule borrow only.
@@ -904,7 +909,18 @@ impl AnalyzeOpts {
     }
 
     /// Search for a target run. Return the run when found.
-    fn do_search(&self) -> RunData {
+    fn do_search(&self) -> Result<RunData, Error> {
+        self.search_rounds(|round, sched_seed| self.launch_search(round, sched_seed))
+    }
+
+    /// The `--search` loop: one chaos trial per round, each with the next
+    /// schedule seed from the search RNG, until a trial matches. A trial that
+    /// cannot finish (for example, one that `--max-log-bytes` ended) ends the
+    /// search with its error unchanged, so main still reports it by its class.
+    fn search_rounds(
+        &self,
+        mut launch: impl FnMut(u64, u64) -> Result<Option<RunData>, Error>,
+    ) -> Result<RunData, Error> {
         let search_seed = self.analyze_seed.unwrap_or_else(|| {
             let seed: u64 = rand::random();
             yellow_msg(&format!("WARNING: performing --search with system randomness, use --analyze-seed={} to repro.", seed));
@@ -916,10 +932,7 @@ impl AnalyzeOpts {
         let mut round = 0;
         loop {
             let sched_seed = rng.random();
-            if let Some(mut rundat) = self
-                .launch_search(round, sched_seed)
-                .unwrap_or_else(|e| panic!("Error: {}", e))
-            {
+            if let Some(mut rundat) = launch(round, sched_seed)? {
                 if self.verbose {
                     let preempts = rundat.preempts_path_out();
                     let init_schedule: PreemptionRecord =
@@ -935,7 +948,7 @@ impl AnalyzeOpts {
                         ),
                     );
                 }
-                return rundat;
+                return Ok(rundat);
             }
             round += 1;
         }
@@ -974,5 +987,46 @@ impl AnalyzeOpts {
             answer = false;
         }
         answer
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::Parser as _;
+
+    use super::*;
+    use crate::container::LogCapExceeded;
+
+    /// A search round whose trial `--max-log-bytes` ended stops the `--search`
+    /// loop and returns that error, still a `LogCapExceeded`, so main reports
+    /// it as the cap (123). Before, the loop panicked on any round's error.
+    #[test]
+    fn a_failing_search_round_ends_the_search_with_its_error() {
+        let options =
+            AnalyzeOpts::try_parse_from(["analyze", "--analyze-seed=7", "--", "/bin/true"])
+                .unwrap();
+        for failing_round in 1..=4 {
+            let mut rounds = 0;
+            let result = options.search_rounds(|round, _sched_seed| {
+                assert_eq!(round, rounds, "rounds are numbered from 0");
+                rounds += 1;
+                if rounds == failing_round {
+                    return Err(Error::new(LogCapExceeded));
+                }
+                // An earlier round finished and did not match.
+                Ok(None)
+            });
+            let Err(error) = result else {
+                panic!("round {failing_round} failed, yet the search returned a run")
+            };
+            assert!(
+                error.downcast_ref::<LogCapExceeded>().is_some(),
+                "round {failing_round}: the error lost its type: {error:#}"
+            );
+            assert_eq!(
+                rounds, failing_round,
+                "the search ran more rounds after round {failing_round} failed"
+            );
+        }
     }
 }
