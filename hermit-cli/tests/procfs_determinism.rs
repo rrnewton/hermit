@@ -2199,15 +2199,23 @@ fn kernel_reports_unique_mount_ids(path: &Path) -> bool {
 fn dbt_maps_lines_prove_their_device_with_a_full_descriptor_table() {
     let _guard = hermit_run_lock();
     let guest = inode_identity_views::compile_guest("dbt-maps-stat-full-table");
+    // This test needs a btrfs CARGO_TARGET_TMPDIR and STATX_MNT_ID_UNIQUE
+    // (Linux 6.8 or newer). It refuses without either instead of passing
+    // without its subject; test.hermit_integration_on_host, whose GitHub-hosted
+    // profile declares neither, leaves it out by exact name
+    // (docs/TESTING_ENVIRONMENTS.md).
     assert!(
         inode_identity_views::is_on_btrfs(&guest),
-        "{} is not on btrfs, so no maps line needs the superblock proof this test exercises",
+        "{} is not on btrfs, so no maps line needs the superblock proof this test exercises; \
+         run it with a btrfs temporary directory for the target (CARGO_TARGET_TMPDIR, under \
+         CARGO_TARGET_DIR), as docs/TESTING_ENVIRONMENTS.md says",
         guest.display()
     );
     assert!(
         kernel_reports_unique_mount_ids(&guest),
-        "this kernel reports no unique mount id (Linux 6.8), so Detcore proves a maps line's \
-         superblock from mountinfo, through a descriptor a full table cannot give"
+        "this kernel reports no unique mount id (STATX_MNT_ID_UNIQUE, Linux 6.8 or newer), so \
+         Detcore proves a maps line's superblock from mountinfo, through a descriptor a full \
+         table cannot give; run it on Linux 6.8 or newer, as docs/TESTING_ENVIRONMENTS.md says"
     );
     let stdout = run_inode_identity_views(
         &guest,

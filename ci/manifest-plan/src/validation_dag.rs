@@ -270,6 +270,65 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "run_liteinst_finds_the_runtime_staged_as_an_installed_resource",
 ];
 
+/// `test.hermit_integration` cases the GitHub-hosted portable profile excludes
+/// by exact name, as (test binary, test name) pairs.
+///
+/// Each needs two host properties that no hosted profile declares: a btrfs
+/// file system under the target's temporary directory (`CARGO_TARGET_TMPDIR`),
+/// where a `/proc/<pid>/maps` line and `stat` report different devices for
+/// the same file, and a kernel that reports `STATX_MNT_ID_UNIQUE` (Linux 6.8
+/// or newer). Each fails loudly, naming the missing property, rather than
+/// passing without exercising its subject. The local `test.hermit_integration`
+/// runs them in the pinned root, whose `/src/target` is a bind mount of the
+/// host's target directory (`ci/hermetic/run-in-pinned-root.sh`), so it
+/// inherits the host's file system and kernel. Only the cloned twin
+/// `test.hermit_integration_on_host` excludes them, with one exact-name
+/// filterset (`-E 'not ((binary(=BINARY) & test(=NAME)) | ...)'`) appended to
+/// its command, and a test below holds both sides to this list.
+pub const HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS: &[(&str, &str)] = &[(
+    "procfs_determinism",
+    "dbt_maps_lines_prove_their_device_with_a_full_descriptor_table",
+)];
+
+/// The filterset `test.hermit_integration_on_host` appends to the command it
+/// clones from `test.hermit_integration`, with its leading space.
+fn hosted_btrfs_integration_filterset() -> String {
+    let exclusions = HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS
+        .iter()
+        .map(|(binary, name)| format!("(binary(={binary}) & test(={name}))"))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    format!(" -E 'not ({exclusions})'")
+}
+
+/// Append the btrfs exclusions to `test.hermit_integration_on_host`, which is
+/// cloned from `test.hermit_integration` before the pinned-root wrapper is
+/// added, and declare the count its own registry entry gives that narrower
+/// selection instead of the local count it was cloned with.
+fn exclude_hosted_btrfs_integration_cases(hosted: &mut Step) -> Result<(), String> {
+    let tag = hosted.tag();
+    // Nextest reads a filterset after `--` as a test-binary argument, so the
+    // exclusion is appended only to a command that has neither.
+    if hosted.cmd.contains(" -E ") || hosted.cmd.contains(" -- ") {
+        return Err(format!(
+            "{tag} already has a filterset or test-binary arguments; \
+             cannot append the btrfs exclusions"
+        ));
+    }
+    hosted.cmd.push_str(&hosted_btrfs_integration_filterset());
+    let expected = NEXTEST_EXPECTED_COUNTS
+        .iter()
+        .find(|(entry, _)| *entry == tag)
+        .map(|(_, count)| count.to_string())
+        .ok_or_else(|| format!("{tag} has no Nextest expected-count entry"))?;
+    let declared = hosted
+        .env
+        .get_mut("NEXTEST_EXPECTED_EXECUTED")
+        .ok_or_else(|| format!("{tag} was cloned without NEXTEST_EXPECTED_EXECUTED"))?;
+    *declared = expected;
+    Ok(())
+}
+
 fn hosted_portable_excludes(cell: &DagManifest) -> bool {
     cell.backend
         .as_deref()
@@ -1260,6 +1319,9 @@ fn materialize_hosted_test_variants(cfg: &mut DagConfig) -> Result<(), String> {
             hosted.job.push_str(HOSTED_VARIANT_SUFFIX);
             hosted.labels = vec![HOSTED_PORTABLE_LABEL.into()];
             hosted.fail_fast_family = Some(hosted.tag());
+            if hosted.tag() == "test.hermit_integration_on_host" {
+                exclude_hosted_btrfs_integration_cases(&mut hosted)?;
+            }
             let owner = hosted.tag();
             for result in hosted.result_manifests.iter_mut().flatten() {
                 if let ResultManifest::StructuredTestResults(result) = result {
@@ -5499,6 +5561,67 @@ sys.exit(37)
     }
 
     #[test]
+    fn hosted_integration_twin_leaves_out_the_btrfs_cases_by_exact_name() {
+        let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
+        let step = |tag: &str| {
+            committed
+                .steps
+                .iter()
+                .find(|step| step.tag() == tag)
+                .unwrap_or_else(|| panic!("{tag} is missing"))
+        };
+        let local = step("test.hermit_integration");
+        let hosted = step("test.hermit_integration_on_host");
+        let filterset = hosted_btrfs_integration_filterset();
+        assert_eq!(
+            hosted.cmd.matches(" -E ").count(),
+            1,
+            "{} must carry exactly one filterset",
+            hosted.tag()
+        );
+        assert!(
+            hosted.cmd.ends_with(&filterset),
+            "{} must end with {filterset:?}",
+            hosted.tag()
+        );
+        let argv = shell_words::split(&local.cmd).unwrap();
+        let boundary = argv.iter().position(|arg| arg == "--").unwrap();
+        let local_payload = &argv[boundary + 5];
+        assert_eq!(
+            &hosted.cmd[..hosted.cmd.len() - filterset.len()],
+            local_payload,
+            "the hosted twin may differ from the local payload only by the filterset"
+        );
+        let local_argv = shell_words::split(local_payload).unwrap();
+        assert!(!local_argv.iter().any(|arg| arg == "-E" || arg == "--"));
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for (binary, name) in HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS {
+            // The local selection builds and runs this binary, and nothing in
+            // it names or skips the excluded case.
+            assert!(
+                local_argv
+                    .windows(2)
+                    .any(|pair| pair[0] == "--test" && pair[1] == *binary),
+                "test.hermit_integration must select --test {binary}"
+            );
+            assert!(
+                !local_payload.contains(name),
+                "test.hermit_integration must keep running {name}"
+            );
+            // An exact test(=NAME) term matches nothing if the test is
+            // renamed, so the name must still be a test function in its file.
+            let source =
+                std::fs::read_to_string(repository.join(format!("hermit-cli/tests/{binary}.rs")))
+                    .unwrap();
+            assert_eq!(
+                source.matches(&format!("fn {name}()")).count(),
+                1,
+                "hermit-cli/tests/{binary}.rs must define {name} once"
+            );
+        }
+    }
+
+    #[test]
     fn hosted_nextest_selections_keep_local_cases_and_failure_limits() {
         let committed = dag_from_json(include_str!("../../dag/validate.json")).unwrap();
         let mut checked = BTreeSet::new();
@@ -5565,6 +5688,18 @@ sys.exit(37)
                     .join(" | ");
                 assert_eq!(local_payload.matches(" -- ").count(), 1);
                 local_payload.replacen(" -- ", &format!(" -E 'not ({exclusions})' -- "), 1)
+            } else if local_tag == "test.hermit_integration" {
+                // The hosted twin appends the exact-name btrfs exclusions,
+                // which the local selection must keep running; see
+                // hosted_integration_twin_leaves_out_the_btrfs_cases_by_exact_name.
+                assert!(!local_payload.contains(" -E "));
+                for (_, name) in HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS {
+                    assert!(
+                        !local_payload.contains(name),
+                        "test.hermit_integration must keep running {name}"
+                    );
+                }
+                format!("{local_payload}{}", hosted_btrfs_integration_filterset())
             } else {
                 local_payload
             };
@@ -5597,10 +5732,10 @@ sys.exit(37)
             // excludes at most one test, so the hosted twin executes exactly
             // that many fewer only if every listed name exists and nothing
             // else is excluded.
-            let hosted_only_skips = if local_tag == "test.cli" {
-                HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len()
-            } else {
-                0
+            let hosted_only_skips = match local_tag.as_str() {
+                "test.cli" => HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS.len(),
+                "test.hermit_integration" => HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS.len(),
+                _ => 0,
             };
             let count =
                 |step: &Step| -> usize { step.env["NEXTEST_EXPECTED_EXECUTED"].parse().unwrap() };
