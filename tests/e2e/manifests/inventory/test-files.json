@@ -1346,6 +1346,12 @@
     },
     {
       "disposition": "guest-fixture",
+      "path": "tests/c/record_replay_pipe_clear_nonblock.c",
+      "runner": "hermit-cli/tests/record_replay.rs",
+      "why": "tests/c/record_replay_pipe_clear_nonblock.c is owned by hermit-cli/tests/record_replay.rs: The record/replay integration suite compiles this workload and checks that clearing O_NONBLOCK on a guest pipe with FIONBIO or F_SETFL leaves a later blocking read to wait for its writer instead of hanging the recording."
+    },
+    {
+      "disposition": "guest-fixture",
       "path": "tests/c/record_replay_poll_partial_copyout.c",
       "runner": "hermit-cli/tests/record_replay.rs",
       "why": "tests/c/record_replay_poll_partial_copyout.c is owned by hermit-cli/tests/record_replay.rs: The dedicated integration suite compiles this workload and checks partial poll copyout behavior at multiple controlled record/replay boundaries."

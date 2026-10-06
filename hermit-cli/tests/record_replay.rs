@@ -2547,6 +2547,23 @@ fn record_timer_slack_proc_read_write() {
     );
 }
 
+/// A guest pipe stays physically nonblocking under record/replay so that a
+/// blocking read waits through the scheduler. Clearing the guest's O_NONBLOCK
+/// with FIONBIO or F_SETFL must change only its view: forwarded to the kernel,
+/// the next read waited as external I/O for a writer that could not run, and
+/// the recording hung. The guest exits non-zero unless the empty read saw
+/// EAGAIN, F_GETFL then showed the flag cleared, and the blocking read got the
+/// writer's bytes.
+#[test]
+fn record_pipe_read_after_clearing_nonblocking_waits_for_its_writer() {
+    let _guard = hermit_record_lock();
+    record_replay_strict_command(
+        "pipe-clear-nonblock",
+        &workload("c_record_replay_pipe_clear_nonblock").path,
+        &[],
+    );
+}
+
 macro_rules! record_replay_tests {
     ($($test_name:ident => $workload_name:literal),+ $(,)?) => {
         $(

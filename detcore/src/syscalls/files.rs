@@ -3325,6 +3325,34 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
+    /// Whether a guest's F_SETFL or FIONBIO on this descriptor changes only its
+    /// logical (guest-visible) O_NONBLOCK, leaving it physically nonblocking for
+    /// the scheduler's nonblockize-and-retry.
+    ///
+    /// Outside record/replay that holds for every scheduler-managed type. In
+    /// record/replay it holds only for a pipe that is already physically
+    /// nonblocking, which is how `handle_pipe2` leaves every guest-created pipe
+    /// in both phases. Forwarding the guest's clear would make the recording's
+    /// next read on that pipe a blocking external read, which deadlocks the
+    /// sequentialized scheduler while the writer waits for its turn. Both phases
+    /// take the same branch, because `fd_type` and `physically_nonblocking` are
+    /// Detcore bookkeeping that record and replay evolve identically: an F_SETFL
+    /// is still recorded and replayed, with the kernel given `flags | O_NONBLOCK`
+    /// in record and the recorded result returned in replay; a FIONBIO returns
+    /// before `record_or_replay`, so neither phase records or applies it. Sockets
+    /// and eventfds stay external in record/replay. A pipe whose physical
+    /// O_NONBLOCK came from the guest rather than from Detcore is also kept
+    /// nonblocking; in record/replay the only such pipes are `pipe2` pipes,
+    /// which Detcore has already made nonblocking.
+    fn keeps_physically_nonblocking(&self, fd_type: FdType, physically_nonblocking: bool) -> bool {
+        self.cfg.use_nonblocking_sockets()
+            && match fd_type {
+                FdType::Pipe => !self.cfg.recordreplay_modes || physically_nonblocking,
+                FdType::Socket | FdType::Eventfd => !self.cfg.recordreplay_modes,
+                _ => false,
+            }
+    }
+
     /// fcntl system call
     pub async fn handle_fcntl<G: Guest<Self>>(
         &self,
@@ -3350,10 +3378,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             F_SETFL(flags) => {
-                let fd_type = guest.thread_state().with_detfd(fd, |detfd| detfd.ty())?;
-                let force_nonblocking = self.cfg.use_nonblocking_sockets()
-                    && !self.cfg.recordreplay_modes
-                    && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd);
+                let (fd_type, physically_nonblocking) = guest
+                    .thread_state()
+                    .with_detfd(fd, |detfd| (detfd.ty(), detfd.physically_nonblocking()))?;
+                let force_nonblocking =
+                    self.keeps_physically_nonblocking(fd_type, physically_nonblocking);
                 let physical_flags = if force_nonblocking {
                     flags | OFlag::O_NONBLOCK.bits()
                 } else {
@@ -3461,10 +3490,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             let (fd_type, physically_nonblocking) = guest
                 .thread_state()
                 .with_detfd(fd, |detfd| (detfd.ty(), detfd.physically_nonblocking()))?;
-            let force_nonblocking = self.cfg.use_nonblocking_sockets()
-                && !self.cfg.recordreplay_modes
-                && matches!(fd_type, FdType::Socket | FdType::Pipe | FdType::Eventfd);
-            if force_nonblocking && physically_nonblocking {
+            if self.keeps_physically_nonblocking(fd_type, physically_nonblocking)
+                && physically_nonblocking
+            {
                 guest.thread_state().with_detfd(fd, |detfd| {
                     detfd.set_logical_nonblocking(enabled);
                 })?;
