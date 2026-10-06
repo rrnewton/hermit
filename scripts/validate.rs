@@ -31507,6 +31507,19 @@ mod submodule_service_tests {
             return;
         }
 
+        // The fixture populates its own agent-utils from this checkout's
+        // submodule (`populate only agent-utils`). A checkout without it, such
+        // as a fresh `git worktree add`, otherwise failed only in the child, as
+        // a git clone error about a repository that does not exist.
+        let agent_utils = test_source_root().join("agent-utils");
+        assert!(
+            agent_utils.join(".git").exists(),
+            "precondition not met: the source checkout's agent-utils submodule is not \
+             initialized at {}; this test populates its fixture from it. Run \
+             `git submodule update --init agent-utils` in the checkout, then rerun.",
+            agent_utils.display()
+        );
+
         // Seed both ownership values in a separate process: the test never
         // mutates the test harness's global environment or borrows its state.
         let fixture = tempfile::tempdir().unwrap();
