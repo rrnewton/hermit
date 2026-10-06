@@ -110,7 +110,7 @@ pub struct Config {
     /// owns and reports in `/proc`, and resumes a Tool's restart errno through the
     /// kernel's own signal-delivery and syscall-restart path. Blocking waits then
     /// decide signal interruption from the guest's real mask and dispositions
-    /// (https://github.com/rrnewton/hermit/issues/3146). Off by default: only the
+    /// (<https://github.com/rrnewton/hermit/issues/3146>). Off by default: only the
     /// backends measured to honor that contract opt in.
     ///
     /// The host sets it from the backend's name, because
