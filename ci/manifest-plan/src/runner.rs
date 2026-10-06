@@ -2504,6 +2504,16 @@ pub struct CellResult {
     /// cells could execute on this host.
     #[serde(default)]
     pub host_capabilities: HostCapabilities,
+    /// The run's hermit binary's own `exact_branch_counter` verdict (whether
+    /// the retired-branch counter that ptrace and e9patch runs read their
+    /// virtual clock from is exact here; see
+    /// [`refused_on_an_inexact_branch_counter`]), recorded in every row so
+    /// that a cell which ran is known to have run on an exact counter or not.
+    /// It is outside the closed `host_capabilities` record, whose set the
+    /// stress series froze. `None` when the binary was not probed or did not
+    /// answer, and in a row written before this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exact_branch_counter: Option<CapabilityVerdict>,
     /// The cell attempt that produced this observation. A retry is a second
     /// observation, so it receives the next positive ordinal instead of
     /// replacing the earlier row.
@@ -7222,6 +7232,7 @@ fn run_cell_inner(
         machine_shortname: context.machine_shortname.clone(),
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
+        exact_branch_counter: context.exact_branch_counter.clone(),
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
@@ -7306,6 +7317,7 @@ pub fn infrastructure_error_result(
         machine_shortname: context.machine_shortname.clone(),
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
+        exact_branch_counter: context.exact_branch_counter.clone(),
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
@@ -7382,6 +7394,7 @@ pub fn host_inapplicable_result(
         machine_shortname: context.machine_shortname.clone(),
         kernel_version: context.kernel_version.clone(),
         host_capabilities: context.host_capabilities.clone(),
+        exact_branch_counter: context.exact_branch_counter.clone(),
         attempt: context.attempt,
         run_index: context.run_index,
         hermit_sha: context.source_sha.clone(),
@@ -10345,6 +10358,78 @@ mod tests {
         assert_eq!(cells.len(), 1);
         assert_eq!(cells[0].timeout_seconds, 74);
         assert_eq!(cells[0].cpu_timeout_seconds, 25);
+    }
+
+    #[test]
+    fn every_row_records_the_binarys_exact_branch_counter_verdict() {
+        // The cell whose remote failures came from an inexact counter
+        // (https://github.com/rrnewton/hermit/issues/3794): a row that ran must
+        // say whether the counter was exact, not only a withheld row's reason.
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let cells = ManifestSet::load(&root)
+            .unwrap()
+            .select(&Selection {
+                population: Some(Population::Required),
+                test: Some("language-runtimes/python-hashseed".into()),
+                mode: Some("verify".into()),
+                backend: Some("ptrace".into()),
+                ..Selection::default()
+            })
+            .unwrap();
+        assert_eq!(cells.len(), 1);
+        let cell = &cells[0];
+        let scratch = std::env::temp_dir().join(format!(
+            "hermit-runner-exact-branch-counter-row-{}",
+            std::process::id()
+        ));
+        let mut context = run_context(&scratch);
+        let verdict = CapabilityVerdict {
+            present: false,
+            evidence: "fixture CPU: Reverie performance-counter validation failed \
+                       (AmdSpecLockMapShouldBeDisabled)"
+                .into(),
+        };
+        context.exact_branch_counter = Some(verdict.clone());
+        for (builder, row) in [
+            (
+                "infrastructure_error_result",
+                infrastructure_error_result(&context, cell, "fixture".into()),
+            ),
+            (
+                "host_inapplicable_result",
+                host_inapplicable_result(&context, cell, "fixture".into()),
+            ),
+        ] {
+            assert_eq!(
+                row.exact_branch_counter.as_ref(),
+                Some(&verdict),
+                "{builder}"
+            );
+            let rendered = serde_json::to_value(&row).unwrap();
+            assert_eq!(
+                rendered["exact_branch_counter"]["present"], false,
+                "{builder}"
+            );
+            assert_eq!(
+                rendered["exact_branch_counter"]["evidence"],
+                verdict.evidence.as_str(),
+                "{builder}"
+            );
+            // The closed record keeps its frozen set.
+            assert!(
+                rendered["host_capabilities"]
+                    .get("exact_branch_counter")
+                    .is_none(),
+                "{builder}"
+            );
+        }
+        // A binary that gave no verdict leaves the key out, as a row written
+        // before the field does.
+        context.exact_branch_counter = None;
+        let row = infrastructure_error_result(&context, cell, "fixture".into());
+        let rendered = serde_json::to_value(&row).unwrap();
+        assert!(rendered.get("exact_branch_counter").is_none());
+        let _ = fs::remove_dir_all(&scratch);
     }
 
     #[test]
@@ -15671,6 +15756,7 @@ backends_disabled:
             machine_shortname: "fixture-host".into(),
             kernel_version: "7.1.3-fixture".into(),
             host_capabilities: fixture_host_capabilities(),
+            exact_branch_counter: None,
             attempt: 1,
             run_index: None,
             hermit_sha: "sha".into(),

@@ -773,7 +773,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3803) retain all 972
     // (oversized_length_is_rejected_before_allocation is renamed
     // hostile_length_is_truncation_without_allocating_it): 972 + 2 = 974.
-    ("test.regular_crates", 974),
+    // manifest-plan's
+    // runner::tests::every_row_records_the_binarys_exact_branch_counter_verdict
+    // retains all 974 (975, measured with cargo nextest list).
+    ("test.regular_crates", 975),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1537,7 +1540,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same pinned-workspace-compile ordering test retains all 968: 969.
     // The three exact-branch-counter tests listed there retain all 969: 972.
     // The two network trace codec tests listed there retain all 972: 974.
-    ("test.regular_crates_on_host", 974),
+    // The row-recording exact-branch-counter test listed there retains all 974: 975.
+    ("test.regular_crates_on_host", 975),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
