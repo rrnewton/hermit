@@ -670,11 +670,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // A scheduler `Signaled` answer is only a hint here; the kernel's
                         // state decides. pselect6 returns ERESTARTNOHAND: EINTR after a
                         // handler, a restart with the remaining timeout after a stop.
-                        match signals.pending_interruption(Errno::ERESTARTNOHAND) {
-                            Ok(None) => {}
-                            Ok(Some(errno)) => {
+                        match signals.interrupted() {
+                            Ok(false) => {}
+                            Ok(true) => {
                                 self.write_pselect6_remaining(guest, call, deadline).await?;
-                                break Err(errno.into());
+                                break Err(Errno::ERESTARTNOHAND.into());
                             }
                             Err(errno) => break Err(errno.into()),
                         }
@@ -923,11 +923,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // A scheduler `Signaled` answer is only a hint here; the kernel's
                         // state decides. select returns ERESTARTNOHAND: EINTR after a
                         // handler, a restart with the remaining timeout after a stop.
-                        match signals.pending_interruption(Errno::ERESTARTNOHAND) {
-                            Ok(None) => {}
-                            Ok(Some(errno)) => {
+                        match signals.interrupted() {
+                            Ok(false) => {}
+                            Ok(true) => {
                                 self.write_select_remaining(guest, call, deadline).await?;
-                                break Err(errno.into());
+                                break Err(Errno::ERESTARTNOHAND.into());
                             }
                             Err(errno) => break Err(errno.into()),
                         }
