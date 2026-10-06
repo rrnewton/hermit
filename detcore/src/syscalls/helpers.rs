@@ -2352,14 +2352,16 @@ impl KernelSignalWait {
     /// intercepted, so such a signal arrived while the call was waiting, and Linux
     /// returns the restart errno for that. Linux reports a source that was ready
     /// when the call began, or an argument error, before any pending signal, so
-    /// `retry_blocking_wait_with_kernel_signal_state` and the waits of `select`
-    /// and `pselect6` run their first probe before this check
-    /// (`inject_first_probe`). A source that becomes ready in a later turn in
-    /// which a signal is also pending is put behind the signal, because the turn
-    /// cannot tell which came first. A signal the wait holds until the
-    /// call returns (`held_until_return`) never counts. A signal that the backend
-    /// holds since `inject_absorbing` absorbed it counts as pending. A failed read
-    /// is never returned as the call's errno (`read_wait_signal_state`).
+    /// `retry_blocking_wait_with_kernel_signal_state` runs its first probe before
+    /// this check (`inject_first_probe`). There, a source that becomes ready in a
+    /// later turn in which a signal is also pending is put behind the signal,
+    /// because the turn cannot tell which came first. The waits of `select` and
+    /// `pselect6` run every probe before this check, as Linux's do_select polls
+    /// every descriptor on each pass before it tests for a pending signal. A
+    /// signal the wait holds until the call returns (`held_until_return`) never
+    /// counts. A signal that the backend holds since `inject_absorbing` absorbed
+    /// it counts as pending. A failed read is never returned as the call's errno
+    /// (`read_wait_signal_state`).
     pub(crate) fn interrupted_with_state(&self) -> Result<(bool, KernelSignalState), Error> {
         let state = read_wait_signal_state(self.pid, self.tid)?;
         let could_interrupt = self.could_interrupt(&state);
@@ -2382,7 +2384,8 @@ impl KernelSignalWait {
     /// kernel and held by the backend, which delivers it when the guest resumes,
     /// and the injection returns a restart errno instead of the call's result.
     /// The backend does not say which signal it holds, so the kernel's state is
-    /// read before each injection (in a polling turn under the full mask, the
+    /// read before each injection (in a polling turn of
+    /// `retry_blocking_wait_with_kernel_signal_state` under the full mask, the
     /// turn's own read: `inject_absorbing_after`), which names the signal the
     /// kernel dequeues next (`KernelSignalState::next_dequeued`), and again
     /// after a stop. The stop is identified only if exactly that signal left its queue
@@ -2405,8 +2408,9 @@ impl KernelSignalWait {
     ///   wait with `ERESTARTNOINTR`, or is held in a wait with a deadline.
     ///
     /// A pending signal that would end the wait ends it before the injection,
-    /// with the restart errno, so it is never held, except by the wait's first
-    /// probe (`inject_first_probe`). A stop that cannot be identified, by a
+    /// with the restart errno, so it is never held, except by a probe made by
+    /// `inject_first_probe`: the first probe of a wait, and every probe of the
+    /// waits of `select` and `pselect6`. A stop that cannot be identified, by a
     /// signal that arrived after the read, does not end the wait while the
     /// backend held nothing whose loss matters: the backend holds that signal
     /// in place of any held one and the injection runs again, as the blind
@@ -2443,11 +2447,12 @@ impl KernelSignalWait {
     /// API. A Detcore-only refusal or capability withdrawal can prevent the
     /// determinism regression.
     ///
-    /// In a first probe that two pending signals would stop in turn, the first
-    /// of which would end the wait, the wait ends with the restart errno before
-    /// the probe has run, so a source that is ready when the call begins, or an
+    /// In a probe made by `inject_first_probe` that two pending signals would
+    /// stop in turn, the first of which would end the wait, the wait ends with
+    /// the restart errno before the probe has run, so a ready source, or an
     /// argument error, is reported behind the signal: the order compromise that
-    /// a later turn already makes (`interrupted_with_state`).
+    /// a later turn of `retry_blocking_wait_with_kernel_signal_state` already
+    /// makes (`interrupted_with_state`).
     pub(crate) async fn inject_absorbing<T, G, S>(
         &mut self,
         guest: &mut G,
@@ -2461,10 +2466,10 @@ impl KernelSignalWait {
         self.inject_absorbing_from(guest, call, None, false).await
     }
 
-    /// The first probe of a wait, which runs before the turn's
-    /// `interrupted_with_state` check: `inject_absorbing`, except that a signal
-    /// that would end the wait neither ends it before the injection nor when it
-    /// stops the injection.
+    /// The first probe of a wait, and every probe of the waits of `select` and
+    /// `pselect6`, which runs before the turn's `interrupted_with_state` check:
+    /// `inject_absorbing`, except that a signal that would end the wait neither
+    /// ends it before the injection nor when it stops the injection.
     ///
     /// Linux reports a descriptor that is ready when the call begins, a queued
     /// event, and an argument error before it looks at pending signals:
@@ -2473,12 +2478,16 @@ impl KernelSignalWait {
     /// descriptor in the sets that is not open; `ep_poll` sends queued events
     /// before it tests it, `do_epoll_wait` rejects a bad descriptor or
     /// `maxevents` first, and `do_sigtimedwait` copies its set first. So the
-    /// probe runs even when such a signal is pending. A pending signal that the
-    /// guest does not block stops the injection before the probe runs; when the
-    /// stop is identified, the signal is held as a precious one
-    /// (`HeldKind::Precious`) and the probe runs again, so its result stands, and
-    /// the backend delivers the signal as the call returns. If the probe would
-    /// block, the caller's check that follows
+    /// probe runs even when such a signal is pending. `do_select` also polls
+    /// every descriptor on each pass before it tests `signal_pending`, so the
+    /// waits of `select` and `pselect6` make every probe this way; once `block`
+    /// has blocked every blockable signal, a pending one cannot stop a probe
+    /// there, and the check that follows a probe that would block counts it.
+    /// A pending signal that the guest does not block stops the injection
+    /// before the probe runs; when the stop is identified, the signal is held
+    /// as a precious one (`HeldKind::Precious`) and the probe runs again, so
+    /// its result stands, and the backend delivers the signal as the call
+    /// returns. If the probe would block, the caller's check that follows
     /// counts the held signal (`interrupted_with_state`) and ends the wait with
     /// the restart errno. A stop that cannot be identified is held, as
     /// `inject_absorbing` describes.
@@ -2504,9 +2513,7 @@ impl KernelSignalWait {
     /// run nothing between the two that resumes the guest thread or changes its
     /// signal state. `retry_blocking_wait_with_kernel_signal_state`, which serves
     /// ppoll, poll, epoll_pwait, epoll_wait, rt_sigtimedwait and polling futex
-    /// waits, runs nothing there; the `select` and `pselect6` waits write the
-    /// probe's timeout and descriptor sets into guest memory, which Detcore in the
-    /// ptrace tracer does without resuming the thread. So between the two reads
+    /// waits and is the only caller, runs nothing there. So between the two reads
     /// the guest thread stays stopped and only it can change its own mask, and
     /// with threads sequentialized no other guest thread runs in its turn, so a
     /// signal that arrives meanwhile arrives at a
@@ -2643,8 +2650,8 @@ impl KernelSignalWait {
             };
             let bit = kernel_sigset_bit(signal);
             let verdict = match self.stop_verdict(&before, signal) {
-                // The first probe holds a signal that would end the wait and runs
-                // again (`inject_first_probe`).
+                // A probe made by `inject_first_probe` holds a signal that would
+                // end the wait and runs again.
                 StopVerdict::End(_)
                     if first_probe
                         && self.consumed & bit == 0
@@ -4738,11 +4745,12 @@ mod kernel_signal_wait_failures {
         }
     }
 
-    /// The same `SIGCHLD` ends a select wait before an injection that is not its
-    /// first probe (`inject_absorbing`: a later probe, or the change of mask that
-    /// blocks signals for the wait), with `ERESTARTNOHAND`, which the handler's
-    /// run turns into `EINTR`. A gated wait makes the injection, and the
-    /// `SIGCHLD` that stops it is held until the call returns.
+    /// The same `SIGCHLD` ends a select wait before an injection that is not a
+    /// probe (`inject_absorbing`: the change of mask that blocks signals for the
+    /// wait), with `ERESTARTNOHAND`, which the handler's run turns into `EINTR`.
+    /// The waits of `select` and `pselect6` make every probe with
+    /// `inject_first_probe`. A gated wait makes the injection, and the `SIGCHLD`
+    /// that stops it is held until the call returns.
     #[tokio::test]
     async fn a_pending_caught_sigchld_ends_a_select_wait_before_the_injection() {
         let (mut guest, kernel) = caught_sigchld_guest(true);

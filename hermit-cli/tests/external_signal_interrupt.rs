@@ -1291,6 +1291,66 @@ fn ptrace_selects_report_ebadf_for_a_closed_descriptor_before_a_racing_signal() 
     }
 }
 
+/// Trials in the guest's `parkready` and `parkclose` modes (`PARKED_TRIALS` in
+/// the guest).
+const PARKED_TRIALS: usize = 4;
+
+/// `assert_cell` for the guest's `parkready` or `parkclose` `sender` with
+/// `call`, `select` or `rawselect`.
+fn assert_parked_sender(backend: &str, call: &str, sender: &str) {
+    assert_cell(
+        backend,
+        FutexMode::Precise,
+        &[call, sender],
+        false,
+        &format!("RESULT call={call} role={sender} trials={PARKED_TRIALS} matched={PARKED_TRIALS}"),
+    );
+}
+
+/// `select` and `pselect6` report a descriptor that becomes ready while they
+/// wait, although a caught SIGUSR1 follows before they look again: Linux's
+/// do_select polls every descriptor on each pass and returns the count of
+/// ready descriptors before it looks at pending signals. In each of the four
+/// trials of the guest's `select parkready` (glibc's select, which issues
+/// pselect6) and `rawselect parkready` (the select system call), the call
+/// finds the pipe empty and waits; a sibling then writes to the pipe and sends
+/// SIGUSR1, caught with SA_RESTART, after zero to three sched_yield calls. The
+/// call returns 1 with the pipe set and the handler runs once, as natively on
+/// Linux 7.1.3 in 4 of 4 trials; each cell is strict-verified. Before round 13
+/// of https://github.com/rrnewton/hermit/pull/3361, each turn of these waits
+/// after the first read the kernel's signal state before its probe and
+/// returned EINTR when the signal was already pending at that turn (round-12
+/// Medium). For the select system call that was a regression of this pull
+/// request: at its base, `rawselect parkready` matched in 4 of 4 trials. Its
+/// base already returned EINTR in 2 of the 4 trials of `select parkready`, so
+/// for pselect6 the gap predates this pull request; it is fixed here as well.
+#[test]
+fn ptrace_selects_report_a_descriptor_made_ready_before_a_later_signal() {
+    for call in SELECTS {
+        assert_parked_sender("ptrace", call, "parkready");
+    }
+}
+
+/// `select` and `pselect6` report EBADF for the descriptor they wait on when a
+/// sibling closes it while they wait and then sends a caught SIGUSR1, in the
+/// guest's `select parkclose` and `rawselect parkclose` cells, as above. This
+/// is Hermit's result and not Linux's: each probe Hermit makes is a new select
+/// call, which rejects the closed descriptor (max_select_fd), while Linux
+/// 7.1.3 polls it on the next pass and returns 1 with it set (measured
+/// natively). The cell pins that the call reports the descriptor and not the
+/// signal: before round 13 of https://github.com/rrnewton/hermit/pull/3361,
+/// each turn after the first returned EINTR when the signal was already
+/// pending at that turn (round-12 Medium). As above, that was a regression of
+/// this pull request for the select system call (EBADF in 4 of 4 trials of
+/// `rawselect parkclose` at its base), while its base already returned EINTR
+/// in 2 of the 4 trials of `select parkclose`.
+#[test]
+fn ptrace_selects_report_ebadf_for_a_descriptor_closed_before_a_later_signal() {
+    for call in SELECTS {
+        assert_parked_sender("ptrace", call, "parkclose");
+    }
+}
+
 /// An ignored, blocked, or default-ignored signal does not end a timed futex wait
 /// in either mode: it returns ETIMEDOUT at its original 300 ms deadline.
 fn assert_timed_futex_wait_is_not_ended(backend: &str) {
