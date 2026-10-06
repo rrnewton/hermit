@@ -676,7 +676,7 @@ pub fn clear_forwarded_source() {
 
 /// Takes every message waiting on the registered forwarding socket into the queue of
 /// its sending thread, without blocking and without writing it. An untagged message is
-/// written at once as [`ForwardedOrder::untagged`] says. Without a registered source it
+/// written at once as `ForwardedOrder::untagged` says. Without a registered source it
 /// does nothing.
 pub fn drain_forwarded() {
     if let Some(source) = FORWARDED_SOURCE.lock().unwrap().as_mut() {
