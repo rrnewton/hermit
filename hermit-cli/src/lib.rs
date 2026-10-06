@@ -339,7 +339,7 @@ const _: () = assert!(
 );
 const _: () = assert!(
     HERMIT_LOG_CAP_EXIT == 123,
-    "123 is the log-byte-cap code shared with bin/safehermit; see the allocation table"
+    "123 is Hermit's log-cap code, reserved for bin/safehermit's log-cap kill as well; see the allocation table"
 );
 const _: () = assert!(
     HERMIT_LOG_CAP_EXIT != 0
