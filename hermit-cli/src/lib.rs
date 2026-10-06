@@ -2593,6 +2593,11 @@ async fn run_kvm(
     backend
         .set_root_pid(detcore::ROOT_DETPID.as_raw())
         .map_err(|error| anyhow!("failed to configure KVM root PID: {error}"))?;
+    // Guests see their task IDs, so number them as the ptrace reference does
+    // (one extra ID per task for its tracer thread; see reverie::task_ids).
+    backend
+        .set_ids_per_task(reverie::task_ids::HERMIT_PTRACE_IDS_PER_TASK)
+        .map_err(|error| anyhow!("failed to configure KVM task IDs: {error}"))?;
     backend
         .install_static_elf_with_context(&image, &argv, &envp, &cwd)
         .map_err(|error| anyhow!("failed to load KVM guest executable {program:?}: {error}"))?;
