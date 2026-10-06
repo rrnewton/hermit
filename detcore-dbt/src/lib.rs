@@ -74,7 +74,8 @@ const MAX_OBSERVED_BUFFER: usize = 1024 * 1024;
 const RANDOM_FILL_CHUNK_BYTES: usize = 4096;
 const GETRANDOM_MAX_BYTES: usize = (i32::MAX as usize) & !4095;
 const GETRANDOM_ALLOWED_FLAGS: u32 = libc::GRND_NONBLOCK | libc::GRND_RANDOM | libc::GRND_INSECURE;
-const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 4;
+/// Version 5 adds `reverie_dbt_runtime_rdtsc`, which this runtime implements.
+const IMPLEMENTED_DBT_RUNTIME_ABI_VERSION: u32 = 5;
 const IMPLEMENTED_DBT_RUNTIME_CALLBACKS_SIZE: usize = 48;
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -1948,6 +1949,210 @@ unsafe fn write_deferred_syscall(syscall: Syscall, number: *mut i64, args: *mut 
     unsafe { std::slice::from_raw_parts_mut(args, values.len()) }.copy_from_slice(&values);
 }
 
+/// Builds and starts this thread's Detcore state on its first runtime event:
+/// constructs it, runs the thread-start hook, then the post-exec hook. A
+/// syscall is usually that event, but an rdtsc can come first (the loader reads
+/// the TSC before its first syscall), so both callbacks start the thread here,
+/// in the same order. Returns `scratch.runtime_state`; `Err` carries the
+/// syscall result to install.
+///
+/// # Safety
+///
+/// `scratch.runtime_state` must be null or name this thread's `ThreadRuntime`,
+/// and the callbacks must be valid for this event.
+#[allow(clippy::too_many_arguments)]
+unsafe fn start_thread_runtime(
+    scratch: &mut NativeThreadScratch,
+    runtime: &Runtime,
+    tool: &Detcore,
+    context: *mut c_void,
+    tid: i32,
+    det_tid: Pid,
+    det_pid: Pid,
+    host_pid: Pid,
+    branches: u64,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    emit: unsafe extern "C" fn(*const u8, usize),
+    first_event: bool,
+) -> Result<*mut ThreadRuntime, i64> {
+    if first_event {
+        emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
+    }
+    if scratch.runtime_state.is_null() {
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
+        }
+        let mut state = init_dbt_thread_state(
+            tool,
+            Tid::from_raw(det_tid.into()),
+            DetTid::from_raw(det_pid.into()),
+            tid,
+            None,
+        );
+        let Some(open_file_creator) = runtime.abi.open_file_creator(scratch.virtual_tid, tid)
+        else {
+            return Err(-(Errno::EIO.into_raw() as i64));
+        };
+        state.set_open_file_creator(open_file_creator);
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
+        }
+        scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
+            tid: det_tid,
+            state,
+            initialized: false,
+            post_exec_pending: true,
+        }));
+    }
+    let thread = unsafe { &mut *scratch.runtime_state };
+    let det_tid = thread.tid;
+    if !thread.initialized {
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: running Detcore thread-start hook\n");
+        }
+        if let Err(error) = reverie_dbt::run_tool_thread_start(
+            tool,
+            context as usize,
+            det_tid,
+            host_pid,
+            branches,
+            &mut thread.state,
+            &runtime.global,
+            &runtime.config,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ) {
+            return Err(error_result(error));
+        }
+        thread.initialized = true;
+    }
+    if thread.post_exec_pending {
+        if first_event {
+            emit_lifecycle_marker(
+                emit,
+                b"detcore-dbt: thread-start hook completed; running post-exec\n",
+            );
+        }
+        if let Err(errno) = reverie_dbt::run_tool_post_exec(
+            tool,
+            context as usize,
+            det_tid,
+            host_pid,
+            branches,
+            &mut thread.state,
+            &runtime.global,
+            &runtime.config,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+        ) {
+            return Err(-(errno.into_raw() as i64));
+        }
+        if first_event {
+            emit_lifecycle_marker(emit, b"detcore-dbt: post-exec hook completed\n");
+        }
+        thread.post_exec_pending = false;
+    }
+    Ok(scratch.runtime_state)
+}
+
+/// Answers one guest `rdtsc` (`with_aux == 0`) or `rdtscp` through the real
+/// Detcore Tool, so the guest reads Detcore's virtual clock and the read is
+/// charged and logged ("inbound rdtsc") as under ptrace, instead of a
+/// client-local counter outside Detcore's time.
+///
+/// Returns 1 with `tsc` written (and `aux` for `rdtscp`), or a negative value
+/// when the thread cannot be served; the client then ends the run.
+///
+/// # Safety
+///
+/// `scratch` must name this thread's initialized storage, the callbacks must be
+/// valid for this event, and `tsc` and `aux` must be writable.
+#[allow(clippy::too_many_arguments)]
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn reverie_dbt_runtime_rdtsc(
+    context: *mut c_void,
+    scratch: *mut c_void,
+    tid: i32,
+    pid: i32,
+    branches: u64,
+    with_aux: i32,
+    invoke_syscall: SyscallInvoker,
+    read_registers: RegisterReader,
+    write_registers: RegisterWriter,
+    emit: unsafe extern "C" fn(*const u8, usize),
+    tsc: *mut u64,
+    aux: *mut u32,
+) -> i32 {
+    let scratch = unsafe { &mut *scratch.cast::<NativeThreadScratch>() };
+    let runtime = current_runtime();
+    let Some((det_tid, det_pid)) =
+        runtime
+            .abi
+            .runtime_identity(scratch.virtual_tid, scratch.virtual_pid, tid, pid)
+    else {
+        return -1;
+    };
+    TOTAL_BRANCHES.store(branches, Ordering::Relaxed);
+    let host_pid = Pid::from_raw(pid);
+    let det_tid = Pid::from_raw(det_tid.into());
+    let tool = runtime
+        .tool
+        .get_or_init(|| Detcore::new(det_pid, &runtime.config));
+    let thread = match unsafe {
+        start_thread_runtime(
+            scratch,
+            &runtime,
+            tool,
+            context,
+            tid,
+            det_tid,
+            det_pid,
+            host_pid,
+            branches,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            emit,
+            false,
+        )
+    } {
+        Ok(thread) => unsafe { &mut *thread },
+        Err(_) => return -1,
+    };
+    let request = if with_aux != 0 {
+        reverie::Rdtsc::Tscp
+    } else {
+        reverie::Rdtsc::Tsc
+    };
+    let mut guest = DbtGuest::new(
+        context as usize,
+        thread.tid,
+        host_pid,
+        None,
+        branches,
+        &mut thread.state,
+        &runtime.global,
+        &runtime.config,
+        invoke_syscall,
+        read_registers,
+        write_registers,
+    );
+    match run_ready(tool.handle_rdtsc_event(&mut guest, request)) {
+        Ok(result) => {
+            unsafe {
+                tsc.write(result.tsc);
+                aux.write(result.aux.unwrap_or(0));
+            }
+            1
+        }
+        Err(_) => -1,
+    }
+}
+
 /// Dispatches one DynamoRIO syscall event through the real Detcore Tool.
 ///
 /// # Safety
@@ -2053,91 +2258,32 @@ pub unsafe extern "C" fn reverie_dbt_runtime_pre_syscall(
     let tool = runtime
         .tool
         .get_or_init(|| Detcore::new(det_pid, &runtime.config));
-    if first_event {
-        emit_lifecycle_marker(emit, b"detcore-dbt: initializing Detcore thread state\n");
-    }
-    if scratch.runtime_state.is_null() {
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: constructing Detcore thread state\n");
-        }
-        let mut state = init_dbt_thread_state(
+    let thread = match unsafe {
+        start_thread_runtime(
+            scratch,
+            &runtime,
             tool,
-            Tid::from_raw(det_tid.into()),
-            DetTid::from_raw(det_pid.into()),
+            context,
             tid,
-            None,
-        );
-        let Some(open_file_creator) = runtime.abi.open_file_creator(scratch.virtual_tid, tid)
-        else {
-            unsafe { result.write(-(Errno::EIO.into_raw() as i64)) };
+            det_tid,
+            det_pid,
+            host_pid,
+            branches,
+            invoke_syscall,
+            read_registers,
+            write_registers,
+            emit,
+            first_event,
+        )
+    } {
+        Ok(thread) => unsafe { &mut *thread },
+        Err(value) => {
+            unsafe { result.write(value) };
             TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
             return 1;
-        };
-        state.set_open_file_creator(open_file_creator);
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: Detcore thread state constructed\n");
         }
-        scratch.runtime_state = Box::into_raw(Box::new(ThreadRuntime {
-            tid: det_tid,
-            state,
-            initialized: false,
-            post_exec_pending: true,
-        }));
-    }
-    let thread = unsafe { &mut *scratch.runtime_state };
+    };
     let det_tid = thread.tid;
-    if !thread.initialized {
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: running Detcore thread-start hook\n");
-        }
-        if let Err(error) = reverie_dbt::run_tool_thread_start(
-            tool,
-            context as usize,
-            det_tid,
-            host_pid,
-            branches,
-            &mut thread.state,
-            &runtime.global,
-            &runtime.config,
-            invoke_syscall,
-            read_registers,
-            write_registers,
-        ) {
-            unsafe { result.write(error_result(error)) };
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-            return 1;
-        }
-        thread.initialized = true;
-    }
-    if thread.post_exec_pending {
-        if first_event {
-            emit_lifecycle_marker(
-                emit,
-                b"detcore-dbt: thread-start hook completed; running post-exec\n",
-            );
-        }
-        if let Err(errno) = reverie_dbt::run_tool_post_exec(
-            tool,
-            context as usize,
-            det_tid,
-            host_pid,
-            branches,
-            &mut thread.state,
-            &runtime.global,
-            &runtime.config,
-            invoke_syscall,
-            read_registers,
-            write_registers,
-        ) {
-            unsafe { result.write(-(errno.into_raw() as i64)) };
-            TOTAL_REWRITTEN.fetch_add(1, Ordering::Relaxed);
-            return 1;
-        }
-        if first_event {
-            emit_lifecycle_marker(emit, b"detcore-dbt: post-exec hook completed\n");
-        }
-        thread.post_exec_pending = false;
-    }
 
     if sysnum == libc::SYS_execveat {
         unsafe { result.write(-(Errno::ENOSYS.into_raw() as i64)) };
@@ -2504,7 +2650,7 @@ mod tests {
 
     #[test]
     fn exported_runtime_identity_matches_the_pinned_reverie_abi() {
-        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 4);
+        assert_eq!(IMPLEMENTED_DBT_RUNTIME_ABI_VERSION, 5);
         assert_eq!(
             reverie_dbt::DBT_RUNTIME_ABI_VERSION,
             IMPLEMENTED_DBT_RUNTIME_ABI_VERSION
@@ -3009,9 +3155,21 @@ mod tests {
             .split_once("pub unsafe extern \"C\" fn reverie_dbt_runtime_pre_syscall")
             .expect("pre-syscall callback")
             .1;
+        // pre_syscall starts the thread's lazy Detcore state through
+        // start_thread_runtime (shared with the rdtsc callback), which must
+        // hold the lazy initialization itself.
         let initialize = dispatch
-            .find("if scratch.runtime_state.is_null()")
+            .find("start_thread_runtime(")
             .expect("lazy thread-state initialization");
+        let helper = source
+            .split_once("unsafe fn start_thread_runtime(")
+            .expect("thread-start helper")
+            .1;
+        let helper = &helper[..helper.find("\n}\n").expect("helper body")];
+        assert!(
+            helper.contains("if scratch.runtime_state.is_null()"),
+            "start_thread_runtime must lazily initialize the thread state"
+        );
         let lifecycle = dispatch
             .find("if requires_native_lifecycle(sysnum)")
             .expect("native lifecycle early return");

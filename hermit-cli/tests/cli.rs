@@ -12373,7 +12373,7 @@ fn liteinst_in_guest_verify_compares_the_records_the_guest_forwards() {
 
 /// Run 1's retained verify log of `/bin/true` under `backend`, with one fixed
 /// epoch, kept in `logs`.
-#[cfg(feature = "liteinst")]
+#[cfg(any(feature = "liteinst", feature = "dbt"))]
 fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
     let log_dir = logs.to_str().expect("UTF-8 temporary path");
     // `--log info`, as the e2e harness runs every verify cell: at the default
@@ -12414,6 +12414,30 @@ fn verify_log_of_true(backend: &str, logs: &Path) -> PathBuf {
         panic!("expected one retained run 1 log in {log_dir}, found {golden:?}");
     };
     golden.clone()
+}
+
+/// Under DBT each guest `rdtsc` is answered by Detcore, as under ptrace: the
+/// read is charged and logged ("inbound rdtsc"), and the guest's TSC is
+/// Detcore's virtual clock. Before, the DBT client answered every read from its
+/// own fixed-stride counter, so DBT's run 1 log of `/bin/true` held none of the
+/// 10 rdtsc records ptrace's does.
+#[test]
+#[cfg(feature = "dbt")]
+fn dbt_rdtsc_is_answered_by_detcore_as_under_ptrace() {
+    let _lock = hermit_run_guard();
+    let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let (ptrace_dir, dbt_dir) = (dir.path().join("ptrace"), dir.path().join("dbt"));
+    fs::create_dir_all(&ptrace_dir).unwrap();
+    fs::create_dir_all(&dbt_dir).unwrap();
+    let ptrace = fs::read_to_string(verify_log_of_true("ptrace", &ptrace_dir)).unwrap();
+    let dbt = fs::read_to_string(verify_log_of_true("dbt", &dbt_dir)).unwrap();
+    let reads = ptrace.matches("inbound rdtsc").count();
+    assert!(reads > 0, "ptrace logged no rdtsc:\n{ptrace}");
+    assert_eq!(
+        dbt.matches("inbound rdtsc").count(),
+        reads,
+        "ptrace:\n{ptrace}\ndbt:\n{dbt}"
+    );
 }
 
 /// The coordinator writes the records the in-guest Tool forwards into the log

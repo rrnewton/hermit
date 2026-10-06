@@ -948,7 +948,21 @@ fi
 # recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
 # second budget are unchanged. Carry, not recalibration: no new timing sample
 # or >=5-sample replacement claim is made.
-expected_pin=7e0f57e9e1318d930f304f05fa9a9cfb257261d3
+# CARRY TO eb4372dcabea6708374f9fe649256f92f2040497 (2026-10-06): from
+# 7e0f57e9e1318d930f304f05fa9a9cfb257261d3. The four inputs the budget governs, the DynamoRIO content-key miss
+# hashed over reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, $CMAKE and
+# $CMAKE_GENERATOR, are unchanged: vendor/dynamorio and build.rs have the same
+# git object ids at both revisions, as do reverie-dbt/Cargo.toml, third-party,
+# rust-toolchain.toml and the root Cargo.toml. The two-commit range (f1353b48,
+# eb4372dc) adds reverie-dbt's coordinator evidence append (reverie-dbt/src)
+# and routes the client's rdtsc through the runtime (reverie-dbt/src and
+# reverie-dbt/native/client.c, the client source, which is not part of the
+# DynamoRIO content key); it does not touch the DynamoRIO build recipe.
+# The available-CPU cap and f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
+# second budget are unchanged. Carry, not recalibration: no new timing sample
+# or >=5-sample replacement claim is made.
+expected_pin=eb4372dcabea6708374f9fe649256f92f2040497
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

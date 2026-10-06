@@ -1276,7 +1276,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // prior identities (`cargo nextest list --profile ci` with this node's
     // skips lists 150). liteinst_in_guest_verify_log_keeps_records_in_ptraces_order
     // retains all 150: 150 + 1 = 151, measured with the same listing.
-    ("test.cli", 152),
+    // dbt_rdtsc_is_answered_by_detcore_as_under_ptrace retains all 152: 153,
+    // listed with the build.workspace_on_host features and this node's
+    // arguments.
+    ("test.cli", 153),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1351,7 +1354,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // build.workspace_on_host features (hermit/kvm-native-test-support,
     // hermit/third-party-backends) and this node's arguments: 152 before,
     // 121 after, and the removed set is exactly those 31.
-    ("test.cli_on_host", 121),
+    // The same DBT rdtsc test as test.cli retains all 121: 122, listed the
+    // same way.
+    ("test.cli_on_host", 122),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
