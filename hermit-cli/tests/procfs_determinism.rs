@@ -1290,23 +1290,38 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
 
     let captured_mount_ids =
         hermit::capture_mountinfo_identity_order().expect("capture producer mount identity order");
-    let raw_proc_mount_id = fs::read_to_string("/proc/self/mountinfo")
+    let producer_rows = fs::read_to_string("/proc/self/mountinfo")
         .expect("read producer mountinfo")
         .lines()
-        .find_map(|row| {
-            let mut fields = row.split(' ');
-            let raw_mount_id = fields.next()?.parse::<u64>().ok()?;
-            let _parent = fields.next()?;
-            let _device = fields.next()?;
-            let _root = fields.next()?;
-            (fields.next()? == proc_target.to_str()?).then_some(raw_mount_id)
+        .map(|row| {
+            let fields = row.split(' ').collect::<Vec<_>>();
+            let id = |index: usize| -> u64 {
+                fields[index]
+                    .parse()
+                    .expect("producer mountinfo ID should be decimal")
+            };
+            (id(0), id(1), fields[4].to_owned())
+        })
+        .collect::<Vec<_>>();
+    let raw_proc_mount_id = producer_rows
+        .iter()
+        .find_map(|(raw, _, mountpoint)| {
+            (Some(mountpoint.as_str()) == proc_target.to_str()).then_some(*raw)
         })
         .expect("find chroot proc mount in producer mountinfo");
-    let expected_proc_mount_id = captured_mount_ids
+    // Detcore numbers mount IDs in the order the guest first observes them.
+    // The guest reads mountinfo before fdinfo, and its chroot view lists only
+    // the mounts under the chroot, so that first view numbers its rows in row
+    // order and then their outside parents. This oracle deliberately ignores
+    // the captured namespace order: the guest cannot see it, so it must not
+    // decide any number. Rows outside the chroot get no number.
+    let chroot_prefix = format!("{}/", root.path().to_str().expect("UTF-8 chroot path"));
+    let expected_proc_mount_id = producer_rows
         .iter()
-        .position(|raw| *raw == raw_proc_mount_id)
+        .filter(|(_, _, mountpoint)| mountpoint.starts_with(&chroot_prefix))
+        .position(|(raw, _, _)| *raw == raw_proc_mount_id)
         .map(|index| index as u64 + 1)
-        .expect("proc mount must be present in captured identity order");
+        .expect("proc mount must be a row of the chroot view");
 
     // The subject is mount identity, not preemption: the guest is a single
     // sequential reader of mountinfo and fdinfo. Request no PMU timeslice
@@ -1352,6 +1367,37 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
         .expect("fdinfo must contain one numeric mnt_id");
     assert_eq!(visible_proc_mount_id, expected_proc_mount_id);
     assert_eq!(fdinfo_mount_id, expected_proc_mount_id);
+    // The whole first view is numbered from its own text: rows 1..=n in row
+    // order, then each outside parent in first-appearance order.
+    let visible_rows = mountinfo
+        .lines()
+        .map(|row| {
+            let mut fields = row.split(' ').map(|field| {
+                field
+                    .parse::<u64>()
+                    .expect("mountinfo ID should be decimal")
+            });
+            (fields.next().unwrap(), fields.next().unwrap())
+        })
+        .collect::<Vec<_>>();
+    let row_ids = visible_rows.iter().map(|(id, _)| *id).collect::<Vec<_>>();
+    assert_eq!(
+        row_ids,
+        (1..=visible_rows.len() as u64).collect::<Vec<_>>(),
+        "chroot mountinfo rows must be numbered in row order:\n{mountinfo}"
+    );
+    let mut outside_parents = Vec::new();
+    for (_, parent) in &visible_rows {
+        if !row_ids.contains(parent) && !outside_parents.contains(parent) {
+            outside_parents.push(*parent);
+        }
+    }
+    assert_eq!(
+        outside_parents,
+        (visible_rows.len() as u64 + 1..=(visible_rows.len() + outside_parents.len()) as u64)
+            .collect::<Vec<_>>(),
+        "outside parents must be numbered after the rows, in first-appearance order:\n{mountinfo}"
+    );
     assert!(
         !mountinfo.contains(root.path().to_str().expect("UTF-8 chroot path")),
         "chroot mountinfo leaked the host-side chroot path:\n{mountinfo}"

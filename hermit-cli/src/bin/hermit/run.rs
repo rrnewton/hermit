@@ -6453,7 +6453,7 @@ impl RunOpts {
             .unwrap_or_default();
         config.mountinfo_mount_ids = mountinfo_order;
         config.mountinfo_mount_ids_captured = identity_sources.is_some();
-        config.fdinfo_unlisted_mount_ids.clear();
+        config.mount_id_assignment_order.clear();
         self.save_config_to_disk()?;
 
         let timeout = self.run_timeout();
@@ -6563,7 +6563,7 @@ impl RunOpts {
             .unwrap_or_default();
         config.mountinfo_mount_ids = mountinfo_order;
         config.mountinfo_mount_ids_captured = identity_sources.is_some();
-        config.fdinfo_unlisted_mount_ids.clear();
+        config.mount_id_assignment_order.clear();
         self.save_config_to_disk()?;
 
         let forwarding = forwarded_detlogs.take().map(|(sender, receiver)| {

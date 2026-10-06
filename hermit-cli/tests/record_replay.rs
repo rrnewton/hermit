@@ -114,11 +114,40 @@ fn public_record_uses_the_completed_command_namespace_and_stdio() {
             .is_some_and(|ids| !ids.is_empty()),
         "completed recording mountinfo order was not persisted"
     );
-    assert!(
-        metadata["fdinfo_unlisted_mount_ids"]
+    let raw_ids = |key: &str| -> Vec<u64> {
+        metadata[key]
             .as_array()
-            .is_some_and(|ids| !ids.is_empty()),
-        "recording-time pipe mount identity was not persisted"
+            .unwrap_or_else(|| panic!("recording metadata {key} must be an array"))
+            .iter()
+            .map(|id| {
+                id.as_u64()
+                    .unwrap_or_else(|| panic!("recording metadata {key} must hold raw mount IDs"))
+            })
+            .collect()
+    };
+    let captured_mountinfo_ids = raw_ids("mountinfo_mount_ids");
+    let assignment_order = raw_ids("mount_id_assignment_order");
+    // The guest's stdout is a pipe. pipefs is never listed in mountinfo, so
+    // its guest-visible mnt_id must index an assignment that only fdinfo
+    // provenance can have produced, and replay must rebuild it from there.
+    let stdout_mount_id = section_contents(&captured, "STDOUT_FDINFO")
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:\t"))
+        .expect("stdout fdinfo must contain mnt_id")
+        .parse::<usize>()
+        .expect("stdout fdinfo mnt_id must be decimal");
+    let stdout_raw_mount_id = stdout_mount_id
+        .checked_sub(1)
+        .and_then(|index| assignment_order.get(index))
+        .unwrap_or_else(|| {
+            panic!(
+                "stdout pipe mnt_id {stdout_mount_id} is not in the persisted assignment order {assignment_order:?}"
+            )
+        });
+    assert!(
+        !captured_mountinfo_ids.contains(stdout_raw_mount_id),
+        "stdout pipe mnt_id {stdout_mount_id} maps to raw {stdout_raw_mount_id}, which mountinfo lists; \
+         the recording did not persist the unlisted pipe assignment"
     );
     let replay = hermit::replay_with_output(data.path()).expect("public recording should replay");
     assert_eq!(replay.status, reverie::process::ExitStatus::Exited(0));
@@ -134,6 +163,15 @@ fn public_record_uses_the_completed_command_namespace_and_stdio() {
         line.split_once(' ')
             .is_some_and(|(mount_id, _)| mount_id == fdinfo_mount_id)
     }));
+    let stdout_mount_id = stdout_mount_id.to_string();
+    assert!(
+        !mountinfo.lines().any(|line| {
+            line.split(' ')
+                .take(2)
+                .any(|mount_id| mount_id == stdout_mount_id)
+        }),
+        "the stdout pipe's mnt_id {stdout_mount_id} must not name a mountinfo row or parent:\n{mountinfo}"
+    );
     assert!(captured.contains("mounted-content\n"));
     assert_eq!(section_contents(&captured, "STDIN"), "");
     assert!(!captured.contains("unmounted-content"));

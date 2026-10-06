@@ -2379,7 +2379,7 @@ fn prepare_kvm_mountinfo_config(
     capture: impl FnOnce() -> Result<Vec<u64>, Error>,
 ) -> Result<(), Error> {
     if !config.mountinfo_mount_ids_captured
-        && (!config.mountinfo_mount_ids.is_empty() || !config.fdinfo_unlisted_mount_ids.is_empty())
+        && (!config.mountinfo_mount_ids.is_empty() || !config.mount_id_assignment_order.is_empty())
     {
         anyhow::bail!("KVM mount identities have no producer-captured namespace");
     }
@@ -2778,6 +2778,11 @@ mod dbt_detconfig_tests {
     /// switches. Any later change to `DetConfig`'s serialized fields also
     /// changes this guest-visible variable, so this test is meant to fail on
     /// it and make that change a deliberate one.
+    ///
+    /// One deliberate change since that capture: the empty
+    /// `fdinfo_unlisted_mount_ids` key was renamed `mount_id_assignment_order`
+    /// when Detcore began numbering mount IDs in first-observation order
+    /// (RECORD_VERSION 0x122). Every other byte is the 806cf2fa output.
     const GOLDEN: [(&str, &str); 3] = [
         (
             "default",
@@ -4227,7 +4232,7 @@ mod tests {
         let mut config = DetConfig {
             mountinfo_mount_ids: vec![10, 20, 30],
             mountinfo_mount_ids_captured: true,
-            fdinfo_unlisted_mount_ids: vec![700, 701],
+            mount_id_assignment_order: vec![700, 701],
             mountinfo_root_rewrites: vec![rewrite],
             mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
             ..DetConfig::default()
@@ -4250,7 +4255,7 @@ mod tests {
         assert_eq!(
             serde_json::to_value(&config).unwrap(),
             serde_json::to_value(&expected).unwrap(),
-            "root rewrites, listed/unlisted order and every other setting must remain intact"
+            "root rewrites, listed and assignment orders and every other setting must remain intact"
         );
 
         let mut empty = DetConfig {
@@ -4343,7 +4348,7 @@ mod tests {
             let config = DetConfig {
                 mountinfo_mount_ids: if captured { vec![10, 20] } else { vec![] },
                 mountinfo_mount_ids_captured: captured,
-                fdinfo_unlisted_mount_ids: if captured { vec![700, 701] } else { vec![] },
+                mount_id_assignment_order: if captured { vec![700, 701] } else { vec![] },
                 mountinfo_device_rewrites: vec![(libc::makedev(0, 1), libc::makedev(8, 1))],
                 ..DetConfig::default()
             };
@@ -4379,10 +4384,10 @@ mod tests {
 
     #[test]
     fn kvm_mountinfo_config_refuses_uncaptured_provenance_vectors() {
-        for (listed, unlisted) in [(vec![10], vec![]), (vec![], vec![700])] {
+        for (listed, assigned) in [(vec![10], vec![]), (vec![], vec![700])] {
             let mut config = DetConfig {
                 mountinfo_mount_ids: listed,
-                fdinfo_unlisted_mount_ids: unlisted,
+                mount_id_assignment_order: assigned,
                 ..DetConfig::default()
             };
             let before = serde_json::to_value(&config).unwrap();
@@ -5673,7 +5678,9 @@ mod tests {
     /// the variable's bytes before `dbt_detconfig_json` re-inserts the three
     /// deleted switches' keys; `dbt_detconfig_matches_806cf2fa_bytes` pins the
     /// complete variable. Every DBT run sequentializes threads, so the DBT
-    /// cases do too.
+    /// cases do too. The fixtures carry one deliberate later change, the
+    /// `fdinfo_unlisted_mount_ids` -> `mount_id_assignment_order` key rename
+    /// described on `dbt_detconfig_tests::GOLDEN`.
     #[test]
     fn dbt_detconfig_bytes_are_unchanged_by_backend_capabilities() {
         let sequential = |mut config: DetConfig| {

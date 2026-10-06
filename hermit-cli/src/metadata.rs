@@ -177,7 +177,14 @@ impl RecordVersion {
 // reports a read error and exits 2 on ENOSYS. Replaying an older stream under
 // the new errno could change guest control flow and event consumption, although
 // no event shape changed.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x121);
+// 0x121 -> 0x122: Detcore numbers raw mount IDs in the order the guest first
+// observes them through mountinfo or fdinfo, instead of by row position in the
+// run's starting mountinfo. Metadata carries that order as
+// `mount_id_assignment_order`, replacing `fdinfo_unlisted_mount_ids`, and
+// replay numbers every raw ID from it. An older recording's metadata cannot
+// rebuild the mapping its guest saw, so replaying it could change the mount IDs
+// the guest reads and its control flow.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x122);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -202,7 +209,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x121);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x121;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x122;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
@@ -250,10 +257,11 @@ pub struct Metadata {
     /// valid empty snapshot.
     #[serde(default)]
     pub mountinfo_mount_ids_captured: bool,
-    /// Recording-time raw fdinfo mount IDs absent from mountinfo, in the order
-    /// Detcore first observed them.
+    /// Recording-time raw mount IDs in the order Detcore numbered them, which
+    /// is the order the guest first observed them through mountinfo or fdinfo.
+    /// Replay numbers each raw ID by its position in this list.
     #[serde(default)]
-    pub fdinfo_unlisted_mount_ids: Vec<u64>,
+    pub mount_id_assignment_order: Vec<u64>,
     /// Whether the recording ran in an isolated network namespace with only
     /// loopback (`record start --network local`). `None` means the recorder
     /// did not say, which is every recording made before this field existed;
@@ -314,7 +322,7 @@ impl Metadata {
             mountinfo_root_rewrites: Vec::new(),
             mountinfo_mount_ids: Vec::new(),
             mountinfo_mount_ids_captured: false,
-            fdinfo_unlisted_mount_ids: Vec::new(),
+            mount_id_assignment_order: Vec::new(),
             local_networking: None,
         })
     }
@@ -355,7 +363,7 @@ impl Metadata {
 pub fn record_or_replay_config(data: &Path) -> detcore::Config {
     // NOTE: Record and replay should use the exact same Detcore configuration.
     // Callers add the completed producer namespace's mountinfo order and
-    // unlisted fdinfo mount-ID order after this common base is built, so replay
+    // mount-ID assignment order after this common base is built, so replay
     // uses recording-time raw IDs rather than IDs from its fresh container.
     //
     // WHY THIS IS NOT `hermit run --strict`, WRITTEN HERE ON PURPOSE.
@@ -421,7 +429,7 @@ pub fn record_or_replay_config(data: &Path) -> detcore::Config {
         mountinfo_device_rewrites: Vec::new(),
         mountinfo_mount_ids: Vec::new(),
         mountinfo_mount_ids_captured: false,
-        fdinfo_unlisted_mount_ids: Vec::new(),
+        mount_id_assignment_order: Vec::new(),
         virtualize_cpuid: true,
         // Record and replay run under the ptrace backend.
         backend: <reverie_ptrace::PtraceBackend as reverie::Backend>::capabilities(),
