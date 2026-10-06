@@ -3536,14 +3536,19 @@ impl<T: RecordOrReplay> Detcore<T> {
             .thread_state()
             .with_detfd(call.fd(), |detfd| detfd.procfs_needs_mapping_identities())?;
         let mapping_identities = if needs_mapping_identities {
-            // A mapping backed by stdio must report the SAME inode fdinfo
-            // reports for that fd, which is the fixed `deterministic_stdio_inode`
-            // value rather than a pooled one. Matching is by the raw device and
-            // inode of the stdio descriptor's own identity
-            // (`inherited_stdio_identity_stats`): its own `fstat`, not the
-            // stand-in `setup_stdio` caches for all three descriptors, which
-            // is stdin's file and matched a mapping of stdin's file as stdout
-            // as well even where stdout is another file.
+            // A mapping of the object behind an inherited stdio descriptor
+            // reports the fixed `deterministic_stdio_inode` value that
+            // descriptor's fdinfo reports, rather than a pooled one, only for
+            // the object those descriptors stand in for: the `fstat(0)`
+            // stand-in `setup_stdio` caches for all three, which is stdin's
+            // file (`fixed_stdio_identity_stats`). Matching is by the raw
+            // device and inode of each descriptor's own identity, so a
+            // mapping of stdin's file is not matched as stdout's when stdout
+            // is another file. That other file is not in the table at all:
+            // its mappings report the pooled inode an alias of stdout above
+            // descriptor 2 and a `stat` of its path report, not descriptor
+            // 1's fixed inode, which neither reports (round-11 review of
+            // https://github.com/rrnewton/hermit/pull/3255).
             //
             // The inode alone is not enough: an unrelated file on another
             // filesystem can share the stdio inode number (a fresh tmpfs
@@ -3560,8 +3565,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // stderr's (1002). Without `virtualize_metadata` every
             // descriptor's identity is still the stand-in, so every mapping of
             // the stdin file matches all three. `namespace.rs`'s
-            // `deterministic_stdio_inode_for_raw` applies the same precedence.
-            let stdio_stats = self.inherited_stdio_identity_stats(guest).await?;
+            // `deterministic_stdio_inode_for_raw` applies the same precedence,
+            // to the same table.
+            let stdio_stats = self.fixed_stdio_identity_stats(guest).await?;
             let mut stdio_by_raw_file: BTreeMap<RawInode, DetInode> = BTreeMap::new();
             for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
                 let inode = guest
@@ -7008,6 +7014,57 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(Error::Errno(Errno::EBADF)) => None,
                 Err(error) => return Err(error),
             };
+        }
+        Ok(stats)
+    }
+
+    /// The stdio identities that keep a fixed inode (1000 plus the descriptor
+    /// number) in the views that name an object rather than a descriptor: the
+    /// memory-map sanitizer's `stdio_by_raw_file` table and another process's
+    /// `/proc/<pid>/fd` link (`canonicalize_other_proc_fd_target`).
+    ///
+    /// This is [`Self::inherited_stdio_identity_stats`] with descriptor
+    /// `fd`'s entry kept only when its own identity is the stand-in
+    /// `setup_stdio` cached for it (`DetFd::stat`): the `fstat(0)` of the
+    /// process that runs Detcore (Hermit's on ptrace and KVM, the guest's on
+    /// DBT and LiteInst). Those views gave a fixed inode to that object and
+    /// to no other before each descriptor's own identity was asked, so the
+    /// fixed inode stays only where it was.
+    ///
+    /// A stdout or stderr that is another object -- a file or a pipe stdout
+    /// was redirected to while stdin is something else -- is left out, so
+    /// these views name it by its pooled inode. That is the inode an alias of
+    /// it above descriptor 2 reports through `fstat` and `fdinfo`, and the
+    /// one a `stat` of its path reports. Keeping its own identity in the
+    /// table gave its mappings, and other processes' links to it, descriptor
+    /// 1's fixed inode instead, which none of those views report (round-11
+    /// review of <https://github.com/rrnewton/hermit/pull/3255>). An `fstat`
+    /// of descriptor 1 itself, and its own `/proc/self/fd/1` link, still
+    /// report the fixed inode. That difference is older than this table:
+    /// removing it needs the inode pool to give such an object a single
+    /// identity, which is not done here.
+    ///
+    /// Asks nothing beyond [`Self::inherited_stdio_identity_stats`]: the
+    /// stand-in is already cached. Without `virtualize_metadata` every
+    /// identity is the stand-in itself, so nothing is dropped. On SaBRe,
+    /// `setup_stdio` caches each descriptor's own `fstat`, so nothing is
+    /// dropped there either, and a stdout that is another object keeps
+    /// descriptor 1's fixed inode in these views, as it did before.
+    pub(crate) async fn fixed_stdio_identity_stats<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+    ) -> Result<[Option<DetStat>; 3], Error> {
+        let mut stats = self.inherited_stdio_identity_stats(guest).await?;
+        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
+            let stand_in = guest
+                .thread_state()
+                .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+                .ok()
+                .flatten();
+            let slot = &mut stats[fd as usize];
+            if slot.is_some_and(|own| Some(own.raw_inode()) != stand_in) {
+                *slot = None;
+            }
         }
         Ok(stats)
     }
@@ -11178,8 +11235,9 @@ pub(crate) mod inject_fstat_scratch {
         }
     }
 
-    // The table the maps and `/proc/<pid>/fd` views match stdio objects
-    // against: each inherited descriptor's own identity, here the test
+    // Each inherited descriptor's own identity, which
+    // `fixed_stdio_identity_stats` narrows to the table the maps and
+    // `/proc/<pid>/fd` views match stdio objects against: here the test
     // process's own descriptors 0 to 2, where the stand-in gave all three
     // the identity of its stdin.
     #[tokio::test]
@@ -11238,6 +11296,80 @@ pub(crate) mod inject_fstat_scratch {
         );
         let recorded = tool.inherited_stdio_identity_stats(&mut guest).await;
         assert_eq!(identities(recorded), stand_ins);
+        assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
+    }
+
+    // Only the object the stand-in describes keeps a fixed stdio inode in
+    // the maps and `/proc/<pid>/fd` views. Here stdin and stderr are that
+    // object, as with one terminal on both, and stdout is another, as with
+    // `prog > file`: its entry is dropped, so those views name it by the
+    // pooled inode its aliases and its path report rather than by
+    // descriptor 1's fixed inode (round-11 review of
+    // https://github.com/rrnewton/hermit/pull/3255). The descriptors' own
+    // identities are scripted, since the test process's descriptors 0 to 2
+    // are whatever the test runner gave it.
+    #[tokio::test]
+    async fn fixed_stdio_identities_keep_only_the_stand_in_object() {
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        assert!(guest.config.virtualize_metadata);
+        let stand_ins: Vec<Option<RawInode>> = (libc::STDIN_FILENO..=libc::STDERR_FILENO)
+            .map(|fd| {
+                guest
+                    .thread
+                    .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.raw_inode()))
+                    .ok()
+                    .flatten()
+            })
+            .collect();
+        let stand_in =
+            stand_ins[0].expect("precondition: the scripted guest's stdin has a stand-in");
+        assert_eq!(
+            stand_ins,
+            [Some(stand_in); 3],
+            "precondition: one stand-in for all three descriptors"
+        );
+        let (file, _) = open_file();
+        let mut answer: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(file, &mut answer) }, 0);
+        assert_eq!(unsafe { libc::close(file) }, 0);
+        let other = RawInode::new(stand_in.dev ^ 1, stand_in.ino);
+        for (fd, identity) in [
+            (libc::STDIN_FILENO, stand_in),
+            (libc::STDOUT_FILENO, other),
+            (libc::STDERR_FILENO, stand_in),
+        ] {
+            answer.st_dev = identity.dev;
+            answer.st_ino = identity.ino;
+            guest.fstat_answers.push((fd, answer));
+        }
+
+        let fixed = tool
+            .fixed_stdio_identity_stats(&mut guest)
+            .await
+            .expect("the scripted descriptors can be asked")
+            .map(|stat| stat.map(|stat| stat.raw_inode()));
+
+        assert_eq!(
+            fixed,
+            [Some(stand_in), None, Some(stand_in)],
+            "stdout's own identity is not the stand-in, so it must not keep a fixed inode"
+        );
+        assert_eq!(
+            guest.injected,
+            [Sysno::fstat, Sysno::fstat, Sysno::fstat],
+            "nothing is asked beyond each inherited descriptor's own identity"
+        );
+
+        // Without virtualize_metadata every identity is the stand-in, so all
+        // three keep their fixed inodes, and nothing is asked.
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        guest.config.virtualize_metadata = false;
+        let recorded = tool
+            .fixed_stdio_identity_stats(&mut guest)
+            .await
+            .expect("without virtualized metadata nothing is asked")
+            .map(|stat| stat.map(|stat| stat.raw_inode()));
+        assert_eq!(recorded, [Some(stand_in); 3]);
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
     }
 
