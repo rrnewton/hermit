@@ -3270,6 +3270,13 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // here: Detcore installs the backend's process signal control when the
     // backend offers it and threads are sequentialized, and reads the installed
     // control from then on.
+    // Only ptrace and LiteInst have been measured to report a thread's signal state
+    // in /proc and to resume a restart errno through the kernel's signal delivery
+    // (https://github.com/rrnewton/hermit/issues/3146). Every other backend keeps the
+    // previous blocking-wait behavior. `reverie::BackendCapabilities` has no field
+    // for this fact yet, so it is set here from the backend's name.
+    config.backend_supports_blocked_wait_signal_interruption =
+        matches!(backend, Backend::Ptrace | Backend::Liteinst);
     config
 }
 
@@ -6049,6 +6056,24 @@ mod tests {
             assert_eq!(
                 config.backend.supports_parked_write_signal_interruption, supports_interruption,
                 "unexpected parked-write signal support for {backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn backend_blocked_wait_signal_contract_is_explicit() {
+        for (backend, supports_interruption) in [
+            (Backend::Ptrace, true),
+            (Backend::Dbt, false),
+            (Backend::Kvm, false),
+            (Backend::Sabre, false),
+            (Backend::Liteinst, true),
+            (Backend::E9patch, false),
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert_eq!(
+                config.backend_supports_blocked_wait_signal_interruption, supports_interruption,
+                "unexpected blocked-wait signal support for {backend:?}"
             );
         }
     }
