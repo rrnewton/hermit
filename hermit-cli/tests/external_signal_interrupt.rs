@@ -1231,6 +1231,69 @@ fn liteinst_timed_futex_wait_and_poll_keep_their_deadline_through_a_discarded_de
     assert_discarded_default_stop_leaves_rearming_waits("liteinst");
 }
 
+/// How many SIGCHLDs the `chldflood` cells send after their SIGUSR1.
+const SIGCHLD_FLOOD: usize = 20_000;
+
+/// `poll` and a timed polling `FUTEX_WAIT` keep their deadline while a flood of
+/// default-ignored SIGCHLD from outside Hermit arrives as they start (the
+/// guest's `chldflood` option). Linux neither ends nor restarts either call for
+/// that signal, so both return their timeout result at 300 ms. The flood keeps
+/// a SIGCHLD arriving after Detcore's `/proc` read and before its injection,
+/// where the stop cannot be identified; that stop used to end the wait with a
+/// restart code that, with no handler to run, restarted the call with its
+/// relative timeout started again (round-8 High 1 on
+/// https://github.com/rrnewton/hermit/pull/3361). The unit tests
+/// `a_stop_that_cannot_be_identified_keeps_a_timed_wait_and_its_deadline` and
+/// `a_timed_wait_keeps_its_deadline_past_a_held_sigchld` pin the decision and
+/// are the tests that fail without it. This test also passed at round-7 head
+/// 3032cd65 when measured: the unidentified stop falls in the call's first
+/// turn, where a restart costs microseconds of virtual time, well inside the
+/// 50 ms overshoot. It guards the deadline, and the liveness of a deadline
+/// wait's unbounded retry, end to end on both backends.
+fn assert_sigchld_flood_leaves_timed_waits_their_deadline(backend: &str) {
+    let mut signals = vec![libc::SIGUSR1];
+    signals.extend(std::iter::repeat_n(libc::SIGCHLD, SIGCHLD_FLOOD));
+    let cells: [(&[&str], &str); 2] = [
+        (
+            &["poll", "external", "chldflood"],
+            "RESULT call=poll ret=0 errno=none handler=1",
+        ),
+        (
+            &["futex", "external", "timed", "chldflood"],
+            "RESULT call=futex ret=-1 errno=ETIMEDOUT handler=1",
+        ),
+    ];
+    for (args, expected) in cells {
+        let run = run_cell_with_external_signals(backend, FutexMode::Polling, args, &signals);
+        assert!(
+            run.status.success()
+                && run.result_line() == Some(expected)
+                && run.stdout.lines().any(|line| line == "DONE"),
+            "{backend} {args:?}: expected `{expected}`\n{}",
+            run.describe()
+        );
+        let elapsed = run.elapsed_ms();
+        assert!(
+            elapsed.is_some_and(|ms| {
+                (QUIET_TIMEOUT_MS..QUIET_TIMEOUT_MS + QUIET_OVERSHOOT_MS).contains(&ms)
+            }),
+            "{backend} {args:?}: the wait took {elapsed:?} ms, not its \
+             {QUIET_TIMEOUT_MS} ms timeout\n{}",
+            run.describe()
+        );
+    }
+}
+
+#[test]
+fn ptrace_timed_futex_wait_and_poll_keep_their_deadline_through_a_sigchld_flood() {
+    assert_sigchld_flood_leaves_timed_waits_their_deadline("ptrace");
+}
+
+#[test]
+fn liteinst_timed_futex_wait_and_poll_keep_their_deadline_through_a_sigchld_flood() {
+    assert_sigchld_flood_leaves_timed_waits_their_deadline("liteinst");
+}
+
 /// Control for the test above: the same discarded SIGTSTP still ends, or
 /// restarts, every other wait as Linux does. glibc `select`, the `select`
 /// system call, and `sem_timedwait` restart with their deadline kept (Detcore

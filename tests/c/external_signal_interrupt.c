@@ -13,7 +13,7 @@
  *            [ignored|blocked|winch|tstp|ign2caught|caught2ign|chldlate|chldign|
  *             chldkill|chldthrexit|chldpend|stealgrp|stealkill|stealthrexit|
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
- *             extchld|extchldreaped|extchldlive]
+ *             extchld|extchldreaped|extchldlive|chldflood]
  *        external_signal_interrupt sigsuspend creator
  *        external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing
  *
@@ -152,6 +152,15 @@
  *                  signals the parent alone.
  * Linux ends the wait with EINTR as soon as the signal arrives, with or
  * without a child, and the handler has run once by the RESULT line.
+ *
+ * `chldflood` needs the `external` sender and `poll`, or `futex` with `timed`.
+ * SIGCHLD stays at SIG_DFL, which ignores it. After READY the guest naps in
+ * 1 ms sleeps until its SIGUSR1 handler has run, then takes the start stamp and
+ * makes the call with the 300 ms timeout of a must-not-wake option. The harness
+ * sends SIGUSR1 followed by a flood of SIGCHLD, so the wait starts while
+ * SIGCHLD keeps arriving. A default-ignored SIGCHLD neither ends nor restarts
+ * the wait on Linux, so poll returns 0 and the futex wait ETIMEDOUT at 300 ms,
+ * and the ELAPSED line reports it.
  *
  * `sigsuspend creator` is a mode of its own. The main thread installs a
  * SIGCHLD handler (flags 0), blocks SIGCHLD, prints READY and waits in
@@ -730,7 +739,7 @@ int main(int argc, char **argv) {
         "<external|process|thread|timer|exit> [restart] [timed] [warm] "
         "[ignored|blocked|winch|tstp|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit|"
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
-        "spinthrexit|usr2|extchld|extchldreaped|extchldlive]\n"
+        "spinthrexit|usr2|extchld|extchldreaped|extchldlive|chldflood]\n"
         "       external_signal_interrupt sigsuspend creator\n"
         "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing\n");
     return 2;
@@ -742,6 +751,7 @@ int main(int argc, char **argv) {
   if (!strcmp(call, "sigsuspend")) return creator_main(sender);
   if (!strcmp(sender, "racing")) return racing_main(call);
   int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
+  int chldflood = 0;
   enum extchld extchld = EXTCHLD_NONE;
   static const struct {
     const char *name;
@@ -787,10 +797,11 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "extchld")) extchld = EXTCHLD_CHILDLESS;
     else if (!strcmp(argv[i], "extchldreaped")) extchld = EXTCHLD_REAPED;
     else if (!strcmp(argv[i], "extchldlive")) extchld = EXTCHLD_LIVE;
+    else if (!strcmp(argv[i], "chldflood")) chldflood = 1;
     else return 2;
   }
   if (ignored + blocked + (sent_signal == SIGWINCH) + tstp + (flip != FLIP_NONE) + options + usr2 +
-          (extchld != EXTCHLD_NONE) >
+          (extchld != EXTCHLD_NONE) + chldflood >
       1)
     return 2;
   flip_timed = timed;
@@ -824,8 +835,10 @@ int main(int argc, char **argv) {
   if (extchld != EXTCHLD_NONE && (strcmp(sender, "external") || restart || timed || warm || quiet ||
                                   (!is_rawselect && strcmp(call, "select"))))
     return 2;
-  int report_elapsed =
-      quiet || flip != FLIP_NONE || from_exit || role != ROLE_NONE || warm || (is_wait && restart);
+  if (chldflood && (strcmp(sender, "external") || restart || warm || !(is_poll || (is_futex && timed))))
+    return 2;
+  int report_elapsed = quiet || flip != FLIP_NONE || from_exit || role != ROLE_NONE || warm ||
+                       (is_wait && restart) || chldflood;
   stamp_handler = is_wait && restart;
   if (tstp) {
     /* Run the test in a child that is alone in an orphaned process group (see
@@ -964,6 +977,14 @@ int main(int argc, char **argv) {
   if (from_thread && pthread_create(&thread, NULL, thread_sender, NULL) != 0) return 3;
 
   say("READY\n");
+  if (chldflood) {
+    /* The wait starts once the handler for the harness's SIGUSR1 has run,
+     * while the SIGCHLD flood that follows it is still arriving. The guest
+     * naps rather than pausing: a pause with no runnable thread is a
+     * deadlock to Hermit before the host signal arrives. */
+    while (!handled) sleep_ms(1);
+    clock_gettime(CLOCK_MONOTONIC, &start);
+  }
   if (from_timer) {
     struct itimerval it;
     memset(&it, 0, sizeof it);
@@ -982,10 +1003,10 @@ int main(int argc, char **argv) {
   errno = 0;
   /* A must-not-wake wait, or a timed disposition-change wait, has the short
    * timeout; a readiness wait is otherwise unbounded. */
-  int bounded = quiet || (flip != FLIP_NONE && timed);
+  int bounded = quiet || (flip != FLIP_NONE && timed) || chldflood;
   if (is_futex) {
     struct timespec timeout = {10, 0};
-    if (quiet || flip != FLIP_NONE || role == ROLE_STEAL || role == ROLE_FORK)
+    if (quiet || flip != FLIP_NONE || role == ROLE_STEAL || role == ROLE_FORK || chldflood)
       timeout = (struct timespec){0, QUIET_TIMEOUT_MS * 1000000L};
     ret = syscall(SYS_futex, &futex_word, FUTEX_WAIT_PRIVATE, 0,
                   timed || quiet ? &timeout : NULL, NULL, 0);
