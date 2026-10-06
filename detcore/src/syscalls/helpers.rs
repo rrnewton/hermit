@@ -2352,10 +2352,11 @@ impl KernelSignalWait {
     /// intercepted, so such a signal arrived while the call was waiting, and Linux
     /// returns the restart errno for that. Linux reports a source that was ready
     /// when the call began, or an argument error, before any pending signal, so
-    /// `retry_blocking_wait_with_kernel_signal_state` runs its first probe before
-    /// this check (`inject_first_probe`). A source that becomes ready in a later
-    /// turn in which a signal is also pending is put behind the signal, because
-    /// the turn cannot tell which came first. A signal the wait holds until the
+    /// `retry_blocking_wait_with_kernel_signal_state` and the waits of `select`
+    /// and `pselect6` run their first probe before this check
+    /// (`inject_first_probe`). A source that becomes ready in a later turn in
+    /// which a signal is also pending is put behind the signal, because the turn
+    /// cannot tell which came first. A signal the wait holds until the
     /// call returns (`held_until_return`) never counts. A signal that the backend
     /// holds since `inject_absorbing` absorbed it counts as pending. A failed read
     /// is never returned as the call's errno (`read_wait_signal_state`).
@@ -2467,12 +2468,14 @@ impl KernelSignalWait {
     ///
     /// Linux reports a descriptor that is ready when the call begins, a queued
     /// event, and an argument error before it looks at pending signals:
-    /// `do_poll` tests `signal_pending` only when no descriptor is ready, `ep_poll`
-    /// sends queued events before it tests it, `do_epoll_wait` rejects a bad
-    /// descriptor or `maxevents` first, and `do_sigtimedwait` copies its set
-    /// first. So the probe runs even when such a signal is pending. A pending
-    /// signal that the guest does not block stops the injection before the probe
-    /// runs; when the stop is identified, the signal is held as a precious one
+    /// `do_poll` tests `signal_pending` only when no descriptor is ready, and so
+    /// does `core_sys_select`, whose `max_select_fd` first returns `EBADF` for a
+    /// descriptor in the sets that is not open; `ep_poll` sends queued events
+    /// before it tests it, `do_epoll_wait` rejects a bad descriptor or
+    /// `maxevents` first, and `do_sigtimedwait` copies its set first. So the
+    /// probe runs even when such a signal is pending. A pending signal that the
+    /// guest does not block stops the injection before the probe runs; when the
+    /// stop is identified, the signal is held as a precious one
     /// (`HeldKind::Precious`) and the probe runs again, so its result stands, and
     /// the backend delivers the signal as the call returns. If the probe would
     /// block, the caller's check that follows
@@ -4735,10 +4738,11 @@ mod kernel_signal_wait_failures {
         }
     }
 
-    /// The same `SIGCHLD` ends a select wait before its probe is injected, with
-    /// `ERESTARTNOHAND`, which the handler's run turns into `EINTR`. A gated
-    /// wait makes the injection, and the `SIGCHLD` that stops it is held until
-    /// the call returns.
+    /// The same `SIGCHLD` ends a select wait before an injection that is not its
+    /// first probe (`inject_absorbing`: a later probe, or the change of mask that
+    /// blocks signals for the wait), with `ERESTARTNOHAND`, which the handler's
+    /// run turns into `EINTR`. A gated wait makes the injection, and the
+    /// `SIGCHLD` that stops it is held until the call returns.
     #[tokio::test]
     async fn a_pending_caught_sigchld_ends_a_select_wait_before_the_injection() {
         let (mut guest, kernel) = caught_sigchld_guest(true);
