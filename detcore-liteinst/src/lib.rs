@@ -13,6 +13,8 @@
 //! tracer sits on the system-call path.
 #![deny(missing_docs)]
 
+use std::path::Path;
+
 // AUTONOMOUS-BOT-IMPLEMENTED
 // TODO-HUMAN-REVIEW(PR-3635): Review the
 // in-guest Detcore constructor boundary.
@@ -100,6 +102,27 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
                 "cannot reserve the DETLOG forwarding descriptor {fd}: {error}"
             )),
         }
+    }
+    // Detcore's exit-dependency refusals name only the capability; this
+    // backend adds its name and the alternative.
+    detcore::exit_dependencies::set_backend_advice(
+        "--backend=liteinst (in-guest LiteInst) cannot run this program; run it with \
+         --backend=ptrace.",
+    );
+    // Coord rulings A and D.1: Detcore checks every descriptor that arrives
+    // later; this checks the ones the process image starts with. A forked
+    // child holds only what its parent held or received.
+    match detcore::exit_dependencies::held_exit_dependency(Path::new("/proc/self/fd")) {
+        Ok(None) => {}
+        Ok(Some((fd, what))) => fail(&format!(
+            "in-guest LiteInst refuses a guest that starts holding {what} (descriptor {fd}): \
+             Hermit holds every guest's turn until an exit completes, and a guest serving that \
+             descriptor could make another guest's exit wait forever; run this program with \
+             --backend=ptrace"
+        )),
+        Err(error) => fail(&format!(
+            "cannot list the descriptors this process started with: {error}"
+        )),
     }
     // SAFETY: the loader runs constructors before any application thread
     // exists and before the application can install a seccomp filter, which is

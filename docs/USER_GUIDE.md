@@ -253,6 +253,12 @@ naming the process, when an exit sleeps in the kernel's exit path for over
 1 s, or when any exit is not complete 60 s after its grant, and kills the
 guests; such a run never verifies. A soft mount whose retries give up in
 under a second can still complete unnoticed.
+For the same reason Hermit refuses, by name, a guest that holds a FUSE or
+CUSE device (`/dev/fuse`, `/dev/cuse`) or a seccomp user-notification
+listener, whether it opens one, starts with one, or receives one through
+`SCM_RIGHTS` or `pidfd_getfd`: such a guest could be the server another
+guest's exit waits for. Reading plain files on a FUSE filesystem is not
+affected, and `userfaultfd` is supported.
 
 In-guest LiteInst needs Linux 6.5 or later (`SO_PEERPIDFD`) and refuses to
 start on an older kernel. `--verify` refuses to compare a run that recorded a

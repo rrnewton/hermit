@@ -1165,7 +1165,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/issues/3815) retains all 975 (976,
     // measured with cargo nextest list).
     // Eleven C3.5 exit-hold tests (scheduler and tool_global) retain all 976: 987.
-    ("test.detcore_unit", 987),
+    // Six exit_dependencies tests (rulings A and D.1) retain all 987: 993.
+    ("test.detcore_unit", 993),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1419,7 +1420,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (the hosted-runner hang of GitHub run
     // https://github.com/rrnewton/hermit/actions/runs/37489014478) retains
     // all 165: 165 + 1 = 166, listed the same way.
-    ("test.cli", 166),
+    // The two in-guest FUSE tests (ruling A) and the userfaultfd test (ruling D.2): 169.
+    ("test.cli", 169),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1507,7 +1509,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same perf-unavailable --max-log-bytes test as test.cli retains all
     // 134 (135, listed with this node's arguments); it starts no LiteInst
     // guest, so the filterset is unchanged: 166 - 31 = 135.
-    ("test.cli_on_host", 135),
+    // The host twin selects the same three exit-dependency tests: 138.
+    ("test.cli_on_host", 138),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
@@ -1556,7 +1559,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same four signal-control tests retain all 971: 975.
     // And the host-independent /proc/modules test (976).
     // The host twin selects the same eleven exit-hold tests: 987.
-    ("test.detcore_unit_on_host", 987),
+    // The host twin selects the same six exit_dependencies tests: 993.
+    ("test.detcore_unit_on_host", 993),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

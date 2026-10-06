@@ -9,7 +9,7 @@
   "selection_rule": "Every candidate-backend (dbt, kvm, liteinst, sabre) verify cell of a test folded from the retired backend-parity-c bucket into c-programs (the ids of the backend-parity-c retirement in tests/e2e/manifests/inventory/retired-ids.json) whose ptrace verify cell is selected by full validation, provided the candidate's verify cell is enabled. Candidate cells that are enabled but not selected by full validation are included and marked not selectable in ci/compat-envelope/parity-cells.json.",
   "counts": {
     "all": {
-      "cells": 3144,
+      "cells": 3148,
       "applicable": 828,
       "selectable": 536,
       "selected": 198,
@@ -17,28 +17,28 @@
     },
     "by_backend": {
       "dbt": {
-        "cells": 786,
+        "cells": 787,
         "applicable": 85,
         "selectable": 38,
         "selected": 16,
         "selected_selectable": 14
       },
       "kvm": {
-        "cells": 786,
+        "cells": 787,
         "applicable": 264,
         "selectable": 258,
         "selected": 91,
         "selected_selectable": 91
       },
       "liteinst": {
-        "cells": 786,
+        "cells": 787,
         "applicable": 0,
         "selectable": 0,
         "selected": 0,
         "selected_selectable": 0
       },
       "sabre": {
-        "cells": 786,
+        "cells": 787,
         "applicable": 479,
         "selectable": 240,
         "selected": 91,
@@ -1159,6 +1159,10 @@
     {"test_id":"c-programs/unix-autobind-stream","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/unix-autobind-stream","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Owner reset 2026-10-04 - the ptrace-owned LiteInst hybrid is being replaced by in-guest Detcore, and LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520)"},
     {"test_id":"c-programs/unix-autobind-stream","backend":"sabre","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
+    {"test_id":"c-programs/userfaultfd-self-service","backend":"dbt","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: dbt verify is disabled: userfaultfd has not been qualified on DBT"},
+    {"test_id":"c-programs/userfaultfd-self-service","backend":"kvm","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: kvm verify is disabled: userfaultfd has not been qualified on KVM"},
+    {"test_id":"c-programs/userfaultfd-self-service","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Owner reset 2026-10-04 - LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520); in-guest LiteInst runs this program in hermit-cli's liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered"},
+    {"test_id":"c-programs/userfaultfd-self-service","backend":"sabre","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: sabre verify is disabled: userfaultfd has not been qualified on SaBRe"},
     {"test_id":"c-programs/ustat-enosys","backend":"dbt","category":"c-programs","applicable":true,"selectable":false,"selected":false,"reason":"not selectable: dbt verify is not selected by full validation: Canonical full validation could not start either DBT attempt because this backend cannot isolate the required /test workdir; this is an infrastructure result, not a product divergence."},
     {"test_id":"c-programs/ustat-enosys","backend":"kvm","category":"c-programs","applicable":true,"selectable":true,"selected":false,"reason":"selectable, not selected: not listed in tests/e2e/parity-selection.yaml"},
     {"test_id":"c-programs/ustat-enosys","backend":"liteinst","category":"c-programs","applicable":false,"selectable":false,"selected":false,"reason":"not applicable: liteinst verify is disabled: Initial C-corpus migration preserves the established ptrace baseline; qualify LiteInst separately"},

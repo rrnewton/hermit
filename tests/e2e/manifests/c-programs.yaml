@@ -3799,6 +3799,71 @@ test:
           kvm: No custom edge-case arguments have been calibrated for this C guest
           sabre: No custom edge-case arguments have been calibrated for this C guest
           liteinst: No custom edge-case arguments have been calibrated for this C guest
+  - id: c-programs/userfaultfd-self-service
+    description: One process resolves its own userfaultfd-registered pages with UFFDIO_COPY before reading them and exits still registered (tests/c/userfaultfd_self_service.c)
+    lane: portable
+    requires:
+      - linux
+      - x86_64
+      - userns
+      - ptrace
+      - cc
+    occasional: false
+    program: tests/c/userfaultfd_self_service.c
+    observation:
+      status: true
+      stdout: true
+      stderr: false
+      artifacts: []
+    modes:
+      verify:
+        ci: false
+        ci_disabled_reason: New coverage (coord ruling D.2); enters blocking CI after its first validation receipts
+        backends_enabled:
+          - ptrace
+        backends_disabled:
+          dbt: userfaultfd has not been qualified on DBT
+          kvm: userfaultfd has not been qualified on KVM
+          sabre: userfaultfd has not been qualified on SaBRe
+          liteinst: Owner reset 2026-10-04 - LiteInst cells return only on the new architecture (https://github.com/rrnewton/hermit/issues/3745, step 1 of https://github.com/rrnewton/hermit/issues/3520); in-guest LiteInst runs this program in hermit-cli's liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered
+        expected_stdout_contains:
+          ptrace: "userfaultfd-"
+      naked:
+        ci: false
+        ci_disabled_reason: Native control has no nondeterminism oracle for this single deterministic output
+        backends_enabled: []
+        backends_disabled:
+          native: This program asserts one deterministic output and has no native nondeterminism oracle
+      replay:
+        ci: false
+        ci_disabled_reason: Record/replay qualification is separate from this strict-verification coverage
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Record/replay qualification is separate from this strict-verification coverage
+          dbt: Record/replay is unsupported by DBT
+          kvm: Record/replay is unsupported by KVM
+          sabre: Record/replay is unsupported by SaBRe
+          liteinst: Record/replay is unsupported by LiteInst
+      chaos:
+        ci: false
+        ci_disabled_reason: This guest has no schedule-diversity oracle for chaos mode
+        backends_enabled: []
+        backends_disabled:
+          ptrace: Chaos scheduling is only meaningful for guests with an explicit schedule-diversity oracle
+          dbt: Chaos scheduling is unsupported by DBT
+          kvm: Chaos scheduling is unsupported by KVM
+          sabre: Chaos scheduling is unsupported by SaBRe
+          liteinst: Chaos scheduling is unsupported by LiteInst
+      custom:
+        ci: false
+        ci_disabled_reason: No custom edge-case arguments have been calibrated for this C guest
+        backends_enabled: []
+        backends_disabled:
+          ptrace: No custom edge-case arguments have been calibrated for this C guest
+          dbt: No custom edge-case arguments have been calibrated for this C guest
+          kvm: No custom edge-case arguments have been calibrated for this C guest
+          sabre: No custom edge-case arguments have been calibrated for this C guest
+          liteinst: No custom edge-case arguments have been calibrated for this C guest
   - id: c-programs/mmap-stress-determinism
     description: Strict verification for tests/c/mmap_stress_determinism.c
     lane: portable

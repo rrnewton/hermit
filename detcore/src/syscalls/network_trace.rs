@@ -503,7 +503,7 @@ fn names_abstract_unix_address(bytes: &[u8], addrlen: usize, binding: bool) -> b
 
 /// The descriptors carried by the `SCM_RIGHTS` messages in a received
 /// control buffer.
-fn received_descriptors(control: &[u8]) -> Vec<RawFd> {
+pub(crate) fn received_descriptors(control: &[u8]) -> Vec<RawFd> {
     const HEADER: usize = size_of::<libc::cmsghdr>();
     let align = |length: usize| length.next_multiple_of(size_of::<usize>());
     let mut descriptors = Vec::new();

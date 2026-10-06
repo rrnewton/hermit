@@ -71,6 +71,7 @@ c-programs/thread-self-procfs-handoff verify sabre
 c-programs/thread-sync-determinism verify kvm
 c-programs/threadexhaustion verify sabre
 c-programs/timer-family-identity verify ptrace
+c-programs/userfaultfd-self-service verify ptrace
 c-programs/ustat-enosys verify dbt
 c-programs/vmsplice-enosys verify dbt
 c-programs/writev-determinism custom ptrace

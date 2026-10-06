@@ -60,6 +60,7 @@ use super::hermit_run_guard;
 
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
+static USERFAULTFD_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPAT_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_SEMANTIC_FIXTURE: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_COMPRESSED_FIXTURES: OnceLock<[PathBuf; 2]> = OnceLock::new();
@@ -1265,4 +1266,160 @@ fn liteinst_in_guest_dispatch_record_reports_patched_sites() {
         .candidates
         .expect("LiteInst measures its candidates");
     assert!(candidates > 0, "{record}");
+}
+
+fn userfaultfd_guest() -> &'static Path {
+    USERFAULTFD_GUEST.get_or_init(|| {
+        let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("hermit-cli should be inside the repository");
+        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        fs::create_dir_all(&build_root).expect("failed to create LiteInst guest directory");
+        let guest = build_root.join("userfaultfd_self_service");
+        let output = Command::new("cc")
+            .args(["-O2", "-g", "-Wall", "-Wextra", "-Werror"])
+            .arg(repository.join("tests/c/userfaultfd_self_service.c"))
+            .arg("-o")
+            .arg(&guest)
+            .output()
+            .expect("failed to compile the userfaultfd guest");
+        assert!(
+            output.status.success(),
+            "tests/c/userfaultfd_self_service.c compilation failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        guest
+    })
+}
+
+/// Coord ruling D.2: userfaultfd stays supported under in-guest LiteInst,
+/// whose exits hold the schedule until they are physically complete. One
+/// process serves its own faults from one thread (tests/c/
+/// userfaultfd_self_service.c, which c-programs.yaml runs on ptrace): it
+/// resolves its registered pages ahead of use with `UFFDIO_COPY`, reads them,
+/// and exits still registered. The run completes, matches under strict
+/// verification, and prints what the pages hold. Skipped, with the reason
+/// printed, where the kernel refuses an unprivileged userfaultfd.
+#[test]
+fn liteinst_in_guest_serves_its_own_userfaultfd_and_exits_registered() {
+    let _guard = hermit_run_guard();
+    let output = liteinst_command("info")
+        .args(["--verify", "--verify-strict"])
+        .arg("--")
+        .arg(userfaultfd_guest())
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit LiteInst on the userfaultfd guest");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if let Some(reason) = stdout.strip_prefix("userfaultfd-unavailable ") {
+        eprintln!(
+            "skipping: this kernel refuses an unprivileged userfaultfd ({})",
+            reason.trim()
+        );
+        return;
+    }
+    assert!(
+        output.status.success(),
+        "status={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status,
+    );
+    assert_eq!(
+        stdout, "userfaultfd-served pages=2 sum=798720\n",
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("Success: deterministic. Determinism verified."),
+        "{stderr}"
+    );
+    assert!(stderr.contains("bitwise parity established"), "{stderr}");
+    assert_in_guest_selected(&stderr);
+}
+
+/// Coord ruling A: a guest that holds a FUSE device could be the server
+/// another guest's exit-time flush waits for, which can never be answered
+/// while Hermit holds every turn until that exit completes. In-guest LiteInst
+/// refuses the open by name, before the guest's next line runs; ptrace runs
+/// the same program. Skipped, with the reason printed, without /dev/fuse.
+#[test]
+fn liteinst_in_guest_refuses_a_guest_that_opens_dev_fuse() {
+    if let Err(error) = fs::File::open("/dev/fuse") {
+        eprintln!("skipping: /dev/fuse cannot be opened on this host ({error})");
+        return;
+    }
+    let _guard = hermit_run_guard();
+    let output = liteinst_command("info")
+        .args(["--", "/bin/sh", "-c", ": < /dev/fuse; echo opened"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit LiteInst");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(detcore_model::HERMIT_POLICY_REFUSAL_EXIT),
+        "stdout={stdout}\nstderr={stderr}"
+    );
+    assert!(!stdout.contains("opened"), "{stdout}");
+    // Detcore names the capability; the in-guest runtime adds the backend.
+    assert!(
+        stderr.contains("refusing a guest that holds a FUSE device (/dev/fuse)"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains("this backend completes process exits asynchronously"),
+        "{stderr}"
+    );
+    assert!(
+        stderr.contains(
+            "--backend=liteinst (in-guest LiteInst) cannot run this program; run it with \
+             --backend=ptrace."
+        ),
+        "{stderr}"
+    );
+    assert_in_guest_selected(&stderr);
+}
+
+/// The other half of ruling A: a plain file on a FUSE filesystem is not
+/// refused. Its server is outside the guest set, so no exit waits for a guest.
+/// Uses the first regular file at the root of a FUSE mount this host has;
+/// skipped, with the reason printed, on a host with none.
+#[test]
+fn liteinst_in_guest_reads_a_plain_file_on_a_fuse_filesystem() {
+    let mounts = fs::read_to_string("/proc/self/mounts").expect("reading /proc/self/mounts");
+    let file = mounts
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split(' ');
+            let mount = fields.nth(1)?;
+            let kind = fields.next()?;
+            (kind.starts_with("fuse") && kind != "fusectl").then(|| PathBuf::from(mount))
+        })
+        .find_map(|mount| {
+            fs::read_dir(&mount).ok()?.flatten().find_map(|entry| {
+                let path = entry.path();
+                let metadata = fs::metadata(&path).ok()?;
+                (metadata.is_file() && metadata.len() > 0 && fs::File::open(&path).is_ok())
+                    .then_some(path)
+            })
+        });
+    let Some(file) = file else {
+        eprintln!("skipping: this host has no readable regular file at a FUSE mount's root");
+        return;
+    };
+    let mut expected = vec![0u8; 16];
+    let read = fs::File::open(&file)
+        .and_then(|mut opened| opened.read(&mut expected))
+        .expect("reading the FUSE file natively");
+    expected.truncate(read);
+    let _guard = hermit_run_guard();
+    let output = liteinst_command("info")
+        .args(["--", "/usr/bin/head", "-c", "16"])
+        .arg(&file)
+        .stdin(Stdio::null())
+        .output()
+        .expect("failed to run Hermit LiteInst");
+    let output = assert_liteinst_in_guest_output(output);
+    assert_eq!(output.stdout, expected, "{}", file.display());
 }

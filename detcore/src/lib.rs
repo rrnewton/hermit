@@ -44,6 +44,7 @@ mod dirents;
 /// Schedule-alignment and edit-distance algorithms shared by Hermit tools.
 #[allow(missing_docs)]
 pub mod edit_distance;
+pub mod exit_dependencies;
 mod fd;
 mod host_inputs;
 mod io_buffers;
@@ -3040,6 +3041,13 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // backend failure owner, not to this observer fence.
         if res.as_ref().is_err_and(crate::random::is_copy_failure) {
             return res;
+        }
+
+        // With asynchronous exit completion, a descriptor that would make this
+        // guest serve another guest's exit ends the run before anything
+        // observes the result (crate::exit_dependencies).
+        if let Ok(ret) = res {
+            self.refuse_exit_dependencies(guest, &call, ret).await;
         }
 
         detlog!(

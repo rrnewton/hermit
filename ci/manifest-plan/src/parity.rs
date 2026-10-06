@@ -5491,7 +5491,8 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 3144);
+        // c-programs/userfaultfd-self-service adds one line per backend but ptrace: 3148.
+        assert_eq!(parsed.cells.len(), 3148);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
         // took the snapshot to 1,099,771 bytes: every test lists one line per
