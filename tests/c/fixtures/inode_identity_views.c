@@ -9,6 +9,7 @@
 // Usage: inode_identity_views scm-getdents DIR
 //        inode_identity_views maps-stat [DIR]
 //        inode_identity_views proc-fd-links
+//        inode_identity_views stdio-mmap-sentinel < REGULAR-FILE
 //
 // Detcore keys its deterministic inodes on a raw device and inode together
 // (https://github.com/rrnewton/hermit/issues/3307). Every interface that
@@ -52,6 +53,17 @@
 //   that limit virtual and does not enforce it on open, so under Hermit the
 //   fill stops at the HOST limit, and the owning test lowers that before
 //   starting Hermit.
+//
+// stdio-mmap-sentinel < REGULAR-FILE
+//   Fills the bytes from 1024 to 128 below the stack pointer with a nonzero
+//   pattern, maps the first page of stdin with a raw MAP_PRIVATE mmap system
+//   call, and counts the 8-byte words of that range that no longer hold the
+//   pattern, all in one asm block so that no compiled code uses the stack in
+//   between. Linux never writes below a thread's stack pointer to serve a
+//   system call, so the count must be zero. Stdin is a descriptor the guest
+//   inherited, which Detcore identifies after the mmap by injecting an fstat;
+//   on ptrace that fstat borrows guest stack below the red zone and must put
+//   the bytes there back.
 
 #define _GNU_SOURCE
 #include <dirent.h>
@@ -648,6 +660,76 @@ static int proc_fd_links(void) {
   return 0;
 }
 
+// ---------------------------------------------------------------------------
+// stdio-mmap-sentinel
+
+#define STACK_SENTINEL 0xa5c3a5c35a3c5a3cULL
+
+// Fills [rsp-1024, rsp-128) with STACK_SENTINEL, maps the first page of fd 0
+// with a raw mmap system call, and stores in *changed_words how many 8-byte
+// words of that range no longer hold the pattern. One asm block does all of it,
+// so no compiled code can use the stack between the fill and the count; the
+// 128 bytes under the stack pointer are the red zone, which compiled code may
+// use without moving the stack pointer, and are left alone. Returns what the
+// system call returned.
+static long map_stdin_and_count_changed_stack_words(long* changed_words) {
+  register long fd __asm__("r8") = 0;
+  long result;
+  long changed;
+  __asm__ volatile(
+      "movabs %[pattern], %%rdx\n\t"
+      "lea -1024(%%rsp), %%rcx\n\t"
+      "lea -128(%%rsp), %%r11\n"
+      "1:\n\t"
+      "mov %%rdx, (%%rcx)\n\t"
+      "add $8, %%rcx\n\t"
+      "cmp %%r11, %%rcx\n\t"
+      "jb 1b\n\t"
+      "mov %[nr], %%eax\n\t"
+      "xor %%edi, %%edi\n\t"
+      "mov $4096, %%esi\n\t"
+      "mov %[prot], %%edx\n\t"
+      "mov %[flags], %%r10d\n\t"
+      "xor %%r9d, %%r9d\n\t"
+      "syscall\n\t"
+      "movabs %[pattern], %%rdx\n\t"
+      "lea -1024(%%rsp), %%rcx\n\t"
+      "lea -128(%%rsp), %%r11\n\t"
+      "xor %%esi, %%esi\n"
+      "2:\n\t"
+      "cmp %%rdx, (%%rcx)\n\t"
+      "je 3f\n\t"
+      "inc %%rsi\n"
+      "3:\n\t"
+      "add $8, %%rcx\n\t"
+      "cmp %%r11, %%rcx\n\t"
+      "jb 2b\n\t"
+      : "=&a"(result), "=&S"(changed)
+      : "r"(fd),
+        [pattern] "i"(STACK_SENTINEL),
+        [nr] "i"(SYS_mmap),
+        [prot] "i"(PROT_READ),
+        [flags] "i"(MAP_PRIVATE)
+      : "rcx", "rdx", "rdi", "r9", "r10", "r11", "memory", "cc");
+  *changed_words = changed;
+  return result;
+}
+
+static int stdio_mmap_sentinel(void) {
+  struct stat stdin_stat;
+  CHECK(fstat(0, &stdin_stat) == 0);
+  CHECK(S_ISREG(stdin_stat.st_mode) && stdin_stat.st_size >= 4096);
+  long changed = -1;
+  long mapped = map_stdin_and_count_changed_stack_words(&changed);
+  if (mapped < 0 && mapped > -4096) {
+    fprintf(stderr, "raw mmap of stdin failed: errno %ld\n", -mapped);
+    exit(1);
+  }
+  CHECK(munmap((void*)mapped, 4096) == 0);
+  printf("stdio-mmap-sentinel changed_words=%ld\n", changed);
+  return 0;
+}
+
 int main(int argc, char** argv) {
   if (argc == 3 && strcmp(argv[1], "scm-getdents") == 0) {
     return scm_getdents(argv[2]);
@@ -658,9 +740,13 @@ int main(int argc, char** argv) {
   if (argc == 2 && strcmp(argv[1], "proc-fd-links") == 0) {
     return proc_fd_links();
   }
+  if (argc == 2 && strcmp(argv[1], "stdio-mmap-sentinel") == 0) {
+    return stdio_mmap_sentinel();
+  }
   fprintf(
       stderr,
-      "usage: %s scm-getdents DIR | maps-stat [DIR] | proc-fd-links\n",
+      "usage: %s scm-getdents DIR | maps-stat [DIR] | proc-fd-links | "
+      "stdio-mmap-sentinel\n",
       argv[0]);
   return 2;
 }
