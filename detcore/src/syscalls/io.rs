@@ -27,6 +27,7 @@ use reverie::syscalls::Displayable;
 use reverie::syscalls::MemoryAccess;
 use reverie::syscalls::Syscall;
 use reverie::syscalls::SyscallInfo;
+use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use tracing::debug;
 use tracing::trace;
@@ -45,6 +46,7 @@ use crate::syscalls::helpers::RestartCall;
 use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::millis_duration_to_absolute_timeout;
 use crate::syscalls::helpers::record_retry_event;
+use crate::syscalls::helpers::refuse_held_signal_loss;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
 use crate::syscalls::signal::kernel_installed_signal_mask;
 use crate::syscalls::signal::read_kernel_sigset;
@@ -790,7 +792,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(signals) = &mut signals {
             signals.restore(guest, mask_cell).await?;
         }
-        result
+        refuse_held_signal_loss(guest, Sysno::pselect6, result).await
     }
 
     fn copy_pselect6_results<G: Guest<Self>>(
@@ -1062,7 +1064,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         if let Some(signals) = &mut signals {
             signals.restore(guest, mask_cell).await?;
         }
-        result
+        refuse_held_signal_loss(guest, Sysno::select, result).await
     }
 
     fn copy_select_results<G: Guest<Self>>(

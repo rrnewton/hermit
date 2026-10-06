@@ -88,24 +88,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         sysno: reverie::syscalls::Sysno,
         fallback: Errno,
     ) -> Result<i64, Error> {
-        if !self.cfg.panic_on_unsupported_syscalls {
-            return Err(fallback.into());
-        }
-        if guest.config().shutdown_on_unsupported_syscall {
-            // Fail-closed policy: the operation is unserviceable and the config
-            // forbids passing it through.
-            crate::tool_global::unrecoverable_shutdown(
-                guest,
-                detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
-            )
-            .await;
-        }
-        if guest.config().exit_on_unsupported_syscall {
-            return Err(Error::Tool(anyhow::Error::new(
-                crate::UnsupportedSyscallError(sysno),
-            )));
-        }
-        panic!("unserviceable operation on syscall: {sysno:?}");
+        refuse_unserviceable_operation_with(
+            guest,
+            self.cfg.panic_on_unsupported_syscalls,
+            sysno,
+            fallback,
+        )
+        .await
     }
 
     /// Record or replay a BLOCKING syscall without stalling the current thread (and thus
@@ -1768,9 +1757,11 @@ where
 /// ignored, and default-ignored signals do not end it, and neither does a default
 /// job-control stop when Linux's restart of the call keeps its deadline
 /// (`NonblockableSyscall::restart_keeps_deadline`). Such a signal that stops one
-/// of the wait's injections is absorbed, and the wait runs on; the stops that
-/// `KernelSignalWait::inject_absorbing` cannot absorb safely end the wait with a
-/// restart instead, after which the call runs again from the start.
+/// of the wait's injections is absorbed, and the wait runs on. A stop that
+/// `KernelSignalWait::inject_absorbing` cannot absorb ends the wait with a
+/// transparent restart when the backend holds nothing whose loss matters, and
+/// otherwise with a [`HeldSignalRefusal`], which `refuse_held_signal_loss`
+/// turns into the unsupported-operation refusal once the guest's mask is back.
 ///
 /// The first probe runs under the guest's own mask, and before the first check
 /// for a pending signal (`KernelSignalWait::inject_first_probe`): Linux reports a
@@ -1914,7 +1905,90 @@ where
 
     drop(guard);
     signals.restore(guest, None).await?;
-    result
+    refuse_held_signal_loss(guest, call0.number(), result).await
+}
+
+/// The policy of `Detcore::refuse_unserviceable_operation`, for a caller that
+/// holds the guest but not the tool. `panic_on_unsupported_syscalls` is the
+/// setting of that name: the tool's own copy in the method, the guest's
+/// configuration in `refuse_held_signal_loss`.
+pub(crate) async fn refuse_unserviceable_operation_with<T, G>(
+    guest: &mut G,
+    panic_on_unsupported_syscalls: bool,
+    sysno: Sysno,
+    fallback: Errno,
+) -> Result<i64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if !panic_on_unsupported_syscalls {
+        return Err(fallback.into());
+    }
+    if guest.config().shutdown_on_unsupported_syscall {
+        // Fail-closed policy: the operation is unserviceable and the config
+        // forbids passing it through.
+        crate::tool_global::unrecoverable_shutdown(
+            guest,
+            detcore_model::HERMIT_POLICY_REFUSAL_EXIT,
+        )
+        .await;
+    }
+    if guest.config().exit_on_unsupported_syscall {
+        return Err(Error::Tool(anyhow::Error::new(
+            crate::UnsupportedSyscallError(sysno),
+        )));
+    }
+    panic!("unserviceable operation on syscall: {sysno:?}");
+}
+
+/// Refuse the guest's `sysno` call when its wait ended with a
+/// [`HeldSignalRefusal`], through the unsupported-operation policy
+/// (`refuse_unserviceable_operation_with`): a fail-closed run, which ordinary
+/// `hermit run` is, ends with the policy's exit, and a run started with
+/// `--allow-unsupported-syscalls` gets `ERESTARTNOINTR`, the transparent
+/// restart that such a wait returned before (round-10 High 1 on
+/// https://github.com/rrnewton/hermit/pull/3361). The message names the call,
+/// the signals and that pull request. Callers pass the wait's result after the
+/// wait has put the guest's mask back. Every other result passes through.
+///
+/// Whether a wait meets such a stop can depend on host timing, as a signal
+/// sent from outside the guest does, so a refusal can be host-timed: it
+/// replaces a run that would have gone on to depend on that timing.
+pub(crate) async fn refuse_held_signal_loss<T, G>(
+    guest: &mut G,
+    sysno: Sysno,
+    result: Result<i64, Error>,
+) -> Result<i64, Error>
+where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    use std::io::Write as _;
+    let refusal = match &result {
+        Err(Error::Tool(error)) => match error.downcast_ref::<HeldSignalRefusal>() {
+            Some(refusal) => HeldSignalRefusal {
+                wait: Some(sysno),
+                ..*refusal
+            },
+            None => return result,
+        },
+        _ => return result,
+    };
+    let panic_on_unsupported_syscalls = guest.config().panic_on_unsupported_syscalls;
+    tracing::error!("[tid {}] {}", guest.tid(), refusal);
+    if panic_on_unsupported_syscalls {
+        // The run ends: report why even when logging is disabled or redirected,
+        // as the refusal of a nonleader exec does.
+        let _ = writeln!(crate::util::RetryingStderr, "{refusal}");
+    }
+    refuse_unserviceable_operation_with(
+        guest,
+        panic_on_unsupported_syscalls,
+        sysno,
+        Errno::ERESTARTNOINTR,
+    )
+    .await
 }
 
 /// Signal handling for one blocking wait whose interruption is decided from the
@@ -1946,7 +2020,9 @@ where
 /// `interrupted_with_state`, and any other unblocked one stops the next
 /// injection and is absorbed; a signal that arrives after the read can stop an
 /// injection in a way that cannot be identified, and is held without ending the
-/// wait, so the wait keeps its deadline and its checks.
+/// wait, so the wait keeps its deadline and its checks, unless the backend held
+/// a signal whose loss matters, which ends the wait with a
+/// [`HeldSignalRefusal`] (`inject_absorbing`).
 /// Afterwards only a signal that cannot be blocked can stop an injection. A stop
 /// after a probe ran replaces its result, so a probe that consumed something (an
 /// edge-triggered event, a dequeued signal) loses it; that remains a known gap.
@@ -1999,8 +2075,12 @@ pub(crate) struct KernelSignalWait {
     /// `block` could not change the mask, so probes run under the guest's own.
     unblockable: bool,
     /// The signal the backend holds since `inject_absorbing` absorbed a stop;
-    /// `None` also after a stop it could not identify.
+    /// `None` also after a stop it could not identify (`held_unidentified`).
     held: Option<HeldSignal>,
+    /// The backend holds a signal from a stop that `inject_absorbing` could not
+    /// identify, which may be one whose loss matters, so no later stop may
+    /// replace it (`would_replace_precious`).
+    held_unidentified: bool,
 }
 
 /// A signal that stopped one of a wait's injections and that the backend holds
@@ -2025,6 +2105,113 @@ enum HeldKind {
     /// defers.
     Precious,
 }
+
+/// How a wait would lose a signal that the backend holds, or deliver it in
+/// place of the result Linux gives (`HeldSignalRefusal`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum HeldSignalLoss {
+    /// Another pending signal would stop the next injection, and the backend,
+    /// which has one slot for a held signal, would drop the held one for it.
+    Replaced,
+    /// A stop that `/proc` cannot identify replaced a held signal whose loss
+    /// matters (`HeldKind::Precious`), or one that could not be identified
+    /// either and so may matter.
+    UnidentifiedStop,
+    /// The wait reached `MAX_ABSORBED_STOPS` absorbed stops while the backend
+    /// held a signal whose loss matters or that could not be identified.
+    StopBound,
+    /// A signal that a wait without a deadline consumes stopped an injection,
+    /// so the backend holds it and delivers it rather than the wait returning
+    /// it, and either it is one the wait holds until the call returns
+    /// (`held_until_return`) or it replaced a held signal whose loss matters.
+    Consumed,
+}
+
+/// A wait that ends because going on, or restarting the call, would lose a
+/// signal the backend holds, or deliver it in place of the result Linux gives.
+///
+/// Every path that used to end such a wait with a fallback that returns
+/// success (a transparent `ERESTARTNOINTR` restart, or a wait that went on and
+/// let a stop replace the held signal) returns this instead (round-10 High 1 on
+/// https://github.com/rrnewton/hermit/pull/3361). The wait puts the guest's mask
+/// back, and its caller then applies the unsupported-operation policy
+/// (`refuse_held_signal_loss`). A complete successful repair preserving signal
+/// information needs additional framework support with the current generic
+/// API: the backend holds one signal, does not say which, and delivers it
+/// without the tool. A Detcore-only refusal or capability withdrawal can
+/// prevent the determinism regression.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct HeldSignalRefusal {
+    /// The guest call whose wait ends, once the caller names it
+    /// (`refuse_held_signal_loss`).
+    pub(crate) wait: Option<Sysno>,
+    /// The signal the backend holds that would be lost or delivered wrongly;
+    /// `None` when it could not be identified.
+    pub(crate) held: Option<i32>,
+    /// The signal that would replace it, or that stopped the injection, when
+    /// known.
+    pub(crate) replacing: Option<i32>,
+    /// How it would be lost.
+    pub(crate) loss: HeldSignalLoss,
+}
+
+/// A signal's name, such as `SIGCHLD`, or its number for a real-time signal.
+fn signal_label(signal: Option<i32>) -> String {
+    match signal {
+        Some(signal) => match nix::sys::signal::Signal::try_from(signal) {
+            Ok(named) => named.as_str().to_string(),
+            Err(_) => format!("signal {signal}"),
+        },
+        None => "a signal that could not be identified".to_string(),
+    }
+}
+
+impl std::fmt::Display for HeldSignalRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let wait = self
+            .wait
+            .map_or_else(|| "a blocking".to_string(), |sysno| sysno.to_string());
+        let held = match self.held {
+            Some(_) => format!("the held signal {}", signal_label(self.held)),
+            None => "a held signal that could not be identified".to_string(),
+        };
+        let replacing = signal_label(self.replacing);
+        match self.loss {
+            HeldSignalLoss::Replaced => write!(
+                f,
+                "unsupported: the {wait} wait cannot keep {held}: the pending {replacing} \
+                 would stop the next injection and replace it"
+            )?,
+            HeldSignalLoss::UnidentifiedStop => write!(
+                f,
+                "unsupported: the {wait} wait cannot keep {held}: a signal stop that /proc \
+                 cannot identify replaced it"
+            )?,
+            HeldSignalLoss::StopBound => write!(
+                f,
+                "unsupported: the {wait} wait cannot keep {held}: the wait absorbed the \
+                 maximum number of signal stops"
+            )?,
+            HeldSignalLoss::Consumed => {
+                write!(
+                    f,
+                    "unsupported: the {wait} wait cannot return {replacing}, which it consumes: \
+                     the signal stopped an injection, so the backend would deliver it instead"
+                )?;
+                if self.held.is_some() {
+                    write!(f, ", in place of {held}")?;
+                }
+            }
+        }
+        write!(
+            f,
+            " (scope reduction of https://github.com/rrnewton/hermit/pull/3361; rerun with \
+             --allow-unsupported-syscalls to restart the call instead)"
+        )
+    }
+}
+
+impl std::error::Error for HeldSignalRefusal {}
 
 /// What a signal that stopped one of a wait's injections means for the wait.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2061,6 +2248,7 @@ impl KernelSignalWait {
             saved_mask: None,
             unblockable: false,
             held: None,
+            held_unidentified: false,
         }
     }
 
@@ -2169,10 +2357,13 @@ impl KernelSignalWait {
     /// after a stop. The stop is identified only if exactly that signal left its queue
     /// and the mask and dispositions did not change; it then decides:
     ///
-    /// - A signal the wait consumes (`consumed`) ends it with `ERESTARTNOINTR`:
-    ///   it is delivered rather than consumed, and the call runs again. In a
-    ///   wait with a deadline (`deadline`) it is classified as if the wait did
-    ///   not consume it, by the rules below.
+    /// - A signal the wait consumes (`consumed`) is delivered rather than
+    ///   consumed. In a wait without a deadline it ends the wait with
+    ///   `ERESTARTNOINTR`, and the call runs again, unless the wait holds it
+    ///   until the call returns (`held_until_return`), so that its delivery now
+    ///   could follow host timing: then the wait ends with a
+    ///   [`HeldSignalRefusal`]. In a wait with a deadline (`deadline`) it is
+    ///   classified as if the wait did not consume it, by the rules below.
     /// - A signal that would end the wait natively ends it with the restart
     ///   errno, except a signal the wait holds until the call returns
     ///   (`held_until_return`), which is held.
@@ -2185,25 +2376,47 @@ impl KernelSignalWait {
     /// A pending signal that would end the wait ends it before the injection,
     /// with the restart errno, so it is never held, except by the wait's first
     /// probe (`inject_first_probe`). A stop that cannot be identified, by a
-    /// signal that arrived after the read, never ends the wait: the backend
-    /// holds that signal in place of any held one and the injection runs again,
-    /// as the blind retry before this machinery did, so the wait keeps its
-    /// deadline and every check that ends it. Which signal it was would need the
-    /// backend to say, so nothing is recorded for it (`held` becomes `None`): a
-    /// later stop may replace it, as the blind retry allowed, and otherwise it
-    /// is delivered as the call returns.
+    /// signal that arrived after the read, does not end the wait while the
+    /// backend held nothing whose loss matters: the backend holds that signal
+    /// in place of any held one and the injection runs again, as the blind
+    /// retry before this machinery did, so the wait keeps its deadline and
+    /// every check that ends it. Which signal it was would need the backend to
+    /// say, so it is recorded only as unidentified (`held_unidentified`), and
+    /// it is delivered as the call returns.
     ///
     /// The backend has one slot for a held signal, and a stop replaces what it
-    /// holds. So while it holds a `SIGCHLD` or a deferred stop, an injection
-    /// that another pending signal would stop is not made, and the wait ends
-    /// with `ERESTARTNOINTR`; the same standard signal on the same queue is the
-    /// exception, because Linux merges the two. After `MAX_ABSORBED_STOPS`
-    /// absorbed stops the wait also ends with `ERESTARTNOINTR`. Neither applies
-    /// to a wait with a deadline, whose restart would start the guest's timeout
-    /// again: there, a held signal that would end the wait natively ends it with
-    /// the restart errno before another signal can replace it, any other held
-    /// signal may be replaced, as the blind retry allowed, and stops are
-    /// absorbed without a bound.
+    /// holds. A held signal whose loss matters (`HeldKind::Precious`), or one
+    /// that could not be identified and so may matter, is never given up for a
+    /// result that reads as success, with or without a deadline:
+    ///
+    /// - An injection that another pending signal would stop is not made. If
+    ///   the held signal would end the wait natively, the wait ends with the
+    ///   restart errno, as Linux ends it for that signal; otherwise it ends
+    ///   with a `HeldSignalRefusal`. The same standard signal on the same queue
+    ///   is the exception, because Linux merges the two.
+    /// - A stop that cannot be identified, which has already replaced such a
+    ///   signal, ends the wait with a `HeldSignalRefusal`.
+    /// - After `MAX_ABSORBED_STOPS` absorbed stops, a wait without a deadline
+    ///   ends with a `HeldSignalRefusal`, or with `ERESTARTNOINTR` when the
+    ///   backend holds nothing whose loss matters. A wait with a deadline,
+    ///   whose restart would start the guest's timeout again, absorbs stops
+    ///   without a bound.
+    ///
+    /// Each refusal is a scope reduction. It replaces a transparent
+    /// `ERESTARTNOINTR` restart, or, in a wait with a deadline, an injection
+    /// that went on and let a stop replace the held signal (round-10 High 1 on
+    /// https://github.com/rrnewton/hermit/pull/3361): the restart made the
+    /// backend deliver the held signal before the wait completed, at a moment
+    /// host timing could set. A complete successful repair preserving signal
+    /// information needs additional framework support with the current generic
+    /// API. A Detcore-only refusal or capability withdrawal can prevent the
+    /// determinism regression.
+    ///
+    /// In a first probe that two pending signals would stop in turn, the first
+    /// of which would end the wait, the wait ends with the restart errno before
+    /// the probe has run, so a source that is ready when the call begins, or an
+    /// argument error, is reported behind the signal: the order compromise that
+    /// a later turn already makes (`interrupted_with_state`).
     pub(crate) async fn inject_absorbing<T, G, S>(
         &mut self,
         guest: &mut G,
@@ -2270,7 +2483,7 @@ impl KernelSignalWait {
     /// just after a fresh read is. One that the full mask leaves unblocked
     /// (`SIGKILL`, `SIGSTOP`, glibc's two reserved signals, `PERF_EVENT_SIGNAL`)
     /// and that stops the injection is not named by `state`, so the stop is not
-    /// identified and is held, as a stop by a signal that arrives just after a
+    /// identified and is handled as a stop by a signal that arrives just after a
     /// fresh read is. `interrupted_with_state` found
     /// no signal in `state` that ends the wait, so the check before the injection
     /// does not end it either.
@@ -2328,15 +2541,6 @@ impl KernelSignalWait {
             if let Some((signal, queue)) = next
                 && self.would_replace_precious(signal, queue)
             {
-                if !self.deadline {
-                    tracing::trace!(
-                        "[tid {}] signal {} would replace the held signal {:?}; the wait ends",
-                        self.tid,
-                        signal,
-                        self.held
-                    );
-                    return Err(Errno::ERESTARTNOINTR.into());
-                }
                 if let Some(held) = self.held
                     && self.held_ends_wait(&before, held.signal)
                 {
@@ -2348,12 +2552,16 @@ impl KernelSignalWait {
                     );
                     return Err(held_signal_restart_errno(self.restart_errno, held.signal).into());
                 }
+                // Round-10 High 1 on https://github.com/rrnewton/hermit/pull/3361:
+                // this used to end a wait without a deadline with ERESTARTNOINTR,
+                // and let a wait with one go on and lose the held signal.
                 tracing::trace!(
-                    "[tid {}] signal {} may replace the held signal {:?}; the wait keeps its deadline",
+                    "[tid {}] signal {} would replace the held signal {:?}; the wait is refused",
                     self.tid,
                     signal,
                     self.held
                 );
+                return Err(self.refusal(Some(signal), HeldSignalLoss::Replaced));
             }
             let result = guest.inject(call).await;
             let Err(errno) = result else {
@@ -2368,14 +2576,28 @@ impl KernelSignalWait {
             let Some((signal, queue)) = identified else {
                 // A signal that `before` did not show stopped the injection. The
                 // backend holds it in place of any held one and delivers it when
-                // the guest resumes, but `/proc` cannot name it. The wait goes on
-                // and the injection runs again, as the blind retry before this
-                // machinery did, so the wait keeps its deadline; the signals that
-                // `/proc` still shows are classified as before, and every check
-                // that ends the wait still runs at the read before the injection
-                // and at each turn's `interrupted_with_state`.
+                // the guest resumes, but `/proc` cannot name it. If the backend
+                // held a signal whose loss matters, or one it could not identify
+                // either, that signal is gone, and the wait is refused. Otherwise
+                // the wait goes on and the injection runs again, as the blind
+                // retry before this machinery did, so the wait keeps its
+                // deadline; the signals that `/proc` still shows are classified
+                // as before, and every check that ends the wait still runs at
+                // the read before the injection and at each turn's
+                // `interrupted_with_state`.
+                if self.holds_precious() {
+                    tracing::trace!(
+                        "[tid {}] a signal stop that cannot be identified replaced the held signal {:?}; the wait is refused",
+                        self.tid,
+                        self.held
+                    );
+                    return Err(self.refusal(None, HeldSignalLoss::UnidentifiedStop));
+                }
                 if !self.deadline && absorbed >= MAX_ABSORBED_STOPS {
-                    return Err(Errno::ERESTARTNOINTR.into());
+                    // The backend now holds the unidentified signal.
+                    self.held = None;
+                    self.held_unidentified = true;
+                    return Err(self.refusal(None, HeldSignalLoss::StopBound));
                 }
                 absorbed += 1;
                 tracing::trace!(
@@ -2383,6 +2605,7 @@ impl KernelSignalWait {
                     self.tid
                 );
                 self.held = None;
+                self.held_unidentified = true;
                 continue;
             };
             let bit = kernel_sigset_bit(signal);
@@ -2399,22 +2622,45 @@ impl KernelSignalWait {
                 verdict => verdict,
             };
             match verdict {
-                StopVerdict::Absorb(kind) if self.deadline || absorbed < MAX_ABSORBED_STOPS => {
-                    absorbed += 1;
+                StopVerdict::Absorb(kind) => {
                     let kind = self.held.map_or(kind, |held| held.kind.max(kind));
+                    let unidentified = self.held_unidentified;
+                    self.held = Some(HeldSignal {
+                        signal,
+                        queue,
+                        kind,
+                    });
+                    self.held_unidentified = false;
+                    if !self.deadline && absorbed >= MAX_ABSORBED_STOPS {
+                        if kind == HeldKind::Precious || unidentified {
+                            return Err(self.refusal(None, HeldSignalLoss::StopBound));
+                        }
+                        return Err(Errno::ERESTARTNOINTR.into());
+                    }
+                    absorbed += 1;
                     tracing::trace!(
                         "[tid {}] signal {} stopped an injection and is held ({:?})",
                         self.tid,
                         signal,
                         kind
                     );
-                    self.held = Some(HeldSignal {
-                        signal,
-                        queue,
-                        kind,
-                    });
                 }
-                StopVerdict::Absorb(_) => return Err(Errno::ERESTARTNOINTR.into()),
+                // A signal that a wait without a deadline consumes, delivered
+                // rather than returned: refused when the wait holds it until the
+                // call returns, or when it replaced a held signal whose loss
+                // matters, and otherwise ended with ERESTARTNOINTR (stop_verdict).
+                StopVerdict::End(_)
+                    if !self.deadline
+                        && self.consumed & bit != 0
+                        && (self.held_until_return & bit != 0 || self.holds_precious()) =>
+                {
+                    tracing::trace!(
+                        "[tid {}] consumed signal {} stopped an injection; the wait is refused",
+                        self.tid,
+                        signal
+                    );
+                    return Err(self.refusal(Some(signal), HeldSignalLoss::Consumed));
+                }
                 // The backend holds `signal`, which stopped the injection.
                 StopVerdict::End(errno) => {
                     return Err(held_signal_restart_errno(errno, signal).into());
@@ -2466,13 +2712,36 @@ impl KernelSignalWait {
 
     /// Whether an injection that `signal`, pending on `queue`, stops would make
     /// the backend drop a held signal whose delivery matters
-    /// (`HeldKind::Precious`). Linux merges a standard signal into the same one
+    /// (`HeldKind::Precious`), or one it could not identify, which may matter
+    /// (`held_unidentified`). Linux merges a standard signal into the same one
     /// pending on the same queue, so that one replaces nothing.
     fn would_replace_precious(&self, signal: i32, queue: SignalQueue) -> bool {
-        self.held.is_some_and(|held| {
-            held.kind == HeldKind::Precious
-                && !(signal == held.signal && queue == held.queue && signal < KERNEL_SIGRTMIN)
-        })
+        self.held_unidentified
+            || self.held.is_some_and(|held| {
+                held.kind == HeldKind::Precious
+                    && !(signal == held.signal && queue == held.queue && signal < KERNEL_SIGRTMIN)
+            })
+    }
+
+    /// Whether the backend holds a signal whose loss matters
+    /// (`HeldKind::Precious`), or one it could not identify, which may matter.
+    fn holds_precious(&self) -> bool {
+        self.held_unidentified
+            || self
+                .held
+                .is_some_and(|held| held.kind == HeldKind::Precious)
+    }
+
+    /// The `HeldSignalRefusal` that ends the wait, naming the signal the backend
+    /// holds, if known, and `replacing`, the one that would replace it or that
+    /// stopped the injection.
+    fn refusal(&self, replacing: Option<i32>, loss: HeldSignalLoss) -> Error {
+        Error::Tool(anyhow::Error::new(HeldSignalRefusal {
+            wait: None,
+            held: self.held.map(|held| held.signal),
+            replacing,
+            loss,
+        }))
     }
 
     /// Whether a held `signal` would end the wait natively, given the kernel's
@@ -3070,6 +3339,13 @@ mod kernel_signal_wait_failures {
         outcomes: VecDeque<MaskOutcome>,
         /// Every mask the guest was asked to set, in order.
         requested: Vec<KernelSigset>,
+        /// How many more signals that stop an injection are sent again, as by
+        /// a sender faster than the injections: each such signal is pending
+        /// again from the read after the one that follows the stop, which still
+        /// shows it gone, so the stop is identified (`pending_repost`).
+        repost_after_take: usize,
+        /// The signals sent again, which the read after the next one shows.
+        pending_repost: KernelSigset,
     }
 
     type Kernel = Arc<Mutex<FakeKernel>>;
@@ -3163,7 +3439,7 @@ mod kernel_signal_wait_failures {
         let kernel = kernel.clone();
         signal_state_read_seam::install(move |_, _| {
             let mut kernel = kernel.lock().unwrap();
-            Some(match kernel.read_failures.pop_front() {
+            let read = match kernel.read_failures.pop_front() {
                 Some(errno) => Err(errno),
                 None => Ok(KernelSignalState {
                     pending: kernel.pending,
@@ -3173,7 +3449,9 @@ mod kernel_signal_wait_failures {
                     ignored: kernel.ignored,
                     ..KernelSignalState::default()
                 }),
-            })
+            };
+            kernel.pending |= std::mem::take(&mut kernel.pending_repost);
+            Some(read)
         })
     }
 
@@ -3241,6 +3519,10 @@ mod kernel_signal_wait_failures {
                 let signal = deliverable.trailing_zeros() as i32 + 1;
                 kernel.pending &= !kernel_sigset_bit(signal);
                 kernel.taken.push(signal);
+                if kernel.repost_after_take > 0 {
+                    kernel.repost_after_take -= 1;
+                    kernel.pending_repost |= kernel_sigset_bit(signal);
+                }
                 return Err(Errno::ERESTARTSYS);
             }
             match kernel.outcomes.pop_front().unwrap_or(MaskOutcome::Apply) {
@@ -3278,6 +3560,16 @@ mod kernel_signal_wait_failures {
                 .downcast_ref::<BlockedWaitSignalError>()
                 .unwrap_or_else(|| panic!("not a blocked-wait diagnostic: {error:#}")),
             other => panic!("expected the run to end with a diagnostic, got {other:?}"),
+        }
+    }
+
+    /// The held-signal refusal a result ends the wait with.
+    fn refusal<V: std::fmt::Debug>(result: Result<V, Error>) -> HeldSignalRefusal {
+        match result {
+            Err(Error::Tool(error)) => *error
+                .downcast_ref::<HeldSignalRefusal>()
+                .unwrap_or_else(|| panic!("not a held-signal refusal: {error:#}")),
+            other => panic!("expected the wait to end with a held-signal refusal, got {other:?}"),
         }
     }
 
@@ -3565,8 +3857,10 @@ mod kernel_signal_wait_failures {
 
     /// The backend holds one signal. Once it holds one whose loss would matter,
     /// a `SIGCHLD` here, an injection that a different pending signal would stop
-    /// is not made and the wait ends with `ERESTARTNOINTR`, so the held signal
-    /// is delivered rather than replaced.
+    /// is not made. The wait used to end with `ERESTARTNOINTR`, a transparent
+    /// restart; it now ends with a `HeldSignalRefusal`, which its caller turns
+    /// into the unsupported-operation refusal (round-10 High 1 on
+    /// https://github.com/rrnewton/hermit/pull/3361).
     #[tokio::test]
     async fn a_held_sigchld_is_never_replaced_by_another_stop() {
         let (mut guest, kernel) = stopping_guest(
@@ -3578,9 +3872,14 @@ mod kernel_signal_wait_failures {
 
         let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
 
-        assert!(
-            matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))),
-            "{result:?}"
+        assert_eq!(
+            refusal(result),
+            HeldSignalRefusal {
+                wait: None,
+                held: Some(libc::SIGCHLD),
+                replacing: Some(libc::SIGWINCH),
+                loss: HeldSignalLoss::Replaced,
+            }
         );
         let kernel = kernel.lock().unwrap();
         assert_eq!(kernel.taken, vec![libc::SIGCHLD]);
@@ -3636,22 +3935,28 @@ mod kernel_signal_wait_failures {
     }
 
     /// A wait with a deadline absorbs stops without the bound that ends any
-    /// other wait with `ERESTARTNOINTR` after `MAX_ABSORBED_STOPS`, because that
-    /// restart would start its timeout again (round-8 High 1 on
-    /// https://github.com/rrnewton/hermit/pull/3361); a wait without one still
-    /// ends at the bound.
+    /// other wait after `MAX_ABSORBED_STOPS`, because a restart would start its
+    /// timeout again (round-8 High 1 on
+    /// https://github.com/rrnewton/hermit/pull/3361). A wait without one still
+    /// ends at the bound, and, while the backend holds only a signal whose loss
+    /// does not matter (an ignored `SIGUSR1` sent again and again here), with
+    /// `ERESTARTNOINTR`: it is not refused.
     #[tokio::test]
     async fn only_a_wait_without_a_deadline_ends_after_the_absorbed_stop_bound() {
         let stops = 100;
-        let (mut guest, kernel) = unidentified_stops_guest(stops);
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let (mut guest, kernel) = stopping_guest(usr1, usr1);
+        kernel.lock().unwrap().repost_after_take = stops - 1;
         let _proc = scripted_proc(&kernel);
         let mut wait =
             KernelSignalWait::new(&guest, 0, true, Errno::ERESTARTNOHAND).with_deadline(true);
         let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
         assert!(matches!(result, Ok(Ok(0))), "{result:?}");
         assert_eq!(kernel.lock().unwrap().requested.len(), stops + 1);
+        assert_eq!(wait.held.map(|held| held.kind), Some(HeldKind::Harmless));
 
-        let (mut guest, kernel) = unidentified_stops_guest(stops);
+        let (mut guest, kernel) = stopping_guest(usr1, usr1);
+        kernel.lock().unwrap().repost_after_take = stops - 1;
         let _proc = scripted_proc(&kernel);
         let mut wait = KernelSignalWait::new(&guest, 0, true, Errno::ERESTARTNOHAND);
         let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
@@ -3662,15 +3967,104 @@ mod kernel_signal_wait_failures {
         assert_eq!(kernel.lock().unwrap().requested.len(), 65);
     }
 
-    /// In a wait with a deadline, a held `SIGCHLD` that would not end the wait
-    /// does not end it with `ERESTARTNOINTR` when another pending signal would
-    /// stop the next injection, as `a_held_sigchld_is_never_replaced_by_another_stop`
-    /// shows for a wait without one: the restart would start the timeout again.
-    /// The injection is made and may replace the held signal, as the blind
-    /// retry allowed (round-8 High 1 on
+    /// At the same bound, a wait without a deadline whose backend holds a
+    /// signal whose loss matters (a default `SIGCHLD`, sent again and again)
+    /// used to end with `ERESTARTNOINTR` too. It now ends with a
+    /// `HeldSignalRefusal` (round-10 High 1 on
     /// https://github.com/rrnewton/hermit/pull/3361).
     #[tokio::test]
-    async fn a_timed_wait_keeps_its_deadline_past_a_held_sigchld() {
+    async fn a_wait_that_reaches_the_stop_bound_holding_a_sigchld_is_refused() {
+        let (mut guest, kernel) = stopping_guest(kernel_sigset_bit(libc::SIGCHLD), 0);
+        kernel.lock().unwrap().repost_after_take = 100;
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
+
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+        assert_eq!(
+            refusal(result),
+            HeldSignalRefusal {
+                wait: None,
+                held: Some(libc::SIGCHLD),
+                replacing: None,
+                loss: HeldSignalLoss::StopBound,
+            }
+        );
+        assert_eq!(kernel.lock().unwrap().requested.len(), 65);
+    }
+
+    /// A stop that cannot be identified while the backend holds a `SIGCHLD`
+    /// replaced the `SIGCHLD` in the backend's one slot. The wait used to go on
+    /// and lose it; it now ends with a `HeldSignalRefusal`, with or without a
+    /// deadline (round-10 High 1 on https://github.com/rrnewton/hermit/pull/3361).
+    #[tokio::test]
+    async fn an_unidentified_stop_over_a_held_sigchld_is_refused() {
+        for deadline in [true, false] {
+            let (mut guest, kernel) = stopping_guest(kernel_sigset_bit(libc::SIGCHLD), 0);
+            kernel.lock().unwrap().outcomes = VecDeque::from([MaskOutcome::StoppedBefore]);
+            let _proc = scripted_proc(&kernel);
+            let mut wait =
+                KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS).with_deadline(deadline);
+
+            let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+            assert_eq!(
+                refusal(result),
+                HeldSignalRefusal {
+                    wait: None,
+                    held: Some(libc::SIGCHLD),
+                    replacing: None,
+                    loss: HeldSignalLoss::UnidentifiedStop,
+                },
+                "deadline={deadline}"
+            );
+            let kernel = kernel.lock().unwrap();
+            assert_eq!(kernel.requested.len(), 2, "deadline={deadline}");
+            assert_eq!(kernel.taken, vec![libc::SIGCHLD], "deadline={deadline}");
+        }
+    }
+
+    /// A second stop that cannot be identified replaced a first one, which may
+    /// have been a signal whose loss matters. The wait used to go on; it now
+    /// ends with a `HeldSignalRefusal`, with or without a deadline (round-10
+    /// High 1 on https://github.com/rrnewton/hermit/pull/3361).
+    #[tokio::test]
+    async fn a_second_unidentified_stop_is_refused() {
+        for deadline in [true, false] {
+            let (mut guest, kernel) = unidentified_stops_guest(2);
+            let _proc = scripted_proc(&kernel);
+            let mut wait = KernelSignalWait::new(&guest, 0, true, Errno::ERESTARTNOHAND)
+                .with_deadline(deadline);
+
+            let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+            assert_eq!(
+                refusal(result),
+                HeldSignalRefusal {
+                    wait: None,
+                    held: None,
+                    replacing: None,
+                    loss: HeldSignalLoss::UnidentifiedStop,
+                },
+                "deadline={deadline}"
+            );
+            assert_eq!(
+                kernel.lock().unwrap().requested.len(),
+                2,
+                "deadline={deadline}"
+            );
+        }
+    }
+
+    /// In a wait with a deadline, a held `SIGCHLD` that would not end the wait
+    /// is not dropped when another pending signal would stop the next
+    /// injection. The injection used to be made, and the stop replaced the held
+    /// signal, as the blind retry allowed (round-8 High 1 on
+    /// https://github.com/rrnewton/hermit/pull/3361); a restart would start the
+    /// timeout again. The wait now ends with a `HeldSignalRefusal` before the
+    /// injection (round-10 High 1 on the same pull request).
+    #[tokio::test]
+    async fn a_timed_wait_refuses_to_let_another_stop_replace_a_held_sigchld() {
         let (mut guest, kernel) = stopping_guest(
             kernel_sigset_bit(libc::SIGCHLD) | kernel_sigset_bit(libc::SIGWINCH),
             0,
@@ -3681,11 +4075,23 @@ mod kernel_signal_wait_failures {
 
         let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
 
-        assert!(matches!(result, Ok(Ok(0))), "{result:?}");
+        assert_eq!(
+            refusal(result),
+            HeldSignalRefusal {
+                wait: None,
+                held: Some(libc::SIGCHLD),
+                replacing: Some(libc::SIGWINCH),
+                loss: HeldSignalLoss::Replaced,
+            }
+        );
         let kernel = kernel.lock().unwrap();
-        assert_eq!(kernel.taken, vec![libc::SIGCHLD, libc::SIGWINCH]);
-        assert_eq!(kernel.requested.len(), 3);
-        assert_eq!(kernel.pending, 0);
+        assert_eq!(kernel.taken, vec![libc::SIGCHLD]);
+        assert_eq!(
+            kernel.requested.len(),
+            1,
+            "the second injection is not made"
+        );
+        assert_eq!(kernel.pending, kernel_sigset_bit(libc::SIGWINCH));
     }
 
     /// In a wait with a deadline, a held signal that would end the wait natively
@@ -3716,6 +4122,158 @@ mod kernel_signal_wait_failures {
             kernel.lock().unwrap().requested.is_empty(),
             "nothing is injected"
         );
+    }
+
+    /// In a wait without a deadline, a held signal that would end the wait
+    /// natively also ends it with the restart errno before another stop can
+    /// replace it, as Linux ends the wait for that signal. It used to end with
+    /// `ERESTARTNOINTR`, which restarted the call after the handler ran
+    /// (round-10 High 1 on https://github.com/rrnewton/hermit/pull/3361).
+    #[tokio::test]
+    async fn a_wait_without_a_deadline_ends_for_a_held_signal_that_would_end_it() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let (mut guest, kernel) = stopping_guest(kernel_sigset_bit(libc::SIGWINCH), 0);
+        kernel.lock().unwrap().caught = usr1;
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
+        wait.held = Some(HeldSignal {
+            signal: libc::SIGUSR1,
+            queue: SignalQueue::Thread,
+            kind: HeldKind::Precious,
+        });
+
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTSYS))),
+            "{result:?}"
+        );
+        assert!(
+            kernel.lock().unwrap().requested.is_empty(),
+            "nothing is injected"
+        );
+    }
+
+    /// A signal that a wait without a deadline consumes and that stops an
+    /// injection is delivered rather than returned. One whose loss does not
+    /// matter still ends the wait with `ERESTARTNOINTR`, and is not refused;
+    /// a `SIGCHLD`, which the wait holds until the call returns, used to end it
+    /// the same way and now ends it with a `HeldSignalRefusal` (round-10 High 1
+    /// on https://github.com/rrnewton/hermit/pull/3361).
+    #[tokio::test]
+    async fn a_consumed_sigchld_that_stops_an_injection_is_refused() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let (mut guest, kernel) = stopping_guest(usr1, 0);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, usr1, false, Errno::ERESTARTSYS);
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))),
+            "{result:?}"
+        );
+        assert_eq!(kernel.lock().unwrap().taken, vec![libc::SIGUSR1]);
+        drop(_proc);
+
+        let chld = kernel_sigset_bit(libc::SIGCHLD);
+        let (mut guest, kernel) = stopping_guest(chld, 0);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, chld, false, Errno::ERESTARTSYS);
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+        assert_eq!(
+            refusal(result),
+            HeldSignalRefusal {
+                wait: None,
+                held: None,
+                replacing: Some(libc::SIGCHLD),
+                loss: HeldSignalLoss::Consumed,
+            }
+        );
+        assert_eq!(kernel.lock().unwrap().taken, vec![libc::SIGCHLD]);
+    }
+
+    /// A stop by a signal outside every class above, such as the backend's own
+    /// preemption signal, still ends a wait without a deadline with
+    /// `ERESTARTNOINTR`: the backend holds nothing whose loss matters, so it is
+    /// not refused.
+    #[tokio::test]
+    async fn a_stop_by_the_preemption_signal_still_restarts_a_wait_without_a_deadline() {
+        let signal = reverie::PERF_EVENT_SIGNAL as i32;
+        let (mut guest, kernel) = stopping_guest(kernel_sigset_bit(signal), 0);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTSYS);
+
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))),
+            "{result:?}"
+        );
+        assert_eq!(kernel.lock().unwrap().taken, vec![signal]);
+    }
+
+    /// A wait that ends with a `HeldSignalRefusal` is refused through the
+    /// unsupported-operation policy that `refuse_unserviceable_operation`
+    /// applies: a run that is not fail-closed gets the `ERESTARTNOINTR` restart
+    /// it got before, and a fail-closed one with `exit_on_unsupported_syscall`
+    /// ends with the typed `UnsupportedSyscallError` for the wait's call. Every
+    /// other result passes through, and the message names the wait, the
+    /// signals and the pull request.
+    #[tokio::test]
+    async fn a_held_signal_refusal_follows_the_unsupported_operation_policy() {
+        let refused = || {
+            Err::<i64, Error>(Error::Tool(anyhow::Error::new(HeldSignalRefusal {
+                wait: None,
+                held: Some(libc::SIGCHLD),
+                replacing: Some(libc::SIGWINCH),
+                loss: HeldSignalLoss::Replaced,
+            })))
+        };
+        let (mut guest, _kernel) = WaitGuest::live(guest_mask());
+        guest.config.panic_on_unsupported_syscalls = false;
+        let result = refuse_held_signal_loss(&mut guest, Sysno::poll, refused()).await;
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))),
+            "{result:?}"
+        );
+        let result = refuse_held_signal_loss(&mut guest, Sysno::poll, Ok(3)).await;
+        assert!(matches!(result, Ok(3)), "{result:?}");
+        let result =
+            refuse_held_signal_loss(&mut guest, Sysno::poll, Err(Errno::ERESTARTSYS.into())).await;
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTSYS))),
+            "{result:?}"
+        );
+
+        guest.config.panic_on_unsupported_syscalls = true;
+        guest.config.exit_on_unsupported_syscall = true;
+        guest.config.shutdown_on_unsupported_syscall = false;
+        let result = refuse_held_signal_loss(&mut guest, Sysno::poll, refused()).await;
+        match result {
+            Err(Error::Tool(error)) => assert!(
+                matches!(
+                    error.downcast_ref::<crate::UnsupportedSyscallError>(),
+                    Some(crate::UnsupportedSyscallError(Sysno::poll))
+                ),
+                "{error:#}"
+            ),
+            other => panic!("expected the typed refusal, got {other:?}"),
+        }
+
+        let message = HeldSignalRefusal {
+            wait: Some(Sysno::poll),
+            held: Some(libc::SIGCHLD),
+            replacing: Some(libc::SIGWINCH),
+            loss: HeldSignalLoss::Replaced,
+        }
+        .to_string();
+        for part in [
+            "poll",
+            "SIGCHLD",
+            "SIGWINCH",
+            "https://github.com/rrnewton/hermit/pull/3361",
+        ] {
+            assert!(message.contains(part), "{part} missing from: {message}");
+        }
     }
 
     /// A guest with a caught `SIGCHLD` pending, outside its mask. With
