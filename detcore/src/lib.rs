@@ -3056,16 +3056,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             self.refuse_exit_dependencies(guest, &call, ret).await;
         }
 
-        // A backend that can finish a syscall without the kernel's syscall-return
-        // path cannot let a kernel restart errno through: the kernel would not see
-        // it to turn it into `EINTR` or a restart, and the guest would read it as
-        // the result (https://github.com/rrnewton/hermit/issues/3146).
-        let res = if self.cfg.backend_may_skip_kernel_syscall_restart {
-            crate::syscalls::complete_skipped_syscall_restart(guest, &call, res).await
-        } else {
-            res
-        };
-
         detlog!(
             event = crate::detlog::DetLogEvent::SyscallResult {
                 finished_syscall_number: new_count,
