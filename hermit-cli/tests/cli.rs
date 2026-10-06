@@ -1359,6 +1359,243 @@ fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
                     k: 0x7fff_0000, // SECCOMP_RET_ALLOW
                 },
             ];
+            set_seccomp_filter(&mut filter)
+        });
+    }
+}
+
+/// Deny `ioctl(fd, TCGETS)`, the terminal query behind glibc's `isatty`, with
+/// `errno` in hermit and everything it starts, and leave every other ioctl
+/// alone. A terminal then looks to `isatty` like something that is not a
+/// terminal. With `EPERM` the error still differs from the `ENOTTY` that a
+/// descriptor which really is not a terminal answers; with `ENOTTY` nothing
+/// does.
+fn deny_terminal_query(command: &mut Command, errno: i32) {
+    // SAFETY: The callback makes only async-signal-safe syscalls before exec.
+    unsafe {
+        command.pre_exec(move || {
+            let mut filter = [
+                libc::sock_filter {
+                    code: 0x20, // BPF_LD | BPF_W | BPF_ABS
+                    jt: 0,
+                    jf: 0,
+                    k: 0, // offsetof(seccomp_data, nr)
+                },
+                libc::sock_filter {
+                    code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
+                    jt: 0,
+                    jf: 3, // not ioctl: allow
+                    k: libc::SYS_ioctl as u32,
+                },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    // offsetof(seccomp_data, args[1]): the low 32 bits of the
+                    // request on a little-endian host.
+                    k: 24,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1, // another request: allow
+                    k: libc::TCGETS as u32,
+                },
+                libc::sock_filter {
+                    code: 0x06, // BPF_RET | BPF_K
+                    jt: 0,
+                    jf: 0,
+                    k: 0x0005_0000 | errno as u32, // SECCOMP_RET_ERRNO
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: 0x7fff_0000, // SECCOMP_RET_ALLOW
+                },
+            ];
+            set_seccomp_filter(&mut filter)
+        });
+    }
+}
+
+/// Answer every question that tells what kind of file stderr is with
+/// `errno`, in hermit and everything it starts: `statx`, `newfstatat` and
+/// `fstat` with descriptor 2, `getsockopt` on descriptor 2, and
+/// `fcntl(2, F_GETPIPE_SZ)`. Every other call is left alone, those on other
+/// descriptors and other `fcntl` commands included. With `errno` 0 each of
+/// those calls returns 0 and fills in nothing: it feigns success. With
+/// `errno` `EINTR` each of them is interrupted, every time it is retried.
+fn deny_file_type_queries_on_stderr(command: &mut Command, errno: i32) {
+    // SAFETY: The callback makes only async-signal-safe syscalls before exec.
+    unsafe {
+        command.pre_exec(move || {
+            let mut filter = [
+                libc::sock_filter {
+                    code: 0x20, // BPF_LD | BPF_W | BPF_ABS
+                    jt: 0,
+                    jf: 0,
+                    k: 0, // offsetof(seccomp_data, nr)
+                },
+                libc::sock_filter {
+                    code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
+                    jt: 6,      // to the descriptor check
+                    jf: 0,
+                    k: libc::SYS_statx as u32,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 5,
+                    jf: 0,
+                    k: libc::SYS_newfstatat as u32,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 4,
+                    jf: 0,
+                    k: libc::SYS_fstat as u32,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 3,
+                    jf: 0,
+                    k: libc::SYS_getsockopt as u32,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 5, // another call: allow
+                    k: libc::SYS_fcntl as u32,
+                },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    // offsetof(seccomp_data, args[1]): the low 32 bits of the
+                    // fcntl command on a little-endian host.
+                    k: 24,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 3, // another fcntl command: allow
+                    k: libc::F_GETPIPE_SZ as u32,
+                },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    // offsetof(seccomp_data, args[0]): the low 32 bits of the
+                    // descriptor on a little-endian host.
+                    k: 16,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1, // another descriptor: allow
+                    k: 2,
+                },
+                libc::sock_filter {
+                    code: 0x06, // BPF_RET | BPF_K
+                    jt: 0,
+                    jf: 0,
+                    k: 0x0005_0000 | errno as u32, // SECCOMP_RET_ERRNO
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: 0x7fff_0000, // SECCOMP_RET_ALLOW
+                },
+            ];
+            set_seccomp_filter(&mut filter)
+        });
+    }
+}
+
+/// Deny `statx` on descriptor 2 with `EPERM`, and make `fstat` and
+/// `newfstatat` on descriptor 2 wait forever, in hermit and everything it
+/// starts; leave every other call alone. The two wait on a seccomp user
+/// notification that nothing answers, which stands in for a FUSE server that
+/// has stopped answering, behind a FIFO on stderr whose cached attributes
+/// have expired: `fstat` asks the server, `statx(AT_STATX_DONT_SYNC)` would
+/// not. The notification listener is left open without `FD_CLOEXEC`, so
+/// hermit inherits it and holds it for as long as it runs; with no listener
+/// left, the calls would fail with `ENOSYS` instead of waiting.
+fn deny_statx_and_hold_the_stat_of_stderr(command: &mut Command) {
+    // SAFETY: The callback makes only async-signal-safe syscalls before exec.
+    unsafe {
+        command.pre_exec(|| {
+            let mut filter = [
+                libc::sock_filter {
+                    code: 0x20, // BPF_LD | BPF_W | BPF_ABS
+                    jt: 0,
+                    jf: 0,
+                    k: 0, // offsetof(seccomp_data, nr)
+                },
+                libc::sock_filter {
+                    code: 0x15, // BPF_JMP | BPF_JEQ | BPF_K
+                    jt: 2,      // to statx's descriptor check
+                    jf: 0,
+                    k: libc::SYS_statx as u32,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 4, // to the stat calls' descriptor check
+                    jf: 0,
+                    k: libc::SYS_newfstatat as u32,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 3,
+                    jf: 6, // another call: allow
+                    k: libc::SYS_fstat as u32,
+                },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    // offsetof(seccomp_data, args[0]): the low 32 bits of the
+                    // descriptor on a little-endian host.
+                    k: 16,
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 4, // another descriptor: allow
+                    k: 2,
+                },
+                libc::sock_filter {
+                    code: 0x06, // BPF_RET | BPF_K
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_ERRNO | libc::EPERM as u32,
+                },
+                libc::sock_filter {
+                    code: 0x20,
+                    jt: 0,
+                    jf: 0,
+                    k: 16, // offsetof(seccomp_data, args[0])
+                },
+                libc::sock_filter {
+                    code: 0x15,
+                    jt: 0,
+                    jf: 1, // another descriptor: allow
+                    k: 2,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_USER_NOTIF,
+                },
+                libc::sock_filter {
+                    code: 0x06,
+                    jt: 0,
+                    jf: 0,
+                    k: libc::SECCOMP_RET_ALLOW,
+                },
+            ];
             let program = libc::sock_fprog {
                 len: filter.len() as u16,
                 filter: filter.as_mut_ptr(),
@@ -1366,17 +1603,46 @@ fn deny_syscall(command: &mut Command, syscall: libc::c_long) {
             if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
-            if libc::prctl(
-                libc::PR_SET_SECCOMP,
-                libc::SECCOMP_MODE_FILTER,
+            let listener = libc::syscall(
+                libc::SYS_seccomp,
+                libc::SECCOMP_SET_MODE_FILTER,
+                libc::SECCOMP_FILTER_FLAG_NEW_LISTENER,
                 &program as *const libc::sock_fprog,
-            ) == -1
-            {
+            );
+            if listener < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::fcntl(listener as libc::c_int, libc::F_SETFD, 0) == -1 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
         });
     }
+}
+
+/// Install `filter` as a seccomp filter on the calling thread, after
+/// `PR_SET_NO_NEW_PRIVS`. Only two `prctl` calls, so a `pre_exec` callback may
+/// use it.
+fn set_seccomp_filter(filter: &mut [libc::sock_filter]) -> std::io::Result<()> {
+    let program = libc::sock_fprog {
+        len: filter.len() as u16,
+        filter: filter.as_mut_ptr(),
+    };
+    // SAFETY: `program` points at `filter`, which outlives both calls.
+    unsafe {
+        if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::prctl(
+            libc::PR_SET_SECCOMP,
+            libc::SECCOMP_MODE_FILTER,
+            &program as *const libc::sock_fprog,
+        ) == -1
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 fn readonly_proc_command(args: &[&str]) -> Command {
@@ -6407,7 +6673,7 @@ fn wait_at_most(
 /// a wide margin. The measured time is printed.
 #[test]
 fn max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads() {
-    assert_capped_run_exits_promptly_with_full_unread_stderr(|_| {});
+    CappedRun::default().assert_exits_promptly_with_full_unread_stderr(|_| {});
 }
 
 /// The same capped run on a host where `perf_event_open` fails, as on the
@@ -6439,35 +6705,125 @@ fn max_log_bytes_exits_promptly_when_perf_is_unavailable_and_stderr_is_a_full_pi
             output.status
         );
     }
-    assert_capped_run_exits_promptly_with_full_unread_stderr(|command| {
+    CappedRun::default().assert_exits_promptly_with_full_unread_stderr(|command| {
         deny_syscall(command, libc::SYS_perf_event_open);
     });
 }
 
-/// Run a capped, noisy guest with stderr a full pipe nobody reads (see
-/// [`max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads`]),
-/// after `configure` adjusts the hermit command, and require exit 123 within
-/// [`LOG_CAP_RUN_WAIT_BOUND`].
-fn assert_capped_run_exits_promptly_with_full_unread_stderr(configure: impl FnOnce(&mut Command)) {
-    let _lock = hermit_run_guard();
-    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
-    let log = directory.path().join("hermit.log");
+/// A capped run with stderr a full pipe nobody reads (see
+/// [`max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads`]).
+/// Its arguments are `--log=debug --max-log-bytes=64K --log-file <log>`,
+/// `global`, `run`, `run_options`, `--timeout 120` when `timeout` is set, `--`
+/// and `guest`. The default is the plain run of [`LOG_CAP_NOISY_GUEST`], which
+/// the cap ends with 123.
+struct CappedRun<'a> {
+    /// Builds the command from the arguments: [`hermit_command`], or
+    /// [`readonly_proc_command`] to deny every writable mount.
+    build: fn(&[&str]) -> Command,
+    global: &'a [&'a str],
+    run_options: &'a [&'a str],
+    timeout: bool,
+    guest: &'a [&'a str],
+    /// The exit code the run must reach within [`LOG_CAP_RUN_WAIT_BOUND`]. For
+    /// 123, the log file must also be non-empty.
+    exit_code: i32,
+    /// A diagnostic this configuration writes to stderr. When set, the same
+    /// run is made first with stderr a pipe that is read, and its stderr must
+    /// contain this text. That shows the run with the full pipe writes it too,
+    /// so it would hang there if the write waited.
+    prints: Option<&'a str>,
+    /// The `--max-log-bytes` value. 64K is crossed early in a run; a larger
+    /// cap lets a quiet first verify run finish under it.
+    max_log_bytes: &'a str,
+}
+
+impl Default for CappedRun<'_> {
+    fn default() -> Self {
+        CappedRun {
+            build: hermit_command,
+            global: &[],
+            run_options: &[],
+            timeout: true,
+            guest: &LOG_CAP_NOISY_GUEST,
+            exit_code: HERMIT_LOG_CAP_EXIT,
+            prints: None,
+            max_log_bytes: "64K",
+        }
+    }
+}
+
+impl CappedRun<'_> {
+    fn command(&self, log: &Path, configure: &impl Fn(&mut Command)) -> Command {
+        let cap = format!("--max-log-bytes={}", self.max_log_bytes);
+        let mut args = vec![
+            "--log=debug",
+            cap.as_str(),
+            "--log-file",
+            log.to_str().unwrap(),
+        ];
+        args.extend_from_slice(self.global);
+        args.push("run");
+        args.extend_from_slice(self.run_options);
+        if self.timeout {
+            args.extend_from_slice(&["--timeout", "120"]);
+        }
+        args.push("--");
+        args.extend_from_slice(self.guest);
+        let mut command = (self.build)(&args);
+        command.stdin(Stdio::null());
+        // The guest inherits hermit's environment. Under a UTF-8 `LANG` every
+        // program the guest runs opens the locale's files at startup, and the
+        // debug log of those syscalls is large: measured, run 1 of
+        // `max_log_bytes_verify_exits_promptly_when_run1_summary_is_unreadable_and_stderr_is_a_full_pipe`
+        // logged 1272857 bytes with `LANG=en_US.UTF-8` against 970529 with
+        // `LC_ALL=C`, and with `--preemption-stacktrace` the 448K cap crossed
+        // while `/bin/sh` was still reading locale files, before its loop
+        // was first preempted. The C locale opens no files, so how much of the
+        // cap a guest's startup uses no longer depends on the caller's locale.
+        command.env("LC_ALL", "C");
+        configure(&mut command);
+        command
+    }
+
+    /// Require [`Self::exit_code`] within [`LOG_CAP_RUN_WAIT_BOUND`] with
+    /// stderr a full pipe nobody reads, after `configure` adjusts the command.
+    /// Stdin is `/dev/null` unless `configure` replaces it.
+    fn assert_exits_promptly_with_full_unread_stderr(&self, configure: impl Fn(&mut Command)) {
+        let _lock = hermit_run_guard();
+        let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        if let Some(text) = self.prints {
+            let mut command = self.command(&directory.path().join("premise.log"), &configure);
+            let (status, elapsed, stderr) = stderr_when_read(&mut command);
+            assert!(
+                stderr.contains(text),
+                "the premise does not hold: with stderr read, the run ({status:?} after \
+                 {elapsed:?}) did not print {text:?}; stderr:\n{stderr}"
+            );
+            assert_eq!(
+                status.and_then(|status| status.code()),
+                Some(self.exit_code),
+                "with stderr read: {status:?} after {elapsed:?}; stderr:\n{stderr}"
+            );
+        }
+        let log = directory.path().join("hermit.log");
+        let status = exit_status_with_full_unread_stderr(&mut self.command(&log, &configure));
+        assert_eq!(status.code(), Some(self.exit_code), "{status:?}");
+        if self.exit_code == HERMIT_LOG_CAP_EXIT {
+            assert!(
+                fs::metadata(&log).unwrap().len() > 0,
+                "the run logged to the file"
+            );
+        }
+    }
+}
+
+/// Spawn `command` with stdout discarded and stderr a full pipe nobody reads
+/// ([`full_unread_stderr_pipe`]), wait for it at most
+/// [`LOG_CAP_RUN_WAIT_BOUND`], and return its exit status. Fails, with the
+/// time waited, when hermit was still running at the bound and was killed.
+fn exit_status_with_full_unread_stderr(command: &mut Command) -> std::process::ExitStatus {
     let (reader, writer) = full_unread_stderr_pipe();
-    let mut args = vec![
-        "--log=debug",
-        "--max-log-bytes=64K",
-        "--log-file",
-        log.to_str().unwrap(),
-        "run",
-        "--timeout",
-        "120",
-        "--",
-    ];
-    args.extend(LOG_CAP_NOISY_GUEST);
-    let mut command = hermit_command(&args);
-    configure(&mut command);
     let mut child = command
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(writer))
         .spawn()
@@ -6478,16 +6834,1108 @@ fn assert_capped_run_exits_promptly_with_full_unread_stderr(configure: impl FnOn
     // died with it; this closes the read end, the last descriptor of the pipe.
     drop(reader);
     eprintln!("capped run, stderr a full unread pipe: {status:?} after {elapsed:?}");
-    let status = status.unwrap_or_else(|| {
+    status.unwrap_or_else(|| {
         panic!(
             "hermit was still running after {elapsed:?} (bound {bound:?}) and was killed: \
              a diagnostic waited on the full stderr pipe"
         )
+    })
+}
+
+/// Spawn `command` with stdout discarded and stderr a pipe that a thread reads
+/// to its end, wait for it at most [`LOG_CAP_RUN_WAIT_BOUND`] (killing it on
+/// expiry), and return its exit status (`None` when it was killed), the time
+/// waited and its stderr.
+fn stderr_when_read(command: &mut Command) -> (Option<std::process::ExitStatus>, Duration, String) {
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut pipe = child.stderr.take().unwrap();
+    let reader = thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+        bytes
+    });
+    let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    let (status, elapsed) = wait_at_most(&mut child, bound);
+    let stderr = String::from_utf8_lossy(&reader.join().unwrap()).into_owned();
+    (status, elapsed, stderr)
+}
+
+/// The options [`run_uses_readonly_proc_after_permission_denial`] runs with
+/// under [`readonly_proc_command`]: local networking would need another
+/// writable mount, for sysfs.
+const READONLY_PROC_RUN_OPTIONS: [&str; 3] = [
+    "--network=host",
+    "--max-timeslice=disabled",
+    "--no-virtualize-cpuid",
+];
+
+/// The capped run of
+/// [`max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads`] on a
+/// host where `/proc` can only be mounted read-only, as
+/// [`run_uses_readonly_proc_after_permission_denial`] arranges with
+/// [`readonly_proc_command`]. The container init then warns about it
+/// (`hermit::proc_mount::warn_if_readonly_proc` in `run_in_container`) before
+/// it starts the guest, so before the cap can cross. That warning was a
+/// blocking `write(2)`, and this run was still running when it was killed at
+/// the 45 s bound.
+#[test]
+fn max_log_bytes_exits_promptly_when_proc_is_readonly_and_stderr_is_a_full_pipe() {
+    CappedRun {
+        build: readonly_proc_command,
+        global: &["--backend=ptrace"],
+        run_options: &READONLY_PROC_RUN_OPTIONS,
+        prints: Some(hermit::proc_mount::READONLY_WARNING.trim()),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// The same read-only `/proc` warning under `--namespace-only`, where it is
+/// written in the `pre_exec` callback, in the forked child before it executes
+/// the guest. The non-waiting write is safe there: it makes only syscalls.
+/// Nothing logs enough here to reach the cap, so the run must end with the
+/// guest's own exit status, 0.
+#[test]
+fn max_log_bytes_namespace_only_exits_promptly_when_proc_is_readonly_and_stderr_is_a_full_pipe() {
+    CappedRun {
+        build: readonly_proc_command,
+        run_options: &["--namespace-only", "--network=host"],
+        guest: &["/bin/true"],
+        exit_code: 0,
+        prints: Some(hermit::proc_mount::READONLY_WARNING.trim()),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `run --verify` writes its `:: Run1...` banner before the first run starts,
+/// so before the cap can cross.
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_stderr_is_a_full_pipe() {
+    CappedRun {
+        run_options: &["--verify"],
+        prints: Some("Run1..."),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `run --verify` writes its `:: Run2...` banner before the second run
+/// starts. The cap counts both runs' logs together, so a first run that stays
+/// under it is followed by that banner, and a second run that crosses the cap
+/// comes after it. See [`assert_verify_run2_crosses_the_cap`] for the guest.
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_run2_crosses_the_cap_and_stderr_is_a_full_pipe() {
+    assert_verify_run2_crosses_the_cap(&["--verify"], "Run2...", "", None, |_| {});
+}
+
+/// `run --verify --print-verify-logs` echoes the first run's log to stderr
+/// after that run and before the second starts, so before a second run that
+/// crosses the cap. The echo is the whole log, far more than a pipe holds; the
+/// premise run shows it on stderr through run 1's debug lines.
+#[test]
+fn max_log_bytes_print_verify_logs_exits_promptly_when_run2_crosses_the_cap_and_stderr_is_a_full_pipe()
+ {
+    assert_verify_run2_crosses_the_cap(
+        &["--verify", "--print-verify-logs"],
+        " DEBUG ",
+        "",
+        None,
+        |_| {},
+    );
+}
+
+/// `run --verify --print-verify-logs` warns on stderr when it cannot read the
+/// first run's log to echo it, and that warning is also written before the
+/// second run starts. With `--keep-logs --verify-log-dir` the log is in a
+/// directory the guest can see, so run 1's guest makes it write-only (mode
+/// 0200): hermit goes on writing the log through the descriptor it already
+/// holds, and the outer hermit process cannot read it and warns. As in the
+/// summary test below, the outer process is started without the capabilities
+/// that override a file's mode ([`without_file_permission_override`]). The
+/// guest changes the mode with one `chmod`, not by replacing the file, because
+/// each program run 1 executes adds roughly 0.5 MB to its debug log, and
+/// `assert_verify_run2_crosses_the_cap` needs run 1 to leave room under the
+/// cap for run 2 to start.
+#[test]
+fn max_log_bytes_print_verify_logs_exits_promptly_when_run1_log_is_unreadable_and_stderr_is_a_full_pipe()
+ {
+    let logs = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log_dir = format!("--verify-log-dir={}", logs.path().to_str().unwrap());
+    assert_verify_run2_crosses_the_cap(
+        &["--verify", "--print-verify-logs", "--keep-logs", &log_dir],
+        "WARNING: --print-verify-logs could not read first-run log",
+        r#"chmod 200 "$3"/run1_log_*"#,
+        Some(logs.path()),
+        without_file_permission_override,
+    );
+}
+
+/// Between the two `--verify` runs hermit reads run 1's summary from a private
+/// file and warns on stderr when it cannot (`read_verify_summary` in
+/// `hermit/run.rs`), then empties the file before run 2. The file is in the
+/// work tree's `ignored/` directory, which the guest can see, so run 1's guest
+/// makes it write-only (mode 0200): hermit inside the container still writes the
+/// summary, the outer hermit process cannot read it and warns, and emptying it
+/// before run 2 still succeeds. The outer process is started without the
+/// capabilities that override a file's mode
+/// ([`without_file_permission_override`]); a root caller, as in the pinned root
+/// or a `--map-root-user` namespace, would otherwise read the file anyway.
+///
+/// The working directory is a work-tree root of the test's own (an empty
+/// `.git` and a `.gitignore` naming `ignored/`), so the summary is the only
+/// file in its `ignored/` and the guest's `chmod` cannot reach another run's.
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_run1_summary_is_unreadable_and_stderr_is_a_full_pipe() {
+    let root = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    fs::create_dir(root.path().join(".git")).unwrap();
+    fs::write(root.path().join(".gitignore"), "ignored/\n").unwrap();
+    assert_verify_run2_crosses_the_cap(
+        &["--verify"],
+        "WARNING: verification runtime statistics unavailable",
+        r#"chmod 200 "$3"/ignored/.hermit-verify-summary-*"#,
+        Some(root.path()),
+        without_file_permission_override,
+    );
+}
+
+/// Exec `command` without `CAP_DAC_OVERRIDE` and `CAP_DAC_READ_SEARCH`, the
+/// capabilities that let a process read a file its mode denies it. A root
+/// caller would exec it with both, from its bounding set, so they are dropped
+/// from that set and from the effective, permitted and inheritable sets, which
+/// also lowers them in the ambient set. A caller without `CAP_SETPCAP` cannot
+/// change its bounding set; when it is not root it does not need to, because
+/// an exec gives it no capability its permitted, inheritable and ambient sets
+/// lack, and when it is root the spawn fails rather than run with them.
+fn without_file_permission_override(command: &mut Command) {
+    // Linux capability ABI version 3 and the capability numbers, from
+    // linux/capability.h.
+    const VERSION_3: u32 = 0x2008_0522;
+    const DAC_OVERRIDE: u32 = 1;
+    const DAC_READ_SEARCH: u32 = 2;
+    const SETPCAP: u32 = 8;
+    #[repr(C)]
+    struct Header {
+        version: u32,
+        pid: i32,
+    }
+    #[derive(Clone, Copy, Default)]
+    #[repr(C)]
+    struct Data {
+        effective: u32,
+        permitted: u32,
+        inheritable: u32,
+    }
+    // SAFETY: the callback makes only async-signal-safe syscalls (capget,
+    // prctl, geteuid and capset) and changes only the child before its exec.
+    unsafe {
+        command.pre_exec(|| {
+            let mut header = Header {
+                version: VERSION_3,
+                pid: 0,
+            };
+            let mut data = [Data::default(); 2];
+            if libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let can_drop_from_bounding_set = data[0].effective & (1 << SETPCAP) != 0;
+            for capability in [DAC_OVERRIDE, DAC_READ_SEARCH] {
+                if can_drop_from_bounding_set {
+                    if libc::prctl(
+                        libc::PR_CAPBSET_DROP,
+                        libc::c_ulong::from(capability),
+                        0,
+                        0,
+                        0,
+                    ) != 0
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                } else if libc::geteuid() == 0
+                    && libc::prctl(
+                        libc::PR_CAPBSET_READ,
+                        libc::c_ulong::from(capability),
+                        0,
+                        0,
+                        0,
+                    ) != 0
+                {
+                    return Err(std::io::Error::from_raw_os_error(libc::EPERM));
+                }
+                data[0].effective &= !(1 << capability);
+                data[0].permitted &= !(1 << capability);
+                data[0].inheritable &= !(1 << capability);
+            }
+            if libc::syscall(libc::SYS_capset, &header, data.as_ptr()) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+}
+
+/// Run `--verify` with `run_options` under a 2M cap, first with stderr read
+/// (which must contain `prints`) and then with stderr a full unread pipe, and
+/// require that the second run's guest started in both and the cap ended the
+/// run (123) within the bound.
+///
+/// The guest finishes at once when the first marker is absent (run 1, which
+/// creates it and then runs `run1_then`, a shell command whose `$3` is
+/// `working_directory`) and, when it is present (run 2), creates the second
+/// marker with a shell redirection, before it runs any program, and then loops
+/// until the cap crosses. Measured at debug in the C locale
+/// ([`CappedRun::command`]): run 1 logged 473316 bytes with no `run1_then` and
+/// at most 974117 with either `chmod` one, and run 2 created its marker 449626
+/// bytes into its log, so at most 1423743 bytes were logged before the marker.
+/// The cap is therefore 2M rather than 64K. Each further program that
+/// `run1_then` executes costs roughly another 0.5 MB, and run 1 with an `mv`
+/// and a `mkdir` logged 1690977 bytes and did cross the cap before run 2's
+/// marker. Both markers are removed before each hermit run, so neither
+/// run can see one the previous run left; the second marker after each run
+/// shows that run 2's guest started in that run, so its 123 came from run 2.
+/// Hermit runs in `working_directory` when one is given, and `prepare` adjusts
+/// each hermit command last.
+fn assert_verify_run2_crosses_the_cap(
+    run_options: &[&str],
+    prints: &str,
+    run1_then: &str,
+    working_directory: Option<&Path>,
+    prepare: fn(&mut Command),
+) {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let run1_finished = directory.path().join("run1-finished");
+    let run2_started = directory.path().join("run2-started");
+    let script = format!(
+        r#"if [ -e "$1" ]; then : > "$2"; while :; do /bin/true; done; else : > "$1"; {run1_then}
+fi"#
+    );
+    let working_directory_arg = working_directory
+        .map(|path| path.to_str().unwrap())
+        .unwrap_or_default();
+    let assert_run2_started = |run: &str| {
+        assert!(
+            run2_started.exists(),
+            "in the {run}, run 2's guest did not create {}: the cap crossed before run 2 \
+             started",
+            run2_started.display()
+        );
+    };
+    let runs_started = std::cell::Cell::new(0);
+    CappedRun {
+        run_options,
+        guest: &[
+            "/bin/sh",
+            "-c",
+            &script,
+            "sh",
+            run1_finished.to_str().unwrap(),
+            run2_started.to_str().unwrap(),
+            working_directory_arg,
+        ],
+        prints: Some(prints),
+        max_log_bytes: "2M",
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|command| {
+        // Called before each hermit run: the premise run, when there is one,
+        // has finished by the second call.
+        if runs_started.get() > 0 {
+            assert_run2_started("premise run, with stderr read");
+        }
+        runs_started.set(runs_started.get() + 1);
+        for marker in [&run1_finished, &run2_started] {
+            match fs::remove_file(marker) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => panic!("removing {}: {error}", marker.display()),
+            }
+        }
+        if let Some(path) = working_directory {
+            command.current_dir(path);
+        }
+        prepare(command);
+    });
+    assert_eq!(
+        runs_started.get(),
+        2,
+        "the premise run and the run under test"
+    );
+    assert_run2_started("run under test, with stderr a full unread pipe");
+}
+
+/// `run --verify` on a read-only `/proc`: the first run's container init
+/// warns about it from `run_verify_in_container`, a different call site from
+/// the plain run's.
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_proc_is_readonly_and_stderr_is_a_full_pipe() {
+    let mut run_options = vec!["--verify"];
+    run_options.extend(READONLY_PROC_RUN_OPTIONS);
+    CappedRun {
+        build: readonly_proc_command,
+        global: &["--backend=ptrace"],
+        run_options: &run_options,
+        prints: Some(hermit::proc_mount::READONLY_WARNING.trim()),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `run --verify` with stdin a pipe: the library notes on stderr that it is
+/// buffering stdin (`hermit::reserve_output_stdin_snapshot`) before either run
+/// starts. The pipe's writer is closed, so stdin ends at once.
+#[test]
+fn max_log_bytes_verify_exits_promptly_when_stdin_is_a_pipe_and_stderr_is_a_full_pipe() {
+    CappedRun {
+        run_options: &["--verify"],
+        prints: Some("hermit: --verify is buffering stdin from a non-seekable stream"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|command| {
+        let (reader, writer) = std::io::pipe().unwrap();
+        drop(writer);
+        command.stdin(reader);
+    });
+}
+
+/// `--seed-from` names the seed it chose on stderr while the outer process
+/// prepares the run, before any container exists. That line was a blocking
+/// `eprintln!`, and this run was still running when it was killed at the
+/// 45 s bound.
+#[test]
+fn max_log_bytes_exits_promptly_with_seed_from_and_stderr_a_full_pipe() {
+    CappedRun {
+        run_options: &["--seed-from=args"],
+        prints: Some("[hermit] auto setting --seed"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `--allow-unsupported-syscalls` warns on stderr before the run starts.
+#[test]
+fn max_log_bytes_exits_promptly_with_allow_unsupported_syscalls_and_stderr_a_full_pipe() {
+    CappedRun {
+        run_options: &["--allow-unsupported-syscalls"],
+        prints: Some("WARNING: --allow-unsupported-syscalls permits unmodeled syscalls"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// A `--bind` whose target is outside guest `/tmp` is ignored with a warning
+/// on stderr while the outer process prepares the container's mounts.
+#[test]
+fn max_log_bytes_exits_promptly_with_a_bind_outside_tmp_and_stderr_a_full_pipe() {
+    CappedRun {
+        run_options: &["--bind=/usr"],
+        prints: Some("WARNING: --bind target /usr is outside guest /tmp"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// A noisy shell script at `directory/name`, which every run in this file can
+/// execute: `CARGO_TARGET_TMPDIR` is not under the host `/tmp` that hermit
+/// hides.
+fn noisy_guest_script(directory: &Path, name: &str) -> String {
+    let script = directory.join(name);
+    fs::write(&script, "#!/bin/sh\nwhile :; do /bin/true; done\n").unwrap();
+    fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    script.to_str().unwrap().to_owned()
+}
+
+/// A guest named like a QEMU system emulator gets the advisory about
+/// virtualized time on stderr while the outer process prepares the run
+/// (`vmm_time_virtualization_warning`). The guest is the noisy shell loop
+/// under that name.
+#[test]
+fn max_log_bytes_exits_promptly_with_a_vmm_guest_and_stderr_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let emulator = noisy_guest_script(directory.path(), "qemu-system-x86_64");
+    CappedRun {
+        guest: &[&emulator],
+        prints: Some("looks like a hardware emulator (VMM)"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `--backend=e9patch` (e9patch preprocessing with the ptrace backend) names
+/// its engagement on stderr before the run starts. For a main executable that
+/// is not ELF there is nothing to rewrite, and the tools are never run. Hermit
+/// still requires both to be executable files before it starts, and no
+/// validation node stages e9patch, so the test names `/bin/false` for each:
+/// had hermit run either, the run would fail rather than reach the cap.
+#[test]
+fn max_log_bytes_exits_promptly_with_e9patch_on_a_script_and_stderr_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let script = noisy_guest_script(directory.path(), "noisy.sh");
+    CappedRun {
+        global: &["--backend=e9patch"],
+        guest: &[&script],
+        prints: Some(
+            ":: Backend: e9patch preprocessing + ptrace runtime; mapped_sites=0; \
+             main_executable=non-ELF; preprocessing=not-applicable",
+        ),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|command| {
+        command
+            .env(hermit::e9patch::E9TOOL_ENV, "/bin/false")
+            .env(hermit::e9patch::E9PATCH_BACKEND_ENV, "/bin/false");
+    });
+}
+
+/// A `--happens-before` spec with one anchor at a function the guest does not
+/// have.
+fn unresolvable_happens_before_spec(directory: &Path) -> String {
+    let spec = directory.join("happens-before.json");
+    fs::write(
+        &spec,
+        r#"{"version": 1, "events": {"A": {"thread": "1", "func": "no_such_function"}}, "edges": []}"#,
+    )
+    .unwrap();
+    spec.to_str().unwrap().to_owned()
+}
+
+/// `--happens-before` reports anchors it cannot resolve on stderr before the
+/// run starts. Whatever debug info the guest has, one line says the anchor
+/// will never fire.
+#[test]
+fn max_log_bytes_exits_promptly_with_an_unresolved_happens_before_anchor_and_stderr_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let spec = unresolvable_happens_before_spec(directory.path());
+    CappedRun {
+        run_options: &["--happens-before", &spec],
+        prints: Some("never fire"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `--hb-list-events` prints the resolved spec and exits 0 without running
+/// the guest; the anchors it cannot resolve are named on stderr.
+#[test]
+fn max_log_bytes_hb_list_events_exits_promptly_with_stderr_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let spec = unresolvable_happens_before_spec(directory.path());
+    CappedRun {
+        run_options: &["--happens-before", &spec, "--hb-list-events"],
+        exit_code: 0,
+        prints: Some("anchor(s) with unresolved code locations: A"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `--stacktrace-event=0` without a path prints the stack of the first
+/// recorded event to stderr: a heading from the scheduler
+/// (`try_pop_stacktrace_event` in `detcore/src/scheduler.rs`), then the stack
+/// itself (`write_backtrace` in `detcore/src/tool_global.rs`), whose first line
+/// names the thread. Event 0 is the guest's first, so both come before the cap
+/// can cross.
+#[test]
+fn max_log_bytes_stacktrace_event_exits_promptly_when_stderr_is_a_full_pipe() {
+    CappedRun {
+        run_options: &["--record-preemptions", "--stacktrace-event=0"],
+        prints: Some("Stack trace for thread"),
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// When a requested `--stacktrace-event` is a thread's exit, the scheduler
+/// (`simulate_exit_posthook` in `detcore/src/scheduler.rs`) says on stderr that
+/// no stack is available. Every event index up to 1000, each with a path so
+/// that the other events' stacks go to a file rather than stderr, includes the
+/// exit of `/bin/true`, which recorded 220 events when measured. That message
+/// comes as the guest exits, so the run must end with its status, 0, under a
+/// cap the run stays under (it logged 288788 bytes at debug).
+#[test]
+fn max_log_bytes_stacktrace_event_at_a_thread_exit_exits_promptly_when_stderr_is_a_full_pipe() {
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let stacks = directory.path().join("stack.json");
+    let events: Vec<String> = (0..1000)
+        .map(|index| format!("--stacktrace-event={index},{}", stacks.display()))
+        .collect();
+    let mut run_options = vec!["--record-preemptions"];
+    run_options.extend(events.iter().map(String::as_str));
+    CappedRun {
+        run_options: &run_options,
+        guest: &["/bin/true"],
+        exit_code: 0,
+        prints: Some("backtrace requested but not available post-exit"),
+        max_log_bytes: "2M",
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// `--chaos --preemption-stacktrace` without `--preemption-stacktrace-log-file`
+/// prints the guest's stack to stderr at every PMU timer preemption
+/// (`handle_timer_event` in `detcore/src/lib.rs`), and the guest keeps running
+/// after each one. A busy shell loop makes no system calls, so only the timer
+/// preempts it. When measured, its first preemption came after 350852 bytes of
+/// debug log, and each one logged about 3.2 KB more and took about 0.25 s, so a
+/// 448K cap crossed after 34 of them, 8.7 s into the run.
+///
+/// The PMU timer is this case's subject: without one there is no preemption and
+/// the premise fails. test.cli and test.cli_on_host skip it by exact name, and
+/// privileged-test.pmu_cli_cases runs it, as for
+/// [`run_chaos_preemption_replay_reuses_the_recorded_epoch`].
+#[test]
+fn max_log_bytes_preemption_stacktrace_exits_promptly_when_stderr_is_a_full_pipe() {
+    CappedRun {
+        run_options: &["--chaos", "--preemption-stacktrace"],
+        guest: &["/bin/sh", "-c", "while :; do :; done"],
+        prints: Some("preempted at thread time"),
+        max_log_bytes: "448K",
+        ..CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}
+
+/// Without `--log-file`, hermit writes its virtual-time epoch line to stderr
+/// (`GlobalOpts::write_controller_diagnostic`) before the guest starts. The
+/// default log level writes nothing else there for `/bin/true`, so the run
+/// must end with the guest's exit status, 0.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_stderr_is_a_full_pipe() {
+    let _lock = hermit_run_guard();
+    let args = [
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+        "/bin/true",
+    ];
+    let (status, elapsed, stderr) = stderr_when_read(hermit_command(&args).stdin(Stdio::null()));
+    assert!(
+        stderr.contains("hermit: virtual-time epoch="),
+        "the premise does not hold: with stderr read, the run ({status:?} after {elapsed:?}) \
+         printed no epoch line; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "with stderr read: {status:?} after {elapsed:?}; stderr:\n{stderr}"
+    );
+    let status = exit_status_with_full_unread_stderr(hermit_command(&args).stdin(Stdio::null()));
+    assert_eq!(status.code(), Some(0), "{status:?}");
+}
+
+/// Without `--log-file`, the log itself goes to stderr through
+/// `CappedWriter::stderr` in `hermit/tracing.rs`, and at debug the noisy guest
+/// fills a pipe long before 64K is logged. A sink that waited for the reader
+/// would never let the cap cross; one that drops what the pipe refuses still
+/// counts it, so the cap ends the run with 123.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_the_log_fills_the_stderr_pipe() {
+    let _lock = hermit_run_guard();
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let (status, elapsed, stderr) = stderr_when_read(hermit_command(&args).stdin(Stdio::null()));
+    assert!(
+        stderr.contains(" DEBUG "),
+        "the premise does not hold: with stderr read, the run ({status:?} after {elapsed:?}) \
+         logged no debug line there; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_LOG_CAP_EXIT),
+        "with stderr read: {status:?} after {elapsed:?}; stderr:\n{stderr}"
+    );
+    let status = exit_status_with_full_unread_stderr(hermit_command(&args).stdin(Stdio::null()));
+    assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_the_log_fills_the_stderr_pipe`]
+/// where `statx` fails, as under a seccomp policy that denies it. The stderr
+/// log sink learns from `statx` whether fd 2 is a pipe, a socket or a regular
+/// file. When `statx` failed it used to fall back to a plain `write(2)`, which
+/// waits forever on a full pipe, and this run was killed at the 45 s bound.
+/// It now asks the pipe itself (`fcntl(F_GETPIPE_SZ)`), learns that fd 2 is a
+/// pipe, and writes through a non-blocking open of it, which the full pipe
+/// refuses; the dropped bytes still count against the cap, so the run ends
+/// with 123.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_log_fills_the_stderr_pipe()
+ {
+    let _lock = hermit_run_guard();
+    // Premise: hermit runs, and logs to stderr, without statx (the Rust
+    // standard library falls back to fstatat). Uncapped, so the log takes the
+    // plain write it always took.
+    let mut premise =
+        hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
+    premise.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_syscall(&mut premise, libc::SYS_statx);
+    let (status, elapsed, stderr) = stderr_when_read(&mut premise);
+    assert!(
+        stderr.contains(" DEBUG "),
+        "the premise does not hold: without statx and with stderr read, the uncapped run \
+         ({status:?} after {elapsed:?}) logged no debug line there; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "without statx and with stderr read: {status:?} after {elapsed:?}; stderr:\n{stderr}"
+    );
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_syscall(&mut command, libc::SYS_statx);
+    let status = exit_status_with_full_unread_stderr(&mut command);
+    assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_log_fills_the_stderr_pipe`]
+/// with stderr read. When `statx` failed, the capped stderr writers wrote
+/// nothing at all, so under such a policy a capped run lost every debug line
+/// and the cap's own class line, and this test found neither. They now learn
+/// that fd 2 is a pipe from `fcntl(F_GETPIPE_SZ)`, and both arrive.
+#[test]
+fn max_log_bytes_without_a_log_file_still_logs_to_a_read_stderr_when_statx_is_denied() {
+    let _lock = hermit_run_guard();
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_syscall(&mut command, libc::SYS_statx);
+    let (status, elapsed, stderr) = stderr_when_read(&mut command);
+    assert!(
+        stderr.contains(" DEBUG "),
+        "without statx and with stderr read, the capped run ({status:?} after {elapsed:?}) \
+         logged no debug line there; stderr:\n{stderr}"
+    );
+    assert!(
+        stderr.contains("HERMIT_LOG_CAP class=log-cap"),
+        "without statx and with stderr read, the capped run ({status:?} after {elapsed:?}) \
+         printed no class line; stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(HERMIT_LOG_CAP_EXIT),
+        "without statx and with stderr read: {status:?} after {elapsed:?}; stderr:\n{stderr}"
+    );
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_log_fills_the_stderr_pipe`]
+/// where every other question about stderr's file type fails too (see
+/// [`deny_file_type_queries_on_stderr`]), so nothing can tell what kind of
+/// file stderr is. The capped stderr writers must then write nothing,
+/// since a plain `write(2)` to the full pipe would wait forever; the dropped
+/// bytes still count against the cap, so the run ends with 123. A writer that
+/// fell back to a plain write here would be killed at the 45 s bound.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_no_file_type_query_answers_and_the_log_fills_the_stderr_pipe()
+ {
+    capped_run_exits_promptly_on_a_full_pipe_with_the_file_type_queries_on_stderr_denied(
+        libc::EPERM,
+    );
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_no_file_type_query_answers_and_the_log_fills_the_stderr_pipe`]
+/// where every file-type query on stderr returns 0 and fills in nothing. The
+/// stderr log sink used to read the zeroed type as "anything else", which
+/// gets a plain `write(2)`, so this run was killed at the 45 s bound. A query
+/// that names no type now counts as failed.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_every_file_type_query_feigns_success_and_the_log_fills_the_stderr_pipe()
+ {
+    capped_run_exits_promptly_on_a_full_pipe_with_the_file_type_queries_on_stderr_denied(0);
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_no_file_type_query_answers_and_the_log_fills_the_stderr_pipe`]
+/// where every file-type query on stderr answers `EINTR`, every time. The
+/// stderr writer then has no type and returns `statx`'s `EINTR`, and the
+/// retrying stderr sink used to retry an interrupted write without limit, so
+/// this run was killed at the 45 s bound. Under the cap it now retries only
+/// within the shared stderr deadline and then gives the line up; the dropped
+/// bytes still count against the cap, so the run ends with 123.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_every_file_type_query_answers_eintr_and_the_log_fills_the_stderr_pipe()
+ {
+    capped_run_exits_promptly_on_a_full_pipe_with_the_file_type_queries_on_stderr_denied(
+        libc::EINTR,
+    );
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_statx_is_denied_and_the_log_fills_the_stderr_pipe`]
+/// where `fstat` on stderr never returns, as when stderr is a FIFO on a FUSE
+/// file system whose server has stopped answering (see
+/// [`deny_statx_and_hold_the_stat_of_stderr`]). When `statx` failed, the
+/// capped stderr writers used to ask `fstat` and wait there forever, the
+/// crossing writer before `_exit(123)` included, so this run was killed at
+/// the 45 s bound. They now ask the pipe itself (`fcntl(F_GETPIPE_SZ)`), which
+/// answers from memory.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_the_stat_of_stderr_never_returns_and_the_log_fills_the_stderr_pipe()
+ {
+    let _lock = hermit_run_guard();
+    // Premise: uncapped, nothing hermit or the guest does stats stderr, so
+    // the run neither waits on the held calls nor needs them, and it logs to
+    // stderr.
+    let mut premise =
+        hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
+    premise.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_statx_and_hold_the_stat_of_stderr(&mut premise);
+    let (status, elapsed, stderr) = stderr_when_read(&mut premise);
+    assert!(
+        stderr.contains(" DEBUG "),
+        "the premise does not hold: with the stat of stderr held and stderr read, the \
+         uncapped run ({status:?} after {elapsed:?}) logged no debug line there; \
+         stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "with the stat of stderr held and stderr read: {status:?} after {elapsed:?}; \
+         stderr:\n{stderr}"
+    );
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_statx_and_hold_the_stat_of_stderr(&mut command);
+    let status = exit_status_with_full_unread_stderr(&mut command);
+    assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
+}
+
+/// A capped run at debug, with every file-type query on stderr answered with
+/// `errno` and stderr a full pipe that nobody reads, ends with 123; uncapped,
+/// with stderr read, it logs and exits 0.
+fn capped_run_exits_promptly_on_a_full_pipe_with_the_file_type_queries_on_stderr_denied(
+    errno: i32,
+) {
+    let _lock = hermit_run_guard();
+    // Premise: hermit runs, and logs to stderr, when no file-type query on
+    // stderr answers. Uncapped, so the log takes the plain write it always
+    // took.
+    let mut premise =
+        hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
+    premise.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_file_type_queries_on_stderr(&mut premise, errno);
+    let (status, elapsed, stderr) = stderr_when_read(&mut premise);
+    assert!(
+        stderr.contains(" DEBUG "),
+        "the premise does not hold: with no file-type query on stderr answering and stderr \
+         read, the uncapped run ({status:?} after {elapsed:?}) logged no debug line there; \
+         stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "with no file-type query on stderr answering and stderr read: {status:?} after \
+         {elapsed:?}; stderr:\n{stderr}"
+    );
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_file_type_queries_on_stderr(&mut command, errno);
+    let status = exit_status_with_full_unread_stderr(&mut command);
+    assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
+}
+
+/// A pseudo-terminal whose master end nobody reads, filled until its slave end
+/// refuses more. Returns the master, which must stay open while the slave is
+/// in use, and a BLOCKING descriptor for the slave: the filling goes through a
+/// second, non-blocking open of the slave, so the descriptor returned for
+/// hermit's stderr does not share its `O_NONBLOCK`.
+fn full_unread_pseudo_terminal() -> (fs::File, fs::File) {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    // SAFETY: posix_openpt returns a new descriptor or -1.
+    let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY | libc::O_CLOEXEC) };
+    assert!(
+        master >= 0,
+        "posix_openpt: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: `master` is a new descriptor that nothing else owns.
+    let master = unsafe { fs::File::from_raw_fd(master) };
+    let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
+    // SAFETY: grantpt and unlockpt only act on `fd`; ptsname_r writes at most
+    // `name.len()` bytes, NUL included, into `name`.
+    let mut name = [0 as libc::c_char; 128];
+    unsafe {
+        assert_eq!(
+            libc::grantpt(fd),
+            0,
+            "grantpt: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::unlockpt(fd),
+            0,
+            "unlockpt: {}",
+            std::io::Error::last_os_error()
+        );
+        assert_eq!(
+            libc::ptsname_r(fd, name.as_mut_ptr(), name.len()),
+            0,
+            "ptsname_r"
+        );
+    }
+    // SAFETY: ptsname_r succeeded, so `name` is NUL-terminated.
+    let slave_path = unsafe { std::ffi::CStr::from_ptr(name.as_ptr()) }
+        .to_str()
+        .unwrap()
+        .to_owned();
+    let open_slave = |flags| {
+        fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOCTTY | flags)
+            .open(&slave_path)
+            .unwrap_or_else(|err| panic!("open {slave_path}: {err}"))
+    };
+    let slave = open_slave(0);
+    let mut filler = open_slave(libc::O_NONBLOCK);
+    let chunk = [b'x'; 4096];
+    let mut filled = 0usize;
+    loop {
+        match filler.write(&chunk) {
+            Ok(n) => filled += n,
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(err) => panic!("filling {slave_path} after {filled} bytes: {err}"),
+        }
+        assert!(
+            filled < 64 << 20,
+            "{slave_path} took {filled} bytes and never filled"
+        );
+    }
+    assert!(filled > 0, "{slave_path} took no byte");
+    (master, slave)
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_the_log_fills_the_stderr_pipe`]
+/// with stderr a terminal that nobody reads and that is full, under a seccomp
+/// policy that denies the terminal query `isatty` makes with `EPERM`. The
+/// stderr log sink used to write plainly to any character device the terminal
+/// query did not call a terminal, so here it made a plain `write(2)` to the
+/// full terminal, which waits for a reader forever, and this run was killed at
+/// the 45 s bound. It now writes to every character device through a
+/// non-blocking open of it, and the run ends with 123.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_the_terminal_query_is_denied_and_the_log_fills_a_terminal()
+ {
+    capped_run_exits_promptly_on_a_full_terminal_with_the_terminal_query_denied(libc::EPERM);
+}
+
+/// The run of
+/// [`max_log_bytes_without_a_log_file_exits_promptly_when_the_terminal_query_is_denied_and_the_log_fills_a_terminal`]
+/// where the policy answers the terminal query with `ENOTTY`, exactly what a
+/// descriptor that really is not a terminal answers. The stderr log sink used
+/// to trust `ENOTTY` and write plainly, so this run was killed at the 45 s
+/// bound.
+#[test]
+fn max_log_bytes_without_a_log_file_exits_promptly_when_the_terminal_query_answers_enotty_and_the_log_fills_a_terminal()
+ {
+    capped_run_exits_promptly_on_a_full_terminal_with_the_terminal_query_denied(libc::ENOTTY);
+}
+
+/// A capped run at debug, with the terminal query denied with `errno` and
+/// stderr a full terminal that nobody reads, ends with 123 within
+/// [`LOG_CAP_RUN_WAIT_BOUND`]; uncapped, with stderr read, it logs and exits 0.
+fn capped_run_exits_promptly_on_a_full_terminal_with_the_terminal_query_denied(errno: i32) {
+    let _lock = hermit_run_guard();
+    // Premise: hermit runs, and logs to stderr, when the terminal query is
+    // denied. Uncapped, so the log takes the plain write it always took.
+    let mut premise =
+        hermit_command(&["--log=debug", "run", "--timeout", "120", "--", "/bin/true"]);
+    premise.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_terminal_query(&mut premise, errno);
+    let (status, elapsed, stderr) = stderr_when_read(&mut premise);
+    assert!(
+        stderr.contains(" DEBUG "),
+        "the premise does not hold: with the terminal query denied and stderr read, the \
+         uncapped run ({status:?} after {elapsed:?}) logged no debug line there; \
+         stderr:\n{stderr}"
+    );
+    assert_eq!(
+        status.and_then(|status| status.code()),
+        Some(0),
+        "with the terminal query denied and stderr read: {status:?} after {elapsed:?}; \
+         stderr:\n{stderr}"
+    );
+    let mut args = vec![
+        "--log=debug",
+        "--max-log-bytes=64K",
+        "run",
+        "--timeout",
+        "120",
+        "--",
+    ];
+    args.extend(LOG_CAP_NOISY_GUEST);
+    let mut command = hermit_command(&args);
+    command.stdin(Stdio::null()).env("LC_ALL", "C");
+    deny_terminal_query(&mut command, errno);
+    let (master, slave) = full_unread_pseudo_terminal();
+    let mut child = command
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
+    let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    let (status, elapsed) = wait_at_most(&mut child, bound);
+    // hermit is reaped, killed first if it outlived the bound.
+    drop(master);
+    eprintln!("capped run, stderr a full unread terminal: {status:?} after {elapsed:?}");
+    let status = status.unwrap_or_else(|| {
+        panic!(
+            "hermit was still running after {elapsed:?} (bound {bound:?}) and was killed: \
+             a diagnostic waited on the full terminal"
+        )
     });
     assert_eq!(status.code(), Some(HERMIT_LOG_CAP_EXIT), "{status:?}");
+}
+
+/// Spawn `command`, whose stderr is already set, and wait at most
+/// [`LOG_CAP_RUN_WAIT_BOUND`] for something to listen on TCP `port`; then kill
+/// and reap hermit. Returns whether it listened, the time waited and, when
+/// stderr is [`Stdio::piped`], everything hermit wrote there, which a thread
+/// reads throughout. Fails if hermit exits first.
+fn gdbserver_listens_promptly(command: &mut Command, port: u16) -> (bool, Duration, String) {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .spawn()
+        .unwrap();
+    let reader = child.stderr.take().map(|mut pipe| {
+        thread::spawn(move || {
+            let mut bytes = Vec::new();
+            let _ = std::io::Read::read_to_end(&mut pipe, &mut bytes);
+            bytes
+        })
+    });
+    let bound = LOG_CAP_RUN_WAIT_BOUND.mul_f64(dap_wall_timeout_multiplier());
+    let start = Instant::now();
+    let (listened, exited) = loop {
+        if tcp_port_is_listening(port) {
+            break (true, None);
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break (false, Some(status));
+        }
+        if start.elapsed() >= bound {
+            break (false, None);
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let elapsed = start.elapsed();
+    let _ = child.kill();
+    let _ = child.wait();
+    let stderr = reader
+        .map(|reader| String::from_utf8_lossy(&reader.join().unwrap()).into_owned())
+        .unwrap_or_default();
+    if let Some(status) = exited {
+        panic!(
+            "hermit run --gdbserver exited {status:?} before it listened on port {port}; \
+             stderr:\n{stderr}"
+        );
+    }
+    (listened, elapsed, stderr)
+}
+
+/// `--gdbserver` with the default local network warns on stderr that it
+/// switches to host networking, while the outer process prepares the run.
+/// The gdbserver then waits for a client and the cap is not reached, so the
+/// test requires that it listens on its port within
+/// [`LOG_CAP_RUN_WAIT_BOUND`], and kills it.
+#[test]
+fn max_log_bytes_gdbserver_listens_promptly_when_stderr_is_a_full_pipe() {
+    let _lock = hermit_run_guard();
+    let directory = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+    let log = directory.path().join("hermit.log");
+    let command = |port: &str| {
+        hermit_command(&[
+            "--log=debug",
+            "--max-log-bytes=64K",
+            "--log-file",
+            log.to_str().unwrap(),
+            "run",
+            "--timeout",
+            "120",
+            "--gdbserver",
+            "--gdbserver-port",
+            port,
+            "--",
+            "/bin/true",
+        ])
+    };
+
+    // A pipe that is read, not a file: under the cap a diagnostic to a
+    // regular file on btrfs or tmpfs is omitted (see
+    // `hermit::nonwaiting_write::write_without_waiting`).
+    let port = unused_local_port();
+    let (listened, elapsed, stderr) =
+        gdbserver_listens_promptly(command(&port.to_string()).stderr(Stdio::piped()), port);
     assert!(
-        fs::metadata(&log).unwrap().len() > 0,
-        "the run logged to the file"
+        listened && stderr.contains("WARNING: --gdbserver requires host networking"),
+        "the premise does not hold: with stderr read, listened={listened} after {elapsed:?}; \
+         stderr:\n{stderr}"
+    );
+
+    let (reader, writer) = full_unread_stderr_pipe();
+    let port = unused_local_port();
+    let (listened, elapsed, _) =
+        gdbserver_listens_promptly(command(&port.to_string()).stderr(writer), port);
+    drop(reader);
+    eprintln!(
+        "capped gdbserver run, stderr a full unread pipe: listened={listened} after {elapsed:?}"
+    );
+    assert!(
+        listened,
+        "hermit run --gdbserver did not listen on port {port} within {elapsed:?} and was \
+         killed: a diagnostic waited on the full stderr pipe"
     );
 }
 

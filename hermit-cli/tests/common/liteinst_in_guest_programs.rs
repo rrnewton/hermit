@@ -1600,3 +1600,34 @@ fn liteinst_in_guest_unscheduled_deaths_complete_and_refuse_verification() {
         assert!(!stderr.contains("Determinism verified"), "{mode}: {stderr}");
     }
 }
+
+/// Under `--max-log-bytes`, Hermit writes its in-guest selection line
+/// ([`IN_GUEST_SELECTED`]) before the guest starts, so before the cap or the
+/// guest's exit can end the run. With stderr a full pipe nobody reads, the run
+/// must still end within the bound of
+/// `max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe_nobody_reads`.
+/// In-guest LiteInst refuses `--timeout`, so the run has none.
+#[test]
+fn liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe() {
+    super::CappedRun {
+        build: |args| {
+            let mut command = Command::new(hermit_binary());
+            command.args(args);
+            command
+        },
+        global: &["--backend", "liteinst"],
+        run_options: &[
+            "--max-timeslice=disabled",
+            "--strict",
+            "--base-env=minimal",
+            "--mount=type=tmpfs,target=/test",
+            "--workdir=/test",
+        ],
+        timeout: false,
+        guest: &["/bin/true"],
+        exit_code: 0,
+        prints: Some(IN_GUEST_SELECTED),
+        ..super::CappedRun::default()
+    }
+    .assert_exits_promptly_with_full_unread_stderr(|_| {});
+}

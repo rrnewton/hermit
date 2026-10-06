@@ -43,6 +43,7 @@ pub(crate) use hermit::canonical_verdict::Verdict;
 pub(crate) use hermit::canonical_verdict::VerificationReport;
 pub(crate) use hermit::canonical_verdict::VerificationRun;
 pub(crate) use hermit::canonical_verdict::VerificationRuntime;
+use hermit::nonwaiting_write::write_without_waiting;
 use pretty_assertions::Comparison;
 use reverie::process::ExitStatus;
 use reverie::process::Output;
@@ -54,7 +55,6 @@ use super::container::LogCapExceeded;
 use super::global_opts::GlobalOpts;
 use super::record_envelope::RecordEnvelope;
 use super::record_envelope::RecordEnvelopePolicy;
-use super::tracing::write_without_waiting;
 
 const FAILED_VERIFY_LOG_DIR_PREFIX: &str = "comparison-";
 const FAILED_VERIFY_LOG_PENDING_PREFIX: &str = ".pending-comparison-";

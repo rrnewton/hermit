@@ -2096,9 +2096,10 @@ impl Scheduler {
                     current_ix, observed,
                 );
                 if m_path.is_none() {
-                    eprintln!(
+                    crate::util::capped_eprintln!(
                         "\nPrinting stack trace for scheduled event #{} = {}:",
-                        current_ix, observed,
+                        current_ix,
+                        observed,
                     );
                 }
                 result = Some(m_path.clone());
@@ -5240,9 +5241,10 @@ impl Scheduler {
         };
         let print_stack2 = if record { self.record_event(&ev) } else { None };
         if print_stack1.is_some() || print_stack2.is_some() {
-            eprintln!(
+            crate::util::capped_eprintln!(
                 ":: Guest tid {}, at thread time {}, backtrace requested but not available post-exit!\n",
-                dettid, thread_duration
+                dettid,
+                thread_duration
             );
         }
     }

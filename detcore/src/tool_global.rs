@@ -4291,7 +4291,7 @@ where
             let file = File::create(path).expect("Failed to open preemption stacktrace log file");
             serde_json::to_writer(file, &backtrace.force_pretty()).unwrap();
         } else {
-            eprintln!("{}", backtrace.force_pretty());
+            crate::util::capped_eprintln!("{}", backtrace.force_pretty());
         }
     } else {
         warn!("Could not read backtrace!");

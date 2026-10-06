@@ -248,6 +248,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings",
     "liteinst_in_guest_programs::liteinst_in_guest_identity_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_max_log_bytes_exits_promptly_when_stderr_is_a_full_pipe",
     "liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_python_entropy",
     "liteinst_in_guest_programs::liteinst_in_guest_python_random_example",

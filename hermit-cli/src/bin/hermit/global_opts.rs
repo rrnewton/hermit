@@ -243,6 +243,12 @@ impl GlobalOpts {
                 "{timestamp} DEBUG {CONTROLLER_TARGET}: {message}"
             )
             .context("cannot write to the host log file")?;
+        } else if hermit::nonwaiting_write::diagnostics_must_not_wait() {
+            // Under --max-log-bytes, termination must not depend on this
+            // write: RetryingStderr below waits as long as a full stderr pipe
+            // stays unread. One attempt that cannot block; the line is dropped
+            // when stderr cannot take it at once.
+            super::tracing::write_stderr_diagnostic(&format!("{message}\n"));
         } else {
             // A stopped stderr reader must not replace the command's primary
             // exit status. This shares the existing invocation-wide deadline
