@@ -2223,6 +2223,186 @@ fn controlled_exit_mode_never_enqueues_legacy_timed_sigchld() {
     );
 }
 
+/// A scheduler for a backend whose supervisor reaps every guest process and
+/// reports that physical exit (SaBRe's capability profile).
+fn physical_exit_reporting_scheduler() -> Scheduler {
+    Scheduler::new(&Config::default().with_backend(|backend| {
+        backend.reports_physical_process_exits = true;
+        backend.signal_interrupts_external_syscalls = true;
+    }))
+}
+
+/// Grant `child`'s `exit_group` through the complete `Exit` resource arm, then
+/// remove its only thread as the backend does before the real exit. The
+/// child's physical exit is left pending, as it is until the supervisor reaps.
+fn grant_child_exit_and_remove_thread(s: &mut Scheduler, child: DetTid, child_mm: MmId) {
+    let process = DetPid::from_raw(child.as_raw());
+    assert!(
+        s.block_for_one_resource(
+            child,
+            &ResourceID::Exit {
+                group: true,
+                process,
+                mm: child_mm,
+            },
+            &Permission::RW,
+            None,
+            &Ivar::new(),
+        )
+        .is_ok()
+    );
+    s.logically_kill_thread(&child, &process, child_mm);
+}
+
+/// Park `tid` in the run queue on an internal I/O poll, the request a signal
+/// wakeup replaces with `InboundSignal`.
+fn park_on_internal_poll(s: &mut Scheduler, tid: DetTid) {
+    let mut polling = Resources::new(tid);
+    polling.insert(ResourceID::InternalIOPolling, Permission::W);
+    s.next_turns.get_mut(&tid).unwrap().req = Ivar::full(Ok(polling));
+    s.runqueue_push_back(tid);
+}
+
+fn requests_inbound_sigchld(s: &Scheduler, tid: DetTid) -> bool {
+    s.next_turns
+        .get(&tid)
+        .and_then(|turn| turn.req.try_read())
+        .is_some_and(|request| {
+            request.is_ok_and(|resources| {
+                resources
+                    .resources
+                    .contains_key(&ResourceID::InboundSignal(SigWrapper::from(
+                        Signal::SIGCHLD,
+                    )))
+            })
+        })
+}
+
+#[test]
+fn reporting_backend_child_exit_wakes_the_parent_once_after_the_reap_without_a_signal() {
+    let mut s = physical_exit_reporting_scheduler();
+    let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (sibling, _, _) = add(&mut s, 300, 300);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    let child_process = DetPid::from_raw(200);
+    park_on_internal_poll(&mut s, parent);
+    park_on_internal_poll(&mut s, sibling);
+
+    grant_child_exit_and_remove_thread(&mut s, child, child_mm);
+    // The grant schedules no SIGCHLD of its own: the reap sends the real one.
+    assert!(s.blocked.timed_waiters.is_empty());
+    assert_eq!(
+        s.child_exit_signals_owed.get(&child_process),
+        Some(&DetPid::from_raw(100))
+    );
+    assert!(s.pending_physical_process_exits.contains(&child_process));
+
+    // Must not: until the supervisor has reaped the child (and so the kernel
+    // has generated the parent's SIGCHLD), no thread may run and the parent is
+    // not woken, however many passes the scheduler makes.
+    for _ in 0..3 {
+        assert!(
+            s.step2_process_blocked(&global_time).is_err(),
+            "a runnable thread must not pass an unreaped child's owed wakeup"
+        );
+    }
+    assert_eq!(s.owed_child_exit_wakeups, 0);
+    assert!(!s.blocked.sigchld_ready.contains(&parent));
+    assert!(!requests_inbound_sigchld(&s, parent));
+    assert_eq!(
+        s.run_queue.tids().copied().collect::<Vec<_>>(),
+        vec![parent, sibling]
+    );
+
+    // Must wake: the first pass after the reap wakes the parent exactly once
+    // and sends no host signal.
+    assert!(s.complete_physical_process_exit(child_process));
+    assert!(s.step2_drain_prefix().is_ok());
+    assert_eq!(s.owed_child_exit_wakeups, 1);
+    assert_eq!(s.host_signal_attempts, 0);
+    assert!(s.child_exit_signals_owed.is_empty());
+    // The parent's poll is replaced by the inbound signal. Requeuing it clears
+    // its blocking entries, `sigchld_ready` included, as the timer path did.
+    assert!(requests_inbound_sigchld(&s, parent));
+    assert_eq!(
+        s.run_queue.tids().copied().collect::<Vec<_>>(),
+        vec![sibling, parent]
+    );
+
+    assert!(s.step2_drain_prefix().is_ok());
+    assert_eq!(s.owed_child_exit_wakeups, 1, "one child exit, one wakeup");
+    assert_eq!(s.host_signal_attempts, 0);
+}
+
+#[test]
+fn reporting_backend_child_exit_readmits_a_deferred_parent() {
+    let mut s = physical_exit_reporting_scheduler();
+    let (parent, _, _) = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    s.blocked.sigchld_deferred.insert(DetPid::from_raw(100));
+
+    grant_child_exit_and_remove_thread(&mut s, child, child_mm);
+    assert!(s.step2_drain_prefix().is_err());
+    assert!(s.blocked.sigchld_deferred.contains(&DetPid::from_raw(100)));
+
+    // `release_all_physical_process_exits` is the supervisor's final drain;
+    // it releases the hold exactly as an individual completion does.
+    assert_eq!(s.release_all_physical_process_exits(), 1);
+    assert!(s.step2_drain_prefix().is_ok());
+    assert_eq!(s.owed_child_exit_wakeups, 1);
+    assert_eq!(s.host_signal_attempts, 0);
+    assert!(!s.blocked.sigchld_deferred.contains(&DetPid::from_raw(100)));
+    assert!(s.blocked.sigchld_ready.contains(&DetPid::from_raw(100)));
+    assert!(s.run_queue.contains_tid(parent));
+}
+
+#[test]
+fn reporting_backend_child_exit_owes_nothing_to_a_parent_that_exited() {
+    let mut s = physical_exit_reporting_scheduler();
+    let (parent, parent_mm, _) = add(&mut s, 100, 100);
+    let (child, child_mm, _) = add_process_child(&mut s, 100, 200);
+    let child_process = DetPid::from_raw(200);
+
+    grant_child_exit_and_remove_thread(&mut s, child, child_mm);
+    assert!(s.child_exit_signals_owed.contains_key(&child_process));
+    s.logically_kill_thread(&parent, &DetPid::from_raw(100), parent_mm);
+    assert!(s.child_exit_signals_owed.is_empty());
+
+    // With no one owed a wakeup, the child's pending exit does not hold the
+    // schedule, and its completion wakes nobody.
+    assert!(s.step2_drain_prefix().is_ok());
+    assert!(s.complete_physical_process_exit(child_process));
+    assert!(s.step2_drain_prefix().is_ok());
+    assert_eq!(s.owed_child_exit_wakeups, 0);
+}
+
+#[test]
+fn reporting_backend_exit_of_a_parent_keeps_the_wakeup_it_owes_its_own_parent() {
+    let mut s = physical_exit_reporting_scheduler();
+    let (grandparent, _, _) = add(&mut s, 100, 100);
+    let (parent, parent_mm, _) = add_process_child(&mut s, 100, 200);
+    let (child, child_mm, _) = add_process_child(&mut s, 200, 300);
+    park_on_internal_poll(&mut s, grandparent);
+
+    grant_child_exit_and_remove_thread(&mut s, child, child_mm);
+    grant_child_exit_and_remove_thread(&mut s, parent, parent_mm);
+    // The middle process's exit drops what is owed TO it, not what it owes.
+    assert_eq!(
+        s.child_exit_signals_owed.iter().collect::<Vec<_>>(),
+        vec![(&DetPid::from_raw(200), &DetPid::from_raw(100))]
+    );
+    // The grandchild's pending exit no longer holds anything; the middle
+    // process's does.
+    assert!(s.step2_drain_prefix().is_err());
+    assert!(s.complete_physical_process_exit(DetPid::from_raw(300)));
+    assert!(s.step2_drain_prefix().is_err());
+    assert!(s.complete_physical_process_exit(DetPid::from_raw(200)));
+    assert!(s.step2_drain_prefix().is_ok());
+    assert_eq!(s.owed_child_exit_wakeups, 1);
+    assert!(requests_inbound_sigchld(&s, grandparent));
+}
+
 #[test]
 fn exit_boundary_reservation_failure_has_no_local_effect() {
     let (mut s, backend) = fixture();

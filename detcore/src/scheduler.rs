@@ -655,6 +655,9 @@ pub struct Scheduler {
     backend: BackendCapabilities,
     #[cfg(test)]
     host_signal_attempts: u64,
+    /// Parents woken by `step2_deliver_owed_child_exit_signals`.
+    #[cfg(test)]
+    owed_child_exit_wakeups: u64,
     /// Turns that `do_a_turn_blocking` ran through the controlled loop.
     #[cfg(test)]
     controlled_turn_entries: u64,
@@ -692,6 +695,13 @@ pub struct Scheduler {
 
     /// Reporting-backend children whose final physical exit has been observed.
     completed_physical_process_exits: BTreeSet<DetPid>,
+
+    /// Reporting-backend child processes whose `Exit` grant owes their parent a
+    /// `SIGCHLD` wakeup, keyed by child and naming the parent. The kernel sends
+    /// that backend's one real `SIGCHLD` when the supervisor reaps the child;
+    /// `step2_deliver_owed_child_exit_signals` makes the parent observe it at
+    /// the first scheduling pass after the reap and sends no signal of its own.
+    child_exit_signals_owed: BTreeMap<DetPid, DetPid>,
 
     /// Ac table of "locks held": which action is using which resources.
     /// A given resource can be held by at most one action at a given time.
@@ -1771,6 +1781,8 @@ impl Scheduler {
             #[cfg(test)]
             host_signal_attempts: 0,
             #[cfg(test)]
+            owed_child_exit_wakeups: 0,
+            #[cfg(test)]
             controlled_turn_entries: 0,
             real_timers: Default::default(),
             parked: Default::default(),
@@ -1782,6 +1794,7 @@ impl Scheduler {
             pending_physical_process_exits: Default::default(),
             logically_exited_processes: Default::default(),
             completed_physical_process_exits: Default::default(),
+            child_exit_signals_owed: Default::default(),
             resources: Default::default(),
             started_up: Default::default(),
             thread_tree: Default::default(),
@@ -2343,6 +2356,11 @@ impl Scheduler {
             }
             self.blocked.timed_waiters.remove_process_timers(*detpid);
             self.real_timers.retire_process(*detpid);
+            // A parent that is gone can no longer be woken for its children.
+            // This process's own entry, if any, stays: its parent is still
+            // owed the wakeup once this exit is physically complete.
+            self.child_exit_signals_owed
+                .retain(|_, parent| parent != detpid);
         }
     }
 
@@ -2932,6 +2950,65 @@ impl Scheduler {
             return Err(SkipTurn);
         }
         self.step2a_wait_for_vfork_barrier()?;
+        self.step2_deliver_owed_child_exit_signals()
+    }
+
+    /// Wake the parents owed a child-exit `SIGCHLD` on a backend that reports
+    /// physical process exits.
+    ///
+    /// On such a backend the kernel sends the parent its one real `SIGCHLD`
+    /// while the supervisor reaps the child, and the reap happens before
+    /// `complete_physical_process_exit` runs under the scheduler lock. So once
+    /// the child has left `pending_physical_process_exits`, the signal has
+    /// already been generated for the parent. Until then no guest turn may run:
+    /// the wakeup must sit at the same point in the schedule on every run, and
+    /// that point is the first scheduling pass after the child's `Exit` grant.
+    ///
+    /// This only makes the parent runnable so that it can take the pending
+    /// signal. It sends nothing; sending a second `SIGCHLD` here is the defect
+    /// this replaces, because whether the kernel merges the two depends on host
+    /// timing.
+    fn step2_deliver_owed_child_exit_signals(&mut self) -> Result<(), SkipTurn> {
+        if self.child_exit_signals_owed.is_empty() {
+            return Ok(());
+        }
+        if self
+            .child_exit_signals_owed
+            .keys()
+            .any(|child| self.pending_physical_process_exits.contains(child))
+        {
+            std::thread::yield_now();
+            return Err(SkipTurn);
+        }
+        let ready: Vec<(DetPid, DetPid)> = self
+            .child_exit_signals_owed
+            .iter()
+            .filter(|(child, _)| {
+                !self
+                    .thread_tree
+                    .my_thread_group(child)
+                    .into_iter()
+                    .any(|tid| self.next_turns.contains_key(&tid))
+            })
+            .map(|(child, parent)| (*child, *parent))
+            .collect();
+        for (child, parent) in ready {
+            self.child_exit_signals_owed.remove(&child);
+            #[cfg(test)]
+            {
+                self.owed_child_exit_wakeups += 1;
+            }
+            self.blocked.sigchld_ready.insert(parent);
+            if self.blocked.sigchld_deferred.remove(&parent) {
+                self.run_queue.push_eager_io_repoll(parent);
+            } else if let Some(target) = self.select_signal_target(parent, Some(parent)) {
+                info!(
+                    "[dtid {}] child {} exited; waking the parent for its pending SIGCHLD.",
+                    target, child
+                );
+                self.wake_signaled_guest(target, Signal::SIGCHLD);
+            }
+        }
         Ok(())
     }
 
@@ -4531,6 +4608,16 @@ impl Scheduler {
             // that pidfd would make the application observe both CLD_EXITED and
             // SI_TKILL for one child, so only the scheduler wait readiness is
             // synthesized on that path.
+            //
+            // A backend that reports physical process exits (SaBRe) has the
+            // same property without a pidfd: its supervisor reaps the child, and
+            // that reap is what makes the kernel send the parent its one real
+            // SIGCHLD. A second, scheduler-sent SIGCHLD may or may not merge
+            // with it depending on host timing, so the guest would sometimes
+            // see one signal and sometimes two. For such a backend the grant
+            // only records that the parent is owed a wakeup;
+            // `step2_deliver_owed_child_exit_signals` performs that wakeup after
+            // the reap, without sending a signal.
             ResourceID::Exit { group, process, mm } => {
                 let reserve_mode = match self.reserve_exit_boundary(dettid, *process, *mm, *group) {
                     Ok(mode) => mode,
@@ -4547,13 +4634,17 @@ impl Scheduler {
                     && let Some(parent) = self.thread_tree.parent_process(process)
                     && self.should_synthesize_child_exit_signal(parent)
                 {
-                    // Fire strictly after the current committed time so the event
-                    // is dispatched on a subsequent scheduler pass (DetTid == DetPid
-                    // for a group leader, so `parent` is also the parent thread id).
-                    let deadline = self.committed_time + LogicalTime::from_nanos(1);
-                    self.blocked
-                        .timed_waiters
-                        .insert_child_exit(deadline, *process, parent, parent);
+                    if self.backend.reports_physical_process_exits {
+                        self.child_exit_signals_owed.insert(*process, parent);
+                    } else {
+                        // Fire strictly after the current committed time so the event
+                        // is dispatched on a subsequent scheduler pass (DetTid == DetPid
+                        // for a group leader, so `parent` is also the parent thread id).
+                        let deadline = self.committed_time + LogicalTime::from_nanos(1);
+                        self.blocked
+                            .timed_waiters
+                            .insert_child_exit(deadline, *process, parent, parent);
+                    }
                 }
                 Ok(())
             }
