@@ -15,6 +15,8 @@ remain ignored because they can be regenerated.
   on first use. `components = ["clippy", "rustfmt"]` is part of that pin
   because rustup does not add them to a freshly installed dated toolchain
   otherwise.
+- `flock` (util-linux). The first Reindeer invocation on a cache builds
+  under a lock.
 - `rust-script` 0.36.0. Dependency regeneration runs one checked-in
   rust-script postprocessor that materializes Reverie DBT's native source tree;
   install the pinned version with
@@ -562,7 +564,19 @@ project root, so the Hermit pin governs the whole build.
 The first Reindeer invocation downloads the pinned source revision, installs the
 pinned Rust toolchain if needed, and compiles Reindeer into the user cache
 (about 1m25s cold). Set `HERMIT_BUCK2_TOOL_CACHE` to place that cache
-elsewhere. DotSlash downloads and verifies the platform-specific Buck2 release
+elsewhere. Each build is named by the tool revision, the toolchain and the
+build recipe in `bootstrap/run-pinned-tool`: its source checkout, target
+directory and lock all carry that name. Concurrent first invocations of one
+build compile it once under the lock, and a checkout left by an interrupted
+build is started again. The build ignores the caller's `RUSTFLAGS`,
+`RUSTC_WRAPPER` and `CARGO_PROFILE_*` settings, which are not part of the name.
+`HERMIT_BUCK2_SHARED_TOOL_CACHE` names a cache shared with other checkouts,
+such as one per validation host, and takes precedence over
+`HERMIT_BUCK2_TOOL_CACHE`; older checkouts, which lack the lock, ignore it. A
+shared cache trusts every checkout that writes to it: a hit runs the cached
+binary without checking it. Nothing is evicted; each build takes about 1 GB.
+
+DotSlash downloads and verifies the platform-specific Buck2 release
 binary; `DOTSLASH_CACHE` relocates its cache.
 
 `regenerate-rust-deps` starts without generated dependency output, vendors the
