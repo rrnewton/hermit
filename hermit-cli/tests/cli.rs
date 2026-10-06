@@ -292,12 +292,23 @@ fn hermit_with_stdin(args: &[&str], input: &[u8]) -> Output {
         .unwrap_or_else(|error| panic!("failed to wait for hermit with {args:?}: {error}"))
 }
 
+/// A directory under `CARGO_TARGET_TMPDIR` owned by this test process. Nextest
+/// runs every test in its own process, so each process builds its fixtures
+/// again; with a shared path, two tests running at once would write, or run,
+/// the same file.
+fn process_build_root(name: &str) -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join(name)
+        .join("build")
+        .join(std::process::id().to_string())
+}
+
 fn dbt_stderr_guest() -> &'static Path {
     DBT_STDERR_GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-stderr-nostdlib");
+        let build_root = process_build_root("dbt-stderr-nostdlib");
         fs::create_dir_all(&build_root).expect("failed to create DBT stderr guest directory");
         let guest = build_root.join("stderr_nostdlib");
         let output = Command::new("cc")
@@ -330,7 +341,7 @@ fn dbt_log_env_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-hermit-log-env");
+        let build_root = process_build_root("dbt-hermit-log-env");
         fs::create_dir_all(&build_root).expect("failed to create DBT log-env guest directory");
         let guest = build_root.join("hermit_log_env");
         let output = Command::new("cc")
@@ -476,7 +487,7 @@ fn liteinst_inert_runtime() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-inert-runtime");
+        let build_root = process_build_root("liteinst-inert-runtime");
         fs::create_dir_all(&build_root).expect("failed to create inert runtime directory");
         let runtime = build_root.join("libdetcore_liteinst_inert.so");
         let output = Command::new("cc")
@@ -501,7 +512,7 @@ fn exec_clock_continuity_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("exec-clock-continuity");
+        let build_root = process_build_root("exec-clock-continuity");
         fs::create_dir_all(&build_root)
             .expect("failed to create exec-clock-continuity guest directory");
         let guest = build_root.join("exec_clock_continuity");
@@ -527,7 +538,7 @@ fn stdio_lseek_identity_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-lseek-identity");
+        let build_root = process_build_root("stdio-lseek-identity");
         fs::create_dir_all(&build_root).expect("failed to create stdio-lseek build directory");
         let guest = build_root.join("stdio_lseek_identity");
         let output = Command::new("cc")
@@ -556,7 +567,7 @@ fn stdio_inode_identity_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("stdio-inode-identity");
+        let build_root = process_build_root("stdio-inode-identity");
         fs::create_dir_all(&build_root).expect("failed to create stdio-inode build directory");
         let guest = build_root.join("stdio_inode_identity");
         let output = Command::new("cc")
@@ -583,7 +594,7 @@ fn replay_epoch_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("replay-epoch-probe");
+        let build_root = process_build_root("replay-epoch-probe");
         fs::create_dir_all(&build_root).expect("failed to create replay-epoch build directory");
         let guest = build_root.join("replay_epoch_probe");
         let output = Command::new("cc")
@@ -611,7 +622,7 @@ fn fork_child_getrandom_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("fork-child-getrandom");
+        let build_root = process_build_root("fork-child-getrandom");
         fs::create_dir_all(&build_root)
             .expect("failed to create fork-child-getrandom guest directory");
         let guest = build_root.join("fork_child_getrandom");
@@ -641,12 +652,7 @@ fn liteinst_in_guest_wait_signals_guest() -> &'static Path {
     LITEINST_IN_GUEST_WAIT_SIGNALS_GUEST.get_or_init(|| {
         let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/liteinst_in_guest_wait_signals.c");
-        // One directory per test process: two test binaries running at once
-        // must not write, or run, the same executable.
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR"))
-            .join("liteinst-in-guest-wait-signals")
-            .join("build")
-            .join(std::process::id().to_string());
+        let build_root = process_build_root("liteinst-in-guest-wait-signals");
         fs::create_dir_all(&build_root)
             .expect("failed to create the in-guest wait-signals guest directory");
         let guest = build_root.join("liteinst_in_guest_wait_signals");
@@ -672,7 +678,7 @@ fn dbt_mmap_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-mmap");
+        let build_root = process_build_root("dbt-mmap");
         fs::create_dir_all(&build_root).expect("failed to create DBT mmap guest directory");
         let guest = build_root.join("dbt_mmap_exec");
         let output = Command::new("cc")
@@ -697,7 +703,7 @@ fn dbt_exec_failure_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-exec-failure");
+        let build_root = process_build_root("dbt-exec-failure");
         fs::create_dir_all(&build_root).expect("failed to create DBT exec-failure guest directory");
         let guest = build_root.join("dbt_exec_failure");
         let output = Command::new("cc")
@@ -722,7 +728,7 @@ fn dbt_execveat_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-execveat");
+        let build_root = process_build_root("dbt-execveat");
         fs::create_dir_all(&build_root).expect("failed to create DBT execveat guest directory");
         let guest = build_root.join("dbt_execveat_unsupported");
         let output = Command::new("cc")
@@ -747,7 +753,7 @@ fn dbt_wait_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-wait");
+        let build_root = process_build_root("dbt-wait");
         fs::create_dir_all(&build_root).expect("failed to create DBT wait guest directory");
         let guest = build_root.join("dbt_wait_lifecycle");
         let output = Command::new("cc")
@@ -772,7 +778,7 @@ fn kvm_exact_child_waits_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-exact-child-waits");
+        let build_root = process_build_root("kvm-exact-child-waits");
         fs::create_dir_all(&build_root)
             .expect("failed to create KVM exact-child wait guest directory");
         let guest = build_root.join("kvm_exact_child_waits");
@@ -797,7 +803,7 @@ fn kvm_gettimeofday_efault_guest() -> &'static Path {
     KVM_GETTIMEOFDAY_EFAULT_GUEST.get_or_init(|| {
         let fixture =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kvm_gettimeofday_efault.c");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-gettimeofday-efault");
+        let build_root = process_build_root("kvm-gettimeofday-efault");
         fs::create_dir_all(&build_root)
             .expect("failed to create KVM gettimeofday EFAULT guest directory");
         let guest = build_root.join("kvm_gettimeofday_efault");
@@ -824,7 +830,7 @@ fn dbt_pid_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-pid");
+        let build_root = process_build_root("dbt-pid");
         fs::create_dir_all(&build_root).expect("failed to create DBT PID guest directory");
         let guest = build_root.join("dbt_pid_virtualization");
         let output = Command::new("cc")
@@ -851,7 +857,7 @@ fn dbt_prlimit_self_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-prlimit-self");
+        let build_root = process_build_root("dbt-prlimit-self");
         fs::create_dir_all(&build_root).expect("failed to create DBT self-prlimit guest directory");
         let guest = build_root.join("dbt_prlimit_self");
         let output = Command::new("cc")
@@ -878,7 +884,7 @@ fn dbt_unsupported_syscall_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-unsupported-syscall");
+        let build_root = process_build_root("dbt-unsupported-syscall");
         fs::create_dir_all(&build_root)
             .expect("failed to create DBT unsupported-syscall guest directory");
         let guest = build_root.join("dbt_unsupported_syscall");
@@ -905,7 +911,7 @@ fn dbt_self_sigqueue_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dbt-self-sigqueue");
+        let build_root = process_build_root("dbt-self-sigqueue");
         fs::create_dir_all(&build_root)
             .expect("failed to create DBT self-sigqueue guest directory");
         let guest = build_root.join("dbt_self_sigqueue");
@@ -4406,7 +4412,7 @@ fn run_kvm_cpuid_policy_is_deterministic() {
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .expect("hermit-cli should be inside the repository");
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kvm-cpuid");
+    let build_root = process_build_root("kvm-cpuid");
     fs::create_dir_all(&build_root).expect("failed to create KVM CPUID guest directory");
     let binary = build_root.join("cpuid_probe");
     let compile = Command::new(compiler)
@@ -5508,8 +5514,9 @@ fn sabre_rpc_socket_ignores_host_tmpdir_hidden_by_container_tmp() {
         .prefix("sabre-host-tmpdir-")
         .tempdir_in("/tmp")
         .expect("failed to create nested host TMPDIR");
-    let verify_report =
-        Path::new(env!("CARGO_TARGET_TMPDIR")).join("sabre-nested-host-tmpdir-verify.json");
+    let report_root = process_build_root("sabre-nested-host-tmpdir");
+    fs::create_dir_all(&report_root).expect("failed to create the verify report directory");
+    let verify_report = report_root.join("verify.json");
     let _ = fs::remove_file(&verify_report);
 
     let _guard = hermit_run_guard();
@@ -10566,7 +10573,7 @@ stderr:
 /// per host.
 #[test]
 fn a_guest_cannot_escape_the_deterministic_pipe_capacity_pin() {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("pipe-capacity-pin");
+    let build_root = process_build_root("pipe-capacity-pin");
     fs::create_dir_all(&build_root).expect("failed to create the pipe-capacity build root");
     let source = build_root.join("pipecap.c");
     fs::write(
@@ -10665,7 +10672,7 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
     );
 
     // Present but not executable: 126, distinct from both 127 and 125.
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("guest-fault-not-executable");
+    let build_root = process_build_root("guest-fault-not-executable");
     fs::create_dir_all(&build_root).expect("failed to create the not-executable build root");
     let unexecutable = build_root.join("not-executable");
     fs::write(&unexecutable, b"\x7fELF not really\n").expect("failed to write the file");
@@ -10787,7 +10794,9 @@ fn a_guest_side_fault_is_not_reported_as_a_hermit_internal_failure() {
 fn record_classifies_a_gdbserver_replay_stage_container_child_failure() {
     let data_dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR"))
         .expect("failed to create a recording dir");
-    let script = Path::new(env!("CARGO_TARGET_TMPDIR")).join("kill-gdbserver-replay-peer.py");
+    let script_root = process_build_root("kill-gdbserver-replay-peer");
+    fs::create_dir_all(&script_root).expect("failed to create the GDB script directory");
+    let script = script_root.join("kill-gdbserver-replay-peer.py");
     // Finds the OUTER `hermit record` by walking GDB's own ancestry, then kills
     // that process's non-ancestor children -- the replay container. Written from
     // inside the run rather than supervised from outside, so the test does not

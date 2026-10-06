@@ -33,9 +33,35 @@ path = "junit.xml"
 # Cargo runs integration test binaries one after another, and these binaries
 # also use process-local mutexes to serialize Hermit executions. Nextest runs
 # each test in a separate process, so keep their shared contract explicit.
+#
+# The `cli` binary is outside the group. Its HERMIT_RUN_LOCK is a
+# process-local mutex, so under nextest it never serialized two tests; while
+# the binary was in the group, the group (and test.cli's -j 1) did. Every
+# fixture the binary writes under CARGO_TARGET_TMPDIR, including those in the
+# tests/common modules it includes, therefore goes in a directory named for
+# the test process (process_build_root), so two tests running at once never
+# write, or run, the same file. test.cli and its hosted twin test.cli_on_host
+# run at the width the DAG assigns through NEXTEST_TEST_THREADS; every other
+# node that runs the cli binary passes -j 1.
+# ci/nextest-timeout-config.rs accepts exactly this filter.
 [test-groups.hermit-serialized]
 max-threads = 1
 
 [[profile.default.overrides]]
-filter = "package(=hermit) & kind(=test)"
+filter = "package(=hermit) & kind(=test) & !binary(=cli)"
 test-group = "hermit-serialized"
+
+# Stopgap for https://github.com/rrnewton/hermit/issues/3827. `hermit record
+# start --verify-with-gdbex` binds its replay gdbserver to host port
+# 16384 + tid % 1024 (record_start.rs), so two such replays running at once can
+# pick the same port. These two cli tests are the only ones that reach that
+# replay stage; the other --verify-with-gdbex cases fault during recording,
+# before the port is chosen. The group keeps the two from overlapping each
+# other. The general fix is a design item on that issue.
+# ci/nextest-timeout-config.rs accepts exactly this filter too.
+[test-groups.cli-gdbserver-port]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = "package(=hermit) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))"
+test-group = "cli-gdbserver-port"

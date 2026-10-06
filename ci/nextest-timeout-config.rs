@@ -348,6 +348,19 @@ fn exact_filter(identity: &nextest_cpu::AttemptIdentity) -> String {
     )
 }
 
+/// The only overrides a regular configuration may carry, as (filter,
+/// test-group) pairs. Each group only lowers how many of its tests run at once.
+const REGULAR_GROUP_OVERRIDES: [(&str, &str); 2] = [
+    (
+        "package(=hermit) & kind(=test) & !binary(=cli)",
+        "hermit-serialized",
+    ),
+    (
+        "package(=hermit) & binary(=cli) & (test(=record_classifies_a_gdbserver_replay_stage_container_child_failure) | test(=every_record_container_site_classifies_a_child_fault_by_name))",
+        "cli-gdbserver-port",
+    ),
+];
+
 fn regular_config_compatible(document: &DocumentMut) -> bool {
     let Some(default_timeout) = document
         .get("profile")
@@ -388,11 +401,15 @@ fn regular_config_compatible(document: &DocumentMut) -> bool {
                 return false;
             };
             for entry in overrides {
+                let pair = (
+                    entry.get("filter").and_then(Item::as_str),
+                    entry.get("test-group").and_then(Item::as_str),
+                );
                 if profile != "default"
                     || entry.len() != 2
-                    || entry.get("filter").and_then(Item::as_str)
-                        != Some("package(=hermit) & kind(=test)")
-                    || entry.get("test-group").and_then(Item::as_str) != Some("hermit-serialized")
+                    || !REGULAR_GROUP_OVERRIDES
+                        .iter()
+                        .any(|&(filter, group)| pair == (Some(filter), Some(group)))
                 {
                     return false;
                 }
@@ -468,12 +485,13 @@ fn resolve_budgets(
 ) -> Result<ResolvedBudgets, String> {
     let identities = nextest_cpu::selected_inventory(inventory)?;
     context.validate_execution_cohort()?;
-    // This calibration never covers the serialized Hermit integration group.
+    // This calibration never covers the hermit package: its integration tests
+    // run in the serialized group or, for the cli binary, at the DAG's width.
     if identities
         .iter()
         .any(|identity| identity.package == "hermit")
     {
-        return Err("regular calibration cannot cover the serialized Hermit group".into());
+        return Err("regular calibration cannot cover the hermit package".into());
     }
     let calibration: Option<BudgetCalibration> = calibration
         .map(serde_json::from_slice)
@@ -1098,6 +1116,28 @@ mod tests {
             include_str!("../.config/nextest.toml").replace("period = \"57s\"", "period = \"58s\"");
         assert!(!regular_config_compatible(
             &changed_default.parse::<DocumentMut>().unwrap()
+        ));
+        let widened_group =
+            include_str!("../.config/nextest.toml").replace(" & !binary(=cli)\"", "\"");
+        assert_ne!(widened_group, include_str!("../.config/nextest.toml"));
+        assert!(!regular_config_compatible(
+            &widened_group.parse::<DocumentMut>().unwrap()
+        ));
+        let widened_gdb_group = include_str!("../.config/nextest.toml").replace(
+            "binary(=cli) & (test(=record_classifies",
+            "binary(=cli) | (test(=record_classifies",
+        );
+        assert_ne!(widened_gdb_group, include_str!("../.config/nextest.toml"));
+        assert!(!regular_config_compatible(
+            &widened_gdb_group.parse::<DocumentMut>().unwrap()
+        ));
+        let swapped_groups = include_str!("../.config/nextest.toml").replace(
+            "test-group = \"cli-gdbserver-port\"",
+            "test-group = \"hermit-serialized\"",
+        );
+        assert_ne!(swapped_groups, include_str!("../.config/nextest.toml"));
+        assert!(!regular_config_compatible(
+            &swapped_groups.parse::<DocumentMut>().unwrap()
         ));
         assert_eq!(
             runtime_settings(&["-j8".into(), "--retries=2".into()]),

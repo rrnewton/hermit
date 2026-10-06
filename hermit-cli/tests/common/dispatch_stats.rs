@@ -39,10 +39,20 @@ int main(void) {
 }
 "#;
 
+/// A directory under `CARGO_TARGET_TMPDIR` owned by this test process. Nextest
+/// runs every test in its own process, so with a shared path two tests running
+/// at once would write, or run, the same file.
+fn process_build_root() -> PathBuf {
+    Path::new(env!("CARGO_TARGET_TMPDIR"))
+        .join("dispatch-stats")
+        .join("build")
+        .join(std::process::id().to_string())
+}
+
 /// Compile the guest under `CARGO_TARGET_TMPDIR`, which Hermit can see: it
 /// isolates the host `/tmp`.
 pub(super) fn build_guest(name: &str, extra_flags: &[&str]) -> PathBuf {
-    let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dispatch-stats");
+    let build_root = process_build_root();
     fs::create_dir_all(&build_root).expect("failed to create guest build directory");
     // One source per guest: the tests run in parallel.
     let source = build_root.join(format!("{name}.c"));
@@ -123,9 +133,7 @@ pub(super) fn dispatch_record(
     env: &[(&str, &Path)],
     guest: &Path,
 ) -> DispatchStats {
-    let summary_dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join("dispatch-stats")
-        .join(format!("{backend}-summary"));
+    let summary_dir = process_build_root().join(format!("{backend}-summary"));
     fs::create_dir_all(&summary_dir).expect("failed to create summary directory");
     let summary = summary_dir.join("summary.json");
     let _ = fs::remove_file(&summary);

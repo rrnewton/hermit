@@ -57,6 +57,7 @@ use std::time::Instant;
 
 use super::dispatch_stats;
 use super::hermit_run_guard;
+use super::process_build_root;
 
 static LITEINST_ADVANCED_GUEST: OnceLock<PathBuf> = OnceLock::new();
 static LITEINST_MMAP_GUEST: OnceLock<PathBuf> = OnceLock::new();
@@ -101,7 +102,7 @@ fn advanced_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        let build_root = process_build_root("liteinst-advanced");
         fs::create_dir_all(&build_root).expect("failed to create LiteInst guest directory");
         let guest = build_root.join("liteinst_advanced");
         let output = Command::new("cc")
@@ -126,7 +127,7 @@ fn mmap_guest() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        let build_root = process_build_root("liteinst-advanced");
         fs::create_dir_all(&build_root).expect("failed to create LiteInst guest directory");
         let guest = build_root.join("mmap_determinism");
         let output = Command::new("cc")
@@ -148,7 +149,7 @@ fn mmap_guest() -> &'static Path {
 
 fn compatibility_fixture() -> &'static Path {
     LITEINST_COMPAT_FIXTURE.get_or_init(|| {
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        let build_root = process_build_root("liteinst-advanced");
         fs::create_dir_all(&build_root).expect("failed to create LiteInst fixture directory");
         let fixture = build_root.join("compatibility-fixture.txt");
         fs::write(&fixture, COMPAT_FIXTURE_CONTENT).expect("failed to write LiteInst fixture");
@@ -158,7 +159,7 @@ fn compatibility_fixture() -> &'static Path {
 
 fn semantic_fixture() -> &'static Path {
     LITEINST_SEMANTIC_FIXTURE.get_or_init(|| {
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-advanced");
+        let build_root = process_build_root("liteinst-advanced");
         fs::create_dir_all(&build_root).expect("failed to create LiteInst fixture directory");
         let mut fixture = tempfile::Builder::new()
             .prefix("semantic-fixture-")
@@ -975,7 +976,7 @@ fn late_cpuid_guest() -> &'static (PathBuf, PathBuf) {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("dlopen-cpuid-vendor");
+        let build_root = process_build_root("dlopen-cpuid-vendor");
         fs::create_dir_all(&build_root).expect("failed to create late-CPUID guest directory");
         let library = build_root.join("libdlopen_cpuid_vendor.so");
         let guest = build_root.join("dlopen_cpuid_vendor");
@@ -1196,7 +1197,7 @@ fn bootstrap_time_host_identity() -> &'static Path {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .expect("hermit-cli should be inside the repository");
-        let build_root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("liteinst-bootstrap-time");
+        let build_root = process_build_root("liteinst-bootstrap-time");
         fs::create_dir_all(&build_root).expect("failed to create bootstrap-time guest directory");
         let guest = build_root.join("host_identity");
         // -D_GNU_SOURCE matches the build flags that the c-programs/host-identity
