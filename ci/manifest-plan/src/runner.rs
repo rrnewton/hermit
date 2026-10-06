@@ -3247,12 +3247,23 @@ pub fn host_input_changed_reason(change: &InfrastructureError) -> String {
 /// Every condition must hold, from the row and from each inner attempt's own
 /// retained evidence, so that a label alone cannot claim it: the row is a
 /// verify `ERROR` of failure class `understood_infrastructure_failure` and
-/// error kind `infrastructure` whose reason is its first attempt's; each inner
+/// error kind `infrastructure` whose reason is its first attempt's, and whose
+/// retained SaBRe path evidence is the evidence the executor summarized into
+/// its recorded execution path (`retained_path_evidence_error`; the executor
+/// makes a row whose evidence does not summarize an
+/// `invalid-backend-evidence` `ERROR`, and judges the path's eligibility only
+/// on a `PASS`, so an ineligible path does not disqualify); each inner
 /// attempt is an `ERROR` of error kind `infrastructure` that did not time
-/// out, whose retained verification report is the bytes its recorded
+/// out, whose retained exit status, stdout and stderr carry no failure its
+/// producer classified (`producer_failure`, which the executor decides
+/// before it reads any report), whose retained verification report is the
+/// bytes its recorded
 /// `verification_report_sha256` names and parses as a current report with
 /// verdict `infrastructure_error`, a `host_input_changed` error, a comparison
-/// and no `no_result_reason`, whose reason is [`host_input_changed_reason`]
+/// that is complete under the comparator the row records ([`row_comparator`];
+/// the check the classifier makes before it labels a host-input attempt, so a
+/// row it did not classify, such as an imported one, cannot skip it) and no
+/// `no_result_reason`, whose reason is [`host_input_changed_reason`]
 /// of that error, and whose report and captured stdout meet the cell's
 /// declared stdout assertions, which the row records
 /// ([`CellResult::declared_stdout`]; a row without that record never
@@ -3271,6 +3282,7 @@ pub fn host_input_change_only(result: &CellResult) -> bool {
             .attempts
             .first()
             .is_none_or(|first| result.reason != first.reason)
+        || retained_path_evidence_error(result).is_some()
     {
         return false;
     }
@@ -3278,6 +3290,21 @@ pub fn host_input_change_only(result: &CellResult) -> bool {
         if attempt.outcome != "ERROR"
             || attempt.timed_out
             || attempt.error_kind.as_deref() != Some("infrastructure")
+        {
+            return false;
+        }
+        // The executor reads no report over a failure its producer classified
+        // on stderr, so an attempt whose retained process evidence carries one
+        // never reached this label.
+        if producer_failure(
+            &result.mode,
+            result.backend.as_deref(),
+            attempt.status == Some(0),
+            attempt.timed_out,
+            &attempt.stdout,
+            &attempt.stderr,
+        )
+        .is_some()
         {
             return false;
         }
@@ -3292,11 +3319,20 @@ pub fn host_input_change_only(result: &CellResult) -> bool {
         let Ok(report) = current_verification_report(raw.as_bytes()) else {
             return false;
         };
+        // The comparison must be the complete one the row's comparator
+        // requires, the check the classifier makes before it labels a
+        // host-input attempt as one: an incomplete comparison is incomplete
+        // verification evidence instead.
+        let complete = || match row_comparator(result) {
+            Comparator::Strict => report.require_canonical_comparison(),
+            Comparator::Stripped => require_stripped_comparison(&report),
+        };
         match &report.infrastructure_error {
             Some(change @ InfrastructureError::HostInputChanged { .. }) => {
                 report.verdict == Verdict::InfrastructureError
                     && report.no_result_reason.is_none()
                     && report.comparison.is_some()
+                    && complete().is_ok()
                     && attempt.reason.as_deref() == Some(host_input_changed_reason(change).as_str())
                     && declared
                         .exact
@@ -4820,6 +4856,76 @@ pub fn execute_spec(spec: &CellRunSpec) -> Result<AttemptResult, String> {
     )
 }
 
+/// The failure an attempt's producer classified on the first line of its
+/// stderr, before any verification report is read. The executor gives each
+/// its own ERROR kind, and no report read afterwards may supersede it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProducerFailure {
+    /// The guest program was not found or not executable, so no guest was
+    /// created.
+    LaunchRefused,
+    /// The runner cannot start the requested backend. The first line is the
+    /// producer-owned class emitted before human prose; matching a broader
+    /// nonzero exit would hide real regressions. KVM currently bypasses
+    /// ensure_available, so its availability failures do not enter this class.
+    BackendUnavailable,
+    /// A backend-unavailable class for another backend or execution shape: it
+    /// is unavailable evidence, not a product crash, and the human error line
+    /// must never override the mismatched class into FAIL.
+    InvalidBackendEvidence,
+    /// The producer wrote a class that does not establish a more specific
+    /// result. That absence stays a no-result instead of letting the following
+    /// English line manufacture a product failure.
+    UnclassifiedInternal,
+}
+
+/// Which [`ProducerFailure`] the executor finds for an attempt of a `mode`
+/// cell on `backend` whose Hermit process `succeeded` (exit status 0) or not,
+/// `timed_out` or not, and wrote `stdout` and `stderr`; `None` when it finds
+/// none. The executor classifies its own attempt with this, and
+/// [`host_input_change_only`] re-decides a retained attempt with it.
+fn producer_failure(
+    mode: &str,
+    backend: Option<&str>,
+    succeeded: bool,
+    timed_out: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Option<ProducerFailure> {
+    if succeeded {
+        return None;
+    }
+    let line = stderr.lines().next().unwrap_or_default();
+    if mode != "naked"
+        && stdout.is_empty()
+        && matches!(
+            line,
+            "HERMIT_INTERNAL_FAILURE class=guest-program-not-found"
+                | "HERMIT_INTERNAL_FAILURE class=guest-program-not-executable"
+        )
+    {
+        return Some(ProducerFailure::LaunchRefused);
+    }
+    if timed_out {
+        return None;
+    }
+    if mode != "naked"
+        && stdout.is_empty()
+        && backend.is_some_and(|backend| {
+            line == format!("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend={backend}")
+        })
+    {
+        return Some(ProducerFailure::BackendUnavailable);
+    }
+    if line.starts_with("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=") {
+        return Some(ProducerFailure::InvalidBackendEvidence);
+    }
+    if line == "HERMIT_INTERNAL_FAILURE class=cli-error" {
+        return Some(ProducerFailure::UnclassifiedInternal);
+    }
+    None
+}
+
 fn execute_spec_until(
     spec: &CellRunSpec,
     deadline: Instant,
@@ -4917,14 +5023,15 @@ fn execute_spec_until(
         .map(|kind| kind.reason(cpu_timeout_seconds, wall_timeout_seconds));
     let mut error_kind = None;
     let failure_class_line = stderr.lines().next().unwrap_or_default();
-    let launch_refusal = spec.id.mode != "naked"
-        && !output.status.success()
-        && stdout.is_empty()
-        && matches!(
-            failure_class_line,
-            "HERMIT_INTERNAL_FAILURE class=guest-program-not-found"
-                | "HERMIT_INTERNAL_FAILURE class=guest-program-not-executable"
-        );
+    let producer_class = producer_failure(
+        &spec.id.mode,
+        spec.id.backend.as_deref(),
+        output.status.success(),
+        output.timeout.is_some(),
+        &stdout,
+        &stderr,
+    );
+    let launch_refusal = producer_class == Some(ProducerFailure::LaunchRefused);
     if launch_refusal {
         outcome = "ERROR".into();
         error_kind = Some("guest-launch-refused".into());
@@ -4937,24 +5044,9 @@ fn execute_spec_until(
         ));
     }
     // A runner that cannot start the requested backend and a backend that ran
-    // but produced no canonical comparison are different failures. Keep both
-    // visible as ERROR, but give the pre-guest availability refusal its own
-    // machine-readable kind so sweeps cannot count it as a product failure.
-    // The first line is the producer-owned class emitted before human prose.
-    // Matching a broader nonzero exit would hide real regressions.
-    // KVM currently bypasses ensure_available, so its availability failures do
-    // not enter this class.
-    let unavailable_class = spec.id.backend.as_deref().map(|backend| {
-        format!("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend={backend}")
-    });
-    let backend_unavailable = spec.id.mode != "naked"
-        && !launch_refusal
-        && output.timeout.is_none()
-        && !output.status.success()
-        && stdout.is_empty()
-        && unavailable_class
-            .as_deref()
-            .is_some_and(|class| failure_class_line == class);
+    // but produced no canonical comparison are different failures
+    // ([`ProducerFailure::BackendUnavailable`]).
+    let backend_unavailable = producer_class == Some(ProducerFailure::BackendUnavailable);
     if backend_unavailable {
         outcome = "ERROR".into();
         error_kind = Some("backend-unavailable".into());
@@ -4967,13 +5059,8 @@ fn execute_spec_until(
         ));
     }
     // A producer class that cannot satisfy the requested backend or execution
-    // shape is unavailable evidence, not a product crash. In particular, the
-    // human error line must never override a mismatched class into FAIL.
-    let invalid_backend_evidence = output.timeout.is_none()
-        && !output.status.success()
-        && !backend_unavailable
-        && failure_class_line
-            .starts_with("HERMIT_INTERNAL_FAILURE class=backend-unavailable backend=");
+    // shape ([`ProducerFailure::InvalidBackendEvidence`]).
+    let invalid_backend_evidence = producer_class == Some(ProducerFailure::InvalidBackendEvidence);
     if invalid_backend_evidence {
         outcome = "ERROR".into();
         error_kind = Some("invalid-backend-evidence".into());
@@ -4982,14 +5069,9 @@ fn execute_spec_until(
         ));
     }
     // The producer did write a class, but it did not establish a more specific
-    // result. Keep that absence as no-result instead of letting the following
-    // English line manufacture a product failure.
-    let unclassified_internal_failure = output.timeout.is_none()
-        && !output.status.success()
-        && !launch_refusal
-        && !backend_unavailable
-        && !invalid_backend_evidence
-        && failure_class_line == "HERMIT_INTERNAL_FAILURE class=cli-error";
+    // result ([`ProducerFailure::UnclassifiedInternal`]).
+    let unclassified_internal_failure =
+        producer_class == Some(ProducerFailure::UnclassifiedInternal);
     if unclassified_internal_failure {
         outcome = "ERROR".into();
         error_kind = Some("incomplete-verification-evidence".into());
@@ -4999,10 +5081,7 @@ fn execute_spec_until(
             .filter(|detail| !detail.trim().is_empty())
             .map(str::to_owned);
     }
-    let producer_failure_classified = launch_refusal
-        || backend_unavailable
-        || invalid_backend_evidence
-        || unclassified_internal_failure;
+    let producer_failure_classified = producer_class.is_some();
     let mut report_json = None;
     let mut report_sha = None;
     let mut runtime = None;
@@ -7508,8 +7587,19 @@ pub(crate) fn execution_path_ineligible(execution_path: Option<&JsonValue>) -> b
 
 /// Whether a Hermit command line selects the SaBRe backend, the executions
 /// that write SaBRe execution-path evidence.
+///
+/// Only Hermit's own arguments select a backend. The executor writes the
+/// guest command after the first `--` (`verified_invocation_argv`, the
+/// `custom` mode), so a `--backend sabre` pair there is an argument of the
+/// guest, not a backend selection, and a ptrace run whose guest takes it
+/// writes no SaBRe evidence.
 fn argv_selects_sabre(argv: &[String]) -> bool {
-    argv.windows(2)
+    let hermit_args = argv
+        .iter()
+        .position(|arg| arg == "--")
+        .map_or(argv, |separator| &argv[..separator]);
+    hermit_args
+        .windows(2)
         .any(|window| window[0] == "--backend" && window[1] == "sabre")
 }
 
@@ -7529,6 +7619,25 @@ fn argv_selects_sabre(argv: &[String]) -> bool {
 /// is eligible (`execution_path_ineligible` is false). A row of another
 /// backend therefore has no evidence and no `execution_path`.
 pub fn retained_execution_path_error(result: &CellResult) -> Option<String> {
+    if let Some(error) = retained_path_evidence_error(result) {
+        return Some(error);
+    }
+    execution_path_ineligible(result.execution_path.as_ref()).then(|| {
+        "the row's SaBRe execution path is incomplete or used fallback/native sites".into()
+    })
+}
+
+/// Why `result`'s retained SaBRe path evidence is not the evidence the
+/// executor summarized into its recorded `execution_path`, if it is not:
+/// [`retained_execution_path_error`] without its eligibility check.
+///
+/// The executor summarizes every row's evidence
+/// (`summarize_sabre_path_evidence`), whatever its outcome, makes a row whose
+/// evidence does not summarize an `invalid-backend-evidence` `ERROR`, and
+/// records the summary as the row's execution path; it judges the path's
+/// eligibility only on a `PASS`. So a non-`PASS` row this finds an error in
+/// is not one the executor wrote, while one with an ineligible path may be.
+fn retained_path_evidence_error(result: &CellResult) -> Option<String> {
     let sabre = result.backend.as_deref() == Some("sabre");
     for attempt in &result.attempts {
         let index = attempt.index.as_str();
@@ -7553,14 +7662,8 @@ pub fn retained_execution_path_error(result: &CellResult) -> Option<String> {
         Ok(summary) => summary,
         Err(error) => return Some(error),
     };
-    if summary != result.execution_path {
-        return Some(
-            "the row's execution_path is not the summary of its retained SaBRe path evidence"
-                .into(),
-        );
-    }
-    execution_path_ineligible(summary.as_ref()).then(|| {
-        "the row's SaBRe execution path is incomplete or used fallback/native sites".into()
+    (summary != result.execution_path).then(|| {
+        "the row's execution_path is not the summary of its retained SaBRe path evidence".into()
     })
 }
 
@@ -17678,8 +17781,8 @@ exit "$(cat "$PWD/exit-status")"
     /// A divergence Hermit attributes to a host file changing during a run is
     /// an infrastructure ERROR, not a product failure, and is the one row the
     /// host-input retry accepts. A plain divergence stays a product FAIL, and
-    /// a row whose reason or report does not match its own evidence does not
-    /// qualify.
+    /// a row whose reason, report or SaBRe path evidence does not match its
+    /// own evidence does not qualify.
     #[test]
     fn only_a_typed_host_input_change_is_a_host_input_row() {
         let change_report = serde_json::to_string(&host_input_change_report_value()).unwrap();
@@ -17749,6 +17852,65 @@ exit "$(cat "$PWD/exit-status")"
             Some(&skid_report(2)),
         )]);
         assert!(!host_input_change_only(&skid));
+
+        // SaBRe path evidence. The executor summarizes a row's retained
+        // evidence into its execution path whatever the row's outcome, makes a
+        // row whose evidence does not summarize an invalid-backend-evidence
+        // ERROR, and judges the path's eligibility only on a PASS. So a
+        // genuine SaBRe host-input row qualifies, with a clean or a fallback
+        // path, and one whose evidence does not summarize, is not the bytes
+        // its digest names, or is not the row's recorded path does not.
+        const CLEAN_PATH: &str = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":0,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+        const FALLBACK_PATH: &str = r#"{"schema":1,"guest_rpc_observed":true,"ptrace_fallback_sites":1,"trusted_shared_object_sites":0,"trusted_shared_objects":[]}"#;
+        let clean_evidence = format!("{CLEAN_PATH}\n{CLEAN_PATH}\n");
+        let fallback_evidence = format!("{CLEAN_PATH}\n{FALLBACK_PATH}\n");
+        let mut sabre = verify_row_from_attempts(vec![attempt_from_script(
+            "sabre",
+            "printf %s \"$1\" > \"$2\"; exit 1",
+            Some(&change_report),
+        )]);
+        sabre.backend = Some("sabre".into());
+        let sabre = with_executor_invocation(sabre);
+        let with_sabre_evidence = |evidence: &str| {
+            let mut row = sabre.clone();
+            for attempt in &mut row.attempts {
+                attempt.sabre_path_evidence = Some(evidence.to_owned());
+                attempt.sabre_path_evidence_sha256 = Some(hex_digest(evidence.as_bytes()));
+            }
+            row.execution_path = summarize_sabre_path_evidence(&row.attempts).unwrap_or(None);
+            row
+        };
+        let genuine = with_sabre_evidence(&clean_evidence);
+        assert_eq!(genuine.execution_path.as_ref().unwrap()["eligible"], true);
+        assert!(host_input_change_only(&genuine), "{genuine:?}");
+        let fallback = with_sabre_evidence(&fallback_evidence);
+        assert_eq!(fallback.execution_path.as_ref().unwrap()["eligible"], false);
+        assert!(host_input_change_only(&fallback), "{fallback:?}");
+        // Evidence without the record schema, under its own digest.
+        let malformed = with_sabre_evidence("{}\n");
+        assert!(summarize_sabre_path_evidence(&malformed.attempts).is_err());
+        assert!(!host_input_change_only(&malformed));
+        let mut misdigested = genuine.clone();
+        misdigested.attempts[0].sabre_path_evidence_sha256 =
+            Some(hex_digest(fallback_evidence.as_bytes()));
+        assert!(!host_input_change_only(&misdigested));
+        let mut mislabelled = genuine.clone();
+        mislabelled.execution_path = fallback.execution_path.clone();
+        assert!(!host_input_change_only(&mislabelled));
+        // A guest argument is not a backend selection: a ptrace row whose
+        // guest takes `--backend sabre`, on the command line the executor
+        // writes, has no SaBRe path and qualifies.
+        let mut guest_args = row.clone();
+        guest_args.attempts[0].guest_argv =
+            ["fixture", "--backend", "sabre"].map(String::from).into();
+        let mut guest_args = with_executor_invocation(guest_args);
+        let argv = &guest_args.attempts[0].argv;
+        let separator = argv.iter().position(|arg| arg == "--").unwrap();
+        assert_eq!(argv[1..5], ["--log", "info", "--backend", "ptrace"]);
+        assert_eq!(argv[separator + 1..], ["fixture", "--backend", "sabre"]);
+        guest_args.execution_path = summarize_sabre_path_evidence(&guest_args.attempts).unwrap();
+        assert_eq!(guest_args.execution_path, None);
+        assert!(host_input_change_only(&guest_args), "{guest_args:?}");
     }
 
     /// A host-input attempt whose compared runs break the cell's declared

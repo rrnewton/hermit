@@ -23,19 +23,22 @@
 //!   only in `summary.json`). Otherwise the cell is one `import-history`
 //!   ERROR. This is checked on the whole history, before anything is dropped.
 //! - The producer retries every failure; this run's retry policy decides which
-//!   of those retries it would have made. History after a failed attempt that
-//!   does not earn a retry here is dropped, so that attempt is the cell's
-//!   verdict.
-//! - Only a FAIL (a product failure) that the policy retries continues an
-//!   imported history; an ERROR always ends it, whatever the policy says. The
-//!   one retry an executed run makes after an ERROR, the skid-overshoot retry
+//!   of those retries it would have made. History after a failed attempt (a
+//!   FAIL or an ERROR) that does not earn a retry here is dropped, so that
+//!   attempt is the cell's verdict.
+//! - The policy is the decision an executed run applies to its own attempt
+//!   (`attempt_retry_cause` in `test-harness`), applied to the imported row.
+//!   For an ERROR that is the skid-overshoot retry
 //!   (`skid_overshoot_only_reports`,
-//!   <https://github.com/rrnewton/hermit/issues/1845>), is admitted only for
-//!   an attempt this run executed and classified itself: its admission rests
-//!   on the retained evidence of both attempts, which a row another runner
-//!   wrote cannot be trusted to carry completely. An imported history that
-//!   reaches a typed skid-overshoot ERROR therefore ends there (fail closed),
-//!   and that infrastructure ERROR is the cell's verdict.
+//!   <https://github.com/rrnewton/hermit/issues/1845>) or the host-input
+//!   retry (`host_input_change_only`). Neither trusts the row's labels: each
+//!   re-decides the attempt from the report bytes the row retains, which must
+//!   match the row's `verification_report_sha256`, and the row must record
+//!   the exit, stdout and relaxation declarations of this checkout's cell. So
+//!   an imported skid-overshoot ERROR whose retained evidence decides it
+//!   continues to its producer's next attempt, as an executed one would, and
+//!   any other ERROR (an untyped one, a report that does not match its digest,
+//!   another declaration) ends the history.
 //! - A PASS counts only if the producer recorded complete evidence for the
 //!   execution that passed: that row's run id in `evidence_complete_executions`
 //!   in the bucket's `summary.json`. Evidence from another execution of the
@@ -78,9 +81,11 @@ pub fn bucket_dir(root: &Path, lane: &str, category: &str) -> PathBuf {
 
 /// The decisions an executed run makes for itself, applied to imported rows.
 pub struct ImportPolicy<'a> {
-    /// Whether this run would retry after `row` (its retry setting and the
-    /// cell's `no_retry_reason`). It is consulted only for a FAIL row: an
-    /// imported ERROR is never retried, whatever this says.
+    /// Whether this run would retry after `row`, by the rule an executed run
+    /// applies to its own attempt: its retry setting, the cell's
+    /// `no_retry_reason`, and for an ERROR the skid-overshoot and host-input
+    /// rules, which re-decide the attempt from its retained report bytes. It
+    /// is consulted for every FAIL and ERROR row; a PASS ends the history.
     pub earns_retry: &'a dyn Fn(&SelectedCell, &CellResult) -> bool,
     /// Why this machine cannot run the cell, if it cannot.
     pub host_inapplicable: &'a dyn Fn(&SelectedCell) -> Option<String>,
@@ -382,13 +387,15 @@ pub fn load(
                     } else {
                         // Keep the history up to the first attempt this run
                         // would not have retried. A PASS is already the last
-                        // row, so only a failed attempt can drop later ones.
-                        // Only a retried FAIL continues it: an ERROR, such as
-                        // a typed skid overshoot this run would retry had it
-                        // executed the attempt itself, ends it (fail closed).
+                        // row (`history_error`), so only a failed attempt can
+                        // drop later ones. A FAIL or an ERROR continues it
+                        // exactly when the policy retries it: a typed skid
+                        // overshoot does, as it would had this run executed
+                        // the attempt, because the policy re-decides it from
+                        // the report bytes the row retains.
                         let kept = found
                             .iter()
-                            .position(|row| row.outcome != "FAIL" || !(policy.earns_retry)(cell, row))
+                            .position(|row| row.outcome == "PASS" || !(policy.earns_retry)(cell, row))
                             .map_or(found.len(), |terminal| terminal + 1);
                         dropped_retries += found.len() - kept;
                         found.truncate(kept);
