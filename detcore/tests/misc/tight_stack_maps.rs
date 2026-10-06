@@ -36,6 +36,19 @@ use super::tight_stack_openat::tight_stack;
 
 const MAPS: &CStr = c"/proc/self/maps";
 
+/// The x86-64 System V red zone below `rsp`, which Detcore never borrows.
+const RED_ZONE: usize = 128;
+
+/// How far below `rsp` the control case plants its pattern; the borrowed
+/// scratch lies between this and the red zone.
+const SCRATCH_SPAN: usize = 1024;
+
+/// The byte planted `offset` bytes above `rsp - SCRATCH_SPAN`: nonzero and
+/// varying, so neither zeroing nor a shifted copy goes unnoticed.
+fn planted_byte(offset: usize) -> u8 {
+    0xa5 ^ (offset % 251) as u8
+}
+
 /// Issue `read(fd, buffer, buffer.len())` with `rsp` switched to `stack` for
 /// the duration of the `syscall` instruction.
 ///
@@ -95,7 +108,37 @@ fn maps_read_succeeds_without_writable_stack_below_rsp() {
             let fd = unsafe { libc::open(MAPS.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
             assert!(fd >= 0, "open of {MAPS:?} failed");
             let (stack, mapping, mapping_len) = tight_stack(below, writable_bytes);
+            // In the control the whole scratch area fits below the red zone,
+            // so Detcore borrows it for the injected `fstatat`. Plant a
+            // pattern in [rsp-1024, rsp-128) and require it back intact, as
+            // Linux leaves memory a `read` does not target.
+            let planted = (writable_bytes >= SCRATCH_SPAN).then(|| {
+                // SAFETY: tight_stack made `writable_bytes` bytes below
+                // `stack` writable, and nothing else uses them.
+                let start = unsafe { stack.sub(SCRATCH_SPAN) };
+                for offset in 0..SCRATCH_SPAN - RED_ZONE {
+                    unsafe { start.add(offset).write_volatile(planted_byte(offset)) };
+                }
+                start
+            });
             let first = unsafe { raw_read_on_stack(stack, fd, &mut buffer) };
+            if let Some(start) = planted {
+                let changed: Vec<usize> = (0..SCRATCH_SPAN - RED_ZONE)
+                    .filter(|&offset| {
+                        // SAFETY: as above; the mapping is still in place.
+                        let byte = unsafe { start.add(offset).read_volatile() };
+                        byte != planted_byte(offset)
+                    })
+                    .collect();
+                assert!(
+                    changed.is_empty(),
+                    "reading {MAPS:?} changed {} of the {} bytes planted below the red zone \
+                     (first offsets from rsp-{SCRATCH_SPAN}: {:?}); Linux changes none",
+                    changed.len(),
+                    SCRATCH_SPAN - RED_ZONE,
+                    &changed[..changed.len().min(8)]
+                );
+            }
             assert_eq!(unsafe { libc::munmap(mapping, mapping_len) }, 0);
             assert!(
                 first > 0,
