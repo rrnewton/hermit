@@ -15,7 +15,7 @@
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
  *             extchld|extchldreaped|extchldlive|chldflood] [held]
  *        external_signal_interrupt sigsuspend creator
- *        external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty>
+ *        external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty|hupinherit>
  *        external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
@@ -871,6 +871,50 @@ static int hangup_main(const char *call, int by_ioctl, const char *role) {
   return 0;
 }
 
+/* The `poll hupinherit` mode. Hermit starts this guest in a session that
+ * already has a controlling terminal: the test harness makes a
+ * pseudoterminal's slave the controlling terminal of a new session before it
+ * starts Hermit, so the guest neither opens the terminal nor issues TIOCSCTTY,
+ * and none of its standard descriptors is a terminal. The guest catches
+ * SIGHUP, prints `CTTY 1` when it can open /dev/tty (Linux opens it only for a
+ * process with a controlling terminal; O_NOCTTY keeps the open from acquiring
+ * one) and `CTTY 0` otherwise, prints READY and polls no descriptors for
+ * HUPINHERIT_POLL_MS. The harness then sends this guest SIGHUP from outside
+ * the container, as a terminal hangup would at a moment the host chooses. On
+ * Linux the poll returns EINTR at that instant; under Hermit that instant is
+ * the host's. So the poll must keep its deadline: it returns 0 after its full
+ * timeout and the handler runs once afterwards. The timeout is long because
+ * Hermit's virtual clock can run several times faster than the host's, and the
+ * signal must arrive while the poll still waits. Prints
+ * `RESULT call=poll role=hupinherit` and the fields of the parent-death modes. */
+#define HUPINHERIT_POLL_MS 10000
+static int inherited_hangup_main(const char *call) {
+  if (strcmp(call, "poll")) return 2;
+  set_handler(SIGHUP, on_pdeath);
+  int tty = open("/dev/tty", O_RDONLY | O_NOCTTY | O_CLOEXEC);
+  say(tty >= 0 ? "CTTY 1\n" : "CTTY 0\n");
+  if (tty >= 0) close(tty);
+  say("READY\n");
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  errno = 0;
+  int ret = poll(NULL, 0, HUPINHERIT_POLL_MS);
+  int err = errno;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  for (int naps = 0; pdeath_handled == 0 && naps < PDEATH_HANDLER_NAPS; naps++) sleep_ms(1);
+  long elapsed = ms_between(&start, &end);
+  int handled_count = pdeath_handled;
+  int ok = ret == 0 && elapsed >= HUPINHERIT_POLL_MS &&
+           elapsed < HUPINHERIT_POLL_MS + PDEATH_OVERSHOOT_MS && handled_count == 1;
+  char line[200];
+  snprintf(line, sizeof line,
+           "RESULT call=poll role=hupinherit ret=%d errno=%s elapsed=%ld handled=%d ok=%d\n", ret,
+           ret < 0 ? errno_name(err) : "none", elapsed, handled_count, ok);
+  say(line);
+  say("DONE\n");
+  return 0;
+}
+
 /* The `stopcont` and `stopcontusr1` modes (see the usage comment). */
 #define STOP_DELAY_MS 100
 #define CONT_DELAY_MS 100
@@ -1064,7 +1108,7 @@ int main(int argc, char **argv) {
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
         "spinthrexit|usr2|extchld|extchldreaped|extchldlive|chldflood]\n"
         "       external_signal_interrupt sigsuspend creator\n"
-        "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty>\n"
+        "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty|hupinherit>\n"
         "       external_signal_interrupt <poll|futex> <stopcont|stopcontusr1>\n"
         "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing\n");
     return 2;
@@ -1079,6 +1123,7 @@ int main(int argc, char **argv) {
   if (!strcmp(sender, "exitusr1")) return exit_signal_main(call);
   if (!strcmp(sender, "hupopen")) return hangup_main(call, 0, "hupopen");
   if (!strcmp(sender, "hupctty")) return hangup_main(call, 1, "hupctty");
+  if (!strcmp(sender, "hupinherit")) return inherited_hangup_main(call);
   if (!strcmp(sender, "racing")) return racing_main(call);
   if (!strcmp(sender, "stopcont")) return stopcont_main(call, 0);
   if (!strcmp(sender, "stopcontusr1")) return stopcont_main(call, 1);

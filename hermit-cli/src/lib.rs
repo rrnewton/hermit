@@ -3281,7 +3281,45 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // fact yet, and no combination of its fields selects ptrace alone (its
     // `E9PATCH` constant is `PTRACE`), so it is set here from the backend's name.
     config.backend_supports_blocked_wait_signal_interruption = backend == Backend::Ptrace;
+    // Only those waits read it (`Config::guest_may_inherit_a_terminal`), so the
+    // host is asked only for them.
+    config.guest_may_inherit_a_terminal =
+        config.backend_supports_blocked_wait_signal_interruption && launcher_may_pass_a_terminal();
     config
+}
+
+/// Whether the guest may start with a terminal, which Linux can hang up and
+/// send SIGHUP and SIGCONT for at a moment the host sets
+/// (`Config::guest_may_inherit_a_terminal`): one of this process's standard
+/// descriptors, which the guest inherits, is a terminal, or this process has a
+/// controlling terminal, which the guest inherits with its session because
+/// neither Hermit nor Reverie starts a new session for it. When the
+/// controlling terminal cannot be read, the answer is yes.
+fn launcher_may_pass_a_terminal() -> bool {
+    // SAFETY: isatty only inspects the descriptor.
+    let standard_terminal = (0..=2).any(|fd| unsafe { libc::isatty(fd) } == 1);
+    may_pass_a_terminal(standard_terminal, controlling_terminal_device())
+}
+
+/// The rule of `launcher_may_pass_a_terminal`: a terminal standard descriptor,
+/// a controlling terminal (a nonzero device number), or an unknown one.
+fn may_pass_a_terminal(standard_terminal: bool, controlling_terminal: Option<i64>) -> bool {
+    standard_terminal || controlling_terminal != Some(0)
+}
+
+/// This process's controlling terminal as `/proc/self/stat` reports it: field
+/// 7, `tty_nr`, the terminal's device number, or 0 when there is none. `None`
+/// when it cannot be read.
+fn controlling_terminal_device() -> Option<i64> {
+    parse_controlling_terminal_device(&std::fs::read_to_string("/proc/self/stat").ok()?)
+}
+
+/// `tty_nr` from the text of a `/proc/<pid>/stat` file. The command name in
+/// field 2 is parenthesized and may hold spaces and parentheses, so the fields
+/// after it are counted from its last `)`: state, ppid, pgrp, session, tty_nr.
+fn parse_controlling_terminal_device(stat: &str) -> Option<i64> {
+    let after_command = stat.get(stat.rfind(')')? + 1..)?;
+    after_command.split_ascii_whitespace().nth(4)?.parse().ok()
 }
 
 /// What the selected backend can do, as Detcore consumes it.
@@ -6080,6 +6118,56 @@ mod tests {
                 "unexpected blocked-wait signal support for {backend:?}"
             );
         }
+    }
+
+    /// A launch may pass the guest a terminal when a standard descriptor is
+    /// one, when the launcher has a controlling terminal, or when that cannot
+    /// be read; only a launch with neither is known not to. The device number
+    /// is read past a command name that holds spaces and parentheses.
+    #[test]
+    fn a_launch_may_pass_a_terminal_unless_it_proves_it_has_none() {
+        assert!(!super::may_pass_a_terminal(false, Some(0)));
+        assert!(super::may_pass_a_terminal(true, Some(0)));
+        assert!(super::may_pass_a_terminal(false, Some(34817)));
+        assert!(super::may_pass_a_terminal(false, None));
+
+        let stat = "4242 (a) b (c)) S 1 4242 4242 34817 4242 4194560 0 0 0 0";
+        assert_eq!(super::parse_controlling_terminal_device(stat), Some(34817));
+        let stat = "4242 (hermit) S 1 4242 4242 0 -1 4194560 0 0 0 0";
+        assert_eq!(super::parse_controlling_terminal_device(stat), Some(0));
+        assert_eq!(
+            super::parse_controlling_terminal_device("4242 (hermit"),
+            None
+        );
+        assert_eq!(
+            super::parse_controlling_terminal_device("4242 (hermit) S 1"),
+            None
+        );
+        assert!(super::controlling_terminal_device().is_some());
+    }
+
+    /// Only a backend whose blocked waits decide interruption from the kernel's
+    /// signal state asks whether the launch may pass the guest a terminal.
+    #[test]
+    fn only_gated_backends_record_an_inherited_terminal() {
+        for backend in [
+            Backend::Dbt,
+            Backend::Kvm,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::E9patch,
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            assert!(
+                !config.guest_may_inherit_a_terminal,
+                "unexpected terminal record for {backend:?}"
+            );
+        }
+        let config = prepare_backend_config(super::DetConfig::default(), Backend::Ptrace);
+        assert_eq!(
+            config.guest_may_inherit_a_terminal,
+            super::launcher_may_pass_a_terminal()
+        );
     }
 
     #[test]
