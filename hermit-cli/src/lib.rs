@@ -1655,6 +1655,9 @@ const SABRE_DETLOG_FORWARD_ENV: &str = "REVERIE_SABRE_HERMIT_FORWARD_DETLOG";
 /// Hermit cannot import the constant.
 #[cfg(feature = "liteinst")]
 const LITEINST_DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
+/// `detcore_liteinst::DETLOG_FORWARD_POLICY_ENV`, for the same reason.
+#[cfg(feature = "liteinst")]
+const LITEINST_DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLICY";
 
 /// Where in-guest LiteInst runs in this process forward Detcore's DETLOG
 /// records; see [`forward_in_guest_detlogs_to`].
@@ -1665,25 +1668,33 @@ static IN_GUEST_DETLOG_SINK: Mutex<Option<std::os::fd::OwnedFd>> = Mutex::new(No
 /// `SOCK_SEQPACKET` pair. `hermit run --verify` gives each run its own pair and
 /// reads the records from the other end into that run's log. Each record is one
 /// message, one line (`detcore::detlog::forwarded_line`).
-/// Records are forwarded only while Detcore's INFO records are logged; without a
-/// socket they are not forwarded.
+/// A record is forwarded when the CLI's filter logs INFO for its module (see
+/// [`in_guest_detlog_forward_policy`]); without a socket none are forwarded.
 #[doc(hidden)]
 pub fn forward_in_guest_detlogs_to(socket: std::os::fd::OwnedFd) {
     *IN_GUEST_DETLOG_SINK.lock().unwrap() = Some(socket);
 }
 
 /// Hands the in-guest LiteInst runtime the socket chosen with
-/// [`forward_in_guest_detlogs_to`], when Detcore's INFO records are logged: an
-/// inheritable duplicate whose number goes in the private opt-in variable. The
-/// runtime moves it to a descriptor Reverie reserves and protects from the
+/// [`forward_in_guest_detlogs_to`], when `policy` forwards any record: an
+/// inheritable duplicate whose number goes in the private opt-in variable, and
+/// the encoded policy, which the guest's Detcore applies to each record by its
+/// module as each in-process `detlog!` callsite asks tracing. The runtime
+/// moves the socket to a descriptor Reverie reserves and protects from the
 /// guest. The caller keeps the returned duplicate open until the guest has
 /// started.
 #[cfg(feature = "liteinst")]
 fn request_liteinst_detlog_forwarding(
     command: &mut Command,
+    policy: &detcore::detlog::ForwardPolicy,
 ) -> Result<Option<std::os::fd::OwnedFd>, Error> {
     command.env_remove(LITEINST_DETLOG_FORWARD_ENV);
-    if !tracing::enabled!(target: "detcore", tracing::Level::INFO) {
+    command.env_remove(LITEINST_DETLOG_FORWARD_POLICY_ENV);
+    // Asking only whether INFO is on for `detcore`, and then forwarding
+    // everything, kept records a target-scoped filter drops under ptrace
+    // (info,detcore::random=warn) and could forward nothing where it keeps
+    // some (warn,detcore::random=info).
+    if !policy.forwards_any() {
         return Ok(None);
     }
     let sink = IN_GUEST_DETLOG_SINK.lock().unwrap();
@@ -1702,17 +1713,19 @@ fn request_liteinst_detlog_forwarding(
         LITEINST_DETLOG_FORWARD_ENV,
         duplicate.as_raw_fd().to_string(),
     );
+    command.env(LITEINST_DETLOG_FORWARD_POLICY_ENV, policy.encode());
     Ok(Some(duplicate))
 }
 #[cfg(feature = "sabre")]
 const SABRE_PATH_EVIDENCE_ENV: &str = "HERMIT_SABRE_PATH_EVIDENCE";
 
-/// The INFO policy for DETLOG records SaBRe's guest plugin forwards: the
-/// current subscriber's answer for every target the CLI's `RUST_LOG` names
-/// (the text `EffectiveFilter::from_default_env` builds every CLI subscriber
-/// from) and for any other target.
-#[cfg(feature = "sabre")]
-fn sabre_detlog_forward_policy() -> detcore::detlog::ForwardPolicy {
+/// The INFO policy for DETLOG records an in-guest Detcore (SaBRe's plugin,
+/// in-guest LiteInst) forwards: the current subscriber's answer for every
+/// target the CLI's `RUST_LOG` names (the text
+/// `EffectiveFilter::from_default_env` builds every CLI subscriber from) and
+/// for any other target.
+#[cfg(any(feature = "sabre", feature = "liteinst"))]
+fn in_guest_detlog_forward_policy() -> detcore::detlog::ForwardPolicy {
     let directives = std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV).unwrap_or_default();
     detcore::detlog::ForwardPolicy::from_current_subscriber(&directives)
 }
@@ -1990,7 +2003,7 @@ async fn run_sabre(
     // Per emitting module, as each in-process `detlog!` callsite asks tracing:
     // asking only about `detcore` dropped every record a target-scoped
     // RUST_LOG (warn,detcore::random=info) keeps under ptrace.
-    let detlog_policy = sabre_detlog_forward_policy();
+    let detlog_policy = in_guest_detlog_forward_policy();
     if detlog_policy.forwards_any() {
         command.env(SABRE_DETLOG_FORWARD_ENV, detlog_policy.encode());
     }
@@ -3344,7 +3357,10 @@ async fn dispatch_backend(
             let stats_request = backend_stats::request(print_summary_to_json_file);
             let mut command = command;
             refuse_in_guest_liteinst_run(&mut command, &config)?;
-            let _detlog_descriptor = request_liteinst_detlog_forwarding(&mut command)?;
+            let _detlog_descriptor = request_liteinst_detlog_forwarding(
+                &mut command,
+                &in_guest_detlog_forward_policy(),
+            )?;
             let preload = liteinst_tool_runtime_library_path()?;
             let (exit_status, mut global_state, dispatch_stats) = if stats_request.is_enabled() {
                 let (exit_status, global_state, source) =
@@ -3626,7 +3642,10 @@ async fn dispatch_output_backend(
             command.stdin(output_backend_stdin()?);
             let stats_request = backend_stats::request(print_summary_to_json_file);
             refuse_in_guest_liteinst_run(&mut command, &config)?;
-            let _detlog_descriptor = request_liteinst_detlog_forwarding(&mut command)?;
+            let _detlog_descriptor = request_liteinst_detlog_forwarding(
+                &mut command,
+                &in_guest_detlog_forward_policy(),
+            )?;
             let preload = liteinst_tool_runtime_library_path()?;
             let (output, mut global_state, dispatch_stats) = if stats_request.is_enabled() {
                 let (output, global_state, source) =
@@ -6522,5 +6541,126 @@ mod tests {
         assert!(!scoped.forwards("detcore::tool_local"));
         assert_eq!(policy_under("", LevelFilter::INFO).0, ForwardPolicy::all());
         assert!(!policy_under("", LevelFilter::WARN).0.forwards_any());
+    }
+
+    /// In-guest LiteInst gets the per-target policy it is given next to the
+    /// forwarding descriptor, and a policy that forwards nothing requests no
+    /// forwarding and clears both variables.
+    #[cfg(feature = "liteinst")]
+    #[test]
+    fn liteinst_detlog_forwarding_hands_the_guest_its_per_target_policy() {
+        use std::os::fd::AsRawFd;
+
+        use detcore::detlog::ForwardPolicy;
+        use reverie::process::Command;
+
+        use super::LITEINST_DETLOG_FORWARD_ENV;
+        use super::LITEINST_DETLOG_FORWARD_POLICY_ENV;
+        use super::forward_in_guest_detlogs_to;
+        use super::request_liteinst_detlog_forwarding;
+
+        let (sink, _peer) = std::os::unix::net::UnixDatagram::pair().unwrap();
+        forward_in_guest_detlogs_to(sink.into());
+        let env = |command: &Command, key: &str| {
+            command
+                .get_envs()
+                .find(|(name, _)| *name == std::ffi::OsStr::new(key))
+                .map(|(_, value)| value.map(|value| value.to_str().unwrap().to_owned()))
+        };
+
+        let scoped = ForwardPolicy::decode("0,detcore::random=1").unwrap();
+        let mut command = Command::new("/bin/true");
+        let duplicate = request_liteinst_detlog_forwarding(&mut command, &scoped)
+            .unwrap()
+            .expect("a policy that forwards a target requests forwarding");
+        assert_eq!(
+            env(&command, LITEINST_DETLOG_FORWARD_ENV),
+            Some(Some(duplicate.as_raw_fd().to_string()))
+        );
+        let sent = env(&command, LITEINST_DETLOG_FORWARD_POLICY_ENV)
+            .flatten()
+            .expect("the policy goes with the descriptor");
+        let sent = ForwardPolicy::decode(&sent).unwrap();
+        assert_eq!(sent, scoped);
+        assert!(sent.forwards("detcore::random"));
+        assert!(!sent.forwards("detcore::tool_local"));
+
+        let nothing = ForwardPolicy::decode("0").unwrap();
+        let mut command = Command::new("/bin/true");
+        command
+            .env(LITEINST_DETLOG_FORWARD_ENV, "9")
+            .env(LITEINST_DETLOG_FORWARD_POLICY_ENV, "1");
+        assert!(
+            request_liteinst_detlog_forwarding(&mut command, &nothing)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(env(&command, LITEINST_DETLOG_FORWARD_ENV), Some(None));
+        assert_eq!(
+            env(&command, LITEINST_DETLOG_FORWARD_POLICY_ENV),
+            Some(None)
+        );
+    }
+
+    /// The forwarding policy answers as a real in-process `detlog!` record
+    /// behaves under the CLI's filter: a record is logged only when both its
+    /// `tracing::enabled!` hint and its event pass, and a directive with a
+    /// field filter applies to the hint whatever its fields but to the event
+    /// only when the event has that field. `info,<module>[{unused}]=warn`
+    /// suppresses the record; the policy once forwarded it, because it probed
+    /// only the event.
+    #[test]
+    fn detlog_forward_policy_matches_real_detlog_emission_under_field_filters() {
+        use std::sync::Arc;
+        use std::sync::atomic::AtomicUsize;
+        use std::sync::atomic::Ordering;
+
+        use detcore::detlog::ForwardPolicy;
+        use tracing::level_filters::LevelFilter;
+        use tracing_subscriber::layer::SubscriberExt;
+
+        use crate::liteinst_bootstrap::EffectiveFilter;
+
+        struct Count(Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Count {
+            fn on_event(
+                &self,
+                _event: &tracing::Event<'_>,
+                _context: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let module = module_path!();
+        for (raw, level) in [
+            (format!("info,{module}[{{unused}}]=warn"), LevelFilter::INFO),
+            (
+                format!("warn,{module}[{{unused}}]=trace"),
+                LevelFilter::WARN,
+            ),
+            (
+                format!("info,{module}[{{message}}]=warn"),
+                LevelFilter::INFO,
+            ),
+            (format!("info,{module}=warn"), LevelFilter::INFO),
+            (format!("warn,{module}=info"), LevelFilter::WARN),
+            ("info".to_owned(), LevelFilter::INFO),
+            ("warn".to_owned(), LevelFilter::WARN),
+        ] {
+            let emitted = Arc::new(AtomicUsize::new(0));
+            let subscriber = tracing_subscriber::registry()
+                .with(EffectiveFilter::from_directives_lossy(&raw, level).into_filter())
+                .with(Count(emitted.clone()));
+            let forwards = tracing::subscriber::with_default(subscriber, || {
+                detcore::detlog!("probe record");
+                ForwardPolicy::from_current_subscriber(&raw).forwards(module)
+            });
+            assert_eq!(
+                forwards,
+                emitted.load(Ordering::Relaxed) == 1,
+                "RUST_LOG={raw:?} --log={level}: the policy and a real detlog! disagree"
+            );
+        }
     }
 }

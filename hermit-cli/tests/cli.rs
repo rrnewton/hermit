@@ -12190,6 +12190,16 @@ struct ForwardedVerify {
 /// including the in-guest Tool's own `detcore::tool_local` records.
 #[cfg(feature = "liteinst")]
 fn liteinst_verify_with_forwarded_records(guest: &[&str]) -> ForwardedVerify {
+    liteinst_verify_with_forwarded_records_under(guest, None)
+}
+
+/// [`liteinst_verify_with_forwarded_records`] with `RUST_LOG` set to `rust_log`
+/// (unset when `None`).
+#[cfg(feature = "liteinst")]
+fn liteinst_verify_with_forwarded_records_under(
+    guest: &[&str],
+    rust_log: Option<&str>,
+) -> ForwardedVerify {
     const FORWARDED: &str = "1970-01-01T00:00:00.000000Z INFO detcore";
 
     let logs = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
@@ -12210,13 +12220,16 @@ fn liteinst_verify_with_forwarded_records(guest: &[&str]) -> ForwardedVerify {
         "--",
     ];
     args.extend_from_slice(guest);
-    let output = hermit_command(&args)
+    let mut command = hermit_command(&args);
+    command
         .env_remove("RUST_LOG")
         .env_remove("HERMIT_LOG")
         .env_remove("HERMIT_LOG_FILE")
-        .stdin(Stdio::null())
-        .output()
-        .expect("failed to run hermit");
+        .stdin(Stdio::null());
+    if let Some(filter) = rust_log {
+        command.env("RUST_LOG", filter);
+    }
+    let output = command.output().expect("failed to run hermit");
     assert_success(&output, &args);
     let stderr = stderr(&output);
     assert!(stderr.contains("Determinism verified"), "stderr:\n{stderr}");
@@ -12281,6 +12294,37 @@ fn liteinst_verify_with_forwarded_records(guest: &[&str]) -> ForwardedVerify {
         syscall_records: run1,
         golden_log,
     }
+}
+
+/// In-guest LiteInst forwards each Detcore record by the CLI filter's INFO
+/// answer for the record's module, which is what each in-process `detlog!`
+/// callsite asks tracing under ptrace. Under `info,detcore::random=warn`
+/// ptrace logs no `detcore::random` record; in-guest LiteInst once forwarded
+/// the AT_RANDOM record anyway, because it forwarded every record whenever
+/// INFO was on for `detcore`.
+#[test]
+#[cfg(feature = "liteinst")]
+fn liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer() {
+    const RANDOM: &str = "INFO detcore::random: DETLOG ";
+    const SCOPED: &str = "info,detcore::random=warn";
+
+    let _lock = hermit_run_guard();
+    let all = liteinst_verify_with_forwarded_records_under(&["/bin/true"], None);
+    assert!(
+        all.golden_log.contains(RANDOM),
+        "without a scoped filter the guest forwards its detcore::random record:\n{}",
+        all.golden_log
+    );
+    let scoped = liteinst_verify_with_forwarded_records_under(&["/bin/true"], Some(SCOPED));
+    assert!(
+        !scoped.golden_log.contains(RANDOM),
+        "RUST_LOG={SCOPED} must keep detcore::random records out, as ptrace does:\n{}",
+        scoped.golden_log
+    );
+    assert_eq!(
+        scoped.syscall_records, all.syscall_records,
+        "the scoped filter must not change the other modules' records"
+    );
 }
 
 /// In-guest LiteInst forwards the Tool's DETLOG records to a descriptor Reverie

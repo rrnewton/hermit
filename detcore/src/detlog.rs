@@ -130,6 +130,15 @@ pub type DetlogForwarder = for<'a> fn(&str, &str, fmt::Arguments<'a>);
 /// the record's target, else the default. That is `tracing-subscriber`'s rule
 /// for target directives: the most specific matching directive decides, and
 /// any target a directive could match through is itself an entry here.
+///
+/// Limit: directives that select by span (`[syscall.intercept]=info`, or a
+/// field filter with a value, which matches span fields) decide per record
+/// from the spans the emitting thread has entered. Those spans exist only in
+/// the process where the coordinator's subscriber runs (under ptrace,
+/// reverie-ptrace enters `syscall.intercept` around each Detcore callback); a
+/// forwarded process has none, so this per-target answer, taken once at
+/// launch, cannot reproduce them. Target directives and field-presence
+/// filters are reproduced exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ForwardPolicy {
     default: bool,
@@ -238,8 +247,14 @@ impl ForwardPolicy {
     }
 }
 
-/// Whether the current subscriber would take an INFO event whose target is
-/// `target`, as `tracing::enabled!` at a callsite in that module would answer.
+/// Whether the current subscriber would log a `detlog!` record emitted in the
+/// module `target`. In-process that record passes two checks: `detlog!`'s own
+/// `tracing::enabled!(INFO)`, a hint with no fields, and then the
+/// `tracing::info!` event itself, which carries one field, the message. A
+/// directive with a field filter (`detcore::random[{name}]=warn`) applies to
+/// the hint whatever its fields but to the event only when the event has that
+/// field, so the two checks can disagree; the record is logged only when both
+/// pass, and so this answers true only when both probes do.
 pub fn info_enabled_for_target(target: &str) -> bool {
     use tracing::Metadata;
     use tracing::callsite::DefaultCallsite;
@@ -247,6 +262,18 @@ pub fn info_enabled_for_target(target: &str) -> bool {
     use tracing::level_filters::LevelFilter;
     use tracing::metadata::Kind;
 
+    // The hint `tracing::enabled!` builds: no fields.
+    static HINT_CALLSITE: DefaultCallsite = DefaultCallsite::new(&HINT_METADATA);
+    static HINT_METADATA: Metadata<'static> = Metadata::new(
+        "detlog forwarding hint probe",
+        "detcore::detlog",
+        tracing::Level::INFO,
+        None,
+        None,
+        None,
+        FieldSet::new(&[], tracing::callsite::Identifier(&HINT_CALLSITE)),
+        Kind::HINT,
+    );
     // `detlog!` events carry exactly one field, the formatted message.
     static PROBE_CALLSITE: DefaultCallsite = DefaultCallsite::new(&PROBE_METADATA);
     static PROBE_METADATA: Metadata<'static> = Metadata::new(
@@ -265,7 +292,17 @@ pub fn info_enabled_for_target(target: &str) -> bool {
     {
         return false;
     }
-    let metadata = Metadata::new(
+    let hint = Metadata::new(
+        "detlog forwarding hint probe",
+        target,
+        tracing::Level::INFO,
+        None,
+        None,
+        Some(target),
+        FieldSet::new(&[], tracing::callsite::Identifier(&HINT_CALLSITE)),
+        Kind::HINT,
+    );
+    let event = Metadata::new(
         "detlog forwarding probe",
         target,
         tracing::Level::INFO,
@@ -275,7 +312,7 @@ pub fn info_enabled_for_target(target: &str) -> bool {
         FieldSet::new(&["message"], tracing::callsite::Identifier(&PROBE_CALLSITE)),
         Kind::EVENT,
     );
-    tracing::dispatcher::get_default(|dispatch| dispatch.enabled(&metadata))
+    tracing::dispatcher::get_default(|dispatch| dispatch.enabled(&hint) && dispatch.enabled(&event))
 }
 
 static FORWARDER: OnceLock<(DetlogForwarder, ForwardPolicy)> = OnceLock::new();

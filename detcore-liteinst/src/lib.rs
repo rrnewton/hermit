@@ -28,6 +28,14 @@
 /// never mixes with the records.
 pub const DETLOG_FORWARD_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG";
 
+/// Set by Hermit next to [`DETLOG_FORWARD_ENV`]: the encoded
+/// `detcore::detlog::ForwardPolicy`, the CLI filter's INFO answer for each
+/// target its `RUST_LOG` names and for any other. The forwarder sends a record
+/// only when that policy logs its module, which is what each in-process
+/// `detlog!` callsite asks tracing under ptrace. The constructor removes it
+/// from the guest's environment.
+pub const DETLOG_FORWARD_POLICY_ENV: &str = "HERMIT_LITEINST_FORWARD_DETLOG_POLICY";
+
 /// Hermit validates that this constructor is registered in `.init_array`
 /// before it preloads the library, so a DSO that would load without
 /// installing Detcore is refused instead of running the guest unmonitored.
@@ -52,9 +60,13 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
         fail("the coordinator socket environment variable is missing");
     };
     let forward_request = std::env::var_os(DETLOG_FORWARD_ENV);
+    let forward_policy = std::env::var_os(DETLOG_FORWARD_POLICY_ENV);
     // SAFETY: the loader runs constructors while the process is still
     // single-threaded, so nothing reads the environment concurrently.
-    unsafe { std::env::remove_var(DETLOG_FORWARD_ENV) };
+    unsafe {
+        std::env::remove_var(DETLOG_FORWARD_ENV);
+        std::env::remove_var(DETLOG_FORWARD_POLICY_ENV);
+    }
     if let Some(value) = forward_request {
         let Some(fd) = value
             .to_str()
@@ -62,19 +74,27 @@ pub unsafe extern "C" fn detcore_liteinst_initialize() {
         else {
             fail("the DETLOG forwarding descriptor is not a descriptor number");
         };
+        // Hermit sends the policy with the descriptor; without a readable one
+        // this process cannot forward the records ptrace would log.
+        let policy = match forward_policy.as_deref().map(|value| {
+            value
+                .to_str()
+                .ok_or_else(|| "it is not UTF-8".to_owned())
+                .and_then(detcore::detlog::ForwardPolicy::decode)
+        }) {
+            Some(Ok(policy)) => policy,
+            Some(Err(error)) => fail(&format!(
+                "the DETLOG forwarding policy is unreadable: {error}"
+            )),
+            None => fail("the DETLOG forwarding policy is missing"),
+        };
         // SAFETY: the process is still single-threaded and Detcore is not yet
         // installed, which is when the reservation must be made.
         match unsafe {
             reverie_liteinst::reserve_tool_output_fd(fd, detcore::detlog::FORWARDING_RETIRED_NOTICE)
         } {
             Ok(_) => {
-                // The opt-in carries only the descriptor, not the coordinator's
-                // per-target answer, so every record is forwarded, as before
-                // set_forwarder took a policy.
-                let _ = detcore::detlog::set_forwarder(
-                    forward_detlog,
-                    detcore::detlog::ForwardPolicy::all(),
-                );
+                let _ = detcore::detlog::set_forwarder(forward_detlog, policy);
             }
             Err(error) => fail(&format!(
                 "cannot reserve the DETLOG forwarding descriptor {fd}: {error}"

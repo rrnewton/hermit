@@ -916,7 +916,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // host_input_change::tests::a_replacement_where_the_guest_rebound_the_path_is_not_named
     // and host_input_change::tests::a_log_with_mutation_lines_is_complete_when_its_end_counts_them
     // retain all 839 (841, measured with cargo nextest list).
-    ("test.hermit_unit", 841),
+    // tests::liteinst_detlog_forwarding_hands_the_guest_its_per_target_policy
+    // and tests::detlog_forward_policy_matches_real_detlog_emission_under_field_filters
+    // retain all 841 (843, measured with cargo nextest list).
+    ("test.hermit_unit", 843),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1241,7 +1244,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // prior identities (`cargo nextest list --profile ci` with this node's
     // skips lists 150). liteinst_in_guest_verify_log_keeps_records_in_ptraces_order
     // retains all 150: 150 + 1 = 151, measured with the same listing.
-    ("test.cli", 151),
+    ("test.cli", 152),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1308,7 +1311,7 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // prior identities retained. The same three forwarded-record --verify
     // tests as test.cli; all 147 prior identities retained. The same
     // forwarded-record order test as test.cli; all 150 retained.
-    ("test.cli_on_host", 151),
+    ("test.cli_on_host", 152),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
@@ -1397,7 +1400,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same forwarded-record bound test retains all 837: 837 + 1 = 838.
     // The same SaBRe DETLOG forwarding-policy test retains all 838: 839.
     // And the two guest-rebinding host_input_change tests (841).
-    ("test.hermit_unit_on_host", 841),
+    // And the same two LiteInst DETLOG forwarding-policy tests (843).
+    ("test.hermit_unit_on_host", 843),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
