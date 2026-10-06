@@ -1,5 +1,0 @@
-# `ci/manifest-plan` is coordinator tooling and has no Buck target. Cargo still
-# resolves its `dagrun` git dependency (agent-utils, pinned to the submodule's
-# gitlink) while resolving the workspace. Nothing Buck builds uses it, so keep
-# Reindeer from emitting a third-party rule for it.
-omit_targets = ["dagrun"]

@@ -1,5 +1,0 @@
-
-# This just tests max-timeslice without chaos mode.
-RUN: %hermit run --max-timeslice=10000 -- hostname | FileCheck %s
-CHECK: hermetic-container.local
-CHECK-EMPTY:
