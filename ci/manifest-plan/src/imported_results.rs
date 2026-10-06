@@ -63,9 +63,11 @@ use serde::Deserialize;
 
 use crate::runner::CELL_RESULT_SCHEMA;
 use crate::runner::CellResult;
+use crate::runner::GuestRoot;
 use crate::runner::RunContext;
 use crate::runner::SelectedCell;
 use crate::runner::cell_timeouts;
+use crate::runner::guest_root_refusal;
 use crate::runner::host_inapplicable_result;
 use crate::runner::infrastructure_error_result;
 use crate::runner::outcome_after_retries;
@@ -89,6 +91,17 @@ pub struct ImportPolicy<'a> {
     pub earns_retry: &'a dyn Fn(&SelectedCell, &CellResult) -> bool,
     /// Why this machine cannot run the cell, if it cannot.
     pub host_inapplicable: &'a dyn Fn(&SelectedCell) -> Option<String>,
+    /// The guest root the cell's bucket requires, if it declares one
+    /// ([`crate::runner::ManifestSet::required_guest_root`]). An imported row
+    /// that does not record that root is stale: it measured another guest.
+    pub required_guest_root: &'a dyn Fn(&SelectedCell) -> Option<GuestRoot>,
+    /// The identity of the pinned image this checkout records
+    /// ([`crate::compat_guest_root::ImagePaths::identity`]), or `None` when
+    /// its listing cannot be read. A row of a bucket that requires the pinned
+    /// root must carry exactly this `guest_root_identity`: a row whose
+    /// producer verified another root, or recorded none, measured another
+    /// guest, whatever its `guest_root` says.
+    pub pinned_root_identity: Option<&'a str>,
 }
 
 /// What the import root says about one selected cell, already turned into the
@@ -160,11 +173,31 @@ fn cell_key(cell: &SelectedCell) -> Key {
 fn error_row(context: &RunContext, cell: &SelectedCell, kind: &str, reason: String) -> CellResult {
     let mut row = infrastructure_error_result(context, cell, reason);
     row.error_kind = Some(kind.into());
+    // The importing process ran no guest for this cell, so its own root is
+    // not this row's.
+    row.guest_root = None;
+    row.guest_root_identity = None;
     row
 }
 
 /// Why `row` cannot stand for `cell` in this run, if it cannot.
-fn stale_reason(context: &RunContext, cell: &SelectedCell, row: &CellResult) -> Option<String> {
+fn stale_reason(
+    context: &RunContext,
+    cell: &SelectedCell,
+    row: &CellResult,
+    required_guest_root: Option<GuestRoot>,
+    pinned_root_identity: Option<&str>,
+) -> Option<String> {
+    if let Some(reason) = guest_root_refusal(
+        "the imported row",
+        &cell.category,
+        required_guest_root,
+        row.guest_root,
+        row.guest_root_identity.as_deref(),
+        pinned_root_identity,
+    ) {
+        return Some(reason);
+    }
     if row.schema != CELL_RESULT_SCHEMA {
         return Some(format!(
             "imported row has schema {}, expected {CELL_RESULT_SCHEMA}",
@@ -380,7 +413,17 @@ pub fn load(
                     )]
                 }
                 (Some(mut found), None) => {
-                    if let Some(reason) = found.iter().find_map(|row| stale_reason(context, cell, row)) {
+                    if let Some(reason) = found
+                        .iter()
+                        .find_map(|row| {
+                            stale_reason(
+                                context,
+                                cell,
+                                row,
+                                (policy.required_guest_root)(cell),
+                                policy.pinned_root_identity,
+                            )
+                        }) {
                         vec![error_row(context, cell, "import-stale", reason)]
                     } else if let Some(reason) = history_error(&found) {
                         vec![error_row(context, cell, "import-history", reason)]

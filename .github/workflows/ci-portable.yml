@@ -1616,10 +1616,13 @@ jobs:
           ' ignored/reduced/results.jsonl >/dev/null
           # GitHub-hosted runners have no PMU, so the hosted-portable profile
           # omits KVM cells (HOSTED_PORTABLE_EXCLUDED_BACKENDS in
-          # ci/manifest-plan/src/validation_dag.rs). Local validate still
-          # requires every KVM cell.
+          # ci/manifest-plan/src/validation_dag.rs). They do not run the
+          # pinned image either, so it omits the compat-pinned cells, whose
+          # bucket requires the pinned guest root
+          # (HOSTED_PORTABLE_EXCLUDED_CATEGORIES). Local validate still
+          # requires every KVM and compat-pinned cell.
           jq -S --argjson expected "$EXPECTED_CELLS" '
-            [.cells[] | select(.lane == "portable" and .backend != "kvm")
+            [.cells[] | select(.lane == "portable" and .backend != "kvm" and .category != "compat-pinned")
               | [.lane, .category, .test, .mode, .backend]]
             | select(length == $expected) | sort
           ' ci/expected-e2e-plan.json > ignored/reduced/expected-identities.json

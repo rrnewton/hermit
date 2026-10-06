@@ -1447,7 +1447,7 @@ test:
     }
 
     /// A cell's published reproducer selects exactly that cell through the
-    /// harness's own selection: a cell of a focused run type (compat/java
+    /// harness's own selection: a cell of a focused run type (compat-pinned/node
     /// verify on ptrace carries the test-level label sabre-compat-only) needs
     /// `--label`, and a `full` cell's reproducer keeps its exact form. The
     /// argv is parsed the way test-harness parses it.
@@ -1505,9 +1505,11 @@ test:
                 .collect::<Vec<_>>()
         };
         for (test, mode, backend) in [
-            ("compat/java", "verify", "ptrace"),
-            ("compat/comm", "verify", "sabre"),
-            ("compat/strict-du", "verify", "sabre"),
+            ("compat-pinned/node", "verify", "ptrace"),
+            ("compat-pinned/comm", "verify", "sabre"),
+            ("compat-pinned/strict-du", "verify", "sabre"),
+            ("compat-pinned/comm", "verify", "ptrace"),
+            // The host-portability copy's diagnostic cell.
             ("compat/comm", "verify", "ptrace"),
         ] {
             let argv = &reproducer(test, mode, backend).argv;
@@ -1518,7 +1520,7 @@ test:
             );
         }
         // A cell of the default run type keeps its exact reproducer.
-        let full = reproducer("compat/comm", "verify", "ptrace");
+        let full = reproducer("compat-pinned/comm", "verify", "ptrace");
         assert_eq!(
             full.argv,
             [
@@ -1527,7 +1529,7 @@ test:
                 "--include-manual",
                 "--include-occasional",
                 "--test",
-                "compat/comm",
+                "compat-pinned/comm",
                 "--mode",
                 "verify",
                 "--backend",
@@ -1536,7 +1538,7 @@ test:
         );
         assert_eq!(
             full.shell_command,
-            "target/debug/test-harness run --include-manual --include-occasional --test compat/comm --mode verify --backend ptrace"
+            "target/debug/test-harness run --include-manual --include-occasional --test compat-pinned/comm --mode verify --backend ptrace"
         );
     }
 }

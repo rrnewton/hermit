@@ -311,7 +311,14 @@ fn main() {
         let location = path.file_name().unwrap().to_string_lossy().to_string();
         ensure_keys(
             &document,
-            &["schema", "bucket", "timeout_seconds", "slow_reason", "test"],
+            &[
+                "schema",
+                "bucket",
+                "timeout_seconds",
+                "slow_reason",
+                "guest_root",
+                "test",
+            ],
             &location,
         );
 
@@ -324,6 +331,13 @@ fn main() {
             die(format!(
                 "{location}: bucket `{bucket}` must equal file stem `{stem}`"
             ));
+        }
+        if let Some(guest_root) = document.get("guest_root") {
+            if guest_root.as_str() != Some("pinned") {
+                die(format!(
+                    "{location}: guest_root may only be `pinned`, got {guest_root:?}"
+                ));
+            }
         }
         let bucket_timeout_seconds = document.get("timeout_seconds").map(|value| {
             required_timeout_seconds(Some(value), &format!("{bucket}.timeout_seconds"))
@@ -375,6 +389,7 @@ fn main() {
     validate_retired_ids(&repo_root, &documents, &seen_ids);
     validate_front_door(&repo_root, &documents, &inventory);
     validate_ci_reason_baseline(&repo_root, &documents);
+    validate_compat_guest_roots(&repo_root, &documents);
 
     rows.sort_by(|left, right| {
         (&left.bucket, &left.id, &left.mode, &left.backend).cmp(&(
@@ -635,6 +650,46 @@ fn unreasoned_ci_false_cells(documents: &[Value]) -> BTreeSet<String> {
         }
     }
     silent
+}
+
+/// Refuse a gating compat cell that does not run from the pinned image
+/// (`hermit_manifest_plan::compat_guest_root`,
+/// https://github.com/rrnewton/hermit/issues/3712). The image listing is read
+/// only when a compat-family manifest is present.
+fn validate_compat_guest_roots(repo_root: &Path, documents: &[Value]) {
+    use hermit_manifest_plan::compat_guest_root;
+    use hermit_manifest_plan::manifest_value::Value as LibraryValue;
+
+    let compat: Vec<LibraryValue> = documents
+        .iter()
+        .filter(|document| {
+            document
+                .get("bucket")
+                .and_then(Value::as_str)
+                .is_some_and(compat_guest_root::is_compat_bucket)
+        })
+        .map(|document| {
+            serde_yaml::to_value(document)
+                .map_err(|error| error.to_string())
+                .and_then(LibraryValue::from_yaml)
+                .unwrap_or_else(|error| die(format!("cannot re-read a compat manifest: {error}")))
+        })
+        .collect();
+    if compat.is_empty() {
+        return;
+    }
+    let image = compat_guest_root::ImagePaths::load(repo_root).unwrap_or_else(|error| die(error));
+    let read = |relative: &str| {
+        std::fs::read_to_string(repo_root.join(relative)).map_err(|error| error.to_string())
+    };
+    let errors = compat_guest_root::violations(&compat, &image, &read);
+    if !errors.is_empty() {
+        die(format!(
+            "{} compat cell(s) break the pinned-guest contract:\n  {}",
+            errors.len(),
+            errors.join("\n  ")
+        ));
+    }
 }
 
 /// Ratchet the silent default-off cells: the recorded set and the observed set

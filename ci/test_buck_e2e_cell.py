@@ -463,6 +463,40 @@ class CellTest(unittest.TestCase):
                     [harness] = self.calls_by("harness")
                     self.assertEqual(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
 
+    def test_pinned_guest_root_cells_run_in_the_pinned_root_as_diagnostic_capable(self) -> None:
+        # A compat-pinned cell's programs and libc resolve only inside the pinned image
+        # (https://github.com/rrnewton/hermit/issues/3712): whatever the routing, defs.bzl
+        # sends it through the wrapper, which keeps /test, and cell.sh passes
+        # --diagnostic-results and --read-only-root as the bucket's node
+        # e2e.manifest_compat_pinned does: the harness refuses a guest_root: pinned bucket
+        # whose image directories a guest could write. A cell of another bucket in the
+        # pinned root gets neither.
+        for routing in ("hybrid", "local"):
+            targets = evaluate_cells(routing).values()
+            pinned = [t for t in targets if t["args"][0].startswith("compat-pinned/")]
+            self.assertTrue(pinned, routing)
+            for target in (pinned[0], pinned[-1]):
+                test, mode, backend = target["args"]
+                with self.subTest(routing=routing, cell=target["name"]):
+                    self.calls.write_text("")
+                    done, result = self.run_cell(backend, test, mode, **target["env"])
+                    self.assertEqual(done["status"], "passed", done)
+                    [wrapper] = self.calls_by("wrapper")
+                    self.assertEqual(wrapper["opts"].count("--read-only-root"), 1, wrapper["opts"])
+                    [harness] = self.calls_by("harness")
+                    self.assertIn("--diagnostic-results", harness["argv"])
+                    self.assertEqual(harness["env"]["HERMIT_E2E_EMPTY_WORKDIR"], "/test")
+                    self.assertEqual(result["container"], "pinned-root")
+                    self.assertEqual(result["route"], "local")
+        self.calls.write_text("")
+        done, _ = self.run_cell("ptrace", "c-programs/cpuid-probe", "verify", HERMIT_E2E_CONTAINER="pinned-root",
+                                HERMIT_E2E_CONTAINER_REASON="privileged lane")
+        self.assertEqual(done["status"], "passed", done)
+        [wrapper] = self.calls_by("wrapper")
+        self.assertNotIn("--read-only-root", wrapper["opts"])
+        [harness] = self.calls_by("harness")
+        self.assertNotIn("--diagnostic-results", harness["argv"])
+
     def test_unknown_container_is_an_error(self) -> None:
         done, _ = self.run_cell(HERMIT_E2E_CONTAINER="docker")
         self.assert_error(done, "unknown HERMIT_E2E_CONTAINER 'docker'")
@@ -696,6 +730,7 @@ class ContainerChoiceTest(unittest.TestCase):
             self.assertEqual(env["HERMIT_E2E_ROUTE"], target["route"], target["name"])
             expected = target["route"] == "local" and (
                 cell["lane"] == "privileged"
+                or cell.get("guest_root") == "pinned"
                 or cell["test"] == "c-programs/environment-and-workdir")
             self.assertEqual(env["HERMIT_E2E_CONTAINER"], "pinned-root" if expected else "", target["name"])
             self.assertEqual(bool(env["HERMIT_E2E_CONTAINER_REASON"]), expected, target["name"])
@@ -721,14 +756,26 @@ class ContainerChoiceTest(unittest.TestCase):
         self.assertTrue(dbt)
         self.assertFalse(dbt & chosen)
         self.assertTrue(any(targets[name]["route"] == "re" for name in dbt))
-        self.assertEqual(chosen, privileged | {"c-programs-environment-and-workdir-custom-ptrace",
-                                               "c-programs-environment-and-workdir-verify-ptrace"})
+        # Every pinned-guest-root cell (the compat-pinned bucket) runs locally, in the pinned
+        # root: its programs and their libc resolve only inside the pinned image, which no RE
+        # worker runs (https://github.com/rrnewton/hermit/issues/3712).
+        pinned = {self.slug(c) for c in self.plan if c.get("guest_root") == "pinned"}
+        self.assertEqual(pinned, {self.slug(c) for c in self.plan if c["category"] == "compat-pinned"})
+        self.assertGreater(len(pinned), 150)
+        for name in pinned:
+            self.assertEqual(targets[name]["route"], "local", name)
+            self.assertTrue(targets[name]["env"]["HERMIT_E2E_ROUTE_REASON"].startswith("pinned guest root:"), name)
+        self.assertEqual(chosen, privileged | pinned | {"c-programs-environment-and-workdir-custom-ptrace",
+                                                        "c-programs-environment-and-workdir-verify-ptrace"})
 
     def test_local(self) -> None:
         chosen = self.containerized(self.check("local"))
         dbt = {self.slug(c) for c in self.plan if c["backend"] == "dbt" and c["lane"] != "privileged"}
         self.assertTrue(dbt)
         self.assertFalse(dbt & chosen)
+        pinned = {self.slug(c) for c in self.plan if c.get("guest_root") == "pinned"}
+        self.assertTrue(pinned)
+        self.assertLessEqual(pinned, chosen)
 
 
 class ParityRouteTest(unittest.TestCase):

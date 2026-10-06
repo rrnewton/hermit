@@ -97,6 +97,8 @@ class CargoCacheMounts(unittest.TestCase):
         proc_locks_runtime=None,
         calibration=False,
         git_location=None,
+        forwarded_env=None,
+        read_only_root=False,
     ):
         # The wrapper gets this process's environment, as it does in
         # production, so an inherited Git location variable reaches it.
@@ -108,12 +110,17 @@ class CargoCacheMounts(unittest.TestCase):
         env["PATH"] = str(self.root / "tools") + os.pathsep + env["PATH"]
         env["PINNED_ROOT_CAPTURE"] = str(self.capture)
         forwarded = ["--nextest-calibration"] if calibration else []
+        if read_only_root:
+            forwarded.append("--read-only-root")
         if proc_locks_runtime is not None:
             env["XDG_RUNTIME_DIR"] = str(proc_locks_runtime)
             forwarded.append("--proc-locks-runtime")
         if run_state is not None:
             env["VALIDATE_RUN_STATE"] = str(run_state)
             forwarded += ["--env", "VALIDATE_RUN_STATE"]
+        for name, value in (forwarded_env or {}).items():
+            env[name] = value
+            forwarded += ["--env", name]
         result = subprocess.run(
             [
                 "bash",
@@ -537,6 +544,67 @@ class CargoCacheMounts(unittest.TestCase):
                 ]
             ],
         )
+
+    def test_container_names_the_exact_image_reference_that_runs(self):
+        # test-harness trusts HERMIT_PINNED_ROOT_IMAGE as the pinned root's
+        # identity (https://github.com/rrnewton/hermit/issues/3712), so the
+        # wrapper sets it to the --digest it runs, once, and nothing else may.
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        self.assertEqual(argv[0], "run")
+        settings = [
+            argv[index + 1]
+            for index, arg in enumerate(argv)
+            if arg in ("-e", "--env")
+            and argv[index + 1].startswith("HERMIT_PINNED_ROOT_IMAGE")
+        ]
+        self.assertEqual(
+            settings,
+            [
+                "HERMIT_PINNED_ROOT_IMAGE=fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            ],
+        )
+
+    def test_read_only_root_mounts_only_the_image_root_read_only(self):
+        # test-harness verifies the pinned image once and then requires a
+        # read-only root, so a guest cannot change the verified files for a
+        # later cell (https://github.com/rrnewton/hermit/issues/3712). The
+        # flag adds podman --read-only before the image reference and leaves
+        # every bind mount's mode as it was; without it the root is writable.
+        result, calls = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        writable = calls[-1]
+        self.assertNotIn("--read-only", writable)
+        self.capture.unlink()
+        result, calls = self.invoke(read_only_root=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        argv = calls[-1]
+        image = argv.index(
+            "fixture@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+        )
+        self.assertEqual(argv.count("--read-only"), 1, argv)
+        self.assertLess(argv.index("--read-only"), image)
+        argv.remove("--read-only")
+        self.assertEqual(argv, writable)
+        check = subprocess.run(
+            ["bash", str(WRAPPER), "--check-image", "--read-only-root"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        self.assertEqual(check.returncode, 2)
+        self.assertIn("--check-image accepts only optional --digest", check.stderr)
+
+    def test_forwarding_the_pinned_root_identity_refuses_before_container_launch(self):
+        result, calls = self.invoke(
+            forwarded_env={
+                "HERMIT_PINNED_ROOT_IMAGE": "claimed@sha256:" + "1" * 64,
+            }
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--env HERMIT_PINNED_ROOT_IMAGE is refused", result.stderr)
+        self.assertTrue(all(call[0] != "run" for call in calls), calls)
 
     def test_relocates_real_nested_submodule_configs_without_changing_host_metadata(
         self,

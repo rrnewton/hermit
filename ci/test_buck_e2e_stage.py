@@ -5,11 +5,15 @@ Each case runs a copy of stage in a scratch tree, with a PATH holding only the c
 it needs and a scratch library directory (HERMIT_STAGE_HOST_LIBDIR) in place of
 /usr/lib64. Refuse: a missing patchelf, readelf, strip or cmake, or a missing libunwind
 library, stops stage with the dnf package that provides it and the documentation
-section, and the previous staging is left in place. Accept: with everything present,
+section, and the previous staging is left in place; so does a pinned-root image that
+ci/hermetic/run-in-pinned-root.sh --check-image cannot find, because stage compiles the
+compat-pinned fixtures inside it (https://github.com/rrnewton/hermit/issues/3712).
+Accept: with everything present,
 stage gets past the check and removes the previous staging (it then fails on the
 scratch tree, which is not a git checkout). --bundle needs none of them.
 
-StageCargoOverlapTest runs stage in a committed scratch checkout with a fake cargo. The
+StageCargoOverlapTest runs stage in a committed scratch checkout with a fake cargo and
+the same pinned-root stand-in, whose image check passes. The
 release harness build and the validate-profile hermit build, in a target directory of
 its own, overlap detcore-dbt and the install bundle and finish before the harness
 binaries are stripped, each build runs main's exact command line, and the hermit binary
@@ -39,6 +43,22 @@ HOST_COMMANDS = ("dirname", "realpath", "rm", "mkdir", "git", "cp", "python3", "
 DOC = '(docs/BUCK2_OSS.md, "Host prerequisites for Buck validation")'
 
 
+def plant_pinned_root_wrapper(tree: Path) -> Path:
+    """Plant a stand-in for ci/hermetic/run-in-pinned-root.sh in `tree`: --check-image
+    succeeds unless FAKE_IMAGE_MISSING is set, and any other call fails loudly."""
+    wrapper = tree / "ci" / "hermetic" / "run-in-pinned-root.sh"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text(
+        "#!/bin/sh\n"
+        "[ \"$1\" = --check-image ] || { echo \"unexpected wrapper call: $*\" >&2; exit 99; }\n"
+        "[ -z \"$FAKE_IMAGE_MISSING\" ] && exit 0\n"
+        "echo 'run-in-pinned-root: image localhost/x@sha256:0 not present' >&2\n"
+        "echo 'second line' >&2\n"
+        "exit 1\n")
+    wrapper.chmod(0o755)
+    return wrapper
+
+
 class StagePrerequisiteTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = Path(tempfile.mkdtemp(prefix="buck-e2e-stage-test."))
@@ -62,6 +82,7 @@ class StagePrerequisiteTest(unittest.TestCase):
         self.libdir.mkdir()
         for name in LIBS:
             (self.libdir / name).write_text(name + "\n")
+        self.wrapper = plant_pinned_root_wrapper(self.tmp / "tree")
 
     def tool(self, name: str) -> Path:
         return self.bin / name
@@ -107,6 +128,21 @@ class StagePrerequisiteTest(unittest.TestCase):
                 finally:
                     (self.libdir / name).write_text(name + "\n")
 
+    def test_a_missing_pinned_root_image_refuses_and_keeps_the_staging(self) -> None:
+        proc = self.run_stage("--from-cargo", FAKE_IMAGE_MISSING="1")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("ci/buck-e2e/stage: the pinned-root image is unavailable "
+                      "(run-in-pinned-root: image localhost/x@sha256:0 not present second line); "
+                      "build it with ci/hermetic/build-image.sh", proc.stderr)
+        self.assertTrue(self.sentinel.exists(), "a refusal removed the previous staging")
+
+    def test_a_missing_pinned_root_wrapper_refuses(self) -> None:
+        self.wrapper.unlink()
+        proc = self.run_stage("--from-cargo")
+        self.assertEqual(proc.returncode, 1, proc.stderr)
+        self.assertIn("ci/buck-e2e/stage: the pinned-root image is unavailable", proc.stderr)
+        self.assertTrue(self.sentinel.exists(), "a refusal removed the previous staging")
+
     def test_all_present_passes_the_check(self) -> None:
         proc = self.run_stage("--from-cargo")
         self.assertNotIn("is missing", proc.stderr)
@@ -117,6 +153,7 @@ class StagePrerequisiteTest(unittest.TestCase):
         for name in TOOLS:
             self.tool(name).unlink()
         shutil.rmtree(self.libdir)
+        self.wrapper.unlink()
         proc = self.run_stage("--bundle", str(self.tmp / "no-bundle"))
         self.assertNotIn("is missing", proc.stderr)
         self.assertFalse(self.sentinel.exists(), proc.stderr)
@@ -197,6 +234,8 @@ class StageCargoOverlapTest(unittest.TestCase):
         self.stage = tree / "ci" / "buck-e2e" / "stage"
         self.stage.parent.mkdir(parents=True)
         shutil.copy2(STAGE, self.stage)
+        # stage --from-cargo checks for the pinned-root image before it builds anything.
+        plant_pinned_root_wrapper(tree)
         (tree / ".gitignore").write_text("ci/buck-e2e/staged/\n")
         git = ["git", "-C", str(tree), "-c", "user.email=t@example.invalid", "-c", "user.name=t",
                "-c", "commit.gpgsign=false"]

@@ -2768,9 +2768,15 @@
     },
     {
       "disposition": "manifest-policy",
+      "path": "tests/e2e/manifests/compat-pinned.yaml",
+      "runner": "target/debug/test-harness via ci/manifest-plan",
+      "why": "tests/e2e/manifests/compat-pinned.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `compat-pinned` YAML file is policy for the `compat-pinned` manifest bucket: a corpus section that states the portable strict compatibility lane's Hermit settings once and one (label, argv) row per program of the pinned image, which ci/manifest-plan/src/manifest_corpus.rs expands into ordinary test recipes that run only in the pinned root. It configures the common system and is not itself executable test input."
+    },
+    {
+      "disposition": "manifest-policy",
       "path": "tests/e2e/manifests/compat.yaml",
       "runner": "target/debug/test-harness via ci/manifest-plan",
-      "why": "tests/e2e/manifests/compat.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `compat` YAML file is policy for the `compat` manifest bucket: a corpus section that states the portable strict compatibility lane's Hermit settings once and one (label, argv) row per host program, which ci/manifest-plan/src/manifest_corpus.rs expands into ordinary test recipes. It configures the common system and is not itself executable test input."
+      "why": "tests/e2e/manifests/compat.yaml is owned by target/debug/test-harness via ci/manifest-plan: The `compat` YAML file is policy for the `compat` manifest bucket: a corpus section that states the portable strict compatibility lane's Hermit settings once and one (label, argv) row per host program, which ci/manifest-plan/src/manifest_corpus.rs expands into ordinary non-gating host-portability recipes. It configures the common system and is not itself executable test input."
     },
     {
       "disposition": "manifest-policy",

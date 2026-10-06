@@ -18,15 +18,23 @@ use dagrun::TestAttemptResult;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use hermit_manifest_plan::cli_help::is_help_flag;
+use hermit_manifest_plan::compat_guest_root::ImagePaths;
+use hermit_manifest_plan::compat_guest_root::PINNED_FIXTURES;
+use hermit_manifest_plan::compat_guest_root::names_pinned_fixtures;
+use hermit_manifest_plan::compat_guest_root::verify_fixture_receipt;
 use hermit_manifest_plan::imported_results;
 use hermit_manifest_plan::imported_results::IMPORT_RESULTS_ENV;
 use hermit_manifest_plan::parity;
 use hermit_manifest_plan::parity::ParityCellId;
 use hermit_manifest_plan::runner::CellId;
 use hermit_manifest_plan::runner::CellResult;
+use hermit_manifest_plan::runner::DirectCommand;
 use hermit_manifest_plan::runner::FailureClass;
+use hermit_manifest_plan::runner::GuestRoot;
 use hermit_manifest_plan::runner::MAX_ATTEMPTS_PER_CELL;
 use hermit_manifest_plan::runner::ManifestSet;
+use hermit_manifest_plan::runner::PINNED_ROOT_IMAGE_DIGEST_FILE;
+use hermit_manifest_plan::runner::PINNED_ROOT_IMAGE_ENV;
 use hermit_manifest_plan::runner::Population;
 use hermit_manifest_plan::runner::RunContext;
 use hermit_manifest_plan::runner::ScheduledWorkerCapacity;
@@ -41,9 +49,11 @@ use hermit_manifest_plan::runner::cell_result_after_retries;
 use hermit_manifest_plan::runner::cell_result_and_attempts_after_retries;
 use hermit_manifest_plan::runner::checked_add_cpu_usage;
 use hermit_manifest_plan::runner::diagnostic_failure_reason;
+use hermit_manifest_plan::runner::guest_root_refusal;
 use hermit_manifest_plan::runner::host_inapplicable_result;
 use hermit_manifest_plan::runner::host_input_change_only;
 use hermit_manifest_plan::runner::is_diagnostic_cell;
+use hermit_manifest_plan::runner::pinned_root_identity;
 use hermit_manifest_plan::runner::prepare_result_path;
 use hermit_manifest_plan::runner::refused_on_an_inexact_branch_counter;
 use hermit_manifest_plan::runner::requires_capability;
@@ -1358,6 +1368,9 @@ fn required_plan_rows(manifests: &ManifestSet) -> (usize, Vec<JsonValue>) {
             });
             if !capabilities.is_empty() {
                 row["requires_host_capabilities"] = serde_json::json!(capabilities);
+            }
+            if let Some(guest_root) = manifests.required_guest_root(&cell.category) {
+                row["guest_root"] = serde_json::json!(guest_root.as_str());
             }
             row
         })
@@ -3000,6 +3013,126 @@ fn run_cells(manifests: &ManifestSet, args: &Args) -> Result<Vec<SelectedCell>, 
     manifests.select(&run_selection(args))
 }
 
+/// Refuse to run a cell whose bucket requires a guest root this process is not
+/// in.
+///
+/// A `guest_root: pinned` bucket exists so its verdicts never come from a
+/// host's own `/usr/bin` and glibc. Running it on the host anyway would write
+/// rows that look like pinned-root evidence, so the whole run stops before
+/// any cell starts and names the image it expected.
+///
+/// In the pinned root the run also stops unless `read_only` passes
+/// ([`ImagePaths::verify_read_only`] outside tests). The pinned root was
+/// verified once, when this harness started; on a writable root a guest of one
+/// cell could replace an image program or create a loader preload file, and
+/// every later cell would run against that instead of the image.
+fn require_guest_root(
+    root: &Path,
+    manifests: &ManifestSet,
+    cells: &[SelectedCell],
+    actual: GuestRoot,
+    read_only: &dyn Fn() -> Result<(), String>,
+) -> Result<(), String> {
+    let mut wrong = BTreeSet::new();
+    let mut pinned = BTreeSet::new();
+    for cell in cells {
+        if let Some(required) = manifests.required_guest_root(&cell.category) {
+            if required != actual {
+                wrong.insert((cell.category.as_str(), required));
+            } else if required == GuestRoot::Pinned {
+                pinned.insert(cell.category.as_str());
+            }
+        }
+    }
+    if wrong.is_empty() {
+        if pinned.is_empty() {
+            return Ok(());
+        }
+        return read_only().map_err(|error| {
+            format!(
+                "{} require guest_root pinned on a read-only root: {error}",
+                pinned
+                    .iter()
+                    .map(|bucket| format!("bucket {bucket}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )
+        });
+    }
+    let expected = std::fs::read_to_string(root.join(PINNED_ROOT_IMAGE_DIGEST_FILE))
+        .map(|digest| digest.trim().to_string())
+        .unwrap_or_else(|error| format!("<unreadable {PINNED_ROOT_IMAGE_DIGEST_FILE}: {error}>"));
+    let marker = std::env::var(PINNED_ROOT_IMAGE_ENV).ok();
+    let found = marker.clone().unwrap_or_else(|| "<unset>".into());
+    // Why the pinned-root check failed, so a forged marker or a stale listing
+    // is named rather than only the root it produced.
+    let why = pinned_root_identity(root, marker.as_deref())
+        .err()
+        .unwrap_or_else(|| "the pinned root check passes now".into());
+    Err(format!(
+        "{} require guest_root {}, but this harness runs in guest_root {}: start it with \
+         ci/hermetic/run-in-pinned-root.sh (expected image {expected}, {PINNED_ROOT_IMAGE_ENV}={found}; {why})",
+        wrong
+            .iter()
+            .map(|(bucket, _)| format!("bucket {bucket}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        wrong
+            .iter()
+            .map(|(_, required)| required.as_str())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>()
+            .join("/"),
+        actual.as_str(),
+    ))
+}
+
+/// Whether a cell of a `guest_root: pinned` bucket names the fixtures the
+/// pinned root builds below the run state ([`PINNED_FIXTURES`]).
+fn reads_pinned_fixtures(manifests: &ManifestSet, cells: &[SelectedCell]) -> bool {
+    cells.iter().any(|cell| {
+        manifests.required_guest_root(&cell.category) == Some(GuestRoot::Pinned)
+            && match &cell.test.direct {
+                Some(DirectCommand::Argv(argv)) => {
+                    argv.iter().any(|arg| names_pinned_fixtures(arg))
+                }
+                Some(DirectCommand::Shell(text)) => names_pinned_fixtures(text),
+                None => false,
+            }
+    })
+}
+
+/// Refuse to run pinned-root cells over fixtures the pinned root did not
+/// build from this checkout.
+///
+/// A `guest_root: pinned` cell runs programs such as the fixtures'
+/// `gprof/program` and `localhost-http-server`, so its verdict is pinned-root
+/// evidence only if those binaries were compiled there, by the image's gcc,
+/// from the sources this harness runs. Their directory name alone does not
+/// say so: the host can write the same tree. The receipt
+/// `tests/compat/prepare_real_compat_fixtures.sh` writes in the pinned root
+/// does ([`verify_fixture_receipt`]), so a missing or stale one stops the
+/// whole run before any cell starts.
+fn require_pinned_fixtures(
+    root: &Path,
+    manifests: &ManifestSet,
+    cells: &[SelectedCell],
+    run_state: Option<&Path>,
+) -> Result<(), String> {
+    if !reads_pinned_fixtures(manifests, cells) {
+        return Ok(());
+    }
+    let run_state = run_state.ok_or_else(|| {
+        format!(
+            "the selected guest_root: pinned cells read {{{{VALIDATE_RUN_STATE}}}}/{PINNED_FIXTURES}, \
+             but VALIDATE_RUN_STATE is unset"
+        )
+    })?;
+    let image = ImagePaths::load(root)?;
+    verify_fixture_receipt(&image, root, &run_state.join(PINNED_FIXTURES))
+}
+
 fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     let cells = run_cells(manifests, args).unwrap_or_else(|e| fail(e));
     if !args.selection.exclude_backends.is_empty() {
@@ -3045,6 +3178,20 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
     .unwrap_or_else(|e| fail(e))
     .with_scheduled_worker_capacity(capacity)
     .with_parity_retained(parity::retention_closure(&parity_scope, &planned_verify));
+    if import_root.is_none() {
+        let read_only = || ImagePaths::load(root)?.verify_read_only();
+        if let Err(error) =
+            require_guest_root(root, manifests, &cells, context.guest_root, &read_only)
+        {
+            fail(error);
+        }
+        let run_state =
+            hermit_manifest_plan::manifest_corpus::validate_run_state().map(PathBuf::from);
+        if let Err(error) = require_pinned_fixtures(root, manifests, &cells, run_state.as_deref()) {
+            fail(error);
+        }
+    }
+    eprintln!("Guest root: {}", context.guest_root.as_str());
     for (capability, verdict) in &context.host_capabilities {
         eprintln!(
             "Host capability {}: {} — {}",
@@ -3082,9 +3229,16 @@ fn run(root: &Path, manifests: &ManifestSet, args: &Args) -> ExitCode {
             )
             .map(|(_, reason)| reason)
         };
+        let required_guest_root =
+            |cell: &SelectedCell| manifests.required_guest_root(&cell.category);
+        // The importing process need not run in the pinned root itself; it
+        // only needs to know which root a pinned row must have verified.
+        let pinned_root_identity = ImagePaths::load(root).map(|listing| listing.identity()).ok();
         let policy = imported_results::ImportPolicy {
             earns_retry: &earns_retry,
             host_inapplicable: &host_inapplicable,
+            required_guest_root: &required_guest_root,
+            pinned_root_identity: pinned_root_identity.as_deref(),
         };
         let imported =
             imported_results::load(import_root, &cells, &context, &results_path, &policy)
@@ -3878,6 +4032,23 @@ fn parity_compare(
         rows.iter().map(|row| row.hermit_sha.as_str()).collect(),
         "hermit_sha",
     );
+    // A run's own post-pass reads rows that `require_guest_root` admitted
+    // before any cell ran, and an import turns every row outside its
+    // bucket's root into an ERROR; this command reads whatever
+    // results.jsonl it is given, so it applies the same admission itself.
+    let pinned_identity = ImagePaths::load(root)
+        .map(|listing| listing.identity())
+        .ok();
+    let refusals = parity_root_refusals(manifests, &scope, &rows, pinned_identity.as_deref());
+    if !refusals.is_empty() {
+        fail(format!(
+            "{} holds {} row(s) the parity comparison would read that cannot count for their \
+             bucket's guest root, so no parity is measured:\n  {}",
+            results.display(),
+            refusals.len(),
+            refusals.join("\n  ")
+        ));
+    }
     let config = parity_compare_config(root, request, &run_id, &hermit_sha)
         .unwrap_or_else(|error| fail(error));
     let report = parity::post_pass(&config, &scope, &rows).unwrap_or_else(|error| fail(error));
@@ -3889,6 +4060,45 @@ fn parity_compare(
     }
     eprintln!("test-harness: {}", report.summary_line());
     ExitCode::SUCCESS
+}
+
+/// Every row the parity post-pass would read for `scope` (a
+/// [`parity::PARITY_MODE`] row of a test in it, on any backend: the
+/// candidate's and the reference's) that cannot count for its test's bucket,
+/// as [`guest_root_refusal`] decides with the bucket the manifests give the
+/// test, not the one the row records. `pinned_identity` is this checkout's
+/// [`ImagePaths::identity`], or `None` when its listing is unreadable.
+fn parity_root_refusals(
+    manifests: &ManifestSet,
+    scope: &BTreeSet<ParityCellId>,
+    rows: &[CellResult],
+    pinned_identity: Option<&str>,
+) -> Vec<String> {
+    let tests: BTreeSet<&str> = scope.iter().map(|cell| cell.test_id.as_str()).collect();
+    rows.iter()
+        .filter(|row| row.mode == parity::PARITY_MODE && tests.contains(row.test.as_str()))
+        .filter_map(|row| {
+            let category = manifests.test_category(&row.test)?;
+            guest_root_refusal(
+                "the row",
+                category,
+                manifests.required_guest_root(category),
+                row.guest_root,
+                row.guest_root_identity.as_deref(),
+                pinned_identity,
+            )
+            .map(|reason| {
+                format!(
+                    "{} {} on {} (run {}, attempt {}): {reason}",
+                    row.test,
+                    row.mode,
+                    row.backend.as_deref().unwrap_or("no backend"),
+                    row.run_id,
+                    row.attempt
+                )
+            })
+        })
+        .collect()
 }
 
 /// The post-pass configuration `parity compare` measures the finished run in
@@ -5974,9 +6184,12 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             (cell.id.mode == "verify" && cell.id.backend.as_deref() == Some("kvm"))
                 .then(|| "this machine lacks kvm".to_string())
         };
+        let required_guest_root = |_: &SelectedCell| None;
         let policy = imported_results::ImportPolicy {
             earns_retry: &earns_retry,
             host_inapplicable: &host_inapplicable,
+            required_guest_root: &required_guest_root,
+            pinned_root_identity: None,
         };
         let imported = imported_results::load(
             &import,
@@ -6024,6 +6237,547 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
             ])
         );
         assert_eq!(imported.missing, 0);
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    /// The pinned-root image reference the guest-root fixtures name.
+    const PINNED_FIXTURE_IMAGE: &str = "localhost/pinned@sha256:00";
+
+    /// The import fixture plus bucket `pinned`: the same test as `imported`,
+    /// renamed, under `guest_root: pinned`, and the image digest file a
+    /// refusal quotes.
+    fn write_pinned_import_fixture(path: &std::path::Path) {
+        write_import_fixture(path);
+        let manifests_dir = path.join("tests/e2e/manifests");
+        let mut pinned: serde_json::Value =
+            serde_json::from_slice(&fs::read(manifests_dir.join("imported.yaml")).unwrap())
+                .unwrap();
+        pinned["bucket"] = "pinned".into();
+        pinned["guest_root"] = "pinned".into();
+        pinned["test"][0]["id"] = "pinned/control".into();
+        fs::write(
+            manifests_dir.join("pinned.yaml"),
+            serde_json::to_vec(&pinned).unwrap(),
+        )
+        .unwrap();
+        fs::create_dir_all(path.join("ci/hermetic")).unwrap();
+        fs::write(
+            path.join(hermit_manifest_plan::runner::PINNED_ROOT_IMAGE_DIGEST_FILE),
+            format!("{PINNED_FIXTURE_IMAGE}\n"),
+        )
+        .unwrap();
+    }
+
+    /// `parity compare` reads any results.jsonl it is given, so before it
+    /// measures it refuses every row the comparison would read (a verify row
+    /// of a test in scope, on the candidate or the reference backend) that
+    /// cannot count for its test's `guest_root: pinned` bucket: a row from the
+    /// host, one with no recorded root, or one that verified another image or
+    /// none. Rows of buckets without the field, and rows of other modes or
+    /// tests, are not its business.
+    #[test]
+    fn parity_compare_refuses_a_row_outside_its_buckets_guest_root() {
+        use hermit_manifest_plan::parity::ParityBackend;
+        use hermit_manifest_plan::parity::ParityCellId;
+        use hermit_manifest_plan::runner::GuestRoot;
+        use hermit_manifest_plan::runner::RunContext;
+
+        use super::parity_root_refusals;
+
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        const IDENTITY: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const OTHER: &str =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-parity-guest-root-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&fixture);
+        fs::create_dir(&fixture).unwrap();
+        write_pinned_import_fixture(&fixture);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let context = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
+        let mut cells = Vec::new();
+        for category in ["pinned", "imported"] {
+            cells.extend(
+                run_cells(
+                    &manifests,
+                    &parse(
+                        ["--category", category, "--ci-only"]
+                            .into_iter()
+                            .map(String::from),
+                    ),
+                )
+                .unwrap(),
+            );
+        }
+        type Recorded = (Option<GuestRoot>, Option<&'static str>);
+        let rows_with = |recorded: &dyn Fn(&str) -> Recorded| {
+            cells
+                .iter()
+                .map(|cell| {
+                    let mut row =
+                        import_producer_row(&context, cell, "parity-run".into(), 1, "PASS");
+                    let key = format!(
+                        "{}@{}@{}",
+                        cell.id.test,
+                        cell.id.mode,
+                        cell.id.backend.as_deref().unwrap()
+                    );
+                    let (root, identity) = recorded(&key);
+                    row.guest_root = root;
+                    row.guest_root_identity = identity.map(str::to_owned);
+                    row
+                })
+                .collect::<Vec<_>>()
+        };
+        let scope = |tests: &[&str]| {
+            tests
+                .iter()
+                .map(|test| ParityCellId {
+                    test_id: (*test).to_owned(),
+                    backend: ParityBackend::Kvm,
+                })
+                .collect::<BTreeSet<_>>()
+        };
+        let both = scope(&["pinned/control", "imported/control"]);
+        let pinned_everywhere = |_: &str| -> Recorded { (Some(GuestRoot::Pinned), Some(IDENTITY)) };
+        assert!(
+            parity_root_refusals(
+                &manifests,
+                &both,
+                &rows_with(&pinned_everywhere),
+                Some(IDENTITY)
+            )
+            .is_empty()
+        );
+        // The reference row verified another image, the candidate ran on the
+        // host, and the custom row (not read) and the unpinned bucket's rows
+        // recorded no root.
+        let mixed = |key: &str| -> Recorded {
+            match key {
+                "pinned/control@verify@ptrace" => (Some(GuestRoot::Pinned), Some(OTHER)),
+                "pinned/control@verify@kvm" => (Some(GuestRoot::Host), None),
+                _ => (None, None),
+            }
+        };
+        let refusals = parity_root_refusals(&manifests, &both, &rows_with(&mixed), Some(IDENTITY));
+        assert_eq!(
+            refusals,
+            [
+                "pinned/control verify on kvm (run parity-run, attempt 1): bucket pinned requires \
+                 guest_root pinned, the row ran in host"
+                    .to_owned(),
+                format!(
+                    "pinned/control verify on ptrace (run parity-run, attempt 1): bucket pinned \
+                     requires the pinned root this checkout records (identity {IDENTITY}), the \
+                     row verified {OTHER}"
+                ),
+            ]
+        );
+        // Out of scope, the same rows are not this command's to refuse.
+        assert!(
+            parity_root_refusals(
+                &manifests,
+                &scope(&["imported/control"]),
+                &rows_with(&mixed),
+                Some(IDENTITY)
+            )
+            .is_empty()
+        );
+        // An unreadable listing matches no pinned row.
+        let refusals = parity_root_refusals(
+            &manifests,
+            &scope(&["pinned/control"]),
+            &rows_with(&pinned_everywhere),
+            None,
+        );
+        assert_eq!(refusals.len(), 2, "{refusals:?}");
+        assert!(
+            refusals
+                .iter()
+                .all(|refusal| refusal
+                    .contains("unknown: ci/hermetic/image-paths.txt is unreadable")),
+            "{refusals:?}"
+        );
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    /// A `guest_root: pinned` bucket runs only in the pinned root
+    /// (https://github.com/rrnewton/hermit/issues/3712): from the host or a
+    /// remote worker the whole run is refused before any cell starts, naming
+    /// the bucket, the root it needs and the image it expected. Buckets
+    /// without the field run anywhere, and a refusal names only the pinned
+    /// ones. In the pinned root, pinned cells run only on a read-only root.
+    #[test]
+    fn a_pinned_guest_root_bucket_is_refused_outside_the_pinned_root() {
+        use hermit_manifest_plan::runner::GuestRoot;
+
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-guest-root-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&fixture);
+        fs::create_dir(&fixture).unwrap();
+        write_pinned_import_fixture(&fixture);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let select = |category: &str| {
+            run_cells(
+                &manifests,
+                &parse(
+                    ["--category", category, "--ci-only"]
+                        .into_iter()
+                        .map(String::from),
+                ),
+            )
+            .unwrap()
+        };
+        let pinned = select("pinned");
+        let unpinned = select("imported");
+        assert_eq!((pinned.len(), unpinned.len()), (3, 3));
+        let mixed = [unpinned.clone(), pinned.clone()].concat();
+        let not_consulted = || -> Result<(), String> {
+            panic!("the read-only check runs only for pinned cells in the pinned root")
+        };
+        let require = |cells: &[SelectedCell], actual| {
+            super::require_guest_root(&fixture, &manifests, cells, actual, &not_consulted)
+        };
+
+        for (cells, actual) in [
+            (&pinned, GuestRoot::Host),
+            (&mixed, GuestRoot::Host),
+            (&pinned, GuestRoot::Remote),
+        ] {
+            let error = require(cells, actual).unwrap_err();
+            let expected_prefix = format!(
+                "bucket pinned require guest_root pinned, but this harness runs in guest_root {}: \
+                 start it with ci/hermetic/run-in-pinned-root.sh (expected image {PINNED_FIXTURE_IMAGE}, \
+                 HERMIT_PINNED_ROOT_IMAGE=",
+                actual.as_str()
+            );
+            assert!(error.starts_with(&expected_prefix), "{error}");
+            assert!(!error.contains("bucket imported"), "{error}");
+            // The pinned-root check's own reason is named too.
+            assert!(
+                error.contains("cannot read ci/hermetic/image-paths.txt"),
+                "{error}"
+            );
+        }
+        for (cells, actual) in [
+            (&unpinned, GuestRoot::Host),
+            (&unpinned, GuestRoot::Remote),
+            (&unpinned, GuestRoot::Pinned),
+        ] {
+            assert_eq!(require(cells, actual), Ok(()), "{actual:?}");
+        }
+        // In the pinned root, pinned cells also need the read-only check to
+        // pass; its refusal names only the pinned buckets.
+        let writable = || Err::<(), String>("/usr/bin is on a writable filesystem".into());
+        let read_only = || Ok::<(), String>(());
+        for cells in [&pinned, &mixed] {
+            let pinned_root = |check: &dyn Fn() -> Result<(), String>| {
+                super::require_guest_root(&fixture, &manifests, cells, GuestRoot::Pinned, check)
+            };
+            assert_eq!(pinned_root(&read_only), Ok(()));
+            assert_eq!(
+                pinned_root(&writable),
+                Err(
+                    "bucket pinned require guest_root pinned on a read-only root: /usr/bin is on \
+                     a writable filesystem"
+                        .into()
+                )
+            );
+        }
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    /// A run whose `guest_root: pinned` cells read the pinned-root fixtures
+    /// stops before any cell starts unless the fixtures carry the receipt the
+    /// pinned root writes (https://github.com/rrnewton/hermit/issues/3712);
+    /// cells that do not read them, and buckets without the field, need none.
+    /// `verify_fixture_receipt`'s own test covers what a receipt must say.
+    #[test]
+    fn pinned_cells_that_read_the_fixtures_require_their_pinned_receipt() {
+        use super::DirectCommand;
+        use super::PINNED_FIXTURES;
+
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-fixture-receipt-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&fixture);
+        fs::create_dir(&fixture).unwrap();
+        write_pinned_import_fixture(&fixture);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let select = |category: &str| {
+            run_cells(
+                &manifests,
+                &parse(
+                    ["--category", category, "--ci-only"]
+                        .into_iter()
+                        .map(String::from),
+                ),
+            )
+            .unwrap()
+        };
+        let reading = |cells: &[SelectedCell], direct: DirectCommand| {
+            let mut cells = cells.to_vec();
+            cells[0].test.direct = Some(direct);
+            cells
+        };
+        let fixture_file = format!("{{{{VALIDATE_RUN_STATE}}}}/{PINNED_FIXTURES}/README.md");
+        let pinned = select("pinned");
+        let unpinned = select("imported");
+        let argv = reading(
+            &pinned,
+            DirectCommand::Argv(vec!["/bin/cat".into(), fixture_file.clone()]),
+        );
+        let shell = reading(&pinned, DirectCommand::Shell(format!("cat {fixture_file}")));
+        let host = reading(
+            &unpinned,
+            DirectCommand::Argv(vec!["/bin/cat".into(), fixture_file.clone()]),
+        );
+        let state = fixture.join("state");
+        let require = |cells: &[SelectedCell], run_state: Option<&std::path::Path>| {
+            super::require_pinned_fixtures(&fixture, &manifests, cells, run_state)
+        };
+
+        for cells in [&pinned, &unpinned, &host] {
+            assert!(!super::reads_pinned_fixtures(&manifests, cells));
+            assert_eq!(require(cells, None), Ok(()));
+        }
+        for cells in [&argv, &shell] {
+            assert!(super::reads_pinned_fixtures(&manifests, cells));
+            let error = require(cells, None).unwrap_err();
+            assert!(error.contains("VALIDATE_RUN_STATE is unset"), "{error}");
+            let error = require(cells, Some(&state)).unwrap_err();
+            assert!(
+                error.contains("cannot read ci/hermetic/image-paths.txt"),
+                "{error}"
+            );
+        }
+        fs::write(
+            fixture.join("ci/hermetic/image-paths.txt"),
+            format!(
+                "image: {PINNED_FIXTURE_IMAGE}\ntree: /s sha256:{0}\nfile: /lib64/ld.so /s/ld.so \
+                 sha256:{0}\n/bin/gcc /s/gcc\n",
+                "0".repeat(64)
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(state.join(PINNED_FIXTURES)).unwrap();
+        for cells in [&argv, &shell] {
+            let error = require(cells, Some(&state)).unwrap_err();
+            assert!(error.contains("has no receipt"), "{error}");
+        }
+        // A receipt is read and checked: this one names the host's gcc.
+        fs::write(
+            state.join(format!("{PINNED_FIXTURES}.receipt")),
+            format!(
+                "hermit-compat-fixture-receipt 1\nimage {PINNED_FIXTURE_IMAGE}\ncompiler /usr/bin/gcc\n"
+            ),
+        )
+        .unwrap();
+        let error = require(&argv, Some(&state)).unwrap_err();
+        assert!(error.contains("compiled by /usr/bin/gcc"), "{error}");
+        fs::remove_dir_all(&fixture).unwrap();
+    }
+
+    /// Import mode skips the run-wide refusal, so each imported row of a
+    /// `guest_root: pinned` bucket must itself record the pinned root AND the
+    /// identity of the pinned image this checkout records: a row that ran on
+    /// the host, recorded no root, verified another root, or recorded no
+    /// identity becomes an `import-stale` ERROR and cannot stand as
+    /// pinned-root evidence. When this checkout's listing cannot be read, no
+    /// pinned row can be matched. A row that verified the recorded image keeps
+    /// its verdict, its `guest_root` and its identity.
+    #[test]
+    fn import_mode_requires_each_row_of_a_pinned_bucket_to_record_the_pinned_root() {
+        use hermit_manifest_plan::imported_results;
+        use hermit_manifest_plan::imported_results::bucket_dir;
+        use hermit_manifest_plan::runner::GuestRoot;
+        use hermit_manifest_plan::runner::RunContext;
+        use serde_json::json;
+
+        const SHA: &str = "0123456789abcdef0123456789abcdef01234567";
+        const IDENTITY: &str =
+            "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        const OTHER: &str =
+            "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+        let fixture = std::env::temp_dir().join(format!(
+            "hermit-harness-import-guest-root-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&fixture);
+        fs::create_dir(&fixture).unwrap();
+        write_pinned_import_fixture(&fixture);
+        let manifests = ManifestSet::load(&fixture).unwrap();
+        let cells = run_cells(
+            &manifests,
+            &parse(
+                ["--category", "pinned", "--ci-only"]
+                    .into_iter()
+                    .map(String::from),
+            ),
+        )
+        .unwrap();
+        let context = RunContext::for_import(fixture.clone(), Some(SHA)).unwrap();
+        let import = fixture.join("import");
+        let bucket = bucket_dir(&import, "portable", "pinned");
+        fs::create_dir_all(&bucket).unwrap();
+        type Recorded = (Option<GuestRoot>, Option<&'static str>);
+        type Verdict = (
+            String,
+            Option<String>,
+            String,
+            Option<GuestRoot>,
+            Option<String>,
+        );
+        let import_with = |recorded: &dyn Fn(&str) -> Recorded, checkout: Option<&str>| {
+            let (rows, evidence): (Vec<_>, Vec<_>) = cells
+                .iter()
+                .enumerate()
+                .map(|(index, cell)| {
+                    let mut row = import_producer_row(
+                        &context,
+                        cell,
+                        format!("buck-producer-{index}"),
+                        1,
+                        "PASS",
+                    );
+                    let key = format!("{}@{}", cell.id.mode, cell.id.backend.as_deref().unwrap());
+                    let (root, identity) = recorded(&key);
+                    row.guest_root = root;
+                    row.guest_root_identity = identity.map(str::to_owned);
+                    (serde_json::to_string(&row).unwrap(), import_execution(&row))
+                })
+                .unzip();
+            fs::write(bucket.join("results.jsonl"), rows.join("\n") + "\n").unwrap();
+            fs::write(
+                bucket.join("summary.json"),
+                serde_json::to_vec(&json!({"evidence_complete_executions": evidence})).unwrap(),
+            )
+            .unwrap();
+            // The policy test-harness builds in import mode.
+            let earns_retry = |_: &SelectedCell, _: &CellResult| true;
+            let host_inapplicable = |_: &SelectedCell| None;
+            let required_guest_root =
+                |cell: &SelectedCell| manifests.required_guest_root(&cell.category);
+            let policy = imported_results::ImportPolicy {
+                earns_retry: &earns_retry,
+                host_inapplicable: &host_inapplicable,
+                required_guest_root: &required_guest_root,
+                pinned_root_identity: checkout,
+            };
+            let imported = imported_results::load(
+                &import,
+                &cells,
+                &context,
+                &fixture.join("out/results.jsonl"),
+                &policy,
+            )
+            .unwrap();
+            assert_eq!(imported.missing, 0);
+            cells
+                .iter()
+                .zip(&imported.cells)
+                .map(|(cell, imported)| {
+                    let [row] = imported.rows.as_slice() else {
+                        panic!("one row per cell: {:?}", imported.rows);
+                    };
+                    (
+                        format!("{}@{}", cell.id.mode, cell.id.backend.as_deref().unwrap()),
+                        (
+                            row.outcome.clone(),
+                            row.error_kind.clone(),
+                            row.reason.clone().unwrap_or_default(),
+                            row.guest_root,
+                            row.guest_root_identity.clone(),
+                        ),
+                    )
+                })
+                .collect::<BTreeMap<String, Verdict>>()
+        };
+        let stale = |reason: String| -> Verdict {
+            (
+                "ERROR".to_string(),
+                Some("import-stale".to_string()),
+                reason,
+                None,
+                None,
+            )
+        };
+        let ran_in = |root: &str| {
+            stale(format!(
+                "bucket pinned requires guest_root pinned, the imported row ran in {root}"
+            ))
+        };
+        let verified = |checkout: &str, found: &str| {
+            stale(format!(
+                "bucket pinned requires the pinned root this checkout records (identity \
+                 {checkout}), the imported row verified {found}"
+            ))
+        };
+        let pass: Verdict = (
+            "PASS".into(),
+            None,
+            String::new(),
+            Some(GuestRoot::Pinned),
+            Some(IDENTITY.into()),
+        );
+
+        // The recorded root.
+        let recorded = |key: &str| -> Recorded {
+            match key {
+                "verify@ptrace" => (Some(GuestRoot::Pinned), Some(IDENTITY)),
+                "verify@kvm" => (Some(GuestRoot::Host), None),
+                "custom@kvm" => (None, None),
+                other => panic!("unexpected cell {other}"),
+            }
+        };
+        assert_eq!(
+            import_with(&recorded, Some(IDENTITY)),
+            BTreeMap::from([
+                ("verify@ptrace".into(), pass.clone()),
+                ("verify@kvm".into(), ran_in("host")),
+                ("custom@kvm".into(), ran_in("an unrecorded root")),
+            ])
+        );
+
+        // The recorded identity: a pinned row that verified another image, or
+        // that recorded none, is stale.
+        let recorded = |key: &str| -> Recorded {
+            match key {
+                "verify@ptrace" => (Some(GuestRoot::Pinned), Some(OTHER)),
+                "verify@kvm" => (Some(GuestRoot::Pinned), None),
+                "custom@kvm" => (Some(GuestRoot::Pinned), Some(IDENTITY)),
+                other => panic!("unexpected cell {other}"),
+            }
+        };
+        assert_eq!(
+            import_with(&recorded, Some(IDENTITY)),
+            BTreeMap::from([
+                ("verify@ptrace".into(), verified(IDENTITY, OTHER)),
+                ("verify@kvm".into(), verified(IDENTITY, "no identity")),
+                ("custom@kvm".into(), pass.clone()),
+            ])
+        );
+
+        // A checkout that cannot read its listing matches no pinned row.
+        let unknown = "unknown: ci/hermetic/image-paths.txt is unreadable";
+        assert_eq!(
+            import_with(&recorded, None),
+            BTreeMap::from([
+                ("verify@ptrace".into(), verified(unknown, OTHER)),
+                ("verify@kvm".into(), verified(unknown, "no identity")),
+                ("custom@kvm".into(), verified(unknown, IDENTITY)),
+            ])
+        );
         fs::remove_dir_all(&fixture).unwrap();
     }
 
@@ -6075,9 +6829,12 @@ sys.exit({'skid':122,'unmarked':122,'rejected':122,'crashed':122,'matched':0,'di
         .unwrap();
         let earns_retry = |_: &SelectedCell, _: &CellResult| false;
         let host_inapplicable = |_: &SelectedCell| None::<String>;
+        let required_guest_root = |_: &SelectedCell| None;
         let policy = imported_results::ImportPolicy {
             earns_retry: &earns_retry,
             host_inapplicable: &host_inapplicable,
+            required_guest_root: &required_guest_root,
+            pinned_root_identity: None,
         };
         for dirty in [false, true] {
             let mut context = clean.clone();
@@ -7309,7 +8066,14 @@ sys.exit(1 if failed else 0)
         // for rrcompat.manifest_compat, the rr run type's. +16 direct for
         // the full-buck-e2e import twins (<bucket>_buck), which import the
         // rows e2e.buck_cells wrote on the host and so run outside the root.
-        assert_eq!((pinned, direct), (19, 37));
+        // (24, 34) since the gating compat corpus runs from the pinned image
+        // (https://github.com/rrnewton/hermit/issues/3712): +1 pinned for
+        // e2e.manifest_compat_pinned and +1 direct for its import twin
+        // e2e.manifest_compat_pinned_buck; portablecompat, sabrecompat,
+        // strictcompat and rrcompat.manifest_compat moved from direct to
+        // pinned. e2e.manifest_compat and its _on_host twin stay direct: they
+        // are now the non-gating host-portability check.
+        assert_eq!((pinned, direct), (24, 34));
     }
 
     /// With the committed parity selection, the full profile's harness
@@ -7371,7 +8135,11 @@ sys.exit(1 if failed else 0)
         // 16 since e2e.manifest_compat (fold 1 of
         // https://github.com/rrnewton/hermit/issues/3448); it plans no parity
         // cell, so the selected cells and their reports are unchanged.
-        assert_eq!(nodes, 16);
+        // 17 since e2e.manifest_compat_pinned, the gating copy of the compat
+        // corpus run from the pinned image
+        // (https://github.com/rrnewton/hermit/issues/3712); it plans no
+        // parity cell either.
+        assert_eq!(nodes, 17);
         // The size of the selection is not pinned here: parity.rs derives it
         // from its written rule and `validate` refuses a stale file. This pins
         // what no generator checks: each selected cell is reported by exactly
@@ -7412,12 +8180,45 @@ sys.exit(1 if failed else 0)
         // run by full, and full planned neither side of their parity cell, so
         // they were unreported; switched off, they are no longer applicable.
         // The 2 left are example-timed-progress-bar's DBT and KVM cells.
-        assert_eq!(unreported.len(), 2 + 30, "{unreported:?}");
+        // 2 + 44 since the gating corpus moved to compat-pinned, run from the
+        // pinned image (https://github.com/rrnewton/hermit/issues/3712): the
+        // 30 SaBRe-only rows are now compat-pinned rows, and 14 more rows'
+        // ptrace verify cells left full while their SaBRe cells stayed
+        // enabled. 13 of them name a program the image lacks (`unavailable`),
+        // and uptime's verify cells are unselected because coreutils 9.11's
+        // uptime reads Detcore's CLOCK_BOOTTIME as a boot at the epoch.
+        // curl and curl-localhost are not among them: the image the
+        // 29a8d19b repin built has /usr/bin/curl, so full runs curl's ptrace
+        // verify cell, and curl-localhost's SaBRe cell is unselected (it
+        // times out in the pinned root), so its parity cell is not
+        // applicable. compat.yaml, the host-portability copy, has no SaBRe
+        // cell.
+        assert_eq!(unreported.len(), 2 + 44, "{unreported:?}");
         let sabre_only = unreported
             .iter()
-            .filter(|cell| cell.starts_with("compat/") && cell.ends_with("@sabre"))
+            .filter(|cell| cell.starts_with("compat-pinned/") && cell.ends_with("@sabre"))
             .count();
-        assert_eq!(sabre_only, 30, "{unreported:?}");
+        assert_eq!(sabre_only, 44, "{unreported:?}");
+        let left_full = [
+            "bc",
+            "clang",
+            "cpio-roundtrip",
+            "dc",
+            "file",
+            "gcov",
+            "ip",
+            "patch",
+            "sar-resource-tables",
+            "time",
+            "uptime",
+            "wget-localhost",
+            "xmllint",
+            "zip-unzip",
+        ];
+        for row in left_full {
+            let cell = format!("compat-pinned/{row}@sabre");
+            assert!(unreported.contains(&cell), "{cell}: {unreported:?}");
+        }
     }
 
     #[test]
@@ -10251,6 +11052,15 @@ sys.exit(1 if failed else 0)
     /// committed order and appends new rows, so a re-flipped row returns to the
     /// end of the plan: the order a hand flip by the generator gives too.
     ///
+    /// The subject must come from a manifest with a `test` list, the form
+    /// `unflip` edits. A corpus manifest (ci/manifest-plan/src/manifest_corpus.rs,
+    /// such as compat-pinned.yaml) expands rows instead and has no per-cell
+    /// `backends_enabled` to take a backend out of. So when the committed plan
+    /// ends in corpus rows, the fixture first moves the last row of a
+    /// `test`-list manifest to the end of its copy of the plan. Any committed
+    /// order is one the generator keeps, so the moved plan is still current:
+    /// `sync` reports nothing stale, which the test asserts before it starts.
+    ///
     /// When that row is a parity candidate (a non-ptrace verify cell that
     /// tests/e2e/parity-selection.yaml lists), un-flipping it also takes it out
     /// of the parity selection, whose rule admits only enabled candidate cells;
@@ -10258,14 +11068,40 @@ sys.exit(1 if failed else 0)
     #[test]
     fn sync_cells_round_trips_an_unflip_and_reflip_byte_for_byte() {
         let root = sync_cells_fixture("tail");
-        let committed_plan = fs::read(root.join(super::EXPECTED_PLAN_PATH)).unwrap();
-        let committed_selection = fs::read(root.join(parity::PARITY_SELECTION_PATH)).unwrap();
         assert!(
             sync(&root).is_empty(),
             "the committed plan and selection are stale; run ci/sync-cell-config.sh"
         );
 
-        let plan: serde_json::Value = serde_json::from_slice(&committed_plan).unwrap();
+        let plan_path = root.join(super::EXPECTED_PLAN_PATH);
+        let mut plan: serde_json::Value =
+            serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
+        let lists_tests = |cell: &serde_json::Value| {
+            let category = cell["category"].as_str().unwrap();
+            fs::read_to_string(root.join(format!("tests/e2e/manifests/{category}.yaml")))
+                .ok()
+                .and_then(|text| serde_yaml::from_str::<YamlValue>(&text).ok())
+                .is_some_and(|manifest| manifest["test"].is_sequence())
+        };
+        let cells = plan["cells"].as_array_mut().unwrap();
+        let subject = cells
+            .iter()
+            .rposition(lists_tests)
+            .expect("no plan row comes from a manifest with a test list");
+        let moved = cells.remove(subject);
+        cells.push(moved);
+        fs::write(
+            &plan_path,
+            serde_json::to_string_pretty(&plan).unwrap() + "\n",
+        )
+        .unwrap();
+        assert!(
+            sync(&root).is_empty(),
+            "moving a row to the end of the plan must keep the plan current"
+        );
+        let committed_plan = fs::read(&plan_path).unwrap();
+        let committed_selection = fs::read(root.join(parity::PARITY_SELECTION_PATH)).unwrap();
+
         let tail = plan["cells"].as_array().unwrap().last().unwrap().clone();
         let field = |name: &str| tail[name].as_str().unwrap().to_owned();
         let (test, mode, backend) = (field("test"), field("mode"), field("backend"));

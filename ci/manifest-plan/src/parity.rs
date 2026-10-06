@@ -5491,14 +5491,21 @@ mod tests {
             panic!("{error}");
         }
         let parsed: ParityCells = serde_json::from_str(committed).unwrap();
-        assert_eq!(parsed.cells.len(), 3144);
+        // 3144 until the gating compat corpus moved to compat-pinned.yaml
+        // (https://github.com/rrnewton/hermit/issues/3712): compat.yaml keeps
+        // its 219 rows as the host-portability copy, compat-pinned.yaml has
+        // the same 219 rows plus the 193 strict-<row> tests that left
+        // compat.yaml, so +219 tests at one line per backend: +876 cells.
+        assert_eq!(parsed.cells.len(), 4020);
         // The repository's limit for a text file is 2 MiB. This bound was
         // 1 MiB until fold 5 of https://github.com/rrnewton/hermit/issues/3448
         // took the snapshot to 1,099,771 bytes: every test lists one line per
         // backend, and the 139 rr-compat-only replay tests added 556
         // not-applicable lines. 854 KB of it is the 2857 not-applicable lines.
         // Folding those replay cells into the rows' own tests removed the 556
-        // lines again (902,846 bytes, 3144 cells, on 2026-10-04).
+        // lines again (902,846 bytes, 3144 cells, on 2026-10-04). The
+        // host-portability copy of the compat corpus took it from 938,865 to
+        // 1,186,460 bytes (4020 cells, on 2026-10-05).
         assert!(
             committed.len() < 1536 * 1024,
             "{PARITY_CELLS_PATH} is {} bytes; it must stay well under 2 MiB",

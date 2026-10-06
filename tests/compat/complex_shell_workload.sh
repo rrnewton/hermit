@@ -30,7 +30,7 @@ rm -rf "$WORK_DIR"
 mkdir -p "$SRC_DIR" "$BUILD_DIR"
 trap 'rm -rf "$WORK_DIR"' EXIT
 
-for tool in /usr/bin/gcc /usr/bin/as /usr/bin/ld /usr/bin/nm; do
+for tool in /bin/gcc /bin/as /bin/ld /bin/nm; do
     test -x "$tool"
 done
 test "$(/usr/bin/uname -m)" = x86_64
@@ -43,7 +43,7 @@ EOF
 
 if (
     cd "$BUILD_DIR"
-    /usr/bin/gcc -std=c11 -Wall -Werror -ffreestanding -fno-ident \
+    /bin/gcc -std=c11 -Wall -Werror -ffreestanding -fno-ident \
         -frandom-seed=hermit-configure -c "$SRC_DIR/conftest.c" \
         -o conftest.o
 ) >"$BUILD_DIR/config.log" 2>&1; then
@@ -106,18 +106,18 @@ EOF
 
 (
     cd "$BUILD_DIR"
-    SOURCE_DATE_EPOCH=946684800 /usr/bin/gcc -std=c11 -O2 -Wall -Werror \
+    SOURCE_DATE_EPOCH=946684800 /bin/gcc -std=c11 -O2 -Wall -Werror \
         -ffreestanding -fno-ident -frandom-seed=hermit-shell-build \
         -fno-stack-protector -fno-pie -I. -c "$SRC_DIR/answer.c" \
         -o answer.o
-    /usr/bin/as --64 "$SRC_DIR/start.s" -o start.o
-    /usr/bin/ld --build-id=none -o program start.o answer.o
+    /bin/as --64 "$SRC_DIR/start.s" -o start.o
+    /bin/ld --build-id=none -o program start.o answer.o
 )
 
 output=$("$BUILD_DIR/program")
 test "$output" = 'shell-build=42'
 
-/usr/bin/nm -g --defined-only "$BUILD_DIR/program" >"$BUILD_DIR/symbols"
+/bin/nm -g --defined-only "$BUILD_DIR/program" >"$BUILD_DIR/symbols"
 symbols=$(/usr/bin/awk \
     '$3 == "_start" || $3 == "shell_answer" { print $3 }' \
     "$BUILD_DIR/symbols")

@@ -233,9 +233,10 @@ on the compile node, so none starts before preparation has finished.
 `target/ci/hermit` and as the E2E bundle. Consumers name `target/ci/hermit`
 or the bundle, never a per-profile path. The host keeps only tooling builds
 (`build.rust_scripts`, `setup.manifest_plan`, `build.manifest_guests`) for
-host-side checks; the strict
-compatibility rows, which run host-installed programs the image does not
-carry, reach the pinned-root binary through `build.host_hermit_link`.
+host-side checks; the diagnostic host-portability strict compatibility rows
+(`e2e.manifest_compat`), which run host-installed programs, reach the
+pinned-root binary through `build.host_hermit_link`. The gating strict
+compatibility rows run inside the pinned root (next section).
 `lint.clippy`, `doc.rustdoc` and `doc.doctests` stay in the dev profile: in the
 validate profile they rebuild units whose build scripts, `hermit-install`'s
 among them, rewrite `target/install_pkg` and `target/validate` under running
@@ -284,10 +285,20 @@ runtime output.
 ### Command fidelity
 
 Node `cmd`s are the **verbatim** commands `scripts/validate.rs` runs. Portable
-strict compatibility is committed as one fixture producer,
-`compatprep.fixtures`, plus one manifest bucket, `e2e.manifest_compat`, which
-runs the 189 rows of `tests/e2e/manifests/compat.yaml` on the host; it is
-selected by that name like any other bucket.
+strict compatibility is committed as two fixture producers and two manifest
+buckets, each selected by name like any other bucket
+(https://github.com/rrnewton/hermit/issues/3712):
+- **`e2e.manifest_compat_pinned` gates.** It runs the 174 cells of
+  `tests/e2e/manifests/compat-pinned.yaml` (169 required, 5 diagnostic) inside
+  the pinned root, so every program and its libc come from the image and a
+  verdict does not depend on the host's glibc. Its fixtures come from
+  `compatpinnedprep.fixtures`, also run in the pinned root. The bucket declares
+  `guest_root: pinned`: test-harness refuses to run it anywhere else, and each
+  result row records the root it ran in.
+- **`e2e.manifest_compat` is diagnostic.** It runs the 216 cells of
+  `tests/e2e/manifests/compat.yaml` on the host, with fixtures from
+  `compatprep.fixtures`, as a host-portability check. It keeps every row,
+  including the programs the image does not carry, and none of its cells gate.
 - **The DBT stderr-isolation CLI case is a separate 120-second node** so a
   backend hang fails quickly without consuming the aggregate CLI budget. The
   aggregate node skips that case, so the test set remains unchanged.
