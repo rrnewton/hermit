@@ -24,6 +24,7 @@ use serde::Serialize;
 
 use crate::dirents::DirEntry;
 use crate::dirents::DirectoryStream;
+use crate::procfs::MappingSubject;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
 use crate::procfs::TimerSlackReadPreview;
@@ -513,13 +514,16 @@ impl DetFd {
             .is_some_and(ProcfsFile::lists_address_space)
     }
 
-    /// The address space this `maps`/`smaps` snapshot is known to show; see
-    /// `ProcfsFile::mapping_address_space`.
-    pub(crate) fn procfs_mapping_address_space(&self) -> Option<MmId> {
+    /// Whose address space this `maps`/`smaps` snapshot shows to a reader in
+    /// `reader_mm`; see `ProcfsFile::mapping_subject`. `Unknown` for a
+    /// descriptor that is not a procfs file.
+    pub(crate) fn procfs_mapping_subject(&self, reader_mm: MmId) -> MappingSubject {
         self.description()
             .procfs
             .as_ref()
-            .and_then(ProcfsFile::mapping_address_space)
+            .map_or(MappingSubject::Unknown, |procfs| {
+                procfs.mapping_subject(reader_mm)
+            })
     }
 
     pub(crate) fn procfs_needs_mountinfo_identities(&self) -> bool {
