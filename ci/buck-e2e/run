@@ -65,6 +65,17 @@ while [[ $# -gt 0 ]]; do
 done
 [[ $mode == hybrid || $mode == local ]] || { echo "ci/buck-e2e/run: --mode hybrid|local is required" >&2; exit 2; }
 [[ -n $out && -n $work ]] || { echo "ci/buck-e2e/run: --out and --work are required" >&2; exit 2; }
+# ingest.py checks the directories it is given, but sees only --work/artifacts; the rest of
+# --work (event logs, the verdict) is this script's, and replacing it would delete them.
+overlaps() { local a b; a=$(realpath -m -- "$1")/ b=$(realpath -m -- "$2")/; [[ $a == "$b"* || $b == "$a"* ]]; }
+if ((${#failed_logs[@]})); then
+    for other in "$out" "$work"; do
+        if overlaps "${failed_logs[1]}" "$other"; then
+            echo "ci/buck-e2e/run: --failed-verify-logs ${failed_logs[1]} overlaps $other; replacing it would delete that directory's files" >&2
+            exit 2
+        fi
+    done
+fi
 [[ -s $here/staged/SOURCE_SHA ]] || { echo "ci/buck-e2e/run: stage the inputs first (ci/buck-e2e/stage)" >&2; exit 2; }
 [[ -x $here/staged/bin/test-harness ]] || {
     echo "ci/buck-e2e/run: $here/staged/bin/test-harness is missing; stage the inputs again (ci/buck-e2e/stage)" >&2

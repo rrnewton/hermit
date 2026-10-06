@@ -85,7 +85,7 @@ which the testx listing shows without a fetch. An execution is read from the one
 directory holding its marker; every other execution, including one whose marker is in
 no local directory or in several, is fetched with testx.
 """
-import argparse, collections, concurrent.futures as cf, hashlib, json, os, re, shutil, subprocess, sys, tempfile, time
+import argparse, collections, concurrent.futures as cf, hashlib, json, os, re, shutil, stat, subprocess, sys, tempfile, time
 
 TESTX = os.environ.get("TESTX", "testx")
 MARKER = "run_id."  # cell.sh: an artifact named run_id.<run id>
@@ -329,9 +329,16 @@ def main():
     a = ap.parse_args()
     failed_root, failed_logs_error = a.failed_verify_logs, None
     if failed_root is not None and os.path.lexists(failed_root):
+        def holds_index():
+            # lstat, not isfile: isfile reads a permission error as "no index", which would
+            # refuse a previous ingest's directory as someone else's.
+            try:
+                return stat.S_ISREG(os.lstat(os.path.join(failed_root, FAILED_LOGS_INDEX)).st_mode)
+            except FileNotFoundError:
+                return False
         try:
             foreign = (not os.path.isdir(failed_root) or os.path.islink(failed_root) or
-                       (os.listdir(failed_root) and not os.path.isfile(os.path.join(failed_root, FAILED_LOGS_INDEX))))
+                       (bool(os.listdir(failed_root)) and not holds_index()))
         except OSError as error:
             # A directory that cannot be inspected cannot be shown to be ours, so it is left
             # alone and no logs are kept; like any retention failure this never fails the ingest.

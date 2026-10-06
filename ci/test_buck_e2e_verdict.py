@@ -629,6 +629,15 @@ class RunTest(unittest.TestCase):
                          ["index.jsonl", "ry1/verify-logs/verify-1/run1_log_detlog",
                           "ry1/verify-logs/verify-1/run2_log_detlog"])
 
+    def test_failed_verify_logs_inside_work_or_out_is_refused_before_the_run(self):
+        runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), ingest_test.Y_PASSES]}
+        for target in (self.root / "work" / "verdict", self.root / "work", self.root / "import"):
+            with self.subTest(str(target.relative_to(self.root))):
+                process = self.run_buck_e2e("local", runs, "--failed-verify-logs", str(target))
+                self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+                self.assertIn("overlaps", process.stderr)
+                self.assertFalse((self.root / "work").exists(), "buck2 ran before the refusal")
+
 
 # Each step validate-node calls: appends its name and argv to FAKE_STEP_CALLS.
 FAKE_STEP = r"""#!/usr/bin/env python3

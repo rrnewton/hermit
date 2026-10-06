@@ -630,6 +630,21 @@ class IngestTest(unittest.TestCase):
         earlier.chmod(0o755)
         self.assertEqual((earlier / "index.jsonl").read_text(), "from an earlier ingest\n")
 
+    def test_a_previous_directory_whose_index_cannot_be_checked_is_not_called_foreign(self):
+        # Mode 0400: its names can be listed, but not one of its files can be looked at.
+        diverged = with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS)
+        earlier = self.root / "earlier"
+        earlier.mkdir()
+        (earlier / "index.jsonl").write_text("from an earlier ingest\n")
+        earlier.chmod(0o400)
+        self.addCleanup(earlier.chmod, 0o755)
+        work, process = self.ingest({"RUN": [execution(X, 100, "PASS", "rx1"), diverged]},
+                                    extra=["--failed-verify-logs", str(earlier)])
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertNotIn("refusing to replace it", process.stderr)
+        self.assertIn("cannot inspect", json.loads(process.stdout)["failed_verify_logs_error"])
+        self.assertTrue((work / "out" / "portable" / "manifest_cat" / "results.jsonl").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()
