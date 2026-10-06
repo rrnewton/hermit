@@ -1925,7 +1925,7 @@ where
     };
 
     drop(guard);
-    signals.restore(guest, None).await?;
+    let result = result_after_restore(signals.restore(guest, None).await, result)?;
     refuse_held_signal_loss(guest, call0.number(), result).await
 }
 
@@ -2146,6 +2146,10 @@ pub(crate) enum HeldSignalLoss {
     /// it, and either it is one the wait holds until the call returns
     /// (`held_until_return`) or it replaced a held signal whose loss matters.
     Consumed,
+    /// A signal stopped an injection of `restore`, which puts the guest's mask
+    /// back and so must run whatever is pending, and the backend dropped a held
+    /// signal whose loss matters, or one that could not be identified, for it.
+    Restoration,
 }
 
 /// A wait that ends because going on, or restarting the call, would lose a
@@ -2223,6 +2227,11 @@ impl std::fmt::Display for HeldSignalRefusal {
                     write!(f, ", in place of {held}")?;
                 }
             }
+            HeldSignalLoss::Restoration => write!(
+                f,
+                "unsupported: the {wait} wait cannot keep {held}: {replacing} stopped the \
+                 injection that puts the guest's signal mask back and replaced it"
+            )?,
         }
         write!(
             f,
@@ -2848,9 +2857,41 @@ impl KernelSignalWait {
     /// guest's mask. The guest never resumes with every signal blocked: if the
     /// mask cannot be put back, the run ends with
     /// [`BlockedWaitSignalError::MaskNotRestored`].
+    ///
+    /// The backend holds the signal that stops one of these injections, in place
+    /// of any it held, as it does for a probe (`inject_absorbing`). Each such
+    /// stop is recorded from the read before the injection and the read after it
+    /// (`absorb_restoration_stop`). If one replaced a held signal whose loss
+    /// matters, or one that could not be identified, the mask is still put back
+    /// and then the first such loss is returned as a [`HeldSignalRefusal`]
+    /// (`HeldSignalLoss::Restoration`), which the caller turns into the wait's
+    /// result (`result_after_restore`). Round-11 High F1 on
+    /// https://github.com/rrnewton/hermit/pull/3361: these stops used to be
+    /// retried without that check, so the held signal was lost silently.
     pub(crate) async fn restore<'a, T, G>(
         &mut self,
         guest: &mut G,
+        scratch: Option<AddrMut<'a, KernelSigset>>,
+    ) -> Result<(), Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        let Some(guest_mask) = self.saved_mask else {
+            return Ok(());
+        };
+        // `stop_verdict` reads the guest's mask from `saved_mask`, so it is cleared
+        // only once the restoration has ended.
+        let restored = self.restore_mask(guest, guest_mask, scratch).await;
+        self.saved_mask = None;
+        restored
+    }
+
+    /// `restore`, for a wait whose guest mask is `guest_mask`.
+    async fn restore_mask<'a, T, G>(
+        &mut self,
+        guest: &mut G,
+        guest_mask: KernelSigset,
         scratch: Option<AddrMut<'a, KernelSigset>>,
     ) -> Result<(), Error>
     where
@@ -2861,22 +2902,31 @@ impl KernelSignalWait {
         // SIGSTOP) can stop the call before it takes effect, and each such stop needs
         // another signal sent, so a bound this large is never reached in practice.
         const ATTEMPTS: usize = 16;
-        let Some(guest_mask) = self.saved_mask.take() else {
-            return Ok(());
-        };
         let mut attempts = 0;
         let mut last_error = None;
+        // The kernel's state before an injection that a signal stopped, until the
+        // next read records the stop.
+        let mut stopped = None;
+        // The first held signal that a stop replaced, as the refusal to return once
+        // the mask is back.
+        let mut loss = None;
         while attempts < ATTEMPTS {
-            if read_wait_signal_state(self.pid, self.tid)?.blocked == guest_mask {
-                return Ok(());
+            let state = read_wait_signal_state(self.pid, self.tid)?;
+            if let Some(before) = stopped.take() {
+                let replaced = self.absorb_restoration_stop(&before, &state);
+                loss = loss.or(replaced);
+            }
+            if state.blocked == guest_mask {
+                return loss.map_or(Ok(()), Err);
             }
             attempts += 1;
             match inject_signal_mask(guest, guest_mask, scratch).await {
-                Ok(()) => return Ok(()),
-                // Stopped by a signal: the read at the top of the loop decides whether
-                // the mask took effect.
+                Ok(()) => return loss.map_or(Ok(()), Err),
+                // Stopped by a signal: the next read records the stop and decides
+                // whether the mask took effect.
                 Err(errno) if probe_was_interrupted_by_signal(errno) => {
                     last_error = Some(errno);
+                    stopped = Some(state);
                 }
                 // The call could not run, so the mask is unchanged.
                 Err(errno) => {
@@ -2885,8 +2935,13 @@ impl KernelSignalWait {
                 }
             }
         }
-        if read_wait_signal_state(self.pid, self.tid)?.blocked == guest_mask {
-            return Ok(());
+        let state = read_wait_signal_state(self.pid, self.tid)?;
+        if let Some(before) = stopped.take() {
+            let replaced = self.absorb_restoration_stop(&before, &state);
+            loss = loss.or(replaced);
+        }
+        if state.blocked == guest_mask {
+            return loss.map_or(Ok(()), Err);
         }
         Err(Error::Tool(anyhow::Error::new(
             BlockedWaitSignalError::MaskNotRestored {
@@ -2896,6 +2951,88 @@ impl KernelSignalWait {
                 last_error,
             },
         )))
+    }
+
+    /// Record a signal stop of an injection of `restore`, given the kernel's state
+    /// `before` the injection and `after` it, as `inject_absorbing` records a stop
+    /// of a probe: the backend holds the signal that stopped it in place of any it
+    /// held. Returns the `HeldSignalRefusal` when that replaced a held signal
+    /// whose loss matters, or one that could not be identified
+    /// (`would_replace_precious`, `holds_precious`), naming the held signal as it
+    /// was before the stop.
+    ///
+    /// A stop is identified only when exactly the signal that the kernel would
+    /// take next under the mask `before` left its queue and the mask did not
+    /// change (`stop_took_only`); a stop after which the mask took effect, or one
+    /// that `before` did not show, is recorded as unidentified. The call's result
+    /// is already decided, so a signal that would have ended the wait is kept as
+    /// one whose delivery matters.
+    fn absorb_restoration_stop(
+        &mut self,
+        before: &KernelSignalState,
+        after: &KernelSignalState,
+    ) -> Option<Error> {
+        let identified = before
+            .next_dequeued(before.blocked)
+            .filter(|&(signal, queue)| stop_took_only(before, after, signal, queue));
+        let Some((signal, queue)) = identified else {
+            let loss = self
+                .holds_precious()
+                .then(|| self.refusal(None, HeldSignalLoss::Restoration));
+            tracing::trace!(
+                "[tid {}] a signal stop that cannot be identified stopped the mask restoration; it replaced the held signal {:?}",
+                self.tid,
+                self.held
+            );
+            self.held = None;
+            self.held_unidentified = true;
+            return loss;
+        };
+        let loss = self
+            .would_replace_precious(signal, queue)
+            .then(|| self.refusal(Some(signal), HeldSignalLoss::Restoration));
+        let kind = match self.stop_verdict(before, signal) {
+            StopVerdict::Absorb(kind) => kind,
+            StopVerdict::End(_) => HeldKind::Precious,
+        };
+        let kind = self.held.map_or(kind, |held| held.kind.max(kind));
+        tracing::trace!(
+            "[tid {}] signal {} stopped the mask restoration and is held ({:?}) in place of {:?}",
+            self.tid,
+            signal,
+            kind,
+            self.held
+        );
+        self.held = Some(HeldSignal {
+            signal,
+            queue,
+            kind,
+        });
+        self.held_unidentified = false;
+        loss
+    }
+}
+
+/// The wait's result once `restore` has put the guest's mask back. A
+/// [`HeldSignalRefusal`] from the restoration (`HeldSignalLoss::Restoration`)
+/// replaces `result`, as a loss during the wait does, unless `result` is
+/// already such a refusal, which came first; the caller then applies the
+/// unsupported-operation policy (`refuse_held_signal_loss`). Every other
+/// restoration error, such as [`BlockedWaitSignalError::MaskNotRestored`], is
+/// returned as the error that ends the run, as before.
+pub(crate) fn result_after_restore(
+    restored: Result<(), Error>,
+    result: Result<i64, Error>,
+) -> Result<Result<i64, Error>, Error> {
+    let is_refusal =
+        |error: &Error| matches!(error, Error::Tool(error) if error.is::<HeldSignalRefusal>());
+    match restored {
+        Ok(()) => Ok(result),
+        Err(refusal) if is_refusal(&refusal) => match &result {
+            Err(error) if is_refusal(error) => Ok(result),
+            _ => Ok(Err(refusal)),
+        },
+        Err(error) => Err(error),
     }
 }
 
@@ -3338,6 +3475,11 @@ mod kernel_signal_wait_failures {
         StoppedBefore,
         /// The call cannot run at all.
         Fail(Errno),
+        /// `StoppedBefore`, by a signal that `/proc` never showed because it
+        /// arrived after the read before the injection, such as a `SIGSTOP`
+        /// sent from outside: the backend holds it in its single slot
+        /// (`FakeKernel::held_slot`).
+        StoppedBy(i32),
     }
 
     /// The kernel's view of the guest thread, shared by the scripted `/proc`
@@ -3372,6 +3514,25 @@ mod kernel_signal_wait_failures {
         repost_after_take: usize,
         /// The signals sent again, which the read after the next one shows.
         pending_repost: KernelSigset,
+        /// The backend's one slot for a held signal: each signal that stops an
+        /// injection (`taken`, `MaskOutcome::StoppedBy`) replaces the one there,
+        /// as Reverie's ptrace backend does (`hold_pending_signal`).
+        held_slot: Option<i32>,
+        /// The signals that a stop dropped from `held_slot`, in order. A standard
+        /// signal that replaces itself is merged, as Linux merges a second one
+        /// sent while the first is pending, and is not lost.
+        lost: Vec<i32>,
+    }
+
+    impl FakeKernel {
+        /// The backend holds `signal`, which stopped an injection.
+        fn hold(&mut self, signal: i32) {
+            if let Some(previous) = self.held_slot.replace(signal)
+                && !(previous == signal && signal < KERNEL_SIGRTMIN)
+            {
+                self.lost.push(previous);
+            }
+        }
     }
 
     type Kernel = Arc<Mutex<FakeKernel>>;
@@ -3545,6 +3706,7 @@ mod kernel_signal_wait_failures {
                 let signal = deliverable.trailing_zeros() as i32 + 1;
                 kernel.pending &= !kernel_sigset_bit(signal);
                 kernel.taken.push(signal);
+                kernel.hold(signal);
                 if kernel.repost_after_take > 0 {
                     kernel.repost_after_take -= 1;
                     kernel.pending_repost |= kernel_sigset_bit(signal);
@@ -3557,6 +3719,10 @@ mod kernel_signal_wait_failures {
                     Ok(0)
                 }
                 MaskOutcome::StoppedBefore => Err(Errno::ERESTARTNOINTR),
+                MaskOutcome::StoppedBy(signal) => {
+                    kernel.hold(signal);
+                    Err(Errno::ERESTARTNOINTR)
+                }
                 MaskOutcome::Fail(errno) => Err(errno),
             }
         }
@@ -3608,6 +3774,13 @@ mod kernel_signal_wait_failures {
         wait
     }
 
+    /// Each stopped attempt is a stop by a signal that `/proc` cannot identify,
+    /// which the backend holds in place of the one before. `restore` used to
+    /// return success here; the second stop drops the first unidentified one,
+    /// which may matter, so the mask is still put back and the wait now ends
+    /// with a `HeldSignalRefusal`, as a wait loop that meets two such stops
+    /// does (round-11 High F1 on
+    /// https://github.com/rrnewton/hermit/pull/3361).
     #[tokio::test]
     async fn restore_repeats_the_mask_change_until_the_kernel_reports_it() {
         let (mut guest, kernel) = WaitGuest::live(guest_mask());
@@ -3619,8 +3792,17 @@ mod kernel_signal_wait_failures {
             .outcomes
             .extend([MaskOutcome::StoppedBefore; 5]);
 
-        wait.restore(&mut guest, None).await.unwrap();
+        let result = wait.restore(&mut guest, None).await;
 
+        assert_eq!(
+            refusal(result),
+            HeldSignalRefusal {
+                wait: None,
+                held: None,
+                replacing: None,
+                loss: HeldSignalLoss::Restoration,
+            }
+        );
         let kernel = kernel.lock().unwrap();
         assert_eq!(kernel.blocked, guest_mask());
         assert_eq!(
@@ -3916,6 +4098,156 @@ mod kernel_signal_wait_failures {
         );
         assert_eq!(kernel.pending, kernel_sigset_bit(libc::SIGWINCH));
         assert_eq!(wait.held.map(|held| held.kind), Some(HeldKind::Precious));
+    }
+
+    /// A wait whose `block` was stopped by a default `SIGCHLD`, which the
+    /// backend holds as a signal whose loss matters (`HeldKind::Precious`).
+    async fn wait_holding_sigchld(guest: &mut WaitGuest, kernel: &Kernel) -> KernelSignalWait {
+        let mut wait = KernelSignalWait::new(&*guest, 0, false, Errno::ERESTARTSYS);
+        wait.block(guest, None).await.unwrap();
+        assert_eq!(
+            wait.held.map(|held| (held.signal, held.kind)),
+            Some((libc::SIGCHLD, HeldKind::Precious))
+        );
+        let kernel = kernel.lock().unwrap();
+        assert_eq!(kernel.blocked, blocked_signal_mask() | guest_mask());
+        assert_eq!(kernel.held_slot, Some(libc::SIGCHLD));
+        wait
+    }
+
+    /// A signal that `/proc` never showed, a `SIGSTOP` sent from outside here,
+    /// stops the injection that puts the guest's mask back before it runs, and
+    /// the next attempt runs. The backend holds one signal, so the `SIGSTOP`
+    /// replaced the held `SIGCHLD`, and `restore` used to return success, so
+    /// the guest resumed without its `SIGCHLD` (round-11 High F1 on
+    /// https://github.com/rrnewton/hermit/pull/3361). The mask is still put
+    /// back, and the wait now ends with a `HeldSignalRefusal`.
+    #[tokio::test]
+    async fn a_stop_of_the_mask_restoration_that_replaces_a_held_sigchld_is_refused() {
+        let (mut guest, kernel) = stopping_guest(kernel_sigset_bit(libc::SIGCHLD), 0);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = wait_holding_sigchld(&mut guest, &kernel).await;
+        kernel
+            .lock()
+            .unwrap()
+            .outcomes
+            .push_back(MaskOutcome::StoppedBy(libc::SIGSTOP));
+
+        let result = wait.restore(&mut guest, None).await;
+
+        {
+            let kernel = kernel.lock().unwrap();
+            assert_eq!(kernel.blocked, guest_mask(), "the guest's mask is back");
+            assert_eq!(
+                kernel.requested[2..],
+                [guest_mask(), guest_mask()],
+                "one stopped restoration attempt and one that ran"
+            );
+            assert_eq!(kernel.held_slot, Some(libc::SIGSTOP));
+            assert_eq!(kernel.lost, vec![libc::SIGCHLD]);
+        }
+        assert_eq!(
+            refusal(result),
+            HeldSignalRefusal {
+                wait: None,
+                held: Some(libc::SIGCHLD),
+                replacing: None,
+                loss: HeldSignalLoss::Restoration,
+            }
+        );
+    }
+
+    /// The same with a signal that `/proc` shows before the restoration and
+    /// that the all-blocked mask leaves unblocked: signal 32, which the C
+    /// library reserves and leaves out of the blockable set. The refusal names
+    /// it.
+    #[tokio::test]
+    async fn an_identified_stop_of_the_mask_restoration_that_replaces_a_held_sigchld_is_refused() {
+        const RESERVED: i32 = 32;
+        assert_eq!(blocked_signal_mask() & kernel_sigset_bit(RESERVED), 0);
+        let (mut guest, kernel) = stopping_guest(kernel_sigset_bit(libc::SIGCHLD), 0);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = wait_holding_sigchld(&mut guest, &kernel).await;
+        kernel.lock().unwrap().pending = kernel_sigset_bit(RESERVED);
+
+        let result = wait.restore(&mut guest, None).await;
+
+        {
+            let kernel = kernel.lock().unwrap();
+            assert_eq!(kernel.blocked, guest_mask(), "the guest's mask is back");
+            assert_eq!(kernel.taken, vec![libc::SIGCHLD, RESERVED]);
+            assert_eq!(kernel.held_slot, Some(RESERVED));
+            assert_eq!(kernel.lost, vec![libc::SIGCHLD]);
+        }
+        let refused = refusal(result);
+        assert_eq!(
+            refused,
+            HeldSignalRefusal {
+                wait: None,
+                held: Some(libc::SIGCHLD),
+                replacing: Some(RESERVED),
+                loss: HeldSignalLoss::Restoration,
+            }
+        );
+        let message = refused.to_string();
+        assert!(
+            message.starts_with(
+                "unsupported: the a blocking wait cannot keep the held signal SIGCHLD: signal 32 \
+                 stopped the injection that puts the guest's signal mask back and replaced it"
+            ),
+            "{message}"
+        );
+    }
+
+    /// A refusal from the mask restoration replaces the wait's result, whether
+    /// that is a value or an errno, unless the wait already ended with a refusal
+    /// of its own, which came first. A mask that could not be put back still
+    /// ends the run.
+    #[test]
+    fn a_restoration_refusal_replaces_the_result_unless_the_wait_refused_first() {
+        let tool = |refusal: HeldSignalRefusal| Error::Tool(anyhow::Error::new(refusal));
+        let restoration = HeldSignalRefusal {
+            wait: None,
+            held: Some(libc::SIGCHLD),
+            replacing: None,
+            loss: HeldSignalLoss::Restoration,
+        };
+        let replaced = HeldSignalRefusal {
+            wait: None,
+            held: Some(libc::SIGCHLD),
+            replacing: Some(libc::SIGUSR1),
+            loss: HeldSignalLoss::Replaced,
+        };
+        let not_restored = BlockedWaitSignalError::MaskNotRestored {
+            pid: Pid::from_raw(1),
+            tid: Pid::from_raw(1),
+            attempts: 16,
+            last_error: Some(Errno::ERESTARTNOINTR),
+        };
+
+        assert_eq!(result_after_restore(Ok(()), Ok(3)).unwrap().unwrap(), 3);
+        assert_eq!(
+            refusal(result_after_restore(Err(tool(restoration)), Ok(3)).unwrap()),
+            restoration
+        );
+        assert_eq!(
+            refusal(
+                result_after_restore(Err(tool(restoration)), Err(Errno::ERESTARTSYS.into()))
+                    .unwrap()
+            ),
+            restoration
+        );
+        assert_eq!(
+            refusal(result_after_restore(Err(tool(restoration)), Err(tool(replaced))).unwrap()),
+            replaced
+        );
+        assert_eq!(
+            diagnostic(result_after_restore(
+                Err(Error::Tool(anyhow::Error::new(not_restored))),
+                Ok(3)
+            )),
+            not_restored
+        );
     }
 
     /// A guest whose next `stops` injections are stopped by a signal that
