@@ -6621,7 +6621,7 @@ pub fn cell_artifact_path(
 
 /// The verdict of `attempt`'s retained verification report, or `None` when it
 /// retains none or one that is not a current report. A `diverged` verdict
-/// here is what [`observed_result`] types a verify row
+/// here is what [`observed_result`] types a verify or chaos row
 /// `determinism-failure` from; the parity post-pass reads the same verdict
 /// from every attempt (`parity::records_mismatch`).
 pub(crate) fn verification_verdict(attempt: &AttemptResult) -> Option<Verdict> {
@@ -6698,7 +6698,11 @@ fn observed_result_from_typed_evidence(
     if attempts.iter().any(|attempt| attempt.timed_out) {
         return Some(ObservedResult::Timeout);
     }
-    if mode == "verify"
+    // A chaos attempt is a verify run under a perturbed schedule, so a
+    // diverged chaos attempt is the same product failure as a diverged verify
+    // attempt. Without the chaos arm it fell through to crash-error, and the
+    // stress series refused the row because a crash cannot carry a divergence.
+    if (mode == "verify" || mode == "chaos")
         && attempts
             .iter()
             .any(|attempt| verification_verdict(attempt) == Some(Verdict::Diverged))
@@ -16300,6 +16304,7 @@ backends_disabled:
         ] {
             for (mode, expected) in [
                 ("verify", ObservedResult::DeterminismFailure),
+                ("chaos", ObservedResult::DeterminismFailure),
                 ("replay", ObservedResult::ReplayFailure),
             ] {
                 for earlier in [false, true] {
@@ -16334,6 +16339,61 @@ backends_disabled:
                 assert_eq!(
                     observed_result(mode, "PASS", &[passed], None),
                     Some(ObservedResult::Pass)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_diverged_chaos_cell_is_a_determinism_failure_as_in_verify() {
+        // A chaos cell compares two runs of one seed with the strict comparator,
+        // as a verify cell compares its two runs, so the same diverged
+        // comparison is the same product failure in both modes. Typed
+        // crash-error instead, the row carried divergence evidence that the
+        // stress series refuses for any outcome but diverged.
+        let report = r#"{"verified":false,"bitwise_parity":false,"verdict":"diverged","comparison":{"strictness":"canonical","compare_logs":true,"record_envelope":"all_records_v1","display_name":"BitwiseInfoV1","compare_io_buffers":true,"log_scope":"info","virtualize_time":true,"strip_lines":false,"canonicalize_addresses":true,"full_trace":true,"exact_remainder":true,"stripped_prefixes":["real-wall-clock-prefix/v1"],"canonicalizations":["host-address-to-first-appearance-ordinal/v1"],"ignore_lines":false,"skip_commit":false,"skip_detlog":false},"compared_log_messages":{"left":1,"right":1},"first_divergent_scheduler_turn":4,"first_divergent_virtual_nanoseconds":7,"first_divergent_record":9,"first_divergent_syscall":2,"first_divergent_left_message":"left","first_divergent_right_message":"right","compared_outputs":{"left":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0},"right":{"exit_code":null,"signal":null,"stdout_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","stdout_bytes":0,"stderr_sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","stderr_bytes":0}},"no_result_reason":null,"infrastructure_error":null,"guest_exit_code":null,"guest_signal":null}"#;
+        let mut diverged = attempt_with_sabre_evidence("");
+        diverged.outcome = "FAIL".into();
+        diverged.status = Some(1);
+        diverged.verification_report = Some(report.into());
+        assert_eq!(verification_verdict(&diverged), Some(Verdict::Diverged));
+        for mode in ["verify", "chaos"] {
+            let result = observed_result(mode, "FAIL", std::slice::from_ref(&diverged), None);
+            assert_eq!(result, Some(ObservedResult::DeterminismFailure), "{mode}");
+            assert_eq!(
+                failure_class("FAIL", result, None),
+                Some(FailureClass::ProductFailure),
+                "{mode}"
+            );
+
+            // A failure without a diverged attempt is still a crash.
+            let mut crashed = diverged.clone();
+            crashed.verification_report = None;
+            assert_eq!(
+                observed_result(mode, "FAIL", &[crashed], None),
+                Some(ObservedResult::CrashError),
+                "{mode}"
+            );
+
+            // The timeout and non-product guards still decide first.
+            let mut timed_out = diverged.clone();
+            timed_out.index = "2".into();
+            timed_out.timed_out = true;
+            assert_eq!(
+                observed_result(mode, "FAIL", &[diverged.clone(), timed_out], None),
+                Some(ObservedResult::Timeout),
+                "{mode}"
+            );
+            for error_kind in ["infrastructure", "incomplete-verification-evidence"] {
+                assert_eq!(
+                    observed_result(
+                        mode,
+                        "ERROR",
+                        std::slice::from_ref(&diverged),
+                        Some(error_kind)
+                    ),
+                    None,
+                    "{mode}, {error_kind}"
                 );
             }
         }

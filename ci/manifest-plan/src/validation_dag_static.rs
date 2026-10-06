@@ -787,7 +787,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // validate_plan::tests::manifest_audit_uses_its_measured_cold_cache_cpu_budget_only,
     // which manifest-plan now path-includes from scripts/lib with the in-process
     // generator, retains all 979 (980, measured with cargo nextest list --profile ci).
-    ("test.regular_crates", 980),
+    // manifest-plan's
+    // runner::tests::a_diverged_chaos_cell_is_a_determinism_failure_as_in_verify
+    // retains all 980: 981.
+    ("test.regular_crates", 981),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1675,7 +1678,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The same detcore-sabre fingerprint test retains all 976: 977.
     // The two shared_dequeue_timers tests listed there retain all 977: 979.
     // The path-included validate_plan test listed there retains all 979: 980.
-    ("test.regular_crates_on_host", 980),
+    // The chaos determinism-failure test listed there retains all 980: 981.
+    ("test.regular_crates_on_host", 981),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
