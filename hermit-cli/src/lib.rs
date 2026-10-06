@@ -3043,6 +3043,7 @@ const POST_BASELINE_DBT_DETCONFIG_KEYS: &[(&str, &str)] = &[
     // (key, exact JSON text of its serde default), one entry per line.
     ("anonymous_object_devices", "null"),
     ("exit_process_on_identity_lookup_refusal", "false"),
+    ("tool_opens_outside_guest_descriptor_table", "false"),
 ];
 
 /// Drop each listed member from a serialized [`DetConfig`] while its value is
@@ -3518,6 +3519,65 @@ mod dbt_detconfig_omit_tests {
         );
         assert_dbt_detconfig_round_trips(&config);
     }
+
+    /// `tool_opens_outside_guest_descriptor_table` is listed with the text
+    /// `false`, and that is exactly what serde writes for the field's default.
+    #[test]
+    fn tool_opens_outside_guest_descriptor_table_default_serializes_as_its_listed_text() {
+        assert!(
+            POST_BASELINE_DBT_DETCONFIG_KEYS
+                .contains(&("tool_opens_outside_guest_descriptor_table", "false"))
+        );
+        let serialized = serde_json::to_string(&default_config()).unwrap();
+        assert_eq!(
+            serialized
+                .matches(r#""tool_opens_outside_guest_descriptor_table":false"#)
+                .count(),
+            1,
+            "{serialized}"
+        );
+    }
+
+    /// With the field false, which is what `prepare_backend_config` gives
+    /// DBT, the key is absent from `HERMIT_DBT_DETCONFIG`, so the value the
+    /// guest can read keeps its baseline bytes.
+    #[test]
+    fn tool_opens_outside_guest_descriptor_table_false_is_absent_from_the_dbt_config() {
+        for (name, config) in [
+            ("default", default_config()),
+            (
+                "dbt",
+                prepare_backend_config(default_config(), Backend::Dbt),
+            ),
+        ] {
+            assert!(!config.tool_opens_outside_guest_descriptor_table, "{name}");
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert!(
+                !encoded.contains("tool_opens_outside_guest_descriptor_table"),
+                "{name}: {encoded}"
+            );
+        }
+    }
+
+    /// The DBT config decodes back to the same config with the field false,
+    /// whose key is omitted, and with it true, whose key is emitted.
+    #[test]
+    fn tool_opens_outside_guest_descriptor_table_round_trips_through_the_dbt_config() {
+        let mut config = default_config();
+        config.tool_opens_outside_guest_descriptor_table = false;
+        assert_dbt_detconfig_round_trips(&config);
+
+        config.tool_opens_outside_guest_descriptor_table = true;
+        let encoded = dbt_detconfig_json(&config).unwrap();
+        assert_eq!(
+            encoded
+                .matches(r#""tool_opens_outside_guest_descriptor_table":true"#)
+                .count(),
+            1,
+            "{encoded}"
+        );
+        assert_dbt_detconfig_round_trips(&config);
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3763,6 +3823,15 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // Detcore, which runs inside the guest process there, ends the process
     // itself.
     config.exit_process_on_identity_lookup_refusal = backend == Backend::Sabre;
+    // A file Detcore opens for itself takes a tracer descriptor on ptrace,
+    // which `hermit run --backend=e9patch` also selects, and a VMM descriptor
+    // on KVM, which translates guest descriptors. On DBT, SaBRe and LiteInst
+    // Detcore runs in the guest process, so such a file would take a number
+    // in the guest's descriptor table, and Detcore refuses a lookup that needs
+    // one. A direct caller's `Backend::E9patch` keeps that refusal too: this
+    // helper cannot tell where that caller's tool runs.
+    config.tool_opens_outside_guest_descriptor_table =
+        matches!(backend, Backend::Ptrace | Backend::Kvm);
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-1152): KVM defers the vfork child spawn, so the child
     // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
@@ -6198,6 +6267,29 @@ mod tests {
                 "{backend:?}"
             );
         }
+    }
+
+    /// Only ptrace and KVM give a file Detcore opens for itself a descriptor
+    /// outside the guest's table; every other backend keeps the default,
+    /// under which Detcore refuses a lookup that would open one.
+    #[test]
+    fn only_ptrace_and_kvm_let_detcore_open_outside_the_guest_descriptor_table() {
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Kvm,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::E9patch,
+        ] {
+            assert_eq!(
+                prepare_backend_config(super::DetConfig::default(), backend)
+                    .tool_opens_outside_guest_descriptor_table,
+                matches!(backend, Backend::Ptrace | Backend::Kvm),
+                "{backend:?}"
+            );
+        }
+        assert!(!super::DetConfig::default().tool_opens_outside_guest_descriptor_table);
     }
 
     #[test]
