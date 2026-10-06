@@ -39,6 +39,7 @@ use reverie::syscalls::StatPtr;
 use reverie::syscalls::StatxMask;
 use reverie::syscalls::StatxPtr;
 use reverie::syscalls::Syscall;
+use reverie::syscalls::SyscallArgs;
 use reverie::syscalls::SyscallInfo;
 use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
@@ -767,6 +768,35 @@ fn host_page_size() -> usize {
     // SAFETY: sysconf has no preconditions.
     usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
         .expect("page size must be positive")
+}
+
+/// `statx` mask bit for the mount's unique id (Linux 6.8 and later). Older
+/// kernels ignore it and report the reusable id under `STATX_MNT_ID`.
+const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+/// `statmount` request bit for the superblock's device and magic.
+const STATMOUNT_SB_BASIC: u64 = 0x1;
+/// Size of the first version of `struct mnt_id_req`: `u32 size`, `u32 spare`,
+/// `u64 mnt_id`, `u64 param`.
+const MNT_ID_REQ_SIZE_VER0: usize = 24;
+/// Bytes offered to `statmount`: the whole fixed `struct statmount`, which
+/// the kernel copies only as far as it fills.
+const STATMOUNT_BUFFER: usize = 512;
+/// Offsets in `struct statmount` of `u64 mask`, `u32 sb_dev_major` and
+/// `u32 sb_dev_minor`.
+const STATMOUNT_MASK_OFFSET: usize = 8;
+const STATMOUNT_SB_DEV_MAJOR_OFFSET: usize = 16;
+const STATMOUNT_SB_DEV_MINOR_OFFSET: usize = 20;
+
+/// What the guest's kernel answered for the mount a file is on.
+#[derive(Debug, PartialEq, Eq)]
+enum MountSuperblock {
+    /// `statmount` reported this superblock device.
+    Device(u64),
+    /// The guest cannot see that mount, or the path changed: no proof.
+    Unproven,
+    /// The kernel reported only this reusable mount id, which the guest's
+    /// `mountinfo` lists.
+    Listed(u64),
 }
 
 /// Whether `errno` from a path lookup the guest made is its filesystem's
@@ -1700,36 +1730,52 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Proven at once when `stat`'s device IS the header's, as on ext4, xfs
     /// and tmpfs. Otherwise -- on btrfs, where `stat` reports the subvolume's
     /// device, and on overlayfs, where it can report a layer's -- the guest
-    /// `statx`es the same path for its mount id (`STATX_MNT_ID`), and that
-    /// mount's row of the guest's `/proc/<pid>/mountinfo` gives the
-    /// superblock's device, which is the device `maps` prints. The `statx`
-    /// must report the device and inode the `stat` did, or the path has
-    /// changed in between and proves nothing.
+    /// `statx`es the same path for the id of its mount, and that mount's
+    /// superblock device is the device `maps` prints. The `statx` must report
+    /// the device and inode the `stat` did, or the path has changed in
+    /// between and proves nothing.
+    ///
+    /// On Linux 6.8 and later the `statx` reports the mount's unique id
+    /// (`STATX_MNT_ID_UNIQUE`), and a guest `statmount` of that id, made in
+    /// the same transient page, reports the superblock's device
+    /// (`STATMOUNT_SB_BASIC`). Neither call opens anything, so the proof
+    /// takes no slot in the guest's descriptor table. On DBT, SaBRe and
+    /// LiteInst the tool runs in the guest process and shares that table: a
+    /// descriptor the proof held there could change the number another guest
+    /// thread's `open` or `SCM_RIGHTS` receipt is given, and at the guest's
+    /// descriptor limit the proof could not be made at all.
+    ///
+    /// An older kernel reports only the reusable id (`STATX_MNT_ID`), and the
+    /// proof falls back to that mount's row of the guest's
+    /// `/proc/<pid>/mountinfo`, read on the tool's side as the fdinfo
+    /// mount-id check reads it. So does a `statmount` that answers `ENOSYS`,
+    /// as a seccomp policy can, after a second `statx` for the reusable id.
+    /// On ptrace that read spends a tracer descriptor. On DBT, SaBRe and
+    /// LiteInst it holds one guest descriptor until it returns, with the race
+    /// above, and fails at the guest's descriptor limit. The fallback is kept
+    /// rather than refused because refusing would stop every guest on such a
+    /// kernel that reads a btrfs or overlayfs mapping.
     ///
     /// `Ok(false)` -- no proof, so the line falls back to its header -- when
-    /// that mount's superblock is another one, or when the guest's filesystem
-    /// answers that the path no longer names that file. A proof that could
-    /// not be asked is an error, never a `false`, as in
-    /// [`Self::stat_guest_path`]: no transient page, a fault in Detcore's own
-    /// buffers, any other errno from the injected `statx`, a kernel that
-    /// reports no mount id, or a `mountinfo` that cannot be read or has no
-    /// row for that mount. Otherwise host resources would choose the
-    /// identity.
+    /// that mount's superblock is another one, when the guest's filesystem
+    /// answers that the path no longer names that file, or when the mount is
+    /// not one the guest can see: `statmount` answers `ENOENT` (no such
+    /// mount in the guest's mount namespace) or `EPERM` (outside the guest's
+    /// root, for a guest without `CAP_SYS_ADMIN` over that namespace), or the
+    /// guest's `mountinfo` lists no row for it. Mounts and namespace changes
+    /// are refused once Detcore starts, so that is the guest's own
+    /// configuration. A proof that could not be asked is an error, never a
+    /// `false`, as in [`Self::stat_guest_path`]: no transient page, a fault
+    /// in Detcore's own buffers, any other errno from the injected `statx` or
+    /// `statmount`, a kernel that reports no mount id or no superblock, or a
+    /// `mountinfo` that cannot be read or has a malformed row for that
+    /// mount. Otherwise host resources would choose the identity.
     ///
     /// ⚠️ THE SAME INODE NUMBER IN TWO BTRFS SUBVOLUMES OF ONE FILESYSTEM STILL
     /// PASSES, and so do two overlayfs layers on one overlay mount: both share
     /// the superblock device `maps` prints, which is all a maps line says
     /// about where its file lives. For step 3, [`Self::link_names_mapping`]
     /// also requires the executable link's text to be the line's pathname.
-    ///
-    /// `mountinfo` is read on the tool's side, as the fdinfo mount-id check
-    /// reads it: mounts and namespace changes are refused once Detcore
-    /// starts, so the guest's mount table cannot change under it. On ptrace
-    /// the read spends a tracer descriptor. On DBT, SaBRe and LiteInst the
-    /// tool runs in the guest process and shares its descriptor table, so the
-    /// read holds one guest descriptor until it returns; at the guest's
-    /// descriptor limit it fails, which is a refusal like any other
-    /// `mountinfo` that cannot be read.
     async fn proves_header_device<G: Guest<Self>>(
         guest: &mut G,
         path: &[u8],
@@ -1739,8 +1785,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         if stat.st_dev == header_device {
             return Ok(true);
         }
-        let Some(mount_id) = Self::guest_mount_id_of(guest, path, stat).await? else {
-            return Ok(false);
+        let mount_id = match Self::guest_superblock_of(guest, path, stat).await? {
+            MountSuperblock::Device(device) => return Ok(device == header_device),
+            MountSuperblock::Unproven => return Ok(false),
+            MountSuperblock::Listed(mount_id) => mount_id,
         };
         let mountinfo = guest_mountinfo(guest)?;
         match mountinfo_superblock_device(&mountinfo, mount_id) {
@@ -1764,36 +1812,100 @@ impl<T: RecordOrReplay> Detcore<T> {
         }
     }
 
-    /// The mount id of the file at `path`, from a `statx` the guest makes in
-    /// a transient page, when that file is still the one `stat` describes.
-    /// `None` when the guest's filesystem answers that `path` names nothing
-    /// or another file; see [`Self::proves_header_device`] for the errors.
-    async fn guest_mount_id_of<G: Guest<Self>>(
+    /// The superblock of the mount the file at `path` is on, asked in one
+    /// transient page by a guest `statx` and, when that reports the mount's
+    /// unique id, a guest `statmount`; see [`Self::proves_header_device`]
+    /// for the answers and the errors.
+    async fn guest_superblock_of<G: Guest<Self>>(
         guest: &mut G,
         path: &[u8],
         stat: &libc::stat,
-    ) -> Result<Option<u64>, Error> {
+    ) -> Result<MountSuperblock, Error> {
         let statx_offset = (path.len() + 1).next_multiple_of(8);
-        let len =
-            (statx_offset + std::mem::size_of::<libc::statx>()).next_multiple_of(host_page_size());
+        let request_offset = statx_offset + std::mem::size_of::<libc::statx>();
+        let statmount_offset = request_offset + MNT_ID_REQ_SIZE_VER0;
+        let len = (statmount_offset + STATMOUNT_BUFFER).next_multiple_of(host_page_size());
         let page = map_identity_page(guest, len, "statx", path).await?;
-        // SAFETY: `statx_offset` is within the `len` bytes just mapped.
-        let statxptr = StatxPtr(unsafe { page.add(statx_offset) }.cast::<libc::statx>());
-        let asked = Self::statx_in_page(guest, path, page, statxptr).await;
+        // SAFETY: every offset is within the `len` bytes just mapped.
+        let (statxptr, request, statmount) = unsafe {
+            (
+                StatxPtr(page.add(statx_offset).cast::<libc::statx>()),
+                page.add(request_offset),
+                page.add(statmount_offset),
+            )
+        };
+        let asked =
+            Self::superblock_in_page(guest, path, stat, page, statxptr, request, statmount).await;
         unmap_identity_page(guest, page, len, path).await;
-        let statx = match asked {
+        asked
+    }
+
+    /// The questions of [`Self::guest_superblock_of`], in its page.
+    async fn superblock_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        stat: &libc::stat,
+        page: AddrMut<'_, u8>,
+        statxptr: StatxPtr<'_>,
+        request: AddrMut<'_, u8>,
+        statmount: AddrMut<'_, u8>,
+    ) -> Result<MountSuperblock, Error> {
+        let unique = StatxMask::STATX_INO
+            | StatxMask::STATX_MNT_ID
+            | StatxMask::from_bits_retain(STATX_MNT_ID_UNIQUE);
+        let Some(statx) = Self::statx_of_stat(guest, path, stat, page, statxptr, unique).await?
+        else {
+            return Ok(MountSuperblock::Unproven);
+        };
+        if statx.stx_mask & STATX_MNT_ID_UNIQUE == 0 {
+            // Before Linux 6.8 the bit is unknown and ignored, and the kernel
+            // reports the reusable id instead.
+            return Self::listed_mount(path, &statx);
+        }
+        match Self::statmount_in_page(guest, statx.stx_mnt_id, request, statmount).await {
+            Ok(Some(device)) => Ok(MountSuperblock::Device(device)),
+            Ok(None) => Err(identity_lookup_refused(
+                "statmount",
+                path,
+                "the kernel reported no superblock (STATMOUNT_SB_BASIC)",
+            )),
+            Err(errno @ (Errno::ENOENT | Errno::EPERM)) => {
+                trace!(
+                    "{:?} is on mount {}, which the guest cannot see: {errno}",
+                    String::from_utf8_lossy(path),
+                    statx.stx_mnt_id
+                );
+                Ok(MountSuperblock::Unproven)
+            }
+            Err(Errno::ENOSYS) => {
+                let listed = StatxMask::STATX_INO | StatxMask::STATX_MNT_ID;
+                match Self::statx_of_stat(guest, path, stat, page, statxptr, listed).await? {
+                    Some(statx) => Self::listed_mount(path, &statx),
+                    None => Ok(MountSuperblock::Unproven),
+                }
+            }
+            Err(Errno::ESRCH) => Err(Error::Errno(Errno::ESRCH)),
+            Err(errno) => Err(identity_lookup_refused("statmount", path, errno)),
+        }
+    }
+
+    /// A guest `statx` of `path` asking `mask`, made in `page`, when the file
+    /// it reports is still the one `stat` describes. `None` when the guest's
+    /// filesystem answers that `path` names nothing or another file.
+    async fn statx_of_stat<G: Guest<Self>>(
+        guest: &mut G,
+        path: &[u8],
+        stat: &libc::stat,
+        page: AddrMut<'_, u8>,
+        statxptr: StatxPtr<'_>,
+        mask: StatxMask,
+    ) -> Result<Option<libc::statx>, Error> {
+        let statx = match Self::statx_in_page(guest, path, page, statxptr, mask).await {
             Ok(Some(statx)) => statx,
             Ok(None) => return Ok(None),
             Err(Errno::ESRCH) => return Err(Error::Errno(Errno::ESRCH)),
             Err(errno) => return Err(identity_lookup_refused("statx", path, errno)),
         };
-        if statx.stx_mask & StatxMask::STATX_MNT_ID.bits() == 0 {
-            return Err(identity_lookup_refused(
-                "statx",
-                path,
-                "the kernel reported no mount id (STATX_MNT_ID needs Linux 5.8)",
-            ));
-        }
         let device = libc::makedev(statx.stx_dev_major, statx.stx_dev_minor);
         if (device, statx.stx_ino) != (stat.st_dev, stat.st_ino) {
             trace!(
@@ -1806,17 +1918,30 @@ impl<T: RecordOrReplay> Detcore<T> {
             );
             return Ok(None);
         }
-        Ok(Some(statx.stx_mnt_id))
+        Ok(Some(statx))
+    }
+
+    /// The reusable mount id a `statx` reported, for the guest's `mountinfo`.
+    fn listed_mount(path: &[u8], statx: &libc::statx) -> Result<MountSuperblock, Error> {
+        if statx.stx_mask & StatxMask::STATX_MNT_ID.bits() == 0 {
+            return Err(identity_lookup_refused(
+                "statx",
+                path,
+                "the kernel reported no mount id (STATX_MNT_ID needs Linux 5.8)",
+            ));
+        }
+        Ok(MountSuperblock::Listed(statx.stx_mnt_id))
     }
 
     /// Stage `path` NUL-terminated at `path_address` and inject
-    /// `statx(AT_FDCWD, path, 0, STATX_INO | STATX_MNT_ID, statxptr)`, with the
-    /// answers and errors of [`Self::fstatat_in_scratch`].
+    /// `statx(AT_FDCWD, path, 0, mask, statxptr)`, with the answers and
+    /// errors of [`Self::fstatat_in_scratch`].
     async fn statx_in_page<G: Guest<Self>>(
         guest: &mut G,
         path: &[u8],
         path_address: AddrMut<'_, u8>,
         statxptr: StatxPtr<'_>,
+        mask: StatxMask,
     ) -> Result<Option<libc::statx>, Errno> {
         let mut staged = Vec::with_capacity(path.len() + 1);
         staged.extend_from_slice(path);
@@ -1828,7 +1953,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 path_address.as_raw() as *const libc::c_char
             ))
             .with_flags(AtFlags::empty())
-            .with_mask(StatxMask::STATX_INO | StatxMask::STATX_MNT_ID)
+            .with_mask(mask)
             .with_statx(Some(statxptr));
         match guest.inject_with_retry(call).await {
             Ok(_) => statxptr.read(&guest.memory()).map(Some),
@@ -1847,6 +1972,58 @@ impl<T: RecordOrReplay> Detcore<T> {
                 Err(error)
             }
         }
+    }
+
+    /// Stage a `struct mnt_id_req` for mount `mount_id` asking
+    /// `STATMOUNT_SB_BASIC` at `request`, and inject
+    /// `statmount(request, statmount, STATMOUNT_BUFFER, 0)`. The superblock's
+    /// device, or `None` when the kernel reports no superblock fields.
+    async fn statmount_in_page<G: Guest<Self>>(
+        guest: &mut G,
+        mount_id: u64,
+        request: AddrMut<'_, u8>,
+        statmount: AddrMut<'_, u8>,
+    ) -> Result<Option<u64>, Errno> {
+        let mut staged = [0u8; MNT_ID_REQ_SIZE_VER0];
+        staged[..4].copy_from_slice(&(MNT_ID_REQ_SIZE_VER0 as u32).to_ne_bytes());
+        // `spare`, bytes 4 to 8, stays zero: the kernel refuses anything else.
+        staged[8..16].copy_from_slice(&mount_id.to_ne_bytes());
+        staged[16..].copy_from_slice(&STATMOUNT_SB_BASIC.to_ne_bytes());
+        guest.memory().write_exact(request, &staged)?;
+        let asked = guest
+            .inject_with_retry(Syscall::Other(
+                Sysno::statmount,
+                SyscallArgs::new(
+                    request.as_raw(),
+                    statmount.as_raw(),
+                    STATMOUNT_BUFFER,
+                    0,
+                    0,
+                    0,
+                ),
+            ))
+            .await;
+        if let Err(error) = asked {
+            trace!("guest statmount of mount {mount_id} failed: {error}");
+            return Err(error);
+        }
+        let mut answer = [0u8; STATMOUNT_SB_DEV_MINOR_OFFSET + 4];
+        guest.memory().read_exact(statmount, &mut answer)?;
+        let word = |offset: usize| {
+            u32::from_ne_bytes(answer[offset..offset + 4].try_into().expect("4 bytes"))
+        };
+        let mask = u64::from_ne_bytes(
+            answer[STATMOUNT_MASK_OFFSET..STATMOUNT_MASK_OFFSET + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        if mask & STATMOUNT_SB_BASIC == 0 {
+            return Ok(None);
+        }
+        Ok(Some(libc::makedev(
+            word(STATMOUNT_SB_DEV_MAJOR_OFFSET),
+            word(STATMOUNT_SB_DEV_MINOR_OFFSET),
+        )))
     }
 
     /// Whether the guest's `readlink` of the executable link `link` reads as
@@ -8663,6 +8840,12 @@ pub(crate) mod inject_fstat_scratch {
         /// is not the test process.
         pub(crate) static SCRIPTED_MOUNTINFO: std::cell::RefCell<Option<Vec<u8>>> =
             const { std::cell::RefCell::new(None) };
+        /// (unique mount id, superblock device) pairs an injected
+        /// `statmount` answers from instead of running, while a test sets
+        /// them: `ENOENT` for a mount not listed, as the guest's kernel
+        /// answers for a mount outside its namespace.
+        static SCRIPTED_SUPERBLOCKS: std::cell::RefCell<Option<Vec<(u64, u64)>>> =
+            const { std::cell::RefCell::new(None) };
     }
 
     /// Room for one `libc::stat`, 8-byte aligned like a real stack slot.
@@ -8849,6 +9032,19 @@ pub(crate) mod inject_fstat_scratch {
         pub(crate) fstatat_paths: Vec<Vec<u8>>,
         /// Path each injected statx named, as the kernel reads it.
         pub(crate) statx_paths: Vec<Vec<u8>>,
+        /// Whether an injected statx ignores `STATX_MNT_ID_UNIQUE`, as a
+        /// kernel before Linux 6.8 does, and so reports the reusable mount
+        /// id instead.
+        statx_without_unique_mount_id: bool,
+        /// The errno every injected `statmount` fails with instead of
+        /// running, when set: `ENOSYS` as under a seccomp policy, or an
+        /// answer the test process's own mounts do not give.
+        statmount_error: Option<Errno>,
+        /// Whether a scripted `statmount` answers without the superblock
+        /// fields it was asked for.
+        statmount_omits_superblock: bool,
+        /// Mount id each injected statmount asked for.
+        statmount_mounts: Vec<u64>,
         /// Link each injected readlinkat named, as the kernel reads it.
         pub(crate) readlink_paths: Vec<Vec<u8>>,
         /// (link, text): an injected readlinkat of `link` reads `text`
@@ -8907,6 +9103,10 @@ pub(crate) mod inject_fstat_scratch {
                 fstatat_guard_live: Vec::new(),
                 fstatat_paths: Vec::new(),
                 statx_paths: Vec::new(),
+                statx_without_unique_mount_id: false,
+                statmount_error: None,
+                statmount_omits_superblock: false,
+                statmount_mounts: Vec::new(),
                 readlink_paths: Vec::new(),
                 readlink_answers: Vec::new(),
                 fstatat_buffers: Vec::new(),
@@ -9129,15 +9329,81 @@ pub(crate) mod inject_fstat_scratch {
                             .into_os_string()
                             .into_vec(),
                     );
+                    // The raw mask: `call.mask()` drops bits the pinned
+                    // Reverie does not name, such as STATX_MNT_ID_UNIQUE.
+                    let mut mask = args.arg3 as u32;
+                    if self.statx_without_unique_mount_id {
+                        mask &= !STATX_MNT_ID_UNIQUE;
+                    }
                     unsafe {
                         libc::syscall(
                             libc::SYS_statx,
                             libc::AT_FDCWD,
                             Some(path).into_raw(),
                             0,
-                            call.mask().bits(),
+                            mask,
                             buffer,
                         )
+                    }
+                }
+                Syscall::Other(Sysno::statmount, args) => {
+                    // SAFETY: Detcore staged the request in a page it mapped.
+                    let request = unsafe {
+                        std::slice::from_raw_parts(args.arg0 as *const u8, MNT_ID_REQ_SIZE_VER0)
+                    };
+                    let word = |offset: usize| {
+                        u32::from_ne_bytes(request[offset..offset + 4].try_into().unwrap())
+                    };
+                    let dword = |offset: usize| {
+                        u64::from_ne_bytes(request[offset..offset + 8].try_into().unwrap())
+                    };
+                    assert_eq!(word(0) as usize, MNT_ID_REQ_SIZE_VER0, "mnt_id_req.size");
+                    assert_eq!(word(4), 0, "mnt_id_req.spare");
+                    assert_eq!(dword(16), STATMOUNT_SB_BASIC, "mnt_id_req.param");
+                    assert_eq!(args.arg2, STATMOUNT_BUFFER, "statmount bufsize");
+                    assert_eq!(args.arg3, 0, "statmount flags");
+                    let mount_id = dword(8);
+                    self.statmount_mounts.push(mount_id);
+                    if let Some(errno) = self.statmount_error {
+                        return Err(errno);
+                    }
+                    match SCRIPTED_SUPERBLOCKS.with(|scripted| scripted.borrow().clone()) {
+                        Some(superblocks) => {
+                            let Some(&(_, device)) =
+                                superblocks.iter().find(|(id, _)| *id == mount_id)
+                            else {
+                                return Err(Errno::ENOENT);
+                            };
+                            let mut answer = [0u8; STATMOUNT_BUFFER];
+                            answer[..4].copy_from_slice(&(STATMOUNT_BUFFER as u32).to_ne_bytes());
+                            if !self.statmount_omits_superblock {
+                                answer[STATMOUNT_MASK_OFFSET..STATMOUNT_MASK_OFFSET + 8]
+                                    .copy_from_slice(&STATMOUNT_SB_BASIC.to_ne_bytes());
+                                answer[STATMOUNT_SB_DEV_MAJOR_OFFSET
+                                    ..STATMOUNT_SB_DEV_MAJOR_OFFSET + 4]
+                                    .copy_from_slice(&libc::major(device).to_ne_bytes());
+                                answer[STATMOUNT_SB_DEV_MINOR_OFFSET
+                                    ..STATMOUNT_SB_DEV_MINOR_OFFSET + 4]
+                                    .copy_from_slice(&libc::minor(device).to_ne_bytes());
+                            }
+                            unsafe {
+                                std::ptr::copy_nonoverlapping(
+                                    answer.as_ptr(),
+                                    args.arg1 as *mut u8,
+                                    answer.len(),
+                                )
+                            };
+                            0
+                        }
+                        None => unsafe {
+                            libc::syscall(
+                                Sysno::statmount as libc::c_long,
+                                args.arg0,
+                                args.arg1,
+                                args.arg2,
+                                args.arg3,
+                            )
+                        },
                     }
                 }
                 Syscall::Readlinkat(call) => {
@@ -10511,7 +10777,8 @@ pub(crate) mod inject_fstat_scratch {
     const RECORDED_START: usize = 0x7e00_0000_0000;
 
     /// While alive, `guest_mountinfo` reads this mount table instead of the
-    /// guest's.
+    /// guest's, and an injected `statmount` answers from the superblocks
+    /// set with it, if any, instead of running.
     struct ScriptedMountinfo;
 
     impl ScriptedMountinfo {
@@ -10520,16 +10787,70 @@ pub(crate) mod inject_fstat_scratch {
             Self
         }
 
-        /// A mount table whose only row is the mount of `path`, as the test
-        /// process's own `statx` reports it, on a superblock with `device`.
+        /// ... and an injected `statmount` of unique mount id `id` reports
+        /// superblock `device` for each `(id, device)`, and `ENOENT` for
+        /// any other id.
+        fn with_superblocks(self, superblocks: Vec<(u64, u64)>) -> Self {
+            SCRIPTED_SUPERBLOCKS.with(|scripted| *scripted.borrow_mut() = Some(superblocks));
+            self
+        }
+
+        /// The mount of `path`, as the test process's own `statx` reports
+        /// it, on a superblock with `device`: the only row of the mount
+        /// table, and the only mount `statmount` reports.
         fn proving(path: &Path, device: u64) -> Self {
-            Self::set(mount_row(mount_id_of(path), device))
+            Self::set(mount_row(mount_id_of(path), device)).with_superblocks(
+                unique_mount_id_of(path)
+                    .map(|id| (id, device))
+                    .into_iter()
+                    .collect(),
+            )
         }
     }
 
     impl Drop for ScriptedMountinfo {
         fn drop(&mut self) {
             SCRIPTED_MOUNTINFO.with(|scripted| *scripted.borrow_mut() = None);
+            SCRIPTED_SUPERBLOCKS.with(|scripted| *scripted.borrow_mut() = None);
+        }
+    }
+
+    /// The unique mount id of `path` from the test process's own `statx`,
+    /// or `None` on a kernel before Linux 6.8, which does not report one.
+    fn unique_mount_id_of(path: &Path) -> Option<u64> {
+        let raw_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut statx = std::mem::MaybeUninit::<libc::statx>::zeroed();
+        // SAFETY: a NUL-terminated path and a buffer of the size statx writes.
+        let raw = unsafe {
+            libc::syscall(
+                libc::SYS_statx,
+                libc::AT_FDCWD,
+                raw_path.as_ptr(),
+                0,
+                STATX_MNT_ID_UNIQUE,
+                statx.as_mut_ptr(),
+            )
+        };
+        assert_eq!(
+            raw,
+            0,
+            "statx of {path:?} failed: {}",
+            std::io::Error::last_os_error()
+        );
+        // SAFETY: statx succeeded, so it wrote the buffer.
+        let statx = unsafe { statx.assume_init() };
+        (statx.stx_mask & STATX_MNT_ID_UNIQUE != 0).then_some(statx.stx_mnt_id)
+    }
+
+    /// The calls a device proof injects on this kernel: a page, the
+    /// `statx`, then `statmount` when the kernel reports unique mount ids,
+    /// and the page's unmapping. Before Linux 6.8 the proof reads the
+    /// guest's mountinfo instead, which injects nothing.
+    fn proof_calls() -> Vec<Sysno> {
+        if unique_mount_id_of(Path::new("/")).is_some() {
+            vec![Sysno::mmap, Sysno::statx, Sysno::statmount, Sysno::munmap]
+        } else {
+            vec![Sysno::mmap, Sysno::statx, Sysno::munmap]
         }
     }
 
@@ -10621,7 +10942,7 @@ pub(crate) mod inject_fstat_scratch {
         );
         assert_eq!(
             guest.injected,
-            [Sysno::newfstatat, Sysno::mmap, Sysno::statx, Sysno::munmap]
+            [&[Sysno::newfstatat][..], &proof_calls()].concat()
         );
         assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
         assert_eq!(guest.statx_paths, [key.pathname.as_bytes().to_vec()]);
@@ -10632,43 +10953,226 @@ pub(crate) mod inject_fstat_scratch {
     // as every file on btrfs does. Its identity is the one `fstat` gives the
     // file only when the mount `statx` names is on the header's superblock;
     // the same inode number on another filesystem keeps the header's pair,
-    // and so does a mount the guest's mountinfo does not list.
+    // and so does a mount the guest cannot see. Each case runs twice: with
+    // the unique mount id and `statmount` (Linux 6.8 and later), and as a
+    // kernel before 6.8 answers, through the guest's mountinfo.
     #[tokio::test]
     async fn a_path_with_the_headers_inode_needs_the_headers_superblock() {
         let (file, identity, key) = mapped_path();
         let header = RawInode::new(HEADER_DEVICE, key.inode);
         let scratch = Pages::map(1, 1);
-        for (mountinfo, expected, why) in [
+        let listed = mount_id_of(file.path());
+        let unique = unique_mount_id_of(file.path())
+            .expect("precondition: this kernel reports unique mount ids (Linux 6.8)");
+        let unseen = (u64::MAX - 1, u64::MAX - 1);
+        for ((listed, unique), device, expected, why) in [
             (
-                mount_row(mount_id_of(file.path()), RECORD_DEVICE),
+                (listed, unique),
+                RECORD_DEVICE,
                 header,
                 "another superblock: the same inode number names another file",
             ),
             (
-                mount_row(u64::MAX - 1, HEADER_DEVICE),
+                unseen,
+                HEADER_DEVICE,
                 header,
-                "a mount the guest's mountinfo does not list proves nothing",
+                "a mount the guest cannot see proves nothing",
             ),
             (
-                mount_row(mount_id_of(file.path()), HEADER_DEVICE),
+                (listed, unique),
+                HEADER_DEVICE,
                 identity,
                 "the header's superblock: the identity fstat gives the file",
             ),
         ] {
-            let _mounts = ScriptedMountinfo::set(mountinfo);
+            for before_6_8 in [false, true] {
+                let _mounts = ScriptedMountinfo::set(mount_row(listed, device))
+                    .with_superblocks(vec![(unique, device)]);
+                let (tool, mut guest) =
+                    ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+                guest.statx_without_unique_mount_id = before_6_8;
+                let resolved = tool
+                    .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                    .await;
+                assert_eq!(
+                    resolved.expect("mapping_stat_identity failed"),
+                    expected,
+                    "{why} (before Linux 6.8: {before_6_8})"
+                );
+                let (proof, asked): (&[Sysno], Vec<u64>) = if before_6_8 {
+                    (&[Sysno::mmap, Sysno::statx, Sysno::munmap], vec![])
+                } else {
+                    (
+                        &[Sysno::mmap, Sysno::statx, Sysno::statmount, Sysno::munmap],
+                        vec![file_unique(&file)],
+                    )
+                };
+                assert_eq!(
+                    guest.injected,
+                    [&[Sysno::newfstatat][..], proof].concat(),
+                    "{why} (before Linux 6.8: {before_6_8})"
+                );
+                assert_eq!(
+                    guest.statmount_mounts, asked,
+                    "{why}: statmount must ask for the unique id statx reported"
+                );
+            }
+        }
+    }
+
+    /// The unique mount id of `file`'s mount.
+    fn file_unique(file: &tempfile::NamedTempFile) -> u64 {
+        unique_mount_id_of(file.path()).expect("precondition: unique mount ids")
+    }
+
+    // `statmount` answers that decide nothing, and the proof's response to
+    // each: a mount outside the guest's namespace (`ENOENT`) or root
+    // (`EPERM`) is the guest's own configuration, so no proof; `ENOSYS`, as
+    // a seccomp policy can answer, falls back to the guest's mountinfo after
+    // a second `statx` for the reusable id; anything else could not be asked
+    // and refuses, as does an answer without the superblock it was asked
+    // for. The page is unmapped on every path.
+    #[tokio::test]
+    async fn a_statmount_that_decides_nothing_proves_nothing_falls_back_or_refuses() {
+        let (file, identity, key) = mapped_path();
+        let header = RawInode::new(HEADER_DEVICE, key.inode);
+        let scratch = Pages::map(1, 1);
+        let unique = file_unique(&file);
+        let asked = [
+            Sysno::newfstatat,
+            Sysno::mmap,
+            Sysno::statx,
+            Sysno::statmount,
+        ];
+        for (errno, expected) in [(Errno::ENOENT, header), (Errno::EPERM, header)] {
+            let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
             let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.statmount_error = Some(errno);
             let resolved = tool
                 .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
                 .await;
             assert_eq!(
                 resolved.expect("mapping_stat_identity failed"),
                 expected,
-                "{why}"
+                "{errno}"
             );
             assert_eq!(
                 guest.injected,
-                [Sysno::newfstatat, Sysno::mmap, Sysno::statx, Sysno::munmap],
-                "{why}"
+                [&asked[..], &[Sysno::munmap]].concat(),
+                "{errno}"
+            );
+            assert_eq!(guest.statmount_mounts, [unique], "{errno}");
+        }
+
+        // ENOSYS: the reusable id, then the guest's mountinfo, proves it.
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.statmount_error = Some(Errno::ENOSYS);
+        let resolved = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .await;
+        assert_eq!(resolved.expect("mapping_stat_identity failed"), identity);
+        assert_eq!(
+            guest.injected,
+            [&asked[..], &[Sysno::statx, Sysno::munmap]].concat()
+        );
+        assert_eq!(guest.statx_paths.len(), 2);
+        drop(_mounts);
+
+        // ENOSYS with a mountinfo row on another superblock: no proof.
+        let _mounts = ScriptedMountinfo::set(mount_row(mount_id_of(file.path()), RECORD_DEVICE))
+            .with_superblocks(vec![(unique, HEADER_DEVICE)]);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.statmount_error = Some(Errno::ENOSYS);
+        let resolved = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .await;
+        assert_eq!(
+            resolved.expect("mapping_stat_identity failed"),
+            header,
+            "after ENOSYS the mountinfo row decides, not the statmount table"
+        );
+        drop(_mounts);
+
+        for (errno, omits, cause) in [
+            (Some(Errno::EINVAL), false, Errno::EINVAL.to_string()),
+            (Some(Errno::EFAULT), false, Errno::EFAULT.to_string()),
+            (None, true, "no superblock".to_owned()),
+        ] {
+            let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.statmount_error = errno;
+            guest.statmount_omits_superblock = omits;
+            let refused = tool
+                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .await;
+            assert!(
+                matches!(&refused, Err(Error::Tool(error))
+                    if error.to_string().contains("statmount")
+                        && error.to_string().contains(&cause)),
+                "a statmount that could not be asked must refuse ({cause}): {refused:?}"
+            );
+            assert_eq!(
+                guest.injected,
+                [&asked[..], &[Sysno::munmap]].concat(),
+                "{cause}"
+            );
+        }
+
+        // ESRCH: the guest is gone, which every injection reports as itself.
+        let _mounts = ScriptedMountinfo::proving(file.path(), HEADER_DEVICE);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        guest.statmount_error = Some(Errno::ESRCH);
+        let gone = tool
+            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+            .await;
+        assert!(
+            matches!(gone, Err(Error::Errno(Errno::ESRCH))),
+            "a guest that is gone must report ESRCH: {gone:?}"
+        );
+    }
+
+    // Against the test host's real kernel, with nothing scripted: the
+    // superblock device `statmount` reports for the mount `statx` names is
+    // the device the test process's own mountinfo lists for that mount,
+    // which is the device a maps line prints. This checks the offsets of
+    // `struct mnt_id_req` and `struct statmount` against the kernel.
+    #[tokio::test]
+    async fn statmount_reports_the_superblock_mountinfo_lists() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mountinfo = std::fs::read("/proc/self/mountinfo").unwrap();
+        for path in [file.path(), Path::new("/proc/self/exe"), Path::new("/")] {
+            unique_mount_id_of(path)
+                .expect("precondition: this kernel reports unique mount ids (Linux 6.8)");
+            let metadata = std::fs::metadata(path).unwrap();
+            // SAFETY: an all-zero stat is a valid value.
+            let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+            stat.st_dev = metadata.dev();
+            stat.st_ino = metadata.ino();
+            let scratch = Pages::map(1, 1);
+            let (_tool, mut guest) =
+                ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            let superblock =
+                Detcore::guest_superblock_of(&mut guest, path.as_os_str().as_bytes(), &stat)
+                    .await
+                    .expect("guest_superblock_of failed");
+            let listed = mountinfo_superblock_device(&mountinfo, mount_id_of(path))
+                .expect("malformed mountinfo")
+                .expect("the test process's mountinfo lists its own mount");
+            assert_eq!(
+                superblock,
+                MountSuperblock::Device(listed),
+                "{path:?}: statmount's superblock must be the one mountinfo lists"
+            );
+            assert_eq!(
+                guest.injected,
+                [Sysno::mmap, Sysno::statx, Sysno::statmount, Sysno::munmap],
+                "{path:?}"
+            );
+            assert_eq!(guest.mapped.len(), 1);
+            assert_eq!(
+                guest.unmapped, guest.mapped,
+                "{path:?}: the page is unmapped"
             );
         }
     }
@@ -10741,31 +11245,42 @@ pub(crate) mod inject_fstat_scratch {
             pathname: fields[5..].join(" "),
         };
         assert_eq!(key.inode, identity.ino, "{line}");
+        // Only the fallback reads this, with the pid-1 guest standing in.
         let _mounts = ScriptedMountinfo::set(std::fs::read("/proc/self/mountinfo").unwrap());
         let scratch = Pages::map(1, 1);
-        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
-
-        let resolved = tool
-            .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
-            .await;
+        let mut outcomes = Vec::new();
+        for before_6_8 in [false, true] {
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.statx_without_unique_mount_id = before_6_8;
+            let resolved = tool
+                .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
+                .await;
+            outcomes.push((before_6_8, resolved, guest.injected));
+        }
         // SAFETY: the mapping made above.
         unsafe { libc::munmap(address, page_size()) };
 
-        eprintln!(
-            "maps device {header_device:#x}, stat device {:#x}; injected {:?}",
-            identity.dev, guest.injected
-        );
-        assert_eq!(
-            resolved.expect("mapping_stat_identity failed"),
-            identity,
-            "{line}: a mapped file's line must take the identity fstat gives it"
-        );
-        let proof: &[Sysno] = if header_device == identity.dev {
-            &[]
-        } else {
-            &[Sysno::mmap, Sysno::statx, Sysno::munmap]
-        };
-        assert_eq!(guest.injected, [&[Sysno::newfstatat][..], proof].concat());
+        for (before_6_8, resolved, injected) in outcomes {
+            eprintln!(
+                "maps device {header_device:#x}, stat device {:#x}; before 6.8: {before_6_8}; \
+                 injected {injected:?}",
+                identity.dev
+            );
+            assert_eq!(
+                resolved.expect("mapping_stat_identity failed"),
+                identity,
+                "{line}: a mapped file's line must take the identity fstat gives it \
+                 (before Linux 6.8: {before_6_8})"
+            );
+            let proof = if header_device == identity.dev {
+                vec![]
+            } else if before_6_8 {
+                vec![Sysno::mmap, Sysno::statx, Sysno::munmap]
+            } else {
+                proof_calls()
+            };
+            assert_eq!(injected, [&[Sysno::newfstatat][..], &proof].concat());
+        }
     }
 
     // Control for the test above: a record with the header's inode keys the
@@ -10948,14 +11463,15 @@ pub(crate) mod inject_fstat_scratch {
         ));
         let _mounts = ScriptedMountinfo::proving(Path::new("/proc/self/exe"), HEADER_DEVICE);
         let exe_proof = [
-            Sysno::newfstatat,
-            Sysno::mmap,
-            Sysno::readlinkat,
-            Sysno::munmap,
-            Sysno::mmap,
-            Sysno::statx,
-            Sysno::munmap,
-        ];
+            &[
+                Sysno::newfstatat,
+                Sysno::mmap,
+                Sysno::readlinkat,
+                Sysno::munmap,
+            ][..],
+            &proof_calls(),
+        ]
+        .concat();
 
         let own = tool
             .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
@@ -10990,7 +11506,7 @@ pub(crate) mod inject_fstat_scratch {
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
         let recorded = RawInode::new(RECORD_DEVICE, identity.ino);
         guest.thread.map_file(RECORDED_START, page_size(), recorded);
-        let path_proof = [Sysno::newfstatat, Sysno::mmap, Sysno::statx, Sysno::munmap];
+        let path_proof = [&[Sysno::newfstatat][..], &proof_calls()].concat();
 
         let own = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Reader)
             .stat_identity(&key, &[RECORDED_START])
@@ -11021,7 +11537,7 @@ pub(crate) mod inject_fstat_scratch {
             identity,
             "a numbered task's line must be keyed on the path's stat, not the reader's record"
         );
-        assert_eq!(guest.injected, [path_proof, path_proof].concat());
+        assert_eq!(guest.injected, path_proof.repeat(2));
     }
 
     /// A running process other than the test's, whose executable stands in
@@ -11144,14 +11660,15 @@ pub(crate) mod inject_fstat_scratch {
         assert_eq!(
             guest.injected,
             [
-                Sysno::newfstatat,
-                Sysno::mmap,
-                Sysno::readlinkat,
-                Sysno::munmap,
-                Sysno::mmap,
-                Sysno::statx,
-                Sysno::munmap,
+                &[
+                    Sysno::newfstatat,
+                    Sysno::mmap,
+                    Sysno::readlinkat,
+                    Sysno::munmap,
+                ][..],
+                &proof_calls(),
             ]
+            .concat()
         );
         assert_eq!(guest.fstatat_paths, [link.clone().into_bytes()]);
         assert_eq!(guest.readlink_paths, [link.clone().into_bytes()]);
@@ -11180,11 +11697,7 @@ pub(crate) mod inject_fstat_scratch {
             Sysno::readlinkat,
             Sysno::munmap,
         ];
-        let device_mismatch = [
-            &text_mismatch[..],
-            &[Sysno::mmap, Sysno::statx, Sysno::munmap],
-        ]
-        .concat();
+        let device_mismatch = [&text_mismatch[..], &proof_calls()].concat();
         for (pathname, superblock, expected_calls, why) in [
             (
                 other.pathname(),
