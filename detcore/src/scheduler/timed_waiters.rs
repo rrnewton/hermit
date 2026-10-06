@@ -226,8 +226,10 @@ impl TimedEvents {
     }
 
     /// Register a one-shot, deterministic child-exit `SIGCHLD` to be delivered to
-    /// `parent` (via thread `parent_tid`) at logical time `ns` (the child's
-    /// `Exit` grant time plus a tick). Inserted directly into the timed `map`,
+    /// `parent` at logical time `ns` (the child's `Exit` grant time plus a tick).
+    /// `parent_tid` is the thread the delivery prefers: the thread that created
+    /// the child where gated waits model interruption, otherwise the leader.
+    /// Inserted directly into the timed `map`,
     /// deliberately bypassing the `signal_timers` re-arm/cancel bookkeeping used
     /// by `alarm`/`setitimer`/POSIX timers: a child exit fires exactly once and
     /// is never re-armed or replaced, and its key (`ChildExit{child,parent}`) is
