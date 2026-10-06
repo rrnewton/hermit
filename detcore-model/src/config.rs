@@ -124,12 +124,15 @@ pub struct Config {
     /// The guest may start with a terminal: one of the launcher's standard
     /// descriptors is a terminal, the launcher has a controlling terminal that
     /// the guest inherits with its session, or the launcher could not tell.
-    /// Linux sends SIGHUP and SIGCONT when such a terminal hangs up, at a moment
-    /// the host sets, and the guest makes no traced call that arms it, so where
-    /// blocked waits decide interruption from the kernel's signal state
+    /// Such a terminal makes Linux send signals at moments the host sets:
+    /// SIGHUP and SIGCONT when it hangs up, SIGINT, SIGQUIT and SIGTSTP for its
+    /// interrupt, quit and suspend characters, SIGWINCH when it is resized, and
+    /// SIGTTIN and SIGTTOU for a background process group's reads and writes.
+    /// The guest makes no traced call that arms them, so where blocked waits
+    /// decide interruption from the kernel's signal state
     /// ([`Config::backend_supports_blocked_wait_signal_interruption`]) the
-    /// scheduler records both signals as host-timed for every process before
-    /// the guest's first instruction
+    /// scheduler records all eight as host-timed for every process before the
+    /// guest's first instruction, and no gated wait ends for them
     /// (<https://github.com/rrnewton/hermit/issues/3146>).
     ///
     /// The host sets it while it prepares the backend configuration. It has no

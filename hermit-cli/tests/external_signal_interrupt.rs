@@ -93,6 +93,13 @@
 //!   orphaned. Linux stops the process when the signal arrives; Detcore lets a
 //!   `poll` with a timeout or a timed `FUTEX_WAIT` run to its end first, and the
 //!   process stops when the call returns, as on hermit main.
+//! - The terminal's signals other than SIGHUP and SIGWINCH. Once the guest may
+//!   have a terminal, Hermit holds every signal a terminal sends until a gated
+//!   wait returns: SIGINT, SIGQUIT, and SIGTSTP for the interrupt, quit, and
+//!   suspend characters, and SIGTTIN and SIGTTOU for a background read or
+//!   write, as well as the SIGHUP and SIGWINCH cells assert. Only the Detcore
+//!   unit tests assert those five. Typing an interrupt or quit character also
+//!   signals Hermit, which is in the same foreground process group.
 
 #[path = "common/hermit_binary.rs"]
 mod hermit_binary;
@@ -2152,15 +2159,50 @@ fn ptrace_terminal_hangup_after_tiocsctty_keeps_a_poll_to_its_deadline() {
     assert_parent_death_signal_keeps_a_poll_to_its_deadline("ptrace", "hupctty");
 }
 
-/// The guest's `poll hupinherit` RESULT line when the poll keeps its deadline
-/// and the handler runs once afterwards: this prefix, the guest's `elapsed`
-/// milliseconds, then this suffix.
-const HUPINHERIT_KEPT_PREFIX: &str = "RESULT call=poll role=hupinherit ret=0 errno=none elapsed=";
-const HUPINHERIT_KEPT_SUFFIX: &str = " handled=1 ok=1";
+/// The end of the guest's `poll hupinherit` or `poll winchinherit` RESULT line
+/// when the poll keeps its deadline and the handler runs once afterwards: the
+/// line is `TerminalEvent::kept_prefix`, the guest's `elapsed` milliseconds,
+/// then this suffix.
+const INHERITED_KEPT_SUFFIX: &str = " handled=1 ok=1";
 
-/// One run of the guest's `poll hupinherit` mode under a session leader that
-/// owns a pseudoterminal.
+/// What this process does to the guest of an inherited-terminal cell
+/// `EXTERNAL_SIGNAL_DELAY` after the guest's READY line, from outside the
+/// container.
+#[derive(Clone, Copy, Debug)]
+enum TerminalEvent {
+    /// Send the guest SIGHUP, standing for the terminal's hangup (the guest's
+    /// `poll hupinherit` mode).
+    Hangup,
+    /// Set a new window size on the terminal's master (TIOCSWINSZ), as a
+    /// user's resize would, so that Linux sends SIGWINCH to the terminal's
+    /// foreground process group, which holds the guest (the guest's
+    /// `poll winchinherit` mode).
+    Resize,
+}
+
+impl TerminalEvent {
+    /// The guest's mode for this event, which is also its RESULT line's role.
+    fn role(self) -> &'static str {
+        match self {
+            TerminalEvent::Hangup => "hupinherit",
+            TerminalEvent::Resize => "winchinherit",
+        }
+    }
+
+    /// The start of the guest's RESULT line when the poll keeps its deadline,
+    /// up to the guest's `elapsed` milliseconds (see `INHERITED_KEPT_SUFFIX`).
+    fn kept_prefix(self) -> String {
+        format!(
+            "RESULT call=poll role={} ret=0 errno=none elapsed=",
+            self.role()
+        )
+    }
+}
+
+/// One run of the guest's `poll hupinherit` or `poll winchinherit` mode under
+/// a session leader that owns a pseudoterminal.
 struct InheritedTerminalRun {
+    event: TerminalEvent,
     /// How the session leader that started Hermit ended, which is how Hermit
     /// ended: the leader exits with Hermit's status.
     status: ExitStatus,
@@ -2181,7 +2223,7 @@ impl InheritedTerminalRun {
 
     fn kept_its_deadline(&self) -> bool {
         self.line("RESULT ").is_some_and(|line| {
-            line.starts_with(HUPINHERIT_KEPT_PREFIX) && line.ends_with(HUPINHERIT_KEPT_SUFFIX)
+            line.starts_with(&self.event.kept_prefix()) && line.ends_with(INHERITED_KEPT_SUFFIX)
         })
     }
 
@@ -2193,18 +2235,20 @@ impl InheritedTerminalRun {
     }
 }
 
-/// Run the guest's `poll hupinherit` mode under Hermit, started by a shell
-/// that leads a new session whose controlling terminal is a pseudoterminal's
-/// slave, so that Hermit and the guest inherit that terminal and none of the
-/// three standard descriptors is a terminal. `EXTERNAL_SIGNAL_DELAY` after the
-/// guest's READY line this process sends the guest SIGHUP, from outside the
-/// container. This process keeps the master open until the run ends, so the
-/// terminal never hangs up.
-fn run_inherited_terminal_cell(namespace: bool) -> InheritedTerminalRun {
+/// Run the guest's mode for `event` under Hermit, started by a shell that
+/// leads a new session whose controlling terminal is a pseudoterminal's slave,
+/// so that Hermit and the guest inherit that terminal and none of the three
+/// standard descriptors is a terminal. `EXTERNAL_SIGNAL_DELAY` after the
+/// guest's READY line this process causes `event`, from outside the
+/// container: it sends the guest SIGHUP, or it checks that the guest's
+/// process group is the terminal's foreground group and sets a new window
+/// size on the master. This process keeps the master open until the run ends,
+/// so the terminal never hangs up.
+fn run_inherited_terminal_cell(namespace: bool, event: TerminalEvent) -> InheritedTerminalRun {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::OpenOptionsExt;
 
-    let describe = format!("ptrace poll hupinherit namespace={namespace}");
+    let describe = format!("ptrace poll {} namespace={namespace}", event.role());
     // Compiling the guest also creates the directory that holds every trial.
     let guest = guest();
     let trial = tempfile::Builder::new()
@@ -2264,7 +2308,7 @@ fn run_inherited_terminal_cell(namespace: bool) -> InheritedTerminalRun {
     command
         .arg("--")
         .arg(&program)
-        .args(["poll", "hupinherit"])
+        .args(["poll", event.role()])
         .stdin(Stdio::null())
         .stdout(Stdio::from(stdout_writer))
         .stderr(Stdio::piped());
@@ -2340,13 +2384,10 @@ fn run_inherited_terminal_cell(namespace: bool) -> InheritedTerminalRun {
             if !signalled && status.is_none() && ready.elapsed() >= EXTERNAL_SIGNAL_DELAY {
                 let pids = pids_with_argv0(&program);
                 if let [pid] = pids[..] {
-                    // SAFETY: plain kill(2) on a pid read from /proc.
-                    if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
-                        failure = Some(format!(
-                            "kill({pid}, SIGHUP) failed: {}",
-                            std::io::Error::last_os_error()
-                        ));
-                    }
+                    failure = match event {
+                        TerminalEvent::Hangup => send_terminal_hangup(pid),
+                        TerminalEvent::Resize => resize_foreground_terminal(&master, pid),
+                    };
                 } else {
                     failure = Some(format!(
                         "expected exactly one guest process with argv[0] {}, found {pids:?}",
@@ -2430,11 +2471,69 @@ fn run_inherited_terminal_cell(namespace: bool) -> InheritedTerminalRun {
             .unwrap_or("no RESULT line")
     );
     InheritedTerminalRun {
+        event,
         status,
         stdout,
         stderr,
         ready_to_result,
     }
+}
+
+/// Send guest process `pid` SIGHUP, as the hangup of its terminal would. The
+/// failure to report, if any.
+fn send_terminal_hangup(pid: libc::pid_t) -> Option<String> {
+    // SAFETY: plain kill(2) on a pid read from /proc.
+    if unsafe { libc::kill(pid, libc::SIGHUP) } != 0 {
+        return Some(format!(
+            "kill({pid}, SIGHUP) failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    None
+}
+
+/// Check that guest process `pid` is in the foreground process group of the
+/// pseudoterminal whose `master` this process holds, then give the terminal a
+/// window size it does not have, as a user's resize would: Linux sends
+/// SIGWINCH to that group (`pty_resize`). The failure to report, if any.
+fn resize_foreground_terminal(master: &fs::File, pid: libc::pid_t) -> Option<String> {
+    use std::os::fd::AsRawFd;
+
+    let master = master.as_raw_fd();
+    // SAFETY: plain calls on a descriptor this process owns and a pid read
+    // from /proc. TIOCGPGRP on a master reads its slave's foreground group.
+    let (foreground, group) = unsafe { (libc::tcgetpgrp(master), libc::getpgid(pid)) };
+    if foreground <= 0 || foreground != group {
+        return Some(format!(
+            "guest {pid} is in process group {group}, not in the terminal's foreground \
+             process group {foreground}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let mut size = libc::winsize {
+        ws_row: 0,
+        ws_col: 0,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: TIOCGWINSZ writes one winsize to `size`.
+    if unsafe { libc::ioctl(master, libc::TIOCGWINSZ, &mut size) } != 0 {
+        return Some(format!(
+            "TIOCGWINSZ failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // Linux signals nothing for a size the terminal already has.
+    size.ws_row = if size.ws_row == 40 { 41 } else { 40 };
+    size.ws_col = 100;
+    // SAFETY: TIOCSWINSZ reads one winsize from `size`.
+    if unsafe { libc::ioctl(master, libc::TIOCSWINSZ, &size) } != 0 {
+        return Some(format!(
+            "TIOCSWINSZ failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    None
 }
 
 /// A SIGHUP from outside the container while Hermit holds an inherited
@@ -2470,7 +2569,7 @@ fn run_inherited_terminal_cell(namespace: bool) -> InheritedTerminalRun {
 /// so this cell runs without it.
 #[test]
 fn ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_sighup_without_a_namespace() {
-    assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(false);
+    assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(false, TerminalEvent::Hangup);
 }
 
 /// The same cell in the default namespace mode, under `--strict`. A guest
@@ -2479,20 +2578,53 @@ fn ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_sighup_with
 /// the guest prints `CTTY 1`.
 #[test]
 fn ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_sighup_in_a_namespace() {
-    assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(true);
+    assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(true, TerminalEvent::Hangup);
 }
 
-fn assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(namespace: bool) {
+/// A resize of an inherited controlling terminal while the guest polls (the
+/// guest's `poll winchinherit` mode), with the terminal set up as in the
+/// SIGHUP cells above. The guest catches SIGWINCH and polls no descriptors for
+/// 10 s; 500 ms after its READY line this process checks that the guest's
+/// process group is the terminal's foreground process group and sets a new
+/// window size on the terminal's master, and Linux sends SIGWINCH to that
+/// group. Natively the poll returns EINTR then. Under Hermit that instant is
+/// set by the host, so Hermit records SIGWINCH as host-timed for the whole
+/// container before the guest's first instruction whenever the launch may
+/// pass the guest a terminal, with every other signal a terminal sends, and no
+/// gated wait ends for it: in each run the poll returns 0 after its full
+/// timeout and the handler runs once afterwards. Round-11 finding "Terminal
+/// resize remains an admitted host-timed interruption" of
+/// https://github.com/rrnewton/hermit/pull/3361: only SIGHUP and SIGCONT were
+/// recorded, and the poll returned EINTR at a turn the host chose
+/// (https://github.com/rrnewton/hermit/issues/3146). Runs as the SIGHUP cells
+/// do: `PDEATH_RUNS` separate launches, none under `--verify`.
+#[test]
+fn ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_a_resize_without_a_namespace()
+{
+    assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(false, TerminalEvent::Resize);
+}
+
+/// The same resize cell in the default namespace mode, under `--strict`.
+#[test]
+fn ptrace_an_inherited_terminal_keeps_a_poll_to_its_deadline_through_a_resize_in_a_namespace() {
+    assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(true, TerminalEvent::Resize);
+}
+
+fn assert_an_inherited_terminal_keeps_a_poll_to_its_deadline(
+    namespace: bool,
+    event: TerminalEvent,
+) {
     for run_index in 1..=PDEATH_RUNS {
-        let run = run_inherited_terminal_cell(namespace);
+        let run = run_inherited_terminal_cell(namespace, event);
         assert!(
             run.status.success()
                 && run.has_line("CTTY 1")
                 && run.kept_its_deadline()
                 && run.has_line("DONE"),
-            "run {run_index} of {PDEATH_RUNS}, namespace={namespace}, poll hupinherit: expected \
-             CTTY 1, `{HUPINHERIT_KEPT_PREFIX}<ms>{HUPINHERIT_KEPT_SUFFIX}`, DONE, and Hermit \
-             exiting 0\n{}",
+            "run {run_index} of {PDEATH_RUNS}, namespace={namespace}, poll {}: expected CTTY 1, \
+             `{}<ms>{INHERITED_KEPT_SUFFIX}`, DONE, and Hermit exiting 0\n{}",
+            event.role(),
+            event.kept_prefix(),
             run.describe()
         );
     }
