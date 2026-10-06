@@ -184,7 +184,26 @@ impl RecordVersion {
 // replay numbers every raw ID from it. An older recording's metadata cannot
 // rebuild the mapping its guest saw, so replaying it could change the mount IDs
 // the guest reads and its control flow.
-pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x122);
+// 0x122 -> 0x123: inode names that Detcore recomputes over the recorded procfs
+// bytes and readlink targets changed value, with no change of event shape.
+// /proc/*/maps lines are minted in the order they appear in the text (they
+// were minted in ascending host inode order) and keyed on the header's device
+// and inode (they were keyed on the inode alone). The ino: line of
+// /proc/*/fdinfo/<fd> is keyed on the descriptor's device and inode, except
+// that a pipe or socket is keyed on its inode alone, on device 0, when
+// metadata is not virtualized -- always the case for record and replay. A
+// pipe or socket link, /proc/<pid>/fd/<fd>, is keyed on the inode its target
+// names, on device 0. When stdio descriptors alias one object, the lowest
+// matching descriptor's stdio inode now wins instead of the last: another
+// process's link to an inherited stdin pipe, and a maps line naming the stdin
+// file, read 1000 where they read 1002. A guest can branch on any of these
+// bytes, so replaying an older stream under the new names could change its
+// control flow and event consumption. A recording made at 0x122 still carries
+// the old names, so this change needs its own version even though 0x122 is
+// recent. The device-and-inode keys of maps lines, fdinfo and getdents first
+// changed within 0x121, in 0baaaaac239c, which raised no version; recordings
+// made before that commit carry 0x121 or lower and are refused already.
+pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x123);
 
 /// The highest RECORD_VERSION this project has ever shipped.
 ///
@@ -209,7 +228,7 @@ pub(crate) const RECORD_VERSION: RecordVersion = RecordVersion(0x122);
 /// the version exists to prevent.
 ///
 /// RAISE THIS IN THE SAME COMMIT THAT RAISES RECORD_VERSION.
-const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x122;
+const HIGHEST_SHIPPED_RECORD_VERSION: u32 = 0x123;
 
 const _: () = assert!(
     RECORD_VERSION.0 >= HIGHEST_SHIPPED_RECORD_VERSION,
