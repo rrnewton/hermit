@@ -6,7 +6,9 @@ and turns what the harness reports into one exit status. VerdictTest runs it aga
 stand-in harness that records how it was called and reports what the case gives it.
 RunTest runs ci/buck-e2e/run end to end in a scratch checkout of its scripts, with
 stand-ins for buck2, testx and the staged harness, and checks that a FAIL, an ERROR or
-results ingest.py refuses make the run exit non-zero.
+results ingest.py refuses make the run exit non-zero, and that --failed-verify-logs
+reaches ingest.py. ValidateNodeTest runs ci/buck-e2e/validate-node with stand-ins for
+the steps it calls and checks where it sends the logs of cells that did not pass.
 """
 
 from __future__ import annotations
@@ -616,6 +618,81 @@ class RunTest(unittest.TestCase):
                 process = subprocess.run([sys.executable, str(VERDICT), form], capture_output=True, text=True)
                 self.assertEqual(process.returncode, 0, process.stderr)
                 self.assertIn("Exit status: 0 when every bucket passes", process.stdout)
+
+    def test_failed_verify_logs_reach_ingest(self):
+        diverged = ingest_test.with_logs(ingest_test.execution(ingest_test.Y, 150, "FAIL", "ry1"), ingest_test.DIVERGED_LOGS)
+        runs = {"all": [ingest_test.execution(ingest_test.X, 100, "PASS", "rx1"), diverged]}
+        kept = self.root / "kept"
+        process = self.run_buck_e2e("local", runs, "--no-verdict", "--failed-verify-logs", str(kept))
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertEqual(sorted(str(p.relative_to(kept)) for p in kept.rglob("*") if p.is_file()),
+                         ["index.jsonl", "ry1/verify-logs/verify-1/run1_log_detlog",
+                          "ry1/verify-logs/verify-1/run2_log_detlog"])
+
+
+# Each step validate-node calls: appends its name and argv to FAKE_STEP_CALLS.
+FAKE_STEP = r"""#!/usr/bin/env python3
+import json, os, sys
+with open(os.environ["FAKE_STEP_CALLS"], "a") as calls:
+    calls.write(json.dumps([os.path.basename(sys.argv[0])] + sys.argv[1:]) + "\n")
+"""
+
+
+class ValidateNodeTest(unittest.TestCase):
+    """ci/buck-e2e/validate-node in a scratch checkout whose steps are stand-ins."""
+
+    def setUp(self) -> None:
+        temporary = tempfile.TemporaryDirectory(prefix="test-buck-e2e-validate-node-")
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        checkout = self.root / "checkout"
+        (checkout / "ci" / "buck-e2e").mkdir(parents=True)
+        self.node = checkout / "ci" / "buck-e2e" / "validate-node"
+        shutil.copy2(BUCK_E2E / "validate-node", self.node)
+        for step in ("bootstrap/regenerate-rust-deps", "ci/buck-e2e/stage", "ci/buck-e2e/run"):
+            write_executable(checkout / step, FAKE_STEP)
+        # with-proxy, when installed, prefixes the network steps; this one only runs them.
+        write_executable(self.root / "bin" / "with-proxy", '#!/bin/sh\nexec "$@"\n')
+        self.buck2 = write_executable(self.root / "bin" / "buck2", "#!/bin/sh\nexit 0\n")
+        self.calls = self.root / "calls.jsonl"
+
+    def validate_node(self, e2e_result_root, cwd=None):
+        """Run validate-node from CWD with E2E_RESULT_ROOT (None: unset)."""
+        environment = {k: v for k, v in os.environ.items() if k != "E2E_RESULT_ROOT"}
+        environment.update(PATH=f"{self.root / 'bin'}:{os.environ['PATH']}",
+                           HERMIT_VALIDATE_E2E_RUNNER="buck-local", HERMIT_VALIDATE_BUCK2=str(self.buck2),
+                           VALIDATE_RUN_STATE=str(self.root / "state"), HERMIT_EPOCH="2026-10-05T00:00:00+00:00",
+                           FAKE_STEP_CALLS=str(self.calls))
+        if e2e_result_root is not None:
+            environment["E2E_RESULT_ROOT"] = e2e_result_root
+        return subprocess.run([str(self.node)], capture_output=True, text=True, env=environment, cwd=cwd)
+
+    def test_the_logs_of_cells_that_did_not_pass_go_below_the_e2e_result_root(self):
+        results = self.root / "e2e-results"
+        stale = results / "buck-failed-verify-logs"
+        stale.mkdir(parents=True)
+        (stale / "index.jsonl").write_text("from an earlier attempt\n")
+        process = self.validate_node(str(results))
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        run = [call for call in calls_in(self.calls) if call[0] == "run"]
+        self.assertEqual(len(run), 1, run)
+        argv = run[0]
+        self.assertEqual(argv[argv.index("--failed-verify-logs") + 1], str(stale))
+        self.assertEqual(argv[argv.index("--out") + 1], str(self.root / "state" / "buck-e2e" / "results"))
+        self.assertFalse(stale.exists(), "an earlier attempt's logs would stand for this run's")
+
+    def test_a_relative_e2e_result_root_is_resolved_before_the_node_changes_directory(self):
+        process = self.validate_node("relative-results", cwd=self.root)
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        argv = [call for call in calls_in(self.calls) if call[0] == "run"][0]
+        self.assertEqual(argv[argv.index("--failed-verify-logs") + 1],
+                         str(self.root / "relative-results" / "buck-failed-verify-logs"))
+
+    def test_a_node_without_an_e2e_result_root_is_refused(self):
+        process = self.validate_node(None)
+        self.assertEqual(process.returncode, 2, process.stdout + process.stderr)
+        self.assertIn("validate-node: E2E_RESULT_ROOT is unset", process.stderr)
+        self.assertFalse(self.calls.exists(), "a step ran before the node was refused")
 
 
 if __name__ == "__main__":

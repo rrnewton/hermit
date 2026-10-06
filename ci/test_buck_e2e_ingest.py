@@ -4,11 +4,13 @@
 Each test lays out a Buck test run the way testx lists it (every cell execution
 with its uploaded artifacts, and optionally Buck's local copies under buck-out),
 runs ingest.py on it, and checks either the refusal or the rows, attempt numbers
-and evidence list that ingest.py writes for test-harness's import mode.
+and evidence list that ingest.py writes for test-harness's import mode, and the
+verify logs it keeps (--failed-verify-logs) from executions that did not pass.
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import subprocess
@@ -92,7 +94,32 @@ def write_artifacts(directory, uploaded):
         (directory / "result.json").write_text(json.dumps(uploaded["result"]))
     for marker in uploaded["markers"]:
         (directory / f"run_id.{marker}").write_text(f"{marker}\n")
+    for name, blob in uploaded.get("files", {}).items():
+        (directory / name).write_bytes(blob)
     return sorted(path.name for path in directory.iterdir())
+
+
+def zstd(blob):
+    return subprocess.run(["zstd", "-q", "-c"], input=blob, capture_output=True, check=True).stdout
+
+
+def with_logs(uploaded, logs, sha256=None):
+    """UPLOADED, also returning LOGS ({artifact name: bytes}) the way cell.sh does: as
+    artifacts whose sha256 its result.json records (SHA256 replaces any of those)."""
+    uploaded = dict(uploaded, files=dict(uploaded.get("files", {}), **logs))
+    hashes = {name: hashlib.sha256(blob).hexdigest() for name, blob in uploaded["files"].items()}
+    uploaded["result"] = dict(uploaded["result"], artifact_sha256=dict(hashes, **(sha256 or {})))
+    return uploaded
+
+
+# What hermit --verify kept in the cell's verify-logs/verify-1 after two runs that
+# differed, as cell.sh returns it: run 2's log is over 256 KiB, so it is compressed.
+RUN1_LOG = b"run 1 DETLOG\n"
+RUN2_LOG = b"run 2 DETLOG " * 30000
+DIVERGED_LOGS = {
+    "cell__verify-logs__verify-1__run1_log_detlog": RUN1_LOG,
+    "cell__verify-logs__verify-1__run2_log_detlog.zst": zstd(RUN2_LOG),
+}
 
 
 def write_test_runs(fake, runs):
@@ -140,9 +167,10 @@ class IngestTest(unittest.TestCase):
         self.testx.chmod(0o755)
         (self.root / "plan.json").write_text(json.dumps(PLAN))
 
-    def ingest(self, runs, local=()):
+    def ingest(self, runs, local=(), extra=()):
         """Run ingest.py on RUNS ({test run id: [execution, ...]}), with each
-        execution in LOCAL copied into its own buck-out artifacts directory."""
+        execution in LOCAL copied into its own buck-out artifacts directory and
+        EXTRA added to its arguments."""
         work = Path(tempfile.mkdtemp(dir=self.root))
         fake = work / "fake"
         write_test_runs(fake, runs)
@@ -164,7 +192,7 @@ class IngestTest(unittest.TestCase):
             command += ["--local-artifacts", str(buck_out)]
         environment = dict(os.environ, TESTX=str(self.testx), FAKE_TESTX_DIR=str(fake))
         process = subprocess.run(
-            command + list(runs), capture_output=True, text=True, env=environment
+            command + list(extra) + list(runs), capture_output=True, text=True, env=environment
         )
         return work, process
 
@@ -391,6 +419,103 @@ class IngestTest(unittest.TestCase):
                 )
                 self.assertEqual(rows, [(X, 1, "FAIL", "rx1"), (X, 2, "FAIL", "rx2"), (Y, 1, "PASS", "ry1")])
                 self.assertEqual(printed["sources"], {"testx": 3})
+
+    def read_kept(self, root):
+        index = {e["run_id"]: e for e in map(json.loads, (root / "index.jsonl").read_text().splitlines())}
+        files = {str(p.relative_to(root)): p.read_bytes() for p in root.rglob("*") if p.is_file()}
+        files.pop("index.jsonl")
+        return index, files
+
+    def test_a_diverged_cells_run_logs_are_kept_and_a_passing_cells_are_not(self):
+        """The 2026-10-05 compat/zip-unzip red: a verify cell diverged on an RE worker and
+        its logs were never brought back. Both logs come back, decompressed, whether the
+        execution is fetched with testx (an RE cell) or read from buck-out (a local one)."""
+        diverged = with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS)
+        # A matched verify keeps run 1's log too; a cell that passed gets nothing kept.
+        passing = with_logs(execution(X, 100, "PASS", "rx1"), {"cell__verify-logs__verify-1__run1_log_detlog": RUN1_LOG})
+        for name, local in (("fetched with testx", ()), ("read from buck-out", [diverged, passing])):
+            with self.subTest(name):
+                work, process = self.ingest({"RUN": [passing, diverged]}, local,
+                                            ["--failed-verify-logs", str(self.root / name / "kept")])
+                self.assertEqual(process.returncode, 0, process.stderr)
+                printed = json.loads(process.stdout)
+                index, files = self.read_kept(self.root / name / "kept")
+                self.assertEqual(files, {"ry1/verify-logs/verify-1/run1_log_detlog": RUN1_LOG,
+                                         "ry1/verify-logs/verify-1/run2_log_detlog": RUN2_LOG})
+                self.assertEqual(list(index), ["ry1"])
+                self.assertEqual(index["ry1"]["cell"], Y)
+                self.assertEqual(index["ry1"]["outcome"], "FAIL")
+                self.assertIsNone(index["ry1"]["reason"])
+                self.assertEqual(
+                    [(one["artifact"], one["log"], one["bytes"], one["truncated"], one["reason"]) for one in index["ry1"]["logs"]],
+                    [("cell__verify-logs__verify-1__run1_log_detlog", "ry1/verify-logs/verify-1/run1_log_detlog",
+                      len(RUN1_LOG), False, None),
+                     ("cell__verify-logs__verify-1__run2_log_detlog.zst", "ry1/verify-logs/verify-1/run2_log_detlog",
+                      len(RUN2_LOG), False, None)])
+                self.assertEqual((printed["failed_executions"], printed["failed_verify_logs_kept"],
+                                  printed["failed_verify_logs_not_kept"]), (1, 2, 0))
+
+    def test_an_execution_that_wrote_no_row_keeps_its_logs_too(self):
+        died = with_logs(execution(X, 100, None, "rx1", complete=False), DIVERGED_LOGS)
+        work, process = self.ingest({"RUN": [died, execution(X, 200, "PASS", "rx2"), Y_PASSES]},
+                                    extra=["--failed-verify-logs", str(self.root / "kept")])
+        self.assertEqual(process.returncode, 0, process.stderr)
+        index, files = self.read_kept(self.root / "kept")
+        self.assertEqual(sorted(files), ["rx1/verify-logs/verify-1/run1_log_detlog",
+                                         "rx1/verify-logs/verify-1/run2_log_detlog"])
+        self.assertEqual(list(index), ["rx1"])
+        self.assertIsNone(index["rx1"]["outcome"])
+
+    def test_a_log_that_cannot_be_checked_is_named_and_never_fails_the_ingest(self):
+        run2 = "cell__verify-logs__verify-1__run2_log_detlog.zst"
+        cases = [
+            ("a log without its recorded sha256", with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS, {run2: "0" * 64}),
+             ["ry1/verify-logs/verify-1/run1_log_detlog"], None, "it does not have the sha256 its cell recorded"),
+            ("no artifact_sha256 at all", dict(with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS),
+                                              result={"cell": Y, "run_id": "ry1", "evidence_complete": True}),
+             [], "records no artifact_sha256", None),
+            ("no log among the artifacts", execution(Y, 150, "ERROR", "ry1"), [], "hold no run1_log_* or run2_log_* log", None),
+        ]
+        for name, failing, kept_files, reason, log_reason in cases:
+            with self.subTest(name):
+                target = self.root / name.replace(" ", "-") / "kept"
+                work, process = self.ingest({"RUN": [execution(X, 100, "PASS", "rx1"), failing]},
+                                            extra=["--failed-verify-logs", str(target)])
+                self.assertEqual(process.returncode, 0, process.stderr)
+                index, files = self.read_kept(target)
+                self.assertEqual(sorted(files), kept_files)
+                if reason:
+                    self.assertIn(reason, index["ry1"]["reason"])
+                if log_reason:
+                    self.assertEqual([one["reason"] for one in index["ry1"]["logs"]], [None, log_reason])
+
+    def test_a_log_is_cut_at_the_bound(self):
+        diverged = with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS)
+        work, process = self.ingest({"RUN": [execution(X, 100, "PASS", "rx1"), diverged]},
+                                    extra=["--failed-verify-logs", str(self.root / "kept"), "--failed-log-max-bytes", "100"])
+        self.assertEqual(process.returncode, 0, process.stderr)
+        index, files = self.read_kept(self.root / "kept")
+        self.assertEqual(files, {"ry1/verify-logs/verify-1/run1_log_detlog": RUN1_LOG,
+                                 "ry1/verify-logs/verify-1/run2_log_detlog": RUN2_LOG[:100]})
+        self.assertEqual([(one["bytes"], one["truncated"]) for one in index["ry1"]["logs"]],
+                         [(len(RUN1_LOG), False), (100, True)])
+
+    def test_a_directory_that_is_not_a_previous_ingests_is_never_replaced(self):
+        target = self.root / "occupied"
+        target.mkdir()
+        (target / "someone-elses").write_text("kept\n")
+        work, process = self.ingest({"RUN": [execution(X, 100, "PASS", "rx1"), Y_PASSES]},
+                                    extra=["--failed-verify-logs", str(target)])
+        self.assertEqual(process.returncode, 1, process.stdout + process.stderr)
+        self.assertIn("is not absent, empty, or a previous ingest's", process.stderr)
+        self.assertEqual((target / "someone-elses").read_text(), "kept\n")
+        # A previous ingest's directory is replaced whole.
+        diverged = with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS)
+        again = self.root / "again"
+        for runs in ({"RUN": [execution(X, 100, "PASS", "rx1"), diverged]}, {"RUN": [execution(X, 100, "PASS", "rx1"), Y_PASSES]}):
+            work, process = self.ingest(runs, extra=["--failed-verify-logs", str(again)])
+            self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(self.read_kept(again), ({}, {}))
 
 
 if __name__ == "__main__":

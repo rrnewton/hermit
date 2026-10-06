@@ -15,6 +15,12 @@
 #   VALIDATE_RUN_STATE          the run's state directory. The rows go to
 #                               $VALIDATE_RUN_STATE/buck-e2e/results, Buck's event logs to
 #                               $VALIDATE_RUN_STATE/buck-e2e/work.
+#   E2E_RESULT_ROOT             the run's durable E2E result directory. The verify logs of
+#                               every cell execution that did not pass go to
+#                               $E2E_RESULT_ROOT/buck-failed-verify-logs (see
+#                               ci/buck-e2e/ingest.py --failed-verify-logs), beside the
+#                               rows the import twins publish; the state directory is not
+#                               kept.
 # Optional: HERMIT_GIT_DEP_MIRRORS (see bootstrap/git-dep-mirrors.sh) serves Cargo.lock's
 # git dependencies from local mirrors while the third-party rules are regenerated.
 #
@@ -58,7 +64,12 @@ if [[ -z ${VALIDATE_RUN_STATE:-} ]]; then
     echo "validate-node: VALIDATE_RUN_STATE is unset; this node runs under scripts/validate.rs" >&2
     exit 2
 fi
+if [[ -z ${E2E_RESULT_ROOT:-} ]]; then
+    echo "validate-node: E2E_RESULT_ROOT is unset; this node runs under scripts/validate.rs" >&2
+    exit 2
+fi
 state=$VALIDATE_RUN_STATE/buck-e2e
+failed_logs=$(realpath -m -- "$E2E_RESULT_ROOT")/buck-failed-verify-logs
 proxy=()
 if command -v with-proxy >/dev/null 2>&1; then proxy=(with-proxy); fi
 
@@ -74,7 +85,7 @@ if [[ $mode == hybrid ]]; then
 fi
 step "staging the inputs Buck does not build (cargo, target/)"
 "${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
-rm -rf -- "${state:?}/results"
+rm -rf -- "${state:?}/results" "${failed_logs:?}"
 mkdir -p "$state/work"
 # Every cell of the run gets one HERMIT_EPOCH: backend parity compares a ptrace reference with
 # its candidates only when they share the guest epoch, and each cell is its own harness
@@ -93,4 +104,5 @@ else
 fi
 step "running every cell under Buck ($runner), HERMIT_EPOCH=$epoch"
 ./ci/buck-e2e/run --mode "$mode" --no-verdict --out "$state/results" --work "$state/work" \
+    --failed-verify-logs "$failed_logs" \
     --buck2 "$buck2" -- "${buck_args[@]}" -c hermit_e2e.hermit=staged -c "hermit_e2e.epoch=$epoch"

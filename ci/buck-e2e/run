@@ -5,7 +5,8 @@
 # write. Only import mode may read IMPORT_DIR; see ci/buck-e2e/ingest.py.
 #
 # usage: ci/buck-e2e/run --mode hybrid|local --out IMPORT_DIR --work DIR
-#            [--buck2 PATH] [--no-verdict] [-- EXTRA_BUCK2_TEST_ARGS...]
+#            [--buck2 PATH] [--no-verdict] [--failed-verify-logs DIR]
+#            [-- EXTRA_BUCK2_TEST_ARGS...]
 #        ci/buck-e2e/run -h|--help
 #
 #   hybrid  RE-routed cells run on Meta RE and the rest locally (see defs.bzl). The two
@@ -19,6 +20,10 @@
 #           that judges them itself (`test-harness run` in import mode, as verdict.py does),
 #           and exit 0 whatever the cells' verdicts are. The validation DAG's e2e.buck_cells node
 #           (ci/buck-e2e/validate-node) does this; its <bucket>_buck import twins judge.
+#   --failed-verify-logs DIR  keep the verify logs (run1_log_*, run2_log_*) of every cell
+#           execution that did not pass in DIR, with DIR/index.jsonl; IMPORT_DIR and --work
+#           are scratch, DIR is the evidence a failure leaves (see ingest.py). An RE cell's
+#           logs exist only as its Tpx artifacts, so nothing else brings them to this host.
 #
 # The inputs Buck does not build yet must already be staged (ci/buck-e2e/stage), and
 # HEAD must be the staged SOURCE_SHA with no uncommitted changes to tracked files before
@@ -44,7 +49,7 @@
 set -euo pipefail
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 root=$(cd "$here/../.." && pwd)
-mode= out= work= buck2=${BUCK2:-buck2} verdict=1
+mode= out= work= buck2=${BUCK2:-buck2} verdict=1 failed_logs=()
 while [[ $# -gt 0 ]]; do
     case $1 in
         --mode) mode=$2; shift 2 ;;
@@ -52,6 +57,7 @@ while [[ $# -gt 0 ]]; do
         --work) work=$2; shift 2 ;;
         --buck2) buck2=$2; shift 2 ;;
         --no-verdict) verdict=0; shift ;;
+        --failed-verify-logs) failed_logs=(--failed-verify-logs "$2"); shift 2 ;;
         -h | --help) awk 'NR > 1 && !/^#/ {exit} NR > 1 {sub(/^# ?/, ""); print}' "${BASH_SOURCE[0]}"; exit 0 ;;
         --) shift; break ;;
         *) echo "ci/buck-e2e/run: unknown argument $1" >&2; exit 2 ;;
@@ -128,7 +134,7 @@ for r in "${runs[@]}"; do
 done
 require_staged_source "after the run" 1
 python3 "$here/ingest.py" --plan "$root/ci/expected-e2e-plan.json" --out "$out" --work "$work/artifacts" \
-    --local-artifacts "$root/buck-out/v2/test/execution" "${ids[@]}" || {
+    --local-artifacts "$root/buck-out/v2/test/execution" "${failed_logs[@]}" "${ids[@]}" || {
     echo "ci/buck-e2e/run: ingest.py could not turn the run's results into rows (above); the run has no verdict" >&2
     exit 1
 }

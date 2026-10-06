@@ -13,6 +13,10 @@ resolves outside the bundle, never replacing one the bundle ships, and a library
 image lacks is an ERROR. The wrapper and the harness each get a deadline that leaves
 the next one out time to stop them. Nothing here needs podman, /test or capabilities.
 
+A diverging verify cell's artifacts also go through ci/buck-e2e/ingest.py, as Tpx
+would list them, to check that both run logs come back to this host from a cell that
+ran remotely (fetched with testx) and from one that ran locally (read from buck-out).
+
 ContainerChoiceTest evaluates defs.bzl's hermit_e2e_cells over the real
 ci/expected-e2e-plan.json with stand-ins for the Buck builtins and checks which cells
 get the pinned-root container in hybrid and local routing.
@@ -32,6 +36,8 @@ import threading
 import time
 import unittest
 from pathlib import Path
+
+import test_buck_e2e_ingest as ingest_test
 
 
 CI = Path(__file__).resolve().parent
@@ -101,7 +107,8 @@ results, tpx = host(flag("--results")), host(flag("--tpx-json"))
 os.makedirs(os.path.dirname(results), exist_ok=True)
 test, mode, backend = flag("--test"), flag("--mode"), flag("--backend")
 with open(results, "w") as f:
-    f.write(json.dumps({"test": test, "mode": mode, "backend": backend, "outcome": outcome}) + "\n")
+    f.write(json.dumps({"test": test, "mode": mode, "backend": backend, "outcome": outcome,
+                        "run_id": os.environ["E2E_RUN_ID"]}) + "\n")
 with open(host(flag("--junit")), "w") as f:
     f.write("<testsuite/>\n")
 status = "passed" if outcome == "PASS" else "failed"
@@ -110,18 +117,20 @@ with open(tpx, "w") as f:
                         "details": json.dumps({"outcome": outcome})}) + "\n")
 celldir = os.path.join(host(os.environ["E2E_RESULT_ROOT"]), "runs", os.environ["E2E_RUN_ID"],
                        os.environ["FAKE_SLUG"])
-os.makedirs(os.path.join(celldir, "verify-logs"), exist_ok=True)
+logs = os.path.join(celldir, "verify-logs", "verify-1")
+os.makedirs(logs, exist_ok=True)
 # Like hermit --keep-logs: a matched verify keeps only run 1's (golden) log, anything else
 # keeps both. FAKE_VERDICT overrides the verdict, FAKE_DETLOGS ("1", "2", "12" or "")
-# which logs survive, FAKE_VERIFY_JSON=missing|garbage the verdict file itself.
+# which logs survive, FAKE_VERIFY_JSON=missing|garbage the verdict file itself, and
+# FAKE_DETLOG_LINES how many lines each log has (default 1).
 verdict = os.environ.get("FAKE_VERDICT", "matched")
 verify_json = os.environ.get("FAKE_VERIFY_JSON", "")
 if verify_json != "missing":
     with open(os.path.join(celldir, "verify-1.json"), "w") as f:
         f.write("not json\n" if verify_json == "garbage" else json.dumps({"verdict": verdict}) + "\n")
 for n in os.environ.get("FAKE_DETLOGS", "1" if verdict == "matched" else "12"):
-    with open(os.path.join(celldir, "verify-logs", "run%s_log_detlog" % n), "w") as f:
-        f.write("detlog\n")
+    with open(os.path.join(logs, "run%s_log_detlog" % n), "w") as f:
+        f.write("".join("run %s detlog line %d\n" % (n, i) for i in range(int(os.environ.get("FAKE_DETLOG_LINES", "1")))))
 sys.exit(0 if outcome == "PASS" else 1)
 """
 
@@ -600,6 +609,41 @@ class CellTest(unittest.TestCase):
                 self.assert_evidence(False, "verify-1.json", FAKE_VERIFY_JSON=verify_json,
                                      FAKE_DETLOGS="12")
         self.assert_evidence(False, "verify-1.json", FAKE_VERDICT="", FAKE_DETLOGS="12")
+    def test_a_diverged_cells_run_logs_come_back_through_ingest(self) -> None:
+        # Run 2's log is over cell.sh's 256 KiB compression threshold, as a real DETLOG is.
+        done, result = self.run_cell(FAKE_OUTCOME="FAIL", FAKE_VERDICT="diverged", FAKE_DETLOG_LINES="20000")
+        self.assertEqual(done["status"], "failed", done)
+        artifacts = sorted(p.name for p in (self.tmp / "tpx" / "artifacts").iterdir())
+        self.assertIn("cell__verify-logs__verify-1__run2_log_detlog.zst", artifacts)
+        expected = {f"{result['run_id']}/verify-logs/verify-1/run{n}_log_detlog":
+                    "".join(f"run {n} detlog line {i}\n" for i in range(20000)).encode() for n in (1, 2)}
+        # As testx lists the execution, and as Buck leaves a local one in buck-out.
+        fake = self.tmp / "testx"
+        shutil.copytree(self.tmp / "tpx" / "artifacts", fake / "art" / "RUN.1.100")
+        listing = [{"test_details": {"name": f"//ci/buck-e2e:cell - {CELL}", "id": 1}, "end_time": 100,
+                    "artifacts": [{"name": n} for n in artifacts]}]
+        (fake / "list-RUN.json").write_text(json.dumps({"results": {"test_results": listing}}))
+        write_exe(self.tmp / "bin" / "testx", ingest_test.FAKE_TESTX)
+        buck_out = self.tmp / "buck-out-test-execution"
+        shutil.copytree(self.tmp / "tpx" / "artifacts", buck_out / "c" / "t" / "default" / "artifacts_directory")
+        plan = self.tmp / "plan.json"
+        plan.write_text(json.dumps({"cells": [{"test": TEST, "mode": MODE, "backend": BACKEND,
+                                               "lane": "portable", "category": "cat"}]}))
+        for route, local in (("remote", []), ("local", ["--local-artifacts", str(buck_out)])):
+            with self.subTest(route):
+                kept = self.tmp / route / "kept"
+                proc = subprocess.run(
+                    [sys.executable, str(CI / "buck-e2e" / "ingest.py"), "--plan", str(plan),
+                     "--out", str(self.tmp / route / "import"), "--work", str(self.tmp / route / "work"),
+                     *local, "--failed-verify-logs", str(kept), "RUN"],
+                    capture_output=True, text=True, timeout=120,
+                    env=dict(os.environ, TESTX=str(self.tmp / "bin" / "testx"), FAKE_TESTX_DIR=str(fake)))
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+                self.assertEqual(json.loads(proc.stdout)["sources"], {"testx" if route == "remote" else "local": 1})
+                files = {str(p.relative_to(kept)): p.read_bytes() for p in kept.rglob("*")
+                         if p.is_file() and p.name != "index.jsonl"}
+                self.assertEqual(files, expected)
+
 
 class _Anything:
     """Stand-in for Buck builtins defs.bzl names at load time but these tests never call."""
