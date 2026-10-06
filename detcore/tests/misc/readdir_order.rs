@@ -62,6 +62,15 @@ fn run_five_times_on<S: Sync>(
 /// the log, as `hermit run` does whenever its log is read: under `--verify`,
 /// or at log level info or above.
 fn run_five_times_hashing_buffers(guest: fn()) {
+    // Detcore reads a call's bytes back only while its records are observed:
+    // by a tracing subscriber at INFO, or by a record sink. The subscriber's
+    // level is the caller's DETCORE_TEST_RUST_LOG, which GitHub's portable
+    // workflow sets to "off", so without a sink nothing is hashed there and
+    // these tests check nothing (portable run 37383177918). A sink that drops
+    // every record, for every target, makes the hashing independent of the
+    // log level.
+    _ = detcore::detlog::set_forwarder(|_, _, _| {}, detcore::detlog::ForwardPolicy::all());
+    assert!(detcore::detlog::forwards_target("detcore::io_buffers"));
     let config = Config {
         sequentialize_threads: true,
         max_timeslice: None,
