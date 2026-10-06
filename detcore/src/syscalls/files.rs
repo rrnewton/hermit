@@ -53,6 +53,7 @@ use super::deterministic_stdio_inode_for_resource;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
+use crate::procfs::MappingSubject;
 use crate::procfs::MountInfoSnapshot;
 use crate::procfs::ProcfsFile;
 use crate::procfs::ProcfsSnapshotContext;
@@ -768,18 +769,18 @@ fn transient_stat_page_len(path_len: usize) -> usize {
 struct GuestMappingMinter<'a, G, T: RecordOrReplay> {
     detcore: &'a Detcore<T>,
     guest: &'a mut G,
-    /// Whether the snapshot shows the reader's own address space, the only
-    /// case in which the reader's mapping records describe its lines
-    /// (`ProcfsFile::mapping_address_space`).
-    readers_address_space: bool,
+    /// Whose address space the snapshot shows (`ProcfsFile::mapping_subject`):
+    /// the reader's mapping records describe its lines only when it is the
+    /// reader's own.
+    subject: MappingSubject,
 }
 
 impl<'a, G, T: RecordOrReplay> GuestMappingMinter<'a, G, T> {
-    fn new(detcore: &'a Detcore<T>, guest: &'a mut G, readers_address_space: bool) -> Self {
+    fn new(detcore: &'a Detcore<T>, guest: &'a mut G, subject: MappingSubject) -> Self {
         Self {
             detcore,
             guest,
-            readers_address_space,
+            subject,
         }
     }
 }
@@ -796,13 +797,8 @@ where
         key: &crate::procfs::MappingKey,
         starts: &[usize],
     ) -> Result<RawInode, Error> {
-        let recorded_starts: &[usize] = if self.readers_address_space {
-            starts
-        } else {
-            &[]
-        };
         self.detcore
-            .mapping_stat_identity(self.guest, key, recorded_starts)
+            .mapping_stat_identity(self.guest, key, starts, self.subject)
             .await
     }
 
@@ -816,6 +812,33 @@ where
 }
 
 impl<T: RecordOrReplay> Detcore<T> {
+    /// Binds, at open time, whose address space a `maps`/`smaps` descriptor
+    /// shows (`ProcfsFile::bind_mapping_subject`).
+    ///
+    /// The opener's thread-group id and thread id are asked of the guest,
+    /// through injected `getpid` and `gettid` that the guest does not see,
+    /// only when metadata is virtualized: the only mode in which a mapping's
+    /// identity is resolved through its subject (`mapping_stat_identity`).
+    /// Both are in the guest's pid namespace, the one its `/proc` spellings
+    /// name, as in `canonicalize_namespace_readlink_result`.
+    pub(crate) async fn bind_procfs_mapping_subject<G: Guest<Self>>(
+        guest: &mut G,
+        procfs: &mut ProcfsFile,
+    ) -> Result<(), Error> {
+        if !procfs.needs_mapping_opener_ids() {
+            return Ok(());
+        }
+        let opener_ids = if guest.config().virtualize_metadata {
+            let tgid = guest.inject(syscalls::Getpid::new()).await? as i32;
+            let tid = guest.inject(syscalls::Gettid::new()).await? as i32;
+            Some((tgid, tid))
+        } else {
+            None
+        };
+        procfs.bind_mapping_subject(guest.thread_state().mm_id, opener_ids);
+        Ok(())
+    }
+
     async fn observe_timer_slack_identity<G: Guest<Self>>(
         &self,
         guest: &mut G,
@@ -1343,9 +1366,9 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// The raw identity `stat` reports for the file a `maps`/`smaps` header
     /// names, which keys that mapping's deterministic inode. `starts` are the
-    /// start addresses of the snapshot's lines with this header, and must be
-    /// empty unless the snapshot shows the reader's own address space
-    /// (`ProcfsFile::mapping_address_space`).
+    /// start addresses of the snapshot's lines with this header, and
+    /// `subject` says whose address space the snapshot shows
+    /// (`ProcfsFile::mapping_subject`).
     ///
     /// The header's own `(device, inode)` pair is NOT always that identity: on
     /// btrfs maps prints the superblock's device and `stat` the subvolume's,
@@ -1359,19 +1382,26 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///    address range (`MemoryMetadata::mapped_file_at`). That record needs
     ///    no path, so it still holds after the file is unlinked or replaced
     ///    and its descriptor closed, when the line reads ` (deleted)`. It is
-    ///    consulted only for a snapshot of the reader's own address space,
-    ///    which Detcore knows only for a file opened through `/proc/self` or
-    ///    `/proc/thread-self` in that same address space.
+    ///    consulted only for a snapshot of the reader's own address space
+    ///    (`MappingSubject::Reader`): a file opened in that same address space
+    ///    through `/proc/self`, `/proc/thread-self`, or the opener's own
+    ///    thread-group id or thread id (`ProcfsFile::bind_mapping_subject`).
     /// 2. Otherwise the pathname is resolved in the guest. This covers the
     ///    executable and the ELF interpreter, which `execve` maps without a
     ///    system call Detcore sees, and files mapped through a descriptor
     ///    Detcore does not track, such as one received over `SCM_RIGHTS`.
-    /// 3. Otherwise, for a snapshot of the reader's own address space, the
-    ///    guest `stat`s `/proc/self/exe`. That link names the running
+    /// 3. Otherwise the guest `stat`s the executable link of the process
+    ///    whose address space the snapshot shows: `/proc/self/exe` for the
+    ///    reader's own, `/proc/<pid>/exe` for a task the file names by
+    ///    number (`MappingSubject::Process`), and none when that task is not
+    ///    known. That link names the running
     ///    executable even after it is unlinked or replaced (the line then
     ///    reads ` (deleted)`, or its path names another inode), and `stat`
     ///    follows it to the file, so this covers the executable where step 2
-    ///    cannot. `/proc/<pid>/map_files/<range>` would name every mapped
+    ///    cannot. Linux binds a `maps` file's address space at open, while
+    ///    `/proc/<pid>/exe` is resolved at read time; after that task exits or
+    ///    calls `execve` the snapshot is empty, so no line asks.
+    ///    `/proc/<pid>/map_files/<range>` would name every mapped
     ///    file the same way, but following it needs `CAP_SYS_ADMIN` or
     ///    `CAP_CHECKPOINT_RESTORE` in the initial user namespace
     ///    (`proc_map_files_get_link`), so it is not used.
@@ -1394,7 +1424,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// inode, so the check discards it and the path or the header decides.
     /// ⚠️ A STALE RECORD WITH THE NEW FILE'S INODE NUMBER STILL WINS: the
     /// same inode number on another device passes, because the check cannot
-    /// compare devices when the header's device is not `stat`'s.
+    /// compare devices when the header's device is not `stat`'s. The same
+    /// holds for steps 2 and 3: a path renamed onto, or an executable link
+    /// naming, a file on another device with the header's inode number keys
+    /// the line on that file. No step compares devices, and step 3 does not
+    /// compare the link's text with the header's pathname.
     ///
     /// Falls back to the header's pair -- which IS `stat`'s identity on every
     /// filesystem whose `st_dev` is its superblock device, such as ext4, xfs
@@ -1406,11 +1440,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// inode column then differs from `st_ino` for a file that is absent from
     /// the record, unresolvable by path, and not the reader's own executable:
     /// the ELF interpreter after it is unlinked or replaced, a file mapped
-    /// through an untracked descriptor and then unlinked, or any unlinked file
-    /// in another process's maps, that process's executable included (the
-    /// subject's pid does not reach this function, so `/proc/<pid>/exe` is not
-    /// tried), or in `/proc/<own pid>/maps`, which is not recognized as the
-    /// reader's own. A path that exists also goes unresolved when
+    /// through an untracked descriptor and then unlinked, any unlinked file
+    /// other than the executable in another process's maps (whose records
+    /// Detcore does not consult), and an unlinked executable in maps whose
+    /// process is not known by number (`MappingSubject::Unknown`: a
+    /// `/proc/self/maps` descriptor read in another address space when the
+    /// opener's ids were not asked for). A path that exists also goes unresolved when
     /// `stat_guest_path` cannot map the transient page it falls back to,
     /// which is not always a function of guest state (see there).
     ///
@@ -1433,21 +1468,24 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         key: &crate::procfs::MappingKey,
         starts: &[usize],
+        subject: MappingSubject,
     ) -> Result<RawInode, Error> {
         let header = RawInode::new(key.device, key.inode);
         if !guest.config().virtualize_metadata {
             return Ok(header);
         }
-        let recorded = {
-            let thread = guest.thread_state();
-            starts.iter().find_map(|&start| {
-                thread
-                    .mapped_file_at(start)
-                    .filter(|file| file.ino == key.inode)
-            })
-        };
-        if let Some(file) = recorded {
-            return Ok(file);
+        if subject == MappingSubject::Reader {
+            let recorded = {
+                let thread = guest.thread_state();
+                starts.iter().find_map(|&start| {
+                    thread
+                        .mapped_file_at(start)
+                        .filter(|file| file.ino == key.inode)
+                })
+            };
+            if let Some(file) = recorded {
+                return Ok(file);
+            }
         }
         for candidate in crate::procfs::mapping_path_candidates(&key.pathname) {
             if let Some(stat) = self.stat_guest_path(guest, candidate.as_bytes()).await?
@@ -1456,12 +1494,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(RawInode::new(stat.st_dev, stat.st_ino));
             }
         }
-        // Step 3. `starts` is non-empty only for a snapshot of the reader's
-        // own address space (`GuestMappingMinter::stat_identity`), whose
-        // process is the one `/proc/self` names in the guest's `fstatat`.
-        if !starts.is_empty()
-            && key.pathname.starts_with('/')
-            && let Some(stat) = self.stat_guest_path(guest, b"/proc/self/exe").await?
+        // Step 3: the executable link of the subject's process, resolved by
+        // the guest's `fstatat`, so `/proc/self` is the reader.
+        let executable_link = match subject {
+            MappingSubject::Reader => Some(b"/proc/self/exe".to_vec()),
+            MappingSubject::Process(pid) => Some(format!("/proc/{pid}/exe").into_bytes()),
+            MappingSubject::Unknown => None,
+        };
+        if key.pathname.starts_with('/')
+            && let Some(link) = executable_link
+            && let Some(stat) = self.stat_guest_path(guest, &link).await?
             && stat.st_ino == key.inode
         {
             return Ok(RawInode::new(stat.st_dev, stat.st_ino));
@@ -2032,7 +2074,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     // A `/proc/self/maps` descriptor shows the opener's address
                     // space even when a forked child reads it, or the opener
                     // after an `execve`.
-                    procfs.bind_mapping_address_space(guest.thread_state().mm_id);
+                    Self::bind_procfs_mapping_subject(guest, procfs).await?;
                 }
                 if procfs
                     .as_ref()
@@ -2747,12 +2789,12 @@ impl<T: RecordOrReplay> Detcore<T> {
                 }
             }
             // The reader's mapping records describe this snapshot only when it
-            // shows the reader's own address space; `GuestMappingMinter` passes
-            // the line start addresses on to its record lookup only then.
-            let readers_address_space = guest
+            // shows the reader's own address space, and the executable link
+            // `GuestMappingMinter` falls back to is the subject's.
+            let reader_mm = guest.thread_state().mm_id;
+            let subject = guest
                 .thread_state()
-                .with_detfd(call.fd(), |detfd| detfd.procfs_mapping_address_space())?
-                == Some(guest.thread_state().mm_id);
+                .with_detfd(call.fd(), |detfd| detfd.procfs_mapping_subject(reader_mm))?;
             // The minting loop lives in `crate::procfs::mint_mapping_identities`
             // so the unit tests drive the same code: it mints in maps-TEXT
             // order, never in host raw-number order, because a file first
@@ -2765,7 +2807,7 @@ impl<T: RecordOrReplay> Detcore<T> {
             crate::procfs::mint_mapping_identities(
                 &contents,
                 &stdio_by_raw_file,
-                &mut GuestMappingMinter::new(self, guest, readers_address_space),
+                &mut GuestMappingMinter::new(self, guest, subject),
             )
             .await?
         } else {
@@ -7186,7 +7228,7 @@ mod procfs_wiring_guard {
         // The keying commit's first draft: a local loop over the keys in
         // sorted order, resolving each one itself.
         let local_order = "for (key, starts) in crate::procfs::mapping_keys(&contents) {\n\
-                           let raw_file = self.mapping_stat_identity(guest, &key, &starts).await?;";
+                           let raw_file = self.mapping_stat_identity(guest, &key, &starts, subject).await?;";
         assert_eq!(
             maps_minting_wiring_violations(local_order),
             [NO_CALL, LOCAL_PARSE]
@@ -7196,13 +7238,13 @@ mod procfs_wiring_guard {
         let valid_call = "crate::procfs::mint_mapping_identities(\n\
                           &contents,\n\
                           &stdio_by_raw_file,\n\
-                          &mut GuestMappingMinter::new(self, guest, readers_address_space),\n\
+                          &mut GuestMappingMinter::new(self, guest, subject),\n\
                           )";
         for local_parse in [
             "let keys = crate::procfs::mapping_keys_in_text_order(&contents);",
             "let key = crate::procfs::mapping_header_key(line);",
             "let pair = crate::procfs::mapping_header_identity(line);",
-            "let raw_file = self.mapping_stat_identity(guest, &key, &starts).await?;",
+            "let raw_file = self.mapping_stat_identity(guest, &key, &starts, subject).await?;",
         ] {
             assert_eq!(
                 maps_minting_wiring_violations(&format!("{local_parse}\n{valid_call}")),
@@ -7213,13 +7255,13 @@ mod procfs_wiring_guard {
         let other_buffer = "crate::procfs::mint_mapping_identities(\n\
                             &resorted,\n\
                             &stdio_by_raw_file,\n\
-                            &mut GuestMappingMinter::new(self, guest, readers_address_space),\n\
+                            &mut GuestMappingMinter::new(self, guest, subject),\n\
                             )";
         assert_eq!(maps_minting_wiring_violations(other_buffer), [NOT_CONTENTS]);
         let no_stdio = "crate::procfs::mint_mapping_identities(\n\
                         &contents,\n\
                         &BTreeMap::new(),\n\
-                        &mut GuestMappingMinter::new(self, guest, readers_address_space),\n\
+                        &mut GuestMappingMinter::new(self, guest, subject),\n\
                         )";
         assert_eq!(maps_minting_wiring_violations(no_stdio), [NO_STDIO]);
         // A stdio map keyed on the raw inode alone, as before
@@ -7227,7 +7269,7 @@ mod procfs_wiring_guard {
         let inode_keyed_stdio = "crate::procfs::mint_mapping_identities(\n\
                                  &contents,\n\
                                  &stdio_by_raw_inode,\n\
-                                 &mut GuestMappingMinter::new(self, guest, readers_address_space),\n\
+                                 &mut GuestMappingMinter::new(self, guest, subject),\n\
                                  )";
         assert_eq!(
             maps_minting_wiring_violations(inode_keyed_stdio),
@@ -8446,6 +8488,9 @@ pub(crate) mod inject_fstat_scratch {
                     self.closed.push(call.fd());
                     i64::from(unsafe { libc::close(call.fd()) })
                 }
+                // The test process stands in for the guest's thread.
+                Syscall::Getpid(_) => i64::from(unsafe { libc::getpid() }),
+                Syscall::Gettid(_) => unsafe { libc::syscall(libc::SYS_gettid) },
                 other => panic!("unexpected injected syscall {other:?}"),
             };
             Errno::result(raw)
@@ -9524,7 +9569,7 @@ pub(crate) mod inject_fstat_scratch {
         guest.thread.map_file(RECORDED_START, page_size(), stale);
 
         let result = tool
-            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START])
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
             .await;
 
         assert_eq!(
@@ -9549,7 +9594,7 @@ pub(crate) mod inject_fstat_scratch {
         guest.thread.map_file(RECORDED_START, page_size(), recorded);
 
         let result = tool
-            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START])
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
             .await;
 
         assert_eq!(result.expect("mapping_stat_identity failed"), recorded);
@@ -9575,17 +9620,19 @@ pub(crate) mod inject_fstat_scratch {
         let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
 
         let own = tool
-            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START])
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Reader)
             .await;
         assert_eq!(own.expect("mapping_stat_identity failed"), identity);
         assert_eq!(guest.injected, [Sysno::newfstatat]);
         assert_eq!(guest.fstatat_paths, [b"/proc/self/exe".to_vec()]);
 
-        let other = tool.mapping_stat_identity(&mut guest, &key, &[]).await;
+        let other = tool
+            .mapping_stat_identity(&mut guest, &key, &[RECORDED_START], MappingSubject::Unknown)
+            .await;
         assert_eq!(
             other.expect("mapping_stat_identity failed"),
             RawInode::new(HEADER_DEVICE, identity.ino),
-            "another address space's line must not borrow the reader's executable"
+            "an unknown address space's line must not borrow the reader's executable"
         );
         assert_eq!(guest.injected, [Sysno::newfstatat], "no second stat");
     }
@@ -9603,7 +9650,7 @@ pub(crate) mod inject_fstat_scratch {
         let recorded = RawInode::new(RECORD_DEVICE, identity.ino);
         guest.thread.map_file(RECORDED_START, page_size(), recorded);
 
-        let own = GuestMappingMinter::new(&tool, &mut guest, true)
+        let own = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Reader)
             .stat_identity(&key, &[RECORDED_START])
             .await;
         assert_eq!(
@@ -9613,7 +9660,7 @@ pub(crate) mod inject_fstat_scratch {
         );
         assert!(guest.injected.is_empty(), "injected {:?}", guest.injected);
 
-        let other = GuestMappingMinter::new(&tool, &mut guest, false)
+        let other = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Unknown)
             .stat_identity(&key, &[RECORDED_START])
             .await;
         assert_eq!(
@@ -9623,6 +9670,170 @@ pub(crate) mod inject_fstat_scratch {
         );
         assert_eq!(guest.injected, [Sysno::newfstatat]);
         assert_eq!(guest.fstatat_paths, [key.pathname.as_bytes().to_vec()]);
+
+        let numbered = GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Process(1))
+            .stat_identity(&key, &[RECORDED_START])
+            .await;
+        assert_eq!(
+            numbered.expect("stat_identity failed for a numbered address space"),
+            identity,
+            "a numbered task's line must be keyed on the path's stat, not the reader's record"
+        );
+        assert_eq!(guest.injected, [Sysno::newfstatat, Sysno::newfstatat]);
+    }
+
+    /// A running process other than the test's, whose executable stands in
+    /// for another guest process's. Killed and reaped on drop.
+    struct OtherProcess(std::process::Child);
+
+    impl OtherProcess {
+        fn spawn() -> Self {
+            Self(
+                std::process::Command::new("sleep")
+                    .arg("600")
+                    .spawn()
+                    .expect("cannot spawn sleep"),
+            )
+        }
+
+        fn pid(&self) -> i32 {
+            i32::try_from(self.0.id()).unwrap()
+        }
+
+        /// The raw identity of its executable, as `stat` of
+        /// `/proc/<pid>/exe` reports it.
+        fn executable(&self) -> RawInode {
+            let exe = std::fs::metadata(format!("/proc/{}/exe", self.pid())).unwrap();
+            RawInode::new(exe.dev(), exe.ino())
+        }
+    }
+
+    impl Drop for OtherProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    // Step 3 for a task the maps file names by number: its executable after
+    // it was unlinked -- ` (deleted)`, so no path candidate -- is keyed on the
+    // guest's `stat` of `/proc/<pid>/exe`, not on the header's device. Before
+    // https://github.com/rrnewton/hermit/pull/3255's fifth round no number
+    // reached this function, and the header decided.
+    #[tokio::test]
+    async fn mapping_stat_identity_keys_a_numbered_tasks_deleted_executable_on_its_exe_link() {
+        let other = OtherProcess::spawn();
+        let identity = other.executable();
+        assert_ne!(identity.dev, HEADER_DEVICE);
+        let key = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: identity.ino,
+            pathname: "/usr/bin/replaced-sleep (deleted)".to_owned(),
+        };
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+
+        let numbered = tool
+            .mapping_stat_identity(
+                &mut guest,
+                &key,
+                &[RECORDED_START],
+                MappingSubject::Process(other.pid()),
+            )
+            .await;
+        assert_eq!(
+            numbered.expect("mapping_stat_identity failed"),
+            identity,
+            "another task's deleted executable must be keyed on its /proc/<pid>/exe"
+        );
+        assert_eq!(guest.injected, [Sysno::newfstatat]);
+        assert_eq!(
+            guest.fstatat_paths,
+            [format!("/proc/{}/exe", other.pid()).into_bytes()]
+        );
+    }
+
+    // Through the numeric spelling's classification at open time, with the
+    // opener's ids from the guest's injected `getpid` and `gettid`: the
+    // reader's own thread-group id or thread id binds its own address space,
+    // whose record keys a deleted file; another task's number keys that task's
+    // deleted executable on its exe link and never consults the reader's
+    // record.
+    #[tokio::test]
+    async fn numeric_maps_spellings_resolve_through_the_task_they_name() {
+        use crate::procfs::MappingIdentityMinter;
+
+        let own_tgid = i32::try_from(std::process::id()).unwrap();
+        // SAFETY: gettid has no preconditions.
+        let own_tid = i32::try_from(unsafe { libc::syscall(libc::SYS_gettid) }).unwrap();
+        let other = OtherProcess::spawn();
+        let other_executable = other.executable();
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+        let reader_mm = guest.thread.mm_id;
+
+        // A file the reader mapped and then unlinked: only its record names it.
+        let (_file, identity, mut key) = mapped_path();
+        key.pathname.push_str(" (deleted)");
+        let recorded = RawInode::new(RECORD_DEVICE, identity.ino);
+        guest.thread.map_file(RECORDED_START, page_size(), recorded);
+
+        for own in [own_tgid, own_tid] {
+            let path = format!("/proc/{own}/maps");
+            let mut file = ProcfsFile::from_path(Path::new(&path)).unwrap();
+            guest.injected.clear();
+            Detcore::bind_procfs_mapping_subject(&mut guest, &mut file)
+                .await
+                .expect("binding failed");
+            assert_eq!(guest.injected, [Sysno::getpid, Sysno::gettid], "{path}");
+            let subject = file.mapping_subject(reader_mm);
+            assert_eq!(subject, MappingSubject::Reader, "{path}");
+            guest.injected.clear();
+            let resolved = GuestMappingMinter::new(&tool, &mut guest, subject)
+                .stat_identity(&key, &[RECORDED_START])
+                .await;
+            assert_eq!(
+                resolved.expect("stat_identity failed"),
+                recorded,
+                "{path}: the reader's own deleted file must be keyed on its record"
+            );
+            assert!(guest.injected.is_empty(), "{path}: {:?}", guest.injected);
+        }
+
+        let path = format!("/proc/{}/maps", other.pid());
+        let mut file = ProcfsFile::from_path(Path::new(&path)).unwrap();
+        guest.injected.clear();
+        Detcore::bind_procfs_mapping_subject(&mut guest, &mut file)
+            .await
+            .expect("binding failed");
+        let subject = file.mapping_subject(reader_mm);
+        assert_eq!(subject, MappingSubject::Process(other.pid()), "{path}");
+        let other_key = crate::procfs::MappingKey {
+            device: HEADER_DEVICE,
+            inode: other_executable.ino,
+            pathname: "/usr/bin/replaced-sleep (deleted)".to_owned(),
+        };
+        // The reader's record at the same address has the same inode number
+        // and must not be used for another task's line.
+        guest.thread.map_file(
+            RECORDED_START,
+            page_size(),
+            RawInode::new(RECORD_DEVICE, other_executable.ino),
+        );
+        guest.injected.clear();
+        guest.fstatat_paths.clear();
+        let resolved = GuestMappingMinter::new(&tool, &mut guest, subject)
+            .stat_identity(&other_key, &[RECORDED_START])
+            .await;
+        assert_eq!(
+            resolved.expect("stat_identity failed"),
+            other_executable,
+            "{path}: another task's deleted executable must be keyed on its exe link"
+        );
+        assert_eq!(
+            guest.fstatat_paths,
+            [format!("/proc/{}/exe", other.pid()).into_bytes()]
+        );
     }
 }
 

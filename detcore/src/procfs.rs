@@ -352,12 +352,37 @@ pub(crate) struct ProcfsFile {
     /// task that opened it.
     #[serde(default)]
     shows_opener_address_space: bool,
-    /// The opener's address space, bound at open time when
-    /// `shows_opener_address_space` holds. See `mapping_address_space`.
+    /// The number a `maps`/`smaps` file was spelled with: `N` in
+    /// `/proc/N/maps`, `/proc/N/smaps` and `/proc/N/task/T/maps`, a pid or tid
+    /// in the guest's pid namespace.
+    #[serde(default)]
+    numeric_mapping_subject: Option<i32>,
+    /// The opener's address space, bound at open time when the file shows it.
+    /// See `bind_mapping_subject` and `mapping_subject`.
     #[serde(default)]
     mapping_address_space: Option<MmId>,
+    /// The pid or tid, in the guest's pid namespace, of the task whose address
+    /// space this file shows, bound at open time. See `mapping_subject`.
+    #[serde(default)]
+    mapping_subject_pid: Option<i32>,
     contents: Option<Vec<u8>>,
     offset: usize,
+}
+
+/// Whose address space a `maps`/`smaps` snapshot shows, as far as its reader
+/// can tell (`ProcfsFile::mapping_subject`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MappingSubject {
+    /// The reader's own address space. The reader's mapping records
+    /// (`MemoryMetadata::mapped_file_at`) describe the snapshot, and
+    /// `/proc/self/exe` names the executable it shows.
+    Reader,
+    /// Another address space, of the task with this pid or tid in the guest's
+    /// pid namespace: `/proc/<pid>/exe` names the executable it shows, while
+    /// that task lives and has not called `execve`.
+    Process(i32),
+    /// Another address space, of a task not known by number.
+    Unknown,
 }
 
 /// A non-mutating candidate for one sequential timer-slack read.
@@ -866,18 +891,28 @@ impl ProcfsFile {
             _ if is_irq_per_cpu_count_path(&path) => ProcfsKind::IrqPerCpuCount,
             _ => sysfs_rtc_kind(&path)?,
         };
-        let shows_opener_address_space = matches!(kind, ProcfsKind::Maps | ProcfsKind::Smaps)
-            && path_text
+        let mapping_task = if matches!(kind, ProcfsKind::Maps | ProcfsKind::Smaps) {
+            path_text
                 .strip_prefix("/proc/")
                 .and_then(|relative| relative.split('/').next())
-                .is_some_and(|task| matches!(task, "self" | "thread-self"));
+        } else {
+            None
+        };
+        let shows_opener_address_space =
+            mapping_task.is_some_and(|task| matches!(task, "self" | "thread-self"));
+        let numeric_mapping_subject = mapping_task
+            .filter(|task| is_numeric_id(task))
+            .and_then(|task| task.parse::<i32>().ok())
+            .filter(|subject| *subject > 0);
         Some(Self {
             kind,
             target_fd,
             bound_thread_identity: None,
             timer_slack_identity: None,
             shows_opener_address_space,
+            numeric_mapping_subject,
             mapping_address_space: None,
+            mapping_subject_pid: None,
             contents: None,
             offset: 0,
         })
@@ -899,30 +934,58 @@ impl ProcfsFile {
         )
     }
 
-    /// Records the address space of the task opening this file. Only a
-    /// `maps`/`smaps` file spelled through `/proc/self` or `/proc/thread-self`
-    /// keeps it; any other spelling, including the opener's own numeric
-    /// `/proc/<pid>`, is left unbound.
-    pub(crate) fn bind_mapping_address_space(&mut self, mm: MmId) {
+    /// Whether binding this file's subject (`bind_mapping_subject`) needs the
+    /// opener's thread-group id and thread id: true for every `maps`/`smaps`
+    /// file, whose subject is the opener or a task named by number.
+    pub(crate) fn needs_mapping_opener_ids(&self) -> bool {
+        self.shows_opener_address_space || self.numeric_mapping_subject.is_some()
+    }
+
+    /// Records, at open time, whose address space this `maps`/`smaps` file
+    /// shows, as Linux binds it then (`proc_mem_open`); other kinds ignore it.
+    ///
+    /// `opener_mm` is the opening task's address space and `opener_ids` its
+    /// thread-group id and thread id as the guest's own `getpid` and `gettid`
+    /// report them, or `None` when they were not asked for.
+    ///
+    /// A file spelled through `/proc/self` or `/proc/thread-self`, or through
+    /// the opener's own thread-group id or thread id, shows the opener's
+    /// address space. A file spelled with another number shows that task's,
+    /// which may share the opener's address space -- a sibling thread's tid,
+    /// or a `CLONE_VM` child -- but is not recognized as doing so.
+    pub(crate) fn bind_mapping_subject(&mut self, opener_mm: MmId, opener_ids: Option<(i32, i32)>) {
         if self.shows_opener_address_space {
-            self.mapping_address_space = Some(mm);
+            self.mapping_address_space = Some(opener_mm);
+            self.mapping_subject_pid = opener_ids.map(|(tgid, _)| tgid);
+        } else if let Some(subject) = self.numeric_mapping_subject {
+            if opener_ids.is_some_and(|(tgid, tid)| subject == tgid || subject == tid) {
+                self.mapping_address_space = Some(opener_mm);
+            }
+            self.mapping_subject_pid = Some(subject);
         }
     }
 
-    /// The address space this `maps`/`smaps` file is known to show, if any.
+    /// Whose address space this `maps`/`smaps` file shows to a reader whose
+    /// address space is `reader_mm`.
     ///
     /// A mapping's recorded file (`MemoryMetadata::mapped_file_at`) belongs to
     /// ONE address space, and the reader's record describes the snapshot only
-    /// when this is the reader's address space. It is not in general: the
-    /// kind matches `/proc/<any pid>/maps`, a descriptor opened through
-    /// `/proc/self` still shows the opener after a `fork` hands it to the
-    /// child, and an `execve` replaces the opener's address space. Without
-    /// this check another file with the same inode number at the same address
-    /// in the reader -- for example a file of another btrfs subvolume, whose
-    /// inode numbers repeat, in a guest without address randomization --
+    /// when the file shows the reader's address space. It does not in
+    /// general: the kind matches `/proc/<any pid>/maps`, a descriptor opened
+    /// through `/proc/self` still shows the opener after a `fork` hands it to
+    /// the child, and an `execve` replaces the opener's address space.
+    /// Without this check another file with the same inode number at the same
+    /// address in the reader -- for example a file of another btrfs subvolume,
+    /// whose inode numbers repeat, in a guest without address randomization --
     /// would key the line on the wrong file.
-    pub(crate) fn mapping_address_space(&self) -> Option<MmId> {
-        self.mapping_address_space
+    pub(crate) fn mapping_subject(&self, reader_mm: MmId) -> MappingSubject {
+        if self.mapping_address_space == Some(reader_mm) {
+            MappingSubject::Reader
+        } else if let Some(pid) = self.mapping_subject_pid {
+            MappingSubject::Process(pid)
+        } else {
+            MappingSubject::Unknown
+        }
     }
 
     pub(crate) fn needs_mountinfo_identities(&self) -> bool {
@@ -4897,40 +4960,99 @@ not-a-range r--p 00000000 00:20 259 /d/z\n" as &[u8];
         );
     }
 
-    /// A maps file spelled through `/proc/self` or `/proc/thread-self` shows
-    /// its opener's address space and keeps the one bound at open time; every
-    /// other spelling stays unbound, so the reader's mapping records are never
-    /// consulted for it (see `mapping_address_space`).
+    /// A maps file spelled through `/proc/self` or `/proc/thread-self`, or
+    /// through the opener's own thread-group id or thread id, shows its
+    /// opener's address space and keeps the one bound at open time, so only
+    /// the opener's reads are the reader's own (see `mapping_subject`). A
+    /// file spelled with another number shows that task, named by number.
     #[test]
-    fn only_self_spelled_maps_bind_the_openers_address_space() {
-        let opener = MmId::initial(crate::types::DetTid::from_raw(7));
+    fn maps_bind_the_subject_their_spelling_names_at_open() {
+        use crate::types::DetTid;
+
+        const TGID: i32 = 7;
+        const TID: i32 = 9;
+        let opener = MmId::initial(DetTid::from_raw(TGID));
+        let other = MmId::initial(DetTid::from_raw(70));
+        let bound = |path: &str, ids: Option<(i32, i32)>| {
+            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
+            assert!(file.needs_mapping_identities(), "{path}");
+            assert!(file.needs_mapping_opener_ids(), "{path}");
+            assert_eq!(
+                file.mapping_subject(opener),
+                MappingSubject::Unknown,
+                "{path}: unbound"
+            );
+            file.bind_mapping_subject(opener, ids);
+            file
+        };
         for path in [
             "/proc/self/maps",
             "/proc/thread-self/maps",
             "/proc/self/task/8/maps",
             "/proc/self/smaps",
             "/proc/./self/maps",
+            // The opener's own numbers, as its getpid and gettid report them.
+            "/proc/7/maps",
+            "/proc/7/smaps",
+            "/proc/7/task/9/maps",
+            "/proc/9/maps",
         ] {
-            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
-            assert!(file.needs_mapping_identities(), "{path}");
-            assert_eq!(file.mapping_address_space(), None, "{path}");
-            file.bind_mapping_address_space(opener);
-            assert_eq!(file.mapping_address_space(), Some(opener), "{path}");
+            let file = bound(path, Some((TGID, TID)));
+            assert_eq!(
+                file.mapping_subject(opener),
+                MappingSubject::Reader,
+                "{path}"
+            );
+            let expected_elsewhere = if path.starts_with("/proc/9/") {
+                MappingSubject::Process(TID)
+            } else {
+                MappingSubject::Process(TGID)
+            };
+            assert_eq!(
+                file.mapping_subject(other),
+                expected_elsewhere,
+                "{path}: read in another address space, as by a forked child"
+            );
         }
-        for path in ["/proc/7/maps", "/proc/7/task/8/maps", "/proc/7/smaps"] {
-            let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
-            assert!(file.needs_mapping_identities(), "{path}");
-            file.bind_mapping_address_space(opener);
-            assert_eq!(file.mapping_address_space(), None, "{path}");
+        // Without the opener's numbers a self spelling still shows the
+        // opener, whose process is then not known by number.
+        let file = bound("/proc/self/maps", None);
+        assert_eq!(file.mapping_subject(opener), MappingSubject::Reader);
+        assert_eq!(file.mapping_subject(other), MappingSubject::Unknown);
+        // Another task's number never shows the reader's records, even when
+        // read in the opener's address space.
+        for (path, subject) in [
+            ("/proc/12/maps", 12),
+            ("/proc/12/smaps", 12),
+            ("/proc/12/task/13/maps", 12),
+            ("/proc/8/maps", 8),
+        ] {
+            for ids in [Some((TGID, TID)), None] {
+                let file = bound(path, ids);
+                assert_eq!(
+                    file.mapping_subject(opener),
+                    MappingSubject::Process(subject),
+                    "{path} {ids:?}"
+                );
+            }
         }
+        // The opener's own number is recognized only from its ids.
+        let file = bound("/proc/7/maps", None);
+        assert_eq!(file.mapping_subject(opener), MappingSubject::Process(TGID));
         for path in [
             "/proc/self/stat",
             "/proc/self/smaps_rollup",
             "/proc/self/numa_maps",
+            "/proc/7/stat",
         ] {
             let mut file = ProcfsFile::from_path(Path::new(path)).unwrap();
-            file.bind_mapping_address_space(opener);
-            assert_eq!(file.mapping_address_space(), None, "{path}");
+            assert!(!file.needs_mapping_opener_ids(), "{path}");
+            file.bind_mapping_subject(opener, Some((TGID, TID)));
+            assert_eq!(
+                file.mapping_subject(opener),
+                MappingSubject::Unknown,
+                "{path}"
+            );
         }
     }
 
