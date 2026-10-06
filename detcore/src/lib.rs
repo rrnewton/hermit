@@ -187,6 +187,11 @@ impl std::error::Error for UnsupportedSyscallError {}
 /// guest as an errno sets the Config's
 /// `exit_process_on_identity_lookup_refusal`, and Detcore ends the process
 /// itself.
+///
+/// On the other backends Detcore's dispatcher returns the refusal as the
+/// call's result before any observer or post-hook of that call runs, so no
+/// later error can take its place and no other thread is given a turn
+/// before the backend acts on it.
 #[derive(Debug)]
 pub struct IdentityLookupRefused(pub String);
 
@@ -3139,6 +3144,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
         // tool error to the guest as an errno.
         if let Some(refused) = refusal_to_exit_on(&self.cfg, &res) {
             exit_refusing_process(refused);
+        }
+        // On every other backend the refusal is this call's result, and it
+        // leaves here as it is, like a copy failure above: an observer below
+        // could fail and put its own error in the refusal's place, which DBT
+        // would give the guest as an errno and let it run on, and the
+        // post-hook could end the timeslice and hand the turn to another
+        // thread before the backend stops the refusing process.
+        if res
+            .as_ref()
+            .err()
+            .and_then(IdentityLookupRefused::carried_by)
+            .is_some()
+        {
+            return res;
         }
 
         detlog!(
