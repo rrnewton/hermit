@@ -3270,19 +3270,17 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // here: Detcore installs the backend's process signal control when the
     // backend offers it and threads are sequentialized, and reads the installed
     // control from then on.
-    // Only ptrace and LiteInst have been measured to report a thread's signal state
-    // in /proc (https://github.com/rrnewton/hermit/issues/3146). Every other backend
-    // keeps the previous blocking-wait behavior. Both hand a restart errno to the
-    // kernel's signal delivery, which turns it into `EINTR` or a restart as Linux
-    // does. Ptrace does so at the syscall stop. LiteInst does so at a call site's
-    // first execution, which stops in ptrace, and at a site it has patched, where
-    // reverie rewinds the guest to the runtime's trap instruction and lets the
-    // kernel decide at a landing in the runtime's private page
-    // (https://github.com/rrnewton/reverie/commit/6c920de24642ffe921c507704748012001f23c0a).
-    // `reverie::BackendCapabilities` has no field for this fact yet, so it is set
-    // here from the backend's name.
-    config.backend_supports_blocked_wait_signal_interruption =
-        matches!(backend, Backend::Ptrace | Backend::Liteinst);
+    // Only ptrace has been measured to report a thread's signal state in /proc
+    // (https://github.com/rrnewton/hermit/issues/3146). It hands a restart errno
+    // to the kernel's signal delivery at the syscall stop, which turns it into
+    // `EINTR` or a restart as Linux does. Every other backend keeps the previous
+    // blocking-wait behavior. That includes LiteInst, which now runs only
+    // in-guest: it has no ptrace stop at which the kernel turns a restart errno
+    // such as ERESTARTNOHAND into `EINTR` or a restart, so the value could
+    // reach guest code. `reverie::BackendCapabilities` has no field for this
+    // fact yet, and no combination of its fields selects ptrace alone (its
+    // `E9PATCH` constant is `PTRACE`), so it is set here from the backend's name.
+    config.backend_supports_blocked_wait_signal_interruption = backend == Backend::Ptrace;
     config
 }
 
@@ -6073,7 +6071,7 @@ mod tests {
             (Backend::Dbt, false),
             (Backend::Kvm, false),
             (Backend::Sabre, false),
-            (Backend::Liteinst, true),
+            (Backend::Liteinst, false),
             (Backend::E9patch, false),
         ] {
             let config = prepare_backend_config(super::DetConfig::default(), backend);
