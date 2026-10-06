@@ -1338,6 +1338,25 @@ fn parse_timer_slack_target(path: &str) -> Option<Option<i32>> {
     Some(Some(target))
 }
 
+/// The inode number on the `ino:` line of `/proc/<pid>/fdinfo/<fd>` bytes, or
+/// `None` unless there is exactly one such line holding only decimal digits.
+pub(crate) fn parse_fdinfo_inode(contents: &[u8]) -> Option<u64> {
+    let mut inode = None;
+    for line in contents.split(|byte| *byte == b'\n') {
+        let Some(value) = line.strip_prefix(b"ino:") else {
+            continue;
+        };
+        let value = value
+            .strip_prefix(b"\t")
+            .or_else(|| value.strip_prefix(b" "))?;
+        if value.is_empty() || value.iter().any(|byte| !byte.is_ascii_digit()) || inode.is_some() {
+            return None;
+        }
+        inode = Some(std::str::from_utf8(value).ok()?.parse().ok()?);
+    }
+    inode
+}
+
 fn parse_fdinfo_target(path: &str) -> Option<i32> {
     let relative = path.strip_prefix("/proc/")?;
     let components = relative.split('/').collect::<Vec<_>>();
@@ -4300,6 +4319,23 @@ fn sanitize_btrfs_commit_stats(contents: &[u8]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fdinfo_inode_needs_exactly_one_numeric_ino_line() {
+        assert_eq!(
+            parse_fdinfo_inode(b"pos:\t0\nflags:\t02\nmnt_id:\t15\nino:\t4026\n"),
+            Some(4026)
+        );
+        assert_eq!(parse_fdinfo_inode(b"pos:\t0\nino: 7"), Some(7));
+        assert_eq!(
+            parse_fdinfo_inode(b"pos:\t0\nflags:\t02\nmnt_id:\t15\n"),
+            None
+        );
+        assert_eq!(parse_fdinfo_inode(b"ino:\t1\nino:\t2\n"), None);
+        assert_eq!(parse_fdinfo_inode(b"ino:\t12a\n"), None);
+        assert_eq!(parse_fdinfo_inode(b"ino:\t\n"), None);
+        assert_eq!(parse_fdinfo_inode(b"ino:12\n"), None);
+    }
 
     #[test]
     fn recognizes_only_normalized_procfs_paths() {
