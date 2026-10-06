@@ -1193,6 +1193,15 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// number on two filesystems still names two files
     /// (<https://github.com/rrnewton/hermit/issues/3307>).
     ///
+    /// In that mode the pipe's or socket's inode comes from the `ino:` line
+    /// of `contents`, the fdinfo bytes being sanitized, and the descriptor's
+    /// `fstat` decides only its file type. At replay those bytes are the
+    /// recording's (ReadV2 supplies them), as is the link's `pipe:[N]`, while
+    /// the replayer's recreated pipe has an inode of its own; keying on the
+    /// live inode made the two views name two inodes whenever those numbers
+    /// differed. When `contents` has no single well-formed `ino:` line (a
+    /// kernel older than the field), the `fstat` inode is used, as before.
+    ///
     /// ⚠️ THE FILE TYPE ALONE DECIDES. A named FIFO, or a socket file reached
     /// through an `O_PATH` descriptor, is keyed on device 0 as well, although
     /// its link names a path. Its inode can then share a deterministic inode
@@ -1203,6 +1212,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         target_fd: i32,
         cached_stat: Option<crate::stat::DetStat>,
+        contents: &[u8],
     ) -> Result<RawInode, Error> {
         let (mode, raw) = match cached_stat {
             Some(stat) => (stat.mode, stat.raw_inode()),
@@ -1213,7 +1223,8 @@ impl<T: RecordOrReplay> Detcore<T> {
         };
         let pipe_or_socket = matches!(mode & libc::S_IFMT, libc::S_IFIFO | libc::S_IFSOCK);
         Ok(if pipe_or_socket && !guest.config().virtualize_metadata {
-            RawInode::new(0, raw.ino)
+            let inode = crate::procfs::parse_fdinfo_inode(contents).unwrap_or(raw.ino);
+            RawInode::new(0, inode)
         } else {
             raw
         })
@@ -2649,7 +2660,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     )
                 })?;
             let raw_inode = self
-                .fdinfo_raw_file_id(guest, target_fd, cached_stat)
+                .fdinfo_raw_file_id(guest, target_fd, cached_stat, &contents)
                 .await?;
             let virtual_inode = match inode_override {
                 Some(inode) => inode,
