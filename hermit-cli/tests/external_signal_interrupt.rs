@@ -801,10 +801,14 @@ fn assert_role_cell(
 
 /// Fix A: a polling-mode futex wait must observe a signal that Hermit did not
 /// send. Before the fix the retry loop never looked for one and spun until the
-/// watchdog fired. Each backend is its own test so that each stays inside the
-/// per-test wall and CPU bounds.
-fn assert_polling_futex_wait_observes_external_signal(backend: &str) {
-    for trial in 0..EXTERNAL_TRIALS {
+/// watchdog fired. Each backend runs `EXTERNAL_TRIALS` trials, split into two
+/// tests of half as many each (`trials`) so that each test stays inside the
+/// per-test wall and CPU bounds with room to spare.
+fn assert_polling_futex_wait_observes_external_signal(
+    backend: &str,
+    trials: std::ops::Range<usize>,
+) {
+    for trial in trials {
         let run = run_cell(backend, FutexMode::Polling, &["futex", "external"], true);
         assert!(
             run.status.success() && run.result_line() == Some(EINTR_FUTEX),
@@ -816,12 +820,22 @@ fn assert_polling_futex_wait_observes_external_signal(backend: &str) {
 
 #[test]
 fn ptrace_polling_futex_wait_is_interrupted_by_an_external_signal() {
-    assert_polling_futex_wait_observes_external_signal("ptrace");
+    assert_polling_futex_wait_observes_external_signal("ptrace", FIRST_HALF_OF_EXTERNAL_TRIALS);
+}
+
+#[test]
+fn ptrace_polling_futex_wait_is_interrupted_by_an_external_signal_in_later_trials() {
+    assert_polling_futex_wait_observes_external_signal("ptrace", SECOND_HALF_OF_EXTERNAL_TRIALS);
 }
 
 #[test]
 fn liteinst_polling_futex_wait_is_interrupted_by_an_external_signal() {
-    assert_polling_futex_wait_observes_external_signal("liteinst");
+    assert_polling_futex_wait_observes_external_signal("liteinst", FIRST_HALF_OF_EXTERNAL_TRIALS);
+}
+
+#[test]
+fn liteinst_polling_futex_wait_is_interrupted_by_an_external_signal_in_later_trials() {
+    assert_polling_futex_wait_observes_external_signal("liteinst", SECOND_HALF_OF_EXTERNAL_TRIALS);
 }
 
 /// Fix C: a precise-mode futex waiter woken for a signal must return EINTR, not
