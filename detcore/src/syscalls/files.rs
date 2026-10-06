@@ -44,7 +44,6 @@ use reverie::syscalls::Sysno;
 use reverie::syscalls::Timespec;
 use reverie::syscalls::Whence;
 use reverie::syscalls::family::StatFamily;
-use tracing::debug;
 use tracing::error;
 use tracing::info;
 use tracing::trace;
@@ -4669,8 +4668,10 @@ impl<T: RecordOrReplay> Detcore<T> {
         // all three (see `setup_stdio`) whether or not metadata is
         // virtualized -- so its identity comes from a real `fstat` of the
         // descriptor once the mapping has succeeded, and only under
-        // `virtualize_metadata`. When that `fstat` fails nothing is recorded,
-        // and the maps line resolves its pathname instead.
+        // `virtualize_metadata`. That `fstat` cannot be the descriptor's own
+        // answer -- the mapping just succeeded -- so its failure means Detcore
+        // could not ask: the mapping is undone and the call is refused
+        // (`identity_lookup_refused`) rather than recorded without an identity.
         let mapped_file = if call.flags().contains(MapFlags::MAP_ANONYMOUS) || call.fd() < 0 {
             MappedFileIdentity::None
         } else {
@@ -4697,11 +4698,29 @@ impl<T: RecordOrReplay> Detcore<T> {
                 match self.inject_fstat(guest, fd).await {
                     Ok(stat) => Some(RawInode::new(stat.st_dev, stat.st_ino)),
                     Err(errno) => {
-                        debug!(
-                            "fstat of stdio descriptor {fd} after mapping it failed ({errno}); \
-                             its maps line resolves the pathname instead"
-                        );
-                        None
+                        // The guest will not learn this mapping's address: on
+                        // ptrace the tool error stops the run, and on DBT and
+                        // SaBRe the call fails. Undo it so the address space
+                        // does not keep a mapping nobody recorded.
+                        guest.thread_state().unmap_memory(start, len);
+                        if let Err(unmap_errno) = guest
+                            .inject_with_retry(Syscall::Munmap(
+                                syscalls::Munmap::new()
+                                    .with_addr(Addr::from_raw(start))
+                                    .with_len(len),
+                            ))
+                            .await
+                        {
+                            warn!(
+                                "[detcore] could not undo the mapping of stdio descriptor {fd} \
+                                 at {start:#x}: {unmap_errno}"
+                            );
+                        }
+                        return Err(identity_lookup_refused(
+                            "fstat the stdio descriptor it mapped",
+                            format!("fd {fd}").as_bytes(),
+                            errno,
+                        ));
                     }
                 }
             }
@@ -6842,18 +6861,21 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// the descriptor table, and the injected `fstat` asks it directly. The
     /// getdents handlers call this BEFORE the real system call, so an `fstat`
     /// failure is reported without consuming directory entries, and a
-    /// successful getdents is never turned into an error afterwards. The
-    /// failure is usually one the kernel would also report for the
-    /// descriptor, but not always: when the guest's stack cannot hold the
-    /// `fstat` buffer, `inject_fstat` maps a transient page instead, and that
-    /// `mmap` can fail for a valid descriptor (`ENOMEM` at the guest's
-    /// address-space or mapping-count limit), failing a getdents Linux would
-    /// have completed.
+    /// successful getdents is never turned into an error afterwards.
+    ///
+    /// Only `EBADF` is the descriptor's own answer, one the getdents would
+    /// report too, so it is the call's result. Any other failure means
+    /// Detcore could not ask -- for example `ENOMEM` from the transient page
+    /// `inject_fstat` maps when the guest's stack cannot hold the buffer,
+    /// which can fail for a valid descriptor at the guest's address-space or
+    /// mapping-count limit -- and it is a tool error
+    /// (`identity_lookup_refused`), never an errno the guest would take as
+    /// its getdents' own result.
     async fn directory_device<G: Guest<Self>>(
         &self,
         guest: &mut G,
         fd: RawFd,
-    ) -> Result<u64, Errno> {
+    ) -> Result<u64, Error> {
         let cached = guest
             .thread_state()
             .with_detfd(fd, |detfd| detfd.stat().map(|stat| stat.dev))
@@ -6861,7 +6883,15 @@ impl<T: RecordOrReplay> Detcore<T> {
             .flatten();
         match cached {
             Some(device) => Ok(device),
-            None => Ok(self.inject_fstat(guest, fd).await?.st_dev),
+            None => match self.inject_fstat(guest, fd).await {
+                Ok(stat) => Ok(stat.st_dev),
+                Err(Errno::EBADF) => Err(Error::Errno(Errno::EBADF)),
+                Err(errno) => Err(identity_lookup_refused(
+                    "fstat the directory descriptor",
+                    format!("fd {fd}").as_bytes(),
+                    errno,
+                )),
+            },
         }
     }
 
@@ -10090,24 +10120,82 @@ pub(crate) mod inject_fstat_scratch {
     }
 
     #[tokio::test]
-    async fn handle_mmap_records_nothing_when_a_stdio_fstat_fails() {
+    async fn handle_mmap_refuses_when_it_cannot_ask_a_stdio_identity() {
         // No writable stack scratch and no transient page: the fstat has
-        // nowhere to put its buffer.
+        // nowhere to put its buffer, so Detcore cannot ask the file's identity
+        // after the guest's mapping succeeded.
         let (tool, mut guest) = ScriptedGuest::new(false, true);
         let (fd, _) = stdio_backed_by_a_file(&mut guest);
+        let len = page_size();
 
-        let start = map_and_unmap(&tool, &mut guest, fd).await;
+        let result = tool
+            .handle_mmap(
+                &mut guest,
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(len)
+                    .with_prot(ProtFlags::PROT_READ)
+                    .with_flags(MapFlags::MAP_PRIVATE)
+                    .with_fd(fd)
+                    .with_offset(0),
+            )
+            .await;
         close_unless_detcore_did(&guest, fd);
 
+        assert!(
+            matches!(result, Err(Error::Tool(_))),
+            "an identity Detcore could not ask must be a tool error, not a mapping \
+             recorded without it: {result:?}"
+        );
         assert_eq!(
             guest.injected,
-            [Sysno::mmap, Sysno::mmap],
-            "the file mapping, then the failed transient page for the fstat"
+            [Sysno::mmap, Sysno::mmap, Sysno::munmap],
+            "the file mapping, the failed transient page for the fstat, then the undo \
+             of the file mapping"
+        );
+        let &[(start, mapped_len)] = guest.file_mapped.as_slice() else {
+            panic!("expected one file mapping, got {:?}", guest.file_mapped);
+        };
+        assert_eq!(
+            guest.unmapped,
+            [(start, mapped_len)],
+            "the refused mapping must not stay in the guest's address space"
         );
         assert_eq!(
             guest.thread.mapped_file_at(start),
             None,
-            "a failed fstat must leave the mapping unrecorded, not recorded with the stand-in"
+            "a refused mapping must leave nothing recorded"
+        );
+    }
+
+    #[tokio::test]
+    async fn getdents_device_lookup_refuses_what_it_could_not_ask() {
+        // A descriptor that is not open is the kernel's own answer, which the
+        // getdents would report too.
+        // (-1 rather than a closed number, which a parallel test could reuse.)
+        let (tool, mut guest) = ScriptedGuest::new(true, false);
+        let result: Result<u64, Error> = tool.directory_device(&mut guest, -1).await;
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::EBADF))),
+            "a descriptor that is not open must be EBADF to the guest: {result:?}"
+        );
+
+        // An open descriptor Detcore does not track, with no writable stack
+        // scratch and no transient page: the fstat could not be asked, which
+        // is not an answer the guest's getdents may report as its own.
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = open_file();
+        let result: Result<u64, Error> = tool.directory_device(&mut guest, fd).await;
+        close_unless_detcore_did(&guest, fd);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "only the failed transient page for the fstat"
+        );
+        assert!(
+            matches!(result, Err(Error::Tool(_))),
+            "a device lookup Detcore could not ask must be a tool error, not an errno \
+             for the guest's getdents: {result:?}"
         );
     }
 
