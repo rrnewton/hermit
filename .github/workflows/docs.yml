@@ -7,8 +7,15 @@ name: Docs
 
 on:
   # Owner-authorized website refresh only; no automatic PR or main-push tests.
+  #
+  # GitHub runs a schedule as the user who last changed its cron syntax. This
+  # line was added by rrnewton-bots (419e47e6, 2026-09-21), which GitHub
+  # suspended on 2026-10-04, and no scheduled Docs run ever started. "0-6" is
+  # every day, the same schedule as "*", written differently so that the push
+  # carrying it makes the pusher the schedule's actor. If the schedule stops
+  # again, check who last changed this line before anything else.
   schedule:
-    - cron: "23 8 * * *"
+    - cron: "23 8 * * 0-6"
   workflow_dispatch:
     inputs:
       rebuild_compatibility:
