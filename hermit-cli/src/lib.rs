@@ -3522,7 +3522,8 @@ async fn dispatch_backend(
                         }
                     },
                 )
-                .await?;
+                .await
+                .inspect_err(|error| exits.fail_launch(error))?;
             let settled = settle_in_guest_exits(&exits, &global_state).await;
             if settled.is_err() || liteinst_requires_forced_shutdown(exit_status) {
                 global_state.force_shutdown_with_error();
@@ -3814,7 +3815,8 @@ async fn dispatch_output_backend(
                         Ok((output, global_state, None))
                     }
                 })
-                .await?;
+                .await
+                .inspect_err(|error| exits.fail_launch(error))?;
             let settled = settle_in_guest_exits(&exits, &global_state).await;
             let output = Output {
                 status: output.status.into(),
