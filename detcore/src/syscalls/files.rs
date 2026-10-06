@@ -10767,7 +10767,10 @@ pub(crate) mod inject_fstat_scratch {
                 tool.handle_pwrite64(guest, call).await
             }
             "writev" => {
-                let call = syscalls::Writev::new().with_fd(fd).with_iov(iov).with_len(1);
+                let call = syscalls::Writev::new()
+                    .with_fd(fd)
+                    .with_iov(iov)
+                    .with_len(1);
                 tool.handle_writev(guest, call).await
             }
             "pwritev" => {
@@ -10892,7 +10895,10 @@ pub(crate) mod inject_fstat_scratch {
                 guest.config.virtualize_metadata = virtualize_metadata;
                 guest.answers_touch_file = true;
                 let (source, _) = open_file();
-                assert_eq!(unsafe { libc::pwrite(source, b"x".as_ptr().cast(), 1, 0) }, 1);
+                assert_eq!(
+                    unsafe { libc::pwrite(source, b"x".as_ptr().cast(), 1, 0) },
+                    1
+                );
                 // Tracked directly: with no stack scratch, the fstat
                 // `add_fd` injects could not be asked either.
                 let mut source_stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -11176,11 +11182,7 @@ pub(crate) mod inject_fstat_scratch {
 
     /// A live file, its raw identity, and a maps header naming it by path
     /// with its inode and `HEADER_DEVICE`.
-    fn mapped_path() -> (
-        tempfile::NamedTempFile,
-        RawInode,
-        crate::procfs::MappingKey,
-    ) {
+    fn mapped_path() -> (tempfile::NamedTempFile, RawInode, crate::procfs::MappingKey) {
         let file = tempfile::NamedTempFile::new().unwrap();
         let metadata = file.as_file().metadata().unwrap();
         let identity = RawInode::new(metadata.dev(), metadata.ino());
@@ -11318,11 +11320,7 @@ pub(crate) mod inject_fstat_scratch {
         let scratch = Pages::map(1, 1);
         let mut outcomes = Vec::new();
         for (before_6_8, statmount_error, proof) in [
-            (
-                true,
-                None,
-                &[Sysno::mmap, Sysno::statx, Sysno::munmap][..],
-            ),
+            (true, None, &[Sysno::mmap, Sysno::statx, Sysno::munmap][..]),
             (
                 false,
                 Some(Errno::ENOSYS),
@@ -11345,7 +11343,14 @@ pub(crate) mod inject_fstat_scratch {
                 .mapping_stat_identity(&mut guest, &key, &[], MappingSubject::Unknown)
                 .await;
             let reads = MOUNTINFO_READS.with(|reads| reads.get()) - reads;
-            outcomes.push((before_6_8, shares_table, resolved, reads, guest.injected, proof));
+            outcomes.push((
+                before_6_8,
+                shares_table,
+                resolved,
+                reads,
+                guest.injected,
+                proof,
+            ));
         }
         for (before_6_8, shares_table, resolved, reads, injected, proof) in outcomes {
             assert!(
@@ -11892,7 +11897,10 @@ pub(crate) mod inject_fstat_scratch {
 
     fn unmap_file_mappings(guest: &ScriptedGuest) {
         for &(address, len) in &guest.file_mapped {
-            assert_eq!(unsafe { libc::munmap(address as *mut libc::c_void, len) }, 0);
+            assert_eq!(
+                unsafe { libc::munmap(address as *mut libc::c_void, len) },
+                0
+            );
         }
     }
 
@@ -11985,7 +11993,10 @@ pub(crate) mod inject_fstat_scratch {
             "precondition: the call's charge expired the slice"
         );
         assert_eq!(
-            (guest.thread.end_of_timeslice, guest.thread.stats.timeslice_count),
+            (
+                guest.thread.end_of_timeslice,
+                guest.thread.stats.timeslice_count
+            ),
             (Some(slice_end), slices),
             "the refused call must leave the expired slice for the backend's stop"
         );
