@@ -908,7 +908,16 @@ fi
 # recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
 # second budget are unchanged. Source identity carries the calibration;
 # no new timing sample or >=5-sample replacement claim is made.
-expected_pin=5cd0b28a878f41c49fafc69bee740807846e5ffa
+# CARRY TO 0395a68f29dfb5f069b8deeb4ef6adef2327cdba (2026-10-05): from
+# 5cd0b28a878f41c49fafc69bee740807846e5ffa; all seven recorded DynamoRIO build inputs
+# are byte-identical. The two-commit range (1b258366, 0395a68f) changes
+# reverie-ptrace (the Zen SpecLockMap check and PMU validation result) and
+# reverie-liteinst, not reverie-dbt or the DynamoRIO build recipe.
+# The available-CPU cap and f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
+# second budget are unchanged. Source identity carries the calibration;
+# no new timing sample or >=5-sample replacement claim is made.
+expected_pin=0395a68f29dfb5f069b8deeb4ef6adef2327cdba
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #
