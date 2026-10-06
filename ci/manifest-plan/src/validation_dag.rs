@@ -231,7 +231,9 @@ pub const HOSTED_PORTABLE_EXCLUDED_BACKENDS: &[&str] = &["kvm"];
 /// initialization failed: CPUID faulting is unavailable: No such device`, and
 /// the runtime-staging case failed earlier only because the prebuilt tree did
 /// not yet ship the runtime it launches. The five `liteinst_in_guest_verify_`
-/// cases came later and run guests under the same runtime. Only
+/// cases came later and run guests under the same runtime, as do the two
+/// inode-identity cases of
+/// <https://github.com/rrnewton/hermit/pull/3255>. Only
 /// `test.cli_on_host` excludes
 /// them, with one exact-name filterset (`-E 'not (test(=NAME) | ...)'`) rather
 /// than substring `--skip`s; the local `test.cli` keeps running every one in
@@ -248,6 +250,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings",
     "liteinst_in_guest_programs::liteinst_in_guest_identity_utilities",
+    "liteinst_in_guest_programs::liteinst_in_guest_maps_inodes_equal_stat_inodes",
     "liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_python_entropy",
     "liteinst_in_guest_programs::liteinst_in_guest_python_random_example",
@@ -261,6 +264,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer",
+    "liteinst_in_guest_programs::liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes",
     "liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time",
     "liteinst_in_guest_verify_compares_the_records_the_guest_forwards",
     "liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer",

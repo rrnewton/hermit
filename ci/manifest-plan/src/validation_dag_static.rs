@@ -792,7 +792,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 980: 981.
     // detcore-model's config::tests::process_exits_complete_asynchronously_never_enters_the_legacy_form
     // (the C3.5 pin bump) retains all 981: 982.
-    ("test.regular_crates", 982),
+    // Adds eleven https://github.com/rrnewton/hermit/pull/3255 tests (detcore-dbt
+    // tests: 5, detcore-model config::tests: 4, hermit-manifest-plan
+    // validation_dag::tests: 2); all 982 prior identities are retained: 993, measured
+    // with cargo nextest list --profile ci.
+    ("test.regular_crates", 993),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1026,7 +1030,11 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The two verification-latch tests and the in-guest kernel-floor test retain all 915: 918.
     // The watcher's two auto-reap tests retain all 918: 920.
     // Three C3.5 fix-forward tests (a refused admission, a brief exit-path sleep, a recorded failure failing the run) retain all 920: 923.
-    ("test.hermit_unit", 923),
+    // Adds eleven https://github.com/rrnewton/hermit/pull/3255 tests (hermit
+    // dbt_detconfig_omit_tests: 7, hermit tests: 3, hermit::bin/hermit run::tests: 1);
+    // all 923 prior identities are retained: 934, measured with cargo nextest list
+    // --profile ci.
+    ("test.hermit_unit", 934),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1177,7 +1185,15 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // and io_buffers::tests::read_written_fails_with_the_wide_error_when_no_method_can_read
     // (write-only destinations, https://github.com/rrnewton/hermit/issues/3823)
     // retain all 995 (998, measured with cargo nextest list --profile ci).
-    ("test.detcore_unit", 998),
+    // Adds 100 https://github.com/rrnewton/hermit/pull/3255 tests (hermit-detcore
+    // identity_lookup_refusal_tests: 4, hermit-detcore memory::tests: 3, hermit-detcore
+    // procfs::tests: 9, hermit-detcore syscalls::files::inject_fstat_scratch: 56,
+    // hermit-detcore syscalls::files::procfs_wiring_guard: 2, hermit-detcore
+    // syscalls::namespace::tests: 2, hermit-detcore
+    // syscalls::namespace::tests::other_proc_fd_target: 14, hermit-detcore
+    // tool_global::tests: 10); all 998 prior identities are retained: 1098, measured
+    // with cargo nextest list --profile ci.
+    ("test.detcore_unit", 1098),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1203,7 +1219,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 76 (measured 77).
     // pipe_read_into_a_write_only_page (the same issue, for a non-random read)
     // retains all 77 (measured 78).
-    ("test.detcore_misc", 78),
+    // Adds one https://github.com/rrnewton/hermit/pull/3255 test
+    // (tight_stack_maps::maps_read_succeeds_without_writable_stack_below_rsp); all 78
+    // prior identities are retained: 79, measured with cargo nextest list --profile ci.
+    ("test.detcore_misc", 79),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1269,7 +1288,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 200 (203, measured with cargo nextest list).
     // verify_claim_names_its_limit's three private-page rewriting tests and
     // reverie_private_page_is_the_range_hermit_guards retain all 203 (207).
-    ("test.hermit_integration", 207),
+    // Adds eleven https://github.com/rrnewton/hermit/pull/3255 tests
+    // (hermit::procfs_determinism (top level): 11); all 207 prior identities are
+    // retained: 218, measured with cargo nextest list --profile ci.
+    ("test.hermit_integration", 218),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1438,7 +1460,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // all 165: 165 + 1 = 166, listed the same way.
     // The two in-guest FUSE tests (ruling A) and the userfaultfd test (ruling D.2): 169.
     // The exit-reaping and unscheduled-death probes (C3.5 evidence): 171.
-    ("test.cli", 171),
+    // Adds three https://github.com/rrnewton/hermit/pull/3255 tests
+    // (liteinst_in_guest_programs::liteinst_in_guest_maps_inodes_equal_stat_inodes,
+    // liteinst_in_guest_programs::liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes,
+    // max_log_bytes_verify_reports_the_cap_status_when_run1_crosses_it); all 171 prior
+    // identities are retained: 174, measured with cargo nextest list --profile ci.
+    ("test.cli", 174),
     // sabre_and_ptrace_detlogs_agree_through_post_exec and
     // detlog_records_drop_only_the_timestamp_and_suffix retain all 7 prior
     // identities.
@@ -1450,7 +1477,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retains all 12 prior identities: 13.
     // sabre_forked_child_gets_no_plugin_warning_on_guest_stderr retains all
     // 13: 14.
-    ("test.sabre_examples", 14),
+    // Adds one https://github.com/rrnewton/hermit/pull/3255 test
+    // (sabre_other_process_links_resolve_with_a_full_descriptor_table); all 14 prior
+    // identities are retained: 15, measured with cargo nextest list --profile ci.
+    ("test.sabre_examples", 15),
     ("test.hermit_modes", 21),
     ("test.app_strict_verify", 8),
     ("test.command_strict_verify", 9),
@@ -1528,7 +1558,16 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // guest, so the filterset is unchanged: 166 - 31 = 135.
     // The host twin selects the same three exit-dependency tests: 138.
     // The host twin selects the same two probes: 140.
-    ("test.cli_on_host", 140),
+    // Adds the same https://github.com/rrnewton/hermit/pull/3255 test as test.cli,
+    // max_log_bytes_verify_reports_the_cap_status_when_run1_crosses_it, except the two
+    // in-guest LiteInst inode tests
+    // (liteinst_in_guest_programs::liteinst_in_guest_maps_inodes_equal_stat_inodes and
+    // liteinst_in_guest_programs::liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes):
+    // they start the in-guest LiteInst runtime, which needs CPUID faulting, so they
+    // join HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS (31 names before, 33 after) and
+    // this node's exact-name filterset; all 140 prior identities are retained: 141,
+    // measured with cargo nextest list --profile ci.
+    ("test.cli_on_host", 141),
     ("test.hermit_modes_on_host", 21),
     ("privileged-only-test.pmu_buck_chaos_cases", 6),
     ("privileged-only-test.cli_kvm", 53),
@@ -1538,7 +1577,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
     // The host node carries the identical 78-test tests_misc selection.
-    ("test.detcore_misc_on_host", 78),
+    // Adds the same one https://github.com/rrnewton/hermit/pull/3255 test as
+    // test.detcore_misc; all 78 prior identities are retained: 79, measured with cargo
+    // nextest list --profile ci.
+    ("test.detcore_misc_on_host", 79),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -1585,7 +1627,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS by exact name
     // (https://github.com/rrnewton/hermit/pull/3255), so it executes twelve
     // fewer than test.detcore_unit: 998 - 12 = 986.
-    ("test.detcore_unit_on_host", 986),
+    // Adds the same https://github.com/rrnewton/hermit/pull/3255 tests as
+    // test.detcore_unit except the twelve
+    // HOSTED_PORTABLE_UNIQUE_MOUNT_ID_DETCORE_TESTS, which this host twin leaves out by
+    // exact name; all 998 prior identities are retained: 1086, measured with cargo
+    // nextest list --profile ci.
+    ("test.detcore_unit_on_host", 1086),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1602,7 +1649,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two --passthru-opt host-input verify tests and the
     // private-page rebinding test (203).
     // And the four private-page guard tests (207).
-    ("test.hermit_integration_on_host", 207),
+    // Adds the same https://github.com/rrnewton/hermit/pull/3255 tests as
+    // test.hermit_integration except
+    // dbt_maps_lines_prove_their_device_with_a_full_descriptor_table, which this host
+    // twin leaves out by exact name (HOSTED_PORTABLE_BTRFS_INTEGRATION_TESTS); all 207
+    // prior identities are retained: 217, measured with cargo nextest list --profile
+    // ci.
+    ("test.hermit_integration_on_host", 217),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -1648,7 +1701,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same three latch and kernel-floor tests: 918.
     // The host twin selects the same two auto-reap tests: 920.
     // The host twin selects the same three tests: 923.
-    ("test.hermit_unit_on_host", 923),
+    // Adds the same eleven https://github.com/rrnewton/hermit/pull/3255 tests as
+    // test.hermit_unit; all 923 prior identities are retained: 934, measured with cargo
+    // nextest list --profile ci.
+    ("test.hermit_unit_on_host", 934),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -1722,13 +1778,19 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The path-included validate_plan test listed there retains all 979: 980.
     // The chaos determinism-failure test listed there retains all 980: 981.
     // The same detcore-model legacy-form test retains all 981: 982.
-    ("test.regular_crates_on_host", 982),
+    // Adds the same eleven https://github.com/rrnewton/hermit/pull/3255 tests as
+    // test.regular_crates; all 982 prior identities are retained: 993, measured with
+    // cargo nextest list --profile ci.
+    ("test.regular_crates_on_host", 993),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
     // And the same target-scoped DETLOG forwarding test (13), and the same
     // forked-child stderr test (14).
-    ("test.sabre_examples_on_host", 14),
+    // Adds the same one https://github.com/rrnewton/hermit/pull/3255 test as
+    // test.sabre_examples; all 14 prior identities are retained: 15, measured with
+    // cargo nextest list --profile ci.
+    ("test.sabre_examples_on_host", 15),
 ];
 
 pub(super) fn structured_result_producer_kind(tag: &str) -> Option<StructuredResultProducerKind> {
@@ -4413,9 +4475,9 @@ const STATIC_STEPS: &[StaticStepSpec] = &[
         group: r########"test"########,
         job: r########"cli_on_host"########,
         desc: r########"Portable CLI cases (skips KVM/DBT-backend-only cases)"########,
-        description: r########"Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. They include real programs (coreutils, sqlite3, Python, jq, perl and the tests/c guests) run under in-guest LiteInst with --max-timeslice=disabled and without --verify (liteinst_in_guest_programs::, formerly the liteinst_advanced binary); those load the libdetcore_liteinst.so that the workspace build writes beside target/validate/hermit, so a missing runtime fails them with Hermit's refusal naming `cargo build -p detcore-liteinst`. The 31 of them that start the in-guest LiteInst runtime (24 liteinst_in_guest_programs:: cases, the five liteinst_in_guest_verify_ cases, liteinst_backend_stats_report_the_guests_own_dispatch_paths and run_liteinst_finds_the_runtime_staged_as_an_installed_resource) need CPUID faulting, a host capability like the PMU: the GitHub-hosted runner has none, and in portable run 37383177918 each of the first 25 refused there with detcore-liteinst: initialization failed: CPUID faulting is unavailable: No such device (the 26th failed earlier, on the runtime the prebuilt tree did not yet ship). This hosted twin excludes them with an exact-name filterset (-E 'not (test(=...) | ...)'), never a substring --skip, and test.cli keeps running all of them in the pinned root; the LiteInst refusal, fixture-staging and command-construction cases, which launch no real runtime, stay here. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
+        description: r########"Five exact DBT product failures are excluded from the portable baseline under #2791 and retain source TODOs naming their individual defects; the LiteInst tests remain active. They include real programs (coreutils, sqlite3, Python, jq, perl and the tests/c guests) run under in-guest LiteInst with --max-timeslice=disabled and without --verify (liteinst_in_guest_programs::, formerly the liteinst_advanced binary); those load the libdetcore_liteinst.so that the workspace build writes beside target/validate/hermit, so a missing runtime fails them with Hermit's refusal naming `cargo build -p detcore-liteinst`. The 33 of them that start the in-guest LiteInst runtime (26 liteinst_in_guest_programs:: cases, two of them the inode-identity cases of https://github.com/rrnewton/hermit/pull/3255, the five liteinst_in_guest_verify_ cases, liteinst_backend_stats_report_the_guests_own_dispatch_paths and run_liteinst_finds_the_runtime_staged_as_an_installed_resource) need CPUID faulting, a host capability like the PMU: the GitHub-hosted runner has none, and in portable run 37383177918 each of the first 25 refused there with detcore-liteinst: initialization failed: CPUID faulting is unavailable: No such device (the 26th failed earlier, on the runtime the prebuilt tree did not yet ship). This hosted twin excludes them with an exact-name filterset (-E 'not (test(=...) | ...)'), never a substring --skip, and test.cli keeps running all of them in the pinned root; the LiteInst refusal, fixture-staging and command-construction cases, which launch no real runtime, stay here. MEMORY RECALIBRATED 2026-08-25 (task remeasure_the_fourteen_stale): five current exact-command cgroup samples peaked at 339279872 bytes; the larger 4068401152-byte historical completed peak governs. The 4-GiB baseline rounds above that floor and the 6-GiB hard cap adds 2 GiB of headroom. See ai_docs/dag-memory-caps-recalibration-20260825.md."########,
         labels: &[r########"hosted-portable"########],
-        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'not (test(=liteinst_backend_stats_report_the_guests_own_dispatch_paths) | test(=liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs) | test(=liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite) | test(=liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites) | test(=liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging) | test(=liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings) | test(=liteinst_in_guest_programs::liteinst_in_guest_identity_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_entropy) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_random_example) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer) | test(=liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time) | test(=liteinst_in_guest_verify_compares_the_records_the_guest_forwards) | test(=liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer) | test(=liteinst_in_guest_verify_log_keeps_records_in_ptraces_order) | test(=liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader) | test(=liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result) | test(=run_liteinst_finds_the_runtime_staged_as_an_installed_resource))' -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch"########,
+        cmd: r########"export PATH="$PWD/ci/rust-script-bin:$PATH"; export HERMIT_RUST_SCRIPT_ARTIFACT_ROOT="$PWD/target/ci/rust-scripts"; export HERMIT_PREBUILT_RUST_SCRIPTS_REQUIRED=1; HERMIT_LITEINST_TEST_BINARY=$PWD/target/ci/hermit ./ci/run-with-reverie-dbt-budget.sh ./ci/run-nextest-counted.sh ${CI:+--profile ci} -p hermit --features third-party-backends --test cli -j 1 -E 'not (test(=liteinst_backend_stats_report_the_guests_own_dispatch_paths) | test(=liteinst_in_guest_programs::liteinst_in_guest_abnormal_exit_after_registration_does_not_hang) | test(=liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs) | test(=liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite) | test(=liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites) | test(=liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging) | test(=liteinst_in_guest_programs::liteinst_in_guest_formatting_and_sequence_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_heap_growth_avoids_trampoline_mappings) | test(=liteinst_in_guest_programs::liteinst_in_guest_identity_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_maps_inodes_equal_stat_inodes) | test(=liteinst_in_guest_programs::liteinst_in_guest_path_and_language_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_entropy) | test(=liteinst_in_guest_programs::liteinst_in_guest_python_random_example) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_arithmetic_and_predicate_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_encoding_and_comparison_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round2_representation_and_path_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_encoding_and_compression_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_portable_system_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_round3_stdin_filter_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_runtime_bootstrap_is_not_charged_to_host_identity_uptime) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_file_and_sqlite_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_semantic_text_utilities) | test(=liteinst_in_guest_programs::liteinst_in_guest_shell_and_entropy_consumer) | test(=liteinst_in_guest_programs::liteinst_in_guest_untracked_directory_descriptor_lists_stat_inodes) | test(=liteinst_in_guest_programs::liteinst_in_guest_virtual_identity_and_time) | test(=liteinst_in_guest_verify_compares_the_records_the_guest_forwards) | test(=liteinst_in_guest_verify_forwards_records_by_the_cli_filters_per_target_answer) | test(=liteinst_in_guest_verify_log_keeps_records_in_ptraces_order) | test(=liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader) | test(=liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result) | test(=run_liteinst_finds_the_runtime_staged_as_an_installed_resource))' -- --skip run_kvm_ --skip backend_accepted_in_global_position --skip run_dbt_aggregates_unsupported_syscalls_and_strict_rejects_them --skip run_dbt_strict_returns_with_blocked_stdin_source --skip run_dbt_verifies_pipe_backpressure --skip run_dbt_keeps_diagnostics_out_of_guest_stderr --skip run_dbt_recovers_after_failed_exec --skip run_dbt_fails_closed_by_default_and_opt_out_aggregates_unsupported_syscalls --skip run_dbt_verifies_queued_self_signals --skip run_dbt_verifies_self_prlimit --skip run_dbt_verifies_shell_process_lifecycle --skip run_dbt_verifies_simple_env_shebang --skip run_liteinst_rejects_non_fork_clone --skip run_liteinst_handles_inherited_ignored_sigchld --skip run_liteinst_verifies_forked_guest --skip run_liteinst_verifies_raw_fork_guest --skip skid_overshoot_and_guest_failure_have_different_exit_codes --skip run_ptrace_nonleader_exec_preserves_identity_and_time --skip run_ptrace_nonleader_exec_preserves_preemption --skip run_ptrace_nonleader_exec_displaces_runnable_leader --skip run_ptrace_nonleader_exec_refuses_preemption_artifacts --skip run_chaos_preemption_replay_reuses_the_recorded_epoch"########,
         cmdtype: CmdType::Unknown,
         manifest: None,
         integration_test_binaries: Some(&[r########"cli"########]),
