@@ -32,6 +32,7 @@ mod interp;
 pub mod liteinst_bootstrap;
 pub mod liteinst_record;
 mod metadata;
+pub mod physical_exit_watch;
 pub mod proc_mount;
 mod ptrace_completion;
 pub mod run_evidence;
