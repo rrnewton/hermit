@@ -293,7 +293,16 @@ fn build_root() -> PathBuf {
     Path::new(env!("CARGO_TARGET_TMPDIR")).join("external-signal-interrupt")
 }
 
+/// The guest binary, compiled on first use within the test's wall budget, which
+/// starts here if no cell has started it (`test_wall_deadline`): a stalled
+/// compiler fails with this harness's report instead of reaching the runner's
+/// kill. Moving the clock alone cannot bound blocking compilation, so the
+/// compiler is a supervised child that is killed and reaped when the budget runs
+/// out. Under Cargo's harness, where tests share the process, a test that finds
+/// another test compiling waits for that compilation, which its own test's
+/// budget bounds.
 fn guest() -> &'static Path {
+    let deadline = test_wall_deadline();
     GUEST.get_or_init(|| {
         let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
@@ -313,19 +322,50 @@ fn guest() -> &'static Path {
             "external_signal_interrupt.{}.partial",
             std::process::id()
         ));
-        let compile = Command::new("cc")
+        // The compiler's diagnostics go to a file, not a pipe, so a compiler
+        // that writes more than a pipe holds never blocks while it is polled.
+        let diagnostics_path = root.join(format!(
+            "external_signal_interrupt.{}.stderr",
+            std::process::id()
+        ));
+        let diagnostics =
+            fs::File::create(&diagnostics_path).expect("failed to create the compiler's stderr");
+        let mut compiler = Command::new("cc")
             .args(["-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread"])
             .arg(&source)
             .arg("-o")
             .arg(&partial)
-            .output()
-            .unwrap_or_else(|error| panic!("failed to compile the guest: {error}"));
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(diagnostics))
+            .spawn()
+            .unwrap_or_else(|error| panic!("failed to start the guest's compiler: {error}"));
+        let status = loop {
+            match compiler.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(10))
+                }
+                Ok(None) => {
+                    let _ = compiler.kill();
+                    let reaped = compiler.wait();
+                    panic!(
+                        "compiling {} did not finish within the test's {:.1}s wall budget; \
+                         the compiler was killed and reaped ({reaped:?})",
+                        source.display(),
+                        test_wall_budget().as_secs_f64(),
+                    );
+                }
+                Err(error) => panic!("failed to wait for the guest's compiler: {error}"),
+            }
+        };
         assert!(
-            compile.status.success(),
-            "failed to compile {}\nstderr:\n{}",
+            status.success(),
+            "failed to compile {} ({status})\nstderr:\n{}",
             source.display(),
-            String::from_utf8_lossy(&compile.stderr),
+            fs::read_to_string(&diagnostics_path).unwrap_or_default(),
         );
+        let _ = fs::remove_file(&diagnostics_path);
         fs::rename(&partial, &guest).unwrap_or_else(|error| {
             panic!(
                 "failed to move the guest from {} to {}: {error}",
@@ -400,10 +440,22 @@ fn test_wall_budget() -> Duration {
 }
 
 thread_local! {
-    /// When this test's first cell started, and how many cells it has started.
+    /// When this test began (`test_wall_deadline`), and how many cells it has
+    /// started.
     /// Every test runs its cells on its own thread, under Cargo's harness and
     /// under nextest alike.
     static TEST_CELLS: Cell<Option<(Instant, usize)>> = const { Cell::new(None) };
+}
+
+/// The running test's wall deadline: `test_wall_budget` after the test began,
+/// which is its first guest setup or its first cell, whichever came first.
+fn test_wall_deadline() -> Instant {
+    let started = TEST_CELLS.with(|cells| {
+        let (started, count) = cells.get().unwrap_or((Instant::now(), 0));
+        cells.set(Some((started, count)));
+        started
+    });
+    started + test_wall_budget()
 }
 
 /// Count a new cell of the running test and print a progress line for it, so
