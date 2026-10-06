@@ -31,10 +31,11 @@ pub type RawFd = std::os::unix::io::RawFd;
 /// and on overlayfs maps reports the lower file's device. This type does not
 /// guess that such devices are equal; a caller holding another interface's
 /// pair must find `stat`'s identity for the same file or key on the pair it
-/// has, accepting that the two views mint different values. Detcore's
-/// `mapping_stat_identity` does the former for a maps line from the `fstat`
-/// identity recorded when the guest mapped the file, or else by resolving the
-/// line's path, and keys on the maps pair only when neither names the file.
+/// has, accepting that the two views mint different values. Detcore does the
+/// former for a maps line from the `fstat` identity recorded when the guest
+/// mapped that line's range (`mapping_recorded_identity`), or else by
+/// resolving the line's path or the executable link (`mapping_stat_identity`),
+/// and keys on the maps pair only when none of them names the file.
 #[derive(
     Debug,
     Clone,
