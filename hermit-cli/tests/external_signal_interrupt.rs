@@ -186,6 +186,10 @@ const HANDLED_BEFORE_EXIT_MS: u64 = SIGNAL_DELAY_MS + SIGNAL_DELAY_MS / 2;
 /// Trials in the guest's `sigsuspend creator` mode (`CREATOR_TRIALS` in the
 /// guest).
 const CREATOR_TRIALS: usize = 6;
+/// Trials in the guest's `poll pdeathchld` mode (`PDEATH_TRIALS` in the guest).
+const PDEATH_TRIALS: usize = 3;
+/// Unverified strict runs of the `poll pdeathchld` cell; each must match.
+const PDEATH_RUNS: usize = 3;
 /// Trials in the guest's `racing` mode (`RACING_TRIALS` in the guest).
 const RACING_TRIALS: usize = 6;
 /// Part of the INFO line Hermit's scheduler logs when a signal is delivered to a
@@ -1831,6 +1835,53 @@ fn ptrace_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend() {
 #[test]
 fn liteinst_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend() {
     assert_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend("liteinst");
+}
+
+/// A child that armed SIGCHLD as its parent-death signal (`PR_SET_PDEATHSIG`)
+/// polls no descriptors for 300 ms while another guest process kills its parent,
+/// which sleeps outside Hermit's run queue (the guest's `poll pdeathchld` mode).
+/// The child has never had a child. Linux returns EINTR when the parent dies.
+/// Under Hermit the parent exits physically before the scheduler deregisters it,
+/// at an instant set by the host, so counting that SIGCHLD would end the poll at
+/// a host-dependent turn. Hermit keeps the behaviour from before the external
+/// signal work instead: in each trial the poll returns 0 after its full timeout
+/// (the guest's 300 ms and 50 ms overshoot match `QUIET_TIMEOUT_MS` and
+/// `QUIET_OVERSHOOT_MS`) and the handler runs once afterwards. Round 7 of
+/// https://github.com/rrnewton/hermit/pull/3361 counted that SIGCHLD under its
+/// childless-process exception (round-8 High 3) and returned EINTR.
+///
+/// The cell runs `PDEATH_RUNS` times under `--strict` without `--verify`, and
+/// every trial of every run must keep its deadline. It is not strict-verified:
+/// killing a parked process from another guest is itself host-timed in Hermit.
+/// The tracer retires the killed parent at a host-set point relative to the
+/// killer's own `kill` completion and to the killer's SIGCHLD, so two runs'
+/// INFO logs differ on the killer's side whatever the child does. That race is
+/// the physical-death-before-logical-deregistration race the finding names; this
+/// pull request does not close it, so it claims only the child's result here.
+fn assert_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline(backend: &str) {
+    let args = ["poll", "pdeathchld"];
+    let expected =
+        format!("RESULT call=poll role=pdeathchld trials={PDEATH_TRIALS} matched={PDEATH_TRIALS}");
+    for attempt in 0..PDEATH_RUNS {
+        let run = run_cell_observed(backend, FutexMode::Precise, &args, &[], Observe::InfoLog);
+        assert!(
+            run.status.success()
+                && run.result_line() == Some(expected.as_str())
+                && run.stdout.lines().any(|line| line == "DONE"),
+            "{backend} {args:?} run {attempt} of {PDEATH_RUNS}: expected `{expected}`\n{}",
+            run.describe()
+        );
+    }
+}
+
+#[test]
+fn ptrace_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline() {
+    assert_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline("ptrace");
+}
+
+#[test]
+fn liteinst_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline() {
+    assert_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline("liteinst");
 }
 
 /// A wait at a LiteInst call site that has already run once goes through the

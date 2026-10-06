@@ -2056,6 +2056,10 @@ impl GlobalTool for GlobalState {
                         sched.retire_answered_sigchld(thread);
                         false
                     }
+                    SigchldEligibilityRequest::ParentDeathSignal { thread } => {
+                        sched.note_parent_death_sigchld(thread);
+                        false
+                    }
                 })
             }
             GlobalRequest::ExactChildWaitState(parent, child) => R::ExactChildWaitState(
@@ -4195,6 +4199,9 @@ pub enum SigchldEligibilityRequest {
     /// next handler for anything but a `SIGCHLD` delivery, so the signal that
     /// answer named has been dequeued (`Scheduler::retire_answered_sigchld`).
     Retire { thread: DetTid },
+    /// `thread` armed `SIGCHLD` as its parent-death signal
+    /// (`Scheduler::note_parent_death_sigchld`).
+    ParentDeathSignal { thread: DetTid },
 }
 
 /// Which actions we can take before/after a futex system call.
@@ -4670,7 +4677,7 @@ where
 
 /// Record or query `SIGCHLD` eligibility for gated waits
 /// (<https://github.com/rrnewton/hermit/issues/3146>). Only a `Take` answer is
-/// meaningful; `Mark`, `Flush` and `Retire` answer `false`.
+/// meaningful; every other request answers `false`.
 pub async fn sigchld_eligibility<G, T>(guest: &mut G, request: SigchldEligibilityRequest) -> bool
 where
     G: Guest<Detcore<T>>,
