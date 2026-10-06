@@ -41,6 +41,7 @@ use crate::resources::Permission;
 use crate::resources::ResourceID;
 use crate::resources::Resources;
 use crate::scheduler::FutexSignalWatch;
+use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::SchedValue;
 use crate::syscalls::helpers::NonblockableSyscall;
 use crate::syscalls::helpers::record_retry_event;
@@ -59,6 +60,7 @@ use crate::tool_global::host_timed_signals;
 use crate::tool_global::prepare_exec;
 use crate::tool_global::process_group;
 use crate::tool_global::ready_child_wait;
+use crate::tool_global::record_host_timed_signals;
 use crate::tool_global::resource_request;
 use crate::tool_global::set_child_tid_address;
 use crate::tool_global::thread_is_live;
@@ -729,6 +731,27 @@ pub(crate) fn kernel_sigset_bit(raw_signal: i32) -> KernelSigset {
     }
 }
 
+/// The exit signal that a child created by this clone-family call sends to
+/// the calling process when it exits, at a moment set by host timing, as a
+/// kernel sigset; 0 when there is none to hold. Linux sends a child's exit
+/// signal to the process that created it. A thread (`CLONE_THREAD`) sends
+/// none. SIGCHLD is already held in every gated wait. A `CLONE_PARENT` child
+/// sends the caller's own exit signal to the caller's parent instead, and that
+/// signal is SIGCHLD or was recorded for that parent when it created the
+/// caller's process (a reparent to another process resets it to SIGCHLD).
+pub(crate) fn clone_host_timed_signals(
+    flags: CloneFlags,
+    exit_signal: libc::c_int,
+) -> KernelSigset {
+    if flags.intersects(CloneFlags::CLONE_THREAD | CloneFlags::CLONE_PARENT)
+        || exit_signal == libc::SIGCHLD
+    {
+        0
+    } else {
+        kernel_sigset_bit(exit_signal)
+    }
+}
+
 /// One thread's signal state as the kernel reports it in
 /// `/proc/<pid>/task/<tid>/status`.
 ///
@@ -1312,6 +1335,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 exit_signal,
                 child_priority_entropy,
             });
+        }
+
+        // A child's exit signal other than SIGCHLD reaches this process when
+        // the child exits, at a moment set by host timing. Record it in this
+        // turn, before the child exists, for every thread of the caller's
+        // process, and never forget it (`Scheduler::record_host_timed_signals`).
+        let exit_signals = clone_host_timed_signals(flags, exit_signal);
+        if exit_signals != 0
+            && guest
+                .config()
+                .backend_supports_blocked_wait_signal_interruption
+        {
+            record_host_timed_signals(guest, HostTimedSignalScope::Caller, exit_signals).await;
         }
 
         trace!("[detcore, dtid {}] parent invoking clone.", parent_dettid);
@@ -3164,6 +3200,30 @@ mod tests {
     use crate::tool_global::GlobalRequest;
     use crate::tool_global::GlobalState;
     use crate::types::MmId;
+
+    /// A new process whose exit signal is not SIGCHLD makes its creator hold
+    /// that signal; a thread, a `CLONE_PARENT` child, a SIGCHLD child, and an
+    /// out-of-range signal add nothing
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn a_child_exit_signal_other_than_sigchld_is_host_timed_for_its_creator() {
+        let usr1 = 1_u64 << (libc::SIGUSR1 - 1);
+        let none = CloneFlags::empty();
+        assert_eq!(clone_host_timed_signals(none, libc::SIGUSR1), usr1);
+        assert_eq!(
+            clone_host_timed_signals(CloneFlags::CLONE_VFORK, libc::SIGUSR1),
+            usr1
+        );
+        assert_eq!(clone_host_timed_signals(none, libc::SIGCHLD), 0);
+        assert_eq!(clone_host_timed_signals(none, 0), 0);
+        assert_eq!(clone_host_timed_signals(none, 65), 0);
+        let thread = CloneFlags::CLONE_THREAD | CloneFlags::CLONE_SIGHAND | CloneFlags::CLONE_VM;
+        assert_eq!(clone_host_timed_signals(thread, libc::SIGUSR1), 0);
+        assert_eq!(
+            clone_host_timed_signals(CloneFlags::CLONE_PARENT, libc::SIGUSR1),
+            0
+        );
+    }
 
     struct FailedExecStack;
     struct FailedExecStackGuard;
