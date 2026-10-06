@@ -27,6 +27,7 @@ use reverie::syscalls::Syscall;
 
 use super::deterministic_stdio_inode;
 use super::deterministic_stdio_inode_for_resource;
+use crate::config::AnonymousObjectDevices;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::determinize_inode;
 use crate::tool_local::Detcore;
@@ -158,23 +159,19 @@ struct AnonymousProcFdIdentity {
     raw_inode: u64,
 }
 
-/// The host devices of the kernel's pipe and socket filesystems, on which
-/// every `pipe:[N]` or `socket:[N]` link's inode lives. Each is one
-/// kernel-wide superblock, so a pipe and a socket made here show them. A host
-/// inode is identified by device AND number, and a pipe's `fstat` reports this
-/// device, so the identity a link names must carry it too.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct AnonymousObjectDevices {
-    pipe: u64,
-    socket: u64,
-}
-
 /// The [`AnonymousObjectDevices`], read once per process, or why they could
 /// not be read. Detcore reads them when it starts in a process
 /// ([`crate::Detcore`]'s `Tool::new`), before any guest syscall, so a guest's
 /// readlink never depends on whether Detcore's host process can make a pipe
 /// or socket at that moment, and keeps the outcome either way: a later call
 /// neither retries nor panics.
+///
+/// Only a Config without `Config::anonymous_object_devices` needs this read.
+/// hermit-cli probes in the Hermit process before launch and passes the
+/// devices to every backend but DBT (`prepare_backend_config`); with them,
+/// Detcore neither reads here when it starts nor consults this for a link
+/// (`resolve_anonymous_object_devices`). Without virtualized metadata
+/// nothing reads the devices, so nothing reads here either.
 ///
 /// Why one read is enough: pipefs and sockfs are each a single
 /// kernel-internal mount made at boot (`kern_mount` in `init_pipe_fs` in
@@ -213,7 +210,11 @@ pub(crate) fn anonymous_object_devices() -> &'static Result<AnonymousObjectDevic
     DEVICES.get_or_init(|| probe_anonymous_object_devices().map_err(|error| error.to_string()))
 }
 
-fn probe_anonymous_object_devices() -> std::io::Result<AnonymousObjectDevices> {
+/// Create and `fstat` one pipe and one socket, return the devices they
+/// report, and close them. hermit-cli calls this in the Hermit process before
+/// launch and passes the result in `Config::anonymous_object_devices`, so that
+/// on every backend but DBT no probe runs in a guest's descriptor table.
+pub fn probe_anonymous_object_devices() -> std::io::Result<AnonymousObjectDevices> {
     use std::os::fd::AsFd;
     let device_of = |fd: std::os::fd::BorrowedFd<'_>| {
         nix::sys::stat::fstat(fd)
@@ -228,8 +229,9 @@ fn probe_anonymous_object_devices() -> std::io::Result<AnonymousObjectDevices> {
     })
 }
 
-/// The device of a `kind` ("pipe" or "socket") link's inode, from the
-/// devices read at start (`devices`). When they could not be read, this is a
+/// The device of a `kind` ("pipe" or "socket") link's inode, from
+/// `devices`: the configured ones, or else the ones read at start. When they
+/// could not be read, this is a
 /// tool error, not an errno: Detcore cannot give the link a faithful identity,
 /// so the run fails as an infrastructure failure through the backend's own
 /// failure handling, rather than a link identity getting an invented device or
@@ -287,6 +289,24 @@ fn may_be_anonymous_proc_fd_target(target: &[u8]) -> bool {
     [b"pipe:[".as_slice(), b"socket:[".as_slice()]
         .into_iter()
         .any(|prefix| target.starts_with(prefix) || prefix.starts_with(target))
+}
+
+/// The devices to key an unconfirmed link on: those in
+/// `Config::anonymous_object_devices` (`configured`), which the Hermit process
+/// probed before launch, when the Config carries them, and only otherwise the
+/// outcome of this process's own probe (`probed`; in production
+/// [`anonymous_object_devices`]). Configured devices win whatever that probe
+/// cached, a failure included, and are used without running it, so a
+/// readlink never depends on a probe in a guest's descriptor table when the
+/// Hermit process supplied the devices.
+fn resolve_anonymous_object_devices(
+    configured: Option<AnonymousObjectDevices>,
+    probed: impl FnOnce() -> Result<AnonymousObjectDevices, String>,
+) -> Result<AnonymousObjectDevices, String> {
+    match configured {
+        Some(devices) => Ok(devices),
+        None => probed(),
+    }
 }
 
 impl AnonymousProcFdIdentity {
@@ -372,10 +392,14 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// The object is keyed on its device and inode, as an `fstat` of it is:
     /// the device comes from the guest's `stat` of the link
     /// (`other_proc_fd_link_identity`), or, when that cannot confirm the
-    /// object, from the devices probed when the tool was constructed
-    /// (`anonymous_object_devices`). If that probe failed, the readlink
-    /// fails with an error rather than keying the link on a device no `fstat`
-    /// reports.
+    /// object, from `Config::anonymous_object_devices`, which the Hermit
+    /// process probed before launch, or failing that from the devices probed
+    /// when the tool was constructed (`anonymous_object_devices`). Only when
+    /// there are neither -- no configured devices and a failed construction
+    /// probe, which a run launched through hermit-cli reaches only on DBT or
+    /// when the Hermit process's own probe failed -- does the readlink fail
+    /// with a tool error (`anonymous_object_device`) rather than key the link
+    /// on a device no `fstat` reports.
     ///
     /// Without `virtualize_metadata` -- `hermit record` and `hermit replay`
     /// -- neither is consulted, and the object is keyed on its inode alone,
@@ -436,10 +460,16 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .await?
             {
                 Some(raw_file) => raw_file,
-                None => RawInode::new(
-                    anonymous_object_device(anonymous_object_devices(), identity.kind)?,
-                    identity.raw_inode,
-                ),
+                None => {
+                    let devices = resolve_anonymous_object_devices(
+                        guest.config().anonymous_object_devices,
+                        || anonymous_object_devices().clone(),
+                    );
+                    RawInode::new(
+                        anonymous_object_device(&devices, identity.kind)?,
+                        identity.raw_inode,
+                    )
+                }
             }
         } else {
             RawInode::new(0, identity.raw_inode)
@@ -986,6 +1016,41 @@ mod tests {
         );
     }
 
+    /// Devices the Hermit process probed and passed in the Config key an
+    /// unconfirmed link whatever this process's own probe gives: a probe that
+    /// failed in the guest (`EMFILE` while the guest's descriptor table was
+    /// full when Detcore was constructed) no longer turns a readlink that
+    /// succeeded into an error, and the probe is not run at all. Without
+    /// configured devices the probe's outcome, a failure included, is used
+    /// as it is.
+    #[test]
+    fn configured_devices_key_a_link_even_when_the_construction_probe_failed() {
+        let configured = AnonymousObjectDevices {
+            pipe: 0xe,
+            socket: 0x8,
+        };
+        let failed = || Err("failed to probe the pipefs device: EMFILE".to_owned());
+        assert_eq!(
+            resolve_anonymous_object_devices(Some(configured), failed),
+            Ok(configured)
+        );
+        assert_eq!(
+            resolve_anonymous_object_devices(Some(configured), || {
+                panic!("configured devices must be used without running the probe")
+            }),
+            Ok(configured)
+        );
+        let resolved = resolve_anonymous_object_devices(Some(configured), failed);
+        assert_eq!(anonymous_object_device(&resolved, "pipe").unwrap(), 0xe);
+        assert_eq!(anonymous_object_device(&resolved, "socket").unwrap(), 0x8);
+
+        let unconfigured = resolve_anonymous_object_devices(None, failed);
+        assert_eq!(unconfigured, failed());
+        let error = anonymous_object_device(&unconfigured, "pipe").unwrap_err();
+        assert!(matches!(error, Error::Tool(_)), "{error:?}");
+        assert!(error.to_string().contains("EMFILE"), "{error}");
+    }
+
     /// A guest-side `stat` of the link is accepted only for the same kind of
     /// object and the same inode as the readlink target it confirms; anything
     /// else means the descriptor changed in between.
@@ -1135,6 +1200,43 @@ mod tests {
                 *guest.determinized.lock().unwrap(),
                 [RawInode::new(device, inode)],
                 "an unconfirmed link must be keyed on the pipefs device and its inode"
+            );
+            assert_eq!(
+                rewritten,
+                format!("pipe:[{FIRST_SCRIPTED_INODE}]").into_bytes()
+            );
+        }
+
+        /// The devices the Hermit process passed in the Config are the ones an
+        /// unconfirmed link is keyed on, whatever the construction probe in
+        /// this address space cached; so a probe that failed in a guest's
+        /// full descriptor table can no longer fail the readlink (round-4
+        /// review of <https://github.com/rrnewton/hermit/pull/3255>). The
+        /// configured devices here differ from the real ones to show which
+        /// source the key came from.
+        #[tokio::test]
+        async fn with_virtualized_metadata_an_unconfirmed_link_is_keyed_on_the_configured_device() {
+            let (reader, device, inode) = pipe_reader();
+            let fd = reader.as_raw_fd();
+            drop(reader);
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            let configured = AnonymousObjectDevices {
+                pipe: 0x7777,
+                socket: 0x8888,
+            };
+            assert_ne!(configured.pipe, device);
+            guest.config.anonymous_object_devices = Some(configured);
+
+            let target = format!("pipe:[{inode}]");
+            let rewritten = rewrite(&tool, &mut guest, fd, target.as_bytes()).await;
+
+            assert_eq!(guest.injected, [Sysno::newfstatat]);
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [RawInode::new(0x7777, inode)],
+                "an unconfirmed link must be keyed on the configured pipefs device"
             );
             assert_eq!(
                 rewritten,
