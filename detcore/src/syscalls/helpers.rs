@@ -1135,6 +1135,20 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
         // the guest.  With timeout=0, the timeout is what shows that it would have blocked.
         res == Err(Errno::ETIMEDOUT)
     }
+
+    /// Linux restarts an untimed `FUTEX_WAIT` under `SA_RESTART` (`-ERESTARTSYS`), but a
+    /// timed wait returns `-ERESTART_RESTARTBLOCK`, which a handler always turns into
+    /// `EINTR`. `ERESTARTNOHAND` gives a timed wait that outcome for a caught signal and a
+    /// transparent restart otherwise; a restarted relative wait starts its timeout again,
+    /// where Linux's restart block would resume the original deadline
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    fn signal_interrupt_errno(&self) -> Errno {
+        if self.timeout().is_some() {
+            Errno::ERESTARTNOHAND
+        } else {
+            Errno::ERESTARTSYS
+        }
+    }
 }
 
 impl TimeoutableSyscall for reverie::syscalls::Futex {
@@ -1461,6 +1475,10 @@ where
     T: RecordOrReplay,
     G: Guest<Detcore<T>>,
 {
+    // Decide the interruption errno from the guest's ORIGINAL call: the nonblocking
+    // rewrite below can replace arguments (a futex gains a zero timeout), and Linux's
+    // restart rule depends on what the guest asked for, not on the probe.
+    let interrupt_errno = call0.signal_interrupt_errno();
     // The stack-allocated memory here needs to live across the loop, which means
     // surviving multiple syscall injections:
     let (call, _maybe_stackguard) = call0.into_nonblocking(guest).await;
@@ -1474,7 +1492,7 @@ where
             _ => resource_request(guest, rsrc.clone()).await,
         };
         if matches!(resumed, ResumeStatus::Signaled(_)) {
-            let errno = call.signal_interrupt_errno();
+            let errno = interrupt_errno;
             tracing::trace!(
                 "retry_nonblocking_syscall: interrupted by signal before retrying {}: {:?}",
                 call.display(&guest.memory()),
@@ -1491,13 +1509,33 @@ where
                     .record_or_replay_preserving_tool_errors(guest, call)
                     .await
             }
-            None => guest.inject_with_retry(call).await.map_err(Error::from),
+            // A plain `inject`, never `inject_with_retry`: a signal that stops the
+            // guest around the probe is dequeued from the kernel and held by the
+            // backend (ptrace reports it as ERESTARTSYS). Retrying would swallow it
+            // for as long as the wait lasts, which is forever when only the handler
+            // could end it (https://github.com/rrnewton/hermit/issues/3146). The
+            // probe has no side effect to repeat, so it is reported as an
+            // interruption below and the held signal is delivered when this handler
+            // returns.
+            None => guest.inject(call).await.map_err(Error::from),
         };
         let syscall_result = match res {
             Ok(value) => Ok(value),
             Err(Error::Errno(error)) => Err(error),
             Err(error) => return Err(error),
         };
+        if subtool.is_none()
+            && let Err(errno) = syscall_result
+            && probe_was_interrupted_by_signal(errno)
+        {
+            tracing::trace!(
+                "retry_nonblocking_syscall: signal interrupted the probe of {}: {:?} -> {:?}",
+                call.display(&guest.memory()),
+                errno,
+                interrupt_errno
+            );
+            return Err(interrupt_errno.into());
+        }
         if call.syscall_would_have_blocked(syscall_result) {
             rsrc.poll_attempt += 1;
             if let Some((timeout, timeout_result)) = maybe_timeout {
@@ -1541,6 +1579,21 @@ where
             return res;
         }
     }
+}
+
+/// Whether a zero-timeout probe's error means a signal interrupted it rather than
+/// that the guest's operation produced a result. A probe never blocks, so every
+/// one of these reports a signal: the backend's restart errno for a signal stop
+/// around the injected syscall, or `EINTR` where a backend runs the probe itself.
+fn probe_was_interrupted_by_signal(errno: Errno) -> bool {
+    matches!(
+        errno,
+        Errno::EINTR
+            | Errno::ERESTARTSYS
+            | Errno::ERESTARTNOINTR
+            | Errno::ERESTARTNOHAND
+            | Errno::ERESTART_RESTARTBLOCK
+    )
 }
 
 pub(crate) async fn record_retry_event<G, C, T>(guest: &mut G, call: C)
@@ -1721,6 +1774,14 @@ mod tests {
         assert_eq!(
             reverie::syscalls::Futex::new().signal_interrupt_errno(),
             Errno::ERESTARTSYS
+        );
+        // A timed wait is never restarted after a handler runs.
+        let timeout = reverie::syscalls::Addr::from_raw(0x1000).unwrap();
+        assert_eq!(
+            reverie::syscalls::Futex::new()
+                .with_timeout(Some(timeout))
+                .signal_interrupt_errno(),
+            Errno::ERESTARTNOHAND
         );
     }
 
