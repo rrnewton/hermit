@@ -100,21 +100,11 @@ pub struct Config {
     /// guest, the backend Detcore's own tests use.
     ///
     /// JSON that the guest can see is written by [`to_legacy_backend_json`],
-    /// which carries this field (and `shared_dequeue_timers`) as the separate
-    /// keys used before it existed; [`from_legacy_backend_json`] reads them
-    /// back.
+    /// which carries this field as the separate keys used before it existed;
+    /// [`from_legacy_backend_json`] reads them back.
     #[serde(default = "default_backend_capabilities")]
     #[clap(skip = BackendCapabilities::PTRACE)]
     pub backend: BackendCapabilities,
-
-    /// Deliver real-timer signals through the backend's process signal control
-    /// and acknowledged shared signal dequeues, rather than Detcore's own
-    /// signal dispatch. A startup-only policy: the host sets it when
-    /// `backend.provides_process_signal_control` holds and threads are
-    /// sequentialized.
-    #[serde(default)]
-    #[clap(skip)]
-    pub shared_dequeue_timers: bool,
 
     /// Epoch of the logical time.
     ///
@@ -1420,8 +1410,8 @@ impl Default for Config {
 /// Serializes `config` as JSON in the form it had before [`Config::backend`]
 /// existed.
 ///
-/// [`Config::backend`] and [`Config::shared_dequeue_timers`] are left out.
-/// In their place, at the same position in the object, are the fifteen
+/// [`Config::backend`] is left out. In its place, at the same position in
+/// the object, are the fifteen
 /// separate backend keys that a serialized configuration carried before,
 /// under the names and in the order it carried them, each with a value
 /// computed from `config`. [`Config::record_host_inputs`], which the legacy
@@ -1435,9 +1425,9 @@ impl Default for Config {
 /// initial stack layout depends on the environment's size, observes this
 /// string; producing the earlier bytes keeps that observation unchanged.
 ///
-/// Read the result with [`from_legacy_backend_json`], which recovers both
-/// fields from the fifteen keys. A plain `Config` deserialization ignores the
-/// keys and gives both fields their serde defaults.
+/// Read the result with [`from_legacy_backend_json`], which recovers
+/// [`Config::backend`] from the fifteen keys. A plain `Config`
+/// deserialization ignores the keys and gives the field its serde default.
 pub fn to_legacy_backend_json(config: &Config) -> serde_json::Result<String> {
     let mut json = Vec::with_capacity(4096);
     let mut serializer = serde_json::Serializer::new(&mut json);
@@ -1453,8 +1443,11 @@ pub fn to_legacy_backend_json(config: &Config) -> serde_json::Result<String> {
 /// value it has for `config`.
 ///
 /// `backend_is_kvm` named the backend rather than a fact; its value is
-/// `provides_process_signal_control`, a capability only KVM reports, and
-/// `kvm_shared_dequeue_timers` is [`Config::shared_dequeue_timers`].
+/// `provides_process_signal_control`, a capability only KVM reports.
+/// `kvm_shared_dequeue_timers` was a startup policy, not a fact: the
+/// production launcher, hermit-cli, set it exactly when that capability and
+/// [`Config::sequentialize_threads`] held. Its value is that conjunction, and
+/// [`from_legacy_backend_json`] refuses any other value.
 fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
     let backend = &config.backend;
     [
@@ -1493,7 +1486,10 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
             backend.requires_thread_directed_process_signals,
         ),
         ("backend_is_kvm", backend.provides_process_signal_control),
-        ("kvm_shared_dequeue_timers", config.shared_dequeue_timers),
+        (
+            "kvm_shared_dequeue_timers",
+            backend.provides_process_signal_control && config.sequentialize_threads,
+        ),
         (
             "backend_supports_parked_write_signal_interruption",
             backend.supports_parked_write_signal_interruption,
@@ -1511,8 +1507,7 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 
 /// Parses JSON written by [`to_legacy_backend_json`], or any JSON in the form
 /// a serialized [`Config`] had before [`Config::backend`] existed, and recovers
-/// [`Config::backend`] and [`Config::shared_dequeue_timers`] from the fifteen
-/// legacy backend keys.
+/// [`Config::backend`] from the fifteen legacy backend keys.
 ///
 /// The keys are read exactly as they were read while each was a `Config`
 /// field: a key that is absent takes the default that field had, and a key of
@@ -1532,19 +1527,35 @@ fn legacy_backend_keys(config: &Config) -> [(&'static str, bool); 15] {
 /// This inverts [`to_legacy_backend_json`] for every capability value the keys
 /// can express, which includes every backend's own constant.
 ///
+/// `kvm_shared_dequeue_timers` supplies no capability. It was read into a
+/// `Config` field that chose the controlled signal path, and that choice is
+/// now made from the capabilities, [`Config::sequentialize_threads`] and the
+/// control the backend offers. It is read as it was, a boolean that is false
+/// when absent, and the parse then fails unless it equals `backend_is_kvm &&
+/// sequentialize_threads`, the value the production launcher always wrote. An
+/// accepted input whose capabilities are those of the backend that runs it
+/// selects the path it selected before. An input that would select another,
+/// such as `true` without `backend_is_kvm`, or absent beside `backend_is_kvm`
+/// and sequentialized threads, fails the parse rather than being silently
+/// reinterpreted. (`backend_is_kvm` given to a backend that offers no control,
+/// such as DBT, already misdescribed that backend and stays outside this
+/// guarantee; the production launcher never writes it.) A failed parse is
+/// handled like any malformed value: the DBT runtime, the only production
+/// reader, falls back to its strict default configuration and emits its
+/// `could not parse HERMIT_DBT_DETCONFIG` warning.
+///
 /// Everything else is read as the legacy form was read, by `Config`'s own
 /// derived deserializer with the legacy keys taken out before it sees them:
 ///
 /// - In an object, a key the legacy form did not name is ignored, whatever its
-///   value. `backend` and `shared_dequeue_timers` are such keys, so they are
-///   ignored too rather than read as the fields they are now; no writer
-///   produces either. A key the legacy form named fails the parse when it
-///   appears twice or holds the wrong type.
+///   value. `backend` is such a key, so it is ignored rather than read as the
+///   field it is now; no production writer emits it. A key the legacy form
+///   named fails the parse when it appears twice or holds the wrong type.
 /// - A JSON array lists the fields by position, as serde reads any derived
 ///   struct. The positions are those of the legacy form, which are the key
 ///   order of [`to_legacy_backend_json`]: the fifteen legacy keys stand where
-///   [`Config::backend`] stands, and [`Config::shared_dequeue_timers`] has no
-///   position. Too many elements fail the parse; too few leave the fields
+///   [`Config::backend`] stands. Too many elements fail the parse; too few
+///   leave the fields
 ///   after them missing, each taking its default or failing the parse as the
 ///   derived deserializer decides for that field.
 pub fn from_legacy_backend_json(json: &str) -> serde_json::Result<Config> {
@@ -1556,8 +1567,18 @@ pub fn from_legacy_backend_json(json: &str) -> serde_json::Result<Config> {
         legacy_backend_json::LegacyConfigVisitor,
     )?;
     deserializer.end()?;
+    let controlled = legacy.backend_is_kvm && config.sequentialize_threads;
+    if legacy.kvm_shared_dequeue_timers != controlled {
+        return Err(<serde_json::Error as serde::de::Error>::custom(
+            format_args!(
+                "kvm_shared_dequeue_timers is {} but backend_is_kvm && \
+             sequentialize_threads is {controlled}; the key is no longer an \
+             independent setting and must equal that conjunction",
+                legacy.kvm_shared_dequeue_timers,
+            ),
+        ));
+    }
     config.backend = legacy.capabilities();
-    config.shared_dequeue_timers = legacy.kvm_shared_dequeue_timers;
     Ok(config)
 }
 
@@ -1613,6 +1634,9 @@ struct LegacyBackendKeys {
     backend_requires_thread_directed_process_signals: bool,
     #[serde(default)]
     backend_is_kvm: bool,
+    /// Read as it was while it was a `Config` field, then checked by
+    /// [`from_legacy_backend_json`] against `backend_is_kvm` and
+    /// [`Config::sequentialize_threads`]; it supplies no capability.
     #[serde(default)]
     kvm_shared_dequeue_timers: bool,
     #[serde(default = "legacy_backend_key_default_true")]
@@ -1702,8 +1726,7 @@ mod legacy_backend_json {
     /// `record_host_inputs` has no legacy key and no legacy value: the legacy
     /// form serves only DBT, whose launcher collects no host inputs, so it is
     /// never written and always reads as false.
-    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 3] =
-        ["backend", "shared_dequeue_timers", "record_host_inputs"];
+    const FIELDS_WITHOUT_A_LEGACY_KEY: [&str; 2] = ["backend", "record_host_inputs"];
 
     /// Reads the top-level object or array of a legacy configuration. The
     /// derived `Config` deserializer reads every field; this takes the legacy
@@ -1790,9 +1813,9 @@ mod legacy_backend_json {
     /// The top-level array's elements, in the legacy form's positions. The
     /// derived `Config` deserializer asks for one element per field in
     /// declaration order; at [`Config::backend`] this reads up to fifteen
-    /// elements as the legacy backend keys, and neither field it asks for
-    /// there and at [`Config::shared_dequeue_timers`] takes an element. Both
-    /// get a placeholder, which [`super::from_legacy_backend_json`] replaces.
+    /// elements as the legacy backend keys, and neither the field it asks for
+    /// there nor [`Config::record_host_inputs`] takes an element. Both get a
+    /// placeholder; [`super::from_legacy_backend_json`] replaces the first.
     struct LegacyPositions<'f, 'l, A> {
         inner: A,
         fields: std::slice::Iter<'f, String>,
@@ -1821,7 +1844,7 @@ mod legacy_backend_json {
                         .map(Some)
                         .map_err(<A::Error as de::Error>::custom)
                 }
-                Some("shared_dequeue_timers" | "record_host_inputs") => {
+                Some("record_host_inputs") => {
                     seed.deserialize(BoolDeserializer::new(false)).map(Some)
                 }
                 _ => self.inner.next_element_seed(seed),
@@ -2062,8 +2085,6 @@ mod legacy_backend_json {
                     self.wrote_backend_keys = true;
                     Ok(())
                 }
-                // Written above as `kvm_shared_dequeue_timers`.
-                "shared_dequeue_timers" => Ok(()),
                 // No legacy key; see FIELDS_WITHOUT_A_LEGACY_KEY.
                 "record_host_inputs" => Ok(()),
                 _ => self.inner.serialize_field(key, value),
@@ -2125,7 +2146,11 @@ mod tests {
         assert!(config.backend.supports_parked_write_signal_interruption);
         assert!(!config.backend.virtualizes_capability_prctls);
         assert!(!config.backend.defers_vfork_child_registration);
-        assert!(!config.shared_dequeue_timers);
+        assert!(!config.sequentialize_threads);
+        assert!(
+            legacy_backend_keys(&config).contains(&("kvm_shared_dequeue_timers", false)),
+            "the default configuration must not write a controlled-run legacy key"
+        );
     }
 
     #[test]
@@ -2133,10 +2158,42 @@ mod tests {
         let mut encoded = serde_json::to_value(Config::default()).unwrap();
         let fields = encoded.as_object_mut().unwrap();
         assert!(fields.remove("backend").is_some());
-        assert!(fields.remove("shared_dequeue_timers").is_some());
+        assert!(!fields.contains_key("shared_dequeue_timers"));
         let decoded: Config = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded.backend, BackendCapabilities::PTRACE);
-        assert!(!decoded.shared_dequeue_timers);
+    }
+
+    /// `Config`'s own derived deserializer ignores a key it does not name, and
+    /// `shared_dequeue_timers` is no longer one it names, so JSON saved while
+    /// it was a field still reads and the key decides nothing, whatever it
+    /// holds and however often it appears. This is the whole compatibility
+    /// policy for the named form, and it is safe because no production code
+    /// reads a `Config` by field name: the guest-visible DBT form is read by
+    /// [`from_legacy_backend_json`], which checks the key, and the bincode form
+    /// that crosses process boundaries is positional. Removing the field
+    /// changed that positional form and [`config_wire_fingerprint`]. SaBRe's
+    /// plugin compares the fingerprint and refuses a coordinator from another
+    /// build; LiteInst's in-guest runtime does not, so a runtime library built
+    /// before the removal and loaded by a newer coordinator can misdecode the
+    /// Config and fail its initialization (exit 127). That mixed-build hazard
+    /// is not new: every change to the positional form has it.
+    #[test]
+    fn a_saved_shared_dequeue_timers_field_is_ignored() {
+        let baseline = serde_json::to_string(&Config::default()).unwrap();
+        for extra in [
+            r#""shared_dequeue_timers":false"#,
+            r#""shared_dequeue_timers":true"#,
+            r#""shared_dequeue_timers":"yes""#,
+            r#""shared_dequeue_timers":true,"shared_dequeue_timers":false"#,
+        ] {
+            let edited = baseline.replacen('{', &format!("{{{extra},"), 1);
+            let decoded: Config = serde_json::from_str(&edited).unwrap();
+            assert_eq!(
+                serde_json::to_string(&decoded).unwrap(),
+                baseline,
+                "{edited}"
+            );
+        }
     }
 
     /// Ptrace's capabilities with the robust-list transition and parked-write
@@ -2164,26 +2221,133 @@ mod tests {
             ("DBT", BackendCapabilities::DBT),
             ("KVM", BackendCapabilities::KVM),
         ] {
-            for shared_dequeue_timers in [false, true] {
+            for sequentialize_threads in [false, true] {
                 let sent = Config {
                     backend,
-                    shared_dequeue_timers,
+                    sequentialize_threads,
                     ..Config::default()
                 };
                 let json = to_legacy_backend_json(&sent).unwrap();
                 let received = from_legacy_backend_json(&json).unwrap();
                 assert_eq!(received.backend, backend, "{name}");
                 assert_eq!(
-                    received.shared_dequeue_timers, shared_dequeue_timers,
+                    received.sequentialize_threads, sequentialize_threads,
                     "{name}"
                 );
+                assert_controlled_key(&json, &backend, sequentialize_threads, name);
                 assert_eq!(
                     serde_json::to_string(&received).unwrap(),
                     serde_json::to_string(&sent).unwrap(),
                     "{name}"
                 );
                 assert_eq!(to_legacy_backend_json(&received).unwrap(), json, "{name}");
+                assert_controlled_key_is_checked(&json, &sent, name);
             }
+        }
+    }
+
+    /// `kvm_shared_dequeue_timers` is read independently of the other keys,
+    /// absent, false or true, and the parse succeeds exactly when the value
+    /// read (false when absent) equals `backend_is_kvm &&
+    /// sequentialize_threads`. Under that condition the accepted value is the
+    /// one the decoded capabilities and `sequentialize_threads` imply, so the
+    /// decoded configuration is the one sent; otherwise the error names the
+    /// key.
+    fn assert_controlled_key_is_checked(json: &str, sent: &Config, name: &str) {
+        let controlled = sent.backend.provides_process_signal_control && sent.sequentialize_threads;
+        let written = format!("\"kvm_shared_dequeue_timers\":{controlled}");
+        assert_eq!(json.matches(&written).count(), 1, "{name}");
+        for value in [None, Some(false), Some(true)] {
+            let edited = match value {
+                None => json.replacen(&format!(",{written}"), "", 1),
+                Some(value) => json.replacen(
+                    &written,
+                    &format!("\"kvm_shared_dequeue_timers\":{value}"),
+                    1,
+                ),
+            };
+            assert_eq!(
+                edited.contains("kvm_shared_dequeue_timers"),
+                value.is_some(),
+                "{name} {value:?}"
+            );
+            let case = format!(
+                "{name} sequentialize_threads={} key={value:?}",
+                sent.sequentialize_threads
+            );
+            match from_legacy_backend_json(&edited) {
+                Ok(received) => {
+                    assert_eq!(value.unwrap_or(false), controlled, "{case} was accepted");
+                    assert_eq!(
+                        serde_json::to_string(&received).unwrap(),
+                        serde_json::to_string(sent).unwrap(),
+                        "{case}"
+                    );
+                }
+                Err(error) => {
+                    assert_ne!(value.unwrap_or(false), controlled, "{case}: {error}");
+                    assert!(
+                        error.to_string().contains("kvm_shared_dequeue_timers"),
+                        "{case}: {error}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The four controlled-key outcomes that differ from simply ignoring the
+    /// key, spelled out: each would otherwise run a configuration on a path
+    /// other than the one the same JSON selected before.
+    #[test]
+    fn a_controlled_key_that_contradicts_the_capabilities_fails_the_parse() {
+        let kvm = Config {
+            backend: BackendCapabilities::KVM,
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let kvm_json = to_legacy_backend_json(&kvm).unwrap();
+        assert!(from_legacy_backend_json(&kvm_json).is_ok());
+        let dbt = Config {
+            backend: BackendCapabilities::DBT,
+            sequentialize_threads: true,
+            ..Config::default()
+        };
+        let dbt_json = to_legacy_backend_json(&dbt).unwrap();
+        assert!(from_legacy_backend_json(&dbt_json).is_ok());
+        for edited in [
+            // KVM, sequentialized, key false: the control was left uninstalled.
+            kvm_json.replacen(
+                r#""kvm_shared_dequeue_timers":true"#,
+                r#""kvm_shared_dequeue_timers":false"#,
+                1,
+            ),
+            // KVM, sequentialized, key absent: read as false, as before.
+            kvm_json.replacen(r#","kvm_shared_dequeue_timers":true"#, "", 1),
+            // No control capability, key true: the controlled loop was chosen.
+            dbt_json.replacen(
+                r#""kvm_shared_dequeue_timers":false"#,
+                r#""kvm_shared_dequeue_timers":true"#,
+                1,
+            ),
+            // KVM without sequentialized threads, key true.
+            to_legacy_backend_json(&Config {
+                sequentialize_threads: false,
+                ..kvm.clone()
+            })
+            .unwrap()
+            .replacen(
+                r#""kvm_shared_dequeue_timers":false"#,
+                r#""kvm_shared_dequeue_timers":true"#,
+                1,
+            ),
+        ] {
+            assert_ne!(edited, kvm_json);
+            assert_ne!(edited, dbt_json);
+            let error = from_legacy_backend_json(&edited).unwrap_err();
+            assert!(
+                error.to_string().contains("kvm_shared_dequeue_timers"),
+                "{error}"
+            );
         }
     }
 
@@ -2203,11 +2367,12 @@ mod tests {
         }
         let decoded = from_legacy_backend_json(&serde_json::to_string(&absent).unwrap()).unwrap();
         assert_eq!(decoded.backend, BackendCapabilities::PTRACE);
-        assert!(!decoded.shared_dequeue_timers);
+        let unflipped =
+            serde_json::to_string(&from_legacy_backend_json(&ptrace_json).unwrap()).unwrap();
+        assert_eq!(serde_json::to_string(&decoded).unwrap(), unflipped);
 
         for (key, ptrace_value) in keys {
             let mut expected = BackendCapabilities::PTRACE;
-            let mut expected_shared_dequeue_timers = false;
             match key {
                 "cpuid_virtualized_by_backend" => expected.virtualizes_cpuid = true,
                 "backend_supports_madvise" => expected.supports_madvise = false,
@@ -2241,7 +2406,19 @@ mod tests {
                     expected.user_address_limit =
                         Some(reverie::X86_64_FOUR_LEVEL_USER_ADDRESS_LIMIT);
                 }
-                "kvm_shared_dequeue_timers" => expected_shared_dequeue_timers = true,
+                "kvm_shared_dequeue_timers" => {
+                    // Set alone it contradicts `backend_is_kvm`, so the parse
+                    // fails; see
+                    // `a_controlled_key_that_contradicts_the_capabilities_fails_the_parse`.
+                    let mut flipped = ptrace.clone();
+                    flipped.insert(key.to_owned(), serde_json::Value::Bool(!ptrace_value));
+                    assert!(
+                        from_legacy_backend_json(&serde_json::to_string(&flipped).unwrap())
+                            .is_err(),
+                        "{key}"
+                    );
+                    continue;
+                }
                 "backend_supports_parked_write_signal_interruption" => {
                     expected.supports_parked_write_signal_interruption = false
                 }
@@ -2258,11 +2435,28 @@ mod tests {
             let decoded =
                 from_legacy_backend_json(&serde_json::to_string(&flipped).unwrap()).unwrap();
             assert_eq!(decoded.backend, expected, "{key}");
-            assert_eq!(
-                decoded.shared_dequeue_timers, expected_shared_dequeue_timers,
-                "{key}"
-            );
+            assert_ne!(serde_json::to_string(&decoded).unwrap(), unflipped, "{key}");
         }
+    }
+
+    /// The legacy `kvm_shared_dequeue_timers` key holds exactly when the
+    /// backend provides process signal control and threads are sequentialized,
+    /// the condition under which Detcore installs that control.
+    fn assert_controlled_key(
+        json: &str,
+        backend: &BackendCapabilities,
+        sequentialize_threads: bool,
+        name: &str,
+    ) {
+        let object: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(json).unwrap();
+        assert_eq!(
+            object["kvm_shared_dequeue_timers"],
+            serde_json::Value::Bool(
+                backend.provides_process_signal_control && sequentialize_threads
+            ),
+            "{name} sequentialize_threads={sequentialize_threads}"
+        );
     }
 
     /// A legacy key failed the parse when it held the wrong type, or appeared
@@ -2328,8 +2522,7 @@ mod tests {
 
     /// The legacy form's positions are `Config`'s fields in declaration order
     /// with the fifteen legacy keys where `backend` stands and no
-    /// `shared_dequeue_timers` or `record_host_inputs`, which is the key
-    /// order the encoder writes.
+    /// `record_host_inputs`, which is the key order the encoder writes.
     #[test]
     fn legacy_positions_are_the_encoded_key_order() {
         let names = legacy_backend_keys(&Config::default()).map(|(name, _)| name);
@@ -2344,7 +2537,7 @@ mod tests {
         for field in &fields {
             match field.as_str() {
                 "backend" => expected.extend(names.map(str::to_owned)),
-                "shared_dequeue_timers" | "record_host_inputs" => {}
+                "record_host_inputs" => {}
                 other => expected.push(other.to_owned()),
             }
         }
@@ -2354,9 +2547,9 @@ mod tests {
             .map(|(key, _)| key)
             .collect();
         assert_eq!(keys, expected);
-        // `backend` becomes fifteen keys; `shared_dequeue_timers` and
-        // `record_host_inputs` none.
-        assert_eq!(fields.len() + 12, keys.len());
+        // `backend` becomes fifteen keys; `record_host_inputs` none.
+        assert!(!fields.iter().any(|field| field == "shared_dequeue_timers"));
+        assert_eq!(fields.len() + 13, keys.len());
     }
 
     /// `record_host_inputs` never enters the legacy form, whatever its value:
@@ -2401,21 +2594,22 @@ mod tests {
             ("DBT", BackendCapabilities::DBT),
             ("KVM", BackendCapabilities::KVM),
         ] {
-            for shared_dequeue_timers in [false, true] {
+            for sequentialize_threads in [false, true] {
                 let sent = Config {
                     backend,
-                    shared_dequeue_timers,
+                    sequentialize_threads,
                     seed: 7,
                     chaos: true,
                     ..Config::default()
                 };
                 let json = to_legacy_backend_json(&sent).unwrap();
+                assert_controlled_key(&json, &backend, sequentialize_threads, name);
                 let array = positional(&json);
                 assert!(array.starts_with('['), "{array}");
                 let received = from_legacy_backend_json(&array).unwrap();
                 assert_eq!(received.backend, backend, "{name}");
                 assert_eq!(
-                    received.shared_dequeue_timers, shared_dequeue_timers,
+                    received.sequentialize_threads, sequentialize_threads,
                     "{name}"
                 );
                 assert_eq!(received.seed, 7, "{name}");
@@ -2580,7 +2774,11 @@ mod tests {
             ] {
                 let received = from_legacy_backend_json(&edited).unwrap();
                 assert_eq!(received.backend, BackendCapabilities::DBT, "{edited}");
-                assert!(!received.shared_dequeue_timers, "{edited}");
+                assert_eq!(
+                    serde_json::to_string(&received).unwrap(),
+                    serde_json::to_string(&sent).unwrap(),
+                    "{edited}"
+                );
                 assert_eq!(to_legacy_backend_json(&received).unwrap(), json, "{edited}");
             }
         }

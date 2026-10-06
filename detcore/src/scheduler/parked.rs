@@ -564,6 +564,16 @@ impl Scheduler {
         Ok(ack)
     }
 
+    /// Replaces the process's `ITIMER_REAL`.
+    ///
+    /// The installed control decides which timer model serves it: with a
+    /// control, the real timer follows the backend's acknowledged dequeues;
+    /// without one, Detcore's own alarm model in the timed waiters serves it.
+    /// A backend whose guest is reached only through the control never runs a
+    /// sequentialized guest without one: Detcore reports that need through
+    /// [`reverie::Tool::requires_signal_control`], and reverie-kvm refuses the
+    /// run before any guest code, with ENOSYS from the runner that has no
+    /// control to offer and EINVAL from a runner whose offer was not taken.
     pub(crate) fn replace_real_timer(
         &mut self,
         pid: DetPid,
@@ -573,10 +583,10 @@ impl Scheduler {
         interval: LogicalTime,
         signal: nix::sys::signal::Signal,
     ) -> Result<(LogicalTime, LogicalTime), TimerFailure> {
-        if !self.backend.provides_process_signal_control {
+        if !self.signal_control_installed() {
             return Ok(self.register_alarm(pid, tid, now, duration, interval, signal));
         }
-        if !self.shared_dequeue_timers || signal != nix::sys::signal::Signal::SIGALRM {
+        if signal != nix::sys::signal::Signal::SIGALRM {
             return Err(TimerFailure::Unsupported);
         }
         let (old, next) = self
@@ -598,7 +608,7 @@ impl Scheduler {
         pid: DetPid,
         now: LogicalTime,
     ) -> Result<super::real_timer::ItimerSnapshot, TimerFailure> {
-        if self.backend.provides_process_signal_control {
+        if self.signal_control_installed() {
             return self.real_timers.snapshot(pid, now);
         }
         Ok(match self.blocked.timed_waiters.alarm_state(pid) {
@@ -638,7 +648,7 @@ impl Scheduler {
         signal: nix::sys::signal::Signal,
         normal_due: bool,
     ) {
-        if self.shared_dequeue_timers && matches!(id, SignalTimerId::Alarm(_)) {
+        if self.signal_control_installed() && matches!(id, SignalTimerId::Alarm(_)) {
             if let Err(failure) = self.publish_real_expiry(id.process(), deadline) {
                 self.fail_parked(tid, failure);
             }

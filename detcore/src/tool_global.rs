@@ -1147,7 +1147,16 @@ impl GlobalTool for GlobalState {
         &self,
         control: Option<reverie::BackendSignalControl>,
     ) -> Result<reverie::BackendSignalControlMode, reverie::Error> {
-        self.sched.lock().unwrap().install_signal_control(control)
+        self.sched
+            .lock()
+            .unwrap()
+            .install_signal_control(control, self.cfg.sequentialize_threads)
+    }
+
+    /// Dequeues carry real-timer signals only in a run that installed the
+    /// backend's control; any other run leaves them to the guest kernel.
+    fn observe_signal_dequeues(&self, mode: reverie::BackendSignalControlMode) -> bool {
+        mode == reverie::BackendSignalControlMode::ToolControlled
     }
 
     fn authorize_backend_signal_boundary(
@@ -1596,7 +1605,7 @@ impl GlobalTool for GlobalState {
                 // the identity-transfer RPC. This successful-exec edge still
                 // commits the frozen sibling cohort in scheduler order.
                 let prepared = self.pending_exec_states.lock().unwrap().get(&dtid).cloned();
-                if self.cfg.shared_dequeue_timers {
+                if sched.signal_control_installed() {
                     let result = (|| {
                         let identity = signal_identity.ok_or(ProtocolFailure::Identity)?;
                         let pid = sched
@@ -2532,7 +2541,7 @@ impl GlobalState {
                 sched.logically_kill_thread(&dettid, &detpid, request_mm);
                 return SchedulerRpcResult::ThreadExited;
             }
-            if self.cfg.shared_dequeue_timers {
+            if sched.signal_control_installed() {
                 let binding = signal_identity
                     .ok_or(TimerFailure::Identity)
                     .and_then(|identity| {
@@ -3522,11 +3531,9 @@ where
     G: Guest<Detcore<T>>,
     T: RecordOrReplay,
 {
-    let signal_identity = guest
-        .config()
-        .shared_dequeue_timers
-        .then(|| guest.signal_task_identity())
-        .flatten();
+    let controlled =
+        guest.signal_control_mode() == reverie::BackendSignalControlMode::ToolControlled;
+    let signal_identity = controlled.then(|| guest.signal_task_identity()).flatten();
     let detpid = guest.thread_state().detpid.expect("detpid unset");
     let (_, response) = send_and_update_time(
         guest,
@@ -3537,7 +3544,7 @@ where
         GlobalResponse::MarkPastFirstExecve(overrides) => overrides,
         _ => unreachable!(),
     };
-    if guest.config().shared_dequeue_timers {
+    if controlled {
         guest.thread_state_mut().signal_task_identity = signal_identity;
     }
     if !overrides.is_empty() {

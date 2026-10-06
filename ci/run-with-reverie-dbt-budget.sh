@@ -972,7 +972,15 @@ fi
 # recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
 # second budget are unchanged. Carry, not recalibration: no new timing sample
 # or >=5-sample replacement claim is made.
-expected_pin=0c2d3db220a64da6aaf0a741b6d0ad225dd85e71
+# CARRY TO ffea36eee6d12c88f0d067837b76c6d0eb073866 (2026-10-06): from
+# 0c2d3db220a64da6aaf0a741b6d0ad225dd85e71. The one commit changes only reverie/src and
+# reverie-kvm (dequeue observation follows the installed signal control, and
+# a run that requires the control is refused when the Tool declines it); no
+# file under reverie-dbt, the root Cargo.toml, third-party or
+# rust-toolchain.toml changes, so the four budget inputs are unchanged.
+# Carry, not recalibration: no new timing sample or >=5-sample replacement
+# claim is made.
+expected_pin=ffea36eee6d12c88f0d067837b76c6d0eb073866
 
 # TAKE THE PIN, NOT WHATEVER ELSE THE PRODUCER PRINTED.
 #

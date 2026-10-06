@@ -3201,10 +3201,10 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // registers its vfork barrier only after the parent posts BlockedExternalContinue. ptrace keeps
     // the parent kernel-blocked until the child registers.
     config.backend = backend_capabilities(backend);
-    // Combined policy, not a backend fact: tool-controlled shared dequeue
-    // timers need the backend's process signal control and a serial schedule.
-    config.shared_dequeue_timers =
-        config.backend.provides_process_signal_control && config.sequentialize_threads;
+    // Whether the run's process signals are tool-controlled is not decided
+    // here: Detcore installs the backend's process signal control when the
+    // backend offers it and threads are sequentialized, and reads the installed
+    // control from then on.
     config
 }
 
@@ -5538,14 +5538,16 @@ mod tests {
         let nonsequential = prepare_backend_config(defaults, Backend::Kvm);
         assert!(nonsequential.backend.provides_process_signal_control);
         assert!(nonsequential.backend.emulates_child_waits);
-        assert!(!nonsequential.shared_dequeue_timers);
+        assert!(!may_observe_signal_dequeues(&nonsequential));
+        assert!(!requires_signal_control(&nonsequential));
 
         let config = super::DetConfig {
             sequentialize_threads: true,
             ..super::DetConfig::default()
         };
         let kvm = prepare_backend_config(config, Backend::Kvm);
-        assert!(kvm.shared_dequeue_timers);
+        assert!(may_observe_signal_dequeues(&kvm));
+        assert!(requires_signal_control(&kvm));
         assert!(kvm.backend.needs_killed_thread_rpc_cancellation);
         assert!(kvm.backend.tracks_process_children);
         assert!(!kvm.backend.runs_exit_robust_list);
@@ -5553,8 +5555,8 @@ mod tests {
         assert!(kvm.backend.virtualizes_capability_prctls);
         assert!(kvm.backend.defers_vfork_child_registration);
 
-        // Shared dequeue timers need both the backend's process-signal control
-        // and sequentialized threads; neither alone enables them.
+        // A controlled run needs both the backend's process-signal control and
+        // sequentialized threads; neither alone admits one.
         for backend in [
             Backend::Ptrace,
             Backend::Dbt,
@@ -5566,11 +5568,22 @@ mod tests {
                 sequentialize_threads: true,
                 ..super::DetConfig::default()
             };
-            assert!(
-                !prepare_backend_config(config, backend).shared_dequeue_timers,
-                "{backend:?}"
-            );
+            let prepared = prepare_backend_config(config, backend);
+            assert!(!may_observe_signal_dequeues(&prepared), "{backend:?}");
+            assert!(!requires_signal_control(&prepared), "{backend:?}");
         }
+    }
+
+    /// Whether Detcore asks the backend to install process signal control for
+    /// `config`: the bound Reverie checks before it offers the control.
+    fn may_observe_signal_dequeues(config: &DetConfig) -> bool {
+        <super::Detcore as reverie::Tool>::may_observe_signal_dequeues(config)
+    }
+
+    /// Whether Reverie must refuse `config` on a runner that offers no
+    /// process signal control, as Detcore's installation did before.
+    fn requires_signal_control(config: &DetConfig) -> bool {
+        <super::Detcore as reverie::Tool>::requires_signal_control(config)
     }
 
     /// The values the hand-written assignments in `prepare_backend_config` and
@@ -5744,7 +5757,12 @@ mod tests {
             let decoded = detcore::from_legacy_backend_json(before).unwrap();
             assert_eq!(decoded.backend, config.backend, "{name}");
             assert_eq!(
-                decoded.shared_dequeue_timers, config.shared_dequeue_timers,
+                decoded.sequentialize_threads, config.sequentialize_threads,
+                "{name}"
+            );
+            assert_eq!(
+                detcore::to_legacy_backend_json(&decoded).unwrap(),
+                before,
                 "{name}"
             );
         }

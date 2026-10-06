@@ -655,8 +655,9 @@ pub struct Scheduler {
     backend: BackendCapabilities,
     #[cfg(test)]
     host_signal_attempts: u64,
-    /// See [`Config::shared_dequeue_timers`].
-    shared_dequeue_timers: bool,
+    /// Turns that `do_a_turn_blocking` ran through the controlled loop.
+    #[cfg(test)]
+    controlled_turn_entries: u64,
     pub(crate) real_timers: real_timer::RealTimers,
     parked: parked::ParkedRequests,
 
@@ -1414,9 +1415,15 @@ pub async fn do_a_turn_blocking(
     global_time: Arc<Mutex<GlobalTime>>,
     last_turn: &Result<Resources, SkipTurn>,
 ) -> Result<Resources, SkipTurn> {
-    let controlled = sched.lock().unwrap().shared_dequeue_timers;
+    // Installed before the first guest thread registers, so every turn of a
+    // run takes the same branch.
+    let controlled = sched.lock().unwrap().signal_control_installed();
     if !controlled {
         return do_ordinary_turn_blocking(sched, global_time, last_turn).await;
+    }
+    #[cfg(test)]
+    {
+        sched.lock().unwrap().controlled_turn_entries += 1;
     }
     let result = async {
         // A control pause retains both its maintenance position and the unpaid
@@ -1763,7 +1770,8 @@ impl Scheduler {
             backend: cfg.backend,
             #[cfg(test)]
             host_signal_attempts: 0,
-            shared_dequeue_timers: cfg.shared_dequeue_timers,
+            #[cfg(test)]
+            controlled_turn_entries: 0,
             real_timers: Default::default(),
             parked: Default::default(),
             logically_killed_threads: Default::default(),

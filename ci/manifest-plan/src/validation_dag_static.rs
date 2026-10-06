@@ -781,7 +781,10 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // cargo nextest list).
     // detcore-sabre's tests::coordinator_fingerprint_survives_plugin_reinitialization
     // retains all 976 (977, measured with cargo nextest list --profile ci).
-    ("test.regular_crates", 977),
+    // detcore-model's config::tests::a_saved_shared_dequeue_timers_field_is_ignored
+    // and config::tests::a_controlled_key_that_contradicts_the_capabilities_fails_the_parse
+    // retain all 977 (979, measured with cargo nextest list --profile ci).
+    ("test.regular_crates", 979),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1140,7 +1143,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (https://github.com/rrnewton/hermit/pull/3686) retains all 970 prior
     // identities: 970 + 1 = 971, measured with cargo nextest list --profile ci
     // -p hermit-detcore --lib --bins.
-    ("test.detcore_unit", 971),
+    // scheduler::parked_tests::signal_control_is_installed_when_offered_in_a_sequentialized_run,
+    // scheduler::parked_tests::signal_control_cannot_be_installed_after_the_run_started,
+    // scheduler::parked_tests::backends_without_signal_control_never_enter_the_controlled_loop
+    // and scheduler::parked_tests::real_timers_follow_the_installed_control
+    // retain all 971: 971 + 4 = 975, measured with cargo nextest list
+    // --profile ci -p hermit-detcore --lib --bins.
+    ("test.detcore_unit", 975),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1510,7 +1519,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the three untraced-code tests (970).
     // The host twin selects the same
     // https://github.com/rrnewton/hermit/pull/3686 logdiff test: 970 + 1 = 971.
-    ("test.detcore_unit_on_host", 971),
+    // The same four signal-control tests retain all 971: 975.
+    ("test.detcore_unit_on_host", 975),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1638,7 +1648,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The row-recording exact-branch-counter test listed there retains all 974: 975.
     // The report exact-branch-counter test listed there retains all 975: 976.
     // The same detcore-sabre fingerprint test retains all 976: 977.
-    ("test.regular_crates_on_host", 977),
+    // The two shared_dequeue_timers tests listed there retain all 977: 979.
+    ("test.regular_crates_on_host", 979),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).

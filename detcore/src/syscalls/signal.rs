@@ -575,7 +575,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         target_process: Option<DetPid>,
         target_thread: Option<DetTid>,
     ) -> bool {
-        if !self.cfg.shared_dequeue_timers {
+        if guest.signal_control_mode() != reverie::BackendSignalControlMode::ToolControlled {
             return false;
         }
         let (current_thread, mm) = {

@@ -1141,8 +1141,23 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     type GlobalState = GlobalState;
     type ThreadState = ThreadState<T::ThreadState>;
 
-    fn observe_signal_dequeues(config: &Config) -> bool {
-        config.shared_dequeue_timers && config.sequentialize_threads
+    /// Only a sequentialized run on a backend with process signal control
+    /// can install that control. Whether this run observes dequeues is
+    /// decided after installation by [`GlobalState`]'s
+    /// `GlobalTool::observe_signal_dequeues`.
+    fn may_observe_signal_dequeues(config: &Config) -> bool {
+        config.backend.provides_process_signal_control && config.sequentialize_threads
+    }
+
+    /// The same runs require the control: real-timer signals on such a run
+    /// travel only through acknowledged shared dequeues. Reverie refuses it
+    /// before any guest code, with ENOSYS on a runner that offers no control,
+    /// as Detcore's own installation did before this check moved into
+    /// Reverie, and with EINVAL on a runner whose offer was not taken. So
+    /// Detcore's scheduler needs no refusal of its own for a capable backend
+    /// without a control.
+    fn requires_signal_control(config: &Config) -> bool {
+        config.backend.provides_process_signal_control && config.sequentialize_threads
     }
 
     async fn handle_signal_dequeue<G: Guest<Self>>(

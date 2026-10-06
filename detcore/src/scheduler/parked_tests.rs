@@ -15,6 +15,7 @@ use std::task::Poll;
 use reverie::BackendChildWaitEvent;
 use reverie::BackendChildWaitState;
 use reverie::BackendSignalControl;
+use reverie::BackendSignalControlMode;
 use reverie::ChildExitCompletion;
 use reverie::ChildExitPublication;
 use reverie::ChildExitPublicationEffect;
@@ -31,6 +32,7 @@ use reverie::SignalRecipient;
 use reverie::SignalTaskIdentity;
 
 use super::parked::*;
+use super::real_timer::TimerFailure;
 use super::*;
 
 #[derive(Default)]
@@ -191,8 +193,15 @@ fn task(pid: i32, tid: i32) -> SignalTaskIdentity {
     }
 }
 fn fixture() -> (Scheduler, Arc<Backend>) {
+    fixture_with_control(true)
+}
+/// A scheduler for a backend that reports the KVM capabilities. With
+/// `installed`, it holds a fake installed process signal control, as a
+/// sequentialized run on that backend does; without, the backend offered
+/// nothing and the run is not controlled.
+fn fixture_with_control(installed: bool) -> (Scheduler, Arc<Backend>) {
     let mut s = Scheduler::new(&Config {
-        shared_dequeue_timers: true,
+        sequentialize_threads: true,
         ..Config::default().with_backend(|backend| {
             // The five behaviours the old `backend_is_kvm` identity flag selected.
             backend.provides_process_signal_control = true;
@@ -204,10 +213,19 @@ fn fixture() -> (Scheduler, Arc<Backend>) {
         })
     });
     let backend = Arc::new(Backend::default());
-    s.install_signal_control(Some(BackendSignalControl {
-        process: backend.clone(),
-    }))
-    .unwrap();
+    if installed {
+        assert_eq!(
+            s.install_signal_control(
+                Some(BackendSignalControl {
+                    process: backend.clone(),
+                }),
+                true,
+            )
+            .unwrap(),
+            BackendSignalControlMode::ToolControlled
+        );
+    }
+    assert_eq!(s.signal_control_installed(), installed);
     (s, backend)
 }
 fn add(s: &mut Scheduler, pid: i32, tid: i32) -> (DetTid, MmId, reverie::CallbackSignalSite) {
@@ -2318,8 +2336,7 @@ fn timed_maintenance_preserves_reference_selection_and_clock() {
     use futures::FutureExt;
 
     let observe = |controlled| {
-        let (mut s, backend) = fixture();
-        s.shared_dequeue_timers = controlled;
+        let (mut s, backend) = fixture_with_control(controlled);
         let mut expected_time = GlobalTime::new(&Config::default());
         let start = expected_time.as_nanos();
         let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
@@ -3352,4 +3369,243 @@ fn child_wait_cross_signal_rejects_conflicting_ownership_before_rewrite() {
     );
     assert!(response.try_read().is_none());
     assert!(b.permits.lock().unwrap().is_empty());
+}
+
+/// A scheduler for `backend` with sequentialized threads set as given.
+fn scheduler_for(backend: BackendCapabilities, sequentialize_threads: bool) -> Scheduler {
+    Scheduler::new(&Config {
+        sequentialize_threads,
+        backend,
+        ..Config::default()
+    })
+}
+
+/// The decision is the backend's offer and Detcore's own sequentialization:
+/// an offer in a sequentialized run is installed, and no offer, or a run that
+/// is not sequentialized, leaves the run unchanged. An offer that contradicts
+/// the backend's reported capabilities is refused rather than resolved either
+/// way, because Reverie bounds dequeue observation by those capabilities.
+/// Refusing a missing control is reverie-kvm's job, not this one.
+#[test]
+fn signal_control_is_installed_when_offered_in_a_sequentialized_run() {
+    for (name, backend) in [
+        ("PTRACE", BackendCapabilities::PTRACE),
+        ("E9PATCH", BackendCapabilities::E9PATCH),
+        ("LITEINST_IN_GUEST", BackendCapabilities::LITEINST_IN_GUEST),
+        ("SABRE", BackendCapabilities::SABRE),
+        ("DBT", BackendCapabilities::DBT),
+        ("KVM", BackendCapabilities::KVM),
+    ] {
+        // Only KVM reports the capability, so it is the only backend whose
+        // offer can be coherent.
+        assert_eq!(
+            backend.provides_process_signal_control,
+            name == "KVM",
+            "{name}"
+        );
+        for sequentialize in [false, true] {
+            for offered in [false, true] {
+                let mut s = scheduler_for(backend, sequentialize);
+                let control = offered.then(|| BackendSignalControl {
+                    process: Arc::new(Backend::default()),
+                });
+                let result = s.install_signal_control(control, sequentialize);
+                let case = format!("{name} sequentialize={sequentialize} offered={offered}");
+                let installs = offered && sequentialize;
+                match (installs, backend.provides_process_signal_control) {
+                    (true, true) => {
+                        assert_eq!(
+                            result.unwrap(),
+                            BackendSignalControlMode::ToolControlled,
+                            "{case}"
+                        );
+                    }
+                    (true, false) => {
+                        assert!(
+                            matches!(
+                                result,
+                                Err(reverie::Error::Errno(reverie::syscalls::Errno::EINVAL))
+                            ),
+                            "{case}: {result:?}"
+                        );
+                    }
+                    (false, _) => {
+                        assert_eq!(
+                            result.unwrap(),
+                            BackendSignalControlMode::Unchanged,
+                            "{case}"
+                        );
+                    }
+                }
+                assert_eq!(
+                    s.signal_control_installed(),
+                    installs && backend.provides_process_signal_control,
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
+/// The installation is decided once, before the first turn: a second offer,
+/// or an offer after a guest thread registered or a turn ran, is refused and
+/// leaves the earlier answer in place.
+#[test]
+fn signal_control_cannot_be_installed_after_the_run_started() {
+    let offer = || {
+        Some(BackendSignalControl {
+            process: Arc::new(Backend::default()),
+        })
+    };
+    let einval = |result: Result<BackendSignalControlMode, reverie::Error>| {
+        matches!(
+            result,
+            Err(reverie::Error::Errno(reverie::syscalls::Errno::EINVAL))
+        )
+    };
+
+    let (mut s, _) = fixture();
+    assert!(einval(s.install_signal_control(offer(), true)));
+    assert!(s.signal_control_installed());
+
+    type StartTheRun = fn(&mut Scheduler);
+    let late: [(&str, StartTheRun); 3] = [
+        ("a pending turn", |s| {
+            add(s, 100, 100);
+        }),
+        ("a completed turn", |s| s.turn = 1),
+        ("a registered guest thread", |s| {
+            s.started_up.try_put(());
+        }),
+    ];
+    for (name, start) in late {
+        let mut s = scheduler_for(BackendCapabilities::KVM, true);
+        start(&mut s);
+        assert!(einval(s.install_signal_control(offer(), true)), "{name}");
+        assert!(!s.signal_control_installed(), "{name}");
+    }
+}
+
+/// A run on a backend without process signal control never enters the
+/// controlled turn loop, even when it is sequentialized and a control is
+/// offered: the offer is refused and the turn takes the ordinary path. KVM,
+/// the one backend with the capability, is the positive control.
+#[test]
+fn backends_without_signal_control_never_enter_the_controlled_loop() {
+    use futures::FutureExt;
+
+    for (name, backend, controlled) in [
+        ("PTRACE", BackendCapabilities::PTRACE, false),
+        ("E9PATCH", BackendCapabilities::E9PATCH, false),
+        (
+            "LITEINST_IN_GUEST",
+            BackendCapabilities::LITEINST_IN_GUEST,
+            false,
+        ),
+        ("SABRE", BackendCapabilities::SABRE, false),
+        ("DBT", BackendCapabilities::DBT, false),
+        ("KVM", BackendCapabilities::KVM, true),
+    ] {
+        let mut s = scheduler_for(backend, true);
+        let result = s.install_signal_control(
+            Some(BackendSignalControl {
+                process: Arc::new(Backend::default()),
+            }),
+            true,
+        );
+        if controlled {
+            assert_eq!(
+                result.unwrap(),
+                BackendSignalControlMode::ToolControlled,
+                "{name}"
+            );
+        } else {
+            // The incoherent offer is refused; the run goes on uncontrolled.
+            assert!(
+                matches!(
+                    result,
+                    Err(reverie::Error::Errno(reverie::syscalls::Errno::EINVAL))
+                ),
+                "{name}: {result:?}"
+            );
+        }
+        assert_eq!(s.signal_control_installed(), controlled, "{name}");
+        let (r, _, _) = add(&mut s, 100, 100);
+        s.next_turns[&r].req.put(Ok(Resources::new(r)));
+        s.runqueue_push_back(r);
+        let scheduler = Arc::new(Mutex::new(s));
+        let global = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        let result = do_a_turn_blocking(scheduler.clone(), global, &Ok(Resources::new(r)))
+            .now_or_never()
+            .expect("a quiescent request must not block the turn")
+            .expect("the only runnable thread must commit");
+        assert_eq!(result.tid, r, "{name}");
+        let s = scheduler.lock().unwrap();
+        assert_eq!(s.turn, 1, "{name}");
+        assert_eq!(s.controlled_turn_entries, u64::from(controlled), "{name}");
+    }
+}
+
+/// Where a real timer goes is decided by the installed control alone. Without
+/// one, Detcore's alarm model serves it, whatever the backend's capabilities.
+/// A backend with process signal control never runs a sequentialized guest
+/// without the control: reverie-kvm refuses that run before any guest code,
+/// because Detcore reports the need through
+/// `reverie::Tool::requires_signal_control`. So a capable scheduler without a
+/// control is reached only in this test, and it gets no refusal of its own.
+/// An installed control drives SIGALRM and refuses any other timer signal.
+#[test]
+fn real_timers_follow_the_installed_control() {
+    let pid = DetTid::from_raw(100);
+
+    // No installed control: Detcore's own alarm model, with or without the
+    // capability, sequentialized or not.
+    for (name, mut s) in [
+        ("KVM capability, no control", fixture_with_control(false).0),
+        ("PTRACE", scheduler_for(BackendCapabilities::PTRACE, false)),
+        (
+            "PTRACE sequentialized",
+            scheduler_for(BackendCapabilities::PTRACE, true),
+        ),
+    ] {
+        assert!(!s.signal_control_installed(), "{name}");
+        assert_eq!(
+            s.replace_real_timer(pid, pid, at(0), at(10), at(3), Signal::SIGALRM),
+            Ok((at(0), at(0))),
+            "{name}"
+        );
+        assert_eq!(
+            s.blocked.timed_waiters.alarm_state(pid),
+            Some((at(10), at(3))),
+            "{name}"
+        );
+        assert_eq!(
+            s.itimer_snapshot(pid, at(4)),
+            Ok(super::real_timer::ItimerSnapshot {
+                remaining: at(6),
+                interval: at(3),
+            }),
+            "{name}"
+        );
+    }
+
+    // An installed control: the process's real timer, SIGALRM only.
+    let (mut s, _) = fixture();
+    let (tid, _, _) = add(&mut s, 100, 100);
+    assert_eq!(
+        s.replace_real_timer(pid, tid, at(0), at(10), at(3), Signal::SIGVTALRM),
+        Err(TimerFailure::Unsupported)
+    );
+    assert_eq!(
+        s.replace_real_timer(pid, tid, at(0), at(10), at(3), Signal::SIGALRM),
+        Ok((at(0), at(0)))
+    );
+    assert_eq!(s.blocked.timed_waiters.alarm_state(pid), None);
+    assert_eq!(
+        s.itimer_snapshot(pid, at(4)),
+        Ok(super::real_timer::ItimerSnapshot {
+            remaining: at(6),
+            interval: at(3),
+        })
+    );
 }

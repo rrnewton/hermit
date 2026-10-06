@@ -234,18 +234,63 @@ impl Scheduler {
         std::mem::take(&mut self.parked.failure_wakes)
     }
 
+    /// Answers the backend's offer of its process signal control, once per
+    /// run, before any guest thread exists.
+    ///
+    /// The offer and Detcore's own `sequentialize` decide. Detcore takes an
+    /// offered control when threads are sequentialized: real-timer signals then
+    /// travel through acknowledged shared dequeues, which only a serial
+    /// schedule can order. Without an offer, or without sequentialized
+    /// threads, the run stays `Unchanged`. A backend refuses a run that needs a
+    /// control it does not hold: Detcore reports the need through
+    /// [`reverie::Tool::requires_signal_control`]. Reverie's non-ELF KVM
+    /// runner, which has none to offer, returns ENOSYS after GlobalState is
+    /// initialized (so its startup records are kept) and before it is asked
+    /// to install anything; its runners that offer one return EINVAL when the
+    /// answer is not `ToolControlled`, which this method never gives for a
+    /// sequentialized run that it does not refuse itself.
+    ///
+    /// Two offers are refused with EINVAL rather than answered:
+    ///
+    /// - one that comes after a guest thread registered, after a turn, or after
+    ///   an earlier installation, because the answer is fixed before the first
+    ///   turn;
+    /// - one from a backend whose capabilities do not report
+    ///   `provides_process_signal_control`. That capability is what
+    ///   [`reverie::Tool::may_observe_signal_dequeues`] reads before any Tool
+    ///   state exists, and the backend observes dequeues only within that
+    ///   bound, so a control taken outside it would never see the dequeues it
+    ///   orders. The contradiction is refused, never resolved silently either
+    ///   way.
     pub(crate) fn install_signal_control(
         &mut self,
         control: Option<BackendSignalControl>,
+        sequentialize: bool,
     ) -> Result<BackendSignalControlMode, reverie::Error> {
-        if !self.shared_dequeue_timers {
+        let Some(control) = control else {
+            return Ok(BackendSignalControlMode::Unchanged);
+        };
+        if !sequentialize {
             return Ok(BackendSignalControlMode::Unchanged);
         }
-        if self.parked.control.is_some() || !self.next_turns.is_empty() {
+        if !self.backend.provides_process_signal_control
+            || self.parked.control.is_some()
+            || !self.next_turns.is_empty()
+            || self.turn != 0
+            || self.started_up.try_read().is_some()
+        {
             return Err(reverie::syscalls::Errno::EINVAL.into());
         }
-        self.parked.control = Some(control.ok_or(reverie::syscalls::Errno::ENOSYS)?);
+        self.parked.control = Some(control);
         Ok(BackendSignalControlMode::ToolControlled)
+    }
+
+    /// Whether this run installed the backend's process signal control: the
+    /// scheduler then runs the controlled turn loop and real-timer SIGALRM
+    /// goes through acknowledged shared dequeues. Fixed before the first turn
+    /// by [`Self::install_signal_control`].
+    pub(crate) fn signal_control_installed(&self) -> bool {
+        self.parked.control.is_some()
     }
 
     pub(crate) fn authorize_signal_boundary(
