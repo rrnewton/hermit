@@ -1685,9 +1685,9 @@ where
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
         let _ = resource_request(guest, rsrc.clone()).await;
-        match signals.interrupted(guest).await {
-            Ok(false) => {}
-            Ok(true) => {
+        let state = match signals.interrupted_with_state(guest).await {
+            Ok((false, state)) => state,
+            Ok((true, _)) => {
                 let errno = call0.kernel_restart_errno();
                 tracing::trace!(
                     "retry_nonblocking_syscall: pending signals interrupt {}: {:?}",
@@ -1697,9 +1697,9 @@ where
                 break Err(errno.into());
             }
             Err(error) => break Err(error),
-        }
+        };
         // Never `inject_with_retry`: see `KernelSignalWait`.
-        let syscall_result = match signals.inject_absorbing(guest, call).await {
+        let syscall_result = match signals.inject_absorbing_after(guest, call, state).await {
             Ok(result) => result,
             Err(error) => {
                 tracing::trace!(
@@ -1924,6 +1924,19 @@ impl KernelSignalWait {
         T: RecordOrReplay,
         G: Guest<Detcore<T>>,
     {
+        Ok(self.interrupted_with_state(guest).await?.0)
+    }
+
+    /// `interrupted`, also returning the kernel's state that it read, which
+    /// `inject_absorbing_after` takes as its first read in the same turn.
+    pub(crate) async fn interrupted_with_state<T, G>(
+        &self,
+        guest: &mut G,
+    ) -> Result<(bool, KernelSignalState), Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
         let state = read_wait_signal_state(self.pid, self.tid)?;
         let could_interrupt = self.could_interrupt(&state);
         let held = self.held.map_or(0, |held| kernel_sigset_bit(held.signal));
@@ -1936,7 +1949,7 @@ impl KernelSignalWait {
                 interrupting
             );
         }
-        Ok(interrupting != 0)
+        Ok((interrupting != 0, state))
     }
 
     /// Inject `call`, a probe or a mask change, absorbing the signal stops that do
@@ -1946,9 +1959,10 @@ impl KernelSignalWait {
     /// kernel and held by the backend, which delivers it when the guest resumes,
     /// and the injection returns a restart errno instead of the call's result.
     /// The backend does not say which signal it holds, so the kernel's state is
-    /// read just before each injection, which names the signal the kernel
-    /// dequeues next (`KernelSignalState::next_dequeued`), and again after a
-    /// stop. The stop is identified only if exactly that signal left its queue
+    /// read before each injection (in a polling turn under the full mask, the
+    /// turn's own read: `inject_absorbing_after`), which names the signal the
+    /// kernel dequeues next (`KernelSignalState::next_dequeued`), and again
+    /// after a stop. The stop is identified only if exactly that signal left its queue
     /// and the mask and dispositions did not change; it then decides:
     ///
     /// - A signal the wait consumes (`consumed`) ends it with `ERESTARTNOINTR`:
@@ -1984,12 +1998,67 @@ impl KernelSignalWait {
         G: Guest<Detcore<T>>,
         S: SyscallInfo,
     {
+        self.inject_absorbing_from(guest, call, None).await
+    }
+
+    /// `inject_absorbing` in a turn whose `interrupted_with_state` read `state`
+    /// and found no signal that ends the wait.
+    ///
+    /// Once `block` has blocked every blockable signal (`saved_mask`), `state`
+    /// serves as the first read before the injection, so a polling turn reads
+    /// `/proc` once, as it did before injections absorbed stops. Between the two
+    /// reads the guest thread stays stopped and only it can change its own mask,
+    /// and with threads sequentialized no other guest thread runs in its turn, so
+    /// a signal that arrives meanwhile arrives at a host-timed moment: sent from
+    /// outside the guest, or posted by the kernel. Under the full mask a
+    /// blockable one stays pending, cannot stop the injection, and is classified
+    /// at the next turn's read, as one that arrives just after a fresh read is.
+    /// One that cannot be blocked and stops the injection is not named by
+    /// `state`, so the stop is not identified and ends the wait with the restart
+    /// errno, as a stop by a signal that arrives just after a fresh read does.
+    /// `interrupted` found no signal in `state` that ends the wait, so the check
+    /// before the injection does not end it either.
+    ///
+    /// Before `block` takes effect, or when it cannot, the probe runs under the
+    /// guest's own mask and a fresh read is taken, so a signal that arrived
+    /// after `state` is still identified or ends the wait before the injection.
+    pub(crate) async fn inject_absorbing_after<T, G, S>(
+        &mut self,
+        guest: &mut G,
+        call: S,
+        state: KernelSignalState,
+    ) -> Result<Result<i64, Errno>, Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+        S: SyscallInfo,
+    {
+        let first = self.saved_mask.is_some().then_some(state);
+        self.inject_absorbing_from(guest, call, first).await
+    }
+
+    /// `inject_absorbing`, taking `first`, if any, as the state read before the
+    /// first injection.
+    async fn inject_absorbing_from<T, G, S>(
+        &mut self,
+        guest: &mut G,
+        call: S,
+        mut first: Option<KernelSignalState>,
+    ) -> Result<Result<i64, Errno>, Error>
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+        S: SyscallInfo,
+    {
         // Each absorbed stop takes one signal off a kernel queue, so only signals
         // sent faster than the injections run can reach this.
         const MAX_ABSORBED_STOPS: usize = 64;
         let mut absorbed = 0;
         loop {
-            let before = read_wait_signal_state(self.pid, self.tid)?;
+            let before = match first.take() {
+                Some(state) => state,
+                None => read_wait_signal_state(self.pid, self.tid)?,
+            };
             let mut ends_wait = self.could_interrupt(&before);
             if self.gates_sigchld(guest) {
                 ends_wait &= !kernel_sigset_bit(libc::SIGCHLD);
