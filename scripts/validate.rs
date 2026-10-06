@@ -31050,8 +31050,10 @@ mod memory_cap_near_miss_tests {
         cells
     }
 
-    /// The two `doc.rustdoc` rows of hermit 0a2e0c24 (2026-10-06), copied from
-    /// the step-profile CSVs of the Buck and Cargo validate runs.
+    /// The two `doc.rustdoc` rows of hermit 0a2e0c24 (2026-10-06). Every column
+    /// set here or by `boxed_row` matches the step-profile CSV row of the Buck
+    /// run (validate-claude-coord-0a2e0c248258-1791256374756074866-436968-5ad00e9e)
+    /// and the Cargo run (validate-tick-buck-cargo-repro-0a2e0c248258-20261006T034408Z).
     fn motivating_rows() -> (BTreeMap<String, String>, BTreeMap<String, String>) {
         let buck_pass = boxed_row(
             "doc.rustdoc",
@@ -31061,17 +31063,19 @@ mod memory_cap_near_miss_tests {
                 ("memory_events_max", "9608"),
             ],
         );
+        // The peak sits one page ABOVE the cap: the kernel's own accounting.
         let cargo_oom = boxed_row(
             "doc.rustdoc",
             &[
                 ("ok", "false"),
-                ("returncode", "137"),
+                ("returncode", "-9"),
                 ("oom_kills", "13"),
-                ("peak_bytes", "3221225472"),
+                ("peak_bytes", "3221229568"),
                 ("memory_max_bytes", "3221225472"),
                 ("memory_events_max", "42600"),
-                ("memory_events_oom", "13"),
+                ("memory_events_oom", "2"),
                 ("memory_events_oom_kill", "13"),
+                ("memory_events_oom_group_kill", "1"),
             ],
         );
         (buck_pass, cargo_oom)
