@@ -4313,6 +4313,16 @@ sys.exit(37)
         }
     }
 
+    /// The generated DAG, read from the committed ci/dag/validate.json compiled
+    /// into this test binary. full_generator_refuses_static_artifact_mutations
+    /// asserts that `generate` emits exactly these bytes, so the other tests read
+    /// them rather than regenerating. Regenerating runs scripts/validate.rs, which
+    /// outside validate (where it is prebuilt) rust-script compiles first: 67 s wall
+    /// for a cold export at load ~265 on 2026-10-06, against nextest's 57 s limit.
+    fn generated_dag() -> DagConfig {
+        dag_from_json(include_str!("../../dag/validate.json")).unwrap()
+    }
+
     #[test]
     fn full_generator_refuses_static_artifact_mutations() {
         let root = crate::git_environment::checkout_root();
@@ -4562,8 +4572,7 @@ sys.exit(37)
         // $E2E_RESULT_ROOT/portable/manifest_compat/results.jsonl. That is safe
         // only while no run type selects two of them: a run selects one label,
         // so their label sets must be non-empty and pairwise disjoint.
-        let root = crate::git_environment::checkout_root();
-        let dag = generate(&root).unwrap();
+        let dag = generated_dag();
         let mut writers: BTreeMap<String, Vec<&Step>> = BTreeMap::new();
         for step in &dag.steps {
             for flag in ["--results", "--junit"] {
@@ -4604,7 +4613,7 @@ sys.exit(37)
     #[test]
     fn new_plans_never_request_a_ptrace_parity_reference() {
         let root = crate::git_environment::checkout_root();
-        let dag = generate(&root).unwrap();
+        let dag = generated_dag();
         assert_eq!(
             dag.steps
                 .iter()
