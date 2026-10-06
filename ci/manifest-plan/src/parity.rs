@@ -1793,6 +1793,56 @@ impl PostPassConfig {
         path_text(path)
     }
 
+    /// `text` as a record carries it: each path below a
+    /// [`PostPassConfig::record_roots`] root that `text` quotes is named as
+    /// [`PostPassConfig::record_path`] names it (whole components only; the
+    /// longest root first). A record's reason quotes the harness's own
+    /// messages, which name result-root and checkout paths, and the public
+    /// parity ledger refuses a record that names a workspace-local host path.
+    pub fn record_text(&self, text: &str) -> String {
+        let mut text = text.to_string();
+        for (root, name) in &self.record_roots {
+            let root = path_text(root);
+            let root = root.trim_end_matches('/');
+            if root.is_empty() {
+                continue;
+            }
+            let name = name.trim_end_matches('/');
+            let mut renamed = String::with_capacity(text.len());
+            let mut rest = text.as_str();
+            while let Some(at) = rest.find(root) {
+                let after = &rest[at + root.len()..];
+                renamed.push_str(&rest[..at]);
+                // A component boundary: the root ends the path or a separator follows.
+                let whole = after.chars().next().is_none_or(|next| {
+                    next == '/' || !(next.is_alphanumeric() || "._-".contains(next))
+                });
+                renamed.push_str(if whole { name } else { root });
+                rest = after;
+            }
+            renamed.push_str(rest);
+            text = renamed;
+        }
+        text
+    }
+
+    /// `record` with its free text ([`ParityRecord::reason`] and the first
+    /// difference's messages) passed through [`PostPassConfig::record_text`].
+    pub fn public_record(&self, mut record: ParityRecord) -> ParityRecord {
+        let rename = |text: &mut Option<String>| {
+            if let Some(value) = text.as_mut() {
+                *value = self.record_text(value);
+            }
+        };
+        rename(&mut record.reason);
+        if let Some(difference) = record.first_difference.as_mut() {
+            rename(&mut difference.field);
+            rename(&mut difference.reference_message);
+            rename(&mut difference.candidate_message);
+        }
+        record
+    }
+
     /// Write every output below `output_dir` instead of `artifacts`, which is
     /// then only read. A golden the harness already wrote below `artifacts`
     /// is still reused when the reference's retained log is gone.
@@ -2726,7 +2776,9 @@ fn measure(
         .into_iter()
         .zip(scope)
         .map(|(record, cell)| {
-            record.ok_or_else(|| format!("parity post-pass produced no record for {cell}"))
+            record
+                .map(|record| config.public_record(record))
+                .ok_or_else(|| format!("parity post-pass produced no record for {cell}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
     let mut text = String::new();
@@ -6985,6 +7037,64 @@ mod tests {
             container.record_path(Path::new("/results/runs/r/log")),
             "/results/runs/r/log"
         );
+        // A reason quotes the harness's messages: the same roots are renamed in
+        // free text, on whole components only.
+        assert_eq!(
+            config.record_text(
+                "report /host/run/e2e/runs/v/verify-1.json cannot support a verdict; \
+                 /host/run/e2e2/log and /host/checkout/target/x stay apart from \
+                 /host/checkoutX and /host/run/e2e"
+            ),
+            "report /results/runs/v/verify-1.json cannot support a verdict; \
+             /host/run/e2e2/log and /src/target/x stay apart from /host/checkoutX and /results"
+        );
+        assert_eq!(
+            nested.record_text("/c/target/results/runs/log beside /c/target/other/log"),
+            "/results/runs/log beside /src/target/other/log"
+        );
+        // The record written to the ledger: a pressure-test reason quoting a
+        // retained verify report under the host result root, and a first
+        // difference quoting a checkout path, carry the public names.
+        let mut record = ParityRecord::unmeasured(
+            &ParityCellId {
+                test_id: "compat/bzip2-roundtrip".to_string(),
+                backend: ParityBackend::Sabre,
+            },
+            ParityVerdict::Unavailable,
+            UnavailableClass::NoResultRow,
+            Some(ParityOperand::Reference),
+            false,
+            "the ptrace reference verify cell of compat/bzip2-roundtrip: verification report \
+             /host/run/e2e/runs/r/verify-1.json cannot support a product verdict",
+            None,
+            None,
+            "run",
+            SHA,
+        )
+        .unwrap();
+        record.first_difference = Some(ParityFirstDifference {
+            field: None,
+            syscall: None,
+            scheduler_turn: None,
+            virtual_nanoseconds: None,
+            reference_message: Some("open /host/checkout/fixture".to_string()),
+            candidate_message: None,
+        });
+        let public = config.public_record(record);
+        assert_eq!(
+            public.reason.as_deref(),
+            Some(
+                "the ptrace reference verify cell of compat/bzip2-roundtrip: verification report \
+                 /results/runs/r/verify-1.json cannot support a product verdict"
+            )
+        );
+        assert_eq!(
+            public
+                .first_difference
+                .and_then(|difference| difference.reference_message)
+                .as_deref(),
+            Some("open /src/fixture")
+        );
         // A caller that names no roots records every path as found.
         let unnamed = PostPassConfig::new(Path::new("/a"), Path::new("/bin/hermit"), "run", SHA);
         assert_eq!(
@@ -7021,6 +7131,18 @@ mod tests {
             {
                 assert!(path.starts_with("/results/"), "{record:?}");
                 assert!(!path.contains(&host), "{record:?}");
+            }
+            // The free text names no host path either.
+            let difference = record.first_difference.as_ref();
+            for text in [
+                record.reason.as_ref(),
+                difference.and_then(|d| d.reference_message.as_ref()),
+                difference.and_then(|d| d.candidate_message.as_ref()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                assert!(!text.contains(&host), "{record:?}");
             }
         }
         let matched = written
