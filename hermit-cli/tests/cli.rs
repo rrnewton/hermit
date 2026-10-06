@@ -12499,9 +12499,15 @@ fn liteinst_in_guest_verify_survives_a_guest_stderr_without_a_reader() {
 /// Forwarded records count against the log's size bound
 /// (`HERMIT_LOG_MAX_BYTES`), and a log they push past it still ends in the
 /// truncation marker, so the comparison is refused (`no_result`) instead of
-/// comparing records that were cut. The bound is chosen so Hermit's own records
-/// for `/bin/echo` (about 40 KB) fit and the forwarded ones (about 36 KB more)
-/// do not; the retained log proves the first half of that.
+/// comparing records that were cut. The guest makes the volume, not the host:
+/// a shell loop whose 200 iterations each record at least an open, a write
+/// and a close forwards well over 100 KB of records (about 1.5 MB on the
+/// development host for 300 iterations), far past the 50 000-byte bound,
+/// while the log interleaves records in the order they happen, so forwarded
+/// records are in it before the cut (the first one is near its start). The
+/// retained log proves that. (`/bin/echo` alone logged about 76 KB on the
+/// development host but under 50 000 bytes in the pinned validation root, so
+/// it could not exercise the bound everywhere.)
 #[test]
 #[cfg(feature = "liteinst")]
 fn liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result() {
@@ -12522,8 +12528,9 @@ fn liteinst_in_guest_verify_with_records_past_the_log_bound_is_no_result() {
         "--verify-json",
         report_arg,
         "--",
-        "/bin/echo",
-        "capped",
+        "/bin/sh",
+        "-c",
+        "i=0; while [ $i -lt 200 ]; do echo x > /dev/null; i=$((i+1)); done; echo capped",
     ];
     let output = hermit_command(&args)
         .env_remove("RUST_LOG")
