@@ -324,16 +324,20 @@ impl AnonymousProcFdIdentity {
     }
 }
 
-/// Match a raw identity against cached current-process inherited-stdio identities.
-/// Callers exclude ordinary replacement objects before filling this array.
+/// Match a raw identity against the current process's inherited-stdio
+/// identities (`Detcore::inherited_stdio_identity_stats`). Callers exclude
+/// ordinary replacement objects before filling this array.
 ///
 /// When stdio descriptors alias, the LOWEST matching descriptor wins, as in
-/// the maps sanitizer's `stdio_by_raw_file` table. Every backend but SaBRe
-/// caches one `fstat(0)` for all three descriptors (`setup_stdio` in
-/// `tool_local.rs`), taken in the process that runs Detcore -- Hermit's on
-/// ptrace and KVM, the guest's on DBT and LiteInst -- so the stdin object
-/// matches every slot, and only the lowest agrees with the guest's `fstat(0)`
-/// and with its own `/proc/self/fd/0` link.
+/// the maps sanitizer's `stdio_by_raw_file` table: `2>&1`, or one pipe or
+/// terminal on all three, gives several descriptors one object, which a link
+/// can name with only one inode. For the stdin object the lowest is the one
+/// that agrees with the guest's `fstat(0)` and with its own `/proc/self/fd/0`
+/// link. Without `virtualize_metadata` every backend but SaBRe keys all three
+/// on one stand-in, the `fstat(0)` that `setup_stdio` in `tool_local.rs`
+/// caches in the process that runs Detcore -- Hermit's on ptrace and KVM, the
+/// guest's on DBT and LiteInst -- so there the stdin object matches every
+/// slot.
 fn deterministic_stdio_inode_for_raw(
     raw_inode: RawInode,
     stdio_raw_inodes: &[Option<RawInode>; 3],
@@ -428,11 +432,18 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// links use the same device-0 key in this mode
     /// (`own_proc_fd_link_identity`).
     ///
-    /// ⚠️ THE STDIO MATCH IS STILL AGAINST THE RUNNING TRACER'S STDIN. The
-    /// cached stdio stat is the tracer's `fstat(0)`, taken in each run, so a
-    /// recorded link to the recording's stdin object names the stdio inode
-    /// only when the replayer's stdin has the same inode number. This is
-    /// unchanged from before the pool was keyed on devices.
+    /// The stdio descriptors are matched on their own identities
+    /// (`inherited_stdio_identity_stats`). With `virtualize_metadata` that is
+    /// each descriptor's own `fstat`, so a link to a stdout pipe names
+    /// stdout's inode even when stdin is another object.
+    ///
+    /// ⚠️ WITHOUT IT THE STDIO MATCH IS STILL AGAINST THE RUNNING PROCESS'S
+    /// STDIN. Every descriptor's identity is then the stand-in `setup_stdio`
+    /// caches, the `fstat(0)` of the process that runs Detcore, taken in each
+    /// run, so a recorded link to the recording's stdin object names the
+    /// stdio inode only when the replayer's stdin has the same inode number,
+    /// and a link to a stdout pipe matches only when it shares stdin's inode
+    /// number. This is unchanged from before the pool was keyed on devices.
     async fn canonicalize_other_proc_fd_target<G>(
         &self,
         guest: &mut G,
@@ -448,23 +459,18 @@ impl<T: RecordOrReplay> Detcore<T> {
             return Ok(None);
         };
         let virtualize_metadata = guest.config().virtualize_metadata;
-        let mut stdio_raw_inodes = [None; 3];
-        for fd in libc::STDIN_FILENO..=libc::STDERR_FILENO {
-            stdio_raw_inodes[fd as usize] = guest
-                .thread_state()
-                .with_detfd(fd, |detfd| {
-                    deterministic_stdio_inode_for_resource(fd, detfd.resource())?;
-                    detfd.stat().map(|stat| {
-                        if virtualize_metadata {
-                            stat.raw_inode()
-                        } else {
-                            RawInode::new(0, stat.inode)
-                        }
-                    })
+        let stdio_raw_inodes = self
+            .inherited_stdio_identity_stats(guest)
+            .await?
+            .map(|stat| {
+                stat.map(|stat| {
+                    if virtualize_metadata {
+                        stat.raw_inode()
+                    } else {
+                        RawInode::new(0, stat.inode)
+                    }
                 })
-                .ok()
-                .flatten();
-        }
+            });
         let raw_file = if virtualize_metadata {
             match self
                 .other_proc_fd_link_identity(guest, link, &identity)
@@ -1115,6 +1121,14 @@ mod tests {
         use crate::syscalls::files::inject_fstat_scratch::Pages;
         use crate::syscalls::files::inject_fstat_scratch::ScriptedGuest;
 
+        /// With `virtualize_metadata`, the first link a process resolves
+        /// asks each inherited stdio descriptor for its own identity, one
+        /// `fstat` per descriptor, before it can tell whether the link names
+        /// a stdio object (`inherited_stdio_identity_stats`). The answers are
+        /// cached on the descriptors' open file descriptions, so later links
+        /// ask nothing more.
+        const STDIO_IDENTITY_FSTATS: [Sysno; 3] = [Sysno::fstat; 3];
+
         /// A fresh pipe's read end, kept open by the caller, and its
         /// `(device, inode)`.
         fn pipe_reader() -> (File, u64, u64) {
@@ -1170,7 +1184,11 @@ mod tests {
             let target = format!("pipe:[{inode}]");
             let rewritten = rewrite(&tool, &mut guest, reader.as_raw_fd(), target.as_bytes()).await;
 
-            assert_eq!(guest.injected, [Sysno::newfstatat]);
+            assert_eq!(
+                guest.injected,
+                [STDIO_IDENTITY_FSTATS.as_slice(), &[Sysno::newfstatat]].concat(),
+                "the stdio descriptors' own identities, then the stat of the link"
+            );
             assert_eq!(
                 guest.fstatat_paths,
                 [format!("/proc/{}/fd/{}", std::process::id(), reader.as_raw_fd()).into_bytes()]
@@ -1208,8 +1226,9 @@ mod tests {
 
             assert_eq!(
                 guest.injected,
-                [Sysno::newfstatat],
-                "only the confirming stat reaches the guest; the devices were probed earlier"
+                [STDIO_IDENTITY_FSTATS.as_slice(), &[Sysno::newfstatat]].concat(),
+                "besides the stdio descriptors' own identities, only the confirming stat \
+                 reaches the guest; the devices were probed earlier"
             );
             assert_eq!(
                 *guest.determinized.lock().unwrap(),
@@ -1247,7 +1266,11 @@ mod tests {
             let target = format!("pipe:[{inode}]");
             let rewritten = rewrite(&tool, &mut guest, fd, target.as_bytes()).await;
 
-            assert_eq!(guest.injected, [Sysno::newfstatat]);
+            assert_eq!(
+                guest.injected,
+                [STDIO_IDENTITY_FSTATS.as_slice(), &[Sysno::newfstatat]].concat(),
+                "the stdio descriptors' own identities, then the stat of the link"
+            );
             assert_eq!(
                 *guest.determinized.lock().unwrap(),
                 [RawInode::new(0x7777, inode)],
@@ -1455,7 +1478,60 @@ mod tests {
                 *guest.determinized.lock().unwrap(),
                 [RawInode::new(device, inode), RawInode::new(device, inode)]
             );
-            assert_eq!(guest.injected, [Sysno::fstat, Sysno::newfstatat]);
+            assert_eq!(
+                guest.injected,
+                [
+                    &[Sysno::fstat],
+                    STDIO_IDENTITY_FSTATS.as_slice(),
+                    &[Sysno::newfstatat]
+                ]
+                .concat(),
+                "the own link's fstat, the stdio descriptors' own identities, then the stat \
+                 of the other process's link"
+            );
+        }
+
+        /// The stdio identities are asked once: a second link resolved by the
+        /// same process reaches the guest with only its own stat, because the
+        /// first left the answers on the stdio descriptors' open file
+        /// descriptions (<https://github.com/rrnewton/hermit/pull/3255>,
+        /// round 9).
+        #[tokio::test]
+        async fn with_virtualized_metadata_stdio_identities_are_asked_once() {
+            let (first, _, first_inode) = pipe_reader();
+            let (second, _, second_inode) = pipe_reader();
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            assert!(guest.config.virtualize_metadata);
+
+            let first_target = format!("pipe:[{first_inode}]");
+            rewrite(
+                &tool,
+                &mut guest,
+                first.as_raw_fd(),
+                first_target.as_bytes(),
+            )
+            .await;
+            assert_eq!(
+                guest.injected,
+                [STDIO_IDENTITY_FSTATS.as_slice(), &[Sysno::newfstatat]].concat()
+            );
+            guest.injected.clear();
+
+            let second_target = format!("pipe:[{second_inode}]");
+            rewrite(
+                &tool,
+                &mut guest,
+                second.as_raw_fd(),
+                second_target.as_bytes(),
+            )
+            .await;
+            assert_eq!(
+                guest.injected,
+                [Sysno::newfstatat],
+                "a second link must not ask the stdio descriptors again"
+            );
         }
 
         /// A target truncated by a short buffer does not parse, so without
