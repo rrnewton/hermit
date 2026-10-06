@@ -143,6 +143,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::process::ExitCode;
 
+use dagrun::Censoring;
 use dagrun::TestResult;
 use dagrun::TestResults;
 use dagrun::cgroup::aggregate_slice_max_cpus;
@@ -159,6 +160,7 @@ use dagrun::model::RunResult;
 use dagrun::model::Step;
 use dagrun::model::StepOutcome;
 use dagrun::model::StructuredTestResultsManifest;
+use dagrun::peak_observation_from_row;
 use dagrun::perflog::append_step_profiles;
 use dagrun::scheduler::BoxedCgroups;
 use dagrun::scheduler::STEP_STARTED_MONOTONIC_NS_ENV;
@@ -16725,6 +16727,8 @@ struct LaneResult {
     ok: bool,
     /// The whole-invocation deadline expired during this lane.
     run_timed_out: bool,
+    /// Passing nodes of this lane that were held at their memory cap.
+    memory_caps: MemoryCapAudit,
 }
 
 /// Return the durable log's byte length once it has stopped growing.
@@ -19974,6 +19978,7 @@ fn run_lane_once(
             complete: false,
             ok: false,
             run_timed_out: true,
+            memory_caps: MemoryCapAudit::default(),
         }
     };
     if remaining_budget_s(deadline) == Some(0) {
@@ -20003,6 +20008,7 @@ fn run_lane_once(
     if record_step_profiles {
         forward_step_profiles(&result, jobs);
     }
+    let memory_caps = memory_cap_audit(&result.step_profile_rows);
 
     let run_timed_out = result.run_timed_out;
     let mut scheduler_not_launched = BTreeSet::new();
@@ -20105,6 +20111,7 @@ fn run_lane_once(
         complete,
         ok,
         run_timed_out,
+        memory_caps,
     }
 }
 
@@ -24523,6 +24530,10 @@ struct RunSummary {
     /// Bookkeeping performed after the validation verdict was finalized.
     /// Failure remains a loud command error but cannot rewrite that verdict.
     scorecard_writeback: Option<ScorecardWriteback>,
+    /// Passing nodes held at their memory cap, judged from every lane's
+    /// per-step cgroup profile rows. Informational: never part of the verdict.
+    /// `None` on a path that collected no profiles, which renders nothing.
+    memory_caps: Option<MemoryCapAudit>,
 }
 
 impl RunSummary {
@@ -24555,6 +24566,7 @@ impl RunSummary {
             ledger: None,
             cpu_wall: None,
             scorecard_writeback: None,
+            memory_caps: None,
         }
     }
     /// Admission control declined. `what` names the gate, `why` the reason.
@@ -24959,6 +24971,201 @@ fn render_test_id_retry(item: &TestIdRetry) -> String {
     )
 }
 
+/// One node run that PASSED while the kernel held it at its memory ceiling.
+///
+/// THE MOTIVATING CASE (hermit 0a2e0c24, 2026-10-06): `doc.rustdoc` ran the
+/// same cold `cargo doc` command under the same 3 GiB `hard_mem_max_bytes` in
+/// two validate runs. The Buck-hybrid run passed with `memory.peak` equal to
+/// the cap and 9608 `memory.events` `max` (reclaim-at-the-ceiling) events; the
+/// Cargo run was OOM-killed 13 times. The nightly Buck-vs-Cargo comparison read
+/// that pair as the two runners disagreeing. It was one memory race with two
+/// outcomes. The ledger shows the node had already passed AT its cap 97 times
+/// since 2026-09-16 before the first kill, and nothing said so, because a pass
+/// at the ceiling and a pass with headroom produced the same summary. f7b56bd0
+/// raised that one cap; this makes the next such node visible before it kills.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct MemoryCapNearMiss {
+    node: String,
+    peak_bytes: Option<i64>,
+    cap_bytes: Option<i64>,
+    /// The recorded `memory.max` was the literal `max`; `cap_bytes` is `None`.
+    cap_unbounded: bool,
+    /// `memory.events` `max`: times the kernel reclaimed to hold the ceiling.
+    reclaim_events: Option<i64>,
+    /// `memory.events` `high`: times a soft ceiling throttled the step.
+    throttle_events: Option<i64>,
+    /// `memory.events` `oom` / `oom_group_kill`: OOM-killer invocations.
+    oom_events: Option<i64>,
+    /// `memory.events` `oom_kill` (or the older `oom_kills` column): processes
+    /// the OOM killer reaped while the node still passed.
+    oom_kills: Option<i64>,
+}
+
+/// What the per-step cgroup profiles said about memory ceilings in one run.
+///
+/// `None` on a [`RunSummary`] means the path never collected profiles, and the
+/// summary then says nothing. `Some` with `judged == 0` means the profiles
+/// could not answer, which the summary states as UNKNOWN rather than as clean.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct MemoryCapAudit {
+    /// Passing node runs whose profile row could be judged: dagrun classified
+    /// the recorded peak as either censored or uncensored by the ceiling.
+    judged: usize,
+    /// Passing node runs whose row could NOT be judged (no peak, no applied
+    /// cap, or no `memory.events` counters). Reported, never read as clean.
+    unjudged: usize,
+    /// The judged passing runs whose peak was censored by the ceiling.
+    near_misses: Vec<MemoryCapNearMiss>,
+}
+
+impl MemoryCapAudit {
+    fn extend(&mut self, other: &MemoryCapAudit) {
+        self.judged += other.judged;
+        self.unjudged += other.unjudged;
+        self.near_misses.extend(other.near_misses.iter().cloned());
+    }
+}
+
+/// Judge every PASSING per-step profile row against its memory ceiling.
+///
+/// The classification is dagrun's own [`peak_observation_from_row`], the reader
+/// its memory-admission estimator uses, so this summary and that estimator
+/// cannot disagree about what "held at the cap" means: any `memory.events`
+/// `max`, `high` or `oom` count, or a peak at or above the applied `memory.max`
+/// (`>=`, because the kernel rounds a cap down to a page boundary).
+///
+/// A row that FAILED is not a near-miss. It already failed the run, and the
+/// scheduler's own `MEMORY CAP HIT` line names an OOM kill. Only an explicitly
+/// true `ok` cell counts as passing: a blank cell is silence, not a pass. A
+/// row cut short by a wall or CPU guard is skipped too: dagrun censors that
+/// peak for a TIME reason, and calling it a memory near-miss would misname it
+/// (dagrun's writer already records such a row as `ok=false`).
+fn memory_cap_audit(rows: &[BTreeMap<String, String>]) -> MemoryCapAudit {
+    let mut audit = MemoryCapAudit::default();
+    for row in rows {
+        let truthy = |name: &str| {
+            matches!(
+                row.get(name)
+                    .map(|value| value.trim().to_ascii_lowercase())
+                    .as_deref(),
+                Some("true" | "1" | "yes")
+            )
+        };
+        if !truthy("ok") || truthy("timed_out") || truthy("cpu_timed_out") {
+            continue;
+        }
+        let row: std::collections::HashMap<String, String> = row
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let observed = peak_observation_from_row(&row);
+        if observed.run_failed {
+            continue;
+        }
+        match observed.verdict {
+            Censoring::Unknown => audit.unjudged += 1,
+            Censoring::Uncensored => audit.judged += 1,
+            Censoring::Censored => {
+                audit.judged += 1;
+                audit.near_misses.push(MemoryCapNearMiss {
+                    node: observed.step,
+                    peak_bytes: observed.peak_bytes,
+                    cap_bytes: observed.applied_cap_bytes,
+                    cap_unbounded: observed.cap_unbounded,
+                    reclaim_events: observed.reclaim_events,
+                    throttle_events: observed.throttle_events,
+                    oom_events: observed.oom_events,
+                    oom_kills: observed.oom_kills,
+                });
+            }
+        }
+    }
+    audit
+}
+
+fn render_bytes(bytes: Option<i64>) -> String {
+    match bytes {
+        Some(bytes) => format!("{:.2} GiB ({bytes} B)", bytes as f64 / (1u64 << 30) as f64),
+        None => "unrecorded".to_string(),
+    }
+}
+
+fn render_memory_cap_near_miss(item: &MemoryCapNearMiss) -> String {
+    let cap = if item.cap_unbounded {
+        "no hard cap (memory.max=max)".to_string()
+    } else {
+        format!("cap {}", render_bytes(item.cap_bytes))
+    };
+    let counters: Vec<String> = [
+        ("max", item.reclaim_events),
+        ("high", item.throttle_events),
+        ("oom", item.oom_events),
+        ("oom_kill", item.oom_kills),
+    ]
+    .into_iter()
+    .filter_map(|(name, count)| count.filter(|n| *n > 0).map(|n| format!("{name}={n}")))
+    .collect();
+    format!(
+        "{}: peak {} under {cap}; memory.events {}",
+        item.node,
+        render_bytes(item.peak_bytes),
+        if counters.is_empty() {
+            "none (the peak reached the cap)".to_string()
+        } else {
+            counters.join(" ")
+        }
+    )
+}
+
+/// The summary block for [`MemoryCapAudit`]. Informational: it never changes
+/// the verdict, because a pass at the cap is still a pass. Its job is to say,
+/// on a GREEN run, which nodes will start failing on reclaim timing alone.
+fn memory_cap_summary_lines(audit: &MemoryCapAudit) -> Vec<String> {
+    if !audit.near_misses.is_empty() {
+        let mut lines = vec![
+            String::new(),
+            format!(
+                "   ⚠️  MEMORY CAP NEAR-MISS — {} of {} judged passing node run(s) were held at their \
+                 memory cap (informational; the verdict is unchanged):",
+                audit.near_misses.len(),
+                audit.judged
+            ),
+        ];
+        let items: Vec<String> = audit
+            .near_misses
+            .iter()
+            .map(render_memory_cap_near_miss)
+            .collect();
+        lines.extend(summary_id_list(&items));
+        lines.push(
+            "     a node held at its cap passes or is OOM-killed depending on reclaim timing; \
+             raise its hard_mem_max_bytes from a measured uncapped peak"
+                .to_string(),
+        );
+        return lines;
+    }
+    if audit.judged == 0 {
+        return vec![format!(
+            "   memory caps: UNKNOWN — none of {} passing node run profile row(s) recorded a \
+             peak, an applied cap and memory.events counters, so near-misses could not be judged",
+            audit.unjudged
+        )];
+    }
+    let unjudged = if audit.unjudged == 0 {
+        String::new()
+    } else {
+        format!(
+            "; {} more passing run(s) recorded too little to judge",
+            audit.unjudged
+        )
+    };
+    vec![format!(
+        "   memory caps: no judged passing node run was held at its cap ({} judged from cgroup \
+         memory.peak and memory.events{unjudged})",
+        audit.judged
+    )]
+}
+
 /// The ONE summary renderer. Called from exactly one place.
 ///
 /// `started` is the process's own start instant, used only when a path stopped
@@ -25061,6 +25268,14 @@ fn run_summary_lines(s: &RunSummary, started: std::time::Instant) -> Vec<String>
             "   no retries, no flaky tests, and no failed test ids: every executed node passed first time"
                 .to_string(),
         );
+    }
+    // Memory-cap near-misses, whenever a DAG ran and its lanes' profile rows
+    // were collected. Stated explicitly in all three states (near-misses, none,
+    // unknown) for the same reason as the retry line above.
+    if s.wall_s.is_some() && s.nodes_executed > 0 {
+        if let Some(audit) = &s.memory_caps {
+            lines.extend(memory_cap_summary_lines(audit));
+        }
     }
     // Node accounting is printed whenever a DAG ran, and deliberately printed as
     // an explicit zero when one did not, so "no nodes ran" is a stated fact
@@ -27484,6 +27699,7 @@ fn run(
     let mut attempts: Vec<NodeAttempt> = Vec::new();
     let mut ok = true;
     let mut execution_complete = true;
+    let mut memory_caps = MemoryCapAudit::default();
 
     // One clock for the whole invocation. Sequential lanes spend from the same
     // allowance rather than each receiving a fresh budget.
@@ -27514,6 +27730,7 @@ fn run(
     ok = ok && r.ok;
     execution_complete = execution_complete && r.complete;
     run_timed_out = run_timed_out || r.run_timed_out;
+    memory_caps.extend(&r.memory_caps);
 
     if let Some(second) = &execution_plan.second {
         // Sequential lanes are separate fail-fast families. A failure in the first lane must not
@@ -27526,6 +27743,7 @@ fn run(
         ok = ok && r2.ok;
         execution_complete = execution_complete && r2.complete;
         run_timed_out = run_timed_out || r2.run_timed_out;
+        memory_caps.extend(&r2.memory_caps);
     }
 
     let wall = (epoch_now() - started_epoch) as f64;
@@ -27859,6 +28077,7 @@ fn run(
             release_builder,
         ));
         let mut s = RunSummary::new(Verdict::Interrupted, 130, &plan.profile, detail);
+        s.memory_caps = Some(memory_caps.clone());
         s.nodes_executed = completed_node_count(&outcomes, &attempts);
         s.nodes_failed = classification.product_failure_nodes.len();
         s.nodes_skipped = skipped.len();
@@ -28513,6 +28732,7 @@ fn run(
     );
     s.nodes_executed = completed_node_count(&outcomes, &attempts);
     s.nodes_failed = failures;
+    s.memory_caps = Some(memory_caps);
     s.flaky = test_summary.recovered;
     s.failed_ids = test_summary.failed;
     s.failed_nodes_without_test_ids = test_summary.failed_nodes_without_test_ids;
@@ -30795,6 +31015,352 @@ os.execv(sys.executable,[sys.executable,str(Path(__file__).with_name('cargo-fixt
 }
 
 #[cfg(test)]
+mod memory_cap_near_miss_tests {
+    use super::*;
+
+    fn row(pairs: &[(&str, &str)]) -> BTreeMap<String, String> {
+        pairs
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.to_string()))
+            .collect()
+    }
+
+    /// A boxed profile row with every column dagrun's scheduler writes for
+    /// memory, defaulting to a clean pass. `overrides` replace cells by name.
+    fn boxed_row(step: &str, overrides: &[(&str, &str)]) -> BTreeMap<String, String> {
+        let mut cells = row(&[
+            ("step", step),
+            ("ok", "true"),
+            ("returncode", "0"),
+            ("timed_out", "false"),
+            ("cpu_timed_out", "false"),
+            ("oom_kills", "0"),
+            ("peak_bytes", "1073741824"),
+            ("memory_max_bytes", "2147483648"),
+            ("memory_events_low", "0"),
+            ("memory_events_high", "0"),
+            ("memory_events_max", "0"),
+            ("memory_events_oom", "0"),
+            ("memory_events_oom_kill", "0"),
+            ("memory_events_oom_group_kill", "0"),
+        ]);
+        for (key, value) in overrides {
+            cells.insert(key.to_string(), value.to_string());
+        }
+        cells
+    }
+
+    /// The two `doc.rustdoc` rows of hermit 0a2e0c24 (2026-10-06), copied from
+    /// the step-profile CSVs of the Buck and Cargo validate runs.
+    fn motivating_rows() -> (BTreeMap<String, String>, BTreeMap<String, String>) {
+        let buck_pass = boxed_row(
+            "doc.rustdoc",
+            &[
+                ("peak_bytes", "3221225472"),
+                ("memory_max_bytes", "3221225472"),
+                ("memory_events_max", "9608"),
+            ],
+        );
+        let cargo_oom = boxed_row(
+            "doc.rustdoc",
+            &[
+                ("ok", "false"),
+                ("returncode", "137"),
+                ("oom_kills", "13"),
+                ("peak_bytes", "3221225472"),
+                ("memory_max_bytes", "3221225472"),
+                ("memory_events_max", "42600"),
+                ("memory_events_oom", "13"),
+                ("memory_events_oom_kill", "13"),
+            ],
+        );
+        (buck_pass, cargo_oom)
+    }
+
+    fn fixture_rows() -> Vec<BTreeMap<String, String>> {
+        let (buck_pass, cargo_oom) = motivating_rows();
+        vec![
+            buck_pass,
+            // f7b56bd0's 7 GiB cap: the same command, cold, with headroom.
+            boxed_row(
+                "doc.rustdoc",
+                &[
+                    ("peak_bytes", "4017664000"),
+                    ("memory_max_bytes", "7516192768"),
+                ],
+            ),
+            // Already failed the run: not a near-miss, not judged.
+            cargo_oom,
+            // The peak reached the cap with no counter: still held there.
+            boxed_row(
+                "build.rust_scripts",
+                &[
+                    ("peak_bytes", "2147483648"),
+                    ("memory_max_bytes", "2147483648"),
+                ],
+            ),
+            // An inherited soft ceiling throttled the step under its hard cap.
+            boxed_row("setup.manifest_plan", &[("memory_events_high", "5")]),
+            // Unboxed: no cap, no counters, no peak. Not evidence either way.
+            row(&[
+                ("step", "check.fmt"),
+                ("ok", "true"),
+                ("returncode", "0"),
+                ("peak_bytes", ""),
+                ("memory_max_bytes", ""),
+                ("memory_events_max", ""),
+            ]),
+            // A blank verdict is silence, not a pass.
+            boxed_row(
+                "silent.node",
+                &[
+                    ("ok", ""),
+                    ("peak_bytes", "2147483648"),
+                    ("memory_events_max", "7"),
+                ],
+            ),
+            // Cut short by a guard: censored for TIME, not memory.
+            boxed_row(
+                "timed.node",
+                &[("timed_out", "true"), ("memory_events_max", "7")],
+            ),
+            // Unbounded memory.max with no counters: a genuine measurement.
+            boxed_row("unbounded.node", &[("memory_max_bytes", "max")]),
+        ]
+    }
+
+    #[test]
+    fn the_buck_pass_at_its_cap_is_a_near_miss_and_the_cargo_kill_is_not() {
+        let (buck_pass, cargo_oom) = motivating_rows();
+        let audit = memory_cap_audit(&[buck_pass, cargo_oom]);
+        assert_eq!(audit.judged, 1);
+        assert_eq!(audit.unjudged, 0);
+        assert_eq!(
+            audit.near_misses,
+            vec![MemoryCapNearMiss {
+                node: "doc.rustdoc".to_string(),
+                peak_bytes: Some(3221225472),
+                cap_bytes: Some(3221225472),
+                cap_unbounded: false,
+                reclaim_events: Some(9608),
+                throttle_events: Some(0),
+                oom_events: Some(0),
+                oom_kills: Some(0),
+            }]
+        );
+    }
+
+    #[test]
+    fn audit_judges_only_explicit_passes_and_names_every_ceiling_signal() {
+        let audit = memory_cap_audit(&fixture_rows());
+        assert_eq!(audit.judged, 5, "{audit:#?}");
+        assert_eq!(audit.unjudged, 1, "{audit:#?}");
+        let nodes: Vec<&str> = audit
+            .near_misses
+            .iter()
+            .map(|item| item.node.as_str())
+            .collect();
+        assert_eq!(
+            nodes,
+            ["doc.rustdoc", "build.rust_scripts", "setup.manifest_plan"]
+        );
+    }
+
+    #[test]
+    fn lane_audits_merge_by_addition() {
+        let (buck_pass, _) = motivating_rows();
+        let mut merged = memory_cap_audit(&fixture_rows());
+        merged.extend(&memory_cap_audit(&[buck_pass]));
+        assert_eq!(merged.judged, 6);
+        assert_eq!(merged.unjudged, 1);
+        assert_eq!(merged.near_misses.len(), 4);
+        assert_eq!(merged.near_misses[3].node, "doc.rustdoc");
+    }
+
+    fn green_summary(memory_caps: Option<MemoryCapAudit>) -> RunSummary {
+        let mut summary = RunSummary::new(Verdict::Pass, 0, "self-test", Vec::new());
+        summary.wall_s = Some(57.0);
+        summary.nodes_executed = 9;
+        summary.individual_test_results_complete = true;
+        // Fixed, so two renderings compare byte for byte; `None` would sample
+        // this process's live CPU time on each call.
+        summary.cpu_wall = Some((57.0, 30.0, 5.0));
+        summary.memory_caps = memory_caps;
+        summary
+    }
+
+    #[test]
+    fn near_miss_block_names_each_node_and_leaves_every_other_line_alone() {
+        let started = std::time::Instant::now();
+        let without = run_summary_lines(&green_summary(None), started);
+        let audit = memory_cap_audit(&fixture_rows());
+        let expected_block = memory_cap_summary_lines(&audit);
+        let summary = green_summary(Some(audit));
+        let with = run_summary_lines(&summary, started);
+        let rendered = with.join("\n");
+
+        assert_eq!(summary.verdict, Verdict::Pass);
+        assert!(
+            rendered.contains(
+                "MEMORY CAP NEAR-MISS — 3 of 5 judged passing node run(s) were held at their \
+                 memory cap (informational; the verdict is unchanged):"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "     - doc.rustdoc: peak 3.00 GiB (3221225472 B) under cap 3.00 GiB \
+                 (3221225472 B); memory.events max=9608"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains(
+                "     - build.rust_scripts: peak 2.00 GiB (2147483648 B) under cap 2.00 GiB \
+                 (2147483648 B); memory.events none (the peak reached the cap)"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("     - setup.manifest_plan: peak 1.00 GiB")
+                && rendered.contains("memory.events high=5"),
+            "{rendered}"
+        );
+        for absent in ["silent.node", "timed.node", "unbounded.node", "check.fmt"] {
+            assert!(!rendered.contains(absent), "{absent} listed: {rendered}");
+        }
+
+        // The block is inserted whole and nothing else moves: removing it gives
+        // back the summary rendered with no audit, byte for byte.
+        let start = with
+            .iter()
+            .position(|line| line.contains("MEMORY CAP NEAR-MISS"))
+            .expect("near-miss heading")
+            - 1;
+        assert_eq!(
+            &with[start..start + expected_block.len()],
+            &expected_block[..]
+        );
+        let mut remainder = with.clone();
+        remainder.drain(start..start + expected_block.len());
+        assert_eq!(remainder, without);
+    }
+
+    #[test]
+    fn a_clean_audit_says_how_much_it_judged() {
+        let started = std::time::Instant::now();
+        let clean = memory_cap_audit(&[boxed_row("doc.rustdoc", &[])]);
+        let rendered = run_summary_lines(&green_summary(Some(clean)), started).join("\n");
+        assert!(
+            rendered.contains(
+                "   memory caps: no judged passing node run was held at its cap (1 judged from \
+                 cgroup memory.peak and memory.events)"
+            ),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("MEMORY CAP NEAR-MISS"), "{rendered}");
+
+        let partial = MemoryCapAudit {
+            judged: 2,
+            unjudged: 1,
+            near_misses: Vec::new(),
+        };
+        let rendered = run_summary_lines(&green_summary(Some(partial)), started).join("\n");
+        assert!(
+            rendered.contains(
+                "(2 judged from cgroup memory.peak and memory.events; 1 more passing run(s) \
+                 recorded too little to judge)"
+            ),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn unjudgeable_profiles_render_as_unknown_never_as_clean() {
+        let unboxed = row(&[
+            ("step", "check.fmt"),
+            ("ok", "true"),
+            ("peak_bytes", ""),
+            ("memory_max_bytes", ""),
+        ]);
+        let audit = memory_cap_audit(&[unboxed.clone(), unboxed]);
+        assert_eq!((audit.judged, audit.unjudged), (0, 2));
+        let rendered =
+            run_summary_lines(&green_summary(Some(audit)), std::time::Instant::now()).join("\n");
+        assert!(
+            rendered.contains(
+                "   memory caps: UNKNOWN — none of 2 passing node run profile row(s) recorded a \
+                 peak, an applied cap and memory.events counters"
+            ),
+            "{rendered}"
+        );
+        assert!(
+            !rendered.contains("no judged passing node run"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn nothing_is_claimed_without_profiles_or_before_the_dag_ran() {
+        let started = std::time::Instant::now();
+        let no_profiles = run_summary_lines(&green_summary(None), started).join("\n");
+        assert!(!no_profiles.contains("memory caps"), "{no_profiles}");
+        assert!(!no_profiles.contains("MEMORY CAP"), "{no_profiles}");
+
+        let audit = memory_cap_audit(&fixture_rows());
+        let mut nothing_ran = green_summary(Some(audit.clone()));
+        nothing_ran.nodes_executed = 0;
+        let rendered = run_summary_lines(&nothing_ran, started).join("\n");
+        assert!(!rendered.contains("MEMORY CAP"), "{rendered}");
+        assert!(!rendered.contains("memory caps"), "{rendered}");
+
+        let mut stopped = green_summary(Some(audit));
+        stopped.wall_s = None;
+        let rendered = run_summary_lines(&stopped, started).join("\n");
+        assert!(!rendered.contains("MEMORY CAP"), "{rendered}");
+        assert!(!rendered.contains("memory caps"), "{rendered}");
+    }
+
+    #[test]
+    fn a_real_lane_carries_its_own_rows_into_the_audit() {
+        let temp = tempfile::tempdir().unwrap();
+        let cfg = DagConfig {
+            steps: vec![step_with_caps(
+                "fixture",
+                "pass",
+                "memory-cap audit lane fixture",
+                "true".to_string(),
+                Vec::new(),
+                30,
+                30,
+                64 * 1024 * 1024,
+            )],
+            ..Default::default()
+        };
+        let result = run_lane_once(
+            &cfg,
+            1,
+            true,
+            0,
+            None,
+            &temp.path().join("lane.log"),
+            None,
+            false,
+        );
+        assert!(result.ok && result.complete, "lane did not pass");
+        // Unboxed, the row records no applied cap, so it is counted as passing
+        // but unjudged; either way exactly one passing row reached the audit.
+        assert_eq!(
+            result.memory_caps.judged + result.memory_caps.unjudged,
+            1,
+            "{:#?}",
+            result.memory_caps
+        );
+        assert!(result.memory_caps.near_misses.is_empty());
+    }
+}
+
+#[cfg(test)]
 mod final_validate_status_tests {
     use super::*;
 
@@ -32810,6 +33376,7 @@ mod raw_census_publication_tests {
                 complete: false,
                 ok: false,
                 run_timed_out: false,
+                memory_caps: MemoryCapAudit::default(),
             },
             rows,
         )
