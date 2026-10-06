@@ -172,9 +172,41 @@ pub(crate) struct AnonymousObjectDevices {
 /// The [`AnonymousObjectDevices`], read once per process, or why they could
 /// not be read. Detcore reads them when it starts in a process
 /// ([`crate::Detcore`]'s `Tool::new`), before any guest syscall, so a guest's
-/// readlink never depends on whether the tracer can make a pipe or socket at
-/// that moment, and keeps the outcome either way: a later call neither retries
-/// nor panics.
+/// readlink never depends on whether Detcore's host process can make a pipe
+/// or socket at that moment, and keeps the outcome either way: a later call
+/// neither retries nor panics.
+///
+/// Why one read is enough: pipefs and sockfs are each a single
+/// kernel-internal mount made at boot (`kern_mount` in `init_pipe_fs` in
+/// fs/pipe.c and in `sock_init` in net/socket.c). Every pipe and every socket
+/// inode is allocated on that superblock, and `stat` reports its `s_dev`
+/// untranslated in every mount, network and user namespace.
+///
+/// ⚠️ THE READ MUST HAPPEN BEFORE THE GUEST CAN RUN CONCURRENTLY WITH IT.
+/// detcore-dbt, detcore-sabre, in-guest LiteInst and e9patch's in-guest tool
+/// host embed Detcore in the guest process, where the probe's descriptors
+/// come from the GUEST's descriptor table. Probing while another guest thread
+/// runs -- one blocked in `recvmsg` under `BlockingExternalIO`, say -- would
+/// let that thread's next descriptor (an `SCM_RIGHTS` delivery, an `accept`)
+/// land on a number that depends on how the two interleaved. Each of those
+/// hosts constructs the tool before the process can have a second thread:
+/// detcore-dbt at the process's first intercepted system call, before a
+/// clone-family call proceeds (detcore-dbt/src/lib.rs, the
+/// `runtime.tool.get_or_init` in its system-call handler); detcore-sabre when
+/// the plugin initializes (reverie-sabre `reverie_adapter.rs`,
+/// `connect_with_root_initializer`); in-guest LiteInst and e9patch at tool
+/// installation (`tool_host.rs` in reverie-liteinst and reverie-e9patch),
+/// which runs "before application-created threads". That installation is a
+/// preloaded library constructor: the dynamic loader, IFUNC resolvers and
+/// earlier library constructors have already run, unmonitored, so on these
+/// two hosts the probe sees a single-threaded process only if none of that
+/// code started a thread. A forked child copies this static already
+/// initialized, and `execve` both resets it and unshares the descriptor
+/// table, so, subject to that condition, every probe sees a single-threaded
+/// process whose descriptors are its own, and it closes what it opened before
+/// returning. The tracer-side backends (ptrace, and e9patch preprocessing
+/// with ptrace) and KVM probe in the Hermit process, never in a guest
+/// descriptor table.
 pub(crate) fn anonymous_object_devices() -> &'static Result<AnonymousObjectDevices, String> {
     static DEVICES: std::sync::OnceLock<Result<AnonymousObjectDevices, String>> =
         std::sync::OnceLock::new();
@@ -329,8 +361,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     ///
     /// The object is keyed on its device and inode, as an `fstat` of it is:
     /// the device comes from the guest's `stat` of the link
-    /// (`other_proc_fd_link_identity`), or from `anonymous_object_devices`
-    /// when that cannot confirm the object.
+    /// (`other_proc_fd_link_identity`), or, when that cannot confirm the
+    /// object, from the devices probed when the tool was constructed
+    /// (`anonymous_object_devices`). If that probe failed, the readlink
+    /// fails with an error rather than keying the link on a device no `fstat`
+    /// reports.
     ///
     /// Without `virtualize_metadata` -- `hermit record` and `hermit replay`
     /// -- neither is consulted, and the object is keyed on its inode alone,
@@ -340,11 +375,13 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// replay host has at that descriptor (nothing, under the replayer's
     /// chroot without `/proc`) and the probe reports the replay host's
     /// devices. Keying on either would make the replayed name depend on the
-    /// replay environment rather than on the recording. Device 0 is no
-    /// filesystem's (Linux numbers anonymous devices from minor 1), so the key
+    /// replay environment rather than on the recording. No filesystem has
+    /// device 0 (Linux numbers anonymous devices from minor 1), so the key
     /// cannot alias a file, and keying on the inode alone is what this
     /// rewrite did before the pool was keyed on devices
-    /// (<https://github.com/rrnewton/hermit/issues/3307>).
+    /// (<https://github.com/rrnewton/hermit/issues/3307>). The guest's own
+    /// links use the same device-0 key in this mode
+    /// (`own_proc_fd_link_identity`).
     ///
     /// ⚠️ THE STDIO MATCH IS STILL AGAINST THE RUNNING TRACER'S STDIN. The
     /// cached stdio stat is the tracer's `fstat(0)`, taken in each run, so a
@@ -1044,6 +1081,42 @@ mod tests {
                 *guest.determinized.lock().unwrap(),
                 [RawInode::new(device, inode)],
                 "the link must be keyed on the device and inode the guest's stat reports"
+            );
+            assert_eq!(
+                rewritten,
+                format!("pipe:[{FIRST_SCRIPTED_INODE}]").into_bytes()
+            );
+        }
+
+        /// When the guest's `stat` of the link cannot confirm the object --
+        /// here the descriptor is closed before the rewrite -- the link is
+        /// keyed on the pipefs device probed when the tool was constructed,
+        /// which is the device an `fstat` of the pipe reports, and never on
+        /// device 0 (round-2 review of
+        /// <https://github.com/rrnewton/hermit/pull/3255>).
+        #[tokio::test]
+        async fn with_virtualized_metadata_an_unconfirmed_link_is_keyed_on_the_probed_device() {
+            let (reader, device, inode) = pipe_reader();
+            let fd = reader.as_raw_fd();
+            drop(reader);
+            let scratch = Pages::map(1, 1);
+            let (tool, mut guest) = ScriptedGuest::with_scratch(scratch.address, scratch.len, None);
+            guest.answers_determinize_inode = true;
+            assert!(guest.config.virtualize_metadata);
+            assert_ne!(device, 0);
+
+            let target = format!("pipe:[{inode}]");
+            let rewritten = rewrite(&tool, &mut guest, fd, target.as_bytes()).await;
+
+            assert_eq!(
+                guest.injected,
+                [Sysno::newfstatat],
+                "only the confirming stat reaches the guest; the devices were probed earlier"
+            );
+            assert_eq!(
+                *guest.determinized.lock().unwrap(),
+                [RawInode::new(device, inode)],
+                "an unconfirmed link must be keyed on the pipefs device and its inode"
             );
             assert_eq!(
                 rewritten,
