@@ -812,7 +812,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // ledger::framework_retries::tests::every_retried_cell_is_counted_with_its_first_attempt_and_selected_outcome
     // and ledger::framework_retries::tests::an_unreadable_history_refuses_rather_than_undercounting
     // (https://github.com/rrnewton/hermit/issues/1845) retain all 986: 988.
-    ("test.regular_crates", 988),
+    // detcore-model's config::tests::
+    // blocked_wait_signal_interruption_never_enters_the_legacy_form and
+    // guest_may_inherit_a_terminal_never_enters_the_legacy_form
+    // (https://github.com/rrnewton/hermit/pull/3361) retain all 979 (981, measured with
+    // cargo nextest list --profile ci).
+    ("test.regular_crates", 990),
     // Three tracing PID-alignment tests added in f9383156 retain all 707 prior IDs.
     // Twelve epoch controls and the LiteInst stderr-pressure control retain all 710 prior IDs.
     // Two real readv import-permission companions retain all 748 prior identities.
@@ -1059,7 +1064,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // (measured with cargo nextest list).
     // Re-listed with the admission-failed hook test: 926.
     // Re-listed with the coordinator-failure and late-watch kill tests: 928.
-    ("test.hermit_unit", 933),
+    // tests::backend_blocked_wait_signal_contract_is_explicit,
+    // tests::a_launch_may_pass_a_terminal_unless_it_proves_it_has_none and
+    // tests::only_gated_backends_record_an_inherited_terminal
+    // (https://github.com/rrnewton/hermit/pull/3361) retain all 902 (905, measured with cargo
+    // nextest list).
+    ("test.hermit_unit", 936),
     // Fifteen stage-two child-publication controls retain all 728 prior IDs.
     // Five resource-limit controls retain all 743 prior identities.
     // Three descriptor-import error controls retain all 780 prior identities.
@@ -1220,7 +1230,81 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The descriptor-alias interning test retains all 998: 999, re-listed.
     // Both 999 counts above, re-listed together: 1000.
     // With the two inode tests above, the descriptor-alias test retains all 1001: 1002.
-    ("test.detcore_unit", 1002),
+    // https://github.com/rrnewton/hermit/pull/3361
+    // (https://github.com/rrnewton/hermit/issues/3146): 65 blocked-wait and
+    // host-timed signal tests, with none removed, retain all 975 prior
+    // identities (1040, measured with cargo nextest list --profile ci):
+    // scheduler::test, 26 tests:
+    //   a_child_exit_sigchld_goes_to_the_first_thread_that_does_not_block_it,
+    //   a_child_exit_timer_commits_a_deferred_creator_delivery_without_sending,
+    //   a_child_exit_timer_names_the_thread_that_created_the_child,
+    //   a_child_exit_wakes_no_parked_futex_waiter,
+    //   a_default_job_control_stop_leaves_a_rearming_futex_wait_parked,
+    //   a_host_timed_signal_never_ends_a_parked_futex_wait_of_its_process,
+    //   a_launch_that_may_pass_a_terminal_holds_the_terminal_signals_from_the_start,
+    //   a_parked_futex_waiter_is_admitted_on_its_mask_alone,
+    //   a_scheduler_that_does_not_model_signal_targets_reads_and_records_no_sleeping_mask,
+    //   a_sigchld_never_ends_a_parked_futex_wait,
+    //   a_sigchld_target_sleeping_outside_the_scheduler_uses_the_mask_recorded_at_its_commit,
+    //   a_signal_caught_after_a_futex_wait_began_ends_it,
+    //   a_signal_ignored_after_a_futex_wait_began_keeps_its_deadline,
+    //   a_signal_that_cannot_wake_a_background_call_leaves_it_in_its_pool,
+    //   a_signal_to_a_thread_sleeping_outside_the_scheduler_is_requeued_after_its_own_stop,
+    //   a_signal_to_an_unposted_thread_outside_the_background_pools_still_asserts,
+    //   a_signal_woken_futex_waiter_runs_before_an_already_runnable_thread,
+    //   an_expired_release_barrier_keeps_the_arm_and_refuses_the_run,
+    //   an_unplaced_sigchld_delivery_is_deferred_behind_a_runnable_sibling,
+    //   an_unreadable_signal_state_ends_a_parked_futex_wait,
+    //   non_interrupting_signal_leaves_a_parked_futex_waiter_parked,
+    //   pending_signal_does_not_rewrite_a_woken_futex_waiter,
+    //   pending_signal_interrupts_a_parked_futex_waiter,
+    //   signaled_background_threads_are_released_together_in_thread_id_order,
+    //   the_signaled_background_barrier_runs_before_any_timer_pop,
+    //   unreported_signal_state_keeps_futex_waiter_parked_for_cross_task_signals;
+    // syscalls::files::test, three tests:
+    //   an_open_acquires_a_controlling_terminal_only_as_a_session_leader,
+    //   async_io_arming_calls_name_their_host_timed_signals,
+    //   terminal_control_calls_name_the_terminal_signals;
+    // syscalls::helpers::kernel_signal_wait_failures, 29 tests:
+    //   a_consumed_sigchld_that_stops_an_injection_is_refused,
+    //   a_default_ignored_signal_that_stops_an_injection_is_held,
+    //   a_held_sigchld_is_never_replaced_by_another_stop,
+    //   a_held_signal_refusal_follows_the_unsupported_operation_policy,
+    //   a_mask_change_that_cannot_run_ends_the_run_instead_of_resuming_the_guest,
+    //   a_mask_that_signals_keep_stopping_ends_the_run_instead_of_resuming_the_guest,
+    //   a_pending_caught_sigchld_ends_a_select_wait_before_the_injection,
+    //   a_pending_caught_sigchld_ends_a_select_wait_but_no_gated_wait,
+    //   a_pending_caught_signal_ends_the_wait_before_the_injection,
+    //   a_restoration_refusal_replaces_the_result_unless_the_wait_refused_first,
+    //   a_second_unidentified_stop_is_refused,
+    //   a_stack_with_no_scratch_room_leaves_the_wait_under_the_guest_mask,
+    //   a_stop_by_the_preemption_signal_still_restarts_a_wait_without_a_deadline,
+    //   a_stop_is_identified_only_by_exactly_its_signal,
+    //   a_stop_of_the_mask_restoration_that_replaces_a_held_sigchld_is_refused,
+    //   a_stop_that_cannot_be_identified_keeps_a_timed_wait_and_its_deadline,
+    //   a_thread_that_no_longer_exists_ends_its_wait_with_erestartnointr,
+    //   a_timed_wait_ends_for_a_held_signal_that_would_end_it,
+    //   a_timed_wait_refuses_to_let_another_stop_replace_a_held_sigchld,
+    //   a_wait_that_reaches_the_stop_bound_holding_a_sigchld_is_refused,
+    //   a_wait_without_a_deadline_ends_for_a_held_signal_that_would_end_it,
+    //   an_identified_stop_of_the_mask_restoration_that_replaces_a_held_sigchld_is_refused,
+    //   an_ignored_signal_that_stops_the_mask_change_does_not_end_the_wait,
+    //   an_unidentified_stop_at_the_stop_bound_is_refused,
+    //   an_unidentified_stop_over_a_held_sigchld_is_refused,
+    //   an_unreadable_signal_state_of_a_live_thread_ends_the_run,
+    //   next_dequeued_follows_the_kernel_order,
+    //   only_a_wait_without_a_deadline_ends_after_the_absorbed_stop_bound,
+    //   restore_repeats_the_mask_change_until_the_kernel_reports_it;
+    // syscalls::helpers::tests, three tests:
+    //   a_held_signal_is_reported_unless_it_is_sigstop,
+    //   a_restart_block_resumes_only_at_the_interrupted_call,
+    //   kernel_restart_errno_matches_linux_restart_policy;
+    // syscalls::threads::tests, four tests:
+    //   a_child_exit_signal_other_than_sigchld_is_host_timed_for_its_creator,
+    //   a_rearming_wait_is_not_ended_by_a_default_job_control_stop,
+    //   kernel_signal_state_parses_proc_status,
+    //   only_unblocked_caught_or_fatal_signals_interrupt_a_wait;
+    ("test.detcore_unit", 1067),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1319,7 +1403,13 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // retain all 200 (203, measured with cargo nextest list).
     // verify_claim_names_its_limit's three private-page rewriting tests and
     // reverie_private_page_is_the_range_hermit_guards retain all 203 (207).
-    ("test.hermit_integration", 207),
+    // https://github.com/rrnewton/hermit/pull/3361
+    // (https://github.com/rrnewton/hermit/issues/3146): the new
+    // external_signal_interrupt binary adds all 66 of its tests (its LiteInst
+    // cells are restoration targets of
+    // https://github.com/rrnewton/hermit/issues/3745), and all 207 prior
+    // identities are retained (273, measured with cargo nextest list).
+    ("test.hermit_integration", 273),
     ("test.arbitrary_binaries", 4),
     // Every record_replay identity but one (`cargo nextest list` lists 110):
     // the --skip waiver of record_node_eventfd_epoll_sequence
@@ -1723,7 +1813,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same test: 999.
     // The host twin selects both tests: 1000.
     // And the descriptor-alias interning test (1002).
-    ("test.detcore_unit_on_host", 1002),
+    // And the same 65 https://github.com/rrnewton/hermit/pull/3361 signal tests
+    // listed for test.detcore_unit (1040, measured).
+    ("test.detcore_unit_on_host", 1067),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).
@@ -1740,7 +1832,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the two --passthru-opt host-input verify tests and the
     // private-page rebinding test (203).
     // And the four private-page guard tests (207).
-    ("test.hermit_integration_on_host", 207),
+    // The host twin also selects the 66 external_signal_interrupt tests
+    // (https://github.com/rrnewton/hermit/pull/3361) (273, measured).
+    ("test.hermit_integration_on_host", 273),
     // The host twin selects the same 4 GiB iced decode regression
     // (https://github.com/rrnewton/hermit/issues/3462), and the two fbcode
     // version-format tests (https://github.com/rrnewton/hermit/pull/3511),
@@ -1789,7 +1883,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // And the same two record-version tests (925).
     // The host twin selects the same tests: 926.
     // The host twin selects the same tests: 928.
-    ("test.hermit_unit_on_host", 933),
+    // And the same blocked-wait backend-contract test and two inherited-terminal
+    // tests (905, measured).
+    ("test.hermit_unit_on_host", 936),
     ("test.ignored_syscall_regressions_on_host", 4),
     // The host node carries the identical selection.
     // test-harness no_retry_flag_turns_framework_retries_off retains all 763 prior identities.
@@ -1867,7 +1963,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The hosted script unit-test twin test listed there retains all 983: 984.
     // The two detcore-dbt handler-error tests listed there retain all 984: 986.
     // The two framework-retry ledger tests listed there retain all 986: 988.
-    ("test.regular_crates_on_host", 988),
+    // The two detcore-model legacy-form tests listed there retain all 979: 981.
+    ("test.regular_crates_on_host", 990),
     ("test.rr_suite_contract_on_host", 1),
     // The host twin also selects the two startup-order tests, and the three
     // SaBRe host-input tests (12).
