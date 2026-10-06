@@ -497,20 +497,16 @@ where
     let (buf, unread) = if rng_output {
         // RNG output was written by Detcore itself after the output commit:
         // reserving the payload and reading it back are both fatal, with no
-        // fallback (see `rng_observation_vec`). The read back is the same
-        // wide-then-exact pair as `read_extent`, so an extent that ends less
-        // than eight bytes before an unmapped page is still read; only when
-        // neither read can is the failure fatal.
+        // substitute digest (see `rng_observation_vec`). The read back is
+        // `read_written`, as in `read_extent`, so a destination that ends just
+        // before an unmapped page, or is write-only, is still read; only when
+        // no method can read it is the failure fatal.
         let size = len as usize;
         let mut buf = rng_observation_vec(size, "digest payload")?;
         buf.resize(size, 0u8);
         if size > 0 {
             let start = AddrMut::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
-            let memory = guest.memory();
-            if let Err(error) = memory.read_values(Addr::from(start), buf.as_mut_slice()) {
-                crate::syscalls::read_guest_exact(&memory, start, buf.as_mut_slice())
-                    .map_err(|_| error)?;
-            }
+            read_written(&guest.memory(), start, buf.as_mut_slice())?;
         }
         (buf, 0)
     } else {
@@ -543,18 +539,9 @@ fn read_extent<M: MemoryAccess>(
         return Ok((buf, 0));
     }
     let start = AddrMut::<u8>::from_raw(addr as usize).ok_or(Errno::EFAULT)?;
-    let Err(error) = memory.read_values(Addr::from(start), buf.as_mut_slice()) else {
+    let Err(error) = read_written(memory, start, buf.as_mut_slice()) else {
         return Ok((buf, 0));
     };
-    // The read above may be wider than the extent: on ptrace, up to eight bytes
-    // are one eight-byte `PTRACE_PEEKDATA`, which fails for a buffer that ends
-    // less than eight bytes before an unmapped page. Read exactly the moved
-    // bytes before treating the extent as unreadable. The wide read stays
-    // first because it can read a write-only page, which `process_vm_readv`
-    // cannot.
-    if crate::syscalls::read_guest_exact(memory, start, buf.as_mut_slice()).is_ok() {
-        return Ok((buf, 0));
-    }
     if !records {
         return Err(error.into());
     }
@@ -567,6 +554,60 @@ fn read_extent<M: MemoryAccess>(
         return Err(error.into());
     }
     Ok((buf, size - readable))
+}
+
+/// Read the bytes a completed syscall wrote at `start`, filling all of `buf`,
+/// or return the first method's error if no method can read them.
+///
+/// Three methods, because each fails where another works on ptrace:
+///
+/// 1. `read_values`. Up to eight bytes are one eight-byte `PTRACE_PEEKDATA`,
+///    which fails for an extent that ends less than eight bytes before an
+///    unmapped page; more are `process_vm_readv`, which cannot read a page
+///    without `PROT_READ`.
+/// 2. [`read_guest_exact`](crate::syscalls::read_guest_exact): one
+///    `process_vm_readv` of exactly the extent, so it reaches no other page,
+///    but it too needs `PROT_READ`.
+/// 3. Aligned eight-byte words, each one `PTRACE_PEEKDATA`, which reads a
+///    write-only page. An aligned word never spans two pages, and every word
+///    read holds at least one byte of the extent, so it lies in a page the
+///    syscall wrote to. Only the extent's bytes are kept.
+///
+/// A later method runs only if the earlier ones failed. Which one succeeds
+/// depends only on the guest's page protections, so it is the same in every
+/// run. The words are a fallback, not the first choice, because they cost one
+/// trap per eight bytes.
+fn read_written<M: MemoryAccess>(
+    memory: &M,
+    start: AddrMut<'_, u8>,
+    buf: &mut [u8],
+) -> Result<(), Errno> {
+    let Err(error) = memory.read_values(Addr::from(start), buf) else {
+        return Ok(());
+    };
+    if crate::syscalls::read_guest_exact(memory, start, buf).is_ok()
+        || read_words(memory, start.as_raw(), buf).is_ok()
+    {
+        return Ok(());
+    }
+    Err(error)
+}
+
+/// Method 3 of [`read_written`].
+fn read_words<M: MemoryAccess>(memory: &M, addr: usize, buf: &mut [u8]) -> Result<(), Errno> {
+    const WORD: usize = std::mem::size_of::<u64>();
+    let end = addr.checked_add(buf.len()).ok_or(Errno::EFAULT)?;
+    let mut word_addr = addr & !(WORD - 1);
+    while word_addr < end {
+        let word = memory
+            .read_value(Addr::<u64>::from_raw(word_addr).ok_or(Errno::EFAULT)?)?
+            .to_ne_bytes();
+        let low = addr.max(word_addr);
+        let high = end.min(word_addr + WORD);
+        buf[low - addr..high - addr].copy_from_slice(&word[low - word_addr..high - word_addr]);
+        word_addr += WORD;
+    }
+    Ok(())
 }
 
 /// The locating half, split out from the guest read so it can be bracketed.
@@ -751,6 +792,9 @@ mod event_tests {
         after_import_error: Vec<&'static str>,
         observer_reads: Vec<(usize, usize)>,
         digest_error: Option<Errno>,
+        /// Spare the digest's aligned eight-byte word reads from
+        /// `digest_error`, so that only the wider read at `FIRST_DEST` fails.
+        digest_error_spares_words: bool,
         /// Exact (`read_vectored`) reads, which the digest makes only after a
         /// scalar read fails, and the error they return at `FIRST_DEST`.
         exact_reads: Vec<(usize, usize)>,
@@ -828,7 +872,9 @@ mod event_tests {
         }
 
         /// Only the digest's exact read of one extent, after its scalar read
-        /// failed; any other vectored read is still a fixture violation.
+        /// failed; any other vectored read is still a fixture violation. It is
+        /// audited like a scalar read, so a phase that forbids memory reads
+        /// also forbids this one.
         fn read_vectored(
             &self,
             remote: &[IoSlice],
@@ -841,6 +887,12 @@ mod event_tests {
             assert_eq!(remote.len(), local.len());
             let mut reads = self.1.lock().unwrap();
             reads.exact_reads.push((start, remote.len()));
+            if reads.import_failed {
+                reads.after_import_error.push("exact-read");
+            }
+            if reads.user_copy_audit && reads.copy_done {
+                reads.after_copy.push("exact-read");
+            }
             if start == FIRST_DEST
                 && let Some(error) = reads.exact_error
             {
@@ -874,6 +926,7 @@ mod event_tests {
             }
             if start == FIRST_DEST
                 && let Some(error) = reads.digest_error
+                && !(reads.digest_error_spares_words && buf.len() == 8)
             {
                 return Err(error);
             }
@@ -1819,7 +1872,12 @@ mod event_tests {
                 assert!(guest.injected_iovecs.is_empty());
                 let reads = memory.1.lock().unwrap();
                 assert_eq!(reads.imported_entries, 2);
-                assert_eq!(reads.observer_reads, [(RETRY_DEST, 3), (FIRST_DEST, 5)]);
+                // The wide read, then the aligned word read of the failing
+                // extent, both fail with `fault`.
+                assert_eq!(
+                    reads.observer_reads,
+                    [(RETRY_DEST, 3), (FIRST_DEST, 5), (FIRST_DEST, 8)]
+                );
                 assert_eq!(reads.exact_reads, [(FIRST_DEST, 5)]);
                 let messages = logs.0.lock().unwrap();
                 assert_eq!(messages.len(), 1);
@@ -1860,6 +1918,51 @@ mod event_tests {
             let messages = logs.0.lock().unwrap();
             assert_eq!(messages.len(), 2, "{messages:?}");
             assert_named_extent(&messages[0], name, RETRY_DEST, &expected[..3]);
+            assert_named_extent(&messages[1], name, FIRST_DEST, &expected[3..]);
+        }
+    }
+
+    /// A write-only destination defeats both the wide read when it is more
+    /// than eight bytes (`process_vm_readv`) and the exact read. The digest
+    /// then reads the aligned eight-byte words holding the extent, each one
+    /// `PTRACE_PEEKDATA` on ptrace, keeps only the extent's bytes, logs it,
+    /// and the guest keeps its result.
+    #[tokio::test(flavor = "current_thread")]
+    async fn rng_readv_event_digest_reads_words_when_wide_and_exact_reads_fail() {
+        for (name, call, advances) in rng_vector_calls(2) {
+            let logs = BufferLog::default();
+            let _subscriber = tracing::subscriber::set_default(logs.clone());
+            let (tool, mut guest) = event_guest(FdType::Rng, None);
+            let memory = guest.memory.clone();
+            memory.put_iovec(0, RETRY_DEST, 3);
+            memory.put_iovec(1, FIRST_DEST, 5);
+            {
+                let mut reads = memory.1.lock().unwrap();
+                reads.digest_error = Some(Errno::EFAULT);
+                reads.exact_error = Some(Errno::EFAULT);
+                reads.digest_error_spares_words = true;
+            }
+
+            let result = tool.handle_syscall_event(&mut guest, call).await;
+            assert_eq!(result.unwrap(), 8, "{name}");
+            let expected = if advances {
+                [41, 114, 187, 4, 77, 150, 223, 40]
+            } else {
+                [148, 221, 38, 111, 184, 1, 74, 147]
+            };
+            assert_eq!(memory.bytes(RETRY_DEST, 3), expected[..3]);
+            assert_eq!(memory.bytes(FIRST_DEST, 5), expected[3..]);
+            assert_eq!(memory.bytes(FIRST_DEST + 5, 1), [CANARY]);
+            let reads = memory.1.lock().unwrap();
+            assert_eq!(
+                reads.observer_reads,
+                [(RETRY_DEST, 3), (FIRST_DEST, 5), (FIRST_DEST, 8)]
+            );
+            assert_eq!(reads.exact_reads, [(FIRST_DEST, 5)]);
+            let messages = logs.0.lock().unwrap();
+            assert_eq!(messages.len(), 2, "{messages:?}");
+            assert_named_extent(&messages[0], name, RETRY_DEST, &expected[..3]);
+            // The word's three bytes after the extent are not hashed.
             assert_named_extent(&messages[1], name, FIRST_DEST, &expected[3..]);
         }
     }
@@ -2399,6 +2502,132 @@ mod tests {
         assert_eq!(completed_mmsghdr_count(1, 2), 1);
     }
 
+    const WORDS_BASE: usize = 0x10000;
+
+    /// The ptrace backend's reads at the locked Reverie, over one mapping at
+    /// `WORDS_BASE` that is write-only unless `readable`. A scalar read of up
+    /// to eight bytes is one eight-byte `PTRACE_PEEKDATA` at its address,
+    /// which reads any mapped byte and fails `EIO` past the mapping; any other
+    /// read is `process_vm_readv`, which fails `EFAULT` without `PROT_READ`.
+    struct PeekModel {
+        data: Vec<u8>,
+        readable: bool,
+        peeks: std::sync::Mutex<Vec<usize>>,
+    }
+
+    impl PeekModel {
+        fn new(data: &[u8], readable: bool) -> Self {
+            Self {
+                data: data.to_vec(),
+                readable,
+                peeks: Default::default(),
+            }
+        }
+
+        fn copy(&self, start: usize, buf: &mut [u8]) -> Result<usize, Errno> {
+            let offset = start.checked_sub(WORDS_BASE).ok_or(Errno::EIO)?;
+            let end = offset.checked_add(buf.len()).ok_or(Errno::EIO)?;
+            buf.copy_from_slice(self.data.get(offset..end).ok_or(Errno::EIO)?);
+            Ok(buf.len())
+        }
+
+        fn readv(&self, start: usize, buf: &mut [u8]) -> Result<usize, Errno> {
+            if !self.readable {
+                return Err(Errno::EFAULT);
+            }
+            self.copy(start, buf).map_err(|_| Errno::EFAULT)
+        }
+    }
+
+    impl MemoryAccess for PeekModel {
+        fn read_vectored(
+            &self,
+            remote: &[std::io::IoSlice],
+            local: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            let ([remote], [local]) = (remote, local) else {
+                panic!("one extent per vectored read")
+            };
+            self.readv(remote.as_ptr() as usize, local)
+        }
+
+        fn write_vectored(
+            &mut self,
+            _local: &[std::io::IoSlice],
+            _remote: &mut [std::io::IoSliceMut],
+        ) -> Result<usize, Errno> {
+            unreachable!("the digest does not write")
+        }
+
+        fn read<'a, A>(&self, addr: A, buf: &mut [u8]) -> Result<usize, Errno>
+        where
+            A: Into<Addr<'a, u8>>,
+        {
+            let start = addr.into().as_raw();
+            if buf.len() > 8 {
+                return self.readv(start, buf);
+            }
+            self.peeks.lock().unwrap().push(start);
+            let mut word = [0u8; 8];
+            self.copy(start, &mut word)?;
+            buf.copy_from_slice(&word[..buf.len()]);
+            Ok(buf.len())
+        }
+    }
+
+    /// Every placement of every extent in a write-only or readable 40-byte
+    /// mapping, including flush against either end, is read exactly
+    /// (https://github.com/rrnewton/hermit/issues/3823). The word method
+    /// reads only aligned words inside the mapping, one per eight-byte slot
+    /// the extent touches.
+    #[test]
+    fn read_written_reads_every_extent_of_a_write_only_mapping() {
+        const LEN: usize = 40;
+        let data: Vec<u8> = (1..=LEN as u8).collect();
+        for len in 1..=LEN {
+            for offset in 0..=LEN - len {
+                let start = WORDS_BASE + offset;
+                for readable in [false, true] {
+                    let memory = PeekModel::new(&data, readable);
+                    let mut buf = vec![0u8; len];
+                    let at = AddrMut::<u8>::from_raw(start).unwrap();
+                    super::read_written(&memory, at, &mut buf).unwrap();
+                    assert_eq!(buf, data[offset..offset + len], "{readable} {len} {offset}");
+                }
+
+                let memory = PeekModel::new(&data, false);
+                let mut buf = vec![0u8; len];
+                super::read_words(&memory, start, &mut buf).unwrap();
+                assert_eq!(buf, data[offset..offset + len], "words {len} {offset}");
+                let first = start & !7;
+                let expected: Vec<usize> = (first..start + len).step_by(8).collect();
+                assert_eq!(*memory.peeks.lock().unwrap(), expected, "{len} {offset}");
+            }
+        }
+    }
+
+    /// An extent that is not all mapped still fails, with the first method's
+    /// error: a peek's `EIO` up to eight bytes, `process_vm_readv`'s `EFAULT`
+    /// beyond.
+    #[test]
+    fn read_written_fails_with_the_wide_error_when_no_method_can_read() {
+        const LEN: usize = 40;
+        let data = [7u8; LEN];
+        for readable in [false, true] {
+            for len in [1, 4, 8, 9, 16] {
+                let memory = PeekModel::new(&data, readable);
+                let mut buf = vec![0u8; len];
+                let at = AddrMut::<u8>::from_raw(WORDS_BASE + LEN - len + 1).unwrap();
+                let expected = if len <= 8 { Errno::EIO } else { Errno::EFAULT };
+                assert_eq!(
+                    super::read_written(&memory, at, &mut buf),
+                    Err(expected),
+                    "{readable} {len}"
+                );
+            }
+        }
+    }
+
     /// What the observer read from an extent, and the bytes actually there.
     type ReadAndContents = (Result<(Vec<u8>, usize), super::Error>, Vec<u8>);
 
@@ -2470,7 +2699,10 @@ mod tests {
         assert_eq!(bytes[45..], [0; 3]);
 
         // Not records; the last name; a write-only buffer; a write-only page
-        // before a readable one.
+        // before a readable one. `LocalMemory` reads only with
+        // `process_vm_readv`, so no method of `read_written` can read a
+        // write-only page here; on ptrace the word read can (see
+        // `read_written_reads_every_extent_of_a_write_only_mapping`).
         for (prot, offset, flag) in [
             ([RW, libc::PROT_NONE], PAGE - 45, false),
             ([RW, libc::PROT_NONE], PAGE - 44, true),

@@ -1593,11 +1593,9 @@ fn write_only_prefix_guest() {
     println!("write-only prefix ok");
 }
 
-/// Detcore cannot read back a buffer the guest can write but not read, so
-/// with the bytes each syscall returns hashed into the log, as `hermit run`
-/// does under `--verify`, it cannot log what the call returned; it fails the
-/// call instead (see `write_only_buffer_is_refused_while_hashing_buffers`).
-/// So the write-only tests run without that hashing.
+/// The write-only tests run without hashing the bytes each syscall returns
+/// into the log; `write_only_buffer_is_filled_while_hashing_buffers` covers a
+/// write-only buffer with that hashing.
 #[test]
 fn write_only_prefix_matches_linux() {
     run_five_times_without_hashing_buffers(write_only_prefix_guest);
@@ -1996,33 +1994,13 @@ fn fresh_write_only_buffer_is_filled() {
     run_five_times_without_hashing_buffers(fresh_write_only_buffer_guest);
 }
 
-fn write_only_buffer_refused_guest() {
-    let root = tempfile::tempdir().unwrap();
-    for index in 0..20 {
-        File::create(root.path().join(name(index))).unwrap();
-    }
-
-    // Hashing the bytes a call returns needs them read back from the
-    // guest's buffer, which cannot be read here, so the call fails rather
-    // than log bytes other than those the guest holds. Main does the same.
-    // (The legacy `getdents` is not among the calls whose bytes are hashed.)
-    let map = guarded_pages(1, 0, libc::PROT_WRITE);
-    let dir = File::open(root.path()).unwrap();
-    let result = unsafe { libc::syscall(libc::SYS_getdents64, dir.as_raw_fd(), map, 256) };
-    let errno = std::io::Error::last_os_error().raw_os_error();
-    assert_eq!((result, errno), (-1, Some(libc::EFAULT)));
-    unsafe { libc::munmap(map.cast(), 4096) };
-    // The refused call still moves past the eight entries (240 bytes) that
-    // fit its 256-byte buffer; the rest come once each, in sorted order.
-    let rest = drain_names(dir.as_raw_fd());
-    assert_eq!(rest, listing_of(20)[8..]);
-
-    println!("write-only buffer refused ok");
-}
-
+/// With the bytes each syscall returns hashed into the log, as `hermit run`
+/// does under `--verify`, Detcore reads them back from a buffer the guest can
+/// write but not read one aligned word at a time, so the call still returns
+/// what Linux returns (https://github.com/rrnewton/hermit/issues/3823).
 #[test]
-fn write_only_buffer_is_refused_while_hashing_buffers() {
-    run_five_times_hashing_buffers(write_only_buffer_refused_guest);
+fn write_only_buffer_is_filled_while_hashing_buffers() {
+    run_five_times_hashing_buffers(fresh_write_only_buffer_guest);
 }
 
 /// `pages` pages, each mapping one of `views` (protection, offset into a
@@ -2066,7 +2044,7 @@ fn aliased_pages(pages: usize, views: &[(i32, usize)]) -> *mut u8 {
     map
 }
 
-fn aliased_padding(hashing: bool) {
+fn aliased_padding() {
     let page = 4096;
 
     // After `.` and `..`, `a` takes the first 24 bytes of the buffer and
@@ -2079,14 +2057,13 @@ fn aliased_padding(hashing: bool) {
     // it: in the second layout, too, whose third page is write-only other
     // memory. (Both lengths leave the names valid UTF-8.) Linux does
     // not look at what it wrote, and returns every record. Hashing the
-    // returned bytes can read only the first page, and must not take the
-    // rest for padding after `a`'s name: a record Linux writes for a
-    // one-byte name is 24 bytes long. So the call fails rather than log
-    // bytes other than those it returned, as with any buffer it cannot read
-    // back (see `write_only_buffer_is_refused_while_hashing_buffers`).
+    // returned bytes reads the write-only pages too, one aligned word at a
+    // time, so it hashes the bytes the guest holds and never takes the rest
+    // for padding after `a`'s name; the call returns what Linux returns,
+    // with or without hashing.
     for (pages, names, second_view) in [(2, 185, None), (3, 297, Some(page))] {
         let count = 24 + names * 32;
-        let context = format!("{pages} pages, hashing {hashing}");
+        let context = format!("{pages} pages");
         let root = tempfile::tempdir().unwrap();
         File::create(root.path().join("a")).unwrap();
         for index in 0..names {
@@ -2108,42 +2085,30 @@ fn aliased_padding(hashing: bool) {
         let mut warm = [0u8; 48];
         assert_eq!(getdents64(fd, &mut warm), Ok(48), "{context}");
         let result = raw_getdents64(fd, map, count as libc::c_uint);
-        if hashing {
-            assert_eq!(result, Err(libc::EFAULT), "{context}");
-        } else {
-            assert_eq!(result, Ok(count), "{context}");
-            let bytes = unsafe { std::slice::from_raw_parts(map, page) };
-            assert_eq!(
-                bytes[16..18],
-                (count as u16).to_ne_bytes(),
-                "{context}: `a`'s record length"
-            );
-            // The last byte of `b127`'s name and the NUL after it.
-            assert_eq!(bytes[19..21], [b'Z', 0], "{context}");
-            assert_eq!(drain_names(fd), Vec::<String>::new(), "{context}");
-        }
+        assert_eq!(result, Ok(count), "{context}");
+        let bytes = unsafe { std::slice::from_raw_parts(map, page) };
+        assert_eq!(
+            bytes[16..18],
+            (count as u16).to_ne_bytes(),
+            "{context}: `a`'s record length"
+        );
+        // The last byte of `b127`'s name and the NUL after it.
+        assert_eq!(bytes[19..21], [b'Z', 0], "{context}");
+        assert_eq!(drain_names(fd), Vec::<String>::new(), "{context}");
         unsafe { libc::munmap(map.cast(), pages * page) };
     }
 
     println!("aliased padding ok");
 }
 
-fn aliased_padding_refused_guest() {
-    aliased_padding(true)
-}
-
-fn aliased_padding_returned_guest() {
-    aliased_padding(false)
-}
-
 #[test]
-fn aliased_padding_is_refused_while_hashing_buffers() {
-    run_five_times_hashing_buffers(aliased_padding_refused_guest);
+fn aliased_padding_is_returned_while_hashing_buffers() {
+    run_five_times_hashing_buffers(aliased_padding);
 }
 
 #[test]
 fn aliased_padding_is_returned_without_hashing_buffers() {
-    run_five_times_without_hashing_buffers(aliased_padding_returned_guest);
+    run_five_times_without_hashing_buffers(aliased_padding);
 }
 
 fn aliased_record_not_copied_guest() {

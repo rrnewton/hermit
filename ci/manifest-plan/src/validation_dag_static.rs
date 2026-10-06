@@ -1172,7 +1172,12 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // io_buffers::event_tests::rng_readv_event_digest_reads_exactly_when_the_wide_read_fails
     // (https://github.com/rrnewton/hermit/issues/3823) retains all 994 (995,
     // measured with cargo nextest list --profile ci).
-    ("test.detcore_unit", 995),
+    // io_buffers::event_tests::rng_readv_event_digest_reads_words_when_wide_and_exact_reads_fail,
+    // io_buffers::tests::read_written_reads_every_extent_of_a_write_only_mapping
+    // and io_buffers::tests::read_written_fails_with_the_wide_error_when_no_method_can_read
+    // (write-only destinations, https://github.com/rrnewton/hermit/issues/3823)
+    // retain all 995 (998, measured with cargo nextest list --profile ci).
+    ("test.detcore_unit", 998),
     // tight_stack_openat::openat_succeeds_without_writable_stack_below_rsp
     // retains all 27 prior selected identities under the unchanged skip filters
     // (measured 28; https://github.com/rrnewton/hermit/issues/3328).
@@ -1196,7 +1201,9 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // random_read_before_an_unmapped_page (1-, 4- and 8-byte random reads
     // before an unmapped page; https://github.com/rrnewton/hermit/issues/3823)
     // retains all 76 (measured 77).
-    ("test.detcore_misc", 77),
+    // pipe_read_into_a_write_only_page (the same issue, for a non-random read)
+    // retains all 77 (measured 78).
+    ("test.detcore_misc", 78),
     ("test.detcore_parallel", 5),
     // The previously unenrolled tests_time target contributes all 28 measured IDs.
     // Two seccomp-EFAULT failed-gettimeofday regressions retain all 28 prior
@@ -1530,8 +1537,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     ("test.app_strict_verify_on_host", 8),
     ("test.arbitrary_binaries_on_host", 4),
     ("test.command_strict_verify_on_host", 9),
-    // The host node carries the identical 77-test tests_misc selection.
-    ("test.detcore_misc_on_host", 77),
+    // The host node carries the identical 78-test tests_misc selection.
+    ("test.detcore_misc_on_host", 78),
     ("test.detcore_parallel_on_host", 5),
     // The host twin selects the same announcement-order test
     // (https://github.com/rrnewton/hermit/issues/3463).
@@ -1573,7 +1580,8 @@ pub(super) const NEXTEST_EXPECTED_COUNTS: &[(&str, u64)] = &[
     // The host twin selects the same six exit_dependencies tests: 993.
     // The host twin selects the same test: 994.
     // And the RNG digest exact-read test (995).
-    ("test.detcore_unit_on_host", 995),
+    // And the three write-only digest-read tests (998).
+    ("test.detcore_unit_on_host", 998),
     // Host variants select the same proc regressions and retain prior identities.
     // The host twin also selects the two clock_passthrough tests
     // (https://github.com/rrnewton/hermit/issues/1176).

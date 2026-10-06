@@ -2036,51 +2036,109 @@ fn getrandom_intercepted() {
     })
 }
 
-/// A random read of 1 or 4 bytes into a destination that ends right before an
-/// unmapped page gets those bytes, as natively, whether through `readv`,
-/// `preadv`, `read` or `getrandom`. The digest of the moved bytes in the log
-/// must not fail on the unmapped page, as an eight-byte `PTRACE_PEEKDATA`
-/// there does (https://github.com/rrnewton/hermit/issues/3823). Eight bytes is
-/// the control.
+/// Map two pages, unmap the second, protect the first as `prot`, and return
+/// the first page's start and the end of the mapping.
+fn page_before_a_hole(prot: i32) -> (*mut u8, *mut u8) {
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            2 * page,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    assert_ne!(mapping, libc::MAP_FAILED);
+    let second_page = unsafe { mapping.cast::<u8>().add(page) };
+    assert_eq!(unsafe { libc::munmap(second_page.cast(), page) }, 0);
+    assert_eq!(unsafe { libc::mprotect(mapping, page, prot) }, 0);
+    (mapping.cast(), second_page)
+}
+
+const WRITE_ONLY: i32 = libc::PROT_WRITE;
+const READ_WRITE: i32 = libc::PROT_READ | libc::PROT_WRITE;
+
+/// A random read into a destination that ends right before an unmapped page
+/// gets its bytes, as natively, whether through `readv`, `preadv`, `read` or
+/// `getrandom`, and whether the page is readable or write-only. The digest of
+/// the moved bytes in the log must read them without crossing into the
+/// unmapped page, as an eight-byte `PTRACE_PEEKDATA` at the destination does
+/// for 1 or 4 bytes, and without needing `PROT_READ`, as `process_vm_readv`
+/// does (https://github.com/rrnewton/hermit/issues/3823).
 #[test]
 fn random_read_before_an_unmapped_page() {
     det_test_fn_sequential_without_pmu(|| {
         let fd = unsafe { libc::open(c"/dev/urandom".as_ptr(), libc::O_RDONLY) };
         assert!(fd >= 0);
-        for count in [1_usize, 4, 8] {
-            for call in ["readv", "preadv", "read", "getrandom"] {
-                let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-                let mapping = unsafe {
-                    libc::mmap(
-                        std::ptr::null_mut(),
-                        2 * page,
-                        libc::PROT_READ | libc::PROT_WRITE,
-                        libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
-                        -1,
-                        0,
-                    )
-                };
-                assert_ne!(mapping, libc::MAP_FAILED);
-                let second_page = unsafe { mapping.cast::<u8>().add(page) };
-                assert_eq!(unsafe { libc::munmap(second_page.cast(), page) }, 0);
-                let destination = unsafe { second_page.sub(count) };
+        for prot in [READ_WRITE, WRITE_ONLY] {
+            for count in [1_usize, 4, 8, 16] {
+                for call in ["readv", "preadv", "read", "getrandom"] {
+                    let (mapping, end) = page_before_a_hole(prot);
+                    let destination = unsafe { end.sub(count) };
+                    let iov = libc::iovec {
+                        iov_base: destination.cast(),
+                        iov_len: count,
+                    };
+                    let n = unsafe {
+                        match call {
+                            "readv" => libc::readv(fd, &iov, 1),
+                            "preadv" => libc::preadv(fd, &iov, 1, 0),
+                            "read" => libc::read(fd, destination.cast(), count),
+                            _ => libc::syscall(libc::SYS_getrandom, destination, count, 0) as isize,
+                        }
+                    };
+                    assert_eq!(n, count as isize, "{call} of {count} bytes, prot {prot}");
+                    assert_eq!(
+                        unsafe { libc::munmap(mapping.cast(), end as usize - mapping as usize) },
+                        0
+                    );
+                }
+            }
+        }
+        assert!(unistd::close(fd).is_ok());
+    })
+}
+
+/// A pipe read into a write-only destination, which the digest cannot read
+/// with `process_vm_readv`, returns its bytes, as natively, with or without a
+/// hole right after it (https://github.com/rrnewton/hermit/issues/3823).
+#[test]
+fn pipe_read_into_a_write_only_page() {
+    det_test_fn_sequential_without_pmu(|| {
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        for count in [1_usize, 4, 8, 16, page] {
+            for call in ["read", "readv"] {
+                let mut fds = [0; 2];
+                assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+                let bytes: Vec<u8> = (0..count).map(|i| i as u8).collect();
+                let written = unsafe { libc::write(fds[1], bytes.as_ptr().cast(), count) };
+                assert_eq!(written, count as isize);
+                let (mapping, end) = page_before_a_hole(WRITE_ONLY);
+                let destination = unsafe { end.sub(count) };
                 let iov = libc::iovec {
                     iov_base: destination.cast(),
                     iov_len: count,
                 };
                 let n = unsafe {
                     match call {
-                        "readv" => libc::readv(fd, &iov, 1),
-                        "preadv" => libc::preadv(fd, &iov, 1, 0),
-                        "read" => libc::read(fd, destination.cast(), count),
-                        _ => libc::syscall(libc::SYS_getrandom, destination, count, 0) as isize,
+                        "read" => libc::read(fds[0], destination.cast(), count),
+                        _ => libc::readv(fds[0], &iov, 1),
                     }
                 };
                 assert_eq!(n, count as isize, "{call} of {count} bytes");
-                assert_eq!(unsafe { libc::munmap(mapping, page) }, 0);
+                assert_eq!(
+                    unsafe { libc::mprotect(mapping.cast(), page, READ_WRITE) },
+                    0
+                );
+                let got = unsafe { std::slice::from_raw_parts(destination, count) };
+                assert_eq!(got, bytes.as_slice(), "{call} of {count} bytes");
+                assert_eq!(unsafe { libc::munmap(mapping.cast(), page) }, 0);
+                assert!(unistd::close(fds[0]).is_ok());
+                assert!(unistd::close(fds[1]).is_ok());
             }
         }
-        assert!(unistd::close(fd).is_ok());
     })
 }
 
