@@ -372,10 +372,11 @@ pub struct BlockedPool {
 
     /// Deferred `SIGCHLD` parents that `step2e_process_signal_deferred` has
     /// re-admitted to the run queue, and threads whose `SIGCHLD` delivery the
-    /// scheduler already placed: a committed wake of a gated parked waiter
-    /// (`wake_signaled_guest`), and the delivery reported for the thread that
-    /// reserved it (`request_put`). Their `InboundSignal` turn must be granted
-    /// rather than deferred (again) on the turn the scheduler selects them.
+    /// scheduler already placed: a child-exit timer's commit of a deferred
+    /// delivery, and a thread sleeping outside the schedule that the
+    /// scheduler's `SIGCHLD` woke (`arm_signaled_background`). Their
+    /// `InboundSignal` turn must be granted rather than deferred (again) on the
+    /// turn the scheduler selects them.
     pub sigchld_ready: BTreeSet<DetTid>,
 
     /// Threads in `external_io_blockers` or `rt_sigsuspend_blockers` that the
@@ -597,16 +598,6 @@ enum WaitidSignalRequest {
     Pending(Vec<SigWrapper>),
 }
 
-/// Which queue held the `SIGCHLD` whose eligibility mark a thread's gated wait
-/// took (https://github.com/rrnewton/hermit/issues/3146).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SigchldQueue {
-    /// The thread's private queue.
-    Thread,
-    /// The shared queue of this process.
-    Process(DetPid),
-}
-
 /// The state for the deterministic scheduler.
 #[derive(Debug)]
 pub struct Scheduler {
@@ -698,73 +689,17 @@ pub struct Scheduler {
     /// run-queue mutation is safe.
     pending_cross_task_signals: BTreeMap<DetTid, Vec<SigWrapper>>,
 
-    /// Whether gated waits filter `SIGCHLD` through the eligibility sets below:
-    /// set exactly when threads are serialized and the backend decides blocked
-    /// wait interruption from the kernel's signal state, the same condition under
-    /// which the guest side asks. Otherwise nothing is marked, so no stale mark
-    /// can outlive a run that never takes one.
-    sigchld_eligibility: bool,
-
-    /// Threads owed a `SIGCHLD` that a deterministic sender queued on their
-    /// private queue: a guest thread-directed send in its turn, or the
-    /// scheduler's own send through a thread pidfd. Together with the two sets
-    /// below, this is what lets a gated wait's `/proc` read tell such a signal
-    /// from the kernel's own host-timed `SIGCHLD`
-    /// (see `Scheduler::take_sigchld_eligibility`).
-    sigchld_eligible_threads: BTreeSet<DetTid>,
-
-    /// Processes owed a `SIGCHLD` that a deterministic sender queued on their
-    /// shared queue: a guest process-directed send in its turn, or the
-    /// scheduler's child-exit or timer send through `kill`.
-    sigchld_eligible_processes: BTreeSet<DetPid>,
-
-    /// Threads whose gated wait, or whose committed wake, took one eligibility
-    /// mark, with the queue the marked signal is pending on. Until that signal
-    /// is dequeued it is reserved for this thread: the delivery the backend
-    /// then reports accounts for it instead of clearing another mark, a repeat
-    /// take by the same thread (its woken wait re-checking) finds it again, and
-    /// a new send to the same queue coalesces into it. A dequeue of a reserved
-    /// shared signal by another thread releases the reservation
-    /// (`Scheduler::note_inbound_sigchld`).
-    sigchld_taken: BTreeMap<DetTid, SigchldQueue>,
-
-    /// Threads whose reservation in `sigchld_taken` has already answered one
-    /// gated wait. That wait returned its restart errno and the kernel dequeued
-    /// the signal as the call returned, so the reservation names no pending
-    /// signal once the thread runs on, whether or not the backend reported the
-    /// delivery: pinned Reverie delivers a signal it held during an injection
-    /// without a report when another signal is pending. A reservation is
-    /// therefore single-use. A later take by the same thread retires an
-    /// answered one instead of finding it again, and so does the thread's next
-    /// syscall or preemption (`Scheduler::retire_answered_sigchld`). A subset of
-    /// `sigchld_taken`'s keys.
-    sigchld_answered: BTreeSet<DetTid>,
-    /// Processes in which a thread armed `SIGCHLD` as its parent-death signal
-    /// (`prctl(PR_SET_PDEATHSIG, SIGCHLD)`). The kernel sends that signal when
-    /// the thread that forked the process exits, at the host instant of the
-    /// physical exit. A parent that another guest kills while it is outside the
-    /// run queue exits before the scheduler deregisters it, so that instant is
-    /// not ordered against the child's probes. Such a `SIGCHLD` is neither
-    /// marked nor from outside the container, so these processes do not take
-    /// the childless exception of `sigchld_eligible`: their gated waits keep the
-    /// base behaviour and count only marked signals. Membership lasts for the
-    /// process's life; a later `PR_SET_PDEATHSIG` of another signal does not
-    /// restore the exception, which fails closed.
-    sigchld_parent_death_processes: BTreeSet<DetPid>,
-
-    /// Parents whose kernel `SIGCHLD` a child's logical death made eligible
-    /// (`Scheduler::note_child_exit_sigchld`), each with the thread the kernel
-    /// tries first: the one that created the child. A logical death is recorded
-    /// while a guest runs, so the thread the kernel would give the signal to is
-    /// chosen later, at the step2 drain, where every scheduler-controlled thread
-    /// is stopped (`drain_pending_cross_task_signals`).
-    pending_child_exit_sigchld: BTreeMap<DetPid, DetTid>,
-
-    /// Child processes whose `Exit` grant set a `ChildExit` timer, so the
-    /// scheduler sends their parent's `SIGCHLD` itself and marks it then. A
-    /// child that dies without one is marked at its logical death instead
-    /// (`note_child_exit_sigchld`), which removes it from this set.
-    sigchld_child_exit_timers: BTreeSet<DetPid>,
+    /// Whether the scheduler models which thread the kernel gives a signal it
+    /// sends, from the signal masks it reads from the kernel: set exactly when
+    /// threads are serialized and the backend decides blocked-wait interruption
+    /// from the kernel's signal state
+    /// (`backend_supports_blocked_wait_signal_interruption`). Under it the
+    /// scheduler records the mask of each thread it releases into a call
+    /// outside the schedule (`BlockedPool::out_of_scheduler_masks`), wakes such
+    /// a thread at a fixed point when its own signal reaches it
+    /// (`arm_signaled_background`), and sends a child-exit `SIGCHLD` to the
+    /// thread the kernel would give it (`kernel_sigchld_target`).
+    models_signal_targets: bool,
 
     /// Kernel signal states that tests install for parked futex waiters, in
     /// place of reading `/proc`.
@@ -980,13 +915,6 @@ pub struct ThreadTree {
     /// the exact creating task for __WNOTHREAD, clone exit-signal class, and
     /// mutable process-group/session membership.
     process_wait: HashMap<DetPid, ProcessWaitMetadata>,
-
-    /// Every process that created a child process, or that a `CLONE_PARENT`
-    /// child names as its wait parent: the processes the kernel can send a
-    /// `SIGCHLD` for a child. A process is added when the child is registered,
-    /// before that child can run, and is never removed
-    /// (`Scheduler::sigchld_eligible`).
-    processes_with_children: HashSet<DetPid>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1178,9 +1106,7 @@ impl ThreadTree {
                 };
                 if let Some(wait_parent) = wait_parent {
                     self.process_parent.insert(child_dettid, wait_parent);
-                    self.processes_with_children.insert(wait_parent);
                 }
-                self.processes_with_children.insert(parent_process);
                 self.process_wait.insert(
                     child_dettid,
                     ProcessWaitMetadata {
@@ -1211,12 +1137,6 @@ impl ThreadTree {
     /// signal to a `Gone` target.
     pub fn parent_process(&self, pid: &DetPid) -> Option<DetPid> {
         self.process_parent.get(pid).copied()
-    }
-
-    /// Whether `pid` ever created a child process or became the wait parent of
-    /// one (`processes_with_children`).
-    pub fn process_had_child(&self, pid: &DetPid) -> bool {
-        self.processes_with_children.contains(pid)
     }
 
     /// Preserve a surviving exec task's children when Linux replaces its TID
@@ -1951,15 +1871,8 @@ impl Scheduler {
             pending_run_queue_admissions: Default::default(),
             pending_run_queue_removals: Default::default(),
             pending_cross_task_signals: Default::default(),
-            sigchld_eligibility: cfg.sequentialize_threads
+            models_signal_targets: cfg.sequentialize_threads
                 && cfg.backend_supports_blocked_wait_signal_interruption,
-            sigchld_eligible_threads: Default::default(),
-            sigchld_eligible_processes: Default::default(),
-            sigchld_taken: Default::default(),
-            sigchld_answered: Default::default(),
-            sigchld_parent_death_processes: Default::default(),
-            pending_child_exit_sigchld: Default::default(),
-            sigchld_child_exit_timers: Default::default(),
             #[cfg(test)]
             test_kernel_signal_states: Default::default(),
             #[cfg(test)]
@@ -2206,18 +2119,6 @@ impl Scheduler {
         // restarts and re-issues a fresh request on the next turn. Any other
         // double-put still panics, preserving the write-once Ivar invariant.
         // Mirrors the `try_put` guard in `logically_kill_thread` (PR-845).
-        //
-        // A reported `SIGCHLD` delivery is accounted for whether or not the
-        // request below is dropped: the kernel has dequeued the signal either way.
-        // A delivery the thread had reserved was placed by the scheduler, so its
-        // handler turn is granted rather than deferred as a host-async `SIGCHLD`
-        // is (`sigchld_ready`). The request is read only at the scheduler's own
-        // decision for this thread, so when it arrives does not matter.
-        let tid = rs.tid;
-        let reserved_sigchld = rs
-            .resources
-            .contains_key(&ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD)))
-            && self.note_inbound_sigchld(tid);
         if let Some(dropped) = req.try_put(Ok(rs)) {
             let tolerated = matches!(
                 req.try_read(),
@@ -2243,8 +2144,6 @@ impl Scheduler {
                     dropped, req
                 );
             }
-        } else if reserved_sigchld {
-            self.blocked.sigchld_ready.insert(tid);
         }
     }
 
@@ -2509,13 +2408,6 @@ impl Scheduler {
         self.vfork_registration_origins.remove(dtid);
         self.real_timers.retire_task(*detpid, *dtid);
         self.retire_parked_requests(*dtid);
-        // A departed thread takes no `SIGCHLD`; its private queue went with it.
-        // A shared one it had reserved is still pending on its process's queue,
-        // for another thread to take.
-        self.sigchld_eligible_threads.remove(dtid);
-        if let Some(SigchldQueue::Process(process)) = self.release_sigchld_reservation(*dtid) {
-            self.sigchld_eligible_processes.insert(process);
-        }
 
         let _ = self.priorities.remove(dtid);
         match self.next_turns.remove(dtid) {
@@ -2563,21 +2455,12 @@ impl Scheduler {
             .any(|tid| self.next_turns.contains_key(&tid));
         if !live_process_thread {
             let _ = self.begin_physical_process_exit(*detpid);
-            // Once per child: a reap removes the child from this set and from
-            // `process_parent` together, so a repeated call cannot reach the
-            // parent branch below with `newly_exited` set a second time.
-            let newly_exited = self.logically_exited_processes.insert(*detpid);
+            self.logically_exited_processes.insert(*detpid);
             if let Some(parent) = self.thread_tree.parent_process(detpid) {
                 self.wake_child_waiters(parent, *detpid);
-                if newly_exited {
-                    self.note_child_exit_sigchld(parent, *detpid);
-                }
             }
             self.blocked.timed_waiters.remove_process_timers(*detpid);
             self.real_timers.retire_process(*detpid);
-            // The shared queue went with the last thread.
-            self.sigchld_eligible_processes.remove(detpid);
-            self.pending_child_exit_sigchld.remove(detpid);
         }
     }
 
@@ -3731,7 +3614,6 @@ impl Scheduler {
             "[dtid {}] deliver signal {} physically to guest thread.",
             dettid, signal
         );
-        let thread_directed = self.physical_thread_pidfds.contains_key(&dettid);
         let result = if let Some((_, _, _, pidfd)) = self.physical_thread_pidfds.get(&dettid) {
             let rc = unsafe {
                 libc::syscall(
@@ -3760,18 +3642,7 @@ impl Scheduler {
             signal::kill(pid, signal)
         };
         match result {
-            Ok(()) => {
-                if signal == Signal::SIGCHLD {
-                    // This send happens at a deterministic scheduler point (a
-                    // timed pop in step2b or the empty-queue time skip), so a
-                    // gated wait may act on it. A thread pidfd queues it on the
-                    // thread's private queue; `kill` queues it on the process's
-                    // shared queue, where it coalesces with any host-timed
-                    // `SIGCHLD` the kernel posted for the same child.
-                    let process = (!thread_directed).then(|| self.sigchld_process(dettid));
-                    self.mark_sigchld_eligible(dettid, process);
-                }
-            }
+            Ok(()) => {}
             // ⚠️ ESRCH IS AN EXPECTED OUTCOME HERE, NOT AN ERROR. The target
             // chose to exit between the moment it was selected and the moment
             // the signal was sent; that window is inherent and cannot be closed
@@ -3817,8 +3688,8 @@ impl Scheduler {
     /// thread is armed for the release barrier
     /// (`step2_release_signaled_background`), which requeues it at the top of
     /// the next pass once that continuation is posted. A `SIGCHLD` target is
-    /// also marked `sigchld_ready`, as a woken futex waiter is, so its delivery
-    /// commits rather than being deferred behind runnable siblings.
+    /// also marked `sigchld_ready`, so its delivery commits rather than being
+    /// deferred behind runnable siblings.
     ///
     /// Not armed, and left in its pool for `step2c` exactly as before, is a
     /// thread the signal does not wake at a known point: a vfork parent (it
@@ -3864,12 +3735,12 @@ impl Scheduler {
             || self.blocked.rt_sigsuspend_blockers.contains_key(&dettid);
         let await_external_continuation =
             self.backend.signal_interrupts_external_syscalls && has_external_blocker;
-        // On a traced backend (the same condition as `sigchld_eligibility`,
-        // which only ptrace meets), such a thread awaits its own continuation
-        // too. Its request was consumed when it was backgrounded, so nothing
-        // may be counterfeited for it; the scheduler orders the continuation
-        // the signal provokes instead.
-        if self.sigchld_eligibility && has_external_blocker && !await_external_continuation {
+        // Where the scheduler models signal targets (`models_signal_targets`),
+        // such a thread awaits its own continuation too. Its request was
+        // consumed when it was backgrounded, so nothing may be counterfeited
+        // for it; the scheduler orders the continuation the signal provokes
+        // instead.
+        if self.models_signal_targets && has_external_blocker && !await_external_continuation {
             self.arm_signaled_background(dettid, signal);
             return;
         }
@@ -3940,11 +3811,13 @@ impl Scheduler {
                 // waiting.
                 if let Some(interrupting) = self.parked_futex_interrupting_signals(dettid) {
                     if interrupting & kernel_signal_bit(signal as i32) == 0 {
-                        // Blocked, ignored, or default-ignored for this waiter now:
-                        // the kernel discards an ignored signal or keeps a blocked
-                        // one pending, and the wait stays registered with its
-                        // original absolute deadline. So does a default job-control
-                        // stop that the wait defers (`FutexSignalWatch`), which the
+                        // Blocked, ignored, or default-ignored for this waiter now,
+                        // or a signal the wait holds until the call returns
+                        // (`parked_futex_interrupting_signals`): the kernel
+                        // discards an ignored signal or keeps the others pending,
+                        // and the wait stays registered with its original
+                        // absolute deadline. So does a default job-control stop
+                        // that the wait defers (`FutexSignalWatch`), which the
                         // kernel delivers or discards when the call returns.
                         debug!(
                             "[dtid {}] signal {} does not interrupt its futex wait; leaving it parked.",
@@ -3952,35 +3825,16 @@ impl Scheduler {
                         );
                         return;
                     }
-                    if signal == Signal::SIGCHLD
-                        && self.sigchld_eligibility
-                        && !self.take_sigchld_eligibility(dettid)
-                    {
-                        // The send coalesced into a `SIGCHLD` that another
-                        // thread's committed wake already reserved, and that
-                        // thread takes it.
-                        debug!(
-                            "[dtid {}] SIGCHLD coalesced into one another thread takes; leaving it parked.",
-                            dettid
-                        );
-                        return;
-                    }
-                    // The wake is committed for this signal, and for a `SIGCHLD`
-                    // it holds the mark its send just set. That commit is the
-                    // deterministic delivery point, so the wake turn is granted
-                    // rather than deferred behind runnable siblings as a
-                    // host-async `SIGCHLD` is (`sigchld_deferred`): a sibling
-                    // resumed first would dequeue the signal instead. (Set after
-                    // the requeue, which clears every blocked-pool entry.)
+                    // The wake is committed for this signal. That commit is the
+                    // deterministic delivery point; the woken waiter goes to the
+                    // front of its band, so it is the next thread to resume and
+                    // dequeue the signal (`force_unblock_thread_at`).
                     let mut rsrcs = Resources::new(dettid);
                     rsrcs.insert(
                         ResourceID::InboundSignal(SigWrapper::from(signal)),
                         Permission::W,
                     );
                     self.force_unblock_thread_at(dettid, rsrcs, true);
-                    if signal == Signal::SIGCHLD && self.sigchld_eligibility {
-                        self.blocked.sigchld_ready.insert(dettid);
-                    }
                     return;
                 }
                 let mut rsrcs = Resources::new(dettid);
@@ -4089,7 +3943,8 @@ impl Scheduler {
     /// The signals that end a parked precise-mode futex waiter's wait NOW, when its
     /// backend reports the kernel's signal state: unblocked by its mask, and caught
     /// or fatal-by-default under the dispositions the kernel holds at this moment
-    /// (https://github.com/rrnewton/hermit/issues/3146).
+    /// (https://github.com/rrnewton/hermit/issues/3146). Never `SIGCHLD`, which a
+    /// gated wait holds until the call returns (`futex_wait_held_signals`).
     ///
     /// ⚠️ CALL THIS ONLY WHERE A WAKE IS COMMITTED: the step2 drain of cross-task
     /// signals and the scheduler-sent signal paths in step2b and the empty-queue
@@ -4131,214 +3986,71 @@ impl Scheduler {
     /// that does interrupt it could instead deadlock it.
     fn parked_futex_interrupting_signals(&self, dettid: DetTid) -> Option<u64> {
         let watch = self.parked_futex_waiter(dettid)?.signal_watch?;
+        let held = self.futex_wait_held_signals();
         #[cfg(test)]
         if let Some(state) = self.test_kernel_signal_states.get(&dettid) {
-            return Some(state.interrupting_wait(!watch.unblocked, watch.defers_default_stops));
+            return Some(
+                state.interrupting_wait(!watch.unblocked, watch.defers_default_stops) & !held,
+            );
         }
         match read_kernel_signal_state(
             reverie::Pid::from_raw(watch.pid),
             reverie::Pid::from_raw(watch.tid),
         ) {
             Ok(state) => {
-                Some(state.interrupting_wait(!watch.unblocked, watch.defers_default_stops))
+                Some(state.interrupting_wait(!watch.unblocked, watch.defers_default_stops) & !held)
             }
             Err(errno) => {
                 debug!(
                     "[dtid {}] cannot read the signal state of parked futex waiter {}/{} ({}); \
-                     treating every unblocked signal as interrupting.",
+                     treating every unblocked signal it does not hold as interrupting.",
                     dettid, watch.pid, watch.tid, errno
                 );
-                Some(watch.unblocked)
+                Some(watch.unblocked & !held)
             }
         }
     }
 
-    // `SIGCHLD` ELIGIBILITY FOR GATED WAITS
+    /// The signals a parked precise-mode futex waiter holds until its call
+    /// returns, whatever its mask and dispositions: `SIGCHLD`, whoever sent it.
+    /// The kernel also posts `SIGCHLD` itself, for a child's exit, stop or
+    /// continue, at a moment set by host timing, and the waiter cannot tell
+    /// that copy from one sent at a deterministic point. The guest side holds
+    /// the same signal in its own checks (`KernelSignalWait`, and the futex
+    /// pre-check in `handle_futex_blocking`)
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    fn futex_wait_held_signals(&self) -> u64 {
+        kernel_signal_bit(libc::SIGCHLD)
+    }
+
+    // `SIGCHLD` AND GATED WAITS
     // (https://github.com/rrnewton/hermit/issues/3146)
     //
-    // A gated wait decides interruption from the kernel's pending set in `/proc`:
-    // the precise futex pre-check, and the polling waits that read the kernel's
-    // signal state each turn. Guest syscalls in their turns and scheduler sends
-    // at deterministic points put most signals in that set. `SIGCHLD` is the
-    // exception that matters inside the container. The kernel posts it to the
-    // parent when a child exits, at a moment set by host timing; on ptrace, that
-    // is when the tracer releases the dying child. The scheduler models the same
-    // event separately, as the `ChildExit` timer at the child's committed exit
-    // time plus 1 ns, which sends its own `SIGCHLD` through `signal_guest`.
-    //
-    // So a gated wait counts a pending `SIGCHLD` only when the scheduler made it
-    // eligible at one of its own ordering points, and it records every one:
-    //   * a guest `kill`, `tgkill`, `tkill`, `rt_sigqueueinfo`,
-    //     `rt_tgsigqueueinfo` or `pidfd_send_signal` that succeeded in the
-    //     sender's turn (`mark_sigchld_eligible`, by RPC);
-    //   * the scheduler's own send in `signal_guest`, which includes the
-    //     `ChildExit` send for a child whose `exit_group` was granted;
-    //   * the logical death of a child that had no `ChildExit` timer: one killed
-    //     by a signal, or whose last thread called `exit`
-    //     (`note_child_exit_sigchld`). The scheduler sends nothing for it; the
-    //     kernel's own `SIGCHLD` becomes eligible at the point where the
-    //     scheduler admits the child's `wait4` and `waitid` waiters.
-    // A process that never created a child, and that no `CLONE_PARENT` child
-    // names as its wait parent, is never sent a `SIGCHLD` by the kernel for a
-    // child, so every pending `SIGCHLD` of such a process counts
-    // (`sigchld_eligible`); this is how a `SIGCHLD` sent from outside the
-    // container reaches a process without children. For a process with
-    // children, any other pending `SIGCHLD` is left out of the pending set:
-    // the kernel's second, coalescing copy of a `ChildExit` send that arrives
-    // after the first was taken, one for a child's stop or continue, and one
-    // sent from outside the container, which `/proc` cannot tell apart from the
-    // kernel's. It stays pending in the kernel and is delivered when the wait
-    // ends.
+    // A gated wait decides interruption from the kernel's pending set in
+    // `/proc`: the precise futex pre-check and the parked waiter's wake
+    // (`parked_futex_interrupting_signals`), and the polling waits that read
+    // the kernel's signal state each turn (`KernelSignalWait`). None of them
+    // ends for a `SIGCHLD`, whoever sent it. The kernel posts `SIGCHLD` to a
+    // parent for a child's exit, stop or continue at a moment set by host
+    // timing (under ptrace, when the tracer releases the dying child), and
+    // `/proc` cannot tell that copy from one a guest or the scheduler sent at
+    // a deterministic point. The signal stays pending in the kernel and is
+    // delivered when the call returns for another reason. Linux would end the
+    // wait; that part of the issue is given up until Reverie reports every
+    // delivery it holds.
     //
     // The waits of `select`, and of `pselect6` without a temporary mask, read
-    // the same state but are not gated and never ask
-    // (`KernelSignalWait::for_select`). Linux ends them for any caught signal,
-    // and the gate would hold a `SIGCHLD` sent from outside the container to a
-    // process that has had a child, possibly for the rest of the wait. They
-    // see the kernel's own `SIGCHLD` for a child event at a host-timed turn,
-    // as Detcore's select and pselect6 waits did before the gate. A marked
-    // `SIGCHLD` that ends one of them is dequeued when the call returns, and
-    // `note_inbound_sigchld` clears its mark as for any other dequeue.
+    // the same state but hold nothing (`KernelSignalWait::for_select`), so a
+    // pending caught `SIGCHLD` still ends them at a turn host timing can
+    // choose: a known gap that these waits had before.
     //
-    // Why the answer is deterministic:
-    //   * Marks are set only at the scheduler's ordering points: in the sender's
-    //     turn; in a step2b timed pop or the empty-queue time skip; or at a
-    //     child's logical death, the point that also orders the reaping of that
-    //     child, so the signal is exactly as ordered as `wait4` is for it.
-    //   * Takes happen only at deterministic points: a gated read in the reader's
-    //     turn, issued whenever `SIGCHLD` could interrupt that reader, pending or
-    //     not; or a committed wake in step2.
-    //   * A take changes state only when a mark exists AND the signal is pending.
-    //     On ptrace a mark implies it is pending. A sender queued it
-    //     synchronously. For a child's logical death, Linux queues the parent's
-    //     `SIGCHLD` inside the tracer's `wait` that reaps the traced child
-    //     (`wait_task_zombie` calls `do_notify_parent` for a reparented
-    //     leader), and the backend reports the thread's exit, which is what
-    //     leads to the logical death, only with the status that `wait` returned.
-    //     A marked signal leaves the queue only through a dequeue, which the
-    //     backend reports as an `InboundSignal` request, and `request_put`
-    //     clears the mark before the scheduler grants any other thread a turn.
-    //     So whether a take succeeds depends on the marks alone.
-    //   * The host-timed copy of a `ChildExit` send can only coalesce into the
-    //     marked one, which changes nothing a reader can see.
-    //   * A process joins `processes_with_children` when its child is
-    //     registered (`ThreadTree::add_child_with_wait_metadata`): by the
-    //     creating thread in its turn, or by a vfork child before its first
-    //     turn. The child cannot exit, stop or continue before that, so the
-    //     kernel's `SIGCHLD` for it is pending only for a process already in
-    //     the set, whose `SIGCHLD` still needs a mark. A `SIGCHLD` counted for
-    //     a process outside the set was sent from outside the container, at a
-    //     host-timed moment like any external signal, and is observed at the
-    //     same boundary as every other: the reader's gated read in its turn.
-    //
-    // The argument needs the guest to be traced, and it is on the only backend
-    // that turns this on: `backend_supports_blocked_wait_signal_interruption`
-    // is set only for ptrace (`hermit-cli/src/lib.rs`). Two kernel facts it
-    // leans on hold only for a traced task, so a backend that enables the gate
-    // without tracing must revisit this section:
-    //   * Linux discards a signal at generation when the target has it
-    //     ignored, explicitly or by default, and unblocked, unless the target is
-    //     traced (`sig_ignored`). A traced task therefore stops for every
-    //     `SIGCHLD`, so every dequeue is reported and clears its mark. Untraced,
-    //     a mark for a discarded `SIGCHLD` would linger until the next
-    //     `SIG_IGN` or `SIG_DFL` flush.
-    //   * The parent's `SIGCHLD` for a traced child is queued when the tracer
-    //     reaps it, before the backend reports the exit. Untraced, the kernel
-    //     posts it from the child's `do_exit`, unordered against the backend's
-    //     report, so a mark could precede the pending signal.
+    // What follows models which thread of a process the kernel gives a
+    // `SIGCHLD` that the scheduler sends for a child's exit
+    // (`kernel_sigchld_target`), under `models_signal_targets`.
 
     /// The process whose shared queue a `SIGCHLD` for `thread` joins.
     fn sigchld_process(&self, thread: DetTid) -> DetPid {
         self.registered_process(thread).unwrap_or(thread)
-    }
-
-    /// Record that a deterministic sender queued a `SIGCHLD`: on `process`'s
-    /// shared queue, or on `thread`'s private queue when `process` is `None`.
-    /// Marks are a set because the kernel coalesces a standard signal that is
-    /// already pending on the same queue.
-    pub(crate) fn mark_sigchld_eligible(&mut self, thread: DetTid, process: Option<DetPid>) {
-        if !self.sigchld_eligibility {
-            return;
-        }
-        trace!(
-            "[dtid {}] SIGCHLD made eligible for gated waits ({:?}).",
-            thread, process
-        );
-        if self.sigchld_reserved_on(thread, process) {
-            // The signal coalesces into the reserved one still pending there,
-            // which its reserving thread takes.
-            return;
-        }
-        match process {
-            Some(process) => self.sigchld_eligible_processes.insert(process),
-            None => self.sigchld_eligible_threads.insert(thread),
-        };
-    }
-
-    /// Make the kernel's `SIGCHLD` for `child`'s exit eligible, at `child`'s
-    /// logical death, when no `ChildExit` timer will send and mark one: the child
-    /// was killed by a signal, or its last thread called `exit` rather than
-    /// `exit_group`. Called once per child, beside the `wake_child_waiters` call
-    /// that makes the same exit reapable.
-    ///
-    /// The kernel sends the child's `exit_signal`, so a child created with any
-    /// other exit signal earns no mark. The parent's gated waits then count the
-    /// signal: a polling wait at its next read, and a precise futex waiter
-    /// through the step2 drain, the same commit point as a guest-sent signal.
-    ///
-    /// The kernel queues this signal on the parent's shared queue. Only one
-    /// thread takes it, and a parked waiter must be woken only if it is that
-    /// thread; otherwise the thread that does take it runs the handler and the
-    /// woken waiter has nothing to be interrupted by. The drain picks the thread
-    /// (`kernel_sigchld_target`), because a logical death is recorded while a
-    /// guest runs, not at a point where every thread is stopped.
-    fn note_child_exit_sigchld(&mut self, parent: DetPid, child: DetPid) {
-        if self.sigchld_child_exit_timers.remove(&child) || !self.sigchld_eligibility {
-            return;
-        }
-        let Some(metadata) = self.thread_tree.process_wait.get(&child).copied() else {
-            return;
-        };
-        if metadata.exit_signal != libc::SIGCHLD {
-            return;
-        }
-        debug!(
-            "[dpid {}] child {} exited without a ChildExit send; its SIGCHLD is now eligible.",
-            parent, child
-        );
-        self.mark_sigchld_eligible(parent, Some(parent));
-        self.pending_child_exit_sigchld
-            .entry(parent)
-            .or_insert(metadata.wait_owner);
-    }
-
-    /// Wake the parked futex waiter, if any, that the kernel gives a `SIGCHLD`
-    /// recorded by `note_child_exit_sigchld`. Runs first in the step2 drain of
-    /// cross-task signals, so the wake it queues is committed by the same drain.
-    fn notify_child_exit_sigchld_targets(&mut self) {
-        let sigchld = kernel_signal_bit(libc::SIGCHLD);
-        let pending = std::mem::take(&mut self.pending_child_exit_sigchld);
-        for (parent, creator) in pending {
-            // A gated wait may already have taken the mark, or a disposition
-            // change flushed it. Either way no marked signal is left to route.
-            if !self.sigchld_eligible_processes.contains(&parent) {
-                continue;
-            }
-            let Some(target) = self.kernel_sigchld_target(parent, creator) else {
-                continue;
-            };
-            let parked_waiter = self
-                .parked_futex_unblocked_signals(target)
-                .is_some_and(|unblocked| unblocked & sigchld != 0);
-            if parked_waiter {
-                self.notify_signal_pending(target, SigWrapper(libc::SIGCHLD));
-            } else {
-                trace!(
-                    "[dpid {}] SIGCHLD goes to thread {}, which is not a parked futex waiter.",
-                    parent, target
-                );
-            }
-        }
     }
 
     /// The thread of `process` that the kernel gives a `SIGCHLD` queued on the
@@ -4349,12 +4061,13 @@ impl Scheduler {
     /// signal, and otherwise looks for another thread that does not. Under a
     /// tracer, a thread held in a ptrace stop does not qualify, and the kernel
     /// instead leaves the signal pending for whichever thread resumes first
-    /// without blocking it. A parked waiter that is chosen is queued to run
-    /// next (`force_unblock_thread_at`), so the first non-blocking thread in
-    /// this order is the one that dequeues the signal: `preferred`, then the
-    /// rest in thread-ID order, which stands in for the kernel's round-robin
-    /// `curr_target`. A running thread counts as much as a parked one; if it
-    /// is chosen, no waiter is woken.
+    /// without blocking it. The order here is `preferred`, then the rest in
+    /// thread-ID order, which stands in for the kernel's round-robin
+    /// `curr_target`. Only a chosen thread that sleeps outside the runnable
+    /// set is woken (`arm_signaled_background`). A chosen parked futex waiter
+    /// is not: its wait holds `SIGCHLD` until the call returns
+    /// (`futex_wait_held_signals`). A running thread counts as much as a
+    /// parked one.
     ///
     /// Every mask this uses is a function of the schedule, so the choice is
     /// too. Call this only at the step2 drain or a step2b timed pop, where no
@@ -4435,190 +4148,6 @@ impl Scheduler {
                 None
             }
         }
-    }
-
-    /// Answer a gated wait of `thread` that found `SIGCHLD` able to interrupt it:
-    /// whether a `SIGCHLD` it found pending (`pending`) counts. The wait issues
-    /// this whenever `SIGCHLD` could interrupt it, pending or not, so the
-    /// question itself is part of the deterministic schedule. A `true` answer
-    /// takes one mark, or finds the one a committed wake reserved for this
-    /// thread: the wait then returns its restart errno and the kernel delivers
-    /// the signal as the call returns. A `false` answer with nothing pending
-    /// also releases a reservation this thread held, since the signal it named
-    /// is gone.
-    ///
-    /// A reservation answers one wait (`sigchld_answered`). A true answer ends
-    /// the wait, so a later take by the same thread comes from a later wait, by
-    /// which time the kernel has dequeued the signal the answer named. The
-    /// backend may not have reported that delivery, so the reservation can still
-    /// be held: it is retired here instead of answering again, and the take goes
-    /// on as if it were absent. Otherwise a reservation that outlived its
-    /// signal would count a later `SIGCHLD` nobody marked, at a turn set by host
-    /// timing.
-    ///
-    /// A `SIGCHLD` pending for a process that never had a child counts without
-    /// a mark: the kernel sends `SIGCHLD` for a child only to the child's
-    /// parent, so it came from a sender, either a guest one, which marked it,
-    /// or one outside the container. No reservation is taken for it: every
-    /// `SIGCHLD` of such a process counts, so a mark that its delivery clears
-    /// changes no answer. A process that armed `SIGCHLD` as its parent-death
-    /// signal is excluded (`sigchld_parent_death_processes`): the kernel also
-    /// sends that signal itself, at a host-timed instant, so such a process
-    /// counts only marked signals, as every process did before this exception.
-    pub(crate) fn sigchld_eligible(&mut self, thread: DetTid, pending: bool) -> bool {
-        if !pending {
-            self.release_sigchld_reservation(thread);
-            return false;
-        }
-        if self.take_sigchld_eligibility(thread) {
-            self.sigchld_answered.insert(thread);
-            return true;
-        }
-        let process = self.sigchld_process(thread);
-        !self.thread_tree.process_had_child(&process)
-            && !self.sigchld_parent_death_processes.contains(&process)
-    }
-
-    /// `thread` armed `SIGCHLD` as its parent-death signal, so its process no
-    /// longer counts an unmarked `SIGCHLD` (`sigchld_parent_death_processes`).
-    pub(crate) fn note_parent_death_sigchld(&mut self, thread: DetTid) {
-        if !self.sigchld_eligibility {
-            return;
-        }
-        let process = self.sigchld_process(thread);
-        trace!(
-            "[dtid {}] process {} armed SIGCHLD as its parent-death signal; it no longer counts an unmarked SIGCHLD.",
-            thread, process
-        );
-        self.sigchld_parent_death_processes.insert(process);
-    }
-
-    /// Take one mark for a `SIGCHLD` that `thread` is about to be interrupted by,
-    /// in the order the kernel dequeues: the thread's private queue first, then
-    /// its process's shared queue. The taken mark is remembered as `thread`'s
-    /// reservation (`sigchld_taken`), so the delivery the backend then reports
-    /// for `thread` accounts for it instead of clearing another mark
-    /// (`note_inbound_sigchld`). A thread whose reservation has not answered a
-    /// wait yet takes nothing more: its woken wait re-checking after the step2
-    /// drain took the mark for it finds the same signal. A reservation that has
-    /// answered one is stale (`sigchld_answered`) and is retired first.
-    fn take_sigchld_eligibility(&mut self, thread: DetTid) -> bool {
-        if self.sigchld_taken.contains_key(&thread) {
-            if !self.sigchld_answered.contains(&thread) {
-                return true;
-            }
-            self.release_sigchld_reservation(thread);
-        }
-        let process = self.sigchld_process(thread);
-        let queue = if self.sigchld_eligible_threads.remove(&thread) {
-            SigchldQueue::Thread
-        } else if self.sigchld_eligible_processes.remove(&process) {
-            SigchldQueue::Process(process)
-        } else {
-            return false;
-        };
-        self.sigchld_taken.insert(thread, queue);
-        true
-    }
-
-    /// Release `thread`'s reservation, answered or not, returning the queue it
-    /// named.
-    fn release_sigchld_reservation(&mut self, thread: DetTid) -> Option<SigchldQueue> {
-        self.sigchld_answered.remove(&thread);
-        self.sigchld_taken.remove(&thread)
-    }
-
-    /// `thread`, whose gated wait a reserved `SIGCHLD` answered, entered its next
-    /// syscall or was preempted. The answered wait returned before either, and
-    /// the kernel dequeued the signal as it returned, so the reservation names
-    /// no pending signal even when the backend did not report that delivery
-    /// (`sigchld_answered`). Retiring it here, at a point the thread always
-    /// reaches before it runs on into another turn, keeps it from absorbing a
-    /// later send to the same queue (`sigchld_reserved_on`) or from claiming a
-    /// later delivery (`note_inbound_sigchld`). A reservation a committed wake
-    /// took for a parked waiter that has not re-checked yet is kept.
-    pub(crate) fn retire_answered_sigchld(&mut self, thread: DetTid) {
-        if self.sigchld_answered.contains(&thread) {
-            trace!(
-                "[dtid {}] retiring the SIGCHLD reservation its gated wait answered",
-                thread
-            );
-            self.release_sigchld_reservation(thread);
-        }
-    }
-
-    /// Whether a thread's reservation names a `SIGCHLD` still pending on `queue`
-    /// (`None` for `thread`'s private queue, `Some` for a process's shared one),
-    /// into which a new send to that queue coalesces.
-    fn sigchld_reserved_on(&self, thread: DetTid, queue: Option<DetPid>) -> bool {
-        match queue {
-            None => self.sigchld_taken.get(&thread) == Some(&SigchldQueue::Thread),
-            Some(process) => self
-                .sigchld_taken
-                .values()
-                .any(|reserved| *reserved == SigchldQueue::Process(process)),
-        }
-    }
-
-    /// Account for a `SIGCHLD` the kernel dequeued for `thread`, as the backend
-    /// reports it, in the kernel's order: `thread`'s private queue first, then
-    /// its process's shared queue. A delivery that `thread` holds the
-    /// reservation for clears nothing else. Otherwise the dequeue emptied
-    /// whichever queue the kernel serves first, so the mark for that queue no
-    /// longer names a pending signal. A shared `SIGCHLD` that another thread
-    /// had reserved is gone too: that thread's woken wait finds nothing pending
-    /// and parks again, so its reservation is released.
-    ///
-    /// Returns whether the delivery is the one `thread`'s own reservation named.
-    /// Its delivery point was then already fixed by the committed wake or gated
-    /// wait that took the mark, not by host timing.
-    fn note_inbound_sigchld(&mut self, thread: DetTid) -> bool {
-        if self.sigchld_taken.get(&thread) == Some(&SigchldQueue::Thread) {
-            self.release_sigchld_reservation(thread);
-            return true;
-        }
-        if self.sigchld_eligible_threads.remove(&thread) {
-            return false;
-        }
-        if let Some(SigchldQueue::Process(_)) = self.sigchld_taken.get(&thread) {
-            self.release_sigchld_reservation(thread);
-            return true;
-        }
-        let process = self.sigchld_process(thread);
-        if self.sigchld_eligible_processes.remove(&process) {
-            return false;
-        }
-        // The kernel coalesces a standard signal already pending on a queue, so
-        // a reserved shared `SIGCHLD` is the only one that queue held.
-        self.sigchld_taken
-            .retain(|_, reserved| *reserved != SigchldQueue::Process(process));
-        let taken = &self.sigchld_taken;
-        self.sigchld_answered
-            .retain(|thread| taken.contains_key(thread));
-        false
-    }
-
-    /// `thread` set `SIGCHLD` to `SIG_IGN` or `SIG_DFL` in its turn. Linux then
-    /// discards every pending `SIGCHLD` of its process, shared and private
-    /// (`do_sigaction`), so none of the process's marks or reservations names a
-    /// pending signal any more.
-    pub(crate) fn flush_sigchld_eligibility(&mut self, thread: DetTid) {
-        let process = self.sigchld_process(thread);
-        let tree = &self.thread_tree;
-        let in_process = |thread: &DetTid| {
-            tree.thread_to_leader
-                .get(thread)
-                .copied()
-                .unwrap_or(*thread)
-                == process
-        };
-        self.sigchld_eligible_threads
-            .retain(|thread| !in_process(thread));
-        self.sigchld_taken.retain(|thread, _| !in_process(thread));
-        let taken = &self.sigchld_taken;
-        self.sigchld_answered
-            .retain(|thread| taken.contains_key(thread));
-        self.sigchld_eligible_processes.remove(&process);
     }
 
     /// Record an unambiguous cross-task signal that was physically queued while
@@ -5598,18 +5127,18 @@ impl Scheduler {
                 // it is still stopped at this request. Once released, its live
                 // mask is host-timed (`kernel_sigchld_target`).
                 //
-                // Only a scheduler with `sigchld_eligibility` reads or records
+                // Only a scheduler with `models_signal_targets` reads or records
                 // that mask. Its two readers, `kernel_sigchld_target` (through
                 // `thread_signal_mask`) and `arm_signaled_background`, run only
                 // under that flag, and the flag needs
-                // `backend_supports_blocked_wait_signal_interruption`, which is
-                // set only for ptrace (`hermit-cli/src/lib.rs`), a backend whose
-                // `DetTid`s are the host thread IDs that `/proc` names. On a
-                // backend whose IDs are guest-virtual, KVM among them, a `/proc`
-                // read of `dettid` would name an unrelated host thread or none at
-                // all.
+                // `backend_supports_blocked_wait_signal_interruption`, which a
+                // backend sets only when its `DetTid`s are the host thread IDs
+                // that `/proc` names (`prepare_backend_config` in
+                // `hermit-cli/src/lib.rs`). On a backend whose IDs are
+                // guest-virtual, a `/proc` read of `dettid` would name an
+                // unrelated host thread or none at all.
                 let sleeping_mask = self
-                    .sigchld_eligibility
+                    .models_signal_targets
                     .then(|| blocked_signal_mask.or_else(|| self.read_thread_blocked_mask(dettid)));
                 self.run_queue.consume_yield_exclusion();
                 self.unblock_guest(dettid, resp)?;
@@ -5748,7 +5277,7 @@ impl Scheduler {
                     // leader's wait is left alone. Elsewhere it keeps naming
                     // the leader (DetTid == DetPid for a group leader).
                     let deadline = self.committed_time + LogicalTime::from_nanos(1);
-                    let parent_thread = if self.sigchld_eligibility {
+                    let parent_thread = if self.models_signal_targets {
                         self.thread_tree
                             .process_wait
                             .get(process)
@@ -5762,9 +5291,6 @@ impl Scheduler {
                         parent,
                         parent_thread,
                     );
-                    if self.sigchld_eligibility {
-                        self.sigchld_child_exit_timers.insert(*process);
-                    }
                 }
                 Ok(())
             }
@@ -6502,7 +6028,6 @@ impl Scheduler {
     /// run-queue mutation point. Re-check the request because a target may have
     /// exited or completed its wait before this drain.
     fn drain_pending_cross_task_signals(&mut self) {
-        self.notify_child_exit_sigchld_targets();
         let pending = std::mem::take(&mut self.pending_cross_task_signals);
         for (dettid, mut signals) in pending {
             match self.waitid_signal_request(dettid) {
@@ -6579,14 +6104,6 @@ impl Scheduler {
                     signals.retain(|signal| interrupting & kernel_signal_bit(signal.raw()) != 0);
                     signals.sort_by_key(SigWrapper::raw);
                     signals.dedup();
-                    if signals.contains(&SigWrapper(libc::SIGCHLD))
-                        && self.sigchld_eligibility
-                        && !self.take_sigchld_eligibility(dettid)
-                    {
-                        // No mark is left for this `SIGCHLD`: a gated wait took
-                        // it first, or a disposition change flushed it.
-                        signals.retain(|signal| *signal != SigWrapper(libc::SIGCHLD));
-                    }
                     if signals.is_empty() {
                         continue;
                     }
@@ -9314,25 +8831,26 @@ mod test {
             vec![SigWrapper::from(Signal::SIGUSR1)]
         );
 
-        // Through a scheduler send (a timer, or a child's exit), for SIGCHLD,
-        // which is ignored by default until a handler is installed.
+        // Through a scheduler send (a timer), for SIGWINCH, which is ignored by
+        // default until a handler is installed. A SIGCHLD never ends the wait
+        // (`a_sigchld_never_ends_a_parked_futex_wait`).
         let mut scheduler = Scheduler::new(&Config::default());
         let (target, futex) = parked_futex_target(&mut scheduler);
-        let chld = kernel_signal_bit(libc::SIGCHLD);
+        let winch = kernel_signal_bit(libc::SIGWINCH);
         scheduler
             .test_kernel_signal_states
             .insert(target, signal_state(0, 0));
-        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, Some(signal_watch(chld)));
+        scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, Some(signal_watch(winch)));
         scheduler
             .test_kernel_signal_states
-            .insert(target, signal_state(chld, 0));
-        scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+            .insert(target, signal_state(winch, 0));
+        scheduler.wake_signaled_guest(target, Signal::SIGWINCH);
 
         assert!(!scheduler.is_parked_futex_waiter(target));
         assert!(scheduler.run_queue.contains_tid(target));
         assert_eq!(
             scheduler.inbound_signals(target),
-            vec![SigWrapper::from(Signal::SIGCHLD)]
+            vec![SigWrapper::from(Signal::SIGWINCH)]
         );
     }
 
@@ -9458,444 +8976,90 @@ mod test {
         assert!(is_futex_request(&scheduler.next_turns[&target]));
     }
 
-    /// The scheduler under the condition that turns on `SIGCHLD` eligibility:
-    /// serialized threads and a backend that decides blocked-wait interruption
-    /// from the kernel's signal state (https://github.com/rrnewton/hermit/issues/3146).
-    fn sigchld_gated_scheduler() -> Scheduler {
+    /// The scheduler under the condition that turns on its model of which thread
+    /// a signal reaches (`models_signal_targets`): serialized threads and a
+    /// backend that decides blocked-wait interruption from the kernel's signal
+    /// state (https://github.com/rrnewton/hermit/issues/3146).
+    fn gated_scheduler() -> Scheduler {
         let scheduler = Scheduler::new(&Config {
             sequentialize_threads: true,
             backend_supports_blocked_wait_signal_interruption: true,
             ..Config::default()
         });
-        assert!(scheduler.sigchld_eligibility);
+        assert!(scheduler.models_signal_targets);
         scheduler
     }
 
-    /// A gated wait counts a pending `SIGCHLD` only when a deterministic sender
-    /// marked one, and one mark answers one delivery: a parked waiter whose
-    /// committed wake took it finds it at its own re-check, and nobody finds it
-    /// after (https://github.com/rrnewton/hermit/issues/3146).
+    /// A `SIGCHLD` never ends a precise-mode futex wait, whether it reaches the
+    /// waiter through the drain of a cross-task signal or through a scheduler
+    /// send (a `ChildExit` timer), and although the waiter catches it: the
+    /// waiter stays parked with its original deadline, and the signal stays
+    /// pending in the kernel until the call returns for another reason. `/proc`
+    /// cannot tell a `SIGCHLD` sent at a deterministic point from the one the
+    /// kernel posts for a child event at a moment set by host timing. This gives
+    /// up the `SIGCHLD` part of https://github.com/rrnewton/hermit/issues/3146
+    /// until Reverie reports every held delivery. A caught `SIGUSR1` still ends
+    /// the same wait.
     #[test]
-    fn a_gated_wait_counts_a_sigchld_only_with_a_mark_and_a_pending_signal() {
-        let mut scheduler = sigchld_gated_scheduler();
-        let thread = DetTid::from_raw(100);
-        let process = DetPid::from_raw(100);
-        // A process with a child, for which the kernel can post a `SIGCHLD`.
-        scheduler.thread_tree.add_child(thread, thread, true);
-        scheduler
-            .thread_tree
-            .add_child(thread, DetTid::from_raw(101), true);
-
-        assert!(
-            !scheduler.sigchld_eligible(thread, true),
-            "an unmarked pending SIGCHLD was posted at a host-timed moment"
-        );
-        scheduler.mark_sigchld_eligible(thread, Some(process));
-        assert!(
-            !scheduler.sigchld_eligible(thread, false),
-            "a wait that found no SIGCHLD pending takes no mark"
-        );
-        assert!(scheduler.sigchld_eligible_processes.contains(&process));
-        assert!(scheduler.sigchld_eligible(thread, true));
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-        assert_eq!(
-            scheduler.sigchld_taken.get(&thread),
-            Some(&SigchldQueue::Process(process))
-        );
-        assert_eq!(scheduler.sigchld_taken.len(), 1);
-        assert!(scheduler.note_inbound_sigchld(thread));
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(
-            !scheduler.sigchld_eligible(thread, true),
-            "one mark answers one delivery"
-        );
-
-        // The step2 drain's committed wake takes the mark for a parked waiter,
-        // whose own re-check then finds the signal reserved for it.
-        scheduler.mark_sigchld_eligible(thread, Some(process));
-        assert!(scheduler.take_sigchld_eligibility(thread));
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-        assert!(
-            scheduler.sigchld_eligible(thread, true),
-            "the woken wait's own re-check finds the signal it reserved"
-        );
-        assert_eq!(scheduler.sigchld_taken.len(), 1);
-        assert!(scheduler.note_inbound_sigchld(thread));
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(scheduler.sigchld_answered.is_empty());
-
-        // A re-check that finds nothing pending releases the reservation.
-        scheduler.mark_sigchld_eligible(thread, Some(process));
-        assert!(scheduler.sigchld_eligible(thread, true));
-        assert!(!scheduler.sigchld_eligible(thread, false));
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-    }
-
-    /// A reservation answers one wait. Pinned Reverie delivers a `SIGCHLD` it
-    /// held during an injection without an `InboundSignal` report when another
-    /// signal is pending, so the reservation a wait's answer used can outlive
-    /// the signal it named. The thread's next take must not find it again: a
-    /// later `SIGCHLD` that nobody marked, which may be the kernel's host-timed
-    /// report of a child's exit, would then end that wait at a turn set by host
-    /// timing (round-8 High 2 on https://github.com/rrnewton/hermit/pull/3361).
-    #[test]
-    fn a_reservation_answers_one_wait_even_when_its_delivery_is_not_reported() {
-        let mut scheduler = sigchld_gated_scheduler();
-        let thread = DetTid::from_raw(100);
-        let process = DetPid::from_raw(100);
-        scheduler.thread_tree.add_child(thread, thread, true);
-        scheduler
-            .thread_tree
-            .add_child(thread, DetTid::from_raw(101), true);
-
-        for queue in [Some(process), None] {
-            scheduler.mark_sigchld_eligible(thread, queue);
-            assert!(scheduler.sigchld_eligible(thread, true));
-            // The kernel delivers the signal as the wait returns; the backend
-            // does not report it, so `note_inbound_sigchld` never runs.
-            assert!(
-                !scheduler.sigchld_eligible(thread, true),
-                "a reservation that answered a wait counted an unmarked SIGCHLD ({:?})",
-                queue
-            );
-            assert!(scheduler.sigchld_taken.is_empty());
-            assert!(scheduler.sigchld_answered.is_empty());
-        }
-
-        // The answered reservation is retired, not re-armed: a later mark is
-        // taken afresh and answers exactly one more wait.
-        scheduler.mark_sigchld_eligible(thread, Some(process));
-        assert!(scheduler.sigchld_eligible(thread, true));
-        assert!(!scheduler.sigchld_eligible(thread, true));
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-
-        // A committed wake that finds an answered reservation still held takes
-        // the new mark instead of reusing the stale one.
-        scheduler.mark_sigchld_eligible(thread, Some(process));
-        assert!(scheduler.sigchld_eligible(thread, true));
-        scheduler.mark_sigchld_eligible(thread, None);
-        assert!(scheduler.take_sigchld_eligibility(thread));
-        assert!(scheduler.sigchld_eligible_threads.is_empty());
-        assert_eq!(
-            scheduler.sigchld_taken.get(&thread),
-            Some(&SigchldQueue::Thread)
-        );
-        assert!(!scheduler.sigchld_answered.contains(&thread));
-        assert!(scheduler.sigchld_eligible(thread, true));
-    }
-
-    /// The thread's next handler retires the reservation its answered wait used
-    /// (`retire_answered_sigchld`), so a stale reservation neither absorbs a
-    /// later send to the same queue nor claims a later delivery. Both would
-    /// otherwise depend on whether the backend reported the first delivery,
-    /// which pinned Reverie decides from whether another signal is pending
-    /// (round-8 High 2 on https://github.com/rrnewton/hermit/pull/3361). A
-    /// reservation a committed wake took for a waiter that has not re-checked
-    /// yet is kept.
-    #[test]
-    fn the_next_handler_retires_a_reservation_whose_delivery_was_not_reported() {
-        let mut scheduler = sigchld_gated_scheduler();
-        let thread = DetTid::from_raw(100);
-        let sibling = DetTid::from_raw(101);
-        let process = DetPid::from_raw(100);
-        scheduler.thread_tree.add_child(thread, thread, true);
-        scheduler.thread_tree.add_child(thread, sibling, false);
-        scheduler
-            .thread_tree
-            .add_child(thread, DetTid::from_raw(102), true);
-
-        // The wait's answer reserves the shared signal; its delivery goes
-        // unreported, and the thread's next handler retires the reservation.
-        scheduler.mark_sigchld_eligible(thread, Some(process));
-        assert!(scheduler.sigchld_eligible(thread, true));
-        scheduler.retire_answered_sigchld(thread);
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(scheduler.sigchld_answered.is_empty());
-
-        // A sibling's later send is a new pending signal and gets its own mark,
-        // which another waiter of the process may take.
-        scheduler.mark_sigchld_eligible(sibling, Some(process));
-        assert!(
-            scheduler.sigchld_eligible_processes.contains(&process),
-            "a stale reservation absorbed a send made after its signal was dequeued"
-        );
-
-        // A later delivery to the thread is accounted for as an unreserved one:
-        // it clears the mark for the queue it emptied and its handler turn is
-        // not granted as if the scheduler had placed it.
-        assert!(!scheduler.note_inbound_sigchld(thread));
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-
-        // A committed wake's reservation has not answered a wait yet: the
-        // waiter's handlers before its re-check leave it in place.
-        scheduler.mark_sigchld_eligible(thread, Some(process));
-        assert!(scheduler.take_sigchld_eligibility(thread));
-        scheduler.retire_answered_sigchld(thread);
-        assert_eq!(
-            scheduler.sigchld_taken.get(&thread),
-            Some(&SigchldQueue::Process(process))
-        );
-        assert!(scheduler.sigchld_eligible(thread, true));
-        assert!(scheduler.note_inbound_sigchld(thread));
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(scheduler.sigchld_answered.is_empty());
-    }
-
-    /// The kernel sends `SIGCHLD` for a child only to the child's parent, so a
-    /// gated wait of a process that never had a child counts its pending
-    /// `SIGCHLD` without a mark: a caught `SIGCHLD` sent from outside the
-    /// container interrupts it (review finding Codex 3 on
-    /// https://github.com/rrnewton/hermit/pull/3361). Once the process creates a
-    /// child process, from any of its threads, an unmarked `SIGCHLD` may be the
-    /// kernel's host-timed report for that child and needs a mark again.
-    #[test]
-    fn a_process_that_never_had_a_child_counts_an_unmarked_sigchld() {
-        let mut scheduler = sigchld_gated_scheduler();
-        let root = DetTid::from_raw(100);
-        let worker = DetTid::from_raw(101);
-        let child = DetTid::from_raw(102);
-        let grandchild = DetTid::from_raw(103);
-        scheduler.thread_tree.add_child(root, root, true);
-        scheduler.thread_tree.add_child(root, worker, false);
-
-        assert!(
-            scheduler.sigchld_eligible(worker, true),
-            "no child can have sent this SIGCHLD"
-        );
-        assert!(
-            scheduler.sigchld_taken.is_empty(),
-            "nothing is reserved for it"
-        );
-        assert!(!scheduler.sigchld_eligible(worker, false));
-
-        // A thread that is not the leader creates a child process.
-        scheduler.thread_tree.add_child(worker, child, true);
-        assert!(scheduler.thread_tree.process_had_child(&root));
-        assert!(
-            !scheduler.sigchld_eligible(root, true),
-            "an unmarked SIGCHLD of a process with a child may be the kernel's"
-        );
-        assert!(!scheduler.sigchld_eligible(worker, true));
-        assert!(
-            scheduler.sigchld_eligible(child, true),
-            "the new child has no child of its own"
-        );
-
-        // A `CLONE_PARENT` child names `root` as its wait parent; its creator
-        // `child` counts as having a child too.
-        scheduler.thread_tree.add_child_with_wait_metadata(
-            child,
-            grandchild,
-            true,
-            true,
-            libc::SIGCHLD,
-        );
-        assert_eq!(
-            scheduler.thread_tree.parent_process(&grandchild),
-            Some(root)
-        );
-        assert!(!scheduler.sigchld_eligible(child, true));
-        assert!(scheduler.sigchld_eligible(grandchild, true));
-
-        // A mark still counts for a process with a child.
-        scheduler.mark_sigchld_eligible(root, Some(root));
-        assert!(scheduler.sigchld_eligible(root, true));
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-    }
-
-    /// A process that armed `SIGCHLD` as its parent-death signal does not take
-    /// the childless exception: the kernel sends that signal when the parent
-    /// exits, at a host-timed instant when another guest killed the parent
-    /// outside the run queue, so only a marked `SIGCHLD` counts, as for every
-    /// process before the exception (round-8 High 3 on
-    /// https://github.com/rrnewton/hermit/pull/3361). Membership is per process
-    /// and outlives the arming thread's later choices.
-    #[test]
-    fn a_process_with_a_sigchld_parent_death_signal_counts_only_marked_sigchld() {
-        let mut scheduler = sigchld_gated_scheduler();
-        let root = DetTid::from_raw(100);
-        let worker = DetTid::from_raw(101);
-        let other = DetTid::from_raw(102);
-        scheduler.thread_tree.add_child(root, root, true);
-        scheduler.thread_tree.add_child(root, worker, false);
-        scheduler.thread_tree.add_child(other, other, true);
-        assert!(scheduler.sigchld_eligible(root, true));
-
-        // A thread that is not the leader arms it; the whole process is covered,
-        // because the kernel sends it to the thread group.
-        scheduler.note_parent_death_sigchld(worker);
-        assert!(
-            !scheduler.sigchld_eligible(root, true),
-            "an unmarked SIGCHLD may be the kernel's parent-death signal"
-        );
-        assert!(!scheduler.sigchld_eligible(worker, true));
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(
-            scheduler.sigchld_eligible(other, true),
-            "another childless process keeps the exception"
-        );
-
-        // A mark still counts, once.
-        scheduler.mark_sigchld_eligible(worker, Some(root));
-        assert!(scheduler.sigchld_eligible(root, true));
-        assert!(!scheduler.sigchld_eligible(root, true));
-
-        // Without gating, nothing is recorded.
-        let mut ungated = sigchld_gated_scheduler();
-        ungated.sigchld_eligibility = false;
-        ungated.thread_tree.add_child(root, root, true);
-        ungated.note_parent_death_sigchld(root);
-        assert!(ungated.sigchld_parent_death_processes.is_empty());
-    }
-
-    /// Marks are taken in the kernel's dequeue order, private queue first, and a
-    /// delivery the backend reports accounts for the mark its wait took rather
-    /// than clearing another (https://github.com/rrnewton/hermit/issues/3146).
-    #[test]
-    fn sigchld_marks_follow_the_kernel_dequeue_order() {
-        let mut scheduler = sigchld_gated_scheduler();
-        let thread = DetTid::from_raw(100);
-        let process = DetPid::from_raw(100);
-
-        scheduler.mark_sigchld_eligible(thread, None);
-        scheduler.mark_sigchld_eligible(thread, Some(process));
-        assert!(scheduler.sigchld_eligible(thread, true));
-        assert!(!scheduler.sigchld_eligible_threads.contains(&thread));
-        assert!(scheduler.sigchld_eligible_processes.contains(&process));
-
-        // The delivery for the taken mark leaves the shared one in place.
-        assert!(scheduler.note_inbound_sigchld(thread));
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(scheduler.sigchld_eligible_processes.contains(&process));
-
-        // A delivery no wait took a mark for empties the queue served first.
-        scheduler.mark_sigchld_eligible(thread, None);
-        assert!(!scheduler.note_inbound_sigchld(thread));
-        assert!(scheduler.sigchld_eligible_threads.is_empty());
-        assert!(scheduler.sigchld_eligible_processes.contains(&process));
-        assert!(!scheduler.note_inbound_sigchld(thread));
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-    }
-
-    /// Setting `SIGCHLD` to `SIG_IGN` or `SIG_DFL` discards every pending
-    /// `SIGCHLD` of the process, so it clears every mark of the process and none
-    /// of another's; a departing thread and a departing process take theirs with
-    /// them (https://github.com/rrnewton/hermit/issues/3146).
-    #[test]
-    fn sigchld_marks_are_flushed_by_the_disposition_and_by_teardown() {
-        let mut scheduler = sigchld_gated_scheduler();
-        let leader = DetTid::from_raw(100);
-        let sibling = DetTid::from_raw(101);
-        let other = DetTid::from_raw(200);
-        scheduler.thread_tree.add_child(leader, leader, true);
-        scheduler.thread_tree.add_child(leader, sibling, false);
-        scheduler.thread_tree.add_child(leader, other, true);
-        for thread in [leader, sibling, other] {
-            register_known_thread(&mut scheduler, thread);
-        }
-
-        scheduler.mark_sigchld_eligible(sibling, None);
-        scheduler.mark_sigchld_eligible(leader, None);
-        assert!(scheduler.sigchld_eligible(leader, true));
-        scheduler.mark_sigchld_eligible(leader, Some(leader));
-        scheduler.mark_sigchld_eligible(other, Some(other));
-        scheduler.flush_sigchld_eligibility(sibling);
-        assert!(scheduler.sigchld_eligible_threads.is_empty());
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert_eq!(
-            scheduler
-                .sigchld_eligible_processes
-                .iter()
-                .copied()
-                .collect::<Vec<_>>(),
-            vec![other]
-        );
-
-        scheduler.mark_sigchld_eligible(sibling, None);
-        scheduler.mark_sigchld_eligible(leader, Some(leader));
-        let mm = MmId::initial(leader);
-        scheduler.logically_kill_thread(&sibling, &leader, mm);
-        assert!(scheduler.sigchld_eligible_threads.is_empty());
-        assert!(scheduler.sigchld_eligible_processes.contains(&leader));
-        scheduler.logically_kill_thread(&leader, &leader, mm);
-        assert!(!scheduler.sigchld_eligible_processes.contains(&leader));
-    }
-
-    /// Without the gate nothing is marked, so no mark can outlive a run whose
-    /// waits never take one (https://github.com/rrnewton/hermit/issues/3146).
-    #[test]
-    fn sigchld_marks_are_not_recorded_without_the_gate() {
-        let mut scheduler = Scheduler::new(&Config::default());
-        assert!(!scheduler.sigchld_eligibility);
-        let (mut scheduler_family, parent, _, child) = sigchld_family(libc::SIGCHLD);
-        scheduler_family.sigchld_eligibility = false;
-        scheduler.mark_sigchld_eligible(DetTid::from_raw(100), None);
-        scheduler.mark_sigchld_eligible(DetTid::from_raw(100), Some(DetPid::from_raw(100)));
-        assert!(scheduler.sigchld_eligible_threads.is_empty());
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-
-        scheduler_family.logically_kill_thread(&child, &child, MmId::initial(child));
-        assert!(scheduler_family.sigchld_eligible_processes.is_empty());
-        assert!(
-            !scheduler_family
-                .pending_cross_task_signals
-                .contains_key(&parent)
-        );
-    }
-
-    /// A precise-mode futex wake committed for a `SIGCHLD` takes the mark its
-    /// sender set, at the drain and at a scheduler send; a `SIGCHLD` that does not
-    /// interrupt the waiter leaves both the waiter and the mark in place
-    /// (https://github.com/rrnewton/hermit/issues/3146).
-    #[test]
-    fn a_futex_wake_committed_for_a_sigchld_takes_its_mark() {
+    fn a_sigchld_never_ends_a_parked_futex_wait() {
         let chld = kernel_signal_bit(libc::SIGCHLD);
-        let process = DetPid::from_raw(100);
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let deadline = LogicalTime::from_nanos(300_000_000);
         for scheduler_send in [false, true] {
-            let mut scheduler = sigchld_gated_scheduler();
+            let mut scheduler = gated_scheduler();
             let (target, futex) = parked_futex_target(&mut scheduler);
-            scheduler.sleep_futex_waiter(&target, futex, None, u32::MAX, Some(signal_watch(chld)));
-
-            // Default action: ignored, so the wait continues and the mark stays.
+            scheduler.sleep_futex_waiter(
+                &target,
+                futex,
+                Some(deadline),
+                u32::MAX,
+                Some(signal_watch(chld | usr1)),
+            );
             scheduler
                 .test_kernel_signal_states
-                .insert(target, signal_state(0, 0));
-            scheduler.mark_sigchld_eligible(target, Some(process));
+                .insert(target, signal_state(chld | usr1, 0));
+            assert_eq!(
+                scheduler.parked_futex_interrupting_signals(target),
+                Some(usr1),
+                "a caught SIGCHLD is not among the signals that end the wait"
+            );
+
             if scheduler_send {
                 scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
             } else {
                 scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGCHLD));
                 scheduler.drain_pending_cross_task_signals();
             }
-            assert!(scheduler.is_parked_futex_waiter(target));
-            assert!(scheduler.sigchld_eligible_processes.contains(&process));
-            assert!(scheduler.sigchld_taken.is_empty());
+            let case = format!("scheduler_send={scheduler_send}");
+            assert!(scheduler.is_parked_futex_waiter(target), "{case}");
+            assert!(!scheduler.run_queue.contains_tid(target), "{case}");
+            assert!(scheduler.inbound_signals(target).is_empty(), "{case}");
+            assert!(scheduler.pending_cross_task_signals.is_empty(), "{case}");
+            assert_eq!(
+                scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),
+                vec![(deadline, TimedEvent::ThreadEvt(target))],
+                "{case}"
+            );
 
-            // Caught: the wait ends and accounts for the mark.
-            scheduler
-                .test_kernel_signal_states
-                .insert(target, signal_state(chld, 0));
             if scheduler_send {
-                scheduler.wake_signaled_guest(target, Signal::SIGCHLD);
+                scheduler.wake_signaled_guest(target, Signal::SIGUSR1);
             } else {
-                scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGCHLD));
+                scheduler.notify_signal_pending(target, SigWrapper::from(Signal::SIGUSR1));
                 scheduler.drain_pending_cross_task_signals();
             }
-            assert!(!scheduler.is_parked_futex_waiter(target));
+            assert!(!scheduler.is_parked_futex_waiter(target), "{case}");
             assert_eq!(
                 scheduler.inbound_signals(target),
-                vec![SigWrapper::from(Signal::SIGCHLD)]
+                vec![SigWrapper::from(Signal::SIGUSR1)],
+                "{case}"
             );
-            assert!(scheduler.sigchld_eligible_processes.is_empty());
-            assert!(scheduler.sigchld_taken.contains_key(&target));
         }
     }
 
     /// A parent process 100 whose second thread 101 created child process 200
-    /// with `exit_signal`, under the `SIGCHLD` eligibility gate.
+    /// with `exit_signal`, on the gated scheduler.
     fn sigchld_family(exit_signal: libc::c_int) -> (Scheduler, DetTid, DetTid, DetTid) {
-        let mut scheduler = sigchld_gated_scheduler();
+        let mut scheduler = gated_scheduler();
         let parent = DetTid::from_raw(100);
         let creator = DetTid::from_raw(101);
         let child = DetTid::from_raw(200);
@@ -9928,73 +9092,53 @@ mod test {
             .insert(thread, signal_state(kernel_signal_bit(libc::SIGCHLD), 0));
     }
 
-    /// A child that dies with no `ChildExit` send, killed by a signal or leaving
-    /// through `exit` in its last thread, makes the kernel's own `SIGCHLD` eligible
-    /// at its logical death. Linux wakes the thread that created the child first,
-    /// so exactly that parked futex waiter is notified, and the drain commits its
-    /// wake and takes the mark. Without this, a gated wait whose only waker is that
-    /// `SIGCHLD` would never end (https://github.com/rrnewton/hermit/issues/3146).
+    /// A child's death wakes no parked futex waiter of its parent, although the
+    /// waiter catches `SIGCHLD`: neither the death itself (a child killed by a
+    /// signal, or leaving through `exit` in its last thread, has no `ChildExit`
+    /// timer) nor the `SIGCHLD` a `ChildExit` timer sends. The kernel posts its
+    /// own `SIGCHLD` at a moment set by host timing, so the signal stays pending
+    /// until the waiter's call returns for another reason. The scheduler still
+    /// names the thread Linux would give it to (`kernel_sigchld_target`), the
+    /// child's creator first. Before, the death made the signal eligible and
+    /// the drain woke that waiter (https://github.com/rrnewton/hermit/issues/3146).
     #[test]
-    fn a_child_exit_without_a_childexit_send_makes_its_sigchld_eligible() {
+    fn a_child_exit_wakes_no_parked_futex_waiter() {
         let chld = kernel_signal_bit(libc::SIGCHLD);
         let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
         park_for_sigchld(&mut scheduler, parent, chld);
         park_for_sigchld(&mut scheduler, creator, chld);
+        assert_eq!(
+            scheduler.kernel_sigchld_target(parent, creator),
+            Some(creator)
+        );
 
         scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
-
-        // The death is recorded while a guest runs, so the target is chosen at
-        // the next drain, where every thread is stopped.
-        assert!(scheduler.sigchld_eligible_processes.contains(&parent));
-        assert!(scheduler.pending_cross_task_signals.is_empty());
-        assert_eq!(
-            scheduler
-                .pending_child_exit_sigchld
-                .iter()
-                .map(|(process, thread)| (*process, *thread))
-                .collect::<Vec<_>>(),
-            vec![(parent, creator)]
-        );
         scheduler.drain_pending_cross_task_signals();
-        assert!(scheduler.pending_child_exit_sigchld.is_empty());
-        assert!(!scheduler.is_parked_futex_waiter(creator));
         assert!(scheduler.is_parked_futex_waiter(parent));
-        assert_eq!(
-            scheduler.inbound_signals(creator),
-            vec![SigWrapper::from(Signal::SIGCHLD)]
-        );
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-        assert!(scheduler.sigchld_taken.contains_key(&creator));
-
-        // A repeated report of the same death marks nothing new.
-        scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-        assert!(scheduler.pending_child_exit_sigchld.is_empty());
-        assert!(scheduler.pending_cross_task_signals.is_empty());
-
-        // When the creating thread blocks SIGCHLD, the next thread in thread-ID
-        // order that does not is woken.
-        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
-        park_for_sigchld(&mut scheduler, parent, chld);
-        park_for_sigchld(&mut scheduler, creator, 0);
-        scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
-        scheduler.drain_pending_cross_task_signals();
-        assert!(!scheduler.is_parked_futex_waiter(parent));
         assert!(scheduler.is_parked_futex_waiter(creator));
-        assert!(scheduler.sigchld_taken.contains_key(&parent));
+        assert!(scheduler.pending_cross_task_signals.is_empty());
+        assert!(scheduler.inbound_signals(parent).is_empty());
+        assert!(scheduler.inbound_signals(creator).is_empty());
+
+        // The SIGCHLD a `ChildExit` timer sends to the creator leaves it parked
+        // too.
+        scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
+        assert!(scheduler.is_parked_futex_waiter(creator));
+        assert!(!scheduler.run_queue.contains_tid(creator));
+        assert!(scheduler.inbound_signals(creator).is_empty());
     }
 
     /// The kernel gives a shared-queue `SIGCHLD` to the first thread that does
     /// not block it, the child's creator first, whether that thread is parked or
-    /// running. A parked waiter behind a running thread that takes it is not
-    /// woken: before, it was, and returned EINTR with no handler to run or with
-    /// the kernel's restart errno (https://github.com/rrnewton/hermit/issues/3146).
+    /// running, and `kernel_sigchld_target` names that thread: a `ChildExit`
+    /// timer signals it. No parked waiter is woken for the child's death,
+    /// whichever thread is the target (https://github.com/rrnewton/hermit/issues/3146).
     #[test]
-    fn a_child_exit_sigchld_wakes_only_the_waiter_the_kernel_gives_it_to() {
+    fn a_child_exit_sigchld_goes_to_the_first_thread_that_does_not_block_it() {
         let chld = kernel_signal_bit(libc::SIGCHLD);
 
         // The creator runs and does not block SIGCHLD: it takes the signal, and
-        // the leader's wait is left alone with the mark in place for it.
+        // the leader's wait is left alone.
         let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
         park_for_sigchld(&mut scheduler, parent, chld);
         scheduler
@@ -10008,11 +9152,6 @@ mod test {
         scheduler.drain_pending_cross_task_signals();
         assert!(scheduler.is_parked_futex_waiter(parent));
         assert!(scheduler.inbound_signals(parent).is_empty());
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(scheduler.sigchld_eligible_processes.contains(&parent));
-        // The creator's delivery then accounts for that mark.
-        assert!(!scheduler.note_inbound_sigchld(creator));
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
 
         // The creator blocks SIGCHLD and the leader runs without blocking it: the
         // leader comes first in thread-ID order and takes it, so a waiter after
@@ -10049,7 +9188,6 @@ mod test {
         scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
         scheduler.drain_pending_cross_task_signals();
         assert!(scheduler.is_parked_futex_waiter(creator));
-        assert!(scheduler.sigchld_eligible_processes.contains(&parent));
     }
 
     /// Commit `thread`'s request to begin a blocking call outside the runnable
@@ -10076,9 +9214,9 @@ mod test {
     /// scheduler recorded when it committed the call, the call's own mask or
     /// else the mask read while the thread was still stopped at its request.
     /// Before, the live mask was read when the child died, so whether the
-    /// creator or a sibling parked in a precise futex wait took the signal,
-    /// and whether that wait was woken, depended on host timing
-    /// (<https://github.com/rrnewton/hermit/issues/3146>).
+    /// creator or a sibling parked in a precise futex wait took the signal
+    /// depended on host timing; the target is also the thread a `ChildExit`
+    /// timer signals (<https://github.com/rrnewton/hermit/issues/3146>).
     #[test]
     fn a_sigchld_target_sleeping_outside_the_scheduler_uses_the_mask_recorded_at_its_commit() {
         let chld = kernel_signal_bit(libc::SIGCHLD);
@@ -10134,11 +9272,11 @@ mod test {
         scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
         scheduler.drain_pending_cross_task_signals();
         assert!(scheduler.is_parked_futex_waiter(sibling));
-        assert!(scheduler.sigchld_taken.is_empty());
 
         // Other external IO sleeps under the thread's own mask, read while it is
         // still stopped at its request: SIGCHLD blocked. A later change of its
-        // live mask does not make it the target; the sibling's wait is woken.
+        // live mask does not make it the target. The sibling is the target, but
+        // its wait holds SIGCHLD, so it stays parked.
         let (mut scheduler, parent, creator, child, sibling) = family_with_parked_sibling();
         commit_out_of_scheduler_call(
             &mut scheduler,
@@ -10159,8 +9297,8 @@ mod test {
         );
         scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
         scheduler.drain_pending_cross_task_signals();
-        assert!(!scheduler.is_parked_futex_waiter(sibling));
-        assert!(scheduler.sigchld_taken.contains_key(&sibling));
+        assert!(scheduler.is_parked_futex_waiter(sibling));
+        assert!(scheduler.inbound_signals(sibling).is_empty());
 
         // A mask that could not be recorded is not a target, whatever the live
         // one says, and the record goes when the thread leaves its pool.
@@ -10190,21 +9328,21 @@ mod test {
         );
     }
 
-    /// A scheduler without `sigchld_eligibility` neither reads a committed
-    /// thread's sleeping mask from `/proc` nor records one. Nothing on such a
-    /// scheduler consumes the record, and on a backend whose `DetTid` is not a
-    /// host thread ID, KVM among them, the read would name an unrelated host
-    /// thread or none. The gated scheduler, for contrast, records the call's
-    /// own mask, or else reads the thread's
+    /// A scheduler that does not model signal targets (`models_signal_targets`)
+    /// neither reads a committed thread's sleeping mask from `/proc` nor records
+    /// one. Nothing on such a scheduler consumes the record, and on a backend
+    /// whose `DetTid` is not a host thread ID the read would name an unrelated
+    /// host thread or none. The gated scheduler, for contrast, records the
+    /// call's own mask, or else reads the thread's
     /// (https://github.com/rrnewton/hermit/issues/3146).
     #[test]
-    fn a_scheduler_without_sigchld_eligibility_reads_and_records_no_sleeping_mask() {
+    fn a_scheduler_that_does_not_model_signal_targets_reads_and_records_no_sleeping_mask() {
         use std::sync::atomic::Ordering;
         let chld = kernel_signal_bit(libc::SIGCHLD);
-        for eligible in [false, true] {
+        for models in [false, true] {
             for (seq, rt_sigsuspend, call_mask) in [(1, false, None), (2, true, Some(0))] {
                 let (mut scheduler, _parent, creator, _child) = sigchld_family(libc::SIGCHLD);
-                scheduler.sigchld_eligibility = eligible;
+                scheduler.models_signal_targets = models;
                 scheduler.test_kernel_signal_states.insert(
                     creator,
                     KernelSignalState {
@@ -10221,7 +9359,7 @@ mod test {
                 let before = scheduler.test_kernel_mask_reads.load(Ordering::Relaxed);
                 commit_out_of_scheduler_call(&mut scheduler, creator, rid, call_mask);
                 let reads = scheduler.test_kernel_mask_reads.load(Ordering::Relaxed) - before;
-                let case = format!("eligible={eligible} rt_sigsuspend={rt_sigsuspend}");
+                let case = format!("models={models} rt_sigsuspend={rt_sigsuspend}");
 
                 // Either way the thread sleeps in its pool.
                 let pool = if rt_sigsuspend {
@@ -10231,7 +9369,7 @@ mod test {
                 };
                 assert_eq!(pool.get(&creator), Some(&op), "{case}");
                 let recorded = scheduler.blocked.out_of_scheduler_masks.get(&creator);
-                if eligible {
+                if models {
                     assert_eq!(recorded, Some(&Some(call_mask.unwrap_or(chld))), "{case}");
                     assert_eq!(reads, usize::from(call_mask.is_none()), "{case}");
                 } else {
@@ -10538,161 +9676,26 @@ mod test {
         assert_eq!(scheduler.blocked.timed_waiters.iter().count(), 0);
     }
 
-    /// A `SIGCHLD` whose delivery the scheduler placed, by committing a parked
-    /// waiter's wake, is not deferred behind a runnable sibling as a host-async
-    /// one is: neither the wake turn nor the handler turn the delivery then
-    /// reports. Deferring either let a sibling that never blocks run first and
-    /// dequeue the signal, or starved the waiter's handler for as long as the
-    /// sibling ran, while Linux ends the creator's wait at the child's death
-    /// (https://github.com/rrnewton/hermit/issues/3146).
+    /// A `SIGCHLD` delivery that no scheduler decision placed is deferred behind
+    /// a runnable sibling, as a host-async signal is, so the sibling's work runs
+    /// first. A committed futex wake no longer places one: no `SIGCHLD` ends a
+    /// gated wait (https://github.com/rrnewton/hermit/issues/3146).
     #[test]
-    fn a_placed_sigchld_delivery_is_not_deferred_behind_a_runnable_sibling() {
-        let chld = kernel_signal_bit(libc::SIGCHLD);
+    fn an_unplaced_sigchld_delivery_is_deferred_behind_a_runnable_sibling() {
         let inbound = ResourceID::InboundSignal(SigWrapper(libc::SIGCHLD));
-        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
-        // The scheduler's own send (a `ChildExit` timer) commits the wake in
-        // `wake_signaled_guest` as an `InboundSignal` turn; the kernel's send for
-        // a child that dies without one is committed at the drain as a
-        // `WaitidSignals` turn.
-        for scheduler_send in [false, true] {
-            let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
-            park_for_sigchld(&mut scheduler, creator, chld);
-            // The leader runs and does not block SIGCHLD either.
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        scheduler.runqueue_push_back(creator);
+        scheduler.runqueue_push_back(parent);
+        assert!(!scheduler.blocked.sigchld_ready.contains(&parent));
+        assert_eq!(scheduler.run_queue.tentative_pop_tid(parent), Some(parent));
+        assert!(
             scheduler
-                .test_kernel_signal_states
-                .insert(parent, signal_state(chld, 0));
-            scheduler.runqueue_push_back(parent);
-
-            if scheduler_send {
-                scheduler.mark_sigchld_eligible(creator, Some(DetPid::from_raw(100)));
-                scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
-                assert!(scheduler.blocked.sigchld_ready.contains(&creator));
-            } else {
-                scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
-                scheduler.drain_pending_cross_task_signals();
-            }
-            assert!(scheduler.sigchld_taken.contains_key(&creator));
-            assert_eq!(
-                scheduler.run_queue.tids().copied().collect::<Vec<_>>(),
-                vec![creator, parent]
-            );
-
-            // The wake turn is granted although the leader is runnable.
-            let wake = scheduler.next_turns[&creator]
-                .req
-                .try_read()
-                .and_then(Result::ok)
-                .expect("the woken waiter holds its wake request");
-            assert_eq!(wake.resources.len(), 1);
-            assert_eq!(
-                scheduler.run_queue.tentative_pop_tid(creator),
-                Some(creator)
-            );
-            assert!(
-                scheduler
-                    .block_for_one_resource(
-                        creator,
-                        wake.resources.keys().next().unwrap(),
-                        &Permission::W,
-                        wake.signal_interrupt_errno(),
-                        None,
-                        &Ivar::new(),
-                    )
-                    .is_ok()
-            );
-            assert!(scheduler.blocked.sigchld_deferred.is_empty());
-            assert!(!scheduler.blocked.sigchld_ready.contains(&creator));
-            assert_eq!(scheduler.run_queue.commit_tentative_pop(), creator);
-            scheduler.runqueue_push_back(creator);
-
-            // So is the handler turn for the delivery it reserved.
-            let mut delivered = Resources::new(creator);
-            delivered.insert(inbound.clone(), Permission::W);
-            scheduler.request_put(&Ivar::new(), delivered, &global_time);
-            assert!(scheduler.sigchld_taken.is_empty());
-            assert!(scheduler.blocked.sigchld_ready.contains(&creator));
-            assert_eq!(
-                scheduler.run_queue.tentative_pop_tid(creator),
-                Some(creator)
-            );
-            assert!(
-                scheduler
-                    .block_for_one_resource(
-                        creator,
-                        &inbound,
-                        &Permission::W,
-                        None,
-                        None,
-                        &Ivar::new()
-                    )
-                    .is_ok()
-            );
-            assert!(scheduler.blocked.sigchld_deferred.is_empty());
-            assert!(!scheduler.blocked.sigchld_ready.contains(&creator));
-            assert_eq!(scheduler.run_queue.commit_tentative_pop(), creator);
-
-            // A delivery nobody reserved is still deferred while other work runs.
-            scheduler.runqueue_push_back(creator);
-            scheduler.mark_sigchld_eligible(parent, Some(DetPid::from_raw(100)));
-            let mut unplaced = Resources::new(parent);
-            unplaced.insert(inbound.clone(), Permission::W);
-            scheduler.request_put(&Ivar::new(), unplaced, &global_time);
-            assert!(scheduler.sigchld_eligible_processes.is_empty());
-            assert!(!scheduler.blocked.sigchld_ready.contains(&parent));
-            assert_eq!(scheduler.run_queue.tentative_pop_tid(parent), Some(parent));
-            assert!(
-                scheduler
-                    .block_for_one_resource(
-                        parent,
-                        &inbound,
-                        &Permission::W,
-                        None,
-                        None,
-                        &Ivar::new()
-                    )
-                    .is_err()
-            );
-            assert!(scheduler.blocked.sigchld_deferred.contains(&parent));
-        }
-    }
-
-    /// A woken waiter's reservation follows the signal it names: a delivery to
-    /// another thread of the same shared `SIGCHLD` releases it, a second send to
-    /// the same queue coalesces into it, and a reserving thread's death returns
-    /// the mark to its process (https://github.com/rrnewton/hermit/issues/3146).
-    #[test]
-    fn a_sigchld_reservation_follows_the_signal_it_names() {
-        let (mut scheduler, parent, creator, _) = sigchld_family(libc::SIGCHLD);
-        let process = DetPid::from_raw(100);
-
-        // Another thread dequeued the reserved shared SIGCHLD.
-        scheduler.mark_sigchld_eligible(parent, Some(process));
-        assert!(scheduler.take_sigchld_eligibility(creator));
-        assert!(!scheduler.note_inbound_sigchld(parent));
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-
-        // A second send to a queue whose SIGCHLD is reserved coalesces into it.
-        scheduler.mark_sigchld_eligible(parent, Some(process));
-        assert!(scheduler.take_sigchld_eligibility(creator));
-        scheduler.mark_sigchld_eligible(parent, Some(process));
-        assert!(scheduler.sigchld_eligible_processes.is_empty());
-        // A private send to another thread does not.
-        scheduler.mark_sigchld_eligible(parent, None);
-        assert!(scheduler.sigchld_eligible_threads.contains(&parent));
-        // The reserving thread's own delivery clears only its reservation.
-        assert!(scheduler.note_inbound_sigchld(creator));
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(scheduler.sigchld_eligible_threads.contains(&parent));
-        assert!(!scheduler.note_inbound_sigchld(parent));
-        assert!(scheduler.sigchld_eligible_threads.is_empty());
-
-        // A reserving thread that dies leaves the signal pending for the rest.
-        scheduler.mark_sigchld_eligible(parent, Some(process));
-        assert!(scheduler.take_sigchld_eligibility(creator));
-        scheduler.logically_kill_thread(&creator, &parent, MmId::initial(parent));
-        assert!(scheduler.sigchld_taken.is_empty());
-        assert!(scheduler.sigchld_eligible_processes.contains(&process));
+                .block_for_one_resource(parent, &inbound, &Permission::W, None, None, &Ivar::new())
+                .is_err()
+        );
+        assert!(scheduler.blocked.sigchld_deferred.contains(&parent));
+        assert!(!scheduler.run_queue.contains_tid(parent));
+        assert!(!scheduler.blocked.sigchld_ready.contains(&parent));
     }
 
     /// A precise futex waiter woken for a signal is queued ahead of a thread that
@@ -10702,7 +9705,7 @@ mod test {
     fn a_signal_woken_futex_waiter_runs_before_an_already_runnable_thread() {
         let usr1 = kernel_signal_bit(libc::SIGUSR1);
         for scheduler_send in [false, true] {
-            let mut scheduler = sigchld_gated_scheduler();
+            let mut scheduler = gated_scheduler();
             let (target, futex) = parked_futex_target(&mut scheduler);
             let runnable = DetTid::from_raw(101);
             register_known_thread(&mut scheduler, runnable);
@@ -10724,24 +9727,13 @@ mod test {
         }
     }
 
-    /// A child created with another exit signal sends no `SIGCHLD`, so its death
-    /// earns no mark (https://github.com/rrnewton/hermit/issues/3146).
-    #[test]
-    fn a_child_exit_with_another_exit_signal_earns_no_sigchld_mark() {
-        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGUSR1);
-        park_for_sigchld(&mut scheduler, creator, kernel_signal_bit(libc::SIGCHLD));
-        scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
-        assert!(!scheduler.sigchld_eligible_processes.contains(&parent));
-        assert!(scheduler.pending_cross_task_signals.is_empty());
-    }
-
     /// A child whose `exit_group` was granted has a `ChildExit` timer that sends
-    /// and marks the parent's `SIGCHLD` at a fixed logical time, so its logical
-    /// death marks nothing a second time; the timer stays armed, and it names
-    /// the thread that created the child, the one Linux prefers
+    /// the parent's `SIGCHLD` at a fixed logical time. Its logical death leaves
+    /// the timer armed and sends nothing itself, and the timer names the thread
+    /// that created the child, the one Linux prefers
     /// (https://github.com/rrnewton/hermit/issues/3146).
     #[test]
-    fn a_child_exit_with_a_childexit_send_is_marked_by_that_send_only() {
+    fn a_child_exit_timer_names_the_thread_that_created_the_child() {
         let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
         park_for_sigchld(&mut scheduler, creator, kernel_signal_bit(libc::SIGCHLD));
         let child_process = DetPid::from_raw(200);
@@ -10762,12 +9754,9 @@ mod test {
                 )
                 .is_ok()
         );
-        assert!(scheduler.sigchld_child_exit_timers.contains(&child_process));
 
         scheduler.logically_kill_thread(&child, &child, MmId::initial(child));
 
-        assert!(scheduler.sigchld_child_exit_timers.is_empty());
-        assert!(!scheduler.sigchld_eligible_processes.contains(&parent));
         assert!(scheduler.pending_cross_task_signals.is_empty());
         assert_eq!(
             scheduler.blocked.timed_waiters.iter().collect::<Vec<_>>(),

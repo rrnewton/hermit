@@ -1999,15 +1999,6 @@ pub struct ThreadState<T> {
     #[serde(default)]
     pub(crate) in_uncharged_bootstrap_syscall: bool,
 
-    /// A gated wait of this thread was answered that a pending `SIGCHLD` counts
-    /// (`syscalls::threads::eligible_pending_signals`), and the scheduler may
-    /// still hold the reservation that answer used. The wait returned and the
-    /// kernel dequeued that signal before the thread's next handler, so that
-    /// handler retires the reservation (`Detcore::pre_handler_hook`), unless it
-    /// is the delivery report itself, which accounts for the reservation.
-    #[serde(default)]
-    pub(crate) sigchld_answered: bool,
-
     /// Thread state associated with record/replay.
     pub record_or_replay: T,
 
@@ -2505,7 +2496,6 @@ impl<T> ThreadState<T> {
             committed_clock_value: 0,
             uncharged_bootstrap_syscalls: 0,
             in_uncharged_bootstrap_syscall: false,
-            sigchld_answered: false,
             end_of_timeslice: None, // Temporary/bogus.
             replay_rcb_end: None,
             // AUTONOMOUS-BOT-IMPLEMENTED

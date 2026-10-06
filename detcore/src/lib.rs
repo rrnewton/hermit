@@ -281,9 +281,7 @@ use crate::syscall_classification::is_zero_copy_pipe_syscall;
 use crate::syscalls::helpers::with_guest_rip;
 use crate::syscalls::helpers::with_guest_time;
 use crate::syscalls::time::guest_clock_time;
-use crate::tool_global::SigchldEligibilityRequest;
 use crate::tool_global::resource_request;
-use crate::tool_global::sigchld_eligibility;
 use crate::tool_global::trace_schedevent;
 use crate::tool_global::unrecoverable_shutdown;
 use crate::types::SigWrapper;
@@ -606,17 +604,6 @@ impl<T: RecordOrReplay> Detcore<T> {
             for ev in vec {
                 trace_schedevent(guest, ev, false).await;
             }
-        }
-
-        // A gated wait this thread ended on a reserved `SIGCHLD` returned before
-        // this handler, and the kernel dequeued that signal as it returned. The
-        // backend reports a delivery it held during an injection only when no
-        // other signal is pending, so the reservation is retired here, before
-        // this handler can yield the turn, rather than left for a report that
-        // may never come. A `SIGCHLD` delivery clears the flag first
-        // (`handle_signal_event`): its report accounts for the reservation.
-        if std::mem::take(&mut guest.thread_state_mut().sigchld_answered) {
-            sigchld_eligibility(guest, SigchldEligibilityRequest::Retire { thread: dettid }).await;
         }
 
         self.end_timeslice_if_needed(guest).await;
@@ -1549,12 +1536,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
             // other tool reports for this, and it keeps 122 meaning one thing.
             unrecoverable_shutdown(guest, detcore_model::HERMIT_SIGINT_DEATH_EXIT).await
         } else {
-            if signal == Signal::SIGCHLD {
-                // The `InboundSignal` request below accounts for a reservation
-                // a gated wait answered (`Scheduler::note_inbound_sigchld`), so
-                // the hook must not retire it first.
-                guest.thread_state_mut().sigchld_answered = false;
-            }
             self.pre_handler_hook(guest, false).await;
 
             // For `hermit run --verify`: a guest that faulted on an illegal
@@ -1774,8 +1755,6 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
                     // bootstrapping thread, so it starts outside any window.
                     uncharged_bootstrap_syscalls: 0,
                     in_uncharged_bootstrap_syscall: false,
-                    // A new thread has answered no gated wait.
-                    sigchld_answered: false,
 
                     end_of_timeslice: None,
                     replay_rcb_end: None,
