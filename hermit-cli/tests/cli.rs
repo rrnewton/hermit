@@ -1938,13 +1938,19 @@ fn run_dbt_binds_in_a_user_namespace_of_its_own() {
     assert_eq!(lines.next(), Some("bound input"), "{text}");
     // The mounts --bind needs come from a user namespace of the DBT adapter's
     // own, which maps root to the caller alone (as reverie's Container::map_root
-    // does for every other backend), not from a privileged host.
-    let map = lines
-        .next()
-        .unwrap_or_default()
-        .split_whitespace()
-        .collect::<Vec<_>>();
-    assert_eq!((map.len(), map[0], map[2]), (3, "0", "1"), "{text}");
+    // does for every other backend), not from a privileged host. A guest left in
+    // the caller's namespace would show the caller's own map instead, whether
+    // that is the host's full range or a container's map.
+    let guest_map = lines.next().unwrap_or_default();
+    let map = guest_map.split_whitespace().collect::<Vec<_>>();
+    let euid = unsafe { libc::geteuid() }.to_string();
+    assert_eq!(map, ["0", euid.as_str(), "1"], "{text}");
+    let caller_map = fs::read_to_string("/proc/self/uid_map").unwrap();
+    assert_ne!(
+        caller_map.split_whitespace().collect::<Vec<_>>(),
+        map,
+        "the guest shares the caller's user namespace: {text}"
+    );
     assert_eq!(lines.next(), None, "{text}");
 }
 

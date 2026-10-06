@@ -611,7 +611,7 @@ class _Anything:
         return self
 
 
-def evaluate_cells(routing: str) -> dict[str, dict]:
+def evaluate_cells(routing: str, pmu_on_re: str = "true") -> dict[str, dict]:
     """Runs defs.bzl's hermit_e2e_cells over the real plan; returns each target's attrs by name."""
     targets: dict[str, dict] = {}
     rule_calls = []
@@ -622,7 +622,7 @@ def evaluate_cells(routing: str) -> dict[str, dict]:
             return lambda **kwargs: targets.__setitem__(kwargs["name"], kwargs)
         return _Anything()
 
-    config = {("hermit_e2e", "routing"): routing}
+    config = {("hermit_e2e", "routing"): routing, ("hermit_e2e", "pmu_on_re"): pmu_on_re}
     namespace = {
         "rule": rule,
         "attrs": _Anything(),
@@ -692,13 +692,17 @@ class ParityRouteTest(unittest.TestCase):
     only when both ran on one route and container (ci/manifest-plan/src/parity.rs
     shares_route), so each pair must be routed alike."""
 
-    def routes(self, routing: str) -> dict[tuple[str, str], tuple[str, str]]:
-        targets = evaluate_cells(routing)
+    # Every routing configuration defs.bzl accepts: hybrid with the PMU allowed on RE or
+    # not (-c hermit_e2e.pmu_on_re), and all-local.
+    CONFIGS = (("hybrid", "true"), ("hybrid", "false"), ("local", "true"))
+
+    def routes(self, routing: tuple[str, str]) -> dict[tuple[str, str], tuple[str, str]]:
+        targets = evaluate_cells(*routing)
         return {(t["args"][0], t["args"][2]): (t["route"], t["env"]["HERMIT_E2E_CONTAINER"])
                 for t in targets.values() if t["args"][1] == "verify"}
 
     def test_every_kvm_cells_ptrace_reference_shares_its_route(self) -> None:
-        for routing in ("hybrid", "local"):
+        for routing in self.CONFIGS:
             routes = self.routes(routing)
             kvm = sorted(test for test, backend in routes if backend == "kvm")
             self.assertGreater(len(kvm), 250, routing)
@@ -709,7 +713,7 @@ class ParityRouteTest(unittest.TestCase):
     def test_every_sabre_cell_shares_its_references_route(self) -> None:
         # Moving a reference to the kvm cell's route must not leave the test's sabre cell,
         # compared with the same reference, on another route.
-        for routing in ("hybrid", "local"):
+        for routing in self.CONFIGS:
             routes = self.routes(routing)
             sabre = sorted(test for test, backend in routes if backend == "sabre")
             self.assertGreater(len(sabre), 200, routing)
@@ -720,7 +724,7 @@ class ParityRouteTest(unittest.TestCase):
     def test_every_dbt_cell_shares_its_references_route(self) -> None:
         # A DBT verify cell is compared with its test's ptrace verify cell like any other
         # candidate, so it runs on that cell's route and container, local or RE.
-        for routing in ("hybrid", "local"):
+        for routing in self.CONFIGS:
             routes = self.routes(routing)
             dbt = sorted(test for test, backend in routes if backend == "dbt")
             self.assertGreater(len(dbt), 20, routing)
