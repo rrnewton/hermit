@@ -1617,9 +1617,10 @@ mod tests {
                 .collect(),
         };
         let payload = bincode::serde::encode_to_vec(&wire, bincode::config::standard()).unwrap();
+        // Literal bytes, so a changed magic or version number fails here too.
         let mut expected = Vec::new();
-        expected.extend_from_slice(&NETWORK_TRACE_MAGIC);
-        expected.extend_from_slice(&NETWORK_TRACE_VERSION_V2.to_le_bytes());
+        expected.extend_from_slice(b"HERMIT-NET-TRACE");
+        expected.extend_from_slice(&[2, 0, 0, 0]);
         expected.extend_from_slice(&(payload.len() as u64).to_le_bytes());
         expected.extend_from_slice(&payload);
         assert_eq!(trace.encode_framed().unwrap(), expected);
