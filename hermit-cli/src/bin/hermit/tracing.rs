@@ -811,7 +811,9 @@ fn suppressing_diagnostic_signals(write: impl FnOnce() -> i32) {
 
 /// Set by `main` when `--max-log-bytes` is in force; see [`bound_log_cap_exit`].
 static LOG_CAP_EXIT_BOUND_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Whether the outer report's class line has been attempted.
+/// Whether the outer diagnostic -- `main`'s final report or the exit path's
+/// class line -- has been attempted. Both paths claim it with a swap, so it is
+/// attempted at most once.
 static LOG_CAP_REPORTED: AtomicBool = AtomicBool::new(false);
 static LOG_CAP_EXIT_SCHEDULED: AtomicBool = AtomicBool::new(false);
 
@@ -887,9 +889,13 @@ pub(crate) const LOG_CAP_CLASS_LINE: &str = "HERMIT_LOG_CAP class=log-cap\n";
 
 /// Write the outer report for a run the log cap ended: once, without waiting,
 /// omitted when it cannot be delivered at once (see [`write_without_waiting`]).
+/// It is elected with the same swap as [`exit_with_log_cap_status`], so if the
+/// exit timer's class line, or an earlier report, was already attempted, this
+/// attempts nothing.
 pub(crate) fn report_log_cap_without_waiting(report: &str) {
-    LOG_CAP_REPORTED.store(true, Ordering::Relaxed);
-    write_without_waiting(libc::STDERR_FILENO, report.as_bytes());
+    if !LOG_CAP_REPORTED.swap(true, Ordering::Relaxed) {
+        write_without_waiting(libc::STDERR_FILENO, report.as_bytes());
+    }
 }
 
 impl<W: Write> Write for CappedWriter<W> {
@@ -2050,6 +2056,36 @@ mod tests {
         });
         assert!(libc::WIFEXITED(status), "status {status:#x}");
         assert_eq!(libc::WEXITSTATUS(status), hermit::HERMIT_LOG_CAP_EXIT);
+    }
+
+    /// Round-3 review of https://github.com/rrnewton/hermit/pull/3686, finding
+    /// 7: the outer report and the exit path elect the one diagnostic with the
+    /// same swap, so it is attempted at most once. Here the report is called
+    /// twice and then the exit path runs, as the exit timer's thread would; only
+    /// the first report may reach stderr.
+    #[test]
+    fn the_outer_log_cap_diagnostic_is_attempted_at_most_once() {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let status = in_child_with_default_sigpipe(|| {
+            unsafe { libc::dup2(fds[1], libc::STDERR_FILENO) };
+            LOG_CAP_REPORTED.store(false, Ordering::Relaxed);
+            report_log_cap_without_waiting("first report\n");
+            report_log_cap_without_waiting("second report\n");
+            exit_with_log_cap_status()
+        });
+        unsafe { libc::close(fds[1]) };
+        let mut delivered = String::new();
+        // SAFETY: fds[0] is this test's own read end, owned by the File below.
+        unsafe { std::fs::File::from_raw_fd(fds[0]) }
+            .read_to_string(&mut delivered)
+            .unwrap();
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(libc::WEXITSTATUS(status), hermit::HERMIT_LOG_CAP_EXIT);
+        assert_eq!(delivered, "first report\n");
     }
 
     /// Round-2 review of https://github.com/rrnewton/hermit/pull/3686, finding
