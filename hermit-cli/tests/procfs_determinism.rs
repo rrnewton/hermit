@@ -36,9 +36,6 @@ use reverie::process::Namespace;
 static HERMIT_RUN_LOCK: Mutex<()> = Mutex::new(());
 const RUNS: usize = 5;
 const FORCE_READONLY_PROC_ENV: &str = "HERMIT_CHROOT_FORCE_READONLY_PROC";
-/// The stack the `hermit` binary runs a guest on: its main thread's, whose
-/// size is the soft `RLIMIT_STACK`, 8 MiB by default on Linux.
-const HERMIT_MAIN_THREAD_STACK: usize = 8 << 20;
 // The fixed accounting expectations below use this explicit fractional input.
 // Other procfs probes continue to exercise the ordinary host-captured default.
 const ACCOUNTING_EPOCH: &str = "2026-01-01T00:00:00.123456789Z";
@@ -1340,28 +1337,12 @@ fn chroot_mountinfo_subset_keeps_fdinfo_identity_consistent() {
         max_timeslice: None,
         ..Default::default()
     };
-    // `hermit::run_with_output` runs the tracer and Detcore on the calling
-    // thread, as the `hermit` binary does on its main thread. Give the run
-    // that thread's stack rather than the 2 MiB libtest gives a test thread.
-    // With --features third-party-backends in the unoptimized test build, the
-    // run needed 2028 to 2032 KiB before the identity work of
-    // https://github.com/rrnewton/hermit/pull/3255 and 2048 to 2052 KiB with
-    // it (RUST_MIN_STACK bisection in 4 KiB steps), so the test overflowed a
-    // stack the `hermit` binary never runs on. The command is built on the
-    // new thread because `ReverieCommand` holds raw pointers and is not Send.
-    let program = controller_program.clone();
-    let chroot_root = root.path().to_owned();
-    let output = std::thread::Builder::new()
-        .name("chroot-hermit-run".to_owned())
-        .stack_size(HERMIT_MAIN_THREAD_STACK)
-        .spawn(move || {
-            let mut command = ReverieCommand::new(&program);
-            command.chroot(&chroot_root).current_dir("/");
-            hermit::run_with_output(command, config, false, &None)
-        })
-        .expect("spawn the thread that runs Hermit")
-        .join()
-        .expect("the thread that runs Hermit panicked");
+    // Deliberately on the libtest thread, whose stack is the 2 MiB Rust
+    // default: a library caller may run Hermit on such a thread, so this
+    // test is the coverage that Hermit's stack use fits one.
+    let mut command = ReverieCommand::new(&controller_program);
+    command.chroot(root.path()).current_dir("/");
+    let output = hermit::run_with_output(command, config, false, &None);
     umount(&proc_target).expect("unmount chroot procfs");
     let output = output.expect("run chroot guest");
     assert_eq!(
