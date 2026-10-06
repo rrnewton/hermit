@@ -97,8 +97,11 @@ use std::time::Instant;
 
 const BACKENDS: [&str; 2] = ["ptrace", "liteinst"];
 const WATCHDOG_BACKSTOP: Duration = Duration::from_secs(90);
-/// Wall-clock bound from the guest's `READY` line to its `RESULT` line. Every
-/// passing run measured on 2026-09-28 finished in under 3 s.
+/// Wall-clock bound from the guest's `READY` line to its `RESULT` line: 20 s,
+/// unchanged since this file was added. It catches a lost interruption, which
+/// hangs; it is not a timing assertion, which the `ELAPSED` windows below make
+/// on Hermit's virtual clock. Every passing run measured on 2026-09-28 finished
+/// in under 3 s; the rest of the bound is margin for a loaded host.
 const RESULT_BOUND: Duration = Duration::from_secs(20);
 /// Wall-clock delay between `READY` and the external signal, so the guest has
 /// entered the blocking call. An early signal cannot make a broken Hermit pass:
@@ -476,18 +479,132 @@ fn run_cell_with_external_signals(
     }
 }
 
-/// Require a matched strict verification report on a cell that ran under `--verify`.
+/// Why a strict verification report is not determinism evidence, or `None` when
+/// it is. The two runs must have matched under the canonical comparison of their
+/// INFO logs, the report must certify bitwise parity, and each run must have
+/// supplied INFO messages to compare. A match alone is not enough: an empty
+/// comparison also matches, and Hermit's verifier then reports
+/// `bitwise_parity: false` (`verification_report` in
+/// hermit-cli/src/bin/hermit/verify.rs).
+fn strict_verification_gap(report: &serde_json::Value) -> Option<String> {
+    let mut gaps = Vec::new();
+    if report["verdict"] != "matched" {
+        gaps.push(format!("verdict is {}, not \"matched\"", report["verdict"]));
+    }
+    if report["verified"] != true {
+        gaps.push(format!("verified is {}, not true", report["verified"]));
+    }
+    let comparison = &report["comparison"];
+    if comparison["strictness"] != "canonical" {
+        gaps.push(format!(
+            "comparison.strictness is {}, not \"canonical\"",
+            comparison["strictness"]
+        ));
+    }
+    if comparison["log_scope"] != "info" {
+        gaps.push(format!(
+            "comparison.log_scope is {}, not \"info\"",
+            comparison["log_scope"]
+        ));
+    }
+    if report["bitwise_parity"] != true {
+        gaps.push(format!(
+            "bitwise_parity is {}, not true",
+            report["bitwise_parity"]
+        ));
+    }
+    for side in ["left", "right"] {
+        let count = &report["compared_log_messages"][side];
+        if !count.as_u64().is_some_and(|count| count > 0) {
+            gaps.push(format!(
+                "compared_log_messages.{side} is {count}, not a positive count"
+            ));
+        }
+    }
+    (!gaps.is_empty()).then(|| gaps.join("; "))
+}
+
+/// Require determinism evidence from a cell that ran under `--verify`: a matched
+/// canonical comparison of nonzero INFO messages with bitwise parity
+/// (`strict_verification_gap`).
 fn assert_verified(backend: &str, mode: FutexMode, args: &[&str], run: &GuestRun) {
     let Some(report) = &run.verify_report else {
         return;
     };
-    assert!(
-        report["verdict"] == "matched"
-            && report["verified"] == true
-            && report["comparison"]["strictness"] == "canonical",
-        "{backend} {mode:?} {args:?}: strict verification did not match\n{}",
-        run.describe()
+    if let Some(gap) = strict_verification_gap(report) {
+        panic!(
+            "{backend} {mode:?} {args:?}: strict verification is not determinism evidence: \
+             {gap}\n{}",
+            run.describe()
+        );
+    }
+}
+
+/// A strict verification report with the fields `strict_verification_gap` reads,
+/// as Hermit's verifier writes them for two runs that matched on 412 INFO
+/// messages each, after `edit`.
+fn verification_report_with(edit: fn(&mut serde_json::Value)) -> serde_json::Value {
+    let mut report = serde_json::json!({
+        "verified": true,
+        "bitwise_parity": true,
+        "verdict": "matched",
+        "comparison": {"strictness": "canonical", "log_scope": "info"},
+        "compared_log_messages": {"left": 412, "right": 412},
+    });
+    edit(&mut report);
+    report
+}
+
+/// `assert_verified` accepts only a matched canonical INFO comparison with
+/// bitwise parity and nonzero message counts on both sides. Every other report
+/// below is refused, including the empty comparison that also matches.
+#[test]
+fn strict_verification_requires_bitwise_parity_over_compared_info_messages() {
+    assert_eq!(
+        strict_verification_gap(&verification_report_with(|_| {})),
+        None
     );
+    let refused: [(&str, fn(&mut serde_json::Value)); 10] = [
+        ("an empty comparison", |report| {
+            report["compared_log_messages"] = serde_json::json!({"left": 0, "right": 0});
+        }),
+        ("an empty right side", |report| {
+            report["compared_log_messages"]["right"] = serde_json::json!(0);
+        }),
+        ("no message counts", |report| {
+            report["compared_log_messages"] = serde_json::Value::Null;
+        }),
+        ("no bitwise parity", |report| {
+            report["bitwise_parity"] = serde_json::json!(false);
+        }),
+        ("an absent bitwise parity", |report| {
+            report
+                .as_object_mut()
+                .expect("the report is an object")
+                .remove("bitwise_parity");
+        }),
+        ("a diverged verdict", |report| {
+            report["verdict"] = serde_json::json!("diverged");
+        }),
+        ("an unverified report", |report| {
+            report["verified"] = serde_json::json!(false);
+        }),
+        ("a stripped comparison", |report| {
+            report["comparison"]["strictness"] = serde_json::json!("stripped");
+        }),
+        ("a deterministic-log comparison", |report| {
+            report["comparison"]["log_scope"] = serde_json::json!("deterministic");
+        }),
+        ("no comparison", |report| {
+            report["comparison"] = serde_json::Value::Null;
+        }),
+    ];
+    for (case, edit) in refused {
+        assert!(
+            strict_verification_gap(&verification_report_with(edit)).is_some(),
+            "{case} was accepted as determinism evidence"
+        );
+    }
 }
 
 /// Run a cell and require a clean exit, the expected `RESULT` line, and `DONE`.
