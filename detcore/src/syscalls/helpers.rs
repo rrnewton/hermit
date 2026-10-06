@@ -999,12 +999,17 @@ pub trait NonblockableSyscall: SyscallInfo {
         self.signal_interrupt_errno()
     }
 
-    /// Whether restarting this call after [`kernel_restart_errno`](Self::kernel_restart_errno)
-    /// starts a relative timeout again, where Linux's restart would keep the original
-    /// deadline. Such a wait is not ended by a default job-control stop signal
+    /// Whether Linux restarts this call, after [`kernel_restart_errno`](Self::kernel_restart_errno)
+    /// with no handler, through a restart block that keeps its absolute deadline: a
+    /// `poll` with a positive timeout (`do_restart_poll`) and a timed `FUTEX_WAIT`
+    /// (`futex_wait_restart`). Its restart code is then `ERESTART_RESTARTBLOCK`, and
+    /// Detcore keeps the deadline in a [`RestartBlock`] for the `restart_syscall` that
+    /// the kernel runs next (<https://github.com/rrnewton/hermit/issues/3358>).
+    ///
+    /// Such a wait is also not ended by a default job-control stop signal
     /// (`KernelSignalState::interrupting_wait`), so that a stop Linux discards in an
-    /// orphaned process group does not make the call return late.
-    fn restart_rearms_timeout(&self) -> bool {
+    /// orphaned process group does not end the call before its deadline.
+    fn restart_keeps_deadline(&self) -> bool {
         false
     }
 
@@ -1068,22 +1073,22 @@ impl NonblockableSyscall for reverie::syscalls::Poll {
     /// Linux ends an interrupted `poll` with a restart code that a handler turns into
     /// `EINTR` and that restarts the call when no handler runs.
     ///
-    /// Known deviation: Linux's code is `ERESTART_RESTARTBLOCK`, and its restart
-    /// (`do_restart_poll`) keeps the original deadline. Hermit cannot install the
-    /// kernel's restart block for a wait it emulates, so it returns `ERESTARTNOHAND`.
-    /// The kernel then re-runs `poll` with its original arguments at the ptrace stop,
-    /// so a restart after `SIGSTOP` or a caught-and-restarted stop starts the
-    /// relative timeout again. A default `SIGTSTP`, `SIGTTIN`, or `SIGTTOU` does not
-    /// end the wait at all
-    /// ([`restart_rearms_timeout`](NonblockableSyscall::restart_rearms_timeout)), so
-    /// the deadline holds when Linux discards that stop. A timed futex wait has the
-    /// same deviation (https://github.com/rrnewton/hermit/issues/3358).
+    /// With a positive timeout that code is Linux's own, `ERESTART_RESTARTBLOCK`: the
+    /// kernel then runs `restart_syscall`, which Detcore resumes with the deadline it
+    /// kept ([`RestartBlock`]), as `do_restart_poll` does
+    /// (https://github.com/rrnewton/hermit/issues/3358). An infinite timeout has no
+    /// deadline to keep, so it returns `ERESTARTNOHAND`, and running `poll` again with
+    /// its original arguments is the same restart.
     fn kernel_restart_errno(&self) -> Errno {
-        Errno::ERESTARTNOHAND
+        if self.restart_keeps_deadline() {
+            Errno::ERESTART_RESTARTBLOCK
+        } else {
+            Errno::ERESTARTNOHAND
+        }
     }
 
     /// A zero timeout never blocks, and a negative one never expires.
-    fn restart_rearms_timeout(&self) -> bool {
+    fn restart_keeps_deadline(&self) -> bool {
         self.timeout() > 0
     }
 }
@@ -1226,15 +1231,19 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
 
     /// Linux restarts an untimed `FUTEX_WAIT` under `SA_RESTART` (`-ERESTARTSYS`), but a
     /// timed wait returns `-ERESTART_RESTARTBLOCK`, which a handler always turns into
-    /// `EINTR`. `ERESTARTNOHAND` gives a timed wait that outcome for a caught signal and a
-    /// transparent restart otherwise. A restart after `SIGSTOP` or a caught-and-restarted
-    /// stop starts a relative `FUTEX_WAIT` timeout again, where Linux's restart block
-    /// would resume the original deadline; a default job-control stop does not end that
-    /// wait ([`restart_rearms_timeout`](NonblockableSyscall::restart_rearms_timeout))
-    /// (https://github.com/rrnewton/hermit/issues/3146; listed with `poll`'s in
-    /// https://github.com/rrnewton/hermit/issues/3358).
+    /// `EINTR` (https://github.com/rrnewton/hermit/issues/3146).
+    ///
+    /// A timed `FUTEX_WAIT` returns Linux's code: with no handler the kernel then runs
+    /// `restart_syscall`, which Detcore resumes with the deadline it kept
+    /// ([`RestartBlock`]), as `futex_wait_restart` does
+    /// (https://github.com/rrnewton/hermit/issues/3358). A timed `FUTEX_WAIT_BITSET`
+    /// returns `ERESTARTNOHAND`, which gives it the same outcome for a caught signal and
+    /// otherwise runs the call again with its original arguments, whose absolute
+    /// deadline is the one it kept.
     fn kernel_restart_errno(&self) -> Errno {
-        if self.timeout().is_some() {
+        if self.restart_keeps_deadline() {
+            Errno::ERESTART_RESTARTBLOCK
+        } else if self.timeout().is_some() {
             Errno::ERESTARTNOHAND
         } else {
             Errno::ERESTARTSYS
@@ -1243,7 +1252,7 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
 
     /// Only `FUTEX_WAIT` takes a relative timeout. `FUTEX_WAIT_BITSET`'s is an
     /// absolute deadline, which a restart with the original arguments keeps.
-    fn restart_rearms_timeout(&self) -> bool {
+    fn restart_keeps_deadline(&self) -> bool {
         (self.futex_op() & libc::FUTEX_CMD_MASK) == libc::FUTEX_WAIT && self.timeout().is_some()
     }
 }
@@ -1548,6 +1557,85 @@ where
     retry_nonblocking_syscall_helper(guest, call, rsrc, None, subtool).await
 }
 
+/// What a wait that ended with `ERESTART_RESTARTBLOCK` keeps for the
+/// `restart_syscall` that Linux runs next when no handler runs
+/// (`NonblockableSyscall::restart_keeps_deadline`). Linux keeps the call and its
+/// absolute deadline in the thread's restart block (`do_restart_poll`,
+/// `futex_wait_restart`). Detcore emulates the wait, so the kernel's restart block
+/// does not describe it, and Detcore keeps its own
+/// (https://github.com/rrnewton/hermit/issues/3358).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct RestartBlock {
+    /// The instruction pointer at the interrupted call's syscall stop: the address
+    /// after its `syscall` instruction. The kernel's restart moves the instruction
+    /// pointer back onto that instruction with `restart_syscall` in `rax`, so the
+    /// restart stops at the same address.
+    pub(crate) rip: u64,
+    /// The wait's absolute deadline.
+    pub(crate) deadline: Option<LogicalTime>,
+    /// The interrupted call.
+    pub(crate) call: RestartCall,
+}
+
+/// A call whose restart keeps its deadline.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RestartCall {
+    Poll(syscalls::Poll),
+    Futex(syscalls::Futex),
+}
+
+impl RestartBlock {
+    /// The record, if a `restart_syscall` that stopped at `rip` is the kernel's
+    /// restart of the interrupted call. At any other address the guest made the
+    /// call itself.
+    pub(crate) fn resumed_at(self, rip: u64) -> Option<Self> {
+        (self.rip == rip).then_some(self)
+    }
+}
+
+/// Keeps `deadline` for the kernel's restart of `call` when the wait ended with
+/// `ERESTART_RESTARTBLOCK` (`RestartBlock`).
+pub(crate) async fn keep_restart_block<T, G>(
+    guest: &mut G,
+    result: &Result<i64, Error>,
+    call: RestartCall,
+    deadline: Option<LogicalTime>,
+) where
+    T: RecordOrReplay,
+    G: Guest<Detcore<T>>,
+{
+    if matches!(result, Err(Error::Errno(errno)) if *errno == Errno::ERESTART_RESTARTBLOCK) {
+        let rip = guest.regs().await.rip;
+        let block = RestartBlock {
+            rip,
+            deadline,
+            call,
+        };
+        tracing::trace!(
+            "[tid {}] the wait keeps {:?} for its restart",
+            guest.tid(),
+            block
+        );
+        guest.thread_state_mut().restart_block = Some(block);
+    }
+}
+
+/// The restart code that ends a wait for a signal the backend holds and delivers
+/// when the guest resumes. The backend passes a held signal on without reporting it
+/// to the tool when the call returns `ERESTART_RESTARTBLOCK`, so for any signal but
+/// `SIGSTOP`, which it never reports, the wait returns `ERESTARTNOHAND` instead. A
+/// handler turns either code into `EINTR`, and a signal that kills the process
+/// leaves no restart. The difference is a stop, which `SIGSTOP` alone can be here:
+/// a default job-control stop does not end a wait whose restart keeps its deadline
+/// (`KernelSignalState::interrupting_wait`).
+fn held_signal_restart_errno(restart_errno: Errno, signal: i32) -> Errno {
+    if restart_errno == Errno::ERESTART_RESTARTBLOCK && signal != libc::SIGSTOP {
+        Errno::ERESTARTNOHAND
+    } else {
+        restart_errno
+    }
+}
+
 /// Retry a non-blocking syscall until it succeeds. Set the timeout to zero for the actual
 /// syscalls (retries), while monitoring the clock to see if/when the logical timeout
 /// should trigger.  Timeout is passed as an ABSOLUTE TIME (not duration).
@@ -1678,8 +1766,8 @@ where
 /// does not block and that is caught, or whose default action terminates or stops
 /// the process (https://github.com/rrnewton/hermit/issues/3146). Blocked,
 /// ignored, and default-ignored signals do not end it, and neither does a default
-/// job-control stop when the call's restart would start a relative timeout again
-/// (`NonblockableSyscall::restart_rearms_timeout`). Such a signal that stops one
+/// job-control stop when Linux's restart of the call keeps its deadline
+/// (`NonblockableSyscall::restart_keeps_deadline`). Such a signal that stops one
 /// of the wait's injections is absorbed, and the wait runs on; the stops that
 /// `KernelSignalWait::inject_absorbing` cannot absorb safely end the wait with a
 /// restart instead, after which the call runs again from the start.
@@ -1709,7 +1797,7 @@ where
     let mut signals = KernelSignalWait::new(
         guest,
         call0.signals_consumed_by_wait(&guest.memory()),
-        call0.restart_rearms_timeout(),
+        call0.restart_keeps_deadline(),
         call0.kernel_restart_errno(),
     )
     .with_deadline(maybe_timeout.is_some());
@@ -1878,12 +1966,14 @@ pub(crate) struct KernelSignalWait {
     /// Signals the wait itself consumes (rt_sigtimedwait's set), which never
     /// interrupt it.
     consumed: KernelSigset,
-    /// Whether a default job-control stop leaves the wait running, because the
-    /// call's restart would start a relative timeout again
-    /// (`NonblockableSyscall::restart_rearms_timeout`).
+    /// Whether a default job-control stop leaves the wait running, because Linux's
+    /// restart of the call keeps its deadline
+    /// (`NonblockableSyscall::restart_keeps_deadline`).
     defers_default_stops: bool,
     /// The errno that ends the wait for an interrupting signal: the restart code
-    /// Linux uses for the call (`NonblockableSyscall::kernel_restart_errno`).
+    /// Linux uses for the call (`NonblockableSyscall::kernel_restart_errno`). A
+    /// signal the backend holds turns `ERESTART_RESTARTBLOCK` into `ERESTARTNOHAND`
+    /// (`held_signal_restart_errno`).
     restart_errno: Errno,
     /// Signals that never end the wait, even ones that would end it natively.
     /// They stay pending in the kernel, or held by the backend, and are
@@ -2256,7 +2346,7 @@ impl KernelSignalWait {
                         signal,
                         held.signal
                     );
-                    return Err(self.restart_errno.into());
+                    return Err(held_signal_restart_errno(self.restart_errno, held.signal).into());
                 }
                 tracing::trace!(
                     "[tid {}] signal {} may replace the held signal {:?}; the wait keeps its deadline",
@@ -2325,7 +2415,10 @@ impl KernelSignalWait {
                     });
                 }
                 StopVerdict::Absorb(_) => return Err(Errno::ERESTARTNOINTR.into()),
-                StopVerdict::End(errno) => return Err(errno.into()),
+                // The backend holds `signal`, which stopped the injection.
+                StopVerdict::End(errno) => {
+                    return Err(held_signal_restart_errno(errno, signal).into());
+                }
             }
         }
     }
@@ -2776,8 +2869,26 @@ mod tests {
         // Signal-state interruption hands the kernel the wait's own restart code, so
         // the guest's disposition decides between a handler's EINTR and a restart
         // (https://github.com/rrnewton/hermit/issues/3146).
+        // A poll with a positive timeout and a timed FUTEX_WAIT end with Linux's own
+        // code: a handler turns it into EINTR, and with no handler the kernel runs
+        // restart_syscall, which Detcore resumes with the deadline it kept
+        // (`RestartBlock`, https://github.com/rrnewton/hermit/issues/3358).
+        assert_eq!(
+            reverie::syscalls::Poll::new()
+                .with_timeout(300)
+                .kernel_restart_errno(),
+            Errno::ERESTART_RESTARTBLOCK
+        );
+        // A zero timeout never blocks and a negative one never expires, so there is
+        // no deadline to keep, and running the call again is Linux's restart.
         assert_eq!(
             reverie::syscalls::Poll::new().kernel_restart_errno(),
+            Errno::ERESTARTNOHAND
+        );
+        assert_eq!(
+            reverie::syscalls::Poll::new()
+                .with_timeout(-1)
+                .kernel_restart_errno(),
             Errno::ERESTARTNOHAND
         );
         assert_eq!(
@@ -2797,14 +2908,70 @@ mod tests {
             reverie::syscalls::Futex::new().kernel_restart_errno(),
             Errno::ERESTARTSYS
         );
-        // A timed wait is never restarted after a handler runs.
+        // A timed wait is never restarted after a handler runs. FUTEX_WAIT's timeout
+        // is relative, so its deadline is kept as poll's is.
         let timeout = reverie::syscalls::Addr::from_raw(0x1000).unwrap();
         assert_eq!(
             reverie::syscalls::Futex::new()
                 .with_timeout(Some(timeout))
                 .kernel_restart_errno(),
+            Errno::ERESTART_RESTARTBLOCK
+        );
+        // FUTEX_WAIT_BITSET's timeout is an absolute deadline, which running the
+        // call again keeps.
+        let bitset = reverie::syscalls::Futex::new()
+            .with_futex_op(libc::FUTEX_WAIT_BITSET | libc::FUTEX_PRIVATE_FLAG)
+            .with_val3(-1);
+        assert_eq!(bitset.kernel_restart_errno(), Errno::ERESTARTSYS);
+        assert_eq!(
+            bitset.with_timeout(Some(timeout)).kernel_restart_errno(),
             Errno::ERESTARTNOHAND
         );
+    }
+
+    #[test]
+    fn a_held_signal_is_reported_unless_it_is_sigstop() {
+        // The backend passes a held signal on unreported when the call returns
+        // ERESTART_RESTARTBLOCK, so a held signal other than SIGSTOP ends the wait
+        // with ERESTARTNOHAND, which a handler also turns into EINTR.
+        for signal in [libc::SIGUSR1, libc::SIGTERM, libc::SIGTSTP, libc::SIGCHLD] {
+            assert_eq!(
+                held_signal_restart_errno(Errno::ERESTART_RESTARTBLOCK, signal),
+                Errno::ERESTARTNOHAND,
+                "signal {signal}"
+            );
+        }
+        // SIGSTOP is never reported, and its restart must keep the deadline.
+        assert_eq!(
+            held_signal_restart_errno(Errno::ERESTART_RESTARTBLOCK, libc::SIGSTOP),
+            Errno::ERESTART_RESTARTBLOCK
+        );
+        // Every other restart code is the call's own.
+        for errno in [
+            Errno::ERESTARTNOHAND,
+            Errno::ERESTARTSYS,
+            Errno::ERESTARTNOINTR,
+            Errno::EINTR,
+        ] {
+            for signal in [libc::SIGUSR1, libc::SIGSTOP] {
+                assert_eq!(held_signal_restart_errno(errno, signal), errno);
+            }
+        }
+    }
+
+    #[test]
+    fn a_restart_block_resumes_only_at_the_interrupted_call() {
+        let timeout = reverie::syscalls::Addr::from_raw(0x1000).unwrap();
+        let block = RestartBlock {
+            rip: 0x4000_1234,
+            deadline: Some(LogicalTime::from_nanos(300_000_000)),
+            call: RestartCall::Futex(reverie::syscalls::Futex::new().with_timeout(Some(timeout))),
+        };
+        // The kernel's restart runs restart_syscall at the interrupted call's address.
+        assert_eq!(block.resumed_at(0x4000_1234), Some(block));
+        // A restart_syscall anywhere else is the guest's own call.
+        assert_eq!(block.resumed_at(0x4000_1236), None);
+        assert_eq!(block.resumed_at(0x4000_1232), None);
     }
 
     #[test]

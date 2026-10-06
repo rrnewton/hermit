@@ -205,6 +205,21 @@
  * Each trial prints a TRIAL line, then one RESULT line counts the trials that
  * matched Linux.
  *
+ * The `stopcont` and `stopcontusr1` senders are modes of their own, for poll
+ * (no descriptors) and a relative FUTEX_WAIT, each with the QUIET_TIMEOUT_MS
+ * timeout. The guest forks a child, prints READY and waits. The child sends the
+ * guest SIGSTOP 100 ms later and SIGCONT 100 ms after that. No handler runs for
+ * either, so Linux restarts the call through the restart block it saved
+ * (do_restart_poll, futex_wait_restart), which keeps the original absolute
+ * deadline: the call returns 0 (poll) or -1 with ETIMEDOUT (futex) once that
+ * deadline passes, QUIET_TIMEOUT_MS after it began, not a full timeout after
+ * SIGCONT (https://github.com/rrnewton/hermit/issues/3358). With `stopcontusr1`
+ * the child also sends SIGUSR1, caught with flags 0, 50 ms after SIGCONT, which
+ * must still end the restarted wait: Linux returns -1 with EINTR when a handler
+ * interrupts a restarted wait. The child exits only after the call's deadline,
+ * so the SIGCHLD of its exit never arrives during the wait. The ELAPSED line
+ * reports how long the call took.
+ *
  * Output is one deterministic RESULT line after the call returns, followed
  * by DONE once every helper has been reaped. A kernel-internal errno, which has
  * no name, prints as UNNAMED(<number>). */
@@ -856,6 +871,55 @@ static int hangup_main(const char *call, int by_ioctl, const char *role) {
   return 0;
 }
 
+/* The `stopcont` and `stopcontusr1` modes (see the usage comment). */
+#define STOP_DELAY_MS 100
+#define CONT_DELAY_MS 100
+#define USR1_AFTER_CONT_MS 50
+static int stopcont_main(const char *call, int then_usr1) {
+  int is_poll = !strcmp(call, "poll");
+  if (!is_poll && strcmp(call, "futex")) return 2;
+  set_handler(SIGUSR1, on_usr1);
+  pid_t parent = getpid();
+  pid_t child = fork();
+  if (child < 0) return 3;
+  if (child == 0) {
+    sleep_ms(STOP_DELAY_MS);
+    if (kill(parent, SIGSTOP) != 0) _exit(91);
+    sleep_ms(CONT_DELAY_MS);
+    if (kill(parent, SIGCONT) != 0) _exit(91);
+    if (then_usr1) {
+      sleep_ms(USR1_AFTER_CONT_MS);
+      if (kill(parent, SIGUSR1) != 0) _exit(91);
+    }
+    /* Exit after the guest's deadline, so the SIGCHLD of this exit, posted
+       at a moment set by host timing, never arrives during the wait. */
+    sleep_ms(QUIET_TIMEOUT_MS);
+    _exit(0);
+  }
+  say("READY\n");
+  struct timespec start, end;
+  clock_gettime(CLOCK_MONOTONIC, &start);
+  long ret;
+  errno = 0;
+  if (is_poll) {
+    ret = poll(NULL, 0, QUIET_TIMEOUT_MS);
+  } else {
+    struct timespec timeout = {0, QUIET_TIMEOUT_MS * 1000000L};
+    ret = syscall(SYS_futex, &futex_word, FUTEX_WAIT_PRIVATE, 0, &timeout, NULL, 0);
+  }
+  int err = errno;
+  clock_gettime(CLOCK_MONOTONIC, &end);
+  char buf[160];
+  snprintf(buf, sizeof buf, "RESULT call=%s ret=%ld errno=%s handler=%d\n", call,
+           ret < 0 ? -1L : ret, ret < 0 ? errno_name(err) : "none", (int)handled);
+  say(buf);
+  snprintf(buf, sizeof buf, "ELAPSED ms=%ld\n", ms_between(&start, &end));
+  say(buf);
+  reap(child);
+  say("DONE\n");
+  return 0;
+}
+
 /* The `racing` sender (see the usage comment). */
 #define RACING_TRIALS 6
 #define RACING_TIMEOUT_MS 5000
@@ -1001,6 +1065,7 @@ int main(int argc, char **argv) {
         "spinthrexit|usr2|extchld|extchldreaped|extchldlive|chldflood]\n"
         "       external_signal_interrupt sigsuspend creator\n"
         "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty>\n"
+        "       external_signal_interrupt <poll|futex> <stopcont|stopcontusr1>\n"
         "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing\n");
     return 2;
   }
@@ -1015,6 +1080,8 @@ int main(int argc, char **argv) {
   if (!strcmp(sender, "hupopen")) return hangup_main(call, 0, "hupopen");
   if (!strcmp(sender, "hupctty")) return hangup_main(call, 1, "hupctty");
   if (!strcmp(sender, "racing")) return racing_main(call);
+  if (!strcmp(sender, "stopcont")) return stopcont_main(call, 0);
+  if (!strcmp(sender, "stopcontusr1")) return stopcont_main(call, 1);
   int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
   int chldflood = 0;
   enum extchld extchld = EXTCHLD_NONE;

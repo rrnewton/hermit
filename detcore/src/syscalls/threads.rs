@@ -44,6 +44,8 @@ use crate::scheduler::FutexSignalWatch;
 use crate::scheduler::HostTimedSignalScope;
 use crate::scheduler::SchedValue;
 use crate::syscalls::helpers::NonblockableSyscall;
+use crate::syscalls::helpers::RestartCall;
+use crate::syscalls::helpers::keep_restart_block;
 use crate::syscalls::helpers::record_retry_event;
 use crate::syscalls::helpers::retry_nonblocking_syscall;
 use crate::syscalls::helpers::retry_nonblocking_syscall_with_timeout;
@@ -843,15 +845,17 @@ impl KernelSignalState {
     /// stops ([`default_job_control_stops`](Self::default_job_control_stops)) when
     /// `defers_default_stops` is set.
     ///
-    /// A wait sets it when Detcore's restart of the call would start a relative
-    /// timeout again (`NonblockableSyscall::restart_rearms_timeout`): a `poll` with
-    /// a timeout, and a timed `FUTEX_WAIT`. Ending such a wait for a stop that
-    /// Linux discards in an orphaned process group would restart it with a fresh
-    /// timeout, so it would return late. Left alone, the wait keeps its deadline,
-    /// as on hermit main, and a stop that Linux does not discard takes effect when
-    /// the call returns rather than when the signal arrives
-    /// (https://github.com/rrnewton/hermit/issues/3358). `SIGSTOP`, a caught
-    /// stop signal, and a fatal one still end the wait.
+    /// A wait sets it when Linux's restart of the call keeps its deadline
+    /// (`NonblockableSyscall::restart_keeps_deadline`): a `poll` with a positive
+    /// timeout, and a timed `FUTEX_WAIT`. Detcore keeps that deadline for the
+    /// kernel's restart only when the wait ends with `ERESTART_RESTARTBLOCK`, which
+    /// a stop signal the backend holds does not (`held_signal_restart_errno`), so
+    /// ending such a wait for a default stop that Linux discards in an orphaned
+    /// process group could restart it with a fresh timeout, and it would return
+    /// late. Left alone, the wait keeps its deadline, as on hermit main, and a stop
+    /// that Linux does not discard takes effect when the call returns rather than
+    /// when the signal arrives (https://github.com/rrnewton/hermit/issues/3358).
+    /// `SIGSTOP`, a caught stop signal, and a fatal one still end the wait.
     pub(crate) fn interrupting_wait(
         &self,
         mask: KernelSigset,
@@ -1217,6 +1221,16 @@ fn absolute_timeout_uses_host_clock(
         < deadline.as_nanos().abs_diff(logical_now.as_nanos())
 }
 
+/// Where a futex wait takes its deadline from.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum FutexDeadline {
+    /// The call's own timeout.
+    FromCall,
+    /// The deadline an interrupted `FUTEX_WAIT` kept for the kernel's restart
+    /// (`RestartBlock`).
+    Restart(Option<LogicalTime>),
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
     async fn futex_timeout_deadline<G: Guest<Self>>(
         &self,
@@ -1279,6 +1293,23 @@ impl<T: RecordOrReplay> Detcore<T> {
                     logical_now,
                 )))
             }
+        }
+    }
+
+    /// The deadline of a futex wait, from the call's timeout or from the record an
+    /// interrupted wait kept for its restart (`FutexDeadline`).
+    async fn futex_deadline<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        deadline: FutexDeadline,
+    ) -> Result<Option<LogicalTime>, Error> {
+        match deadline {
+            FutexDeadline::FromCall => {
+                self.futex_timeout_deadline(guest, call.futex_op(), call.timeout())
+                    .await
+            }
+            FutexDeadline::Restart(deadline) => Ok(deadline),
         }
     }
 
@@ -1661,6 +1692,20 @@ impl<T: RecordOrReplay> Detcore<T> {
         guest: &mut G,
         call: syscalls::Futex,
     ) -> Result<i64, Error> {
+        self.handle_futex_from(guest, call, FutexDeadline::FromCall)
+            .await
+    }
+
+    /// `handle_futex`, taking a wait's deadline from `deadline`. A `restart_syscall`
+    /// resumes an interrupted `FUTEX_WAIT` here with the deadline the wait kept,
+    /// and the value is compared again, as in Linux's `futex_wait_restart`
+    /// (`Detcore::handle_restart_syscall`).
+    pub(crate) async fn handle_futex_from<G: Guest<Self>>(
+        &self,
+        guest: &mut G,
+        call: syscalls::Futex,
+        deadline: FutexDeadline,
+    ) -> Result<i64, Error> {
         let dettid = guest.thread_state().dettid;
         let ptr = match call.uaddr() {
             None => {
@@ -1679,8 +1724,14 @@ impl<T: RecordOrReplay> Detcore<T> {
             Ok(guest.inject(call).await?)
         } else {
             match self.cfg.debug_futex_mode {
-                BlockingMode::Precise => self.handle_futex_blocking(guest, call, init_val).await,
-                BlockingMode::Polling => self.handle_futex_polling(guest, call, init_val).await,
+                BlockingMode::Precise => {
+                    self.handle_futex_blocking(guest, call, init_val, deadline)
+                        .await
+                }
+                BlockingMode::Polling => {
+                    self.handle_futex_polling(guest, call, init_val, deadline)
+                        .await
+                }
                 BlockingMode::External => self.record_or_replay_blocking(guest, call.into()).await,
             }
         }
@@ -1689,11 +1740,12 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// Blocking (precise) Futex implementation.
     /// Here we use a two-phase request to the scheduler: before and after the futex wait/wake
     /// side effects. We EMULATE futex calls and NEVER run them inside the kernel.
-    pub async fn handle_futex_blocking<G: Guest<Self>>(
+    pub(crate) async fn handle_futex_blocking<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Futex,
         init_val: i32,
+        deadline: FutexDeadline,
     ) -> Result<i64, Error> {
         let ptr = call.uaddr().unwrap();
         let futexid = guest.thread_state().futex_id(
@@ -1759,9 +1811,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                     );
                     Err(Error::Errno(Errno::EAGAIN))
                 } else {
-                    let maybe_timeout_lt = self
-                        .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
-                        .await?;
+                    let maybe_timeout_lt = self.futex_deadline(guest, call, deadline).await?;
                     let signal_interruption = guest
                         .config()
                         .backend_supports_blocked_wait_signal_interruption;
@@ -1836,7 +1886,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                             };
                             // A timed `FUTEX_WAIT` lets a default job-control stop
                             // wait for its deadline (`KernelSignalState::interrupting_wait`).
-                            let defers_default_stops = call.restart_rearms_timeout();
+                            let defers_default_stops = call.restart_keeps_deadline();
                             let held =
                                 kernel_sigset_bit(libc::SIGCHLD) | host_timed_signals(guest).await;
                             let pending = state
@@ -1915,6 +1965,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                         futex_action(guest, FutexAction::WaitFinished, &futexid, init_val, bitset)
                             .await;
                     }
+                    keep_restart_block(guest, &res, RestartCall::Futex(call), maybe_timeout_lt)
+                        .await;
                     res
                 }
             }
@@ -1929,11 +1981,12 @@ impl<T: RecordOrReplay> Detcore<T> {
 
     /// Futex system call, alternative implemenattion where we treat futexes as InternalIOPolling
     /// operations.
-    pub async fn handle_futex_polling<G: Guest<Self>>(
+    pub(crate) async fn handle_futex_polling<G: Guest<Self>>(
         &self,
         guest: &mut G,
         call: syscalls::Futex,
         init_val: i32,
+        deadline: FutexDeadline,
     ) -> Result<i64, Error> {
         fn make_futex_wake_request(dettid: DetTid) -> Resources {
             let mut rsrc = Resources::new(dettid);
@@ -1972,11 +2025,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                     Ok(res?)
                 } else {
                     let rsrc = make_futex_wait_request(dettid);
-                    let deadline = self
-                        .futex_timeout_deadline(guest, call.futex_op(), call.timeout())
-                        .await?;
+                    let deadline = self.futex_deadline(guest, call, deadline).await?;
                     let res =
-                        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await?;
+                        retry_nonblocking_syscall_with_timeout(guest, call, rsrc, deadline).await;
+                    keep_restart_block(guest, &res, RestartCall::Futex(call), deadline).await;
+                    let res = res?;
                     trace!(
                         "[detcore, dtid {}] after futex wait, memory value is {}",
                         &dettid,
