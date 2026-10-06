@@ -1758,21 +1758,46 @@ impl<T: RecordOrReplay> Detcore<T> {
             Err(err) => return Err(err.into()),
         }
 
+        // The capture reads land in the caller's own buffer, and the caller
+        // later receives only the sanitized bytes. Without a restore, every
+        // host byte past the sanitized length stays in guest memory after the
+        // read returns: all of a host `/proc/modules` chunk behind its empty
+        // sanitized view (https://github.com/rrnewton/hermit/issues/3815).
+        // Save what the capture can overwrite and put it back, so the only
+        // change the guest sees is the sanitized prefix that the read returns.
         let remote_buf = call.buf().ok_or(Errno::EFAULT)?;
+        let mut saved = vec![0; call.len().min(MAX_SNAPSHOT_BYTES)];
+        let readable = read_guest_prefix(&guest.memory(), remote_buf, &mut saved)?;
+        saved.truncate(readable);
+        let mut clobbered = 0;
         let mut contents = Vec::new();
-        loop {
-            let bytes_read = self.record_or_replay(guest, call).await? as usize;
+        let result = loop {
+            let bytes_read = match self.record_or_replay(guest, call).await {
+                Ok(bytes_read) => bytes_read as usize,
+                Err(err) => break Err(err.into()),
+            };
+            clobbered = clobbered.max(bytes_read);
             if bytes_read == 0 {
-                return Ok(contents);
+                break Ok(contents);
             }
             if contents.len() + bytes_read > MAX_SNAPSHOT_BYTES {
-                return Err(Errno::EFBIG.into());
+                break Err(Errno::EFBIG.into());
             }
 
             let mut chunk = vec![0; bytes_read];
-            guest.memory().read_exact(remote_buf, &mut chunk)?;
+            if let Err(err) = guest.memory().read_exact(remote_buf, &mut chunk) {
+                break Err(err.into());
+            }
             contents.extend_from_slice(&chunk);
+        };
+        // The kernel wrote `clobbered` bytes, so they were mapped and readable
+        // when `saved` was taken; `saved` is shorter only past the cap, where
+        // the capture has already failed with EFBIG.
+        let restore = &saved[..clobbered.min(saved.len())];
+        if !restore.is_empty() {
+            guest.memory().write_exact(remote_buf, restore)?;
         }
+        result
     }
 
     async fn initialize_procfs_snapshot<G: Guest<Self>>(

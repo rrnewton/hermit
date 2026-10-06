@@ -9,6 +9,7 @@
 //! misc syscall tests
 
 mod notification_fds;
+mod procfs_caller_buffer;
 mod readdir_order;
 mod tight_stack_openat;
 mod vfork;
