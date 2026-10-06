@@ -14,6 +14,7 @@
  *             chldkill|chldthrexit|chldpend|stealgrp|stealkill|stealthrexit|
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
  *             extchld|extchldreaped|extchldlive]
+ *        external_signal_interrupt sigsuspend creator
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
  * select system call itself. `sem` is glibc's sem_timedwait, a FUTEX_WAIT_BITSET
@@ -149,6 +150,20 @@
  *                  signals the parent alone.
  * Linux ends the wait with EINTR as soon as the signal arrives, with or
  * without a child, and the handler has run once by the RESULT line.
+ *
+ * `sigsuspend creator` is a mode of its own. The main thread installs a
+ * SIGCHLD handler (flags 0), blocks SIGCHLD, prints READY and waits in
+ * pthread_join for a second thread, the creator, which inherits that mask. Six times, the creator
+ * forks a child that exits 50 ms later with the trial number as its status,
+ * and sleeps in sigsuspend with SIGCHLD unblocked. Linux sends the child's
+ * SIGCHLD to the thread that forked it when that thread does not block it, so
+ * the handler runs on the creator and sigsuspend returns -1 with EINTR once
+ * the child has exited. The creator then reaps the child and sets SIGCHLD to
+ * SIG_IGN and back to the handler, which discards any second SIGCHLD left
+ * pending for the same exit. Each trial prints a TRIAL line (whether the wait
+ * ended after the child's exit, the call's result, how often the handler ran,
+ * whether it ran on the creator, and the reaped status), then one RESULT line
+ * counts the trials that matched Linux.
  *
  * Output is one deterministic RESULT line after the call returns, followed
  * by DONE once every helper has been reaped. A kernel-internal errno, which has
@@ -482,19 +497,94 @@ static void *thread_sender(void *arg) {
   return NULL;
 }
 
+/* The `sigsuspend creator` mode (see the usage comment). */
+#define CREATOR_TRIALS 6
+#define CREATOR_CHILD_MS 50
+static volatile sig_atomic_t creator_handled = 0;
+static volatile sig_atomic_t creator_handled_tid = 0;
+
+static void on_creator_chld(int sig) {
+  (void)sig;
+  creator_handled += 1;
+  /* gettid is async-signal-safe. */
+  creator_handled_tid = (sig_atomic_t)syscall(SYS_gettid);
+}
+
+static void *creator_thread(void *arg) {
+  int *matched = arg;
+  pid_t self = (pid_t)syscall(SYS_gettid);
+  sigset_t wait_mask;
+  if (pthread_sigmask(SIG_SETMASK, NULL, &wait_mask) != 0) _exit(95);
+  sigdelset(&wait_mask, SIGCHLD);
+  for (int i = 0; i < CREATOR_TRIALS; i++) {
+    creator_handled = 0;
+    creator_handled_tid = 0;
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    pid_t child = fork();
+    if (child < 0) _exit(96);
+    if (child == 0) {
+      sleep_ms(CREATOR_CHILD_MS);
+      _exit(i);
+    }
+    errno = 0;
+    int ret = sigsuspend(&wait_mask);
+    int err = errno;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    int status = 0;
+    pid_t reaped;
+    while ((reaped = waitpid(child, &status, 0)) < 0 && errno == EINTR) {
+    }
+    int after_exit = ms_between(&start, &end) >= CREATOR_CHILD_MS;
+    int handled_count = creator_handled;
+    int on_creator = creator_handled_tid == self;
+    int child_status = reaped == child && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+    printf("TRIAL %d after_exit=%d ret=%d errno=%s handled=%d on_creator=%d status=%d\n", i,
+           after_exit, ret, errno_name(err), handled_count, on_creator, child_status);
+    fflush(stdout);
+    if (after_exit && ret == -1 && err == EINTR && handled_count == 1 && on_creator &&
+        child_status == i)
+      *matched += 1;
+    /* Discard a second SIGCHLD still pending for this exit. */
+    set_handler(SIGCHLD, SIG_IGN);
+    set_handler(SIGCHLD, on_creator_chld);
+  }
+  return NULL;
+}
+
+static int creator_main(const char *role_name) {
+  if (strcmp(role_name, "creator")) return 2;
+  set_handler(SIGCHLD, on_creator_chld);
+  sigset_t chld;
+  sigemptyset(&chld);
+  sigaddset(&chld, SIGCHLD);
+  if (pthread_sigmask(SIG_BLOCK, &chld, NULL) != 0) return 97;
+  say("READY\n");
+  int matched = 0;
+  pthread_t creator;
+  if (pthread_create(&creator, NULL, creator_thread, &matched) != 0) return 98;
+  pthread_join(creator, NULL);
+  printf("RESULT call=sigsuspend role=creator trials=%d matched=%d\n", CREATOR_TRIALS, matched);
+  printf("DONE\n");
+  fflush(stdout);
+  return 0;
+}
+
 int main(int argc, char **argv) {
   if (argc < 3) {
     say("usage: external_signal_interrupt <futex|sem|select|rawselect|poll|epoll|wait4|waitid> "
         "<external|process|thread|timer|exit> [restart] [timed] [warm] "
         "[ignored|blocked|winch|tstp|ign2caught|caught2ign|chldlate|chldign|chldkill|chldthrexit|"
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
-        "spinthrexit|usr2|extchld|extchldreaped|extchldlive]\n");
+        "spinthrexit|usr2|extchld|extchldreaped|extchldlive]\n"
+        "       external_signal_interrupt sigsuspend creator\n");
     return 2;
   }
   /* Before any handler is installed: the handler compares against it. */
   main_thread = pthread_self();
   const char *call = argv[1];
   const char *sender = argv[2];
+  if (!strcmp(call, "sigsuspend")) return creator_main(sender);
   int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
   enum extchld extchld = EXTCHLD_NONE;
   static const struct {

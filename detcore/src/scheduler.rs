@@ -9989,14 +9989,7 @@ mod test {
         );
         assert!(
             scheduler
-                .block_for_one_resource(
-                    creator,
-                    &inbound,
-                    &Permission::W,
-                    None,
-                    None,
-                    &Ivar::new()
-                )
+                .block_for_one_resource(creator, &inbound, &Permission::W, None, None, &Ivar::new())
                 .is_ok()
         );
         assert!(scheduler.blocked.sigchld_deferred.is_empty());
@@ -10098,7 +10091,10 @@ mod test {
             }
             scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
             assert!(scheduler.blocked.signaled_background.is_empty(), "{case}");
-            assert!(!scheduler.blocked.sigchld_ready.contains(&creator), "{case}");
+            assert!(
+                !scheduler.blocked.sigchld_ready.contains(&creator),
+                "{case}"
+            );
             assert_eq!(
                 scheduler.blocked.external_io_blockers.get(&creator),
                 Some(&op),
@@ -10115,7 +10111,10 @@ mod test {
                     .is_none(),
                 "{case}"
             );
-            assert!(scheduler.step2_release_signaled_background().is_ok(), "{case}");
+            assert!(
+                scheduler.step2_release_signaled_background().is_ok(),
+                "{case}"
+            );
         }
     }
 
@@ -10150,14 +10149,7 @@ mod test {
         );
         assert!(
             scheduler
-                .block_for_one_resource(
-                    creator,
-                    &inbound,
-                    &Permission::W,
-                    None,
-                    None,
-                    &Ivar::new()
-                )
+                .block_for_one_resource(creator, &inbound, &Permission::W, None, None, &Ivar::new())
                 .is_err()
         );
         assert!(scheduler.blocked.sigchld_deferred.contains(&creator));
@@ -10166,10 +10158,7 @@ mod test {
         let attempts = scheduler.host_signal_attempts;
         scheduler.dispatch_timed_signal(
             LogicalTime::from_nanos(1),
-            timed_waiters::SignalTimerId::ChildExit {
-                child,
-                parent,
-            },
+            timed_waiters::SignalTimerId::ChildExit { child, parent },
             creator,
             Signal::SIGCHLD,
             true,

@@ -185,6 +185,18 @@ const RESTARTED_WAKE_MS: std::ops::Range<u64> =
 /// first ran: midway between the child's signal near 100 ms and its exit near
 /// 200 ms. A handler that ran only after the wait returned reads near 200 ms.
 const HANDLED_BEFORE_EXIT_MS: u64 = SIGNAL_DELAY_MS + SIGNAL_DELAY_MS / 2;
+/// Trials in the guest's `sigsuspend creator` mode (`CREATOR_TRIALS` in the
+/// guest).
+const CREATOR_TRIALS: usize = 6;
+/// Part of the INFO line Hermit's scheduler logs when a signal is delivered to a
+/// thread that sleeps outside its run queue, here the creator in
+/// `rt_sigsuspend` (`[dtid N] signal S armed signaled background thread`, in
+/// detcore/src/scheduler.rs).
+const SIGNALED_BACKGROUND_ARMED: &str = "armed signaled background thread";
+/// Part of the INFO line it logs when it later orders that thread's
+/// continuation at a fixed point of the schedule (`[step2] Reschedule signaled
+/// background dtid`).
+const SIGNALED_BACKGROUND_RELEASED: &str = "Reschedule signaled background dtid";
 
 static GUEST: OnceLock<PathBuf> = OnceLock::new();
 
@@ -200,6 +212,21 @@ struct GuestRun {
     stderr: String,
     /// The strict verification report, for a cell run under `--verify`.
     verify_report: Option<serde_json::Value>,
+    /// Hermit's INFO log, for a cell run with `Observe::InfoLog`.
+    info_log: Option<String>,
+}
+
+/// How a cell is observed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Observe {
+    /// Strict verification for a cell with no external signal; for a cell with
+    /// an external signal, one plain run.
+    Default,
+    /// One run, not verified, that writes Hermit's INFO log to a file and keeps
+    /// it in `GuestRun::info_log`. A run under `--verify` does not print its INFO
+    /// messages, so a test that counts a scheduler INFO line needs this run as
+    /// well as the strict-verified one.
+    InfoLog,
 }
 
 impl GuestRun {
@@ -332,6 +359,18 @@ fn run_cell_with_external_signals(
     args: &[&str],
     external_signals: &[libc::c_int],
 ) -> GuestRun {
+    run_cell_observed(backend, mode, args, external_signals, Observe::Default)
+}
+
+/// Run one cell as `run_cell_with_external_signals` does, observed as `observe`
+/// says.
+fn run_cell_observed(
+    backend: &str,
+    mode: FutexMode,
+    args: &[&str],
+    external_signals: &[libc::c_int],
+    observe: Observe,
+) -> GuestRun {
     let external = !external_signals.is_empty();
     // Compiling the guest also creates the directory that holds every trial.
     let guest = guest();
@@ -345,10 +384,15 @@ fn run_cell_with_external_signals(
     let stdout_writer = fs::File::create(&stdout_path).expect("failed to create guest stdout");
 
     // Strict verification replays the guest, so it needs a sender inside Hermit.
-    let verify_report = (!external).then(|| trial.path().join("verify.json"));
+    let verify_report =
+        (!external && observe == Observe::Default).then(|| trial.path().join("verify.json"));
+    let info_log = (observe == Observe::InfoLog).then(|| trial.path().join("info.log"));
     let mut command = Command::new(hermit_binary::hermit_binary());
     if verify_report.is_some() {
         command.arg("--log=info");
+    }
+    if let Some(log) = &info_log {
+        command.arg("--log=info").arg("--log-file").arg(log);
     }
     // `--backend` is a global option and goes before the subcommand.
     command.args(["--backend", backend, "run", "--strict"]);
@@ -496,11 +540,20 @@ fn run_cell_with_external_signals(
             panic!("{backend} {mode:?} {args:?}: invalid verification report: {error}")
         })
     });
+    let info_log = info_log.map(|log| {
+        fs::read_to_string(&log).unwrap_or_else(|error| {
+            panic!(
+                "{backend} {mode:?} {args:?}: Hermit did not write its INFO log: {error}\nguest \
+                 stdout:\n{stdout}\nhermit stderr:\n{stderr}"
+            )
+        })
+    });
     GuestRun {
         status: status.expect("hermit status should be collected"),
         stdout,
         stderr,
         verify_report,
+        info_log,
     }
 }
 
@@ -1480,6 +1533,58 @@ fn ptrace_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
 #[test]
 fn liteinst_precise_futex_wait_takes_its_childs_sigchld_while_a_sibling_runs() {
     assert_waiting_forker_takes_the_sigchld("liteinst");
+}
+
+/// A thread other than the thread-group leader forks a child and waits for it in
+/// `rt_sigsuspend` with SIGCHLD unblocked, while the leader blocks SIGCHLD and
+/// waits in `pthread_join`. Linux sends the child's SIGCHLD to the thread that
+/// forked it, so each of the guest's six trials ends with the creator's handler
+/// running once and `sigsuspend` returning EINTR after the child's exit, and the
+/// cell is strict-verified. Hermit's scheduler does not keep a thread in
+/// `rt_sigsuspend` on its run queue; it delivers the signal by arming the
+/// sleeper and ordering its continuation at a fixed point of the schedule. A
+/// second run, with Hermit's INFO log written to a file, counts the arm and
+/// release lines of that path: one each per trial. Before
+/// https://github.com/rrnewton/hermit/pull/3361 round 7, Hermit panicked when the
+/// child's exit sent its SIGCHLD to the sleeping creator ("should be parked",
+/// exit status 125).
+fn assert_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend(backend: &str) {
+    let args = ["sigsuspend", "creator"];
+    let expected = format!(
+        "RESULT call=sigsuspend role=creator trials={CREATOR_TRIALS} matched={CREATOR_TRIALS}"
+    );
+    assert_cell(backend, FutexMode::Precise, &args, false, &expected);
+    let run = run_cell_observed(backend, FutexMode::Precise, &args, &[], Observe::InfoLog);
+    assert!(
+        run.status.success()
+            && run.result_line() == Some(expected.as_str())
+            && run.stdout.lines().any(|line| line == "DONE"),
+        "{backend} {args:?} with an INFO log: expected `{expected}`\n{}",
+        run.describe()
+    );
+    let log = run
+        .info_log
+        .as_deref()
+        .expect("an InfoLog run keeps its log");
+    let armed = log.matches(SIGNALED_BACKGROUND_ARMED).count();
+    let released = log.matches(SIGNALED_BACKGROUND_RELEASED).count();
+    assert!(
+        armed == CREATOR_TRIALS && released == CREATOR_TRIALS,
+        "{backend} {args:?}: expected {CREATOR_TRIALS} `{SIGNALED_BACKGROUND_ARMED}` and \
+         {CREATOR_TRIALS} `{SIGNALED_BACKGROUND_RELEASED}` INFO lines, one per trial; found \
+         {armed} and {released}\n{}",
+        run.describe()
+    );
+}
+
+#[test]
+fn ptrace_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend() {
+    assert_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend("ptrace");
+}
+
+#[test]
+fn liteinst_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend() {
+    assert_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend("liteinst");
 }
 
 /// A wait at a LiteInst call site that has already run once goes through the
