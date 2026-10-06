@@ -62,8 +62,11 @@
 //! run must print `RESULT` within `RESULT_BOUND` of `READY`.
 //!
 //! External cells send `SIGUSR1` from this host process, which is outside
-//! Hermit's deterministic schedule. Every such trial runs the guest through a
-//! symlink in a fresh directory, so the guest is found by its exact `argv[0]`.
+//! Hermit's deterministic schedule; the `usr2` cells add `SIGUSR2`, and the
+//! external-SIGCHLD cells send a caught `SIGCHLD` instead, to a guest that never
+//! had a child, reaped one, or has a live one. Linux ends `select` with EINTR
+//! for it in all three. Every such trial runs the guest through a symlink in a
+//! fresh directory, so the guest is found by its exact `argv[0]`.
 //!
 //! Not covered here:
 //! - An external signal to a precise-mode futex waiter: with no in-guest waker
@@ -73,6 +76,13 @@
 //! - A host-timed kernel SIGCHLD that the scheduler has not made eligible yet.
 //!   The detcore unit tests cover that filter; every cell here also passes
 //!   without it.
+//! - A caught SIGCHLD sent from outside Hermit to a `poll`, `epoll_wait`,
+//!   `ppoll`, futex, or `rt_sigtimedwait` waiter whose process has had a child.
+//!   Those waits keep the filter above, which cannot tell such a SIGCHLD from
+//!   the kernel's report of a child event, so it does not end them until the
+//!   scheduler makes a SIGCHLD eligible, where Linux returns EINTR at once.
+//!   Hermit main did not end `poll` or `epoll_wait` for it either; only the
+//!   select waits are asserted above.
 //! - The `spin` role in polling mode. Between probes a polling waiter blocks
 //!   every signal, so the running sibling takes the SIGCHLD that Linux gives the
 //!   waiting thread that forked the child.
@@ -1061,6 +1071,53 @@ fn select_is_interrupted_by_an_external_signal() {
             "RESULT call=select ret=-1 errno=EINTR handler=1",
         );
     }
+}
+
+/// The guest options that catch SIGCHLD in a process that never had a child,
+/// that reaped one, and that has a live one.
+const EXTERNAL_SIGCHLD_OPTIONS: [&str; 3] = ["extchld", "extchldreaped", "extchldlive"];
+
+/// A caught SIGCHLD sent with kill(2) from outside Hermit ends glibc's `select`,
+/// which is `pselect6` with no mask, and the `select` system call with EINTR,
+/// as on Linux, whether or not the process has had a child. Before select and
+/// pselect6 stopped asking the scheduler whether a pending SIGCHLD may end the
+/// wait, the scheduler, which only makes the SIGCHLD it can order eligible,
+/// held this one in a process that had had a child, and the wait never ended
+/// (https://github.com/rrnewton/hermit/issues/3146). Each backend is its own
+/// test so that each stays inside the per-test wall and CPU bounds.
+fn assert_external_sigchld_ends_selects(backend: &str) {
+    for option in EXTERNAL_SIGCHLD_OPTIONS {
+        for call in ["select", "rawselect"] {
+            let args = [call, "external", option];
+            let run = run_cell_with_external_signals(
+                backend,
+                FutexMode::Precise,
+                &args,
+                &[libc::SIGCHLD],
+            );
+            let expected = format!("RESULT call={call} ret=-1 errno=EINTR handler=1");
+            assert!(
+                run.status.success() && run.result_line() == Some(expected.as_str()),
+                "{backend} {args:?}: expected `{expected}`\n{}",
+                run.describe()
+            );
+            assert!(
+                run.stdout.lines().any(|line| line == "DONE"),
+                "{backend} {args:?}: guest did not finish\n{}",
+                run.describe()
+            );
+        }
+    }
+}
+
+#[test]
+fn ptrace_selects_are_ended_by_an_external_sigchld_with_or_without_a_child() {
+    assert_external_sigchld_ends_selects("ptrace");
+}
+
+#[test]
+fn liteinst_selects_are_ended_by_an_external_sigchld_with_or_without_a_child() {
+    assert_external_sigchld_ends_selects("liteinst");
 }
 
 /// Positive control: `wait4` and `waitid` on a live child already returned

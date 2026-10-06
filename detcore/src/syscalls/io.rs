@@ -656,11 +656,12 @@ impl<T: RecordOrReplay> Detcore<T> {
         // cell lets the wait block signals under the one scratch-stack guard
         // (https://github.com/rrnewton/hermit/issues/3146). A restart resumes from
         // the remaining time written back below, so a default stop ends the wait
-        // as on Linux. A `SIGCHLD` ends it once the scheduler makes it eligible
-        // (`eligible_pending_signals`).
+        // as on Linux. A pending caught `SIGCHLD` ends it without waiting for the
+        // scheduler to make it eligible, as Linux ends it for one sent from
+        // outside the container (`KernelSignalWait::for_select`).
         let mut signals = (sigmask.is_none()
             && self.cfg.backend_supports_blocked_wait_signal_interruption)
-            .then(|| KernelSignalWait::new(guest, 0, false, Errno::ERESTARTNOHAND));
+            .then(|| KernelSignalWait::for_select(guest));
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         let _guard = stack.commit()?;
         let probe = call
@@ -927,12 +928,13 @@ impl<T: RecordOrReplay> Detcore<T> {
         // signals under the one scratch-stack guard
         // (https://github.com/rrnewton/hermit/issues/3146). A restart resumes from
         // the remaining time written back below, so a default stop ends the wait
-        // as on Linux. A `SIGCHLD` ends it once the scheduler makes it eligible
-        // (`eligible_pending_signals`).
+        // as on Linux. A pending caught `SIGCHLD` ends it without waiting for the
+        // scheduler to make it eligible, as Linux ends it for one sent from
+        // outside the container (`KernelSignalWait::for_select`).
         let mut signals = self
             .cfg
             .backend_supports_blocked_wait_signal_interruption
-            .then(|| KernelSignalWait::new(guest, 0, false, Errno::ERESTARTNOHAND));
+            .then(|| KernelSignalWait::for_select(guest));
         let mask_cell = signals.as_ref().map(|_| stack.reserve::<KernelSigset>());
         let _guard = stack.commit()?;
         let probe = call
