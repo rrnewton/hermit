@@ -602,6 +602,21 @@ impl SharedLog {
     }
 }
 
+/// The writer of a verification run's log: [`BoundedWriter`] bounds the file
+/// at `limit` bytes and [`CappedWriter`] charges every byte to `budget`, the
+/// `--max-log-bytes` counter (`None` without the flag). The tracing subscriber
+/// and the forwarded-record sink both write through the returned log.
+fn verification_log(
+    log_file: fs::File,
+    limit: u64,
+    budget: Option<super::tracing::LogBudget>,
+) -> SharedLog {
+    SharedLog::new(CappedWriter::new(
+        BoundedWriter::new(log_file, limit),
+        budget,
+    ))
+}
+
 impl Write for SharedLog {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
         self.0.lock().unwrap().write(bytes)
@@ -6926,10 +6941,7 @@ impl RunOpts {
         // `--max-log-bytes` counts these logs too, forwarded records as well
         // as tracing events, and its counter is shared across the verify runs,
         // so the cap is a total for the invocation.
-        let log = SharedLog::new(CappedWriter::new(
-            BoundedWriter::new(log_file, limit),
-            global.log_budget(),
-        ));
+        let log = verification_log(log_file, limit, global.log_budget());
         let _guard = init_sync_file_tracing(Some(level), log.clone(), self.runtime_backend());
 
         let command = self.guest_command()?;
@@ -6995,6 +7007,61 @@ mod tests {
     use clap::CommandFactory;
 
     use super::*;
+
+    /// https://github.com/rrnewton/hermit/pull/3686, restacked onto a main
+    /// whose verification log is one writer shared by the tracing subscriber
+    /// and the coordinator's forwarded in-guest records: `--max-log-bytes`
+    /// charges the forwarded records too. Records alone, with no tracing
+    /// event, cross the cap and end the process with the cap's exit code, and
+    /// the log holds only what was written before the crossing.
+    #[test]
+    fn forwarded_records_alone_cross_the_log_cap() {
+        let budget = super::super::tracing::LogBudget::new(100).unwrap();
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let mut sink =
+            verification_log(file.reopen().unwrap(), 1 << 20, Some(budget)).record_sink();
+        let record = b"INFO detcore DETLOG [syscall] write(1, 0x1000, 5) = 5\n";
+        // SAFETY: the child only calls the sink, which formats one line into a
+        // new Vec, takes the uncontended mutex created above and writes to the
+        // file, and then _exits.
+        let child = unsafe { libc::fork() };
+        assert!(
+            child >= 0,
+            "fork failed: {}",
+            std::io::Error::last_os_error()
+        );
+        if child == 0 {
+            // SAFETY: plain descriptor calls. The cap's final message goes to
+            // stderr, so point it away from the test runner's.
+            unsafe {
+                let null = libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY);
+                libc::dup2(null, 2);
+            }
+            for _ in 0..10 {
+                sink(record);
+            }
+            // SAFETY: _exit has no preconditions.
+            unsafe { libc::_exit(0) }
+        }
+        let mut status = 0;
+        // SAFETY: waitpid writes only `status`.
+        assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+        assert!(libc::WIFEXITED(status), "status {status:#x}");
+        assert_eq!(
+            libc::WEXITSTATUS(status),
+            hermit::HERMIT_LOG_CAP_EXIT,
+            "ten forwarded records of {} bytes each, against a cap of 100 bytes, did not end \
+             the process with the log cap's exit code",
+            record.len() + NORMALIZED_FORWARDED_DETLOG_TIMESTAMP.len() + 1
+        );
+        let mut expected = format!("{NORMALIZED_FORWARDED_DETLOG_TIMESTAMP} ").into_bytes();
+        expected.extend_from_slice(record);
+        assert_eq!(
+            String::from_utf8_lossy(&fs::read(file.path()).unwrap()),
+            String::from_utf8_lossy(&expected),
+            "the log holds the one record admitted before the crossing, and not the crossing one"
+        );
+    }
 
     #[test]
     fn real_returned_guest_disposition_still_uses_first_run_rejected() {
