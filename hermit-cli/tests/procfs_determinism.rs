@@ -1981,6 +1981,48 @@ fn maps_inodes_equal_stat_inodes_for_every_mapped_file() {
     );
 }
 
+/// Run the fixture's stdio-mmap-sentinel mode on ptrace with a regular file as
+/// stdin and return its stdout.
+fn run_stdio_mmap_sentinel() -> String {
+    let guest = inode_identity_views::compile_guest("stdio-mmap-sentinel");
+    let mut input =
+        tempfile::NamedTempFile::new_in(env!("CARGO_TARGET_TMPDIR")).expect("stdin file to map");
+    input.write_all(&[b'x'; 8192]).expect("fill stdin file");
+    let stdin = input.reopen().expect("reopen stdin file");
+    run_inode_identity_views(
+        &guest,
+        None,
+        &["stdio-mmap-sentinel".as_ref()],
+        Some(stdin),
+        None,
+    )
+}
+
+// Detcore identifies a mapping of an inherited descriptor such as stdin by
+// injecting an fstat after the mmap. On ptrace that fstat's buffer is borrowed
+// from the guest's stack below the red zone, where a guest issuing raw system
+// calls may keep live data and where Linux never writes to serve a system
+// call. This guards that the borrowed bytes are put back: the fixture fills
+// the 896 bytes from 1024 to 128 below its stack pointer with a pattern, maps
+// its regular-file stdin with a raw MAP_PRIVATE mmap system call, and counts
+// the words that changed before any compiled code runs.
+//
+// Only ptrace can host this check. DBT hands its guest a pipe as stdin, so
+// there is no regular file to map. SaBRe's own system call interception, and
+// the in-guest LiteInst entry, which saves the guest's registers and extended
+// state on the guest stack below the red zone and runs Detcore there, already
+// change most of the words in this range around any intercepted system call,
+// a raw getpid included, so on those backends the count measures the
+// interception rather than the injected fstat.
+#[test]
+fn mapping_inherited_stdin_leaves_the_stack_below_the_red_zone_intact() {
+    let _guard = hermit_run_lock();
+    assert_eq!(
+        run_stdio_mmap_sentinel(),
+        "stdio-mmap-sentinel changed_words=0\n"
+    );
+}
+
 // Another process's pipe:[N] and socket:[N] links must name the inode an fstat
 // of the same object reports.
 #[test]
