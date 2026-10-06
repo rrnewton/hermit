@@ -758,7 +758,8 @@ impl<W: Write> CappedWriter<W> {
             // NOT once BoundedWriter has truncated: its marker must stay the
             // final line of a truncated log, because that is the only thing
             // `detcore::logdiff::log_was_truncated` accepts as truncation.
-            // The message still reaches stderr below.
+            // Stderr still gets an attempt below, also without waiting, so
+            // delivery there is best effort too.
             if !(self.inner_has_final_line)(&self.inner) {
                 write_without_waiting(fd, message);
             }
@@ -2268,8 +2269,9 @@ mod tests {
     /// Once the file bound has truncated the log, the cap must not append its
     /// stop message after the truncation marker: the marker is the final line
     /// of a truncated log, and the comparator accepts nothing else after it.
-    /// The stop message still reaches stderr. (Round-2 review finding 5 on
-    /// <https://github.com/rrnewton/hermit/pull/3686>.)
+    /// Stderr still gets a best-effort attempt at the stop message; this test
+    /// sends stderr to /dev/null and does not check it. (Round-2 review
+    /// finding 5 on <https://github.com/rrnewton/hermit/pull/3686>.)
     #[test]
     fn the_stop_message_is_not_appended_after_the_truncation_marker() {
         use std::io::Read;
