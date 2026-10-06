@@ -89,7 +89,23 @@ pub struct FileMetadata {
     next_socket_open_file_sequence: u64,
     /// Track what file handles actually point to (e.g. after dup2).
     /// This includes both the identifying resource (usually inode) and the deterministic file handle.
+    /// Deserialization restores aliasing (`crate::fd::intern_open_files`).
+    #[serde(deserialize_with = "deserialize_interned_file_handles")]
     pub(crate) file_handles: HashMap<RawFd, DetFd>,
+}
+
+/// Deserializes a descriptor table with its aliases restored, so a table
+/// carried across fork (or any other state migration) keeps one open file
+/// description object per `OpenFileId`.
+fn deserialize_interned_file_handles<'de, D>(
+    deserializer: D,
+) -> Result<HashMap<RawFd, DetFd>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let mut handles = <HashMap<RawFd, DetFd> as Deserialize>::deserialize(deserializer)?;
+    crate::fd::intern_open_files(&mut handles);
+    Ok(handles)
 }
 
 /// A descriptor identity held across an awaited syscall.
@@ -1025,6 +1041,41 @@ mod file_metadata_tests {
             None,
             "a live descriptor may already hold a flock that Detcore did not observe"
         );
+    }
+
+    /// A table carried through serialization (in-guest LiteInst's fork) keeps
+    /// its aliases: two descriptors that shared one open file description
+    /// before still share one object after, while a separate open stays
+    /// separate and descriptor flags stay per descriptor.
+    #[test]
+    fn a_deserialized_table_keeps_dup_aliases_as_one_open_file() {
+        let owner = DetTid::from_raw(9);
+        let mut metadata = FileMetadata::new(owner);
+        metadata
+            .add_fd(owner, 3, OFlag::empty(), FdType::Rng, None)
+            .expect("register descriptor");
+        metadata
+            .dup_fd(3, 4, OFlag::O_CLOEXEC)
+            .expect("dup the descriptor");
+        metadata
+            .add_fd(owner, 5, OFlag::empty(), FdType::Rng, None)
+            .expect("register a separate open");
+        let encoded = serde_json::to_string(&metadata).expect("serialize the table");
+        let restored: FileMetadata = serde_json::from_str(&encoded).expect("deserialize the table");
+        let three = restored.file_handles[&3].clone();
+        let four = restored.file_handles[&4].clone();
+        let five = restored.file_handles[&5].clone();
+        assert_eq!(three.open_file_id(), four.open_file_id());
+        assert_ne!(three.open_file_id(), five.open_file_id());
+        // One object again: a read through one alias moves the other's cursor.
+        four.advance_random_device_offset(50);
+        assert_eq!(three.random_device_offset(), 50);
+        assert_eq!(five.random_device_offset(), 0);
+        // The table plus the two local handles above.
+        assert_eq!(three.open_file_alias_count(), 4);
+        // Descriptor flags stay per descriptor.
+        assert!(!three.is_cloexec());
+        assert!(four.is_cloexec());
     }
 
     #[test]

@@ -242,6 +242,7 @@ pub const HOSTED_PORTABLE_CPUID_FAULTING_CLI_TESTS: &[&str] = &[
     "liteinst_in_guest_programs::liteinst_in_guest_cpuid_in_a_late_loaded_library_runs",
     "liteinst_in_guest_programs::liteinst_in_guest_detcore_micro_suite",
     "liteinst_in_guest_programs::liteinst_in_guest_dispatch_record_reports_patched_sites",
+    "liteinst_in_guest_programs::liteinst_in_guest_dup_aliases_share_one_cursor_after_fork",
     "liteinst_in_guest_programs::liteinst_in_guest_encoding_and_digest_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_file_and_text_utilities",
     "liteinst_in_guest_programs::liteinst_in_guest_fork_runs_without_hanging",
