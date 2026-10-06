@@ -990,8 +990,9 @@ pub trait NonblockableSyscall: SyscallInfo {
 
     /// Whether Linux restarts this call, after [`kernel_restart_errno`](Self::kernel_restart_errno)
     /// with no handler, through a restart block that keeps its absolute deadline: a
-    /// `poll` with a positive timeout (`do_restart_poll`) and a timed `FUTEX_WAIT`
-    /// (`futex_wait_restart`). Its restart code is then `ERESTART_RESTARTBLOCK`, and
+    /// `poll` with a positive timeout (`do_restart_poll`) and a timed `FUTEX_WAIT` or
+    /// `FUTEX_WAIT_BITSET` (`futex_wait_restart`). Its restart code is then
+    /// `ERESTART_RESTARTBLOCK`, and
     /// Detcore keeps the deadline in a [`RestartBlock`] for the `restart_syscall` that
     /// the kernel runs next (<https://github.com/rrnewton/hermit/issues/3358>).
     ///
@@ -1222,13 +1223,16 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
     /// timed wait returns `-ERESTART_RESTARTBLOCK`, which a handler always turns into
     /// `EINTR` (https://github.com/rrnewton/hermit/issues/3146).
     ///
-    /// A timed `FUTEX_WAIT` returns Linux's code: with no handler the kernel then runs
-    /// `restart_syscall`, which Detcore resumes with the deadline it kept
-    /// ([`RestartBlock`]), as `futex_wait_restart` does
-    /// (https://github.com/rrnewton/hermit/issues/3358). A timed `FUTEX_WAIT_BITSET`
-    /// returns `ERESTARTNOHAND`, which gives it the same outcome for a caught signal and
-    /// otherwise runs the call again with its original arguments, whose absolute
-    /// deadline is the one it kept.
+    /// A timed `FUTEX_WAIT` or `FUTEX_WAIT_BITSET` returns Linux's code: with no
+    /// handler the kernel then runs `restart_syscall`, which Detcore resumes with the
+    /// deadline it kept ([`RestartBlock`]), as `futex_wait_restart` does
+    /// (https://github.com/rrnewton/hermit/issues/3358). Linux's `futex_wait` keeps
+    /// the absolute deadline of every timed wait in the restart block, so a
+    /// `FUTEX_WAIT_BITSET` deadline the guest moves in memory after the wait began
+    /// does not change when the restarted wait ends. `FUTEX_WAIT_BITSET` used to
+    /// return `ERESTARTNOHAND`, which ran the call again with its original
+    /// arguments and so read the deadline again (round-10 finding Medium 4 on
+    /// https://github.com/rrnewton/hermit/pull/3361).
     fn kernel_restart_errno(&self) -> Errno {
         if self.restart_keeps_deadline() {
             Errno::ERESTART_RESTARTBLOCK
@@ -1239,10 +1243,13 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
         }
     }
 
-    /// Only `FUTEX_WAIT` takes a relative timeout. `FUTEX_WAIT_BITSET`'s is an
-    /// absolute deadline, which a restart with the original arguments keeps.
+    /// Every timed wait: `FUTEX_WAIT`'s relative timeout and `FUTEX_WAIT_BITSET`'s
+    /// absolute deadline both become the absolute deadline Linux's restart keeps.
     fn restart_keeps_deadline(&self) -> bool {
-        (self.futex_op() & libc::FUTEX_CMD_MASK) == libc::FUTEX_WAIT && self.timeout().is_some()
+        matches!(
+            self.futex_op() & libc::FUTEX_CMD_MASK,
+            libc::FUTEX_WAIT | libc::FUTEX_WAIT_BITSET
+        ) && self.timeout().is_some()
     }
 }
 
@@ -2064,7 +2071,7 @@ pub(crate) struct KernelSignalWait {
     held_until_return: KernelSigset,
     /// Whether the wait has a finite deadline (`with_deadline`). Hermit cannot
     /// install the restart block with which Linux keeps the absolute deadline
-    /// of a restarted `poll` or timed `FUTEX_WAIT`, and a restarted `ppoll`,
+    /// of a restarted `poll` or timed futex wait, and a restarted `ppoll`,
     /// `epoll_wait`, `epoll_pwait` or `rt_sigtimedwait` runs again with the
     /// guest's unchanged timeout. So a transparent restart would start the
     /// timeout again, and such a wait never ends with `ERESTARTNOINTR`
@@ -3138,7 +3145,7 @@ mod tests {
         // Signal-state interruption hands the kernel the wait's own restart code, so
         // the guest's disposition decides between a handler's EINTR and a restart
         // (https://github.com/rrnewton/hermit/issues/3146).
-        // A poll with a positive timeout and a timed FUTEX_WAIT end with Linux's own
+        // A poll with a positive timeout and a timed futex wait end with Linux's own
         // code: a handler turns it into EINTR, and with no handler the kernel runs
         // restart_syscall, which Detcore resumes with the deadline it kept
         // (`RestartBlock`, https://github.com/rrnewton/hermit/issues/3358).
@@ -3186,16 +3193,21 @@ mod tests {
                 .kernel_restart_errno(),
             Errno::ERESTART_RESTARTBLOCK
         );
-        // FUTEX_WAIT_BITSET's timeout is an absolute deadline, which running the
-        // call again keeps.
+        // FUTEX_WAIT_BITSET's timeout is an absolute deadline, which Linux copies
+        // into the restart block as it does FUTEX_WAIT's, so a deadline the guest
+        // moves in memory after the wait began has no effect. Running the call
+        // again, which ERESTARTNOHAND did, read the moved deadline (round-10
+        // finding Medium 4 on https://github.com/rrnewton/hermit/pull/3361).
         let bitset = reverie::syscalls::Futex::new()
             .with_futex_op(libc::FUTEX_WAIT_BITSET | libc::FUTEX_PRIVATE_FLAG)
             .with_val3(-1);
         assert_eq!(bitset.kernel_restart_errno(), Errno::ERESTARTSYS);
+        assert!(!bitset.restart_keeps_deadline());
         assert_eq!(
             bitset.with_timeout(Some(timeout)).kernel_restart_errno(),
-            Errno::ERESTARTNOHAND
+            Errno::ERESTART_RESTARTBLOCK
         );
+        assert!(bitset.with_timeout(Some(timeout)).restart_keeps_deadline());
     }
 
     #[test]

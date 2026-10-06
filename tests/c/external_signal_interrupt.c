@@ -218,7 +218,12 @@
  * must still end the restarted wait: Linux returns -1 with EINTR when a handler
  * interrupts a restarted wait. The child exits only after the call's deadline,
  * so the SIGCHLD of its exit never arrives during the wait. The ELAPSED line
- * reports how long the call took.
+ * reports how long the call took. The `bitset` call is a FUTEX_WAIT_BITSET
+ * whose absolute CLOCK_MONOTONIC deadline, QUIET_TIMEOUT_MS after the call
+ * began, is in memory shared with the child; just before SIGSTOP the child
+ * moves it 200 ms later. Linux copied the deadline when the wait began and
+ * restarts the call with that copy (futex_wait_restart), so the move has no
+ * effect and the call returns -1 with ETIMEDOUT at the original deadline.
  *
  * Output is one deterministic RESULT line after the call returns, followed
  * by DONE once every helper has been reaped. A kernel-internal errno, which has
@@ -238,6 +243,7 @@
 #include <string.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
+#include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
 #include <sys/select.h>
@@ -919,15 +925,27 @@ static int inherited_hangup_main(const char *call) {
 #define STOP_DELAY_MS 100
 #define CONT_DELAY_MS 100
 #define USR1_AFTER_CONT_MS 50
+/* How far the `bitset` child moves the wait's absolute deadline before SIGSTOP. */
+#define BITSET_MOVE_MS 200
 static int stopcont_main(const char *call, int then_usr1) {
   int is_poll = !strcmp(call, "poll");
-  if (!is_poll && strcmp(call, "futex")) return 2;
+  int is_bitset = !strcmp(call, "bitset");
+  if (!is_poll && !is_bitset && strcmp(call, "futex")) return 2;
+  /* `bitset` keeps its absolute deadline in memory the child shares, so the
+     child can move it after the wait has begun. */
+  struct timespec *deadline = NULL;
+  if (is_bitset) {
+    deadline = mmap(NULL, sizeof *deadline, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS,
+                    -1, 0);
+    if (deadline == MAP_FAILED) return 3;
+  }
   set_handler(SIGUSR1, on_usr1);
   pid_t parent = getpid();
   pid_t child = fork();
   if (child < 0) return 3;
   if (child == 0) {
     sleep_ms(STOP_DELAY_MS);
+    if (is_bitset) add_ms(deadline, BITSET_MOVE_MS);
     if (kill(parent, SIGSTOP) != 0) _exit(91);
     sleep_ms(CONT_DELAY_MS);
     if (kill(parent, SIGCONT) != 0) _exit(91);
@@ -936,8 +954,9 @@ static int stopcont_main(const char *call, int then_usr1) {
       if (kill(parent, SIGUSR1) != 0) _exit(91);
     }
     /* Exit after the guest's deadline, so the SIGCHLD of this exit, posted
-       at a moment set by host timing, never arrives during the wait. */
-    sleep_ms(QUIET_TIMEOUT_MS);
+       at a moment set by host timing, never arrives during the wait, which
+       for `bitset` includes a wait that took the moved deadline. */
+    sleep_ms(QUIET_TIMEOUT_MS + (is_bitset ? BITSET_MOVE_MS : 0));
     _exit(0);
   }
   say("READY\n");
@@ -947,6 +966,11 @@ static int stopcont_main(const char *call, int then_usr1) {
   errno = 0;
   if (is_poll) {
     ret = poll(NULL, 0, QUIET_TIMEOUT_MS);
+  } else if (is_bitset) {
+    *deadline = start;
+    add_ms(deadline, QUIET_TIMEOUT_MS);
+    ret = syscall(SYS_futex, &futex_word, FUTEX_WAIT_BITSET_PRIVATE, 0, deadline, NULL,
+                  FUTEX_BITSET_MATCH_ANY);
   } else {
     struct timespec timeout = {0, QUIET_TIMEOUT_MS * 1000000L};
     ret = syscall(SYS_futex, &futex_word, FUTEX_WAIT_PRIVATE, 0, &timeout, NULL, 0);
@@ -1109,7 +1133,7 @@ int main(int argc, char **argv) {
         "spinthrexit|usr2|extchld|extchldreaped|extchldlive|chldflood]\n"
         "       external_signal_interrupt sigsuspend creator\n"
         "       external_signal_interrupt poll <pdeathchld|pdeathusr1|exitusr1|hupopen|hupctty|hupinherit>\n"
-        "       external_signal_interrupt <poll|futex> <stopcont|stopcontusr1>\n"
+        "       external_signal_interrupt <poll|futex|bitset> <stopcont|stopcontusr1>\n"
         "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing\n");
     return 2;
   }

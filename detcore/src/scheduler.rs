@@ -245,8 +245,8 @@ pub struct FutexSignalWatch {
     /// the backend's own preemption signal.
     pub unblocked: u64,
     /// Whether a default `SIGTSTP`, `SIGTTIN`, or `SIGTTOU` leaves the wait parked:
-    /// set for a timed `FUTEX_WAIT`, whose restart would start its relative timeout
-    /// again (`KernelSignalState::interrupting_wait`). Fixed by the call, so it
+    /// set for a timed futex wait, whose restart would not keep its deadline
+    /// (`KernelSignalState::interrupting_wait`). Fixed by the call, so it
     /// cannot change while the waiter is parked.
     pub defers_default_stops: bool,
     /// The waiter's process, as the backend names it for `/proc`.
