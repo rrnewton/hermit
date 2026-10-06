@@ -7224,12 +7224,32 @@ mod tests {
     /// A first run that `--verify` rejects -- a typed refusal is Detcore's exit
     /// code 125 with its reason on standard error -- is reported as rejected
     /// even when its forwarded DETLOG records are unusable as well: on in-guest
-    /// LiteInst a socket the runtime had to retire, on SaBRe a log the records
-    /// cannot be appended to. An accepted first run with the same unusable
-    /// records still stops on them, before anything is compared.
+    /// LiteInst a log holding a loss notice where records belong, on SaBRe a log
+    /// the records cannot be appended to. An accepted first run with the same
+    /// unusable records still stops on them, before anything is compared.
+    ///
+    /// The LiteInst case runs once for each loss notice the coordinator's record
+    /// sink can write behind [`FORWARDING_REFUSED_MARKER`]: the runtime's
+    /// retirement of its socket, and the order rule's notices for an untagged
+    /// record and for more than one root (`detcore::detlog::set_forwarded_source`).
     #[test]
     fn rejected_first_run_is_reported_before_unusable_forwarded_records() {
-        for (backend, socket) in [(Backend::Liteinst, true), (Backend::Sabre, false)] {
+        for (backend, notice) in [
+            (
+                Backend::Liteinst,
+                Some(detcore::detlog::FORWARDING_RETIRED_NOTICE),
+            ),
+            (
+                Backend::Liteinst,
+                Some(detcore::detlog::FORWARDING_UNTAGGED_RECORD_NOTICE),
+            ),
+            (
+                Backend::Liteinst,
+                Some(detcore::detlog::FORWARDING_AMBIGUOUS_ORDER_NOTICE),
+            ),
+            (Backend::Sabre, None),
+        ] {
+            let socket = notice.is_some();
             for (status, rejected) in [
                 (ExitStatus::Exited(125), true),
                 (ExitStatus::SUCCESS, false),
@@ -7251,9 +7271,9 @@ mod tests {
                 let log = tempfile::NamedTempFile::new_in(directory.path())
                     .unwrap()
                     .into_temp_path();
-                if socket {
+                if let Some(notice) = notice {
                     let mut line = format!("{FORWARDING_REFUSED_MARKER} ").into_bytes();
-                    line.extend_from_slice(detcore::detlog::FORWARDING_RETIRED_NOTICE);
+                    line.extend_from_slice(notice);
                     fs::write(&log, line).unwrap();
                 } else {
                     fs::remove_file(&log).unwrap();
