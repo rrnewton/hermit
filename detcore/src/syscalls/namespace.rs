@@ -247,22 +247,35 @@ fn anonymous_proc_fd_identity(target: &[u8]) -> Option<AnonymousProcFdIdentity> 
     None
 }
 
+impl AnonymousProcFdIdentity {
+    /// Whether a `stat` of the link describes the object this link target
+    /// names: the same kind of object and the same inode.
+    fn matches_stat(&self, mode: libc::mode_t, inode: u64) -> bool {
+        let file_type = match self.kind {
+            "pipe" => libc::S_IFIFO,
+            "socket" => libc::S_IFSOCK,
+            kind => unreachable!("anonymous_proc_fd_identity never yields kind {kind:?}"),
+        };
+        mode & libc::S_IFMT == file_type && inode == self.raw_inode
+    }
+}
+
 /// Match a raw identity against cached current-process inherited-stdio identities.
 /// Callers exclude ordinary replacement objects before filling this array.
 ///
-/// Iterating in fd order deliberately matches the last-insert-wins behavior of
-/// the maps sanitizer's `stdio_by_raw_inode` table when stdio descriptors alias.
+/// When stdio descriptors alias, the LOWEST matching descriptor wins, as in
+/// the maps sanitizer's `stdio_by_raw_file` table. The tracer-side backends
+/// cache the tracer's `fstat(0)` for all three descriptors, so the stdin object
+/// matches every slot, and only the lowest agrees with the guest's `fstat(0)`
+/// and with its own `/proc/self/fd/0` link.
 fn deterministic_stdio_inode_for_raw(
     raw_inode: RawInode,
     stdio_raw_inodes: &[Option<RawInode>; 3],
 ) -> Option<DetInode> {
-    let mut matched = None;
-    for (fd, cached) in stdio_raw_inodes.iter().enumerate() {
-        if *cached == Some(raw_inode) {
-            matched = deterministic_stdio_inode(fd as i32);
-        }
-    }
-    matched
+    stdio_raw_inodes
+        .iter()
+        .position(|cached| *cached == Some(raw_inode))
+        .and_then(|fd| deterministic_stdio_inode(fd as i32))
 }
 
 fn canonical_anonymous_proc_fd_target(
@@ -275,10 +288,46 @@ fn canonical_anonymous_proc_fd_target(
     target
 }
 
+/// Another process's `/proc/<subject>/fd/<fd>` link, as the guest named it.
+#[derive(Clone, Copy, Debug)]
+struct OtherProcFdLink {
+    subject: u32,
+    fd: i32,
+}
+
 impl<T: RecordOrReplay> Detcore<T> {
+    /// The raw identity of the object behind another process's pipe or socket
+    /// link, from a `stat` of the link performed by the guest.
+    ///
+    /// `stat` follows the link to the object itself, so it reports the pipefs
+    /// or sockfs device along with the inode, without creating a descriptor
+    /// anywhere. Linux applies the same ptrace-read access check to following
+    /// the link as to reading it, so it succeeds wherever the readlink did.
+    /// `None` when the stat fails or describes a different object -- the
+    /// descriptor was closed or replaced after the readlink, or the guest has
+    /// no `/proc` of its own, as under the replayer's chroot.
+    async fn other_proc_fd_link_identity<G>(
+        &self,
+        guest: &mut G,
+        link: OtherProcFdLink,
+        identity: &AnonymousProcFdIdentity,
+    ) -> Result<Option<RawInode>, Error>
+    where
+        G: Guest<Self>,
+    {
+        let path = format!("/proc/{}/fd/{}", link.subject, link.fd);
+        let Some(stat) = self.stat_guest_path(guest, path.as_bytes()).await? else {
+            return Ok(None);
+        };
+        Ok(identity
+            .matches_stat(stat.st_mode, stat.st_ino)
+            .then(|| RawInode::new(stat.st_dev, stat.st_ino)))
+    }
+
     async fn canonicalize_other_proc_fd_target<G>(
         &self,
         guest: &mut G,
+        link: OtherProcFdLink,
         raw_target: &[u8],
         buffer: Option<AddrMut<'_, libc::c_char>>,
         buffer_len: usize,
@@ -300,13 +349,19 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .ok()
                 .flatten();
         }
-        let raw_inode = RawInode::new(
-            anonymous_object_device(anonymous_object_devices(), identity.kind)?,
-            identity.raw_inode,
-        );
-        let inode = match deterministic_stdio_inode_for_raw(raw_inode, &stdio_raw_inodes) {
+        let raw_file = match self
+            .other_proc_fd_link_identity(guest, link, &identity)
+            .await?
+        {
+            Some(raw_file) => raw_file,
+            None => RawInode::new(
+                anonymous_object_device(anonymous_object_devices(), identity.kind)?,
+                identity.raw_inode,
+            ),
+        };
+        let inode = match deterministic_stdio_inode_for_raw(raw_file, &stdio_raw_inodes) {
             Some(inode) => inode,
-            None => determinize_inode(guest, raw_inode).await.0,
+            None => determinize_inode(guest, raw_file).await.0,
         };
         let target = canonical_anonymous_proc_fd_target(&identity, inode, buffer_len);
         let buffer = buffer.ok_or(Errno::EFAULT)?;
@@ -320,6 +375,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn canonicalize_other_proc_fd_readlink<G>(
         &self,
         guest: &mut G,
+        link: OtherProcFdLink,
         buffer: Option<AddrMut<'_, libc::c_char>>,
         buffer_len: usize,
         result: i64,
@@ -334,7 +390,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut observed = vec![0; observed_len];
         guest.memory().read_exact(buffer.cast(), &mut observed)?;
         Ok(self
-            .canonicalize_other_proc_fd_target(guest, &observed, Some(buffer), buffer_len)
+            .canonicalize_other_proc_fd_target(guest, link, &observed, Some(buffer), buffer_len)
             .await?
             .unwrap_or(result))
     }
@@ -361,7 +417,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 let current_pid = guest.inject(syscalls::Getpid::new()).await?;
                 if current_pid != i64::from(subject) {
                     return self
-                        .canonicalize_other_proc_fd_readlink(guest, buffer, buffer_len, result)
+                        .canonicalize_other_proc_fd_readlink(
+                            guest,
+                            OtherProcFdLink { subject, fd },
+                            buffer,
+                            buffer_len,
+                            result,
+                        )
                         .await;
                 }
             }
@@ -402,6 +464,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn write_other_proc_fd_target<G>(
         &self,
         guest: &mut G,
+        link: OtherProcFdLink,
         raw_target: &[u8],
         buffer: Option<AddrMut<'_, libc::c_char>>,
         buffer_len: usize,
@@ -410,7 +473,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         G: Guest<Self>,
     {
         if let Some(result) = self
-            .canonicalize_other_proc_fd_target(guest, raw_target, buffer, buffer_len)
+            .canonicalize_other_proc_fd_target(guest, link, raw_target, buffer, buffer_len)
             .await?
         {
             return Ok(result);
@@ -426,6 +489,7 @@ impl<T: RecordOrReplay> Detcore<T> {
     async fn finish_other_proc_fd_readlink<G>(
         &self,
         guest: &mut G,
+        link: OtherProcFdLink,
         call: syscalls::Readlink,
     ) -> Result<i64, Error>
     where
@@ -439,7 +503,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(result);
             }
             return self
-                .canonicalize_other_proc_fd_readlink(guest, buffer, buffer_len, result)
+                .canonicalize_other_proc_fd_readlink(guest, link, buffer, buffer_len, result)
                 .await;
         }
 
@@ -458,13 +522,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut raw_target = vec![0; length];
         guest.memory().read_exact(scratch.cast(), &mut raw_target)?;
         drop(guard);
-        self.write_other_proc_fd_target(guest, &raw_target, buffer, buffer_len)
+        self.write_other_proc_fd_target(guest, link, &raw_target, buffer, buffer_len)
             .await
     }
 
     async fn finish_other_proc_fd_readlinkat<G>(
         &self,
         guest: &mut G,
+        link: OtherProcFdLink,
         call: syscalls::Readlinkat,
     ) -> Result<i64, Error>
     where
@@ -478,7 +543,7 @@ impl<T: RecordOrReplay> Detcore<T> {
                 return Ok(result);
             }
             return self
-                .canonicalize_other_proc_fd_readlink(guest, buffer, buffer_len, result)
+                .canonicalize_other_proc_fd_readlink(guest, link, buffer, buffer_len, result)
                 .await;
         }
 
@@ -497,7 +562,7 @@ impl<T: RecordOrReplay> Detcore<T> {
         let mut raw_target = vec![0; length];
         guest.memory().read_exact(scratch.cast(), &mut raw_target)?;
         drop(guard);
-        self.write_other_proc_fd_target(guest, &raw_target, buffer, buffer_len)
+        self.write_other_proc_fd_target(guest, link, &raw_target, buffer, buffer_len)
             .await
     }
 
@@ -529,14 +594,14 @@ impl<T: RecordOrReplay> Detcore<T> {
         call: syscalls::Readlink,
     ) -> Result<i64, Error> {
         let path: PathBuf = call.path().ok_or(Errno::EFAULT)?.read(&guest.memory())?;
-        let (host_path, other_proc_fd) = if let Some((Some(subject), _)) = proc_fd_target(&path) {
+        let (host_path, other_proc_fd) = if let Some((Some(subject), fd)) = proc_fd_target(&path) {
             let current_pid = guest.inject(syscalls::Getpid::new()).await?;
             (
                 host_self_proc_fd_alias(&path, current_pid),
-                current_pid != i64::from(subject),
+                (current_pid != i64::from(subject)).then_some(OtherProcFdLink { subject, fd }),
             )
         } else {
-            (None, false)
+            (None, None)
         };
         if let Some(host_path) = host_path {
             let bytes = host_path.as_os_str().as_bytes();
@@ -560,8 +625,8 @@ impl<T: RecordOrReplay> Detcore<T> {
                 )
                 .await;
         }
-        if other_proc_fd {
-            return self.finish_other_proc_fd_readlink(guest, call).await;
+        if let Some(link) = other_proc_fd {
+            return self.finish_other_proc_fd_readlink(guest, link, call).await;
         }
         self.finish_namespace_readlink(guest, path, call.buf(), call.bufsize(), call)
             .await
@@ -584,10 +649,13 @@ impl<T: RecordOrReplay> Detcore<T> {
                 .with_detfd(call.dirfd(), |detfd| detfd.path())?
                 .map_or(path.clone(), |directory| directory.join(path))
         };
-        if let Some((Some(subject), _)) = proc_fd_target(&observed_path) {
+        if let Some((Some(subject), fd)) = proc_fd_target(&observed_path) {
             let current_pid = guest.inject(syscalls::Getpid::new()).await?;
             if current_pid != i64::from(subject) {
-                return self.finish_other_proc_fd_readlinkat(guest, call).await;
+                let link = OtherProcFdLink { subject, fd };
+                return self
+                    .finish_other_proc_fd_readlinkat(guest, link, call)
+                    .await;
             }
         }
         self.finish_namespace_readlink(guest, observed_path, call.buf(), call.buf_len(), call)
@@ -750,24 +818,45 @@ mod tests {
 
     #[test]
     fn stdio_identity_requires_a_raw_inode_match_and_preserves_alias_precedence() {
-        let raw = |ino| RawInode::new(9, ino);
-        let stdio = [Some(raw(11)), Some(raw(22)), Some(raw(33))];
+        let id = |inode| RawInode::new(0x7, inode);
+        let stdio = [Some(id(11)), Some(id(22)), Some(id(33))];
         assert_eq!(
-            deterministic_stdio_inode_for_raw(raw(22), &stdio),
+            deterministic_stdio_inode_for_raw(id(22), &stdio),
             Some(DetInode::mint(1001))
         );
-        assert_eq!(deterministic_stdio_inode_for_raw(raw(44), &stdio), None);
+        assert_eq!(deterministic_stdio_inode_for_raw(id(44), &stdio), None);
         // The same number on another device is another file.
         assert_eq!(
-            deterministic_stdio_inode_for_raw(RawInode::new(10, 22), &stdio),
+            deterministic_stdio_inode_for_raw(RawInode::new(0x8, 22), &stdio),
             None
         );
 
-        let aliased = [None, Some(raw(55)), Some(raw(55))];
+        let aliased = [None, Some(id(55)), Some(id(55))];
         assert_eq!(
-            deterministic_stdio_inode_for_raw(raw(55), &aliased),
-            Some(DetInode::mint(1002))
+            deterministic_stdio_inode_for_raw(id(55), &aliased),
+            Some(DetInode::mint(1001))
         );
+        // What the tracer-side backends cache: fstat(0) in every slot.
+        let all_stdin = [Some(id(66)); 3];
+        assert_eq!(
+            deterministic_stdio_inode_for_raw(id(66), &all_stdin),
+            Some(DetInode::mint(1000))
+        );
+    }
+
+    /// A guest-side `stat` of the link is accepted only for the same kind of
+    /// object and the same inode as the readlink target it confirms; anything
+    /// else means the descriptor changed in between.
+    #[test]
+    fn link_stat_must_describe_the_object_the_target_names() {
+        let pipe = anonymous_proc_fd_identity(b"pipe:[42]").unwrap();
+        assert!(pipe.matches_stat(libc::S_IFIFO | 0o600, 42));
+        assert!(!pipe.matches_stat(libc::S_IFIFO | 0o600, 43));
+        assert!(!pipe.matches_stat(libc::S_IFSOCK | 0o777, 42));
+        assert!(!pipe.matches_stat(libc::S_IFREG | 0o600, 42));
+        let socket = anonymous_proc_fd_identity(b"socket:[7]").unwrap();
+        assert!(socket.matches_stat(libc::S_IFSOCK | 0o777, 7));
+        assert!(!socket.matches_stat(libc::S_IFIFO | 0o600, 7));
     }
 
     #[test]
