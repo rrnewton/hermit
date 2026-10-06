@@ -1712,7 +1712,8 @@ where
         call0.signals_consumed_by_wait(&guest.memory()),
         call0.restart_rearms_timeout(),
         call0.kernel_restart_errno(),
-    );
+    )
+    .with_deadline(maybe_timeout.is_some());
     let mut rsrc = rsrc.clone();
     let (mut call, mut guard) = call0.into_nonblocking(guest).await;
     let mut first_turn = true;
@@ -1854,7 +1855,8 @@ where
 /// pending at the turn's `/proc` read that would end the wait is reported by
 /// `interrupted_with_state`, and any other unblocked one stops the next
 /// injection and is absorbed; a signal that arrives after the read can stop an
-/// injection in a way that cannot be identified, which ends the wait.
+/// injection in a way that cannot be identified, and is held without ending the
+/// wait, so the wait keeps its deadline and its checks.
 /// Afterwards only a signal that cannot be blocked can stop an injection. A stop
 /// after a probe ran replaces its result, so a probe that consumed something (an
 /// edge-triggered event, a dequeued signal) loses it; that remains a known gap.
@@ -1885,11 +1887,20 @@ pub(crate) struct KernelSignalWait {
     /// before it ends the wait (`gates_sigchld`). Every wait is gated except
     /// `select`'s and `pselect6`'s (`for_select`).
     sigchld_gated: bool,
+    /// Whether the wait has a finite deadline (`with_deadline`). Hermit cannot
+    /// install the restart block with which Linux keeps the absolute deadline
+    /// of a restarted `poll` or timed `FUTEX_WAIT`, and a restarted `ppoll`,
+    /// `epoll_wait`, `epoll_pwait` or `rt_sigtimedwait` runs again with the
+    /// guest's unchanged timeout. So a transparent restart would start the
+    /// timeout again, and such a wait never ends with `ERESTARTNOINTR`
+    /// (`inject_absorbing`).
+    deadline: bool,
     /// The guest's own mask while the wait runs with every signal blocked.
     saved_mask: Option<KernelSigset>,
     /// `block` could not change the mask, so probes run under the guest's own.
     unblockable: bool,
-    /// The signal the backend holds since `inject_absorbing` absorbed a stop.
+    /// The signal the backend holds since `inject_absorbing` absorbed a stop;
+    /// `None` also after a stop it could not identify.
     held: Option<HeldSignal>,
 }
 
@@ -1946,10 +1957,18 @@ impl KernelSignalWait {
             defers_default_stops,
             restart_errno,
             sigchld_gated: true,
+            deadline: false,
             saved_mask: None,
             unblockable: false,
             held: None,
         }
+    }
+
+    /// This wait, with a finite deadline when `deadline` is set (the `deadline`
+    /// field): no fallback of `inject_absorbing` then ends it with
+    /// `ERESTARTNOINTR`, which would start the guest's timeout again.
+    pub(crate) fn with_deadline(self, deadline: bool) -> Self {
+        Self { deadline, ..self }
     }
 
     /// The wait of `select`, or of `pselect6` without a temporary mask, which a
@@ -2075,7 +2094,9 @@ impl KernelSignalWait {
     /// and the mask and dispositions did not change; it then decides:
     ///
     /// - A signal the wait consumes (`consumed`) ends it with `ERESTARTNOINTR`:
-    ///   it is delivered rather than consumed, and the call runs again.
+    ///   it is delivered rather than consumed, and the call runs again. In a
+    ///   wait with a deadline (`deadline`) it is classified as if the wait did
+    ///   not consume it, by the rules below.
     /// - A signal that would end the wait natively ends it with the restart
     ///   errno, except, in a gated wait (`gates_sigchld`), a `SIGCHLD`, which is
     ///   held and counts in `interrupted_with_state` once the scheduler makes it
@@ -2084,21 +2105,30 @@ impl KernelSignalWait {
     ///   defers, are held, and so are an ignored signal and a default-ignored
     ///   one. The injection runs again.
     /// - Anything else, which is the backend's own preemption signal, ends the
-    ///   wait with `ERESTARTNOINTR`.
+    ///   wait with `ERESTARTNOINTR`, or is held in a wait with a deadline.
     ///
     /// A pending signal that would end the wait ends it before the injection,
     /// with the restart errno, so it is never held, except by the wait's first
-    /// probe (`inject_first_probe`). The backend has one slot for
-    /// a held signal, and a stop replaces what it holds. So while it holds a
-    /// `SIGCHLD` or a deferred stop, an injection that another pending signal
-    /// would stop is not made, and the wait ends with `ERESTARTNOINTR`; the same
-    /// standard signal on the same queue is the exception, because Linux merges
-    /// the two. A stop that cannot be identified, a signal that arrived after
-    /// the first read, ends the wait with the restart errno when that is a kernel
-    /// restart code, which becomes `EINTR` only if a handler runs, and with
-    /// `ERESTARTNOHAND`, which does the same, for a call whose restart errno is
-    /// `EINTR`. After `MAX_ABSORBED_STOPS` absorbed stops the wait ends with
-    /// `ERESTARTNOINTR`.
+    /// probe (`inject_first_probe`). A stop that cannot be identified, by a
+    /// signal that arrived after the read, never ends the wait: the backend
+    /// holds that signal in place of any held one and the injection runs again,
+    /// as the blind retry before this machinery did, so the wait keeps its
+    /// deadline and every check that ends it. Which signal it was would need the
+    /// backend to say, so nothing is recorded for it (`held` becomes `None`): a
+    /// later stop may replace it, as the blind retry allowed, and otherwise it
+    /// is delivered as the call returns.
+    ///
+    /// The backend has one slot for a held signal, and a stop replaces what it
+    /// holds. So while it holds a `SIGCHLD` or a deferred stop, an injection
+    /// that another pending signal would stop is not made, and the wait ends
+    /// with `ERESTARTNOINTR`; the same standard signal on the same queue is the
+    /// exception, because Linux merges the two. After `MAX_ABSORBED_STOPS`
+    /// absorbed stops the wait also ends with `ERESTARTNOINTR`. Neither applies
+    /// to a wait with a deadline, whose restart would start the guest's timeout
+    /// again: there, a held signal that would end the wait natively ends it with
+    /// the restart errno before another signal can replace it, any other held
+    /// signal may be replaced, as the blind retry allowed, and stops are
+    /// absorbed without a bound.
     pub(crate) async fn inject_absorbing<T, G, S>(
         &mut self,
         guest: &mut G,
@@ -2129,7 +2159,7 @@ impl KernelSignalWait {
     /// again, so its result stands, and the backend delivers the signal as the
     /// call returns. If the probe would block, the caller's check that follows
     /// counts the held signal (`interrupted_with_state`) and ends the wait with
-    /// the restart errno. A stop that cannot be identified ends the wait as
+    /// the restart errno. A stop that cannot be identified is held, as
     /// `inject_absorbing` describes.
     pub(crate) async fn inject_first_probe<T, G, S>(
         &mut self,
@@ -2165,8 +2195,8 @@ impl KernelSignalWait {
     /// just after a fresh read is. One that the full mask leaves unblocked
     /// (`SIGKILL`, `SIGSTOP`, glibc's two reserved signals, `PERF_EVENT_SIGNAL`)
     /// and that stops the injection is not named by `state`, so the stop is not
-    /// identified and ends the wait with the restart errno, as a stop by a signal
-    /// that arrives just after a fresh read does. `interrupted_with_state` found
+    /// identified and is held, as a stop by a signal that arrives just after a
+    /// fresh read is. `interrupted_with_state` found
     /// no signal in `state` that ends the wait, so the check before the injection
     /// does not end it either.
     ///
@@ -2205,7 +2235,9 @@ impl KernelSignalWait {
         S: SyscallInfo,
     {
         // Each absorbed stop takes one signal off a kernel queue, so only signals
-        // sent faster than the injections run can reach this.
+        // sent faster than the injections run can reach this. A wait with a
+        // deadline has no bound, as the blind retry before this machinery had
+        // none: ending it would start its timeout again (`deadline`).
         const MAX_ABSORBED_STOPS: usize = 64;
         let mut absorbed = 0;
         loop {
@@ -2221,17 +2253,35 @@ impl KernelSignalWait {
                 return Err(self.restart_errno.into());
             }
             let next = before.next_dequeued(before.blocked);
-            if let (Some(held), Some((signal, queue))) = (self.held, next)
-                && held.kind == HeldKind::Precious
-                && !(signal == held.signal && queue == held.queue && signal < KERNEL_SIGRTMIN)
+            if let Some((signal, queue)) = next
+                && self.would_replace_precious(signal, queue)
             {
+                if !self.deadline {
+                    tracing::trace!(
+                        "[tid {}] signal {} would replace the held signal {:?}; the wait ends",
+                        self.tid,
+                        signal,
+                        self.held
+                    );
+                    return Err(Errno::ERESTARTNOINTR.into());
+                }
+                if let Some(held) = self.held
+                    && self.held_ends_wait(guest, &before, held.signal)
+                {
+                    tracing::trace!(
+                        "[tid {}] signal {} would replace the held signal {}, which ends the wait",
+                        self.tid,
+                        signal,
+                        held.signal
+                    );
+                    return Err(self.restart_errno.into());
+                }
                 tracing::trace!(
-                    "[tid {}] signal {} would replace the held signal {}; the wait ends",
+                    "[tid {}] signal {} may replace the held signal {:?}; the wait keeps its deadline",
                     self.tid,
                     signal,
-                    held.signal
+                    self.held
                 );
-                return Err(Errno::ERESTARTNOINTR.into());
             }
             let result = guest.inject(call).await;
             let Err(errno) = result else {
@@ -2244,18 +2294,24 @@ impl KernelSignalWait {
             let identified =
                 next.filter(|&(signal, queue)| stop_took_only(&before, &after, signal, queue));
             let Some((signal, queue)) = identified else {
-                let errno = match self.restart_errno {
-                    Errno::ERESTARTSYS | Errno::ERESTARTNOHAND | Errno::ERESTARTNOINTR => {
-                        self.restart_errno
-                    }
-                    _ => Errno::ERESTARTNOHAND,
-                };
+                // A signal that `before` did not show stopped the injection. The
+                // backend holds it in place of any held one and delivers it when
+                // the guest resumes, but `/proc` cannot name it. The wait goes on
+                // and the injection runs again, as the blind retry before this
+                // machinery did, so the wait keeps its deadline; the signals that
+                // `/proc` still shows are classified as before, and every check
+                // that ends the wait still runs at the read before the injection
+                // and at each turn's `interrupted_with_state`.
+                if !self.deadline && absorbed >= MAX_ABSORBED_STOPS {
+                    return Err(Errno::ERESTARTNOINTR.into());
+                }
+                absorbed += 1;
                 tracing::trace!(
-                    "[tid {}] a signal stop that cannot be identified ends the wait: {}",
-                    self.tid,
-                    errno
+                    "[tid {}] a signal stop that cannot be identified is held; the injection runs again",
+                    self.tid
                 );
-                return Err(errno.into());
+                self.held = None;
+                continue;
             };
             let bit = kernel_sigset_bit(signal);
             let verdict = match self.stop_verdict(guest, &before, signal) {
@@ -2271,7 +2327,7 @@ impl KernelSignalWait {
                 verdict => verdict,
             };
             match verdict {
-                StopVerdict::Absorb(kind) if absorbed < MAX_ABSORBED_STOPS => {
+                StopVerdict::Absorb(kind) if self.deadline || absorbed < MAX_ABSORBED_STOPS => {
                     absorbed += 1;
                     let kind = self.held.map_or(kind, |held| held.kind.max(kind));
                     tracing::trace!(
@@ -2300,11 +2356,20 @@ impl KernelSignalWait {
         G: Guest<Detcore<T>>,
     {
         let bit = kernel_sigset_bit(signal);
-        if self.consumed & bit != 0 {
-            return StopVerdict::End(Errno::ERESTARTNOINTR);
-        }
+        let interrupts = if self.consumed & bit != 0 {
+            if !self.deadline {
+                return StopVerdict::End(Errno::ERESTARTNOINTR);
+            }
+            // The backend delivers the signal rather than the wait consuming it,
+            // as Linux does for one the guest does not block, so it is classified
+            // as if the wait did not consume it.
+            let guest_mask = self.saved_mask.unwrap_or(before.blocked);
+            before.interrupting_wait(guest_mask, self.defers_default_stops) & bit != 0
+        } else {
+            self.could_interrupt(before) & bit != 0
+        };
         let sigchld = signal == libc::SIGCHLD;
-        if self.could_interrupt(before) & bit != 0 {
+        if interrupts {
             return if sigchld && self.gates_sigchld(guest) {
                 StopVerdict::Absorb(HeldKind::Precious)
             } else {
@@ -2320,7 +2385,35 @@ impl KernelSignalWait {
         if (before.ignored | (default_ignored & !before.caught)) & bit != 0 {
             return StopVerdict::Absorb(HeldKind::Harmless);
         }
-        StopVerdict::End(Errno::ERESTARTNOINTR)
+        if self.deadline {
+            StopVerdict::Absorb(HeldKind::Precious)
+        } else {
+            StopVerdict::End(Errno::ERESTARTNOINTR)
+        }
+    }
+
+    /// Whether an injection that `signal`, pending on `queue`, stops would make
+    /// the backend drop a held signal whose delivery matters
+    /// (`HeldKind::Precious`). Linux merges a standard signal into the same one
+    /// pending on the same queue, so that one replaces nothing.
+    fn would_replace_precious(&self, signal: i32, queue: SignalQueue) -> bool {
+        self.held.is_some_and(|held| {
+            held.kind == HeldKind::Precious
+                && !(signal == held.signal && queue == held.queue && signal < KERNEL_SIGRTMIN)
+        })
+    }
+
+    /// Whether a held `signal` would end the wait natively, given the kernel's
+    /// state `before` an injection: it could interrupt the wait, and it is not a
+    /// `SIGCHLD` that a gated wait counts only once the scheduler makes it
+    /// eligible (`interrupted_with_state`).
+    fn held_ends_wait<T, G>(&self, guest: &G, before: &KernelSignalState, signal: i32) -> bool
+    where
+        T: RecordOrReplay,
+        G: Guest<Detcore<T>>,
+    {
+        self.could_interrupt(before) & kernel_sigset_bit(signal) != 0
+            && !(signal == libc::SIGCHLD && self.gates_sigchld(guest))
     }
 
     /// Block every blockable signal for the rest of the wait, and keep blocked the
@@ -3388,6 +3481,131 @@ mod kernel_signal_wait_failures {
         );
         assert_eq!(kernel.pending, kernel_sigset_bit(libc::SIGWINCH));
         assert_eq!(wait.held.map(|held| held.kind), Some(HeldKind::Precious));
+    }
+
+    /// A guest whose next `stops` injections are stopped by a signal that
+    /// `/proc` never shows, as one that arrives after the read before an
+    /// injection and that the backend then holds: nothing leaves a queue, so the
+    /// stop cannot be identified.
+    fn unidentified_stops_guest(stops: usize) -> (WaitGuest, Kernel) {
+        let (guest, kernel) = WaitGuest::live(guest_mask());
+        kernel.lock().unwrap().outcomes =
+            std::iter::repeat_n(MaskOutcome::StoppedBefore, stops).collect();
+        (guest, kernel)
+    }
+
+    /// A stop that cannot be identified, such as a default-ignored `SIGCHLD`
+    /// that arrives after the read, used to end the wait with `ERESTARTNOHAND`
+    /// for a call whose restart code is not a kernel restart code. With no
+    /// handler to run, the call then restarted, and a relative `poll` timeout
+    /// or a timed polling `FUTEX_WAIT` started again with a fresh deadline
+    /// (round-8 High 1 on https://github.com/rrnewton/hermit/pull/3361). The
+    /// stop is now held and the injection runs again, so the wait goes on with
+    /// its absolute deadline, as the blind retry before this machinery did.
+    #[tokio::test]
+    async fn a_stop_that_cannot_be_identified_keeps_a_timed_wait_and_its_deadline() {
+        for deadline in [true, false] {
+            let (mut guest, kernel) = unidentified_stops_guest(1);
+            let _proc = scripted_proc(&kernel);
+            let mut wait = KernelSignalWait::new(&guest, 0, true, Errno::ERESTARTNOHAND)
+                .with_deadline(deadline);
+
+            let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+            assert!(
+                matches!(result, Ok(Ok(0))),
+                "deadline={deadline}: {result:?}"
+            );
+            assert_eq!(
+                kernel.lock().unwrap().requested.len(),
+                2,
+                "deadline={deadline}"
+            );
+            assert_eq!(wait.held, None, "deadline={deadline}");
+        }
+    }
+
+    /// A wait with a deadline absorbs stops without the bound that ends any
+    /// other wait with `ERESTARTNOINTR` after `MAX_ABSORBED_STOPS`, because that
+    /// restart would start its timeout again (round-8 High 1 on
+    /// https://github.com/rrnewton/hermit/pull/3361); a wait without one still
+    /// ends at the bound.
+    #[tokio::test]
+    async fn only_a_wait_without_a_deadline_ends_after_the_absorbed_stop_bound() {
+        let stops = 100;
+        let (mut guest, kernel) = unidentified_stops_guest(stops);
+        let _proc = scripted_proc(&kernel);
+        let mut wait =
+            KernelSignalWait::new(&guest, 0, true, Errno::ERESTARTNOHAND).with_deadline(true);
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+        assert!(matches!(result, Ok(Ok(0))), "{result:?}");
+        assert_eq!(kernel.lock().unwrap().requested.len(), stops + 1);
+
+        let (mut guest, kernel) = unidentified_stops_guest(stops);
+        let _proc = scripted_proc(&kernel);
+        let mut wait = KernelSignalWait::new(&guest, 0, true, Errno::ERESTARTNOHAND);
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTNOINTR))),
+            "{result:?}"
+        );
+        assert_eq!(kernel.lock().unwrap().requested.len(), 65);
+    }
+
+    /// In a wait with a deadline, a held `SIGCHLD` that would not end the wait
+    /// does not end it with `ERESTARTNOINTR` when another pending signal would
+    /// stop the next injection, as `a_held_sigchld_is_never_replaced_by_another_stop`
+    /// shows for a wait without one: the restart would start the timeout again.
+    /// The injection is made and may replace the held signal, as the blind
+    /// retry allowed (round-8 High 1 on
+    /// https://github.com/rrnewton/hermit/pull/3361).
+    #[tokio::test]
+    async fn a_timed_wait_keeps_its_deadline_past_a_held_sigchld() {
+        let (mut guest, kernel) = stopping_guest(
+            kernel_sigset_bit(libc::SIGCHLD) | kernel_sigset_bit(libc::SIGWINCH),
+            0,
+        );
+        let _proc = scripted_proc(&kernel);
+        let mut wait =
+            KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND).with_deadline(true);
+
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+        assert!(matches!(result, Ok(Ok(0))), "{result:?}");
+        let kernel = kernel.lock().unwrap();
+        assert_eq!(kernel.taken, vec![libc::SIGCHLD, libc::SIGWINCH]);
+        assert_eq!(kernel.requested.len(), 3);
+        assert_eq!(kernel.pending, 0);
+    }
+
+    /// In a wait with a deadline, a held signal that would end the wait natively
+    /// ends it with the restart errno before another stop can replace it, as
+    /// Linux ends the wait for that signal.
+    #[tokio::test]
+    async fn a_timed_wait_ends_for_a_held_signal_that_would_end_it() {
+        let usr1 = kernel_sigset_bit(libc::SIGUSR1);
+        let (mut guest, kernel) = stopping_guest(usr1 | kernel_sigset_bit(libc::SIGWINCH), 0);
+        let _proc = scripted_proc(&kernel);
+        let mut wait =
+            KernelSignalWait::new(&guest, 0, false, Errno::ERESTARTNOHAND).with_deadline(true);
+        wait.held = Some(HeldSignal {
+            signal: libc::SIGUSR1,
+            queue: SignalQueue::Thread,
+            kind: HeldKind::Precious,
+        });
+        kernel.lock().unwrap().pending = kernel_sigset_bit(libc::SIGWINCH);
+        kernel.lock().unwrap().caught = usr1;
+
+        let result = inject_mask_absorbing(&mut wait, &mut guest, guest_mask()).await;
+
+        assert!(
+            matches!(result, Err(Error::Errno(Errno::ERESTARTNOHAND))),
+            "{result:?}"
+        );
+        assert!(
+            kernel.lock().unwrap().requested.is_empty(),
+            "nothing is injected"
+        );
     }
 
     /// A guest whose scheduler tracks `SIGCHLD` eligibility, as with threads
