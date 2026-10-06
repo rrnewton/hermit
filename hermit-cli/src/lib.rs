@@ -2993,6 +2993,7 @@ mod dbt_detconfig_tests {
 /// for the default, for example `"false"` or `"null"`.
 const POST_BASELINE_DBT_DETCONFIG_KEYS: &[(&str, &str)] = &[
     // (key, exact JSON text of its serde default), one entry per line.
+    ("anonymous_object_devices", "null"),
 ];
 
 /// Drop each listed member from a serialized [`DetConfig`] while its value is
@@ -3350,6 +3351,65 @@ mod dbt_detconfig_omit_tests {
             assert_dbt_detconfig_round_trips(&config);
         }
     }
+
+    /// `anonymous_object_devices` is listed with the text `null`, and that is
+    /// exactly what serde writes for the field's default, `None`.
+    #[test]
+    fn anonymous_object_devices_default_serializes_as_its_listed_text() {
+        assert!(POST_BASELINE_DBT_DETCONFIG_KEYS.contains(&("anonymous_object_devices", "null")));
+        let serialized = serde_json::to_string(&default_config()).unwrap();
+        assert_eq!(
+            serialized
+                .matches(r#""anonymous_object_devices":null"#)
+                .count(),
+            1,
+            "{serialized}"
+        );
+    }
+
+    /// With the field `None`, which is what `prepare_backend_config` gives
+    /// DBT, the key is absent from `HERMIT_DBT_DETCONFIG`, so the value the
+    /// guest can read keeps its baseline bytes.
+    #[test]
+    fn anonymous_object_devices_none_is_absent_from_the_dbt_config() {
+        for (name, config) in [
+            ("default", default_config()),
+            (
+                "dbt",
+                prepare_backend_config(default_config(), Backend::Dbt),
+            ),
+        ] {
+            assert_eq!(config.anonymous_object_devices, None, "{name}");
+            let encoded = dbt_detconfig_json(&config).unwrap();
+            assert!(
+                !encoded.contains("anonymous_object_devices"),
+                "{name}: {encoded}"
+            );
+        }
+    }
+
+    /// The DBT config decodes back to the same config with the field `None`,
+    /// whose key is omitted, and with it `Some`, whose key is emitted.
+    #[test]
+    fn anonymous_object_devices_round_trip_through_the_dbt_config() {
+        let mut config = default_config();
+        config.anonymous_object_devices = None;
+        assert_dbt_detconfig_round_trips(&config);
+
+        config.anonymous_object_devices = Some(detcore::AnonymousObjectDevices {
+            pipe: 0x0e,
+            socket: 0x08,
+        });
+        let encoded = dbt_detconfig_json(&config).unwrap();
+        assert_eq!(
+            encoded
+                .matches(r#""anonymous_object_devices":{"pipe":14,"socket":8}"#)
+                .count(),
+            1,
+            "{encoded}"
+        );
+        assert_dbt_detconfig_round_trips(&config);
+    }
 }
 
 // AUTONOMOUS-BOT-IMPLEMENTED
@@ -3596,6 +3656,32 @@ pub fn prepare_backend_config(mut config: DetConfig, backend: Backend) -> DetCon
     // here: Detcore installs the backend's process signal control when the
     // backend offers it and threads are sequentialized, and reads the installed
     // control from then on.
+    // Probe the pipefs and sockfs devices here, in the Hermit process, for
+    // every backend except DBT. Detcore otherwise probes them when it
+    // constructs the tool, which on SaBRe, LiteInst and e9patch's in-guest
+    // host allocates descriptors in the guest's table, and a failure there (a
+    // full table at construction) would make a later readlink of another
+    // process's pipe or socket link fail. DBT receives `None`: its config
+    // travels in HERMIT_DBT_DETCONFIG, which the guest can read and which must
+    // stay byte-identical to the baseline, so the devices stay out of it and
+    // Detcore probes in the guest when it constructs the tool. Always
+    // re-probed, never carried over, because the devices are numbered at boot.
+    // A failure here leaves `None`, and Detcore probes at construction as
+    // before.
+    config.anonymous_object_devices = if config.virtualize_metadata && backend != Backend::Dbt {
+        match detcore::probe_anonymous_object_devices() {
+            Ok(devices) => Some(devices),
+            Err(error) => {
+                tracing::warn!(
+                    "could not probe the pipefs and sockfs devices ({error}); Detcore will probe \
+                     when it constructs the tool"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     config
 }
 
@@ -6233,6 +6319,59 @@ mod tests {
         assert!(!config.backend.runs_exit_robust_list);
         assert!(config.backend.requires_thread_directed_process_signals);
         assert!(!config.backend.defers_vfork_child_registration);
+    }
+
+    /// Every backend except DBT receives the pipefs and sockfs devices the
+    /// Hermit process probed, so none of them probes in a guest's descriptor
+    /// table. DBT receives `None`, which keeps the key out of the guest-visible
+    /// HERMIT_DBT_DETCONFIG, and Detcore probes in the guest when it constructs
+    /// the tool. Without virtualized metadata nothing reads the devices and
+    /// nothing is probed.
+    #[test]
+    fn every_backend_receives_the_hermit_process_anonymous_object_devices() {
+        use std::os::unix::fs::MetadataExt;
+
+        let (reader, _writer) = std::io::pipe().unwrap();
+        let pipe = std::fs::File::from(std::os::fd::OwnedFd::from(reader))
+            .metadata()
+            .unwrap()
+            .dev();
+        let (left, _right) = std::os::unix::net::UnixStream::pair().unwrap();
+        let socket = std::fs::File::from(std::os::fd::OwnedFd::from(left))
+            .metadata()
+            .unwrap()
+            .dev();
+        let expected = detcore::AnonymousObjectDevices { pipe, socket };
+        for backend in [
+            Backend::Ptrace,
+            Backend::Dbt,
+            Backend::Kvm,
+            Backend::Sabre,
+            Backend::Liteinst,
+            Backend::E9patch,
+        ] {
+            let config = prepare_backend_config(super::DetConfig::default(), backend);
+            if backend == Backend::Dbt {
+                assert_eq!(
+                    config.anonymous_object_devices, None,
+                    "DBT must not carry devices in its guest-visible config"
+                );
+            } else {
+                assert_eq!(
+                    config.anonymous_object_devices,
+                    Some(expected),
+                    "{backend:?} must carry the probed devices"
+                );
+            }
+            let raw = super::DetConfig {
+                virtualize_metadata: false,
+                ..super::DetConfig::default()
+            };
+            assert_eq!(
+                prepare_backend_config(raw, backend).anonymous_object_devices,
+                None
+            );
+        }
     }
 
     #[test]

@@ -65,6 +65,21 @@ pub struct MountInfoRootRewrite {
     pub deterministic_mountpoint_prefix: Option<Vec<u8>>,
 }
 
+/// Raw devices of the kernel-internal filesystems that back every anonymous
+/// pipe (pipefs) and every socket (sockfs).
+///
+/// The kernel has one pipefs and one sockfs superblock, and `stat` reports
+/// their devices untranslated in every mount, network and user namespace, so
+/// devices probed in the Hermit process are the devices every guest pipe and
+/// socket reports.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct AnonymousObjectDevices {
+    /// `st_dev` of a pipe.
+    pub pipe: u64,
+    /// `st_dev` of a socket.
+    pub socket: u64,
+}
+
 /// Configuration options for detcore.
 #[derive(Debug, Serialize, Deserialize, Clone, Parser)]
 pub struct Config {
@@ -75,6 +90,18 @@ pub struct Config {
     /// Disable virtual cpuid
     #[clap(long = "no-virtualize-cpuid", action = clap::ArgAction::SetFalse)]
     pub virtualize_cpuid: bool,
+
+    /// The pipefs and sockfs devices, probed by the Hermit process before
+    /// launch (`prepare_backend_config` in hermit-cli) for every backend but
+    /// DBT. Detcore keys another process's `pipe:[N]` or `socket:[N]` link on
+    /// them when it cannot confirm the link with a `stat`. `None`, as on DBT,
+    /// whose config the guest can read and which must stay byte-identical, or
+    /// from a host that constructs Detcore without probing, makes Detcore
+    /// probe when it constructs the tool, which on the in-guest backends
+    /// allocates guest descriptors.
+    #[serde(default)]
+    #[clap(skip)]
+    pub anonymous_object_devices: Option<AnonymousObjectDevices>,
 
     // AUTONOMOUS-BOT-IMPLEMENTED
     // TODO-HUMAN-REVIEW(PR-845): Review in-process backend descriptor discovery.
@@ -2832,6 +2859,37 @@ mod tests {
         assert!(restored.mountinfo_mount_ids.is_empty());
         assert!(!restored.mountinfo_mount_ids_captured);
         assert!(restored.mount_id_assignment_order.is_empty());
+    }
+
+    #[test]
+    fn anonymous_object_devices_default_to_unprobed_and_cross_both_wires() {
+        assert_eq!(Config::default().anonymous_object_devices, None);
+        let mut value = serde_json::to_value(Config::default()).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("anonymous_object_devices");
+        let restored: Config = serde_json::from_value(value).unwrap();
+        assert_eq!(restored.anonymous_object_devices, None);
+
+        // DBT receives the Config as JSON, where hermit-cli leaves the field
+        // `None` but a host that sets it must get it back; SaBRe and in-guest
+        // LiteInst receive it as bincode and must carry the probed devices to
+        // the guest.
+        let devices = AnonymousObjectDevices {
+            pipe: 0x0e,
+            socket: 0x08,
+        };
+        let config = Config {
+            anonymous_object_devices: Some(devices),
+            ..Config::default()
+        };
+        let json: Config = serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+        assert_eq!(json.anonymous_object_devices, Some(devices));
+        let wire = bincode::serde::encode_to_vec(&config, bincode::config::legacy()).unwrap();
+        let (decoded, _): (Config, usize) =
+            bincode::serde::decode_from_slice(&wire, bincode::config::legacy()).unwrap();
+        assert_eq!(decoded.anonymous_object_devices, Some(devices));
     }
 
     #[test]

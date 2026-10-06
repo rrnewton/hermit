@@ -80,6 +80,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
+pub use config::AnonymousObjectDevices;
 pub use config::BlockingMode;
 pub use config::CONFIG_FINGERPRINT_ENV;
 pub use config::Config;
@@ -124,6 +125,7 @@ pub use scheduler::Priority;
 pub use scheduler::runqueue::DEFAULT_PRIORITY;
 pub use scheduler::runqueue::FIRST_PRIORITY;
 pub use scheduler::runqueue::LAST_PRIORITY;
+pub use syscalls::probe_anonymous_object_devices;
 pub use tool_global::BackendFailureCleanup;
 pub use tool_global::GlobalState;
 use tool_global::ThreadDeregistration;
@@ -1172,14 +1174,20 @@ impl<T: RecordOrReplay> Tool for Detcore<T> {
     fn new(pid: Pid, cfg: &Config) -> Self {
         let detpid = DetPid::from_raw(pid.into()); // TODO(T78538674): virtualize pid.
         cfg.validate_invariants();
-        // Read before any guest syscall, so a readlink of another process's
-        // pipe or socket never depends on the descriptors Detcore's host
-        // process has then. The outcome is kept; a failure is reported only
-        // if a guest needs it. Every backend constructs the tool before the
-        // process can run a second guest thread, so on the in-guest backends
-        // this is the last point at which the probe's descriptors cannot
-        // interleave with the guest's own; see `anonymous_object_devices`.
-        let _ = syscalls::anonymous_object_devices();
+        // Runs launched through hermit-cli on every backend but DBT carry the
+        // pipefs and sockfs devices the Hermit process probed, so this probes
+        // nothing. A Config without them, which every DBT run with virtualized
+        // metadata has, probes here, before any guest syscall, so a readlink
+        // of another process's pipe or socket never depends on the descriptors
+        // Detcore's host process has then. The outcome is kept; a failure is
+        // reported only if a guest needs it. On the in-guest backends this
+        // probe uses the guest's descriptor table, and on in-guest LiteInst
+        // and e9patch other threads may already exist; see
+        // `anonymous_object_devices`. Without virtualized metadata nothing
+        // reads the devices, so nothing is probed.
+        if cfg.virtualize_metadata && cfg.anonymous_object_devices.is_none() {
+            let _ = syscalls::anonymous_object_devices();
+        }
         Self {
             detpid,
             cfg: cfg.clone(),
