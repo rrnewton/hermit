@@ -72,10 +72,10 @@ pub fn diagnostics_must_not_wait() -> bool {
 ///   write of at most `PIPE_BUF` bytes, which a pipe either takes whole or
 ///   refuses with `EAGAIN`. Opening a pipe that has no reader fails with
 ///   `ENXIO` rather than raising `SIGPIPE`.
-/// - anything else, including a descriptor `statx` cannot inspect: omitted.
+/// - anything else, including a descriptor whose type cannot be learned:
+///   omitted.
 ///
-/// The file type comes from `statx(AT_STATX_DONT_SYNC)`, which answers from
-/// cached attributes instead of asking a network or FUSE file system.
+/// The file type comes from [`file_type`].
 ///
 /// No signal escapes; see [`suppressing_diagnostic_signals`].
 ///
@@ -87,22 +87,10 @@ pub fn diagnostics_must_not_wait() -> bool {
 pub fn write_without_waiting(fd: RawFd, bytes: &[u8]) {
     let bytes = &bytes[..bytes.len().min(libc::PIPE_BUF)];
     suppressing_diagnostic_signals(|| {
-        // SAFETY: statx writes only into the zeroed struct it is given; an
-        // empty path with AT_EMPTY_PATH names `fd` itself.
-        let mut stat: libc::statx = unsafe { mem::zeroed() };
-        let inspected = unsafe {
-            libc::statx(
-                fd,
-                c"".as_ptr(),
-                libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
-                libc::STATX_TYPE,
-                &mut stat,
-            )
-        } == 0;
-        if !inspected {
+        let Ok(file_type) = file_type(fd) else {
             return 0;
-        }
-        let written = match libc::mode_t::from(stat.stx_mode) & libc::S_IFMT {
+        };
+        let written = match file_type {
             libc::S_IFREG => {
                 let iov = libc::iovec {
                     iov_base: bytes.as_ptr() as *mut libc::c_void,
@@ -141,22 +129,29 @@ pub fn write_without_waiting(fd: RawFd, bytes: &[u8]) {
 /// THE DESCRIPTOR ITSELF IS NEVER MADE NON-BLOCKING, as in
 /// [`write_without_waiting`]:
 ///
-/// - a pipe, FIFO or terminal: one write through a new `O_NONBLOCK` open file
-///   description for the same object (see [`write_without_waiting`]). Opening
-///   a pipe that has no reader fails with `ENXIO`, reported here as `EPIPE`,
-///   what a write to it would have returned.
+/// - a pipe, a FIFO or any character device, a terminal or `/dev/null`: one
+///   write through a new `O_NONBLOCK` open file description for the same
+///   object (see [`write_without_waiting`]). Opening a pipe that has no reader
+///   fails with `ENXIO`, reported here as `EPIPE`, what a write to it would
+///   have returned. If the new description cannot be opened, nothing is
+///   written and the error is returned.
+///
+///   ⚠️ NO CHARACTER DEVICE GETS A PLAIN WRITE, not even one the terminal
+///   query says is not a terminal. Nothing the process asks can tell a
+///   terminal from `/dev/null` in a way a seccomp policy cannot forge: a
+///   policy that answers the query with `ENOTTY` makes a terminal look like
+///   `/dev/null`, and a plain write to a full terminal waits for a reader
+///   forever.
 /// - a socket: `send(MSG_DONTWAIT | MSG_NOSIGNAL)`.
-/// - a character device that the terminal query reports, with `ENOTTY`, is
-///   not a terminal (`/dev/null`): a plain `write(2)`. If the query fails any
-///   other way, the device is treated as a terminal.
 /// - anything else, a regular file included: a plain `write(2)`. Nothing
 ///   reads a regular file, so the write cannot wait for a reader to drain it;
 ///   and `RWF_NOWAIT` would refuse buffered writes on btrfs and tmpfs, which
 ///   would lose every line of a log written there. A regular file on a
 ///   network or FUSE file system whose server has stopped answering can
 ///   still hold this write.
-/// - a descriptor `statx` cannot inspect: nothing is written, and the
-///   `statx` error is returned, so the caller gives up on the bytes.
+/// - a descriptor whose type cannot be learned (see [`file_type`]): nothing
+///   is written, and the error is returned, so the caller gives up on the
+///   bytes.
 ///
 /// No `SIGPIPE`, `SIGXFSZ` or `SIGTTOU` escapes; see
 /// [`suppressing_diagnostic_signals`].
@@ -167,28 +162,18 @@ pub fn write_without_waiting_for_a_reader(fd: RawFd, bytes: &[u8]) -> io::Result
         "the signal mask for a diagnostic write could not be set",
     ));
     suppressing_diagnostic_signals(|| {
-        // SAFETY: statx writes only into the zeroed struct it is given; an
-        // empty path with AT_EMPTY_PATH names `fd` itself.
-        let mut stat: libc::statx = unsafe { mem::zeroed() };
-        let inspected = unsafe {
-            libc::statx(
-                fd,
-                c"".as_ptr(),
-                libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
-                libc::STATX_TYPE,
-                &mut stat,
-            )
-        } == 0;
-        if !inspected {
-            // ⚠️ FAIL CLOSED. Without the file type there is no way to tell a
-            // pipe from a regular file, and a plain write to a full pipe waits
-            // forever (statx denied by a seccomp policy, for example). The
-            // line is not written; the caller gives up on it.
-            let errno = last_errno();
-            result = Err(io::Error::from_raw_os_error(errno));
-            return 0;
-        }
-        let written = match libc::mode_t::from(stat.stx_mode) & libc::S_IFMT {
+        let file_type = match file_type(fd) {
+            Ok(file_type) => file_type,
+            Err(errno) => {
+                // ⚠️ FAIL CLOSED. Without the file type there is no way to
+                // tell a pipe from a regular file, and a plain write to a full
+                // pipe waits forever. The line is not written; the caller
+                // gives up on it.
+                result = Err(io::Error::from_raw_os_error(errno));
+                return 0;
+            }
+        };
+        let written = match file_type {
             // SAFETY: `bytes` is valid for its length.
             libc::S_IFSOCK => unsafe {
                 libc::send(
@@ -197,12 +182,6 @@ pub fn write_without_waiting_for_a_reader(fd: RawFd, bytes: &[u8]) -> io::Result
                     bytes.len(),
                     libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
                 )
-            },
-            // A character device that is not a terminal (`/dev/null`, say)
-            // has no reader to wait for either.
-            // SAFETY: `bytes` is valid for its length.
-            libc::S_IFCHR if is_known_not_to_be_a_terminal(fd) => unsafe {
-                libc::write(fd, bytes.as_ptr().cast(), bytes.len())
             },
             libc::S_IFIFO | libc::S_IFCHR => {
                 let path = proc_self_fd_path(fd);
@@ -249,13 +228,46 @@ pub fn write_without_waiting_for_a_reader(fd: RawFd, bytes: &[u8]) -> io::Result
     result
 }
 
-/// Whether the terminal query on `fd` answered `ENOTTY`, the one answer that
-/// says "not a terminal". Any other failure of the query (a seccomp policy that
-/// denies the ioctl, say) leaves a terminal possible, and a terminal can wait
-/// for a reader.
-fn is_known_not_to_be_a_terminal(fd: RawFd) -> bool {
-    // SAFETY: isatty only inspects `fd`.
-    unsafe { libc::isatty(fd) == 0 && last_errno() == libc::ENOTTY }
+/// The type of the file behind `fd`, its nonzero `S_IFMT` bits, or the errno
+/// that kept it from being learned.
+///
+/// `statx(AT_STATX_DONT_SYNC)` first: it answers from cached attributes
+/// instead of asking a network or FUSE file system. When `statx` fails (a
+/// seccomp policy that denies it, as the Rust standard library also allows
+/// for), `fstat`, which can ask such a file system when its cached attributes
+/// have expired. The error is `fstat`'s when both fail.
+///
+/// ⚠️ A CALL THAT RETURNS 0 BUT NAMES NO TYPE HAS FAILED. A seccomp policy
+/// that answers with errno 0 makes the call return 0 and fill in nothing, and
+/// a zeroed type would read as "anything else", which
+/// [`write_without_waiting_for_a_reader`] writes to plainly. Such an `fstat`
+/// is reported as `EIO`.
+fn file_type(fd: RawFd) -> Result<libc::mode_t, i32> {
+    // SAFETY: statx writes only into the zeroed struct it is given; an empty
+    // path with AT_EMPTY_PATH names `fd` itself.
+    let mut stat: libc::statx = unsafe { mem::zeroed() };
+    let inspected = unsafe {
+        libc::statx(
+            fd,
+            c"".as_ptr(),
+            libc::AT_EMPTY_PATH | libc::AT_STATX_DONT_SYNC,
+            libc::STATX_TYPE,
+            &mut stat,
+        )
+    } == 0;
+    let file_type = libc::mode_t::from(stat.stx_mode) & libc::S_IFMT;
+    if inspected && stat.stx_mask & libc::STATX_TYPE != 0 && file_type != 0 {
+        return Ok(file_type);
+    }
+    // SAFETY: fstat writes only into the zeroed struct it is given.
+    let mut stat: libc::stat = unsafe { mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } != 0 {
+        return Err(last_errno());
+    }
+    match stat.st_mode & libc::S_IFMT {
+        0 => Err(libc::EIO),
+        file_type => Ok(file_type),
+    }
 }
 
 /// The calling thread's `errno`, 0 when there is none.
