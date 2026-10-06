@@ -2171,6 +2171,73 @@ fn other_process_pipe_and_socket_links_match_fstat() {
     assert_eq!(stdout, "proc-fd-links pipe=agrees socket=agrees\n");
 }
 
+/// Whether this kernel reports a unique mount id (STATX_MNT_ID_UNIQUE, Linux
+/// 6.8) for `path`. An older kernel ignores the request bit.
+#[cfg(feature = "dbt")]
+fn kernel_reports_unique_mount_ids(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    const STATX_MNT_ID_UNIQUE: u32 = 0x4000;
+    let path = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path has no NUL");
+    // SAFETY: `statx` is plain data, for which all-zero bytes are valid.
+    let mut statx: libc::statx = unsafe { std::mem::zeroed() };
+    // SAFETY: `path` is NUL-terminated and `statx` is a valid out-pointer.
+    let result = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            0,
+            STATX_MNT_ID_UNIQUE,
+            &mut statx,
+        )
+    };
+    assert_eq!(
+        result,
+        0,
+        "statx failed: {}",
+        std::io::Error::last_os_error()
+    );
+    statx.stx_mask & STATX_MNT_ID_UNIQUE != 0
+}
+
+// DBT embeds Detcore in the guest process. On btrfs a maps line reports the
+// superblock's device and stat the subvolume's, so before Detcore keys such a
+// line on the file's fstat identity (https://github.com/rrnewton/hermit/issues/3307)
+// it proves that the path is on the line's superblock. Reading
+// /proc/<pid>/mountinfo for that proof would take a descriptor in the guest's
+// table, where another guest thread can be installing one at the same moment;
+// a statx unique mount id and statmount take none. This guards that the proof
+// needs no descriptor: the fixture fills its table between opening
+// /proc/self/maps and the first read, which is when Detcore rewrites the
+// snapshot, and every split line must still report the inode stat reports.
+// The executable's line is compared with stat of the path readlink reports
+// for /proc/self/exe: under DBT, stat of the link itself describes
+// DynamoRIO's loader, the process's executable there, as it does without a
+// full table.
+#[cfg(feature = "dbt")]
+#[test]
+fn dbt_maps_lines_prove_their_device_with_a_full_descriptor_table() {
+    let _guard = hermit_run_lock();
+    let guest = inode_identity_views::compile_guest("dbt-maps-stat-full-table");
+    assert!(
+        inode_identity_views::is_on_btrfs(&guest),
+        "{} is not on btrfs, so no maps line needs the superblock proof this test exercises",
+        guest.display()
+    );
+    assert!(
+        kernel_reports_unique_mount_ids(&guest),
+        "this kernel reports no unique mount id (Linux 6.8), so Detcore proves a maps line's \
+         superblock from mountinfo, through a descriptor a full table cannot give"
+    );
+    let stdout = run_inode_identity_views(
+        &guest,
+        Some("dbt"),
+        &["maps-stat-full-table".as_ref()],
+        None,
+        Some(inode_identity_views::PROC_FD_LINKS_HOST_NOFILE),
+    );
+    inode_identity_views::assert_maps_stat_summary(stdout.trim_end(), &guest, "unmapped", None);
+}
+
 // DBT embeds Detcore in the guest process. Keying another process's pipe:[N]
 // or socket:[N] link needs the pipefs or sockfs device
 // (https://github.com/rrnewton/hermit/issues/3307), and learning it must not

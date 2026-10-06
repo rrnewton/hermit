@@ -8,6 +8,7 @@
 //
 // Usage: inode_identity_views scm-getdents DIR
 //        inode_identity_views maps-stat [DIR]
+//        inode_identity_views maps-stat-full-table
 //        inode_identity_views proc-fd-links
 //        inode_identity_views stdio-mmap-sentinel < REGULAR-FILE
 //        inode_identity_views stdio-getdents > DIR
@@ -42,6 +43,18 @@
 //   must still equal the st_ino fstat reported before the unlink. These are
 //   counted as `unlinked`, and those whose device columns differ from st_dev
 //   as `unlinked_split`.
+//
+// maps-stat-full-table
+//   maps-stat without DIR, except that after opening /proc/self/maps and
+//   before reading it the process opens descriptors until open fails with
+//   EMFILE, as proc-fd-links does (see there for how the fill is bounded).
+//   Detcore rewrites the maps snapshot on the first read, and on btrfs that
+//   rewrite must prove which superblock each split line's path is on; a
+//   Detcore embedded in the guest (DBT, SaBRe) must make that proof without
+//   creating descriptors of its own in the guest. The executable's line is
+//   compared with stat of the path readlink("/proc/self/exe") reports, not
+//   with stat of the link: under DBT the link names DynamoRIO's loader, which
+//   is the process's executable there, while readlink reports the program.
 //
 // proc-fd-links
 //   A forked child reads the parent's /proc/<pid>/fd/N links for a pipe and a
@@ -369,7 +382,9 @@ static int check_unlinked_line(
   return 0;
 }
 
-static int maps_stat(const char* directory) {
+static int fill_descriptor_table(void);
+
+static int maps_stat(const char* directory, int full_table) {
   struct unlinked_mapping unlinked[] = {
       {.name = "maps-stat-unlinked-open", .keep_open = 1},
       {.name = "maps-stat-unlinked-closed", .keep_open = 0},
@@ -398,11 +413,15 @@ static int maps_stat(const char* directory) {
       readlink("/proc/self/exe", executable, sizeof(executable) - 1);
   CHECK(executable_length > 0);
   executable[executable_length] = '\0';
+  const char* executable_link = full_table ? executable : "/proc/self/exe";
   struct stat executable_stat;
-  CHECK(stat("/proc/self/exe", &executable_stat) == 0);
+  CHECK(stat(executable_link, &executable_stat) == 0);
 
   FILE* maps = fopen("/proc/self/maps", "re");
   CHECK(maps != NULL);
+  if (full_table) {
+    fill_descriptor_table();
+  }
   char* line = NULL;
   size_t capacity = 0;
   int checked = 0;
@@ -474,7 +493,8 @@ static int maps_stat(const char* directory) {
       if ((unsigned long)executable_stat.st_ino != inode) {
         fprintf(
             stderr,
-            "/proc/self/exe: maps inode %lu, stat inode %llu\n",
+            "%s: maps inode %lu, stat inode %llu\n",
+            executable_link,
             inode,
             (unsigned long long)executable_stat.st_ino);
         exit(1);
@@ -825,7 +845,10 @@ int main(int argc, char** argv) {
     return scm_getdents(argv[2]);
   }
   if ((argc == 2 || argc == 3) && strcmp(argv[1], "maps-stat") == 0) {
-    return maps_stat(argc == 3 ? argv[2] : NULL);
+    return maps_stat(argc == 3 ? argv[2] : NULL, 0);
+  }
+  if (argc == 2 && strcmp(argv[1], "maps-stat-full-table") == 0) {
+    return maps_stat(NULL, 1);
   }
   if (argc == 2 && strcmp(argv[1], "proc-fd-links") == 0) {
     return proc_fd_links();
@@ -838,8 +861,8 @@ int main(int argc, char** argv) {
   }
   fprintf(
       stderr,
-      "usage: %s scm-getdents DIR | maps-stat [DIR] | proc-fd-links | "
-      "stdio-mmap-sentinel | stdio-getdents\n",
+      "usage: %s scm-getdents DIR | maps-stat [DIR] | maps-stat-full-table | "
+      "proc-fd-links | stdio-mmap-sentinel | stdio-getdents\n",
       argv[0]);
   return 2;
 }
