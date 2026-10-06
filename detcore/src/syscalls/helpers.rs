@@ -47,6 +47,7 @@ use crate::syscalls::threads::read_wait_signal_state;
 use crate::syscalls::threads::restore_signals_after_disposition;
 use crate::syscalls::threads::wait_signal_disposition;
 use crate::tool_global::ResumeStatus;
+use crate::tool_global::host_timed_signals;
 use crate::tool_global::resource_request;
 use crate::tool_global::thread_observe_time;
 use crate::tool_global::trace_schedevent;
@@ -1720,6 +1721,9 @@ where
         // A scheduler `Signaled` answer only says a signal may be pending. The kernel's
         // state below decides whether it ends the wait.
         let _ = resource_request(guest, rsrc.clone()).await;
+        // Read in this turn, before the probe: another thread may have armed a
+        // host-timed source since the last turn, and none can until this turn ends.
+        signals.hold_until_return(host_timed_signals(guest).await);
         let first = std::mem::take(&mut first_turn);
         // Never `inject_with_retry`: see `KernelSignalWait`.
         let injected = if first {
@@ -1888,7 +1892,9 @@ pub(crate) struct KernelSignalWait {
     /// `SIGCHLD`, whichever process sent it: the kernel also posts one for a
     /// child's exit, stop or continue at a moment set by host timing, and
     /// `/proc` shows no siginfo that would tell the two apart
-    /// (https://github.com/rrnewton/hermit/issues/3146).
+    /// (https://github.com/rrnewton/hermit/issues/3146). The gated loop adds,
+    /// in each of its turns, every signal a host-timed source armed by a guest
+    /// can post to this process (`hold_until_return`).
     held_until_return: KernelSigset,
     /// Whether the wait has a finite deadline (`with_deadline`). Hermit cannot
     /// install the restart block with which Linux keeps the absolute deadline
@@ -1999,6 +2005,17 @@ impl KernelSignalWait {
             held_until_return: 0,
             ..Self::new(guest, 0, false, Errno::ERESTARTNOHAND)
         }
+    }
+
+    /// Adds `signals` to the ones this wait holds until the call returns
+    /// (`held_until_return`). The gated loop passes, in each of its turns, the
+    /// signals that a host-timed source armed by a guest can post to this
+    /// process, such as a parent-death signal (`tool_global::host_timed_signals`):
+    /// the kernel posts those at a moment set by host timing, so ending the wait
+    /// for one would make the run depend on host timing. Never called for a
+    /// `select` wait (`for_select`), which holds nothing.
+    pub(crate) fn hold_until_return(&mut self, signals: KernelSigset) {
+        self.held_until_return |= signals;
     }
 
     /// Whether the caller should still call `block`: it has neither blocked the

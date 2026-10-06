@@ -15,7 +15,7 @@
  *             forkgrp|forkkill|forkthrexit|spin|spinkill|spinthrexit|usr2|
  *             extchld|extchldreaped|extchldlive|chldflood] [held]
  *        external_signal_interrupt sigsuspend creator
- *        external_signal_interrupt poll pdeathchld
+ *        external_signal_interrupt poll <pdeathchld|pdeathusr1>
  *        external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing
  *
  * `select` is glibc's, which issues pselect6 with no mask; `rawselect` is the
@@ -613,20 +613,21 @@ static int creator_main(const char *role_name) {
   return 0;
 }
 
-/* The `poll pdeathchld` mode. Each of PDEATH_TRIALS trials forks a parent P,
- * which forks a child C and then sleeps, outside Hermit's run queue. C catches
- * SIGCHLD, arms it as its parent-death signal with PR_SET_PDEATHSIG, checks that
- * P is still its parent, tells the main process it is ready, and polls no
- * descriptors for PDEATH_POLL_MS. The main process waits PDEATH_KILL_DELAY_MS,
- * kills P with SIGKILL and reaps it. Linux sends C the SIGCHLD when P exits,
- * and C has never had a child. On Linux the poll returns EINTR at the instant P
- * dies; under Hermit that instant is the host's, because P exits before the
- * scheduler deregisters it. So the poll must keep its deadline: it returns 0
- * after its full timeout and the handler runs once afterwards. C reports its
- * fields on a pipe; a trial matches when ret=0, the poll took
+/* The `poll pdeathchld` and `poll pdeathusr1` modes. Each of PDEATH_TRIALS
+ * trials forks a parent P, which forks a child C and then sleeps, outside
+ * Hermit's run queue. C catches the mode's signal (SIGCHLD or SIGUSR1), arms it
+ * as its parent-death signal with PR_SET_PDEATHSIG, checks that P is still its
+ * parent, tells the main process it is ready, and polls no descriptors for
+ * PDEATH_POLL_MS. The main process waits PDEATH_KILL_DELAY_MS, kills P with
+ * SIGKILL and reaps it. Linux sends C the signal when P exits, and C has never
+ * had a child. On Linux the poll returns EINTR at the instant P dies; under
+ * Hermit that instant is the host's, because P exits before the scheduler
+ * deregisters it. So the poll must keep its deadline: it returns 0 after its
+ * full timeout and the handler runs once afterwards. C reports its fields on a
+ * pipe; a trial matches when ret=0, the poll took
  * [PDEATH_POLL_MS, PDEATH_POLL_MS + PDEATH_OVERSHOOT_MS) ms and the handler ran
  * once. Prints one TRIAL line per trial, then
- * `RESULT call=poll role=pdeathchld trials=<n> matched=<m>`. */
+ * `RESULT call=poll role=<mode> trials=<n> matched=<m>`. */
 #define PDEATH_TRIALS 3
 #define PDEATH_POLL_MS 300
 #define PDEATH_OVERSHOOT_MS 50
@@ -634,14 +635,14 @@ static int creator_main(const char *role_name) {
 #define PDEATH_HANDLER_NAPS 2000
 static volatile sig_atomic_t pdeath_handled = 0;
 
-static void on_pdeath_chld(int sig) {
+static void on_pdeath(int sig) {
   (void)sig;
   pdeath_handled += 1;
 }
 
-static void pdeath_child(pid_t parent, int ready_fd, int out_fd) {
-  set_handler(SIGCHLD, on_pdeath_chld);
-  if (prctl(PR_SET_PDEATHSIG, SIGCHLD) != 0) _exit(80);
+static void pdeath_child(pid_t parent, int sig, int ready_fd, int out_fd) {
+  set_handler(sig, on_pdeath);
+  if (prctl(PR_SET_PDEATHSIG, sig) != 0) _exit(80);
   /* P was not killed before the signal was armed. */
   if (getppid() != parent) _exit(81);
   if (write(ready_fd, "R", 1) != 1) _exit(82);
@@ -665,7 +666,7 @@ static void pdeath_child(pid_t parent, int ready_fd, int out_fd) {
   _exit(0);
 }
 
-static int pdeath_main(const char *call) {
+static int pdeath_main(const char *call, int sig, const char *role) {
   if (strcmp(call, "poll")) return 2;
   int matched = 0;
   for (int i = 0; i < PDEATH_TRIALS; i++) {
@@ -679,7 +680,7 @@ static int pdeath_main(const char *call) {
       pid_t self = getpid();
       pid_t child = fork();
       if (child < 0) _exit(86);
-      if (child == 0) pdeath_child(self, ready[1], out[1]);
+      if (child == 0) pdeath_child(self, sig, ready[1], out[1]);
       close(ready[1]);
       close(out[1]);
       for (;;) sleep_ms(1000);
@@ -707,7 +708,7 @@ static int pdeath_main(const char *call) {
     fflush(stdout);
     if (strstr(line, " ok=1\n") != NULL) matched += 1;
   }
-  printf("RESULT call=poll role=pdeathchld trials=%d matched=%d\n", PDEATH_TRIALS, matched);
+  printf("RESULT call=poll role=%s trials=%d matched=%d\n", role, PDEATH_TRIALS, matched);
   printf("DONE\n");
   fflush(stdout);
   return 0;
@@ -857,7 +858,7 @@ int main(int argc, char **argv) {
         "chldpend|stealgrp|stealkill|stealthrexit|forkgrp|forkkill|forkthrexit|spin|spinkill|"
         "spinthrexit|usr2|extchld|extchldreaped|extchldlive|chldflood]\n"
         "       external_signal_interrupt sigsuspend creator\n"
-        "       external_signal_interrupt poll pdeathchld\n"
+        "       external_signal_interrupt poll <pdeathchld|pdeathusr1>\n"
         "       external_signal_interrupt <poll|ppoll|epoll|epollpwait|epollinval|epollbadf|sigtimedwaitfault> racing\n");
     return 2;
   }
@@ -866,7 +867,8 @@ int main(int argc, char **argv) {
   const char *call = argv[1];
   const char *sender = argv[2];
   if (!strcmp(call, "sigsuspend")) return creator_main(sender);
-  if (!strcmp(sender, "pdeathchld")) return pdeath_main(call);
+  if (!strcmp(sender, "pdeathchld")) return pdeath_main(call, SIGCHLD, "pdeathchld");
+  if (!strcmp(sender, "pdeathusr1")) return pdeath_main(call, SIGUSR1, "pdeathusr1");
   if (!strcmp(sender, "racing")) return racing_main(call);
   int restart = 0, timed = 0, ignored = 0, blocked = 0, warm = 0, usr2 = 0, tstp = 0, options = 0;
   int chldflood = 0;

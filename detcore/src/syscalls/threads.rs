@@ -55,6 +55,7 @@ use crate::tool_global::child_tid_clear_address;
 use crate::tool_global::consume_child_wait;
 use crate::tool_global::create_child_thread;
 use crate::tool_global::futex_action;
+use crate::tool_global::host_timed_signals;
 use crate::tool_global::prepare_exec;
 use crate::tool_global::process_group;
 use crate::tool_global::ready_child_wait;
@@ -1765,7 +1766,10 @@ impl<T: RecordOrReplay> Detcore<T> {
                         // never ends it: it stays pending until the call returns,
                         // because the kernel also posts one for a child event at a
                         // moment set by host timing
-                        // (https://github.com/rrnewton/hermit/issues/3146).
+                        // (https://github.com/rrnewton/hermit/issues/3146). Nor does
+                        // a signal that a host-timed source armed by a guest can
+                        // post to this process, such as a parent-death signal
+                        // (`host_timed_signals`, read here in this thread's turn).
                         //
                         // The same check decides a wait the scheduler woke for a
                         // signal. The scheduler commits such a wake without this
@@ -1797,9 +1801,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                             // A timed `FUTEX_WAIT` lets a default job-control stop
                             // wait for its deadline (`KernelSignalState::interrupting_wait`).
                             let defers_default_stops = call.restart_rearms_timeout();
+                            let held =
+                                kernel_sigset_bit(libc::SIGCHLD) | host_timed_signals(guest).await;
                             let pending = state
                                 .pending_interrupting(state.blocked, defers_default_stops)
-                                & !kernel_sigset_bit(libc::SIGCHLD);
+                                & !held;
                             if pending != 0 {
                                 let errno = call.kernel_restart_errno();
                                 trace!(

@@ -181,9 +181,10 @@ const HANDLED_BEFORE_EXIT_MS: u64 = SIGNAL_DELAY_MS + SIGNAL_DELAY_MS / 2;
 /// Trials in the guest's `sigsuspend creator` mode (`CREATOR_TRIALS` in the
 /// guest).
 const CREATOR_TRIALS: usize = 6;
-/// Trials in the guest's `poll pdeathchld` mode (`PDEATH_TRIALS` in the guest).
+/// Trials in the guest's `poll pdeathchld` and `poll pdeathusr1` modes
+/// (`PDEATH_TRIALS` in the guest).
 const PDEATH_TRIALS: usize = 3;
-/// Unverified strict runs of the `poll pdeathchld` cell; each must match.
+/// Unverified strict runs of a parent-death cell; each must match.
 const PDEATH_RUNS: usize = 3;
 /// Trials in the guest's `racing` mode (`RACING_TRIALS` in the guest).
 const RACING_TRIALS: usize = 6;
@@ -1684,9 +1685,15 @@ fn ptrace_nonleader_creator_takes_its_childs_sigchld_in_sigsuspend() {
 /// the physical-death-before-logical-deregistration race the finding names; this
 /// pull request does not close it, so it claims only the child's result here.
 fn assert_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline(backend: &str) {
-    let args = ["poll", "pdeathchld"];
+    assert_parent_death_signal_keeps_a_poll_to_its_deadline(backend, "pdeathchld");
+}
+
+/// Runs the guest's `poll <role>` parent-death mode `PDEATH_RUNS` times under
+/// `--strict` without `--verify`; every trial of every run must keep its deadline.
+fn assert_parent_death_signal_keeps_a_poll_to_its_deadline(backend: &str, role: &str) {
+    let args = ["poll", role];
     let expected =
-        format!("RESULT call=poll role=pdeathchld trials={PDEATH_TRIALS} matched={PDEATH_TRIALS}");
+        format!("RESULT call=poll role={role} trials={PDEATH_TRIALS} matched={PDEATH_TRIALS}");
     for attempt in 0..PDEATH_RUNS {
         let run = run_cell_observed(backend, FutexMode::Precise, &args, &[], Observe::InfoLog);
         assert!(
@@ -1702,6 +1709,25 @@ fn assert_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline(backend: &
 #[test]
 fn ptrace_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline() {
     assert_parent_death_sigchld_keeps_a_childless_poll_to_its_deadline("ptrace");
+}
+
+/// The same cell with SIGUSR1 as the parent-death signal (the guest's
+/// `poll pdeathusr1` mode). The child catches SIGUSR1 and arms it with
+/// `PR_SET_PDEATHSIG`; Linux returns EINTR when the parent dies. Hermit cannot
+/// tell the kernel's copy, posted at an instant set by the host, from a SIGUSR1
+/// a guest sends at a fixed point, so the arming call records SIGUSR1 as
+/// host-timed for the child's process, in the child's turn, and no gated wait of
+/// that process ends for it afterwards: in each trial the poll returns 0 after
+/// its full timeout and the handler runs once afterwards. Before that record, the
+/// poll returned EINTR at a turn the host chose. A guest `kill` of SIGUSR1 to
+/// that process is held the same way, which is what every gated wait did before
+/// the external signal work (https://github.com/rrnewton/hermit/issues/3146).
+///
+/// Unverified for the reason given for the SIGCHLD cell: the killer's side of
+/// two runs' INFO logs differs whatever the child does.
+#[test]
+fn ptrace_parent_death_usr1_keeps_a_poll_to_its_deadline() {
+    assert_parent_death_signal_keeps_a_poll_to_its_deadline("ptrace", "pdeathusr1");
 }
 
 /// `wait4` and `waitid` restart under SA_RESTART, as Linux restarts them: the

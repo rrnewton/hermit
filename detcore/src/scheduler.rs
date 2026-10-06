@@ -255,6 +255,17 @@ pub struct FutexSignalWatch {
     pub tid: i32,
 }
 
+/// Which processes a host-timed signal source can signal once a guest arms it
+/// (`Scheduler::record_host_timed_signals`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum HostTimedSignalScope {
+    /// Only the process of the thread that armed it.
+    Caller,
+    /// Any process of the container: the receiver can be another process, a
+    /// process group, or a process Hermit does not track.
+    Container,
+}
+
 /// The one-bit kernel sigset for a 1-based signal number, or 0 when out of range.
 fn kernel_signal_bit(raw_signal: i32) -> u64 {
     if (1..=64).contains(&raw_signal) {
@@ -700,6 +711,17 @@ pub struct Scheduler {
     /// (`arm_signaled_background`), and sends a child-exit `SIGCHLD` to the
     /// thread the kernel would give it (`kernel_sigchld_target`).
     models_signal_targets: bool,
+
+    /// Signals that a host-timed source armed by a guest can post to a process,
+    /// keyed by that process: no gated wait of the process ends for them
+    /// (`host_timed_signals`). An entry is added in the turn of the call that
+    /// arms the source and is never removed
+    /// (https://github.com/rrnewton/hermit/issues/3146).
+    host_timed_signals: BTreeMap<DetPid, u64>,
+
+    /// Signals that a host-timed source armed by a guest can post to any process
+    /// of the container (`HostTimedSignalScope::Container`). Never removed.
+    host_timed_signals_everywhere: u64,
 
     /// Kernel signal states that tests install for parked futex waiters, in
     /// place of reading `/proc`.
@@ -1873,6 +1895,8 @@ impl Scheduler {
             pending_cross_task_signals: Default::default(),
             models_signal_targets: cfg.sequentialize_threads
                 && cfg.backend_supports_blocked_wait_signal_interruption,
+            host_timed_signals: Default::default(),
+            host_timed_signals_everywhere: 0,
             #[cfg(test)]
             test_kernel_signal_states: Default::default(),
             #[cfg(test)]
@@ -3986,7 +4010,7 @@ impl Scheduler {
     /// that does interrupt it could instead deadlock it.
     fn parked_futex_interrupting_signals(&self, dettid: DetTid) -> Option<u64> {
         let watch = self.parked_futex_waiter(dettid)?.signal_watch?;
-        let held = self.futex_wait_held_signals();
+        let held = self.futex_wait_held_signals(dettid);
         #[cfg(test)]
         if let Some(state) = self.test_kernel_signal_states.get(&dettid) {
             return Some(
@@ -4012,15 +4036,59 @@ impl Scheduler {
     }
 
     /// The signals a parked precise-mode futex waiter holds until its call
-    /// returns, whatever its mask and dispositions: `SIGCHLD`, whoever sent it.
-    /// The kernel also posts `SIGCHLD` itself, for a child's exit, stop or
-    /// continue, at a moment set by host timing, and the waiter cannot tell
-    /// that copy from one sent at a deterministic point. The guest side holds
-    /// the same signal in its own checks (`KernelSignalWait`, and the futex
-    /// pre-check in `handle_futex_blocking`)
+    /// returns, whatever its mask and dispositions: `SIGCHLD`, whoever sent it,
+    /// and every signal a host-timed source armed by a guest can post to its
+    /// process (`host_timed_signals`). The kernel posts these at a moment set
+    /// by host timing (`SIGCHLD` for a child's exit, stop or continue), and the
+    /// waiter cannot tell that copy from one sent at a deterministic point. The
+    /// guest side holds the same signals in its own checks (`KernelSignalWait`,
+    /// and the futex pre-check in `handle_futex_blocking`)
     /// (https://github.com/rrnewton/hermit/issues/3146).
-    fn futex_wait_held_signals(&self) -> u64 {
-        kernel_signal_bit(libc::SIGCHLD)
+    fn futex_wait_held_signals(&self, dettid: DetTid) -> u64 {
+        kernel_signal_bit(libc::SIGCHLD) | self.host_timed_signals(dettid)
+    }
+
+    /// Records that `caller`, in its turn, armed a host-timed source of
+    /// `signals`: a source the kernel fires at a moment set by host timing,
+    /// such as `PR_SET_PDEATHSIG`. From then on no gated wait of a process in
+    /// `scope` ends for any of `signals`, whoever sends it
+    /// (`host_timed_signals`). Returns what `caller`'s waits now hold.
+    ///
+    /// An entry is never removed: not when the guest disarms the source, nor
+    /// at `exec`, nor when the source has fired. Hermit cannot tell a copy
+    /// posted by the source from one a guest sends with `kill`, and a source
+    /// that fired once may stay armed. Holding a signal too long keeps the
+    /// behaviour gated waits had before signal interruption
+    /// (https://github.com/rrnewton/hermit/issues/3146); ending a wait for a
+    /// host-timed copy makes the run depend on host timing.
+    ///
+    /// The entry is keyed by the caller's process, so every thread of it is
+    /// covered: Linux sends a parent-death signal process-directed, and the
+    /// kernel picks the thread. A forked child starts with no entry, as it
+    /// starts with no parent-death signal.
+    pub fn record_host_timed_signals(
+        &mut self,
+        caller: DetTid,
+        scope: HostTimedSignalScope,
+        signals: u64,
+    ) -> u64 {
+        match scope {
+            HostTimedSignalScope::Caller => {
+                let process = self.sigchld_process(caller);
+                *self.host_timed_signals.entry(process).or_default() |= signals;
+            }
+            HostTimedSignalScope::Container => self.host_timed_signals_everywhere |= signals,
+        }
+        self.host_timed_signals(caller)
+    }
+
+    /// The signals that no gated wait of `thread` ends for, because a
+    /// host-timed source a guest armed can post them to its process
+    /// (`record_host_timed_signals`). Gated waits read this in their own turn.
+    pub fn host_timed_signals(&self, thread: DetTid) -> u64 {
+        let process = self.sigchld_process(thread);
+        self.host_timed_signals_everywhere
+            | self.host_timed_signals.get(&process).copied().unwrap_or(0)
     }
 
     // `SIGCHLD` AND GATED WAITS
@@ -9054,6 +9122,75 @@ mod test {
                 "{case}"
             );
         }
+    }
+
+    /// A signal recorded as host-timed for a process, as `PR_SET_PDEATHSIG`
+    /// records its signal in the arming thread's turn, never ends a parked
+    /// precise-mode futex wait of any thread of that process, although the
+    /// waiter catches it, and a later disarm does not remove the record. A
+    /// forked child's wait still ends for it; a container-wide record holds
+    /// it in every process (https://github.com/rrnewton/hermit/issues/3146).
+    #[test]
+    fn a_host_timed_signal_never_ends_a_parked_futex_wait_of_its_process() {
+        let usr1 = kernel_signal_bit(libc::SIGUSR1);
+        let usr2 = kernel_signal_bit(libc::SIGUSR2);
+        let term = kernel_signal_bit(libc::SIGTERM);
+        let (mut scheduler, parent, creator, child) = sigchld_family(libc::SIGCHLD);
+        for thread in [parent, creator, child] {
+            assert_eq!(scheduler.host_timed_signals(thread), 0, "nothing armed yet");
+        }
+
+        // The creator, not its process's leader, arms SIGUSR1.
+        assert_eq!(
+            scheduler.record_host_timed_signals(creator, HostTimedSignalScope::Caller, usr1),
+            usr1
+        );
+        assert_eq!(
+            scheduler.host_timed_signals(parent),
+            usr1,
+            "the record covers every thread of the arming process"
+        );
+        assert_eq!(scheduler.host_timed_signals(creator), usr1);
+        assert_eq!(
+            scheduler.host_timed_signals(child),
+            0,
+            "a forked child starts without its parent's record"
+        );
+        // A disarm (signal 0) records nothing and removes nothing.
+        assert_eq!(
+            scheduler.record_host_timed_signals(parent, HostTimedSignalScope::Caller, 0),
+            usr1
+        );
+        // A container-wide source holds its signal in every process.
+        assert_eq!(
+            scheduler.record_host_timed_signals(child, HostTimedSignalScope::Container, usr2),
+            usr2
+        );
+        assert_eq!(scheduler.host_timed_signals(parent), usr1 | usr2);
+        assert_eq!(scheduler.host_timed_signals(child), usr2);
+
+        // Parked futex waiters that catch all three signals: only SIGTERM ends
+        // the parent's wait, and SIGUSR1 and SIGTERM end the child's.
+        for (thread, mm_pid) in [(parent, 100), (child, 200)] {
+            scheduler.sleep_futex_waiter(
+                &thread,
+                FutexID::private(MmId::initial(DetPid::from_raw(mm_pid)), 0x404110),
+                None,
+                u32::MAX,
+                Some(signal_watch(usr1 | usr2 | term)),
+            );
+            scheduler
+                .test_kernel_signal_states
+                .insert(thread, signal_state(usr1 | usr2 | term, 0));
+        }
+        assert_eq!(
+            scheduler.parked_futex_interrupting_signals(parent),
+            Some(term)
+        );
+        assert_eq!(
+            scheduler.parked_futex_interrupting_signals(child),
+            Some(usr1 | term)
+        );
     }
 
     /// A parent process 100 whose second thread 101 created child process 200
