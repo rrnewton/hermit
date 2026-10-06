@@ -139,7 +139,7 @@ const _: () = assert!(
 /// exceptional (`POLLIN_SET`, `POLLOUT_SET` and `POLLEX_SET` in
 /// `fs/select.c`). Newer kernels include `POLLNVAL` in all three, so a
 /// descriptor closed during the wait reports ready in every set it is in;
-/// older ones fail such a wait with `EBADF`.
+/// older ones ignore such a descriptor (no bit, no error).
 const SELECT_REPORTED: [i16; 3] = [
     libc::POLLRDNORM
         | libc::POLLRDBAND
