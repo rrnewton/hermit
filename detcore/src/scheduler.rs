@@ -3908,10 +3908,11 @@ impl Scheduler {
     /// in its turn (`handle_futex_blocking`). If that read succeeds and finds no
     /// interrupting signal pending, it parks again with its original absolute
     /// deadline, so a false wake costs one extra turn. If that read fails too,
-    /// the wait ends with the read's errno (`ESRCH` or `EIO`), as a wait whose
-    /// first read fails does; no test reaches that path end to end. Leaving a
-    /// waiter parked for a signal that does interrupt it could instead deadlock
-    /// it.
+    /// it is handled as a wait's first read is (`read_wait_signal_state`): a
+    /// thread that no longer exists ends the call with `ERESTARTNOINTR`, which
+    /// nothing observes, and otherwise the run ends with a diagnostic, never an
+    /// errno the futex call cannot return. Leaving a waiter parked for a signal
+    /// that does interrupt it could instead deadlock it.
     fn parked_futex_interrupting_signals(&self, dettid: DetTid) -> Option<u64> {
         let watch = self.parked_futex_waiter(dettid)?.signal_watch?;
         #[cfg(test)]
