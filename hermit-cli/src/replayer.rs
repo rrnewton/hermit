@@ -1570,15 +1570,39 @@ impl Replayer {
         Ok((dirfd, path))
     }
 
+    /// Creates the recorded mkdir's target directory, or with `parent_only`
+    /// just its parent chain, beneath the replay root. Returns false when the
+    /// directory base is a virtual replay descriptor or lies outside the root.
     fn materialize_recorded_mkdir<G: Guest<Self>>(
         &self,
         guest: &G,
         syscall: Syscall,
+        parent_only: bool,
     ) -> io::Result<bool> {
         let (dirfd, path) = self.mkdir_request(guest, syscall)?;
+        let path = if parent_only {
+            match path
+                .parent()
+                .filter(|parent| !parent.as_os_str().is_empty())
+            {
+                Some(parent) => parent.to_path_buf(),
+                None => return Ok(true),
+            }
+        } else {
+            path
+        };
+        // Linux follows a symlink in every component except the final one of
+        // the mkdir path, so a parent's own final component is followed. As for
+        // an O_CREAT open's parent, a procfs symlink is refused rather than
+        // followed to a host path.
+        let ensure = if parent_only {
+            crate::record_replay_path::ensure_directory_path_follow_final_without_procfs_symlinks
+        } else {
+            crate::record_replay_path::ensure_directory_path
+        };
         let root = crate::record_replay_path::open_process_root(guest.pid())?;
         if path.is_absolute() {
-            crate::record_replay_path::ensure_directory_path(&root, &root, &path)?;
+            ensure(&root, &root, &path)?;
             return Ok(true);
         }
 
@@ -1607,12 +1631,15 @@ impl Replayer {
                 return Ok(false);
             }
         }
-        crate::record_replay_path::ensure_directory_path(&root, &start, &path)?;
+        ensure(&root, &start, &path)?;
         Ok(true)
     }
 
     // TODO-HUMAN-REVIEW(#2370)
-    /// Replays successful mkdir side effects exactly as before. For a recorded
+    /// Replays successful mkdir side effects. A successful mkdir proves that
+    /// every parent directory existed at record time, so replay first creates
+    /// that parent chain in the fresh chroot; a standalone replay otherwise
+    /// lacks any host directory the guest only mkdir'd beneath. For a recorded
     /// `EEXIST` caused by a directory, it reconstructs that directory in the
     /// fresh chroot while still returning the recorded error to the guest.
     async fn handle_mkdir<G: Guest<Self>>(
@@ -1623,11 +1650,18 @@ impl Replayer {
     ) -> Result<i64, Errno> {
         let event = next_event!(guest, Mkdir)?;
         if event.result == Err(Errno::EEXIST) && event.existing_directory {
-            self.materialize_recorded_mkdir(guest, syscall)
+            self.materialize_recorded_mkdir(guest, syscall, false)
                 .unwrap_or_else(|error| {
                     panic!("failed to materialize recorded mkdir directory: {error}")
                 });
         } else if let Ok(expected) = event.result {
+            if (!confined_dirfd || self.path_mutation_dirfds_are_confined(guest.pid(), syscall))
+                && let Err(error) = self.materialize_recorded_mkdir(guest, syscall, true)
+            {
+                // The injected mkdir below still decides: it must reproduce the
+                // recorded success (or, for a confined mkdirat, stay virtual).
+                tracing::debug!(?syscall, %error, "replay could not create the mkdir parent");
+            }
             if !confined_dirfd {
                 let actual = guest.inject_with_retry(syscall).await;
                 assert_eq!(actual, Ok(expected), "mkdir side effects diverged");

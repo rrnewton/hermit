@@ -1618,6 +1618,37 @@ fn record_nested_mkdir_side_effects() {
     );
 }
 
+/// A successful mkdir proves that its parent directories existed at record
+/// time, but a standalone replay starts from an empty chroot that holds none of
+/// them. `git clone <src> <existing>/clone` is the real-world instance.
+#[test]
+fn replay_mkdir_beneath_a_directory_that_only_existed_at_record_time() {
+    let _guard = hermit_record_lock();
+    let shell = Path::new("/bin/bash");
+    assert!(shell.is_file(), "bash is missing at {}", shell.display());
+    let host = tempfile::tempdir().expect("failed to create pre-existing host directory");
+    let cwd = host.path().join("cwd");
+    fs::create_dir_all(cwd.join("relative-parent"))
+        .expect("failed to create relative mkdir fixture");
+
+    record_then_replay_command(
+        "mkdir-beneath-record-time-directory",
+        shell,
+        &[
+            OsStr::new("-c"),
+            OsStr::new(
+                "set -euo pipefail; mkdir \"$1/absolute\"; cd \"$1/cwd\"; mkdir relative-parent/relative; printf 'mkdir-beneath-record-time-directory-ok\\n'",
+            ),
+            OsStr::new("mkdir-fixture"),
+            host.path().as_os_str(),
+        ],
+    );
+    assert!(
+        host.path().join("absolute").is_dir() && cwd.join("relative-parent/relative").is_dir(),
+        "recording did not create the directories on the host"
+    );
+}
+
 /// Exercises the replay-only distinction between an EEXIST directory and an
 /// EEXIST file/symlink, including Linux's symlink-before-`..` resolution order
 /// and mkdirat's absolute-path rule that ignores an unusable dirfd.
