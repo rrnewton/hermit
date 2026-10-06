@@ -1027,6 +1027,14 @@ impl NonblockableSyscall for reverie::syscalls::Poll {
 
     /// Linux ends an interrupted `poll` with a restart code that a handler turns into
     /// `EINTR` and that restarts the call when no handler runs.
+    ///
+    /// Known deviation: Linux's code is `ERESTART_RESTARTBLOCK`, and its restart
+    /// (`do_restart_poll`) keeps the original deadline. Hermit cannot install the
+    /// kernel's restart block for a wait it emulates, so it returns `ERESTARTNOHAND`.
+    /// The kernel then re-runs `poll` with its original arguments, at a ptrace stop
+    /// and, through Reverie's restart, at a LiteInst patched site, so a restart after
+    /// a stop signal starts the relative timeout again. A timed futex wait has the
+    /// same deviation (https://github.com/rrnewton/hermit/issues/3358).
     fn kernel_restart_errno(&self) -> Errno {
         Errno::ERESTARTNOHAND
     }
@@ -1173,7 +1181,8 @@ impl NonblockableSyscall for reverie::syscalls::Futex {
     /// `EINTR`. `ERESTARTNOHAND` gives a timed wait that outcome for a caught signal and a
     /// transparent restart otherwise. A restart after a stop signal starts a relative
     /// timeout again, where Linux's restart block would resume the original deadline
-    /// (https://github.com/rrnewton/hermit/issues/3146).
+    /// (https://github.com/rrnewton/hermit/issues/3146; listed with `poll`'s in
+    /// https://github.com/rrnewton/hermit/issues/3358).
     fn kernel_restart_errno(&self) -> Errno {
         if self.timeout().is_some() {
             Errno::ERESTARTNOHAND
