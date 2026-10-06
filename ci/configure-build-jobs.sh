@@ -1039,8 +1039,18 @@ fi
 # recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
 # second budget are unchanged. Carry, not recalibration: no new timing sample
 # or >=5-sample replacement claim is made.
-if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != eb4372dcabea6708374f9fe649256f92f2040497 ]]; then
-    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie eb4372dcabea6708374f9fe649256f92f2040497 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
+# CARRY TO 0c2d3db220a64da6aaf0a741b6d0ad225dd85e71 (2026-10-06): from
+# eb4372dcabea6708374f9fe649256f92f2040497. The four inputs the budget governs, the DynamoRIO content-key miss
+# hashed over reverie-dbt/vendor/dynamorio, reverie-dbt/build.rs, $CMAKE and
+# $CMAKE_GENERATOR, are unchanged: the one-commit range changes only
+# reverie-kvm (the KVM guest's stack placement and initial-stack layout); it
+# touches nothing under reverie-dbt and not the DynamoRIO build recipe.
+# The available-CPU cap and f85df40daa25eff544e316659d674515091948a66bb7a3861f5e613dc3465b21
+# recipe, CMAKE/CMAKE_GENERATOR policy, 16-job clamp and 1050 effective-job-
+# second budget are unchanged. Carry, not recalibration: no new timing sample
+# or >=5-sample replacement claim is made.
+if [[ ${REVERIE_DBT_BUDGET_BOUND_PIN:-} != 0c2d3db220a64da6aaf0a741b6d0ad225dd85e71 ]]; then
+    echo "configure-build-jobs.sh: DECLINED (no_result, exit 75): DBT budget is not bound to Reverie 0c2d3db220a64da6aaf0a741b6d0ad225dd85e71 (bound pin: ${REVERIE_DBT_BUDGET_BOUND_PIN:-<unset>})" >&2
     return 75
 fi
 
