@@ -50,6 +50,7 @@ use tracing::trace;
 use tracing::warn;
 
 use super::deterministic_stdio_inode_for_resource;
+use crate::IdentityLookupRefused;
 use crate::config::SchedHeuristic;
 use crate::dirents::*;
 use crate::fd::*;
@@ -778,15 +779,17 @@ fn is_path_answer(errno: Errno) -> bool {
     )
 }
 
-/// The error of an identity lookup that could not be asked: a tool error,
-/// which fails the run on ptrace and is `EIO` to the guest on DBT and SaBRe,
-/// never an errno the guest's call would report as its own result.
+/// The error of an identity lookup that could not be asked: a tool error
+/// carrying [`IdentityLookupRefused`], which stops the refusing process on
+/// every backend, never an errno the guest's call would report as its own
+/// result.
 fn identity_lookup_refused(what: &str, path: &[u8], cause: impl std::fmt::Display) -> Error {
-    Error::Tool(anyhow::anyhow!(
+    IdentityLookupRefused(format!(
         "could not ask the guest to {what} {:?}: {cause}; refusing rather than \
          keying the file's identity on another source",
         String::from_utf8_lossy(path)
     ))
+    .into_error()
 }
 
 /// A private anonymous mapping of `len` bytes in the guest, made for one
@@ -864,10 +867,11 @@ fn guest_mountinfo<G: Guest<Detcore<T>>, T: RecordOrReplay>(guest: &G) -> Result
     }
     let path = format!("/proc/{}/mountinfo", guest.pid().as_raw());
     std::fs::read(&path).map_err(|error| {
-        Error::Tool(anyhow::anyhow!(
+        IdentityLookupRefused(format!(
             "could not read {path} to prove a maps line's device: {error}; refusing \
              rather than keying the file's identity on another source"
         ))
+        .into_error()
     })
 }
 
@@ -1998,11 +2002,11 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// so does the call it serves (a `read` of `maps` or `smaps`, a
     /// `readlink` of `/proc/<pid>/fd/<n>`). Every failure that is not the
     /// guest filesystem's answer is returned as a tool error rather than an
-    /// errno, which fails the run on ptrace and is `EIO` to the guest on DBT
-    /// and SaBRe, except `ESRCH`: that thread is gone, and nothing it would
-    /// print an identity to is left. Why the `mmap` fails is partly
-    /// guest state and partly host state: the guest's `RLIMIT_AS` and its
-    /// mapping count are the guest's, but the limit on that count
+    /// errno, a refusal ([`IdentityLookupRefused`]) that stops the refusing
+    /// process on every backend, except `ESRCH`: that thread is gone, and
+    /// nothing it would print an identity to is left. Why the `mmap` fails
+    /// is partly guest state and partly host state: the guest's `RLIMIT_AS`
+    /// and its mapping count are the guest's, but the limit on that count
     /// (`vm.max_map_count`) is a host setting, and a strict overcommit policy
     /// (`vm.overcommit_memory=2`) refuses the page on the host's commit
     /// charge. A caller that treated the failure as "no such file" and keyed
@@ -2038,13 +2042,9 @@ impl<T: RecordOrReplay> Detcore<T> {
             // is left; the errno is returned as before.
             Errno::ESRCH => Error::Errno(errno),
             // Not an `Error::Errno`: the guest's call must not see a host
-            // resource's errno as its own result. A tool error fails the run
-            // on ptrace and is `EIO` to the guest on DBT and SaBRe.
-            errno => Error::Tool(anyhow::anyhow!(
-                "could not ask the guest to stat {:?}: {errno}; refusing rather than \
-                 keying the file's identity on another source",
-                String::from_utf8_lossy(path)
-            )),
+            // resource's errno as its own result. The refusal stops the
+            // refusing process on every backend.
+            errno => identity_lookup_refused("stat", path, errno),
         })
     }
 
@@ -4704,10 +4704,11 @@ impl<T: RecordOrReplay> Detcore<T> {
                 match self.inject_fstat(guest, fd).await {
                     Ok(stat) => Some(RawInode::new(stat.st_dev, stat.st_ino)),
                     Err(errno) => {
-                        // The guest will not learn this mapping's address: on
-                        // ptrace the tool error stops the run, and on DBT and
-                        // SaBRe the call fails. Undo it so the address space
-                        // does not keep a mapping nobody recorded.
+                        // The guest will not learn this mapping's address:
+                        // the refusal stops this process on every backend
+                        // before the guest runs again. Undo it anyway, so
+                        // the address space does not keep a mapping nobody
+                        // recorded while the process is being stopped.
                         guest.thread_state().unmap_memory(start, len);
                         if let Err(unmap_errno) = guest
                             .inject_with_retry(Syscall::Munmap(
@@ -10577,6 +10578,95 @@ pub(crate) mod inject_fstat_scratch {
             RawInode::new(HEADER_DEVICE, key.inode)
         );
         assert_eq!(guest.injected, [Sysno::newfstatat]);
+    }
+
+    /// Asserts that `result` is a refusal carrying [`IdentityLookupRefused`]
+    /// whose message names `errno`.
+    fn assert_typed_refusal(path: &str, result: Result<(), Error>, errno: Errno) {
+        let refused = result
+            .as_ref()
+            .err()
+            .and_then(IdentityLookupRefused::carried_by);
+        assert!(
+            refused.is_some_and(|refused| refused.to_string().contains(&errno.to_string())),
+            "the {path} path's refusal must reach the dispatcher as an IdentityLookupRefused \
+             naming {errno}: {result:?}"
+        );
+    }
+
+    // A refusal must reach Detcore's dispatcher, and the DBT glue, as the
+    // typed `IdentityLookupRefused`, because that type is what stops the
+    // refusing process: an untyped tool error is still EIO to the guest on
+    // DBT. One refusal from each path that asks the guest before it keys an
+    // identity, each with neither a stack scratch nor a transient page to ask
+    // in: a `maps` snapshot, through `mint_mapping_identities` as the read
+    // handler calls it; the stdio identity of an `mmap`; and the directory
+    // device of a `getdents64`, which is resolved before the real call.
+    #[tokio::test]
+    async fn refusals_from_maps_mmap_and_getdents_reach_the_dispatcher_typed() {
+        let (_file, _identity, key) = mapped_path();
+        let line = format!(
+            "{:x}-{:x} r--p 00000000 {:02x}:{:02x} {} {}",
+            RECORDED_START,
+            RECORDED_START + page_size(),
+            libc::major(key.device),
+            libc::minor(key.device),
+            key.inode,
+            key.pathname
+        );
+        assert_eq!(
+            crate::procfs::mapping_header_key(&line),
+            Some(key.clone()),
+            "precondition: the scripted maps line names the file"
+        );
+        let scratch = Pages::map(1, 1);
+        let (tool, mut guest) =
+            ScriptedGuest::with_scratch(scratch.address, scratch.len, Some(Errno::EFAULT));
+        guest.mmap_fails = true;
+        let maps = crate::procfs::mint_mapping_identities(
+            line.as_bytes(),
+            &BTreeMap::new(),
+            &mut GuestMappingMinter::new(&tool, &mut guest, MappingSubject::Unknown),
+        )
+        .await;
+        assert_typed_refusal("maps", maps.map(|_| ()), Errno::ENOMEM);
+        assert_eq!(guest.injected, [Sysno::mmap], "maps: only the failed page");
+
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = stdio_backed_by_a_file(&mut guest);
+        let mmap = tool
+            .handle_mmap(
+                &mut guest,
+                syscalls::Mmap::new()
+                    .with_addr(None)
+                    .with_len(page_size())
+                    .with_prot(ProtFlags::PROT_READ)
+                    .with_flags(MapFlags::MAP_PRIVATE)
+                    .with_fd(fd)
+                    .with_offset(0),
+            )
+            .await;
+        close_unless_detcore_did(&guest, fd);
+        assert_typed_refusal("mmap", mmap.map(|_| ()), Errno::ENOMEM);
+
+        let (tool, mut guest) = ScriptedGuest::new(false, true);
+        let (fd, _) = open_file();
+        let getdents = tool
+            .handle_getdents64(
+                &mut guest,
+                syscalls::Getdents64::new()
+                    .with_fd(u32::try_from(fd).unwrap())
+                    .with_dirent(AddrMut::from_raw(scratch.address))
+                    .with_count(u32::try_from(page_size()).unwrap()),
+            )
+            .await;
+        close_unless_detcore_did(&guest, fd);
+        assert_typed_refusal("getdents64", getdents.map(|_| ()), Errno::ENOMEM);
+        assert_eq!(
+            guest.injected,
+            [Sysno::mmap],
+            "getdents64: the refusal comes before the real call"
+        );
     }
 
     // Step 3 of `mapping_stat_identity`: the reader's own executable after it

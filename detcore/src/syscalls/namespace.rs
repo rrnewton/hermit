@@ -27,6 +27,7 @@ use reverie::syscalls::Syscall;
 
 use super::deterministic_stdio_inode;
 use super::deterministic_stdio_inode_for_resource;
+use crate::IdentityLookupRefused;
 use crate::config::AnonymousObjectDevices;
 use crate::record_or_replay::RecordOrReplay;
 use crate::tool_global::determinize_inode;
@@ -231,20 +232,21 @@ pub fn probe_anonymous_object_devices() -> std::io::Result<AnonymousObjectDevice
 
 /// The device of a `kind` ("pipe" or "socket") link's inode, from
 /// `devices`: the configured ones, or else the ones read at start. When they
-/// could not be read, this is a
-/// tool error, not an errno: Detcore cannot give the link a faithful identity,
-/// so the run fails as an infrastructure failure through the backend's own
-/// failure handling, rather than a link identity getting an invented device or
-/// a guest getting an error Linux would not return.
+/// could not be read, the lookup is refused ([`IdentityLookupRefused`]), not
+/// answered with an errno: Detcore cannot give the link a faithful identity,
+/// so the refusing process is stopped on every backend, rather than a link
+/// identity getting an invented device or a guest getting an error Linux
+/// would not return.
 fn anonymous_object_device(
     devices: &Result<AnonymousObjectDevices, String>,
     kind: &str,
 ) -> Result<u64, Error> {
     let devices = devices.as_ref().map_err(|error| {
-        Error::Tool(anyhow::anyhow!(
+        IdentityLookupRefused(format!(
             "Detcore could not read the pipe and socket filesystem devices when it started \
              ({error}), so it cannot identify the {kind} a /proc fd link names"
         ))
+        .into_error()
     })?;
     Ok(match kind {
         "pipe" => devices.pipe,
@@ -398,17 +400,17 @@ impl<T: RecordOrReplay> Detcore<T> {
     /// process probed before launch, or failing that from the devices probed
     /// when the tool was constructed (`anonymous_object_devices`). Only when
     /// there are neither -- no configured devices and a failed construction
-    /// probe -- does the readlink fail with a tool error
-    /// (`anonymous_object_device`) rather than key the link on a device no
-    /// `fstat` reports. A run launched through hermit-cli lacks configured
-    /// devices when its own probe failed, and on DBT always: hermit-cli
-    /// leaves them out of DBT's `HERMIT_DBT_DETCONFIG`, which the guest can
-    /// read and which must stay byte-identical, so every DBT run keys an
-    /// unconfirmed link on the devices probed in the guest when the tool was
-    /// constructed. A DBT guest that execs with `HERMIT_DBT_DETCONFIG` removed
-    /// from its environment is in the same position: the re-injected runtime
-    /// builds its default Config, which carries no devices, and probes in the
-    /// guest.
+    /// probe -- is the readlink refused ([`IdentityLookupRefused`], from
+    /// `anonymous_object_device`, which stops the refusing process on every
+    /// backend) rather than key the link on a device no `fstat` reports. A
+    /// run launched through hermit-cli lacks configured devices when its own
+    /// probe failed, and on DBT always: hermit-cli leaves them out of DBT's
+    /// `HERMIT_DBT_DETCONFIG`, which the guest can read and which must stay
+    /// byte-identical, so every DBT run keys an unconfirmed link on the
+    /// devices probed in the guest when the tool was constructed. A DBT guest
+    /// that execs with `HERMIT_DBT_DETCONFIG` removed from its environment is
+    /// in the same position: the re-injected runtime builds its default
+    /// Config, which carries no devices, and probes in the guest.
     ///
     /// Without `virtualize_metadata` -- `hermit record` and `hermit replay`
     /// -- neither is consulted, and the object is keyed on its inode alone,
@@ -1058,6 +1060,10 @@ mod tests {
         let error = anonymous_object_device(&unconfigured, "pipe").unwrap_err();
         assert!(matches!(error, Error::Tool(_)), "{error:?}");
         assert!(error.to_string().contains("EMFILE"), "{error}");
+        assert!(
+            IdentityLookupRefused::carried_by(&error).is_some(),
+            "a failed probe must be a typed refusal, which stops the process: {error:?}"
+        );
     }
 
     /// A guest-side `stat` of the link is accepted only for the same kind of
