@@ -327,12 +327,20 @@ def main():
     ap.add_argument("--failed-log-max-bytes", type=int, default=FAILED_LOG_MAX_BYTES, help=argparse.SUPPRESS)  # tests only
     ap.add_argument("run_ids", nargs="+")
     a = ap.parse_args()
-    failed_root = a.failed_verify_logs
-    if failed_root is not None and os.path.lexists(failed_root) and (
-            not os.path.isdir(failed_root) or os.path.islink(failed_root) or
-            (os.listdir(failed_root) and not os.path.isfile(os.path.join(failed_root, FAILED_LOGS_INDEX)))):
-        sys.exit(f"ingest: --failed-verify-logs {failed_root} is not absent, empty, or a previous ingest's "
-                 f"(no {FAILED_LOGS_INDEX}); refusing to replace it")
+    failed_root, failed_logs_error = a.failed_verify_logs, None
+    if failed_root is not None and os.path.lexists(failed_root):
+        try:
+            foreign = (not os.path.isdir(failed_root) or os.path.islink(failed_root) or
+                       (os.listdir(failed_root) and not os.path.isfile(os.path.join(failed_root, FAILED_LOGS_INDEX))))
+        except OSError as error:
+            # A directory that cannot be inspected cannot be shown to be ours, so it is left
+            # alone and no logs are kept; like any retention failure this never fails the ingest.
+            failed_logs_error = f"cannot inspect {failed_root}: {error}"
+            print(f"ingest: the failed cells' verify logs will not be kept: {failed_logs_error}", file=sys.stderr)
+            failed_root, foreign = None, False
+        if foreign:
+            sys.exit(f"ingest: --failed-verify-logs {failed_root} is not absent, empty, or a previous ingest's "
+                     f"(no {FAILED_LOGS_INDEX}); refusing to replace it")
     plan = json.load(open(a.plan))
     want = {"{}/{}@{}".format(c["test"], c["mode"], c["backend"]): c for c in plan["cells"]}
     work = a.work or tempfile.mkdtemp(prefix="buck-e2e-ingest-")
@@ -456,7 +464,7 @@ def main():
     # the logs of the executions that died are the evidence that refusal needs.
     # Like every log kept here, the directory is evidence, not input: failing to write it is
     # reported in the summary line and never fails the ingest.
-    failed_entries, failed_logs_error = [], None
+    failed_entries = []
     if failed_root is not None:
         try:
             shutil.rmtree(failed_root, ignore_errors=True)

@@ -614,6 +614,22 @@ class IngestTest(unittest.TestCase):
         self.assertIn("overlaps --work", process.stderr)
         self.assertFalse((work / "out").exists(), "ingest wrote before refusing")
 
+    def test_an_earlier_directory_that_cannot_be_inspected_never_fails_the_ingest(self):
+        diverged = with_logs(execution(Y, 150, "FAIL", "ry1"), DIVERGED_LOGS)
+        earlier = self.root / "earlier"
+        earlier.mkdir()
+        (earlier / "index.jsonl").write_text("from an earlier ingest\n")
+        earlier.chmod(0o000)
+        self.addCleanup(earlier.chmod, 0o755)
+        work, process = self.ingest({"RUN": [execution(X, 100, "PASS", "rx1"), diverged]},
+                                    extra=["--failed-verify-logs", str(earlier)])
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertIn("the failed cells' verify logs will not be kept: cannot inspect", process.stderr)
+        self.assertIn("cannot inspect", json.loads(process.stdout)["failed_verify_logs_error"])
+        self.assertTrue((work / "out" / "portable" / "manifest_cat" / "results.jsonl").is_file())
+        earlier.chmod(0o755)
+        self.assertEqual((earlier / "index.jsonl").read_text(), "from an earlier ingest\n")
+
 
 if __name__ == "__main__":
     unittest.main()

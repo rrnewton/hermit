@@ -85,7 +85,14 @@ if [[ $mode == hybrid ]]; then
 fi
 step "staging the inputs Buck does not build (cargo, target/)"
 "${proxy[@]}" ./ci/buck-e2e/stage --from-cargo
-rm -rf -- "${state:?}/results" "${failed_logs:?}"
+rm -rf -- "${state:?}/results"
+# The failed cells' logs are evidence, not input: an earlier attempt's copy that cannot be
+# removed costs this run its copy, never the run.
+failed_logs_args=(--failed-verify-logs "$failed_logs")
+if ! rm -rf -- "${failed_logs:?}"; then
+    echo "validate-node: cannot remove the earlier $failed_logs (above); this run keeps no failed-cell verify logs" >&2
+    failed_logs_args=()
+fi
 mkdir -p "$state/work"
 # Every cell of the run gets one HERMIT_EPOCH: backend parity compares a ptrace reference with
 # its candidates only when they share the guest epoch, and each cell is its own harness
@@ -104,5 +111,5 @@ else
 fi
 step "running every cell under Buck ($runner), HERMIT_EPOCH=$epoch"
 ./ci/buck-e2e/run --mode "$mode" --no-verdict --out "$state/results" --work "$state/work" \
-    --failed-verify-logs "$failed_logs" \
+    "${failed_logs_args[@]}" \
     --buck2 "$buck2" -- "${buck_args[@]}" -c hermit_e2e.hermit=staged -c "hermit_e2e.epoch=$epoch"

@@ -681,6 +681,19 @@ class ValidateNodeTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--out") + 1], str(self.root / "state" / "buck-e2e" / "results"))
         self.assertFalse(stale.exists(), "an earlier attempt's logs would stand for this run's")
 
+    def test_an_earlier_copy_that_cannot_be_removed_costs_only_the_logs(self):
+        results = self.root / "e2e-results"
+        stuck = results / "buck-failed-verify-logs" / "run" / "verify-logs"
+        stuck.mkdir(parents=True)
+        (stuck / "run1_log_detlog").write_text("earlier\n")
+        stuck.chmod(0o555)
+        self.addCleanup(stuck.chmod, 0o755)
+        process = self.validate_node(str(results))
+        self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+        self.assertIn("this run keeps no failed-cell verify logs", process.stderr)
+        argv = [call for call in calls_in(self.calls) if call[0] == "run"][0]
+        self.assertNotIn("--failed-verify-logs", argv)
+
     def test_a_relative_e2e_result_root_is_resolved_before_the_node_changes_directory(self):
         process = self.validate_node("relative-results", cwd=self.root)
         self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
