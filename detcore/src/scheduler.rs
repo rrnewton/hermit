@@ -798,6 +798,9 @@ pub struct Scheduler {
     /// waiting for the threads in `blocked.signaled_background` to post their
     /// continuations; `None` while the set is empty.
     signaled_background_since: Option<std::time::Instant>,
+    /// Set when the release barrier's watchdog expires; the scheduler loop
+    /// ends the run with it (`exit_on_signaled_background_refusal`).
+    signaled_background_refusal: Option<SignaledBackgroundRefusal>,
     #[cfg(test)]
     host_signal_attempts: u64,
     /// Turns that `do_a_turn_blocking` ran through the controlled loop.
@@ -1476,6 +1479,48 @@ enum SchedLoopPoint {
 #[derive(Debug, Clone)]
 pub struct SkipTurn;
 
+/// The release barrier's watchdog expired (`step2_release_signaled_background`):
+/// committed signals armed these background threads, and they had still not
+/// posted their continuations when it fired. Their admission point can no
+/// longer be fixed by the scheduler, so the run is refused instead of being
+/// continued with an order that host delivery time decides
+/// (https://github.com/rrnewton/hermit/pull/3361).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SignaledBackgroundRefusal {
+    /// The armed threads that posted no continuation, in `DetTid` order.
+    pub unposted: Vec<DetTid>,
+    /// How long, in host time, the barrier had waited when it refused.
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for SignaledBackgroundRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "hermit refused to continue the run: the signaled background threads {:?} \
+             posted no continuation within {:?} of the release barrier, so their \
+             admission order would depend on host signal delivery time",
+            self.unposted.iter().map(|t| t.as_raw()).collect::<Vec<_>>(),
+            self.waited
+        )
+    }
+}
+
+impl std::error::Error for SignaledBackgroundRefusal {}
+
+/// End the run on a scheduler refusal: write it to stderr and exit with
+/// `HERMIT_POLICY_REFUSAL_EXIT`, the status for "hermit examined the run and
+/// refused it", as the network replay refusal does. Only the ptrace backend
+/// arms the release barrier, and a ptrace guest does not outlive this process
+/// (Reverie sets `PTRACE_O_EXITKILL`).
+fn exit_on_signaled_background_refusal(refusal: &SignaledBackgroundRefusal) -> ! {
+    {
+        use std::io::Write;
+        let _ = writeln!(crate::util::RetryingStderr, "{refusal}");
+    }
+    std::process::exit(detcore_model::HERMIT_POLICY_REFUSAL_EXIT);
+}
+
 /// Scheduler-local attribution also represents process operations that have no
 /// selected task. The public backend callback still supplies its actual task.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1554,7 +1599,12 @@ async fn do_ordinary_turn_blocking(
         if sched.backend_failed() {
             return Err(SkipTurn);
         }
-        sched.step2_process_blocked(&global_time)?;
+        let blocked = sched.step2_process_blocked(&global_time);
+        if let Some(refusal) = sched.signaled_background_refusal.take() {
+            drop(sched);
+            exit_on_signaled_background_refusal(&refusal);
+        }
+        blocked?;
         sched.step3_peek().ok_or(SkipTurn)?
     };
 
@@ -1929,6 +1979,7 @@ impl Scheduler {
             backend_failure_wake: backend_failure_wake.shared(),
             backend: cfg.backend,
             signaled_background_since: None,
+            signaled_background_refusal: None,
             #[cfg(test)]
             host_signal_attempts: 0,
             #[cfg(test)]
@@ -3227,7 +3278,7 @@ impl Scheduler {
     }
 
     /// How long the release barrier waits for an armed thread's continuation
-    /// before it gives up on ordering it (see `step2_release_signaled_background`).
+    /// before it refuses the run (see `step2_release_signaled_background`).
     const SIGNALED_BACKGROUND_VALVE: Duration = Duration::from_secs(30);
 
     /// Requeue, at a fixed point, the background-pool threads that a committed
@@ -3245,11 +3296,15 @@ impl Scheduler {
     /// and the requeue, so host delivery time decides only how many empty
     /// passes spin, never where the threads enter the run queue.
     ///
-    /// The valve is liveness insurance, not part of the order: an armed thread
-    /// is woken because its recorded mask does not block the signal and a traced
-    /// thread is never spared a signal at generation, so it always stops and
-    /// posts. If that ever fails to happen within the valve, the barrier warns
-    /// and leaves the thread in its pool for `step2c` to harvest as before.
+    /// The watchdog (`SIGNALED_BACKGROUND_VALVE`) only bounds how long the
+    /// barrier waits; it never decides an admission. An armed thread is woken
+    /// because its recorded mask does not block the signal and a traced thread
+    /// is never spared a signal at generation, so it always stops and posts. If
+    /// that ever fails to happen before the watchdog fires, the barrier keeps
+    /// every arm, records a `SignaledBackgroundRefusal`, and the scheduler loop
+    /// ends the run with `HERMIT_POLICY_REFUSAL_EXIT`. Dropping the arms instead
+    /// would leave the threads for `step2c` to harvest behind runnable siblings:
+    /// an admission order that host delivery time decides.
     fn step2_release_signaled_background(&mut self) -> Result<(), SkipTurn> {
         if self.blocked.signaled_background.is_empty() {
             self.signaled_background_since = None;
@@ -3273,7 +3328,8 @@ impl Scheduler {
             let since = *self
                 .signaled_background_since
                 .get_or_insert_with(std::time::Instant::now);
-            if since.elapsed() < Self::SIGNALED_BACKGROUND_VALVE {
+            let waited = since.elapsed();
+            if waited < Self::SIGNALED_BACKGROUND_VALVE {
                 trace!(
                     "[step2] waiting for signaled background dtids {:?} to post their continuations",
                     unposted
@@ -3281,14 +3337,14 @@ impl Scheduler {
                 std::thread::yield_now();
                 return Err(SkipTurn);
             }
-            tracing::warn!(
-                "[step2] signaled background dtids {:?} posted no continuation within {:?}; leaving them to step2c",
-                unposted,
-                Self::SIGNALED_BACKGROUND_VALVE
-            );
-            for dtid in &unposted {
-                self.blocked.signaled_background.remove(dtid);
+            // Fail closed: keep every arm, so nothing is admitted at a
+            // host-timed point, and refuse the run.
+            if self.signaled_background_refusal.is_none() {
+                let refusal = SignaledBackgroundRefusal { unposted, waited };
+                tracing::error!("[step2] {}", refusal);
+                self.signaled_background_refusal = Some(refusal);
             }
+            return Err(SkipTurn);
         }
         let ready = std::mem::take(&mut self.blocked.signaled_background);
         self.signaled_background_since = None;
@@ -9684,6 +9740,66 @@ mod test {
                 .is_ok()
         );
         assert!(scheduler.blocked.sigchld_deferred.is_empty());
+    }
+
+    /// When the release barrier's watchdog expires with an armed thread that
+    /// has still not posted its continuation, the barrier must not drop the
+    /// arm and resume scheduling: that would leave the thread for `step2c` to
+    /// harvest behind runnable siblings, an admission order that host delivery
+    /// time decides. The watchdog's start is backdated here (an injected clock),
+    /// so the production bound needs no test knob.
+    #[test]
+    fn an_expired_release_barrier_keeps_the_arm_and_refuses_the_run() {
+        let (mut scheduler, parent, creator, _child) = sigchld_family(libc::SIGCHLD);
+        let op = ExternalOpId::new(creator, 1);
+        commit_out_of_scheduler_call(
+            &mut scheduler,
+            creator,
+            ResourceID::BlockingRtSigsuspend(op),
+            Some(0),
+        );
+        scheduler.runqueue_push_back(parent);
+        scheduler.wake_signaled_guest(creator, Signal::SIGCHLD);
+        assert!(scheduler.blocked.signaled_background.contains(&creator));
+
+        // The first empty pass starts the watchdog.
+        assert!(scheduler.step2_release_signaled_background().is_err());
+        assert!(scheduler.signaled_background_since.is_some());
+        scheduler.signaled_background_since = Some(
+            std::time::Instant::now()
+                .checked_sub(Scheduler::SIGNALED_BACKGROUND_VALVE + Duration::from_secs(1))
+                .expect("the monotonic clock has run longer than the watchdog bound"),
+        );
+
+        // Expired: the pass is still refused, the arm and the pool entry stay,
+        // and nothing is requeued for a later harvest.
+        for _ in 0..2 {
+            assert!(scheduler.step2_release_signaled_background().is_err());
+            assert!(scheduler.blocked.signaled_background.contains(&creator));
+            assert_eq!(
+                scheduler.blocked.rt_sigsuspend_blockers.get(&creator),
+                Some(&op)
+            );
+            assert!(!scheduler.run_queue.contains_tid(creator));
+        }
+        // The typed refusal names the thread, and the scheduler loop ends the
+        // run with it rather than scheduling on.
+        let refusal = scheduler
+            .signaled_background_refusal
+            .take()
+            .expect("an expired barrier records a typed refusal");
+        assert_eq!(refusal.unposted, vec![creator]);
+        assert!(refusal.waited >= Scheduler::SIGNALED_BACKGROUND_VALVE);
+        assert!(
+            refusal
+                .to_string()
+                .starts_with("hermit refused to continue the run")
+        );
+        // A whole pass is refused as well, so step2c cannot harvest the thread.
+        let global_time = Arc::new(Mutex::new(GlobalTime::new(&Config::default())));
+        assert!(scheduler.step2_process_blocked(&global_time).is_err());
+        assert!(!scheduler.run_queue.contains_tid(creator));
+        assert!(scheduler.signaled_background_refusal.is_some());
     }
 
     /// Armed threads are released together, only once every one has posted,
