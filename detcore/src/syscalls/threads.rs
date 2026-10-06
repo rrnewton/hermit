@@ -1092,6 +1092,9 @@ where
         pending: pending & sigchld != 0,
     };
     if sigchld_eligibility(guest, request).await {
+        // The thread's next handler retires the reservation this answer may
+        // have used (`Detcore::pre_handler_hook`).
+        guest.thread_state_mut().sigchld_answered = true;
         pending
     } else {
         if pending & sigchld != 0 {
